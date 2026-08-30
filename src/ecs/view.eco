@@ -1,0 +1,296 @@
+/**
+ * Packed component list for one type. EnTT sparse set: dense arrays of
+ * entities and T (structs sit inline), sparse index for O(1) lookup.
+ * A T& into the payload is invalidated if this view grows.
+ */
+
+namespace visu::ecs;
+
+private class AttachHook<T>
+{
+    public int32 $handle;
+    public function<void(Entities, Entity, const T&)> $fn;
+
+    public constructor(int32 $handle, function<void(Entities, Entity, const T&)> $fn)
+    {
+        $this->handle = $handle;
+        $this->fn = $fn;
+    }
+}
+
+private class DetachHook<T>
+{
+    public int32 $handle;
+    public function<void(Entities, Entity, const T&)> $fn;
+
+    public constructor(int32 $handle, function<void(Entities, Entity, const T&)> $fn)
+    {
+        $this->handle = $handle;
+        $this->fn = $fn;
+    }
+}
+
+public struct ViewCursor<T> : contract::iterator<T>, contract::keyed<Entity>
+{
+    public View<T> $view;
+    public usize $i;
+
+    public constructor(View<T> $view)
+    {
+        $this->view = $view;
+        $this->i = 0;
+    }
+
+    public function advance() : bool
+    {
+        if ($this->i >= $this->view->size()) {
+            return false;
+        }
+
+        $this->i = $this->i + 1;
+        return true;
+    }
+
+    public function current() : T&
+    {
+        return $this->view->at($this->i - 1);
+    }
+
+    public function key() : Entity
+    {
+        return $this->view->entity($this->i - 1);
+    }
+}
+
+public class View<T> : contract::iterable<T>
+{
+    private array<uint32> $sparse;
+    private array<Entity> $dense;
+    private array<T> $payload;
+    private array<erased> $attachHooks;
+    private array<erased> $detachHooks;
+
+    public constructor()
+    {
+        $this->sparse = array<uint32>();
+        $this->dense = array<Entity>();
+        $this->payload = array<T>();
+        $this->attachHooks = array<erased>();
+        $this->detachHooks = array<erased>();
+    }
+
+    public const function size() : usize
+    {
+        return $this->dense->count();
+    }
+
+    public const function empty() : bool
+    {
+        return $this->dense->empty();
+    }
+
+    public function reserve(usize $n) : void
+    {
+        $this->dense->reserve($n);
+        $this->payload->reserve($n);
+    }
+
+    public function contains(Entity $e) : bool
+    {
+        uint32 $idx = $e->index();
+        if (($idx as usize) >= $this->sparse->count()) {
+            return false;
+        }
+
+        uint32 $denseIdx = $this->sparse[$idx as usize];
+        if ($denseIdx == ENTITY_NULL_ID) {
+            return false;
+        }
+
+        return $this->dense[$denseIdx as usize] == $e;
+    }
+
+    public function get(Entity $e) : T&
+    {
+        assert($this->contains($e), 'view: get of missing component');
+        uint32 $denseIdx = $this->sparse[$e->index() as usize];
+        return $this->payload->at($denseIdx as usize);
+    }
+
+    public function find(Entity $e) : ptr<T>
+    {
+        if (!$this->contains($e)) {
+            return null;
+        }
+
+        uint32 $denseIdx = $this->sparse[$e->index() as usize];
+        return &$this->payload[$denseIdx as usize];
+    }
+
+    public function at(usize $i) : T&
+    {
+        return $this->payload->at($i);
+    }
+
+    public function ptrAt(usize $i) : ptr<T>
+    {
+        return &$this->payload[$i];
+    }
+
+    public const function entity(usize $i) : Entity
+    {
+        return $this->dense[$i];
+    }
+
+    public const function ids() : array<Entity>
+    {
+        return $this->dense->clone();
+    }
+
+    /**
+     * Emplace or replace. Does not fire attach hooks — Entities does.
+     */
+    public function attach(Entity $e, T $component) : T&
+    {
+        uint32 $idx = $e->index();
+        $this->ensureSparse($idx);
+
+        if ($this->contains($e)) {
+            uint32 $denseIdx = $this->sparse[$idx as usize];
+            usize $i = $denseIdx as usize;
+            $this->payload[$i] = $component;
+            return $this->payload->at($i);
+        }
+
+        uint32 $denseIdx = $this->dense->count() as uint32;
+        $this->sparse[$idx as usize] = $denseIdx;
+        $this->dense->push($e);
+        $this->payload->push($component);
+        return $this->payload->at($denseIdx as usize);
+    }
+
+    /**
+     * Sparse-set remove, no hooks. Tests and the two-arg remove use this.
+     */
+    public function erase(Entity $e) : void
+    {
+        if (!$this->contains($e)) {
+            return;
+        }
+
+        uint32 $idx = $e->index();
+        uint32 $denseIdx = $this->sparse[$idx as usize];
+        usize $last = $this->dense->count() - 1;
+
+        if (($denseIdx as usize) != $last) {
+            Entity $moved = $this->dense[$last];
+            $this->dense[$denseIdx as usize] = $moved;
+            T& $dest = $this->payload->at($denseIdx as usize);
+            $dest = $this->payload[$last];
+            $this->sparse[$moved->index() as usize] = $denseIdx;
+        }
+
+        $this->dense->pop();
+        $this->payload->pop();
+        $this->sparse[$idx as usize] = ENTITY_NULL_ID;
+    }
+
+    /**
+     * Fire detach hooks then erase. Entities.detachAll uses this.
+     */
+    public function remove(Entities $world, Entity $e) : void
+    {
+        if (!$this->contains($e)) {
+            return;
+        }
+
+        T& $component = $this->get($e);
+        $this->fireDetach($world, $e, $component);
+        $this->erase($e);
+    }
+
+    public function iterate() : ViewCursor<T>
+    {
+        return ViewCursor<T>($this);
+    }
+
+    internal function listenAttach(int32 $handle, function<void(Entities, Entity, const T&)> $fn) : void
+    {
+        AttachHook<T> $hook = AttachHook<T>($handle, $fn);
+        $this->attachHooks->push(erased::from($hook));
+    }
+
+    internal function listenDetach(int32 $handle, function<void(Entities, Entity, const T&)> $fn) : void
+    {
+        DetachHook<T> $hook = DetachHook<T>($handle, $fn);
+        $this->detachHooks->push(erased::from($hook));
+    }
+
+    internal function fireAttach(Entities $world, Entity $e, const T& $component) : void
+    {
+        foreach ($this->attachHooks as $held) {
+            unsafe {
+                AttachHook<T> $hook = assume<AttachHook<T>>($held);
+                function<void(Entities, Entity, const T&)> $fn = $hook->fn;
+                $fn($world, $e, $component);
+            }
+        }
+    }
+
+    internal function fireDetach(Entities $world, Entity $e, const T& $component) : void
+    {
+        foreach ($this->detachHooks as $held) {
+            unsafe {
+                DetachHook<T> $hook = assume<DetachHook<T>>($held);
+                function<void(Entities, Entity, const T&)> $fn = $hook->fn;
+                $fn($world, $e, $component);
+            }
+        }
+    }
+
+    public function releaseAttach(int32 $handle) : void
+    {
+        array<erased> $kept = array<erased>();
+        foreach ($this->attachHooks as $held) {
+            bool $drop = false;
+            unsafe {
+                AttachHook<T> $hook = assume<AttachHook<T>>($held);
+                if ($hook->handle == $handle) {
+                    $drop = true;
+                }
+            }
+            if ($drop) {
+                continue;
+            }
+            $kept->push($held);
+        }
+        $this->attachHooks = $kept;
+    }
+
+    public function releaseDetach(int32 $handle) : void
+    {
+        array<erased> $kept = array<erased>();
+        foreach ($this->detachHooks as $held) {
+            bool $drop = false;
+            unsafe {
+                DetachHook<T> $hook = assume<DetachHook<T>>($held);
+                if ($hook->handle == $handle) {
+                    $drop = true;
+                }
+            }
+            if ($drop) {
+                continue;
+            }
+            $kept->push($held);
+        }
+        $this->detachHooks = $kept;
+    }
+
+    private function ensureSparse(uint32 $idx) : void
+    {
+        usize $need = ($idx as usize) + 1;
+        while ($this->sparse->count() < $need) {
+            $this->sparse->push(ENTITY_NULL_ID);
+        }
+    }
+}

@@ -1,0 +1,408 @@
+/**
+ * Entity allocator plus a View<T> per component type. Components are
+ * structs in a sparse set; this class is the shared registry. Gpu is
+ * never stored here.
+ */
+
+namespace visu::ecs;
+
+private class Slot<T>
+{
+    public T $value;
+
+    public constructor(T $value)
+    {
+        $this->value = $value;
+    }
+
+    public function get() : T&
+    {
+        return &$this->value;
+    }
+
+    public function asPtr() : ptr<T>
+    {
+        return &$this->value;
+    }
+}
+
+private class StoreBox
+{
+    public function<bool(Entity)> $contains;
+    public function<void(Entities, Entity)> $remove;
+    public function<void(int32)> $releaseAttach;
+    public function<void(int32)> $releaseDetach;
+
+    public constructor(
+        function<bool(Entity)> $contains,
+        function<void(Entities, Entity)> $remove,
+        function<void(int32)> $releaseAttach,
+        function<void(int32)> $releaseDetach
+    )
+    {
+        $this->contains = $contains;
+        $this->remove = $remove;
+        $this->releaseAttach = $releaseAttach;
+        $this->releaseDetach = $releaseDetach;
+    }
+}
+
+public class Entities
+{
+    private array<uint32> $generations;
+    private array<uint32> $freelist;
+    private uint32 $nextIndex;
+    private map<type_id, erased> $views;
+    private array<StoreBox> $stores;
+    private map<type_id, erased> $singletons;
+    private int32 $hookIndex;
+
+    public constructor()
+    {
+        $this->generations = array<uint32>();
+        $this->freelist = array<uint32>();
+        $this->nextIndex = 0;
+        $this->views = map<type_id, erased>();
+        $this->stores = array<StoreBox>();
+        $this->singletons = map<type_id, erased>();
+        $this->hookIndex = 0;
+    }
+
+    public function create() : Entity
+    {
+        if (!$this->freelist->empty()) {
+            uint32 $idx = $this->freelist->pop();
+            uint32 $ver = $this->generations[$idx as usize];
+            return Entity(index: $idx, version: $ver);
+        }
+
+        uint32 $idx = $this->nextIndex;
+        $this->nextIndex = $this->nextIndex + 1;
+        $this->generations->push(0);
+        return Entity(index: $idx, version: 0);
+    }
+
+    public const function valid(Entity $e) : bool
+    {
+        if ($e == Entity::none()) {
+            return false;
+        }
+
+        uint32 $idx = $e->index();
+        if (($idx as usize) >= $this->generations->count()) {
+            return false;
+        }
+
+        return $this->generations[$idx as usize] == $e->version();
+    }
+
+    public function destroy(Entity $e) : void
+    {
+        assert($this->valid($e), 'entities: destroy of invalid entity');
+        $this->detachAll($e);
+
+        uint32 $idx = $e->index();
+        uint32 $ver = $this->generations[$idx as usize] + 1;
+        if ($ver > ENTITY_VERSION_MASK) {
+            $ver = 0;
+        }
+        $this->generations[$idx as usize] = $ver;
+        $this->freelist->push($idx);
+    }
+
+    public function register<T>() : void
+    {
+        type_id $id = type_id<T>();
+        if ($this->views->has($id)) {
+            return;
+        }
+
+        View<T> $view = View<T>();
+        $this->views[$id] = erased::from($view);
+        $this->stores->push(StoreBox(
+            function(Entity $e) : bool {
+                return $view->contains($e);
+            },
+            function(Entities $world, Entity $e) : void {
+                $view->remove($world, $e);
+            },
+            function(int32 $handle) : void {
+                $view->releaseAttach($handle);
+            },
+            function(int32 $handle) : void {
+                $view->releaseDetach($handle);
+            },
+        ));
+    }
+
+    public function view<T>() : View<T>
+    {
+        $this->register<T>();
+        erased $held = $this->views->get(type_id<T>());
+        unsafe {
+            return assume<View<T>>($held);
+        }
+    }
+
+    public function attach<T>(Entity $e, T $component) : T&
+    {
+        assert($this->valid($e), 'entities: attach to invalid entity');
+        View<T> $view = $this->view<T>();
+        $view->attach($e, $component);
+        $view->fireAttach($this, $e, $view->get($e));
+        return $view->get($e);
+    }
+
+    public function detach<T>(Entity $e) : void
+    {
+        assert($this->valid($e), 'entities: detach from invalid entity');
+        View<T> $view = $this->view<T>();
+        assert($view->contains($e), 'entities: detach of missing component');
+        $view->remove($this, $e);
+    }
+
+    public function detachAll(Entity $e) : void
+    {
+        foreach ($this->stores as $store) {
+            function<bool(Entity)> $contains = $store->contains;
+            if (!$contains($e)) {
+                continue;
+            }
+            function<void(Entities, Entity)> $remove = $store->remove;
+            $remove($this, $e);
+        }
+    }
+
+    public function get<T>(Entity $e) : T&
+    {
+        assert($this->valid($e), 'entities: get on invalid entity');
+        View<T> $view = $this->view<T>();
+        return $view->get($e);
+    }
+
+    public function find<T>(Entity $e) : ptr<T>
+    {
+        View<T> $view = guard $this->findView<T>() else {
+            return null;
+        }
+
+        return $view->find($e);
+    }
+
+    public function has<T>(Entity $e) : bool
+    {
+        if (!$this->valid($e)) {
+            return false;
+        }
+
+        View<T> $view = guard $this->findView<T>() else {
+            return false;
+        }
+
+        return $view->contains($e);
+    }
+
+    public function ids<T>() : array<Entity>
+    {
+        View<T> $view = guard $this->findView<T>() else {
+            return array<Entity>();
+        }
+
+        return $view->ids();
+    }
+
+    public function idsWith<A, B>() : array<Entity>
+    {
+        array<Entity> $out = array<Entity>();
+        View<A> $va = $this->view<A>();
+        View<B> $vb = $this->view<B>();
+        if ($va->size() <= $vb->size()) {
+            foreach ($va as $e => &$a) {
+                if ($vb->contains($e)) {
+                    $out->push($e);
+                }
+            }
+        } else {
+            foreach ($vb as $e => &$b) {
+                if ($va->contains($e)) {
+                    $out->push($e);
+                }
+            }
+        }
+        return $out;
+    }
+
+    public function each<T>(function<void(Entity, T&)> $fn) : void
+    {
+        foreach ($this->view<T>() as $e => &$c) {
+            $fn($e, $c);
+        }
+    }
+
+    public function each<A, B>(function<void(Entity, A&, B&)> $fn) : void
+    {
+        View<A> $va = $this->view<A>();
+        View<B> $vb = $this->view<B>();
+        if ($va->size() <= $vb->size()) {
+            foreach ($va as $e => &$a) {
+                if (!$vb->contains($e)) {
+                    continue;
+                }
+                $fn($e, $a, $vb->get($e));
+            }
+        } else {
+            foreach ($vb as $e => &$b) {
+                if (!$va->contains($e)) {
+                    continue;
+                }
+                $fn($e, $va->get($e), $b);
+            }
+        }
+    }
+
+    public function each<A, B, C>(function<void(Entity, A&, B&, C&)> $fn) : void
+    {
+        View<A> $va = $this->view<A>();
+        View<B> $vb = $this->view<B>();
+        View<C> $vc = $this->view<C>();
+        usize $na = $va->size();
+        usize $nb = $vb->size();
+        usize $nc = $vc->size();
+
+        if ($na <= $nb && $na <= $nc) {
+            foreach ($va as $e => &$a) {
+                if (!$vb->contains($e) || !$vc->contains($e)) {
+                    continue;
+                }
+                $fn($e, $a, $vb->get($e), $vc->get($e));
+            }
+        } else if ($nb <= $na && $nb <= $nc) {
+            foreach ($vb as $e => &$b) {
+                if (!$va->contains($e) || !$vc->contains($e)) {
+                    continue;
+                }
+                $fn($e, $va->get($e), $b, $vc->get($e));
+            }
+        } else {
+            foreach ($vc as $e => &$c) {
+                if (!$va->contains($e) || !$vb->contains($e)) {
+                    continue;
+                }
+                $fn($e, $va->get($e), $vb->get($e), $c);
+            }
+        }
+    }
+
+    public function first<T>() : ptr<T>
+    {
+        View<T> $view = guard $this->findView<T>() else {
+            return null;
+        }
+        if ($view->empty()) {
+            return null;
+        }
+
+        return $view->ptrAt(0);
+    }
+
+    public function firstWith<T>() : Entity?
+    {
+        View<T> $view = guard $this->findView<T>() else {
+            return null;
+        }
+        if ($view->empty()) {
+            return null;
+        }
+
+        return $view->entity(0);
+    }
+
+    public function setSingleton<T>(T $value) : void
+    {
+        Slot<T> $slot = Slot<T>($value);
+        $this->singletons[type_id<T>()] = erased::from($slot);
+    }
+
+    public function getSingleton<T>() : T&
+    {
+        type_id $id = type_id<T>();
+        assert($this->singletons->has($id), 'entities: singleton was never set');
+        erased $held = $this->singletons->get($id);
+        unsafe {
+            Slot<T> $slot = assume<Slot<T>>($held);
+            return $slot->get();
+        }
+    }
+
+    public function findSingleton<T>() : ptr<T>
+    {
+        type_id $id = type_id<T>();
+        if (!$this->singletons->has($id)) {
+            return null;
+        }
+
+        erased $held = $this->singletons->get($id);
+        unsafe {
+            Slot<T> $slot = assume<Slot<T>>($held);
+            return $slot->asPtr();
+        }
+    }
+
+    public function hasSingleton<T>() : bool
+    {
+        return $this->singletons->has(type_id<T>());
+    }
+
+    public function removeSingleton<T>() : void
+    {
+        type_id $id = type_id<T>();
+        if ($this->singletons->has($id)) {
+            $this->singletons->remove($id);
+        }
+    }
+
+    public function onAttach<T>(function<void(Entities, Entity, const T&)> $fn) : int32
+    {
+        int32 $handle = $this->hookIndex;
+        $this->hookIndex = $this->hookIndex + 1;
+        $this->view<T>()->listenAttach($handle, $fn);
+        return $handle;
+    }
+
+    public function onDetach<T>(function<void(Entities, Entity, const T&)> $fn) : int32
+    {
+        int32 $handle = $this->hookIndex;
+        $this->hookIndex = $this->hookIndex + 1;
+        $this->view<T>()->listenDetach($handle, $fn);
+        return $handle;
+    }
+
+    public function releaseOnAttach(int32 $handle) : void
+    {
+        foreach ($this->stores as $store) {
+            function<void(int32)> $release = $store->releaseAttach;
+            $release($handle);
+        }
+    }
+
+    public function releaseOnDetach(int32 $handle) : void
+    {
+        foreach ($this->stores as $store) {
+            function<void(int32)> $release = $store->releaseDetach;
+            $release($handle);
+        }
+    }
+
+    private function findView<T>() : View<T>?
+    {
+        type_id $id = type_id<T>();
+        if (!$this->views->has($id)) {
+            return null;
+        }
+
+        erased $held = $this->views->get($id);
+        unsafe {
+            return assume<View<T>>($held);
+        }
+    }
+}

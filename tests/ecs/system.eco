@@ -1,0 +1,82 @@
+/**
+ * System binder: register/update/render, bind-once.
+ */
+
+use visu::ecs::{Entities, Entity, System, Systems};
+use visu::graphics::{Pool, Frame, Pipeline, Context, Framebuffer, RenderTarget};
+
+class CountingSystem : System
+{
+    public int32 $registers;
+    public int32 $unregisters;
+    public int32 $updates;
+    public int32 $renders;
+
+    public constructor()
+    {
+        $this->registers = 0;
+        $this->unregisters = 0;
+        $this->updates = 0;
+        $this->renders = 0;
+    }
+
+    public function register(Entities $entities) : void
+    {
+        $this->registers = $this->registers + 1;
+        $entities->register<Position>();
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+        $this->unregisters = $this->unregisters + 1;
+    }
+
+    public function update(Entities $entities) : void
+    {
+        $this->updates = $this->updates + 1;
+        foreach ($entities->view<Position>() as $e => &$p) {
+            $p->x = $p->x + 1.0f;
+        }
+    }
+
+    public function render(Entities $entities, const Context& $ctx) : void
+    {
+        $this->renders = $this->renders + 1;
+    }
+}
+
+test systems_bind_and_update
+{
+    Systems $systems = Systems();
+    CountingSystem $sys = CountingSystem();
+    $systems->bind($sys);
+
+    Entities $world = Entities();
+    $systems->register($world);
+    Entity $e = $world->create();
+    $world->attach($e, Position(0.0f, 0.0f));
+    $systems->update($world);
+    $systems->unregister($world);
+
+    assert($sys->registers == 1, 'register');
+    assert($sys->updates == 1, 'update');
+    assert($sys->unregisters == 1, 'unregister');
+    assert($world->get<Position>($e)->x == 1.0f, 'moved');
+}
+
+test systems_render_reaches_bound
+{
+    Systems $systems = Systems();
+    CountingSystem $sys = CountingSystem();
+    $systems->bind($sys);
+
+    Entities $world = Entities();
+    Pool $pool = Pool();
+    Frame $frame = Frame();
+    Framebuffer $fb = Framebuffer();
+    RenderTarget $rt = RenderTarget(64, 64, $fb);
+    Pipeline $pipeline = Pipeline($pool, $frame, $rt);
+    Context $ctx = Context($pipeline, $frame, $pool);
+    $systems->render($world, $ctx);
+    assert($sys->renders == 1, 'render');
+}

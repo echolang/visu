@@ -4,9 +4,9 @@
 
 use visu::os::{Window, WindowHints, init, terminate};
 use visu::graphics::{
-    Gpu, Pipeline, Pool, Frame, CallbackPass, TargetRef, IoSink, Context,
+    Gpu, Pipeline, Pool, Frame, CallbackPass, TargetRef, TextureRef, IoSink, Context,
     TextureOptions, FramebufferStatus, RenderTarget, PipelineError,
-    QuadVertexArray
+    QuadVertexArray, Texture, PoolError
 };
 
 class Offscreen
@@ -44,7 +44,7 @@ test pool_creates_complete_offscreen_target
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             TargetRef $t = $pipe->createTarget('gbuffer', 32, 32);
             $t->rboDepthStencil = true;
-            $pipe->createColor($t, 'albedo', TextureOptions::color());
+            $pipe->createColor($t, 'albedo', TextureOptions());
             $io->writes($t);
             $f->set(Offscreen($t));
         },
@@ -53,7 +53,7 @@ test pool_creates_complete_offscreen_target
             RenderTarget $rt = guard $ctx->pool->getTarget($s, $off->target) else ($e) {
                 return .error(.pool($e));
             }
-            assert($rt->width() == 32, 'width');
+            assert($rt->width == 32, 'width');
             assert($rt->isOffscreen(), 'offscreen');
             FramebufferStatus $status = $rt->framebuffer->status($s);
             bool $complete = match ($status) {
@@ -124,13 +124,13 @@ test pool_resizes_when_desc_changes
             RenderTarget $rt = guard $ctx->pool->getTarget($s, $off->target) else ($e) {
                 return .error(.pool($e));
             }
-            assert($rt->width() == 16, 'first');
+            assert($rt->width == 16, 'first');
             $off->target->width = 48;
             $off->target->height = 24;
             RenderTarget $again = guard $ctx->pool->getTarget($s, $off->target) else ($e) {
                 return .error(.pool($e));
             }
-            assert($again->width() == 48, 'resized');
+            assert($again->width == 48, 'resized');
             return .ok(true);
         }
     ));
@@ -236,6 +236,214 @@ test pool_caches_quad_by_name
     });
     assert($a->vao != $c->vao, 'different name different vao');
     $a->bind($state);
+    $pool->destroy($state);
+    $window->destroy();
+    terminate();
+}
+
+class ColorTex
+{
+    public TextureRef $tex;
+    public TargetRef $target;
+
+    public constructor(TextureRef $tex, TargetRef $target)
+    {
+        $this->tex = $tex;
+        $this->target = $target;
+    }
+}
+
+#[group: "glfw"]
+test pool_get_texture_does_not_allocate
+{
+    bool $ok = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('pool-gettex', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    Pool $pool = Pool();
+    Frame $frame = Frame();
+    Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
+
+    $pipeline->add(CallbackPass(
+        'gbuffer',
+        setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
+            TargetRef $t = $pipe->createTarget('gbuffer', 16, 16);
+            TextureRef $c = $pipe->createColor($t, 'albedo', TextureOptions());
+            $io->writes($t);
+            $f->set(ColorTex($c, $t));
+        },
+        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+            ColorTex $held = $ctx->frame->get<ColorTex>();
+            result<Texture, PoolError> $before = $ctx->pool->getTexture($s, $held->tex);
+            assert($before->failed(), 'not allocated yet');
+            RenderTarget $rt = guard $ctx->pool->getTarget($s, $held->target) else ($e) {
+                return .error(.pool($e));
+            }
+            Texture $tex = guard $ctx->pool->getTexture($s, $held->tex) else ($e) {
+                return .error(.pool($e));
+            }
+            assert($tex->width == 16, 'color size');
+            return .ok(true);
+        }
+    ));
+
+    bool $ran = guard $pipeline->execute($state, 0) else ($e) {
+        $pool->destroy($state);
+        $window->destroy();
+        terminate();
+        die($e->message());
+    }
+    $pool->destroy($state);
+    $window->destroy();
+    terminate();
+}
+
+#[group: "glfw"]
+test pool_keeps_target_when_attachment_is_read
+{
+    bool $ok = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('pool-hist', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    Pool $pool = Pool();
+    Frame $frame = Frame();
+    Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
+
+    $pipeline->add(CallbackPass(
+        'write',
+        setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
+            TargetRef $t = $pipe->createTarget('gbuffer', 16, 16);
+            TextureRef $c = $pipe->createColor($t, 'albedo', TextureOptions());
+            $io->writes($t);
+            $f->set(ColorTex($c, $t));
+        },
+        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+            ColorTex $held = $ctx->frame->get<ColorTex>();
+            RenderTarget $rt = guard $ctx->pool->getTarget($s, $held->target) else ($e) {
+                return .error(.pool($e));
+            }
+            return .ok(true);
+        }
+    ));
+
+    bool $ran = guard $pipeline->execute($state, 0) else ($e) {
+        $pool->destroy($state);
+        $window->destroy();
+        terminate();
+        die($e->message());
+    }
+
+    $pool->setCurrentTick(1);
+    TextureRef $albedo = TextureRef('gbuffer.attachment.color_albedo', 16, 16, TextureOptions());
+    Texture $tex = guard $pool->getTexture($state, $albedo) else ($e) {
+        $pool->destroy($state);
+        $window->destroy();
+        terminate();
+        die($e->message());
+    }
+    $pool->collect($state);
+    assert($tex->width == 16, 'history');
+    assert($pool->hasTarget('gbuffer'), 'parent lived');
+    assert($pool->hasTexture('gbuffer.attachment.color_albedo'), 'color lived');
+
+    $pool->destroy($state);
+    $window->destroy();
+    terminate();
+}
+
+class TwoTargets
+{
+    public TargetRef $a;
+    public TargetRef $b;
+
+    public constructor(TargetRef $a, TargetRef $b)
+    {
+        $this->a = $a;
+        $this->b = $b;
+    }
+}
+
+#[group: "glfw"]
+test pool_two_mrts_both_complete
+{
+    bool $ok = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('pool-mrt', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    Pool $pool = Pool();
+    Frame $frame = Frame();
+    Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
+
+    $pipeline->add(CallbackPass(
+        'mrts',
+        setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
+            TargetRef $a = $pipe->createTarget('a', 16, 16);
+            $pipe->createColor($a, 'c0', TextureOptions());
+            $pipe->createColor($a, 'c1', TextureOptions());
+            TargetRef $b = $pipe->createTarget('b', 16, 16);
+            $pipe->createColor($b, 'c0', TextureOptions());
+            $pipe->createColor($b, 'c1', TextureOptions());
+            $io->writes($a);
+            $io->writes($b);
+            $f->set(TwoTargets($a, $b));
+        },
+        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+            TwoTargets $held = $ctx->frame->get<TwoTargets>();
+            RenderTarget $ra = guard $ctx->pool->getTarget($s, $held->a) else ($e) {
+                return .error(.pool($e));
+            }
+            RenderTarget $rb = guard $ctx->pool->getTarget($s, $held->b) else ($e) {
+                return .error(.pool($e));
+            }
+            FramebufferStatus $sa = $ra->framebuffer->status($s);
+            FramebufferStatus $sb = $rb->framebuffer->status($s);
+            bool $okA = match ($sa) {
+                FramebufferStatus::complete => true,
+                else => false,
+            };
+            bool $okB = match ($sb) {
+                FramebufferStatus::complete => true,
+                else => false,
+            };
+            assert($okA, 'a complete');
+            assert($okB, 'b complete');
+            return .ok(true);
+        }
+    ));
+
+    bool $ran = guard $pipeline->execute($state, 0) else ($e) {
+        $pool->destroy($state);
+        $window->destroy();
+        terminate();
+        die($e->message());
+    }
     $pool->destroy($state);
     $window->destroy();
     terminate();

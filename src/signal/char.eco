@@ -1,0 +1,52 @@
+/**
+ * Unicode character input (GLFW char callback).
+ */
+
+namespace visu::signal;
+
+internal function utf8(int32 $codepoint) : string?
+{
+    if ($codepoint < 0 || $codepoint > 0x10FFFF) {
+        return null;
+    }
+
+    if ($codepoint >= 0xD800 && $codepoint <= 0xDFFF) {
+        return null;
+    }
+
+    string $out = '';
+
+    if ($codepoint <= 0x7F) {
+        $out->push($codepoint as uint8);
+        return $out;
+    }
+
+    if ($codepoint <= 0x7FF) {
+        $out->push((0xC0 | ($codepoint >> 6)) as uint8);
+        $out->push((0x80 | ($codepoint & 0x3F)) as uint8);
+        return $out;
+    }
+
+    if ($codepoint <= 0xFFFF) {
+        $out->push((0xE0 | ($codepoint >> 12)) as uint8);
+        $out->push((0x80 | (($codepoint >> 6) & 0x3F)) as uint8);
+        $out->push((0x80 | ($codepoint & 0x3F)) as uint8);
+        return $out;
+    }
+
+    $out->push((0xF0 | ($codepoint >> 18)) as uint8);
+    $out->push((0x80 | (($codepoint >> 12) & 0x3F)) as uint8);
+    $out->push((0x80 | (($codepoint >> 6) & 0x3F)) as uint8);
+    $out->push((0x80 | ($codepoint & 0x3F)) as uint8);
+    return $out;
+}
+
+public struct Char
+{
+    public const int32 $codepoint;
+
+    public const function text() : string?
+    {
+        return utf8($this->codepoint);
+    }
+}

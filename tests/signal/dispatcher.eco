@@ -1,0 +1,199 @@
+/**
+ * Type-keyed dispatcher: priority, stop, snapshot, clear.
+ */
+
+use visu::signal::{Dispatcher, Flow};
+
+class Hits
+{
+    public int32 $n;
+
+    public constructor()
+    {
+        $this->n = 0;
+    }
+}
+
+class Order
+{
+    public array<string> $names;
+
+    public constructor()
+    {
+        $this->names = array<string>();
+    }
+}
+
+class Id
+{
+    public int32 $v;
+
+    public constructor()
+    {
+        $this->v = 0;
+    }
+}
+
+struct Ping
+{
+    public const int32 $n;
+}
+
+struct Pong
+{
+    public const int32 $n;
+}
+
+test dispatcher_register_and_dispatch
+{
+    Dispatcher $d = Dispatcher();
+    Hits $hits = Hits();
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $hits->n = $hits->n + $p->n;
+        return .proceed;
+    });
+    $d->dispatch(Ping(3));
+    $d->dispatch(Ping(4));
+    assert($hits->n == 7, 'sum');
+}
+
+test dispatcher_no_handlers_is_noop
+{
+    Dispatcher $d = Dispatcher();
+    $d->dispatch(Ping(1));
+}
+
+test dispatcher_priority_lower_runs_first
+{
+    Dispatcher $d = Dispatcher();
+    Order $order = Order();
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $order->names->push('last');
+        return .proceed;
+    }, 10);
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $order->names->push('first');
+        return .proceed;
+    }, -10);
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $order->names->push('mid');
+        return .proceed;
+    });
+    $d->dispatch(Ping(0));
+    assert($order->names->count() == 3, 'count');
+    assert($order->names[0] == 'first', 'first');
+    assert($order->names[1] == 'mid', 'mid');
+    assert($order->names[2] == 'last', 'last');
+}
+
+test dispatcher_equal_priority_keeps_registration_order
+{
+    Dispatcher $d = Dispatcher();
+    Order $order = Order();
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $order->names->push('a');
+        return .proceed;
+    });
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $order->names->push('b');
+        return .proceed;
+    });
+    $d->dispatch(Ping(0));
+    assert($order->names[0] == 'a', 'a');
+    assert($order->names[1] == 'b', 'b');
+}
+
+test dispatcher_stop_skips_later_handlers
+{
+    Dispatcher $d = Dispatcher();
+    Hits $hits = Hits();
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $hits->n = $hits->n + 1;
+        return .proceed;
+    });
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $hits->n = $hits->n + 1;
+        return .stop;
+    });
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $hits->n = $hits->n + 1;
+        return .proceed;
+    });
+    $d->dispatch(Ping(0));
+    assert($hits->n == 2, 'stopped');
+}
+
+test dispatcher_unregister
+{
+    Dispatcher $d = Dispatcher();
+    Hits $hits = Hits();
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $hits->n = $hits->n + 1;
+        return .proceed;
+    });
+    int32 $gone = $d->register<Ping>(function(const Ping& $p) : Flow {
+        $hits->n = $hits->n + 10;
+        return .proceed;
+    });
+    $d->unregister<Ping>($gone);
+    $d->dispatch(Ping(0));
+    assert($hits->n == 1, 'removed');
+}
+
+test dispatcher_clear_one_type
+{
+    Dispatcher $d = Dispatcher();
+    Hits $pingHits = Hits();
+    Hits $pongHits = Hits();
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $pingHits->n = $pingHits->n + 1;
+        return .proceed;
+    });
+    $d->register<Pong>(function(const Pong& $p) : Flow {
+        $pongHits->n = $pongHits->n + 1;
+        return .proceed;
+    });
+    $d->clear<Ping>();
+    $d->dispatch(Ping(0));
+    $d->dispatch(Pong(0));
+    assert($pingHits->n == 0, 'ping gone');
+    assert($pongHits->n == 1, 'pong kept');
+}
+
+test dispatcher_clear_all
+{
+    Dispatcher $d = Dispatcher();
+    Hits $hits = Hits();
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $hits->n = $hits->n + 1;
+        return .proceed;
+    });
+    $d->register<Pong>(function(const Pong& $p) : Flow {
+        $hits->n = $hits->n + 1;
+        return .proceed;
+    });
+    $d->clearAll();
+    $d->dispatch(Ping(0));
+    $d->dispatch(Pong(0));
+    assert($hits->n == 0, 'empty');
+}
+
+test dispatcher_snapshot_keeps_unregistered_handler
+{
+    Dispatcher $d = Dispatcher();
+    Hits $hits = Hits();
+    Id $second = Id();
+    $d->register<Ping>(function(const Ping& $p) : Flow {
+        $hits->n = $hits->n + 1;
+        $d->unregister<Ping>($second->v);
+        return .proceed;
+    });
+    $second->v = $d->register<Ping>(function(const Ping& $p) : Flow {
+        $hits->n = $hits->n + 1;
+        return .proceed;
+    });
+    $d->dispatch(Ping(0));
+    assert($hits->n == 2, 'snapshot');
+    $d->dispatch(Ping(0));
+    assert($hits->n == 3, 'gone next tick');
+}

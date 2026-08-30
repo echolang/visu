@@ -5,6 +5,8 @@
 
 namespace visu::graphics;
 
+use visu::math::Mat4;
+
 #[unique]
 public struct Gpu
 {
@@ -66,22 +68,26 @@ public struct Gpu
     private float32 $clearB;
     private float32 $clearA;
     private uint32 $renderbuffer;
-    private array<uint32> $drawBufferList;
-    private bool $drawBuffersSet;
 
     public constructor()
     {
         $this->clearCache();
     }
 
-    public function load() : bool
+    /**
+     * Load the GL table. `$getProc` is os's address lookup (GLFW
+     * `getProcAddress` in the default backend). Call after the
+     * context is current.
+     */
+    public function load(extern function<ptr<uint8>(ptr<const uint8>)> $getProc) : bool
     {
-        usize $n = gl::load(&glfw::getProcAddress);
+        usize $n = gl::load($getProc);
         return $n != 0;
     }
 
     public function reset() : void
     {
+        $this->unbindAllTextures();
         $this->clearCache();
 
         gl::UseProgram(0);
@@ -90,10 +96,27 @@ public struct Gpu
         gl::BindVertexArray(0);
         gl::BindBuffer(gl::ARRAY_BUFFER, 0);
         gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
-        gl::BindTexture(gl::TEXTURE_2D, 0);
-        gl::BindTexture(gl::TEXTURE_CUBE_MAP, 0);
         gl::ActiveTexture(gl::TEXTURE0);
         gl::BindRenderbuffer(gl::RENDERBUFFER, 0);
+    }
+
+    private function unbindAllTextures() : void
+    {
+        array<uint32> $units = $this->textures->keys();
+
+        foreach ($units as $unit) {
+            gl::ActiveTexture($unit);
+            map<uint32, uint32> $bound = $this->textures[$unit];
+            array<uint32> $targets = $bound->keys();
+
+            foreach ($targets as $target) {
+                gl::BindTexture($target, 0);
+            }
+        }
+
+        gl::ActiveTexture(gl::TEXTURE0);
+        gl::BindTexture(gl::TEXTURE_2D, 0);
+        gl::BindTexture(gl::TEXTURE_CUBE_MAP, 0);
     }
 
     private function clearCache() : void
@@ -117,8 +140,6 @@ public struct Gpu
         $this->clearB = 0.0f;
         $this->clearA = 0.0f;
         $this->renderbuffer = 0;
-        $this->drawBufferList = array<uint32>();
-        $this->drawBuffersSet = false;
     }
 
     public function useProgram(uint32 $program) : void
@@ -538,149 +559,161 @@ public struct Gpu
 
     private function applyDrawBuffers(array<uint32> $bufs) : void
     {
-        if ($this->drawBuffersSet && drawBufferListsEqual($this->drawBufferList, $bufs)) {
-            return;
-        }
-
-        $this->drawBuffersSet = true;
-        $this->drawBufferList = $bufs;
         int32 $n = $bufs->count() as int32;
 
         if ($n == 0) {
+            gl::DrawBuffer(gl::NONE);
             return;
         }
 
         gl::DrawBuffers($n, &$bufs[0]);
     }
-}
 
-internal function glAttachment(Attachment $a) : uint32
-{
-    return match ($a) {
-        Attachment::color($slot) => gl::COLOR_ATTACHMENT0 + $slot->index,
-        Attachment::depth => gl::DEPTH_ATTACHMENT,
-        Attachment::stencil => gl::STENCIL_ATTACHMENT,
-        Attachment::depthStencil => gl::DEPTH_STENCIL_ATTACHMENT,
-    };
-}
-
-internal function glPixelFormat(PixelFormat $format) : uint32
-{
-    return match ($format) {
-        PixelFormat::rgba => gl::RGBA,
-        PixelFormat::r32f => gl::R32F,
-        PixelFormat::depthComponent => gl::DEPTH_COMPONENT,
-        PixelFormat::depthStencil => gl::DEPTH24_STENCIL8,
-    };
-}
-
-internal function glTextureTarget(TextureTarget $target) : uint32
-{
-    return match ($target) {
-        TextureTarget::texture2D => gl::TEXTURE_2D,
-        TextureTarget::cubeMap => gl::TEXTURE_CUBE_MAP,
-    };
-}
-
-internal function glPixelDataFormat(PixelFormat $format) : uint32
-{
-    return match ($format) {
-        PixelFormat::rgba => gl::RGBA,
-        PixelFormat::r32f => gl::RED,
-        PixelFormat::depthComponent => gl::DEPTH_COMPONENT,
-        PixelFormat::depthStencil => gl::DEPTH_STENCIL,
-    };
-}
-
-internal function glPixelDataType(PixelFormat $format) : uint32
-{
-    return match ($format) {
-        PixelFormat::rgba => gl::UNSIGNED_BYTE,
-        PixelFormat::r32f => gl::FLOAT,
-        PixelFormat::depthComponent => gl::FLOAT,
-        PixelFormat::depthStencil => gl::UNSIGNED_INT_24_8,
-    };
-}
-
-internal function glFilter(Filter $filter) : uint32
-{
-    return match ($filter) {
-        Filter::nearest => gl::NEAREST,
-        Filter::linear => gl::LINEAR,
-        Filter::nearestMipmapNearest => gl::NEAREST_MIPMAP_NEAREST,
-        Filter::nearestMipmapLinear => gl::NEAREST_MIPMAP_LINEAR,
-        Filter::linearMipmapNearest => gl::LINEAR_MIPMAP_NEAREST,
-        Filter::linearMipmapLinear => gl::LINEAR_MIPMAP_LINEAR,
-    };
-}
-
-internal function glWrap(Wrap $wrap) : uint32
-{
-    return match ($wrap) {
-        Wrap::repeat => gl::REPEAT,
-        Wrap::mirroredRepeat => gl::MIRRORED_REPEAT,
-        Wrap::clampToEdge => gl::CLAMP_TO_EDGE,
-        Wrap::clampToBorder => gl::CLAMP_TO_BORDER,
-    };
-}
-
-internal function framebufferStatusFrom(uint32 $code) : FramebufferStatus
-{
-    if ($code == gl::FRAMEBUFFER_COMPLETE) {
-        return .complete;
+    public function createShader(ShaderKind $kind) : uint32
+    {
+        return gl::CreateShader(glShaderKind($kind));
     }
 
-    if ($code == gl::FRAMEBUFFER_UNDEFINED) {
-        return .undefined;
+    public function deleteShader(uint32 $id) : void
+    {
+        gl::DeleteShader($id);
     }
 
-    if ($code == gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT) {
-        return .incompleteAttachment;
-    }
+    public function shaderSource(uint32 $id, string $source) : void
+    {
+        string $term = $source;
 
-    if ($code == gl::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT) {
-        return .incompleteMissingAttachment;
-    }
-
-    if ($code == gl::FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER) {
-        return .incompleteDrawBuffer;
-    }
-
-    if ($code == gl::FRAMEBUFFER_INCOMPLETE_READ_BUFFER) {
-        return .incompleteReadBuffer;
-    }
-
-    if ($code == gl::FRAMEBUFFER_UNSUPPORTED) {
-        return .unsupported;
-    }
-
-    if ($code == gl::FRAMEBUFFER_INCOMPLETE_MULTISAMPLE) {
-        return .incompleteMultisample;
-    }
-
-    if ($code == gl::FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS) {
-        return .incompleteLayerTargets;
-    }
-
-    return .unknown($code);
-}
-
-internal function drawBufferListsEqual(const array<uint32>& $a, const array<uint32>& $b) : bool
-{
-    if ($a->count() != $b->count()) {
-        return false;
-    }
-
-    usize $i = 0;
-    usize $n = $a->count();
-
-    while ($i < $n) {
-        if ($a[$i] != $b[$i]) {
-            return false;
+        if (!$term->terminated()) {
+            $term = $source->clone();
         }
 
-        $i = $i + 1;
+        ptr<const uint8> $cstr = $term->cstr();
+        int32 $len = $term->size() as int32;
+        gl::ShaderSource($id, 1, &$cstr, &$len);
     }
 
-    return true;
+    public function compileShader(uint32 $id) : void
+    {
+        gl::CompileShader($id);
+    }
+
+    internal function shaderIv(uint32 $id, uint32 $pname) : int32
+    {
+        int32 $value = 0;
+        gl::GetShaderiv($id, $pname, &$value);
+        return $value;
+    }
+
+    public function shaderCompiled(uint32 $id) : bool
+    {
+        return $this->shaderIv($id, gl::COMPILE_STATUS) == (gl::TRUE as int32);
+    }
+
+    public function shaderInfoLog(uint32 $id) : string
+    {
+        return glShaderInfoLog($id);
+    }
+
+    public function createProgram() : uint32
+    {
+        return gl::CreateProgram();
+    }
+
+    public function deleteProgram(uint32 $id) : void
+    {
+        gl::DeleteProgram($id);
+
+        if ($this->program == $id) {
+            $this->program = 0;
+        }
+    }
+
+    public function attachShader(uint32 $program, uint32 $shader) : void
+    {
+        gl::AttachShader($program, $shader);
+    }
+
+    public function linkProgram(uint32 $id) : void
+    {
+        gl::LinkProgram($id);
+    }
+
+    internal function programIv(uint32 $id, uint32 $pname) : int32
+    {
+        int32 $value = 0;
+        gl::GetProgramiv($id, $pname, &$value);
+        return $value;
+    }
+
+    public function programLinked(uint32 $id) : bool
+    {
+        return $this->programIv($id, gl::LINK_STATUS) == (gl::TRUE as int32);
+    }
+
+    public function programInfoLog(uint32 $id) : string
+    {
+        return glProgramInfoLog($id);
+    }
+
+    public function uniformLocation(uint32 $program, string $name) : int32
+    {
+        string $term = $name;
+
+        if (!$term->terminated()) {
+            $term = $name->clone();
+        }
+
+        return gl::GetUniformLocation($program, $term->cstr());
+    }
+
+    public function uniform1f(int32 $location, float32 $v) : void
+    {
+        gl::Uniform1f($location, $v);
+    }
+
+    public function uniform1i(int32 $location, int32 $v) : void
+    {
+        gl::Uniform1i($location, $v);
+    }
+
+    public function uniform2f(int32 $location, float32 $a, float32 $b) : void
+    {
+        gl::Uniform2f($location, $a, $b);
+    }
+
+    public function uniform3f(int32 $location, float32 $a, float32 $b, float32 $c) : void
+    {
+        gl::Uniform3f($location, $a, $b, $c);
+    }
+
+    public function uniform4f(int32 $location, float32 $a, float32 $b, float32 $c, float32 $d) : void
+    {
+        gl::Uniform4f($location, $a, $b, $c, $d);
+    }
+
+    public function uniform2i(int32 $location, int32 $a, int32 $b) : void
+    {
+        gl::Uniform2i($location, $a, $b);
+    }
+
+    public function uniform3i(int32 $location, int32 $a, int32 $b, int32 $c) : void
+    {
+        gl::Uniform3i($location, $a, $b, $c);
+    }
+
+    public function uniform4i(int32 $location, int32 $a, int32 $b, int32 $c, int32 $d) : void
+    {
+        gl::Uniform4i($location, $a, $b, $c, $d);
+    }
+
+    public function uniformMat4(int32 $location, bool $transpose, const Mat4& $m) : void
+    {
+        uint8 $t = 0;
+
+        if ($transpose) {
+            $t = 1;
+        }
+
+        gl::UniformMatrix4fv($location, 1, $t, &$m->c0->x);
+    }
 }

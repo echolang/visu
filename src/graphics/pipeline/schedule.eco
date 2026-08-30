@@ -1,6 +1,6 @@
 /**
  * Stable topological sort of pass I/O. Setup still runs at add();
- * this only orders execute.
+ * this only orders execute. Resources are keyed by name.
  */
 
 namespace visu::graphics;
@@ -23,7 +23,6 @@ public enum PipelineError
 
 internal struct GraphRes
 {
-    public int32 $id;
     public string $name;
     public bool $imported;
 }
@@ -36,25 +35,25 @@ internal function schedule(int32 $passCount, const array<Io>& $io) : result<arra
         return .ok($empty);
     }
 
-    map<int32, array<int32>> $writers = map<int32, array<int32>>();
-    map<int32, array<int32>> $readers = map<int32, array<int32>>();
-    map<int32, GraphRes> $info = map<int32, GraphRes>();
+    map<string, array<int32>> $writers = map<string, array<int32>>();
+    map<string, array<int32>> $readers = map<string, array<int32>>();
+    map<string, GraphRes> $info = map<string, GraphRes>();
     array<Io> $edges = $io;
 
     foreach ($edges as $edge) {
         array<GraphRes> $res = expandIo($edge->resource);
 
         foreach ($res as $r) {
-            $info[$r->id] = $r;
+            $info[$r->name] = $r;
             bool $isWrite = match ($edge->access) {
                 Access::write => true,
                 Access::read => false,
             };
 
             if ($isWrite) {
-                appendUnique($writers, $r->id, $edge->passIndex);
+                appendUnique($writers, $r->name, $edge->passIndex);
             } else {
-                appendUnique($readers, $r->id, $edge->passIndex);
+                appendUnique($readers, $r->name, $edge->passIndex);
             }
         }
     }
@@ -69,7 +68,7 @@ internal function schedule(int32 $passCount, const array<Io>& $io) : result<arra
         $n = $n + 1;
     }
 
-    array<int32> $ids = $info->keys();
+    array<string> $ids = $info->keys();
 
     foreach ($ids as $id) {
         GraphRes $meta = $info[$id];
@@ -104,21 +103,21 @@ internal function expandIo(ResourceIo $resource) : array<GraphRes>
 
     match ($resource) {
         ResourceIo::target($ref) => {
-            $out->push(GraphRes($ref->id, $ref->name, $ref->imported));
+            $out->push(GraphRes($ref->name, $ref->imported));
             array<TextureRef> $texes = $ref->textures();
             foreach ($texes as $tex) {
-                $out->push(GraphRes($tex->id, $tex->name, $tex->imported));
+                $out->push(GraphRes($tex->name, $tex->imported));
             }
         },
         ResourceIo::texture($ref) => {
-            $out->push(GraphRes($ref->id, $ref->name, $ref->imported));
+            $out->push(GraphRes($ref->name, $ref->imported));
         },
     };
 
     return $out;
 }
 
-internal function appendUnique(map<int32, array<int32>>& $into, int32 $id, int32 $pass) : void
+internal function appendUnique(map<string, array<int32>>& $into, string $id, int32 $pass) : void
 {
     if (!$into->has($id)) {
         array<int32> $first = array<int32>();
@@ -137,7 +136,7 @@ internal function appendUnique(map<int32, array<int32>>& $into, int32 $id, int32
     $list->push($pass);
 }
 
-internal function passList(const map<int32, array<int32>>& $m, int32 $id) : array<int32>
+internal function passList(const map<string, array<int32>>& $m, string $id) : array<int32>
 {
     if (!$m->has($id)) {
         return array<int32>();

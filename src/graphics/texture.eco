@@ -43,19 +43,27 @@ public struct TextureOptions
     public bool $mipmaps = false;
 
     /**
-     * Color attachment defaults: rgba, linear, clamp, no mipmaps.
-     */
-    public static function color() : TextureOptions
-    {
-        return TextureOptions();
-    }
-
-    /**
      * Depth attachment defaults: depthComponent, nearest, clamp, no mipmaps.
      */
     public static function depth() : TextureOptions
     {
         return TextureOptions($format: .depthComponent, $min: .nearest, $mag: .nearest);
+    }
+
+    public const function key() : string
+    {
+        int32 $mip = 0;
+
+        if ($this->mipmaps) {
+            $mip = 1;
+        }
+
+        int32 $fmt = pixelCode($this->format);
+        int32 $min = filterCode($this->min);
+        int32 $mag = filterCode($this->mag);
+        int32 $ws = wrapCode($this->wrapS);
+        int32 $wt = wrapCode($this->wrapT);
+        return "{$fmt}|{$min}|{$mag}|{$ws}|{$wt}|{$mip}";
     }
 }
 
@@ -82,8 +90,8 @@ public class Texture : GpuObject
     public const bool $owned;
 
     private bool $dead;
-    private int32 $width;
-    private int32 $height;
+    public int32 $width;
+    public int32 $height;
 
     /**
      * Allocates a 2D texture name.
@@ -117,22 +125,13 @@ public class Texture : GpuObject
         $this->dead = true;
     }
 
-    public const function width() : int32
-    {
-        return $this->width;
-    }
-
-    public const function height() : int32
-    {
-        return $this->height;
-    }
-
     /**
-     * Binds this texture to `$unit` (TEXTURE0, TEXTURE1, …).
+     * Bind to texture unit `$index` (0 is TEXTURE0).
      */
-    public function bind(Gpu& $state, uint32 $unit = TEXTURE0) : void
+    public function bind(Gpu& $state, int32 $index = 0) : void
     {
-        $state->bindTexture($unit, $this->target, $this->id);
+        assert($index >= 0, 'texture unit index must be >= 0');
+        $state->bindTexture(TEXTURE0 + ($index as uint32), $this->target, $this->id);
     }
 
     /**
@@ -155,4 +154,36 @@ public class Texture : GpuObject
         $this->width = $width;
         $this->height = $height;
     }
+}
+
+internal function pixelCode(PixelFormat $format) : int32
+{
+    return match ($format) {
+        PixelFormat::rgba => 0,
+        PixelFormat::r32f => 1,
+        PixelFormat::depthComponent => 2,
+        PixelFormat::depthStencil => 3,
+    };
+}
+
+internal function filterCode(Filter $filter) : int32
+{
+    return match ($filter) {
+        Filter::nearest => 0,
+        Filter::linear => 1,
+        Filter::nearestMipmapNearest => 2,
+        Filter::nearestMipmapLinear => 3,
+        Filter::linearMipmapNearest => 4,
+        Filter::linearMipmapLinear => 5,
+    };
+}
+
+internal function wrapCode(Wrap $wrap) : int32
+{
+    return match ($wrap) {
+        Wrap::repeat => 0,
+        Wrap::mirroredRepeat => 1,
+        Wrap::clampToEdge => 2,
+        Wrap::clampToBorder => 3,
+    };
 }

@@ -1,0 +1,174 @@
+/**
+ * A linked GL program. Never stores Gpu; bind / set / destroy borrow
+ * it. Uniform locations are cached after the first lookup. Stages are
+ * an array: one of each kind, attach does not replace.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Vec2, Vec3, Vec4, Mat4};
+
+public class ShaderProgram : GpuObject
+{
+    public const uint32 $id;
+    private bool $linked;
+    private bool $dead;
+    private array<ShaderStage> $stages;
+    private map<string, int32> $locations;
+
+    public constructor(Gpu& $state)
+    {
+        $this->id = $state->createProgram();
+        $this->linked = false;
+        $this->dead = false;
+        $this->stages = array<ShaderStage>();
+        $this->locations = map<string, int32>();
+    }
+
+    destructor()
+    {
+        assert($this->dead, 'ShaderProgram dropped without destroy');
+    }
+
+    public const function linked() : bool
+    {
+        return $this->linked;
+    }
+
+    public const function destroyed() : bool
+    {
+        return $this->dead;
+    }
+
+    public function attach(Gpu& $state, ShaderStage $stage) : void
+    {
+        foreach ($this->stages as $held) {
+            assert($held->kind != $stage->kind, 'shader: kind already attached');
+        }
+
+        $this->stages[] = $stage;
+        $state->attachShader($this->id, $stage->id);
+    }
+
+    public function link(Gpu& $state, string $name = '') : result<bool, ShaderError>
+    {
+        foreach ($this->stages as $stage) {
+            if ($stage->compiled($state)) {
+                continue;
+            }
+
+            bool $ok = guard $stage->compile($state) else ($e) {
+                return .error($e);
+            }
+        }
+
+        $state->linkProgram($this->id);
+
+        if (!$state->programLinked($this->id)) {
+            string $label = $name;
+
+            if ($label->empty()) {
+                $label = 'program';
+            }
+
+            return .error(.link($label, $state->programInfoLog($this->id)));
+        }
+
+        $this->linked = true;
+        $this->locations->clear();
+        return .ok(true);
+    }
+
+    public function bind(Gpu& $state) : void
+    {
+        assert($this->linked, 'shader: program is not linked');
+        $state->useProgram($this->id);
+    }
+
+    public function location(Gpu& $state, string $name) : int32
+    {
+        if ($this->locations->has($name)) {
+            return $this->locations[$name];
+        }
+
+        int32 $loc = $state->uniformLocation($this->id, $name);
+        $this->locations[$name] = $loc;
+        return $loc;
+    }
+
+    public function set(Gpu& $state, string $name, float32 $value) : void
+    {
+        $this->bind($state);
+        $state->uniform1f($this->location($state, $name), $value);
+    }
+
+    public function set(Gpu& $state, string $name, int32 $value) : void
+    {
+        $this->bind($state);
+        $state->uniform1i($this->location($state, $name), $value);
+    }
+
+    public function set(Gpu& $state, string $name, Vec2 $value) : void
+    {
+        $this->bind($state);
+        $state->uniform2f($this->location($state, $name), $value->x, $value->y);
+    }
+
+    public function set(Gpu& $state, string $name, Vec3 $value) : void
+    {
+        $this->bind($state);
+        $state->uniform3f($this->location($state, $name), $value->x, $value->y, $value->z);
+    }
+
+    public function set(Gpu& $state, string $name, Vec4 $value) : void
+    {
+        $this->bind($state);
+        $state->uniform4f($this->location($state, $name), $value->x, $value->y, $value->z, $value->w);
+    }
+
+    public function set(Gpu& $state, string $name, const Mat4& $value, bool $transpose = false) : void
+    {
+        $this->bind($state);
+        $state->uniformMat4($this->location($state, $name), $transpose, $value);
+    }
+
+    public function set2i(Gpu& $state, string $name, int32 $a, int32 $b) : void
+    {
+        $this->bind($state);
+        $state->uniform2i($this->location($state, $name), $a, $b);
+    }
+
+    public function set3i(Gpu& $state, string $name, int32 $a, int32 $b, int32 $c) : void
+    {
+        $this->bind($state);
+        $state->uniform3i($this->location($state, $name), $a, $b, $c);
+    }
+
+    public function set4i(Gpu& $state, string $name, int32 $a, int32 $b, int32 $c, int32 $d) : void
+    {
+        $this->bind($state);
+        $state->uniform4i($this->location($state, $name), $a, $b, $c, $d);
+    }
+
+    public function sampler(Gpu& $state, string $name, Texture $texture, int32 $unit) : void
+    {
+        $texture->bind($state, $unit);
+        $this->set($state, $name, $unit);
+    }
+
+    public function destroy(Gpu& $state) : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        foreach ($this->stages as $stage) {
+            $stage->destroy($state);
+        }
+
+        $this->stages->clear();
+        $state->deleteProgram($this->id);
+        $this->dead = true;
+        $this->linked = false;
+    }
+}

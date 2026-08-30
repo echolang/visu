@@ -1,0 +1,74 @@
+/**
+ * Typed drain for one payload type. The dispatcher registers the
+ * push handler; shift() is the camera/gizmo FIFO.
+ */
+
+namespace visu::signal;
+
+public class Queue<T>
+{
+    internal const int32 $id;
+    private array<T> $items;
+    private usize? $cap;
+
+    internal constructor(int32 $id, usize? $cap)
+    {
+        $this->id = $id;
+        $this->items = array<T>();
+        $this->cap = $cap;
+    }
+
+    internal function push(const T& $signal) : void
+    {
+        usize $max = guard $this->cap else {
+            $this->items->push($signal);
+            return;
+        }
+
+        if ($this->items->count() >= $max) {
+            return;
+        }
+
+        $this->items->push($signal);
+    }
+
+    public function shift() : T?
+    {
+        if ($this->items->empty()) {
+            return null;
+        }
+
+        return $this->items->remove(0);
+    }
+
+    public function pop() : T?
+    {
+        if ($this->items->empty()) {
+            return null;
+        }
+
+        return $this->items->pop();
+    }
+
+    public function take() : array<T>
+    {
+        array<T> $out = $this->items->clone();
+        $this->items->clear();
+        return $out;
+    }
+
+    public function flush() : void
+    {
+        $this->items->clear();
+    }
+
+    public const function size() : usize
+    {
+        return $this->items->count();
+    }
+
+    public const function empty() : bool
+    {
+        return $this->items->empty();
+    }
+}

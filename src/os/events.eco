@@ -156,25 +156,27 @@ internal function windowUnregister(Window $window) : void
 
 internal function windowOf(ptr<glfw::Window> $handle) : Window?
 {
-    array<weak<Window>> $kept = array<weak<Window>>();
     array<weak<Window>> $slots = WindowTable::$slots;
-    Window? $found = null;
+    usize $i = 0;
+    usize $n = $slots->count();
 
-    foreach ($slots as $ref) {
+    while ($i < $n) {
+        weak<Window> $ref = $slots[$i];
         Window $live = guard strong($ref) else {
+            $i = $i + 1;
             continue;
         }
 
-        $kept->push($ref);
         ptr<glfw::Window> $existing = $live->glfwHandle();
 
-        if ($existing:$ == $handle:$ && $found == null) {
-            $found = $live;
+        if ($existing:$ == $handle:$) {
+            return $live;
         }
+
+        $i = $i + 1;
     }
 
-    WindowTable::$slots = $kept;
-    return $found;
+    return null;
 }
 
 internal function onKey(ptr<glfw::Window> $handle, int32 $key, int32 $scancode, int32 $action, int32 $mods) : void

@@ -15,7 +15,8 @@ public class Window
     private int32 $height;
     public const WindowHints $hints;
     private ptr<glfw::Window> $handle;
-    private Framebuffer $framebuffer;
+    public Framebuffer $framebuffer;
+    private RenderTarget $target;
     private WindowEventHandler? $handler;
 
     public constructor(string $title, int32 $width, int32 $height, WindowHints $hints = WindowHints::defaults())
@@ -25,7 +26,8 @@ public class Window
         $this->height = $height;
         $this->hints = $hints;
         $this->handle:$ = null;
-        $this->framebuffer = Framebuffer::backbuffer();
+        $this->framebuffer = Framebuffer();
+        $this->target = RenderTarget($width, $height, $this->framebuffer);
         $this->handler = null;
     }
 
@@ -51,13 +53,15 @@ public class Window
         $this->handle:$ = $created:$;
         glfw::makeContextCurrent($this->handle);
 
-        if (!$state->load()) {
+        if (!$state->load(&glfw::getProcAddress)) {
             glfw::destroyWindow($this->handle);
             $this->handle:$ = null;
             return .error(.gpuLoad);
         }
 
-        $this->framebuffer = Framebuffer::backbuffer();
+        $this->framebuffer = Framebuffer();
+        $this->target->framebuffer = $this->framebuffer;
+        $this->syncTarget();
         $state->reset();
         windowRegister($this);
 
@@ -180,45 +184,38 @@ public class Window
 
     public const function framebufferSize() : Vec2
     {
-        int32 $x = 0;
-        int32 $y = 0;
-        glfw::getFramebufferSize($this->requireHandle(), &$x, &$y);
-        return Vec2($x as float32, $y as float32);
+        int32 $w = 0;
+        int32 $h = 0;
+        glfw::getFramebufferSize($this->requireHandle(), &$w, &$h);
+        return Vec2($w as float32, $h as float32);
     }
 
     public const function framebufferWidth() : int32
     {
-        int32 $x = 0;
-        int32 $y = 0;
-        glfw::getFramebufferSize($this->requireHandle(), &$x, &$y);
-        return $x;
+        return $this->framebufferSize()->x as int32;
     }
 
     public const function framebufferHeight() : int32
     {
-        int32 $x = 0;
-        int32 $y = 0;
-        glfw::getFramebufferSize($this->requireHandle(), &$x, &$y);
-        return $y;
-    }
-
-    public const function framebuffer() : Framebuffer
-    {
-        return $this->framebuffer;
+        return $this->framebufferSize()->y as int32;
     }
 
     public function renderTarget() : RenderTarget
     {
-        ptr<glfw::Window> $glfwWindow = $this->requireHandle();
-        int32 $w = $this->framebufferWidth();
-        int32 $h = $this->framebufferHeight();
-        RenderTarget $rt = RenderTarget($w, $h, $this->framebuffer);
+        $this->syncTarget();
+        return $this->target;
+    }
+
+    private function syncTarget() : void
+    {
+        Vec2 $px = $this->framebufferSize();
+        $this->target->width = $px->x as int32;
+        $this->target->height = $px->y as int32;
         float32 $sx = 1.0f;
         float32 $sy = 1.0f;
-        glfw::getWindowContentScale($glfwWindow, &$sx, &$sy);
-        $rt->contentScaleX = $sx;
-        $rt->contentScaleY = $sy;
-        return $rt;
+        glfw::getWindowContentScale($this->requireHandle(), &$sx, &$sy);
+        $this->target->contentScaleX = $sx;
+        $this->target->contentScaleY = $sy;
     }
 
     public function setHandler(WindowEventHandler $handler) : void

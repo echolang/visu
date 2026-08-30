@@ -1,23 +1,24 @@
 /**
  * A place to draw: pixel size, content scale, and a Framebuffer.
+ * Class so the pool, window, and callers share one identity.
  */
 
 namespace visu::graphics;
 
 use visu::math::Vec2;
 
-public struct RenderTarget
+public class RenderTarget
 {
-    private int32 $width;
-    private int32 $height;
+    public int32 $width;
+    public int32 $height;
 
     /**
-     * The render target's pixel density (for high dpi displays) on the x axis.
+     * Pixel density on the x axis (high-dpi).
      */
     public float32 $contentScaleX;
 
     /**
-     * The render target's pixel density (for high dpi displays) on the y axis.
+     * Pixel density on the y axis (high-dpi).
      */
     public float32 $contentScaleY;
 
@@ -36,23 +37,7 @@ public struct RenderTarget
     }
 
     /**
-     * Returns the render target's width in device pixels.
-     */
-    public const function width() : int32
-    {
-        return $this->width;
-    }
-
-    /**
-     * Returns the render target's height in device pixels.
-     */
-    public const function height() : int32
-    {
-        return $this->height;
-    }
-
-    /**
-     * Returns the render target's logical width (in points).
+     * Logical width in points.
      */
     public const function effectiveWidth() : int32
     {
@@ -60,40 +45,31 @@ public struct RenderTarget
     }
 
     /**
-     * Returns the render target's logical height (in points).
+     * Logical height in points.
      */
     public const function effectiveHeight() : int32
     {
         return ($this->height as float32 / $this->contentScaleY) as int32;
     }
 
-    /**
-     * Returns a Vec2 with effectiveWidth and effectiveHeight.
-     */
     public const function effectiveSize() : Vec2
     {
         return Vec2($this->effectiveWidth() as float32, $this->effectiveHeight() as float32);
     }
 
-    /**
-     * Returns true if the render target is offscreen (owns its framebuffer).
-     */
     public const function isOffscreen() : bool
     {
         return $this->framebuffer->owned;
     }
 
-    /**
-     * Updates the viewport to the render target's dimensions.
-     */
     public function updateViewport(Gpu& $state) : void
     {
         $state->viewport(0, 0, $this->width, $this->height);
     }
 
     /**
-     * Prepares a render pass to the render target.
-     * This will bind the render target's framebuffer and update the viewport.
+     * Bind the framebuffer and set the viewport. The verb for "I
+     * will draw here".
      */
     public function preparePass(Gpu& $state) : void
     {
@@ -101,20 +77,14 @@ public struct RenderTarget
         $this->updateViewport($state);
     }
 
-    /**
-     * Bind the framebuffer for reading.
-     */
     public function bindForRead(Gpu& $state) : bool
     {
         return $this->framebuffer->bind($state, .read);
     }
 
     /**
-     * Resizes the render target to new dimensions.
-     *
-     * `$width` / `$height` are the new size in pixels.
-     * Updates the internal size and viewport, and resizes renderbuffer
-     * attachments. Texture attachments are left as-is.
+     * New size in pixels. Updates viewport and renderbuffer
+     * attachments; texture attachments are left as-is.
      */
     public function resize(Gpu& $state, int32 $width, int32 $height) : void
     {

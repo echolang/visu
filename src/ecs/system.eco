@@ -1,0 +1,66 @@
+/**
+ * Per-frame update/render extension point, plus the list that binds
+ * them. Gpu is borrowed into a pass, never stored on a system.
+ */
+
+namespace visu::ecs;
+
+use visu::graphics::Context;
+
+public interface System
+{
+    function register(Entities $entities) : void;
+    function unregister(Entities $entities) : void;
+    function update(Entities $entities) : void;
+    function render(Entities $entities, const Context& $ctx) : void;
+}
+
+public class Systems
+{
+    private array<System> $bound;
+
+    public constructor()
+    {
+        $this->bound = array<System>();
+    }
+
+    public function bind(System $system) : void
+    {
+        $this->bound->push($system);
+    }
+
+    public function bindAll(const array<System>& $systems) : void
+    {
+        foreach ($systems as $system) {
+            $this->bind($system);
+        }
+    }
+
+    public function register(Entities $entities) : void
+    {
+        foreach ($this->bound as $system) {
+            $system->register($entities);
+        }
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+        foreach ($this->bound as $system) {
+            $system->unregister($entities);
+        }
+    }
+
+    public function update(Entities $entities) : void
+    {
+        foreach ($this->bound as $system) {
+            $system->update($entities);
+        }
+    }
+
+    public function render(Entities $entities, const Context& $ctx) : void
+    {
+        foreach ($this->bound as $system) {
+            $system->render($entities, $ctx);
+        }
+    }
+}

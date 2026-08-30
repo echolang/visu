@@ -1,0 +1,311 @@
+/**
+ * Named shader programs and their permutations. Does not store Gpu;
+ * get / permutation / load / destroy borrow it. No directory scan —
+ * register files explicitly. One record per shader name.
+ */
+
+namespace visu::graphics;
+
+internal class ShaderEntry
+{
+    public array<ShaderFile> $files;
+    public ShaderProgram? $program;
+    public ordered_map<string, array<Define>> $variants;
+    public ordered_map<string, ShaderProgram> $compiledVariants;
+
+    public constructor()
+    {
+        $this->files = array<ShaderFile>();
+        $this->program = null;
+        $this->variants = ordered_map<string, array<Define>>();
+        $this->compiledVariants = ordered_map<string, ShaderProgram>();
+    }
+}
+
+public class ShaderCollection
+{
+    public ShaderLoader $loader;
+    private ordered_map<string, string> $globals;
+    private map<string, ShaderEntry> $shaders;
+
+    public constructor(string $directory)
+    {
+        $this->loader = ShaderLoader($directory);
+        $this->globals = ordered_map<string, string>();
+        $this->shaders = map<string, ShaderEntry>();
+    }
+
+    public function enableVisuIncludes() : void
+    {
+        $this->loader->enableVisuIncludes();
+    }
+
+    public function define(string $name, int32 $value) : void
+    {
+        $this->globals[$name] = "{$value}";
+    }
+
+    public function define(string $name, float32 $value) : void
+    {
+        $this->globals[$name] = "{$value}";
+    }
+
+    public function define(string $name, string $value) : void
+    {
+        $this->globals[$name] = $value;
+    }
+
+    public function register(string $name, array<ShaderFile> $files) : result<bool, ShaderError>
+    {
+        ShaderEntry $entry = $this->entry($name);
+
+        if ($entry->files->count() > 0) {
+            return .error(.duplicate($name));
+        }
+
+        $entry->files = $files;
+        return .ok(true);
+    }
+
+    public function get(Gpu& $state, string $name) : result<ShaderProgram, ShaderError>
+    {
+        if (!$this->shaders->has($name)) {
+            return .error(.missing($name));
+        }
+
+        ShaderEntry $entry = $this->shaders[$name];
+
+        if ($entry->files->count() == 0) {
+            return .error(.missing($name));
+        }
+
+        ShaderProgram $held = guard $entry->program else {
+            return $this->compileBase($state, $name, $entry);
+        }
+
+        if ($held->destroyed()) {
+            return $this->compileBase($state, $name, $entry);
+        }
+
+        return .ok($held);
+    }
+
+    public function definePermutation(string $shader, string $variant, array<Define> $defines = array<Define>()) : void
+    {
+        ShaderEntry $entry = $this->entry($shader);
+        $entry->variants[$variant] = $defines;
+    }
+
+    public function permutation(Gpu& $state, string $shader, string $variant) : result<ShaderProgram, ShaderError>
+    {
+        if (!$this->shaders->has($shader)) {
+            return .error(.missingPermutation($shader, $variant));
+        }
+
+        ShaderEntry $entry = $this->shaders[$shader];
+
+        if (!$entry->variants->has($variant)) {
+            return .error(.missingPermutation($shader, $variant));
+        }
+
+        if ($entry->files->count() == 0) {
+            return .error(.missingBase($shader));
+        }
+
+        if ($entry->compiledVariants->has($variant)) {
+            ShaderProgram $held = $entry->compiledVariants[$variant];
+
+            if (!$held->destroyed()) {
+                return .ok($held);
+            }
+        }
+
+        return $this->compileVariant($state, $shader, $entry, $variant);
+    }
+
+    public function permutations(string $shader) : array<string>
+    {
+        if (!$this->shaders->has($shader)) {
+            return array<string>();
+        }
+
+        ShaderEntry $entry = $this->shaders[$shader];
+        return $entry->variants->keys();
+    }
+
+    public function hasPermutations(string $shader) : bool
+    {
+        return !$this->permutations($shader)->empty();
+    }
+
+    /**
+     * Drop the compiled program and every permutation so the next
+     * get / permutation recompiles.
+     */
+    public function forget(Gpu& $state, string $shader) : void
+    {
+        if (!$this->shaders->has($shader)) {
+            return;
+        }
+
+        ShaderEntry $entry = $this->shaders[$shader];
+        ShaderProgram $base = guard $entry->program else {
+            $this->forgetVariants($state, $entry);
+            return;
+        }
+        $base->destroy($state);
+        $entry->program = null;
+        $this->forgetVariants($state, $entry);
+    }
+
+    public function load(Gpu& $state) : result<bool, ShaderError>
+    {
+        array<string> $names = $this->shaders->keys();
+
+        foreach ($names as $name) {
+            ShaderEntry $entry = $this->shaders[$name];
+
+            if ($entry->files->count() == 0) {
+                continue;
+            }
+
+            ShaderProgram $p = guard $this->get($state, $name) else ($e) {
+                return .error($e);
+            }
+        }
+
+        return .ok(true);
+    }
+
+    public function loadPermutations(Gpu& $state, string $shader) : result<bool, ShaderError>
+    {
+        if (!$this->shaders->has($shader)) {
+            return .ok(true);
+        }
+
+        array<string> $names = $this->permutations($shader);
+
+        foreach ($names as $name) {
+            ShaderProgram $p = guard $this->permutation($state, $shader, $name) else ($e) {
+                return .error($e);
+            }
+        }
+
+        return .ok(true);
+    }
+
+    public function destroy(Gpu& $state) : void
+    {
+        array<string> $names = $this->shaders->keys();
+
+        foreach ($names as $name) {
+            $this->forget($state, $name);
+        }
+    }
+
+    destructor()
+    {
+        array<string> $names = $this->shaders->keys();
+
+        foreach ($names as $name) {
+            ShaderEntry $entry = $this->shaders[$name];
+            assert($entry->program == null, 'ShaderCollection dropped without destroy');
+            assert($entry->compiledVariants->empty(), 'ShaderCollection dropped without destroy');
+        }
+    }
+
+    private function entry(string $name) : ShaderEntry
+    {
+        if (!$this->shaders->has($name)) {
+            $this->shaders[$name] = ShaderEntry();
+        }
+
+        return $this->shaders[$name];
+    }
+
+    private function forgetVariants(Gpu& $state, ShaderEntry $entry) : void
+    {
+        array<string> $keys = $entry->compiledVariants->keys();
+
+        foreach ($keys as $key) {
+            ShaderProgram $held = $entry->compiledVariants[$key];
+            $held->destroy($state);
+        }
+
+        $entry->compiledVariants->clear();
+    }
+
+    private function compileBase(Gpu& $state, string $name, ShaderEntry $entry) : result<ShaderProgram, ShaderError>
+    {
+        ShaderProgram $program = guard $this->build($state, $entry, $this->globalDefines(), $name) else ($e) {
+            return .error($e);
+        }
+
+        $entry->program = $program;
+        return .ok($program);
+    }
+
+    private function compileVariant(Gpu& $state, string $shader, ShaderEntry $entry, string $variant) : result<ShaderProgram, ShaderError>
+    {
+        string $key = "{$shader}#{$variant}";
+        ShaderProgram $program = guard $this->build($state, $entry, $this->mergedDefines($entry->variants[$variant]), $key) else ($e) {
+            return .error($e);
+        }
+
+        $entry->compiledVariants[$variant] = $program;
+        return .ok($program);
+    }
+
+    private function globalDefines() : array<Define>
+    {
+        array<Define> $out = array<Define>();
+        array<string> $keys = $this->globals->keys();
+
+        foreach ($keys as $k) {
+            $out[] = Define($k, $this->globals[$k]);
+        }
+
+        return $out;
+    }
+
+    private function mergedDefines(array<Define> $variant) : array<Define>
+    {
+        ordered_map<string, string> $merged = $this->globals->clone();
+
+        foreach ($variant as $d) {
+            $merged[$d->name] = $d->value;
+        }
+
+        array<Define> $out = array<Define>();
+        array<string> $keys = $merged->keys();
+
+        foreach ($keys as $k) {
+            $out[] = Define($k, $merged[$k]);
+        }
+
+        return $out;
+    }
+
+    private function build(Gpu& $state, ShaderEntry $entry, array<Define> $defines, string $linkName) : result<ShaderProgram, ShaderError>
+    {
+        array<ShaderFile> $files = $entry->files;
+        ShaderProgram $program = ShaderProgram($state);
+
+        foreach ($files as $file) {
+            string $src = guard $this->loader->load($file->path, $defines) else ($e) {
+                $program->destroy($state);
+                return .error($e);
+            }
+
+            ShaderStage $stage = ShaderStage($state, $file->kind, $src);
+            $program->attach($state, $stage);
+        }
+
+        bool $ok = guard $program->link($state, $linkName) else ($e) {
+            $program->destroy($state);
+            return .error($e);
+        }
+
+        return .ok($program);
+    }
+}

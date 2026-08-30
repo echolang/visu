@@ -1,0 +1,147 @@
+/**
+ * ShaderStage and ShaderProgram against a real GL context.
+ */
+
+use visu::os::{Window, WindowHints, init, terminate};
+use visu::graphics::{Gpu, ShaderStage, ShaderProgram, ShaderKind, ShaderError};
+use visu::math::Vec4;
+
+#[group: "glfw"]
+test stage_compile
+{
+    bool $booted = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('stage', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    ShaderStage $shader = ShaderStage($state, .vertex);
+    assert(!$shader->compiled($state), 'not compiled');
+    $shader->source($state, "#version 330\nvoid main() { }\n");
+    bool $ok = guard $shader->compile($state) else ($e) {
+        $shader->destroy($state);
+        $window->destroy();
+        terminate();
+        die($e->message());
+    }
+    assert($shader->compiled($state), 'compiled');
+    $shader->destroy($state);
+    $window->destroy();
+    terminate();
+}
+
+#[group: "glfw"]
+test program_link
+{
+    bool $booted = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('program', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    ShaderProgram $program = ShaderProgram($state);
+    ShaderStage $vs = ShaderStage($state, .vertex, "#version 330 core\nlayout (location = 0) in vec3 position;\nlayout (location = 1) in vec3 color;\nout vec4 pcolor;\nvoid main()\n{\n    pcolor = vec4(color, 1.0);\n    gl_Position = vec4(position, 1.0);\n}\n");
+    ShaderStage $fs = ShaderStage($state, .fragment, "#version 330 core\nout vec4 fragment_color;\nin vec4 pcolor;\nvoid main()\n{\n    fragment_color = pcolor;\n}\n");
+    $program->attach($state, $vs);
+    $program->attach($state, $fs);
+    bool $ok = guard $program->link($state, 'triangle') else ($e) {
+        $program->destroy($state);
+        $window->destroy();
+        terminate();
+        die($e->message());
+    }
+    assert($program->linked(), 'linked');
+    $program->bind($state);
+    $program->set($state, 'u_unused', Vec4(1.0f, 0.0f, 0.0f, 1.0f));
+    $program->destroy($state);
+    $window->destroy();
+    terminate();
+}
+
+#[if: os == darwin]
+#[group: "glfw"]
+test program_link_mismatch
+{
+    bool $booted = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('program-mismatch', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    ShaderProgram $program = ShaderProgram($state);
+    ShaderStage $vs = ShaderStage($state, .vertex, "#version 330 core\nlayout (location = 0) in vec3 position;\nlayout (location = 1) in vec3 color;\nout vec4 pcolor_wrong;\nvoid main()\n{\n    pcolor_wrong = vec4(color, 1.0);\n    gl_Position = vec4(position, 1.0);\n}\n");
+    ShaderStage $fs = ShaderStage($state, .fragment, "#version 330 core\nout vec4 fragment_color;\nin vec4 pcolor;\nvoid main()\n{\n    fragment_color = pcolor;\n}\n");
+    $program->attach($state, $vs);
+    $program->attach($state, $fs);
+    result<bool, ShaderError> $r = $program->link($state, 'mismatch');
+    assert($r->failed(), 'link mismatch');
+    $program->destroy($state);
+    $window->destroy();
+    terminate();
+}
+#[end]
+
+#[group: "glfw"]
+#[tests: expects death]
+test program_attach_duplicate_kind_dies
+{
+    bool $booted = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('program-dup', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    ShaderProgram $program = ShaderProgram($state);
+    $program->attach($state, ShaderStage($state, .vertex, "#version 330\nvoid main() { }\n"));
+    $program->attach($state, ShaderStage($state, .vertex, "#version 330\nvoid main() { }\n"));
+}
+
+#[group: "glfw"]
+#[tests: expects death]
+test program_drop_without_destroy_dies
+{
+    bool $booted = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('program-drop', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    ShaderProgram $program = ShaderProgram($state);
+    $window->destroy();
+    terminate();
+}

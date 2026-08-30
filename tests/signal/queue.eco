@@ -1,0 +1,120 @@
+/**
+ * Dispatcher queues: FIFO drain, cap, two queues of one type.
+ */
+
+use visu::signal::{Dispatcher, Queue};
+
+struct Pulse
+{
+    public const int32 $n;
+}
+
+test queue_shift_is_fifo
+{
+    Dispatcher $d = Dispatcher();
+    Queue<Pulse> $q = $d->queue<Pulse>();
+    $d->dispatch(Pulse(1));
+    $d->dispatch(Pulse(2));
+    $d->dispatch(Pulse(3));
+    assert($q->size() == 3, 'size');
+    Pulse $a = guard $q->shift() else {
+        die('a');
+    }
+    Pulse $b = guard $q->shift() else {
+        die('b');
+    }
+    Pulse $c = guard $q->shift() else {
+        die('c');
+    }
+    assert($a->n == 1, 'first');
+    assert($b->n == 2, 'second');
+    assert($c->n == 3, 'third');
+    assert($q->empty(), 'drained');
+    Pulse? $miss = $q->shift();
+    assert($miss == null, 'empty shift');
+}
+
+test queue_pop_is_lifo
+{
+    Dispatcher $d = Dispatcher();
+    Queue<Pulse> $q = $d->queue<Pulse>();
+    $d->dispatch(Pulse(1));
+    $d->dispatch(Pulse(2));
+    Pulse $last = guard $q->pop() else {
+        die('pop');
+    }
+    assert($last->n == 2, 'last');
+    assert($q->size() == 1, 'left');
+}
+
+test queue_take_drains
+{
+    Dispatcher $d = Dispatcher();
+    Queue<Pulse> $q = $d->queue<Pulse>();
+    $d->dispatch(Pulse(4));
+    $d->dispatch(Pulse(5));
+    array<Pulse> $all = $q->take();
+    assert($all->count() == 2, 'took');
+    assert($q->empty(), 'cleared');
+    assert($all[0]->n == 4, 'a');
+    assert($all[1]->n == 5, 'b');
+}
+
+test queue_flush
+{
+    Dispatcher $d = Dispatcher();
+    Queue<Pulse> $q = $d->queue<Pulse>();
+    $d->dispatch(Pulse(1));
+    $q->flush();
+    assert($q->empty(), 'flushed');
+}
+
+test queue_limit_drops_new
+{
+    Dispatcher $d = Dispatcher();
+    Queue<Pulse> $q = $d->queue<Pulse>(limit: 2);
+    $d->dispatch(Pulse(1));
+    $d->dispatch(Pulse(2));
+    $d->dispatch(Pulse(3));
+    assert($q->size() == 2, 'capped');
+    Pulse $a = guard $q->shift() else {
+        die('a');
+    }
+    Pulse $b = guard $q->shift() else {
+        die('b');
+    }
+    assert($a->n == 1, 'kept first');
+    assert($b->n == 2, 'kept second');
+}
+
+test queue_two_of_same_type
+{
+    Dispatcher $d = Dispatcher();
+    Queue<Pulse> $camera = $d->queue<Pulse>();
+    Queue<Pulse> $gizmo = $d->queue<Pulse>(1);
+    $d->dispatch(Pulse(9));
+    assert($camera->size() == 1, 'camera');
+    assert($gizmo->size() == 1, 'gizmo');
+    Pulse $c = guard $camera->shift() else {
+        die('camera');
+    }
+    Pulse $g = guard $gizmo->shift() else {
+        die('gizmo');
+    }
+    assert($c->n == 9, 'c');
+    assert($g->n == 9, 'g');
+}
+
+test queue_unqueue_stops_collecting
+{
+    Dispatcher $d = Dispatcher();
+    Queue<Pulse> $q = $d->queue<Pulse>();
+    $d->dispatch(Pulse(1));
+    $d->unqueue($q);
+    $d->dispatch(Pulse(2));
+    assert($q->size() == 1, 'stale kept');
+    Pulse $kept = guard $q->shift() else {
+        die('kept');
+    }
+    assert($kept->n == 1, 'only first');
+}

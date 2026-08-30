@@ -19,13 +19,6 @@ internal struct RboAttach
     public int32 $height;
 }
 
-internal struct TexAttach
-{
-    public TextureTarget $target;
-    public uint32 $id;
-    public int32 $level;
-}
-
 public class Framebuffer : GpuObject
 {
     /**
@@ -40,7 +33,6 @@ public class Framebuffer : GpuObject
 
     private bool $dead;
     private map<Attachment, RboAttach> $rbos;
-    private map<Attachment, TexAttach> $texes;
 
     /**
      * The window backbuffer (id 0).
@@ -51,7 +43,6 @@ public class Framebuffer : GpuObject
         $this->owned = false;
         $this->dead = true;
         $this->rbos = map<Attachment, RboAttach>();
-        $this->texes = map<Attachment, TexAttach>();
     }
 
     /**
@@ -63,15 +54,6 @@ public class Framebuffer : GpuObject
         $this->owned = true;
         $this->dead = false;
         $this->rbos = map<Attachment, RboAttach>();
-        $this->texes = map<Attachment, TexAttach>();
-    }
-
-    /**
-     * The window backbuffer (id 0).
-     */
-    public static function backbuffer() : Framebuffer
-    {
-        return Framebuffer();
     }
 
     destructor()
@@ -98,7 +80,6 @@ public class Framebuffer : GpuObject
 
         $state->deleteFramebuffer($this->id);
         $this->rbos->clear();
-        $this->texes->clear();
         $this->dead = true;
     }
 
@@ -181,7 +162,6 @@ public class Framebuffer : GpuObject
     {
         $this->bind($state, .readDraw);
         $this->dropRbo($state, $point);
-        $this->texes->remove($point);
 
         uint32 $rbo = $state->createRenderbuffer();
         $state->bindRenderbuffer($rbo);
@@ -198,7 +178,6 @@ public class Framebuffer : GpuObject
         $this->bind($state, .readDraw);
         $this->dropRbo($state, $point);
         $state->framebufferTexture2D($point, $target, $texture, $level);
-        $this->texes[$point] = TexAttach($target, $texture, $level);
     }
 
     /**

@@ -1,7 +1,6 @@
 /**
- * Persistent GPU objects for the render graph. Keyed by resource name
- * (handle ids reset every Pipeline). Does not store Gpu; every GPU
- * call takes Gpu&.
+ * Persistent GPU objects for the render graph. Keyed by resource name.
+ * Does not store Gpu; every GPU call takes Gpu&.
  */
 
 namespace visu::graphics;
@@ -9,12 +8,14 @@ namespace visu::graphics;
 public enum PoolError
 {
     case missingImport(string $name);
+    case missing(string $name);
     case incomplete(string $name, FramebufferStatus $status);
 
     public const function message() : string
     {
         return match ($this) {
             PoolError::missingImport($name) => "pool: imported '{$name}' was never set",
+            PoolError::missing($name) => "pool: '{$name}' was never created",
             PoolError::incomplete($name, $status) => "pool: failed to create '{$name}': {$status}",
         };
     }
@@ -41,11 +42,13 @@ public class StoredTexture
 {
     public Texture $texture;
     public bool $imported;
+    public string? $parent;
 
-    public constructor(Texture $texture, bool $imported)
+    public constructor(Texture $texture, bool $imported, string? $parent = null)
     {
         $this->texture = $texture;
         $this->imported = $imported;
+        $this->parent = $parent;
     }
 }
 
@@ -54,7 +57,7 @@ public class Pool
     private map<string, StoredTarget> $targets;
     private map<string, StoredTexture> $textures;
     private map<string, int32> $used;
-    private map<string, erased> $cached;
+    private map<string, map<type_id, erased>> $cached;
     private array<GpuObject> $cachedOwned;
     private int32 $tick;
 
@@ -63,7 +66,7 @@ public class Pool
         $this->targets = map<string, StoredTarget>();
         $this->textures = map<string, StoredTexture>();
         $this->used = map<string, int32>();
-        $this->cached = map<string, erased>();
+        $this->cached = map<string, map<type_id, erased>>();
         $this->cachedOwned = array<GpuObject>();
         $this->tick = 0;
     }
@@ -93,7 +96,7 @@ public class Pool
      */
     public function setTexture(TextureRef $ref, Texture $texture) : void
     {
-        $this->textures[$ref->name] = StoredTexture($texture, true);
+        $this->textures[$ref->name] = StoredTexture($texture, true, null);
         $this->touch($ref->name);
     }
 
@@ -141,7 +144,8 @@ public class Pool
     }
 
     /**
-     * The GPU texture for `$ref`. Attachments are created by getTarget.
+     * The GPU texture for `$ref`. Attachments are created by getTarget;
+     * this never allocates.
      */
     public function getTexture(Gpu& $state, TextureRef $ref) : result<Texture, PoolError>
     {
@@ -149,6 +153,10 @@ public class Pool
 
         if ($this->textures->has($ref->name)) {
             StoredTexture $held = $this->textures[$ref->name];
+            string $parent = guard $held->parent else {
+                return .ok($held->texture);
+            }
+            $this->touch($parent);
             return .ok($held->texture);
         }
 
@@ -156,28 +164,34 @@ public class Pool
             return .error(.missingImport($ref->name));
         }
 
-        Texture $tex = Texture($state, $ref->name);
-        $tex->allocateEmpty($state, $ref->width, $ref->height, $ref->options);
-        $this->textures[$ref->name] = StoredTexture($tex, false);
-        return .ok($tex);
+        return .error(.missing($ref->name));
     }
 
     /**
      * Named static cache for the lifetime of the pool (PHP
-     * cacheStaticResource). Same name returns the same object. Not
-     * tick-collected; destroy() tears GPU objects down.
+     * cacheStaticResource). Same (name, type) returns the same object.
+     * Not tick-collected; destroy() tears GPU objects down.
      */
     public function cache<T : GpuObject>(string $name, Gpu& $state, function<T(Gpu&)> $make) : T
     {
+        type_id $id = type_id<T>();
+
         if ($this->cached->has($name)) {
-            erased $held = $this->cached->get($name);
-            unsafe {
-                return assume<T>($held);
+            map<type_id, erased>& $slot = $this->cached->at($name);
+
+            if ($slot->has($id)) {
+                erased $held = $slot->get($id);
+                unsafe {
+                    return assume<T>($held);
+                }
             }
+        } else {
+            $this->cached[$name] = map<type_id, erased>();
         }
 
         T $value = $make($state);
-        $this->cached[$name] = erased::from($value);
+        map<type_id, erased>& $into = $this->cached->at($name);
+        $into[$id] = erased::from($value);
         GpuObject $owned = $value;
         $this->cachedOwned->push($owned);
         return $value;
@@ -185,7 +199,8 @@ public class Pool
 
     /**
      * Destroy created GPU objects that were not touched this tick.
-     * Imported resources and the static cache are never collected.
+     * A target stays if any owned texture was touched. Imported
+     * resources and the static cache are never collected.
      */
     public function collect(Gpu& $state) : void
     {
@@ -196,9 +211,40 @@ public class Pool
                 continue;
             }
 
+            if (!$this->targets->has($name)) {
+                continue;
+            }
+
+            if ($this->targetHasLiveOwned($name)) {
+                continue;
+            }
+
             $this->dropTarget($state, $name);
-            $this->dropTexture($state, $name);
             $this->used->remove($name);
+        }
+
+        $names = $this->used->keys();
+
+        foreach ($names as $name) {
+            if ($this->used[$name] >= $this->tick) {
+                continue;
+            }
+
+            if (!$this->textures->has($name)) {
+                continue;
+            }
+
+            StoredTexture $held = $this->textures[$name];
+            string $parent = guard $held->parent else {
+                $this->dropTexture($state, $name);
+                $this->used->remove($name);
+                continue;
+            }
+
+            if (!$this->targets->has($parent)) {
+                $this->dropTexture($state, $name);
+                $this->used->remove($name);
+            }
         }
     }
 
@@ -240,6 +286,20 @@ public class Pool
         return $this->textures->has($name);
     }
 
+    private function targetHasLiveOwned(string $name) : bool
+    {
+        StoredTarget $held = $this->targets[$name];
+        array<string> $owned = $held->ownedTextures;
+
+        foreach ($owned as $texName) {
+            if ($this->used->has($texName) && $this->used[$texName] >= $this->tick) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private function touchExpanded(TargetRef $ref) : void
     {
         array<GraphRes> $res = expandIo(.target($ref));
@@ -264,9 +324,10 @@ public class Pool
         foreach ($colors as $color) {
             $color->width = $ref->width;
             $color->height = $ref->height;
+            $this->dropTexture($state, $color->name);
             Texture $tex = Texture($state, $color->name);
             $tex->allocateEmpty($state, $ref->width, $ref->height, $color->options);
-            $this->textures[$color->name] = StoredTexture($tex, false);
+            $this->textures[$color->name] = StoredTexture($tex, false, $ref->name);
             $owned->push($color->name);
             ColorAttachment $slot = ColorAttachment($i);
             $fb->attachTexture($state, $slot->attachment(), .texture2D, $tex->id, 0);
@@ -283,9 +344,10 @@ public class Pool
         }
         $depth->width = $ref->width;
         $depth->height = $ref->height;
+        $this->dropTexture($state, $depth->name);
         Texture $depthTex = Texture($state, $depth->name);
         $depthTex->allocateEmpty($state, $ref->width, $ref->height, $depth->options);
-        $this->textures[$depth->name] = StoredTexture($depthTex, false);
+        $this->textures[$depth->name] = StoredTexture($depthTex, false, $ref->name);
         $owned->push($depth->name);
         $fb->attachTexture($state, .depth, .texture2D, $depthTex->id, 0);
         return $this->finishTarget($state, $ref, $target, $fb, $owned);
@@ -377,6 +439,8 @@ internal function targetFingerprint(TargetRef $ref) : string
     foreach ($texes as $tex) {
         $fp->append('|');
         $fp->append($tex->name);
+        $fp->append('|');
+        $fp->append($tex->options->key());
     }
 
     return $fp;

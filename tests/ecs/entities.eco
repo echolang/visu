@@ -1,0 +1,294 @@
+/**
+ * Registry: versioned ids, struct components, views, singletons, listeners.
+ */
+
+use visu::ecs::{Entities, Entity, View};
+
+test entities_create_and_valid
+{
+    Entities $world = Entities();
+    Entity $a = $world->create();
+    Entity $b = $world->create();
+    assert($a != $b, 'distinct');
+    assert($world->valid($a), 'a');
+    assert($world->valid($b), 'b');
+    assert(!$world->valid(Entity(index: 42, version: 0)), 'missing');
+    assert(!$world->valid(Entity::none()), 'none');
+}
+
+test entities_destroy_recycles_index_bumps_version
+{
+    Entities $world = Entities();
+    Entity $a = $world->create();
+    uint32 $idx = $a->index();
+    uint32 $ver = $a->version();
+    $world->destroy($a);
+    assert(!$world->valid($a), 'stale');
+    Entity $b = $world->create();
+    assert($b->index() == $idx, 'recycled');
+    assert($b->version() != $ver, 'bumped');
+    assert($world->valid($b), 'fresh');
+    assert(!$world->valid($a), 'old still dead');
+}
+
+test entities_attach_get_has_detach
+{
+    Entities $world = Entities();
+    Entity $e = $world->create();
+    assert(!$world->has<Position>($e), 'no');
+    $world->attach($e, Position(1.0f, 2.0f));
+    assert($world->has<Position>($e), 'has');
+    Position& $p = $world->get<Position>($e);
+    assert($p->x == 1.0f, 'x');
+    $p->y = 8.0f;
+    assert($world->get<Position>($e)->y == 8.0f, 'mut');
+    $world->detach<Position>($e);
+    assert(!$world->has<Position>($e), 'gone');
+}
+
+test entities_find_miss
+{
+    Entities $world = Entities();
+    Entity $e = $world->create();
+    ptr<Position> $miss = $world->find<Position>($e);
+    assert($miss:$ == null, 'miss');
+    $world->attach($e, Position(3.0f, 0.0f));
+    ptr<Position> $hit = $world->find<Position>($e);
+    assert($hit:$ != null, 'hit');
+}
+
+test entities_reattach_replaces
+{
+    Entities $world = Entities();
+    Entity $e = $world->create();
+    $world->attach($e, Position(1.0f, 0.0f));
+    $world->attach($e, Position(2.0f, 0.0f));
+    assert($world->view<Position>()->size() == 1, 'one');
+    assert($world->get<Position>($e)->x == 2.0f, 'replaced');
+}
+
+test entities_view_foreach
+{
+    Entities $world = Entities();
+    Entity $a = $world->create();
+    Entity $b = $world->create();
+    $world->attach($a, Position(1.0f, 0.0f));
+    $world->attach($b, Position(2.0f, 0.0f));
+    int32 $n = 0;
+    foreach ($world->view<Position>() as $e => &$p) {
+        $n = $n + 1;
+        $p->x = $p->x + 1.0f;
+    }
+    assert($n == 2, 'n');
+    assert($world->get<Position>($a)->x == 2.0f, 'a');
+    assert($world->get<Position>($b)->x == 3.0f, 'b');
+}
+
+test entities_ids_with_both_components
+{
+    Entities $world = Entities();
+    Entity $e1 = $world->create();
+    $world->attach($e1, Position(1.0f, 0.0f));
+
+    Entity $e2 = $world->create();
+    $world->attach($e2, Position(2.0f, 0.0f));
+    $world->attach($e2, Velocity(1.0f, 0.0f));
+
+    Entity $e3 = $world->create();
+    $world->attach($e3, Velocity(1.0f, 0.0f));
+    $world->attach($e3, Position(3.0f, 0.0f));
+
+    Entity $e4 = $world->create();
+    $world->attach($e4, Velocity(1.0f, 0.0f));
+
+    array<Entity> $both = $world->idsWith<Position, Velocity>();
+    assert($both->count() == 2, 'count');
+    assert($both[0] == $e2 || $both[1] == $e2, 'e2');
+    assert($both[0] == $e3 || $both[1] == $e3, 'e3');
+}
+
+test entities_each_two_components
+{
+    Entities $world = Entities();
+    Entity $onlyP = $world->create();
+    $world->attach($onlyP, Position(1.0f, 0.0f));
+    Entity $both = $world->create();
+    $world->attach($both, Position(10.0f, 0.0f));
+    $world->attach($both, Velocity(5.0f, 0.0f));
+
+    Counter $n = Counter();
+    $world->each<Position, Velocity>(function(Entity $e, Position& $p, Velocity& $v) : void {
+        $n->n = $n->n + 1;
+        $p->x = $p->x + $v->dx;
+    });
+    assert($n->n == 1, 'one pair');
+    assert($world->get<Position>($both)->x == 15.0f, 'integrated');
+    assert($world->get<Position>($onlyP)->x == 1.0f, 'untouched');
+}
+
+test entities_each_three_components
+{
+    Entities $world = Entities();
+    Entity $e = $world->create();
+    $world->attach($e, Position(1.0f, 0.0f));
+    $world->attach($e, Velocity(2.0f, 0.0f));
+    $world->attach($e, Tag(7));
+    Entity $partial = $world->create();
+    $world->attach($partial, Position(0.0f, 0.0f));
+    $world->attach($partial, Velocity(0.0f, 0.0f));
+
+    Counter $n = Counter();
+    $world->each<Position, Velocity, Tag>(function(Entity $ent, Position& $p, Velocity& $v, Tag& $t) : void {
+        $n->n = $n->n + $t->id;
+        $p->x = $p->x + $v->dx;
+    });
+    assert($n->n == 7, 'tag');
+    assert($world->get<Position>($e)->x == 3.0f, 'moved');
+}
+
+test entities_first_and_first_with
+{
+    Entities $world = Entities();
+    ptr<Position> $none = $world->first<Position>();
+    assert($none:$ == null, 'empty first');
+    Entity? $noneId = $world->firstWith<Position>();
+    assert($noneId == null, 'empty id');
+
+    Entity $e = $world->create();
+    $world->attach($e, Position(4.0f, 0.0f));
+    ptr<Position> $p = $world->first<Position>();
+    assert($p:$ != null, 'hit');
+    Entity $id = guard $world->firstWith<Position>() else {
+        die('id');
+    }
+    assert($id == $e, 'id');
+}
+
+test entities_singleton
+{
+    Entities $world = Entities();
+    assert(!$world->hasSingleton<Tag>(), 'no');
+    $world->setSingleton(Tag(3));
+    assert($world->hasSingleton<Tag>(), 'has');
+    Tag& $t = $world->getSingleton<Tag>();
+    assert($t->id == 3, 'id');
+    $t->id = 9;
+    assert($world->getSingleton<Tag>()->id == 9, 'mut');
+    $world->removeSingleton<Tag>();
+    assert(!$world->hasSingleton<Tag>(), 'gone');
+    ptr<Tag> $miss = $world->findSingleton<Tag>();
+    assert($miss:$ == null, 'find miss');
+}
+
+test entities_on_attach_and_release
+{
+    Entities $world = Entities();
+    EntityLog $log = EntityLog();
+    int32 $handle = $world->onAttach<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $log->entities->push($e);
+        $log->values->push($p->x as int32);
+    });
+
+    Entity $e1 = $world->create();
+    $world->attach($e1, Position(1.0f, 0.0f));
+    Entity $e2 = $world->create();
+    $world->attach($e2, Position(2.0f, 0.0f));
+    assert($log->entities->count() == 2, 'two');
+    assert($log->entities[0] == $e1, 'e1');
+    assert($log->values[1] == 2, 'v2');
+
+    $world->releaseOnAttach($handle);
+    Entity $e3 = $world->create();
+    $world->attach($e3, Position(3.0f, 0.0f));
+    assert($log->entities->count() == 2, 'released');
+}
+
+test entities_on_detach_and_destroy
+{
+    Entities $world = Entities();
+    EntityLog $log = EntityLog();
+    $world->onDetach<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $log->entities->push($e);
+        $log->values->push($p->x as int32);
+    });
+
+    Entity $e1 = $world->create();
+    $world->attach($e1, Position(1.0f, 0.0f));
+    Entity $e2 = $world->create();
+    $world->attach($e2, Position(2.0f, 0.0f));
+    $world->detach<Position>($e1);
+    $world->destroy($e2);
+    assert($log->entities->count() == 2, 'both');
+    assert($log->values[0] == 1, 'detach');
+    assert($log->values[1] == 2, 'destroy');
+    assert(!$world->valid($e2), 'dead');
+}
+
+test entities_detach_all_fires_both
+{
+    Entities $world = Entities();
+    EntityLog $posLog = EntityLog();
+    EntityLog $velLog = EntityLog();
+    $world->onDetach<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $posLog->values->push($p->x as int32);
+    });
+    $world->onDetach<Velocity>(function(Entities $ents, Entity $e, const Velocity& $v) : void {
+        $velLog->values->push($v->dx as int32);
+    });
+
+    Entity $e = $world->create();
+    $world->attach($e, Position(4.0f, 0.0f));
+    $world->attach($e, Velocity(5.0f, 0.0f));
+    $world->detachAll($e);
+    assert($posLog->values->count() == 1, 'pos');
+    assert($velLog->values->count() == 1, 'vel');
+    assert(!$world->has<Position>($e), 'no pos');
+    assert(!$world->has<Velocity>($e), 'no vel');
+}
+
+test entities_multiple_attach_listeners
+{
+    Entities $world = Entities();
+    Counter $a = Counter();
+    Counter $b = Counter();
+    $world->onAttach<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $a->n = $a->n + 1;
+    });
+    $world->onAttach<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $b->n = $b->n + 1;
+    });
+    Entity $e = $world->create();
+    $world->attach($e, Position(0.0f, 0.0f));
+    assert($a->n == 1, 'a');
+    assert($b->n == 1, 'b');
+}
+
+test entities_release_unknown_listener
+{
+    Entities $world = Entities();
+    $world->releaseOnAttach(999);
+    $world->releaseOnDetach(999);
+    assert(true, 'ok');
+}
+
+#[tests: expects death]
+test entities_attach_invalid_dies
+{
+    Entities $world = Entities();
+    $world->attach(Entity(index: 9, version: 0), Position(0.0f, 0.0f));
+}
+
+#[tests: expects death]
+test entities_get_missing_dies
+{
+    Entities $world = Entities();
+    Entity $e = $world->create();
+    Position& $p = $world->get<Position>($e);
+}
+
+#[tests: expects death]
+test entities_missing_singleton_get_dies
+{
+    Entities $world = Entities();
+    Tag& $t = $world->getSingleton<Tag>();
+}

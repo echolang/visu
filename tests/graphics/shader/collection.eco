@@ -1,0 +1,130 @@
+/**
+ * ShaderCollection bookkeeping (no GL) and permutation compile (glfw).
+ */
+
+use visu::os::{Window, WindowHints, init, terminate};
+use visu::graphics::{
+    Gpu, ShaderCollection, ShaderFile, ShaderProgram, ShaderError, Define, ShaderKind
+};
+
+test collection_define_permutations
+{
+    ShaderCollection $shaders = ShaderCollection('tests/resources/shaders');
+    array<Define> $basic = [Define('DEFINE_A', 1), Define('DEFINE_B', 0)];
+    array<Define> $advanced = [Define('DEFINE_A', 1), Define('DEFINE_B', 1), Define('DEFINE_C', 'test')];
+    $shaders->definePermutation('test', 'basic', $basic);
+    $shaders->definePermutation('test', 'advanced', $advanced);
+
+    assert($shaders->hasPermutations('test'), 'has');
+    assert(!$shaders->hasPermutations('nonexistent'), 'missing shader');
+
+    array<string> $names = $shaders->permutations('test');
+    assert($names->count() == 2, 'two variants');
+    assert($names[0] == 'basic', 'basic first');
+    assert($names[1] == 'advanced', 'advanced second');
+}
+
+test collection_empty_permutations
+{
+    ShaderCollection $shaders = ShaderCollection('tests/resources/shaders');
+    assert(!$shaders->hasPermutations('empty'), 'none');
+    $shaders->definePermutation('empty', 'x');
+    assert($shaders->hasPermutations('empty'), 'named empty variant');
+    array<string> $none = $shaders->permutations('nonexistent');
+    assert($none->empty(), 'unknown shader');
+}
+
+test collection_duplicate_register
+{
+    ShaderCollection $shaders = ShaderCollection('tests/resources/shaders');
+    array<ShaderFile> $files = [
+        ShaderFile(ShaderKind::vertex, 'triangle.vert.glsl'),
+        ShaderFile(ShaderKind::fragment, 'triangle.frag.glsl')
+    ];
+    bool $ok = guard $shaders->register('triangle', $files) else ($e) {
+        die($e->message());
+    }
+    result<bool, ShaderError> $again = $shaders->register('triangle', $files);
+    assert($again->failed(), 'duplicate');
+}
+
+#[group: "glfw"]
+test collection_get_and_permutations
+{
+    bool $booted = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('shader-col', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    ShaderCollection $shaders = ShaderCollection('tests/resources/shaders');
+    array<ShaderFile> $files = [
+        ShaderFile(ShaderKind::vertex, 'triangle.vert.glsl'),
+        ShaderFile(ShaderKind::fragment, 'triangle.frag.glsl')
+    ];
+    bool $reg = guard $shaders->register('triangle', $files) else ($e) {
+        $window->destroy();
+        terminate();
+        die($e->message());
+    }
+
+    ShaderProgram $base = guard $shaders->get($state, 'triangle') else ($e) {
+        $window->destroy();
+        terminate();
+        die($e->message());
+    }
+    assert($base->linked(), 'base linked');
+
+    array<Define> $a = [Define('TEST', 1)];
+    array<Define> $b = [Define('TEST', 2)];
+    $shaders->definePermutation('triangle', 'a', $a);
+    $shaders->definePermutation('triangle', 'b', $b);
+
+    ShaderProgram $pa = guard $shaders->permutation($state, 'triangle', 'a') else ($e) {
+        $shaders->destroy($state);
+        $window->destroy();
+        terminate();
+        die($e->message());
+    }
+    ShaderProgram $pb = guard $shaders->permutation($state, 'triangle', 'b') else ($e) {
+        $shaders->destroy($state);
+        $window->destroy();
+        terminate();
+        die($e->message());
+    }
+
+    assert($pa->id != $pb->id, 'distinct programs');
+    assert($pa->linked() && $pb->linked(), 'variants linked');
+
+    result<ShaderProgram, ShaderError> $missing = $shaders->permutation($state, 'triangle', 'nope');
+    assert($missing->failed(), 'unknown variant');
+
+    result<ShaderProgram, ShaderError> $noDef = $shaders->permutation($state, 'ghost', 'a');
+    assert($noDef->failed(), 'unknown shader permutation');
+
+    $shaders->definePermutation('ghost', 'a', $a);
+    result<ShaderProgram, ShaderError> $ghost = $shaders->permutation($state, 'ghost', 'a');
+    assert($ghost->failed(), 'missing base');
+
+    $shaders->forget($state, 'triangle');
+    assert($base->destroyed(), 'old program dead');
+    ShaderProgram $again = guard $shaders->get($state, 'triangle') else ($e) {
+        $shaders->destroy($state);
+        $window->destroy();
+        terminate();
+        die($e->message());
+    }
+    assert(!$again->destroyed(), 'new program');
+    assert($again->linked(), 'recompiled linked');
+
+    $shaders->destroy($state);
+    $window->destroy();
+    terminate();
+}

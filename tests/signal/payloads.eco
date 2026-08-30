@@ -1,0 +1,107 @@
+/**
+ * Signal payload fields. No window — the producer holds that.
+ */
+
+use visu::ecs::Entity;
+use visu::math::Vec2;
+use visu::os::key;
+use visu::os::mouse;
+use visu::signal::{
+    Char, CharMod, Click, ConsoleCommand, Cursor, CursorEnter, Drop,
+    EntitySelected, Key, MouseButton, Pick, Scroll
+};
+
+test console_command_parts
+{
+    ConsoleCommand $cmd = ConsoleCommand('spawn box');
+    assert($cmd->raw == 'spawn box', 'raw');
+    assert($cmd->parts->count() == 2, 'n');
+    assert($cmd->isAction('spawn'), 'action');
+    assert(!$cmd->isAction('kill'), 'other');
+}
+
+test entity_selected
+{
+    Entity $e = Entity(index: 3, version: 1);
+    EntitySelected $sel = EntitySelected($e, Pick::picker);
+    assert($sel->entity == $e, 'entity');
+    bool $fromPicker = match ($sel->pick) {
+        Pick::picker => true,
+    };
+    assert($fromPicker, 'picker');
+}
+
+test key_fields
+{
+    int32 $mods = key::MOD_SHIFT | key::MOD_CONTROL;
+    Key $k = Key(key::A, 0, key::PRESS, $mods);
+    assert($k->key == key::A, 'key');
+    assert($k->action == key::PRESS, 'press');
+    assert($k->isShift(), 'shift');
+    assert($k->isControl(), 'control');
+    assert(!$k->isAlt(), 'alt');
+    assert(!$k->isSuper(), 'super');
+    assert(!$k->isCapsLock(), 'caps');
+    assert(!$k->isNumLock(), 'num');
+}
+
+test char_text_utf8
+{
+    Char $a = Char(65);
+    string $at = guard $a->text() else {
+        die('A');
+    }
+    assert($at == 'A', 'A');
+    Char $e = Char(0xE9);
+    string $et = guard $e->text() else {
+        die('e-acute');
+    }
+    assert($et == 'é', 'e-acute');
+    string? $bad = Char(-1)->text();
+    assert($bad == null, 'invalid');
+    CharMod $cm = CharMod(66, 0);
+    string $bt = guard $cm->text() else {
+        die('B');
+    }
+    assert($bt == 'B', 'B');
+}
+
+test mouse_button_fields
+{
+    MouseButton $left = MouseButton(mouse::LEFT, key::PRESS, 0);
+    assert($left->isLeft(), 'left');
+    assert($left->isLeftDown(), 'down');
+    assert(!$left->isLeftUp(), 'not up');
+    MouseButton $right = MouseButton(mouse::RIGHT, key::RELEASE, 0);
+    assert($right->isRight(), 'right');
+    assert($right->isRightUp(), 'up');
+    assert(!$right->isRightDown(), 'not down');
+    MouseButton $mid = MouseButton(mouse::MIDDLE, key::PRESS, 0);
+    assert($mid->isMiddle(), 'middle');
+    assert($mid->isMiddleDown(), 'mid down');
+    assert(!$mid->isMiddleUp(), 'mid not up');
+}
+
+test click_cursor_scroll_enter_drop
+{
+    Vec2 $pos = Vec2(4.0f, 8.0f);
+    Vec2 $start = Vec2(1.0f, 2.0f);
+    Click $click = Click(0, $pos, $start, 5.0f);
+    assert($click->travel == 5.0f, 'travel');
+    assert($click->position->x == 4.0f, 'px');
+    Cursor $cursor = Cursor(10.0, 20.0, 1.0, -2.0);
+    assert($cursor->x == 10.0, 'x');
+    assert($cursor->offsetY == -2.0, 'oy');
+    Scroll $scroll = Scroll(0.0, 3.0);
+    assert($scroll->y == 3.0, 'sy');
+    CursorEnter $enter = CursorEnter(true);
+    assert($enter->entered, 'in');
+    CursorEnter $leave = CursorEnter(false);
+    assert(!$leave->entered, 'out');
+    array<string> $paths = array<string>();
+    $paths->push('a.obj');
+    $paths->push('b.png');
+    Drop $drop = Drop($paths);
+    assert($drop->paths->count() == 2, 'n');
+    assert($drop->paths[0] == 'a.obj', 'first');
+}

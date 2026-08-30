@@ -7,6 +7,14 @@ public struct Quat
     public float32 $z;
     public float32 $w;
 
+    public constructor()
+    {
+        $this->x = 0.0f;
+        $this->y = 0.0f;
+        $this->z = 0.0f;
+        $this->w = 1.0f;
+    }
+
     public constructor(float32 $x, float32 $y, float32 $z, float32 $w)
     {
         $this->x = $x;
@@ -17,7 +25,7 @@ public struct Quat
 
     public static function identity() : Quat
     {
-        return Quat(0.0f, 0.0f, 0.0f, 1.0f);
+        return Quat();
     }
 
     public constructor(angleAxis: float32 $radians, Vec3 $axis)
@@ -225,21 +233,28 @@ public function mix(Quat $a, Quat $b, float32 $t) : Quat
 
     if ($cosTheta < 0.0f) {
         $end = -$b;
+    }
+
+    return normalize($a * (1.0f - $t) + $end * $t);
+}
+
+public function slerp(Quat $a, Quat $b, float32 $t) : Quat
+{
+    $cosTheta = dot($a, $b);
+    Quat $end = $b;
+
+    if ($cosTheta < 0.0f) {
+        $end = -$b;
         $cosTheta = -$cosTheta;
     }
 
     if ($cosTheta > 0.9995f) {
-        return normalize($a * (1.0f - $t) + $end * $t);
+        return mix($a, $end, $t);
     }
 
     $angle = std::math::acos($cosTheta);
 
     return ($a * std::math::sin((1.0f - $t) * $angle) + $end * std::math::sin($t * $angle)) / std::math::sin($angle);
-}
-
-public function slerp(Quat $a, Quat $b, float32 $t) : Quat
-{
-    return mix($a, $b, $t);
 }
 
 #[inline]
@@ -254,7 +269,7 @@ public function equal(Quat $a, Quat $b, float32 $eps) : bool
 #[inline]
 public function equal(Quat $a, Quat $b) : bool
 {
-    return equal($a, $b, 0.0001f);
+    return equal($a, $b, EPS);
 }
 
 #[inline]

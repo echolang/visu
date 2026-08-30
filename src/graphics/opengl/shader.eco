@@ -1,0 +1,59 @@
+/**
+ * OpenGL shader helpers used by Gpu. Not the public shader types
+ * (those live in graphics/shader/).
+ */
+
+namespace visu::graphics;
+
+internal function glShaderKind(ShaderKind $kind) : uint32
+{
+    return match ($kind) {
+        ShaderKind::vertex => gl::VERTEX_SHADER,
+        ShaderKind::fragment => gl::FRAGMENT_SHADER,
+        ShaderKind::geometry => gl::GEOMETRY_SHADER,
+        ShaderKind::tessControl => gl::TESS_CONTROL_SHADER,
+        ShaderKind::tessEvaluation => gl::TESS_EVALUATION_SHADER,
+    };
+}
+
+internal function glShaderInfoLog(uint32 $id) : string
+{
+    return glInfoLog($id, true);
+}
+
+internal function glProgramInfoLog(uint32 $id) : string
+{
+    return glInfoLog($id, false);
+}
+
+internal function glInfoLog(uint32 $id, bool $shader) : string
+{
+    int32 $len = 0;
+
+    if ($shader) {
+        gl::GetShaderiv($id, gl::INFO_LOG_LENGTH, &$len);
+    } else {
+        gl::GetProgramiv($id, gl::INFO_LOG_LENGTH, &$len);
+    }
+
+    if ($len <= 1) {
+        return '';
+    }
+
+    string $log = '';
+    $log->reserve($len as usize);
+    ptr<uint8> $buf = $log->spare();
+    int32 $written = 0;
+
+    if ($shader) {
+        gl::GetShaderInfoLog($id, $len, &$written, $buf);
+    } else {
+        gl::GetProgramInfoLog($id, $len, &$written, $buf);
+    }
+
+    if ($written > 0) {
+        $log->commit($written as usize);
+    }
+
+    return $log;
+}

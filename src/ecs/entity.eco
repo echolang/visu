@@ -1,0 +1,56 @@
+/**
+ * Versioned entity id. Packed like EnTT's 32-bit entity: 20 bits of
+ * index, 12 bits of generation. Destroy bumps the generation so a
+ * stale id is never valid after the index is recycled.
+ */
+
+namespace visu::ecs;
+
+internal const uint32 ENTITY_INDEX_MASK = 0x000FFFFF;
+internal const uint32 ENTITY_VERSION_SHIFT = 20;
+internal const uint32 ENTITY_VERSION_MASK = 0x00000FFF;
+internal const uint32 ENTITY_NULL_ID = 0xFFFFFFFF;
+
+public struct Entity
+{
+    public const uint32 $id;
+
+    public constructor(uint32 $id)
+    {
+        $this->id = $id;
+    }
+
+    public constructor(index: uint32 $index, version: uint32 $version)
+    {
+        $this->id = ($version << ENTITY_VERSION_SHIFT) | $index;
+    }
+
+    public static function none() : Entity
+    {
+        return Entity(ENTITY_NULL_ID);
+    }
+
+    #[inline]
+    public const function index() : uint32
+    {
+        return $this->id & ENTITY_INDEX_MASK;
+    }
+
+    #[inline]
+    public const function version() : uint32
+    {
+        return $this->id >> ENTITY_VERSION_SHIFT;
+    }
+}
+
+#[inline]
+operator (Entity $a) == (Entity $b) : bool
+{
+    return $a->id == $b->id;
+}
+
+#[inline]
+operator (Entity $a) != (Entity $b) : bool
+{
+    return $a->id != $b->id;
+}

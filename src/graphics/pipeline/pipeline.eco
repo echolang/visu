@@ -30,18 +30,16 @@ public class Pipeline
     private Pool $pool;
     private Frame $frame;
     private array<Pass> $passes;
-    private map<string, int32> $names;
+    private map<string, bool> $names;
     private array<Io> $io;
-    private int32 $nextId;
 
     public constructor(Pool $pool, Frame $frame, RenderTarget $backbuffer)
     {
         $this->pool = $pool;
         $this->frame = $frame;
         $this->passes = array<Pass>();
-        $this->names = map<string, int32>();
+        $this->names = map<string, bool>();
         $this->io = array<Io>();
-        $this->nextId = 0;
 
         TargetRef $bb = $this->importTarget('backbuffer', $backbuffer);
         $this->frame->set(Backbuffer($bb));
@@ -54,7 +52,7 @@ public class Pipeline
 
     public function createTargetLike(string $name, const RenderTarget& $like) : TargetRef
     {
-        TargetRef $ref = $this->makeTarget($name, $like->width(), $like->height(), false);
+        TargetRef $ref = $this->makeTarget($name, $like->width, $like->height, false);
         $ref->contentScaleX = $like->contentScaleX;
         $ref->contentScaleY = $like->contentScaleY;
         return $ref;
@@ -62,7 +60,7 @@ public class Pipeline
 
     public function importTarget(string $name, RenderTarget $target) : TargetRef
     {
-        TargetRef $ref = $this->makeTarget($name, $target->width(), $target->height(), $imported: true);
+        TargetRef $ref = $this->makeTarget($name, $target->width, $target->height, $imported: true);
         $ref->contentScaleX = $target->contentScaleX;
         $ref->contentScaleY = $target->contentScaleY;
         $this->pool->setTarget($ref, $target);
@@ -90,9 +88,19 @@ public class Pipeline
         return $ref;
     }
 
+    /**
+     * Graph handle for a standalone 2D texture. GPU storage comes
+     * from importTexture or from getTarget when used as an attachment.
+     */
+    public function createTexture(string $name, int32 $width, int32 $height, TextureOptions $options) : TextureRef
+    {
+        return $this->makeTexture($name, $width, $height, $options, false);
+    }
+
     public function importTexture(string $name, Texture $texture) : TextureRef
     {
-        TextureRef $ref = $this->makeTexture($name, $texture->width(), $texture->height(), TextureOptions::color(), $imported: true);
+        TextureOptions $opt = TextureOptions();
+        TextureRef $ref = $this->makeTexture($name, $texture->width, $texture->height, $opt, $imported: true);
         $this->pool->setTexture($ref, $texture);
         return $ref;
     }
@@ -142,23 +150,19 @@ public class Pipeline
     private function makeTarget(string $name, int32 $width, int32 $height, bool $imported) : TargetRef
     {
         $this->claimName($name);
-        int32 $id = $this->nextId;
-        $this->nextId = $this->nextId + 1;
-        return TargetRef($id, $name, $width, $height, $imported);
+        return TargetRef($name, $width, $height, $imported);
     }
 
     private function makeTexture(string $name, int32 $width, int32 $height, TextureOptions $options, bool $imported) : TextureRef
     {
         $this->claimName($name);
-        int32 $id = $this->nextId;
-        $this->nextId = $this->nextId + 1;
-        return TextureRef($id, $name, $width, $height, $options, $imported);
+        return TextureRef($name, $width, $height, $options, $imported);
     }
 
     private function claimName(string $name) : void
     {
         assert(!$this->names->has($name), 'pipeline: duplicate resource name');
-        $this->names[$name] = $this->nextId;
+        $this->names[$name] = true;
     }
 
     private function touchIo() : void

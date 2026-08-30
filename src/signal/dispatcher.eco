@@ -1,0 +1,199 @@
+/**
+ * Type-keyed event bus. The payload type is the key (no string names).
+ * N handlers, many events per type per tick — the other shape from
+ * Frame (one producer per type per cycle).
+ */
+
+namespace visu::signal;
+
+private class Handler<T>
+{
+    public int32 $id;
+    public int32 $priority;
+    public function<Flow(const T&)> $fn;
+
+    public constructor(int32 $id, int32 $priority, function<Flow(const T&)> $fn)
+    {
+        $this->id = $id;
+        $this->priority = $priority;
+        $this->fn = $fn;
+    }
+}
+
+private class Bucket<T>
+{
+    public array<Handler<T>> $handlers;
+
+    public constructor()
+    {
+        $this->handlers = array<Handler<T>>();
+    }
+
+    public function insert(Handler<T> $handler) : void
+    {
+        array<Handler<T>> $next = array<Handler<T>>();
+        bool $placed = false;
+
+        foreach ($this->handlers as $existing) {
+            if (!$placed && $handler->priority < $existing->priority) {
+                $next->push($handler);
+                $placed = true;
+            }
+
+            $next->push($existing);
+        }
+
+        if (!$placed) {
+            $next->push($handler);
+        }
+
+        $this->handlers = $next;
+    }
+
+    public function release(int32 $id) : void
+    {
+        array<Handler<T>> $kept = array<Handler<T>>();
+
+        foreach ($this->handlers as $existing) {
+            if ($existing->id == $id) {
+                continue;
+            }
+
+            $kept->push($existing);
+        }
+
+        $this->handlers = $kept;
+    }
+
+    public function emit(const T& $signal) : void
+    {
+        // snapshot so register/unregister during dispatch cannot
+        // invalidate the walk
+        array<Handler<T>> $shot = $this->handlers->clone();
+
+        foreach ($shot as $handler) {
+            function<Flow(const T&)> $fn = $handler->fn;
+            Flow $flow = $fn($signal);
+
+            if ($flow == Flow::stop) {
+                return;
+            }
+        }
+    }
+}
+
+public class Dispatcher
+{
+    private map<type_id, erased> $buckets;
+    private int32 $nextId;
+
+    public constructor()
+    {
+        $this->buckets = map<type_id, erased>();
+        $this->nextId = 0;
+    }
+
+    /**
+     * Lower priority runs first. Equal priority keeps registration
+     * order. Returns an id for unregister.
+     */
+    public function register<T>(function<Flow(const T&)> $fn, int32 $priority = 0) : int32
+    {
+        int32 $id = $this->nextHandle();
+        $this->bind<T>($id, $fn, $priority);
+        return $id;
+    }
+
+    public function unregister<T>(int32 $id) : void
+    {
+        Bucket<T> $bucket = guard $this->findBucket<T>() else {
+            return;
+        }
+        $bucket->release($id);
+    }
+
+    /**
+     * No listeners is a no-op, not a wiring bug.
+     */
+    public function dispatch<T>(const T& $signal) : void
+    {
+        Bucket<T> $bucket = guard $this->findBucket<T>() else {
+            return;
+        }
+        $bucket->emit($signal);
+    }
+
+    public function queue<T>(int32 $priority = 0) : Queue<T>
+    {
+        return $this->makeQueue<T>(null, $priority);
+    }
+
+    public function queue<T>(limit: int32 $cap, int32 $priority = 0) : Queue<T>
+    {
+        assert($cap >= 0, 'signal queue: limit is negative');
+        return $this->makeQueue<T>($cap as usize, $priority);
+    }
+
+    public function unqueue<T>(Queue<T> $queue) : void
+    {
+        $this->unregister<T>($queue->id);
+    }
+
+    public function clear<T>() : void
+    {
+        $this->buckets->remove(type_id<T>());
+    }
+
+    public function clearAll() : void
+    {
+        $this->buckets->clear();
+    }
+
+    private function nextHandle() : int32
+    {
+        int32 $id = $this->nextId;
+        $this->nextId = $this->nextId + 1;
+        return $id;
+    }
+
+    private function bind<T>(int32 $id, function<Flow(const T&)> $fn, int32 $priority) : void
+    {
+        Bucket<T> $bucket = $this->bucket<T>();
+        $bucket->insert(Handler<T>($id, $priority, $fn));
+    }
+
+    private function makeQueue<T>(usize? $cap, int32 $priority) : Queue<T>
+    {
+        int32 $id = $this->nextHandle();
+        Queue<T> $queue = Queue<T>($id, $cap);
+        $this->bind<T>($id, function(const T& $signal) : Flow {
+            $queue->push($signal);
+            return .proceed;
+        }, $priority);
+        return $queue;
+    }
+
+    private function bucket<T>() : Bucket<T>
+    {
+        Bucket<T> $existing = guard $this->findBucket<T>() else {
+            Bucket<T> $created = Bucket<T>();
+            $this->buckets[type_id<T>()] = erased::from($created);
+            return $created;
+        }
+
+        return $existing;
+    }
+
+    private function findBucket<T>() : Bucket<T>?
+    {
+        type_id $id = type_id<T>();
+        if (!$this->buckets->has($id)) {
+            return null;
+        }
+
+        erased $held = $this->buckets->get($id);
+        unsafe {
+            return assume<Bucket<T>>($held);
+        }
+    }
+}

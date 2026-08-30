@@ -1,0 +1,68 @@
+/**
+ * One compiled shader object (vertex, fragment, …). Construct
+ * allocates a GL name; an owned stage must be destroy()ed with a
+ * Gpu& before it is dropped. After attach, ShaderProgram.destroy
+ * takes the stages with it.
+ */
+
+namespace visu::graphics;
+
+public class ShaderStage : GpuObject
+{
+    public const uint32 $id;
+    public const ShaderKind $kind;
+    private bool $dead;
+    private bool $compiled;
+
+    public constructor(Gpu& $state, ShaderKind $kind, string $source = '')
+    {
+        $this->id = $state->createShader($kind);
+        $this->kind = $kind;
+        $this->dead = false;
+        $this->compiled = false;
+
+        if (!$source->empty()) {
+            $state->shaderSource($this->id, $source);
+        }
+    }
+
+    destructor()
+    {
+        assert($this->dead, 'ShaderStage dropped without destroy');
+    }
+
+    public function source(Gpu& $state, string $source) : void
+    {
+        $state->shaderSource($this->id, $source);
+        $this->compiled = false;
+    }
+
+    public function compiled(Gpu& $state) : bool
+    {
+        return $this->compiled;
+    }
+
+    public function compile(Gpu& $state) : result<bool, ShaderError>
+    {
+        $state->compileShader($this->id);
+
+        if (!$state->shaderCompiled($this->id)) {
+            $this->compiled = false;
+            return .error(.compile($state->shaderInfoLog($this->id)));
+        }
+
+        $this->compiled = true;
+        return .ok(true);
+    }
+
+    public function destroy(Gpu& $state) : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $state->deleteShader($this->id);
+        $this->dead = true;
+        $this->compiled = false;
+    }
+}

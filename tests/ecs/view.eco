@@ -1,0 +1,96 @@
+/**
+ * Sparse set: packed iteration, O(1) lookup, swap-and-pop remove.
+ */
+
+use visu::ecs::{Entity, View};
+
+test view_attach_get_and_has
+{
+    View<Position> $view = View<Position>();
+    Entity $e = Entity(index: 0, version: 0);
+    assert(!$view->contains($e), 'empty');
+    $view->attach($e, Position(1.0f, 2.0f));
+    assert($view->contains($e), 'has');
+    assert($view->size() == 1, 'size');
+    Position& $p = $view->get($e);
+    assert($p->x == 1.0f, 'x');
+    $p->x = 9.0f;
+    assert($view->get($e)->x == 9.0f, 'mut');
+}
+
+test view_find_miss_is_null
+{
+    View<Position> $view = View<Position>();
+    Entity $e = Entity(index: 0, version: 0);
+    ptr<Position> $miss = $view->find($e);
+    assert($miss:$ == null, 'miss');
+    $view->attach($e, Position(1.0f, 0.0f));
+    ptr<Position> $hit = $view->find($e);
+    assert($hit:$ != null, 'hit');
+}
+
+test view_replace_keeps_dense_size
+{
+    View<Position> $view = View<Position>();
+    Entity $e = Entity(index: 0, version: 0);
+    $view->attach($e, Position(1.0f, 0.0f));
+    $view->attach($e, Position(2.0f, 0.0f));
+    assert($view->size() == 1, 'size');
+    assert($view->get($e)->x == 2.0f, 'replaced');
+}
+
+test view_erase_swap_and_pop
+{
+    View<Position> $view = View<Position>();
+    Entity $a = Entity(index: 0, version: 0);
+    Entity $b = Entity(index: 1, version: 0);
+    Entity $c = Entity(index: 2, version: 0);
+    $view->attach($a, Position(1.0f, 0.0f));
+    $view->attach($b, Position(2.0f, 0.0f));
+    $view->attach($c, Position(3.0f, 0.0f));
+    $view->erase($b);
+    assert($view->size() == 2, 'size');
+    assert(!$view->contains($b), 'gone');
+    assert($view->contains($a), 'a');
+    assert($view->contains($c), 'c');
+    assert($view->get($a)->x == 1.0f, 'a x');
+    assert($view->get($c)->x == 3.0f, 'c x');
+}
+
+test view_iteration_is_dense
+{
+    View<Position> $view = View<Position>();
+    Entity $a = Entity(index: 0, version: 0);
+    Entity $b = Entity(index: 4, version: 0);
+    $view->attach($a, Position(1.0f, 0.0f));
+    $view->attach($b, Position(2.0f, 0.0f));
+    int32 $n = 0;
+    float32 $sum = 0.0f;
+    foreach ($view as $e => &$p) {
+        $n = $n + 1;
+        $sum = $sum + $p->x;
+        $p->x = $p->x + 10.0f;
+    }
+    assert($n == 2, 'count');
+    assert($sum == 3.0f, 'sum');
+    assert($view->get($a)->x == 11.0f, 'a mut');
+    assert($view->get($b)->x == 12.0f, 'b mut');
+}
+
+test view_stale_entity_does_not_match
+{
+    View<Position> $view = View<Position>();
+    Entity $old = Entity(index: 0, version: 0);
+    Entity $fresh = Entity(index: 0, version: 1);
+    $view->attach($fresh, Position(5.0f, 0.0f));
+    assert(!$view->contains($old), 'stale');
+    assert($view->contains($fresh), 'fresh');
+}
+
+#[tests: expects death]
+test view_get_missing_dies
+{
+    View<Position> $view = View<Position>();
+    Entity $e = Entity(index: 0, version: 0);
+    Position& $p = $view->get($e);
+}
