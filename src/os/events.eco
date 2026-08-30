@@ -1,0 +1,264 @@
+/**
+ * Window event handler and the GLFW callback bridge.
+ *
+ * GLFW takes C function pointers, not methods. Named functions look the
+ * window up through a table of weaks so the table never keeps a window
+ * alive.
+ */
+
+namespace visu::os;
+
+public interface WindowEventHandler
+{
+    function handleKey(Window $window, int32 $key, int32 $scancode, int32 $action, int32 $mods) : void;
+    function handleChar(Window $window, int32 $codepoint) : void;
+    function handleCharMods(Window $window, int32 $codepoint, int32 $mods) : void;
+    function handleMouseButton(Window $window, int32 $button, int32 $action, int32 $mods) : void;
+    function handleCursorPos(Window $window, float64 $x, float64 $y) : void;
+    function handleCursorEnter(Window $window, bool $entered) : void;
+    function handleScroll(Window $window, float64 $x, float64 $y) : void;
+    function handleDrop(Window $window, array<string> $paths) : void;
+    function handleWillPoll(Window $window) : void;
+    function handleDidPoll(Window $window) : void;
+}
+
+/**
+ * Optional callbacks. Echo has no class inheritance, so this is the
+ * empty handler: set the fields you care about.
+ */
+public class WindowEventAdapter : WindowEventHandler
+{
+    public function<void(Window, int32, int32, int32, int32)>? $onKey = null;
+    public function<void(Window, int32)>? $onChar = null;
+    public function<void(Window, int32, int32)>? $onCharMods = null;
+    public function<void(Window, int32, int32, int32)>? $onMouseButton = null;
+    public function<void(Window, float64, float64)>? $onCursorPos = null;
+    public function<void(Window, bool)>? $onCursorEnter = null;
+    public function<void(Window, float64, float64)>? $onScroll = null;
+    public function<void(Window, array<string>)>? $onDrop = null;
+    public function<void(Window)>? $onWillPoll = null;
+    public function<void(Window)>? $onDidPoll = null;
+
+    public function handleKey(Window $window, int32 $key, int32 $scancode, int32 $action, int32 $mods) : void
+    {
+        function<void(Window, int32, int32, int32, int32)> $fn = guard $this->onKey else {
+            return;
+        }
+        $fn($window, $key, $scancode, $action, $mods);
+    }
+
+    public function handleChar(Window $window, int32 $codepoint) : void
+    {
+        function<void(Window, int32)> $fn = guard $this->onChar else {
+            return;
+        }
+        $fn($window, $codepoint);
+    }
+
+    public function handleCharMods(Window $window, int32 $codepoint, int32 $mods) : void
+    {
+        function<void(Window, int32, int32)> $fn = guard $this->onCharMods else {
+            return;
+        }
+        $fn($window, $codepoint, $mods);
+    }
+
+    public function handleMouseButton(Window $window, int32 $button, int32 $action, int32 $mods) : void
+    {
+        function<void(Window, int32, int32, int32)> $fn = guard $this->onMouseButton else {
+            return;
+        }
+        $fn($window, $button, $action, $mods);
+    }
+
+    public function handleCursorPos(Window $window, float64 $x, float64 $y) : void
+    {
+        function<void(Window, float64, float64)> $fn = guard $this->onCursorPos else {
+            return;
+        }
+        $fn($window, $x, $y);
+    }
+
+    public function handleCursorEnter(Window $window, bool $entered) : void
+    {
+        function<void(Window, bool)> $fn = guard $this->onCursorEnter else {
+            return;
+        }
+        $fn($window, $entered);
+    }
+
+    public function handleScroll(Window $window, float64 $x, float64 $y) : void
+    {
+        function<void(Window, float64, float64)> $fn = guard $this->onScroll else {
+            return;
+        }
+        $fn($window, $x, $y);
+    }
+
+    public function handleDrop(Window $window, array<string> $paths) : void
+    {
+        function<void(Window, array<string>)> $fn = guard $this->onDrop else {
+            return;
+        }
+        $fn($window, $paths);
+    }
+
+    public function handleWillPoll(Window $window) : void
+    {
+        function<void(Window)> $fn = guard $this->onWillPoll else {
+            return;
+        }
+        $fn($window);
+    }
+
+    public function handleDidPoll(Window $window) : void
+    {
+        function<void(Window)> $fn = guard $this->onDidPoll else {
+            return;
+        }
+        $fn($window);
+    }
+}
+
+internal struct WindowTable
+{
+    public static array<weak<Window>> $slots = array<weak<Window>>();
+}
+
+internal function windowRegister(Window $window) : void
+{
+    weak<Window> $ref = &$window;
+    WindowTable::$slots->push($ref);
+}
+
+internal function windowUnregister(Window $window) : void
+{
+    array<weak<Window>> $kept = array<weak<Window>>();
+    array<weak<Window>> $slots = WindowTable::$slots;
+    ptr<glfw::Window> $gone = $window->glfwHandle();
+
+    foreach ($slots as $ref) {
+        Window $live = guard strong($ref) else {
+            continue;
+        }
+
+        ptr<glfw::Window> $existing = $live->glfwHandle();
+
+        if ($existing:$ == $gone:$) {
+            continue;
+        }
+
+        $kept->push($ref);
+    }
+
+    WindowTable::$slots = $kept;
+}
+
+internal function windowOf(ptr<glfw::Window> $handle) : Window?
+{
+    array<weak<Window>> $kept = array<weak<Window>>();
+    array<weak<Window>> $slots = WindowTable::$slots;
+    Window? $found = null;
+
+    foreach ($slots as $ref) {
+        Window $live = guard strong($ref) else {
+            continue;
+        }
+
+        $kept->push($ref);
+        ptr<glfw::Window> $existing = $live->glfwHandle();
+
+        if ($existing:$ == $handle:$ && $found == null) {
+            $found = $live;
+        }
+    }
+
+    WindowTable::$slots = $kept;
+    return $found;
+}
+
+internal function onKey(ptr<glfw::Window> $handle, int32 $key, int32 $scancode, int32 $action, int32 $mods) : void
+{
+    Window $window = guard windowOf($handle) else {
+        return;
+    }
+    $window->triggerKey($key, $scancode, $action, $mods);
+}
+
+internal function onChar(ptr<glfw::Window> $handle, uint32 $codepoint) : void
+{
+    Window $window = guard windowOf($handle) else {
+        return;
+    }
+    $window->triggerChar($codepoint as int32);
+}
+
+internal function onCharMods(ptr<glfw::Window> $handle, uint32 $codepoint, int32 $mods) : void
+{
+    Window $window = guard windowOf($handle) else {
+        return;
+    }
+    $window->triggerCharMods($codepoint as int32, $mods);
+}
+
+internal function onMouseButton(ptr<glfw::Window> $handle, int32 $button, int32 $action, int32 $mods) : void
+{
+    Window $window = guard windowOf($handle) else {
+        return;
+    }
+    $window->triggerMouseButton($button, $action, $mods);
+}
+
+internal function onCursorPos(ptr<glfw::Window> $handle, float64 $x, float64 $y) : void
+{
+    Window $window = guard windowOf($handle) else {
+        return;
+    }
+    $window->triggerCursorPos($x, $y);
+}
+
+internal function onCursorEnter(ptr<glfw::Window> $handle, int32 $entered) : void
+{
+    Window $window = guard windowOf($handle) else {
+        return;
+    }
+    $window->triggerCursorEnter($entered == glfw::TRUE);
+}
+
+internal function onScroll(ptr<glfw::Window> $handle, float64 $x, float64 $y) : void
+{
+    Window $window = guard windowOf($handle) else {
+        return;
+    }
+    $window->triggerScroll($x, $y);
+}
+
+internal function onDrop(ptr<glfw::Window> $handle, int32 $count, ptr<ptr<const uint8>> $paths) : void
+{
+    Window $window = guard windowOf($handle) else {
+        return;
+    }
+
+    array<string> $out = array<string>();
+    int32 $i = 0;
+
+    while ($i < $count) {
+        ptr<const uint8> $p = $paths:$[$i];
+
+        if ($p:$ != null) {
+            $out->push(str::from($p:$));
+        }
+
+        $i = $i + 1;
+    }
+
+    $window->triggerDrop($out);
+}
+
+internal function onSize(ptr<glfw::Window> $handle, int32 $width, int32 $height) : void
+{
+    Window $window = guard windowOf($handle) else {
+        return;
+    }
+    $window->noteSize($width, $height);
+}

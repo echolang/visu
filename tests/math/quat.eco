@@ -1,0 +1,69 @@
+test quat_identity_leaves_vector
+{
+    visu::math::Vec3 $v = visu::math::Vec3(1.0f, 2.0f, 3.0f);
+    visu::math::Vec3 $out = visu::math::Quat::identity() * $v;
+
+    assert(visu::math::equal($out, $v));
+}
+
+test quat_euler_zero_is_identity
+{
+    visu::math::Quat $q = visu::math::Quat(euler: visu::math::Vec3(0.0f));
+
+    assert(visu::math::equal($q, visu::math::Quat::identity()));
+}
+
+test angleAxis_y_rotates_x_to_neg_z
+{
+    visu::math::Quat $q = visu::math::Quat(angleAxis: std::math::HALF_PI_F32, visu::math::Vec3(0.0f, 1.0f, 0.0f));
+    visu::math::Vec3 $out = $q * visu::math::Vec3(1.0f, 0.0f, 0.0f);
+
+    assert(visu::math::equal($out, visu::math::Vec3(0.0f, 0.0f, -1.0f), 0.001f));
+}
+
+test quat_hamilton_composes
+{
+    visu::math::Quat $yaw = visu::math::Quat(angleAxis: std::math::HALF_PI_F32, visu::math::Vec3(0.0f, 1.0f, 0.0f));
+    visu::math::Quat $twice = $yaw * $yaw;
+    visu::math::Vec3 $out = $twice * visu::math::Vec3(1.0f, 0.0f, 0.0f);
+
+    assert(visu::math::equal($out, visu::math::Vec3(-1.0f, 0.0f, 0.0f), 0.001f));
+}
+
+test slerp_endpoints
+{
+    visu::math::Quat $a = visu::math::Quat::identity();
+    visu::math::Quat $b = visu::math::Quat(angleAxis: std::math::HALF_PI_F32, visu::math::Vec3(0.0f, 0.0f, 1.0f));
+
+    assert(visu::math::equal(visu::math::slerp($a, $b, 0.0f), $a, 0.001f));
+    assert(visu::math::equal(visu::math::normalize(visu::math::slerp($a, $b, 1.0f)), visu::math::normalize($b), 0.001f));
+}
+
+test mat4_from_quat_matches_rotate
+{
+    visu::math::Quat $q = visu::math::Quat(angleAxis: std::math::PI_F32 / 3.0f, visu::math::Vec3(0.0f, 1.0f, 0.0f));
+    visu::math::Mat4 $fromQ = visu::math::Mat4($q);
+    visu::math::Mat4 $fromR = visu::math::rotate(radians: std::math::PI_F32 / 3.0f, axis: visu::math::Vec3(0.0f, 1.0f, 0.0f));
+
+    assert(visu::math::equal($fromQ, $fromR, 0.001f));
+}
+
+test quat_from_mat4_roundtrip
+{
+    visu::math::Quat $q = visu::math::normalize(visu::math::Quat(angleAxis: 0.7f, visu::math::Vec3(0.2f, 0.8f, 0.3f)));
+    visu::math::Quat $back = visu::math::Quat(visu::math::Mat4($q));
+
+    if (visu::math::dot($q, $back) < 0.0f) {
+        $back = -$back;
+    }
+
+    assert(visu::math::equal($q, visu::math::normalize($back), 0.001f));
+}
+
+test conjugate_inverts_unit_quat
+{
+    visu::math::Quat $q = visu::math::Quat(angleAxis: 0.4f, visu::math::Vec3(0.0f, 0.0f, 1.0f));
+    visu::math::Quat $id = $q * visu::math::conjugate($q);
+
+    assert(visu::math::equal($id, visu::math::Quat::identity(), 0.001f));
+}

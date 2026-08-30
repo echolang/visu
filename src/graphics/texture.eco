@@ -1,0 +1,158 @@
+/**
+ * A 2D GPU texture. Construct allocates a name; allocateEmpty fills
+ * storage. An owned texture must be destroy()ed with a Gpu& before
+ * it is dropped.
+ */
+
+namespace visu::graphics;
+
+public enum Filter
+{
+    case nearest;
+    case linear;
+    case nearestMipmapNearest;
+    case nearestMipmapLinear;
+    case linearMipmapNearest;
+    case linearMipmapLinear;
+
+    public const function mipmapped() : bool
+    {
+        return match ($this) {
+            Filter::nearest => false,
+            Filter::linear => false,
+            else => true,
+        };
+    }
+}
+
+public enum Wrap
+{
+    case repeat;
+    case mirroredRepeat;
+    case clampToEdge;
+    case clampToBorder;
+}
+
+public struct TextureOptions
+{
+    public PixelFormat $format = .rgba;
+    public Filter $min = .linear;
+    public Filter $mag = .linear;
+    public Wrap $wrapS = .clampToEdge;
+    public Wrap $wrapT = .clampToEdge;
+    public bool $mipmaps = false;
+
+    /**
+     * Color attachment defaults: rgba, linear, clamp, no mipmaps.
+     */
+    public static function color() : TextureOptions
+    {
+        return TextureOptions();
+    }
+
+    /**
+     * Depth attachment defaults: depthComponent, nearest, clamp, no mipmaps.
+     */
+    public static function depth() : TextureOptions
+    {
+        return TextureOptions($format: .depthComponent, $min: .nearest, $mag: .nearest);
+    }
+}
+
+public class Texture : GpuObject
+{
+    /**
+     * GPU texture name.
+     */
+    public const uint32 $id;
+
+    /**
+     * Texture target this name is bound as.
+     */
+    public const TextureTarget $target;
+
+    /**
+     * Debug name. Identity for the GPU is $id.
+     */
+    public const string $name;
+
+    /**
+     * True when this object created the GL name and must delete it.
+     */
+    public const bool $owned;
+
+    private bool $dead;
+    private int32 $width;
+    private int32 $height;
+
+    /**
+     * Allocates a 2D texture name.
+     */
+    public constructor(Gpu& $state, string $name)
+    {
+        $this->id = $state->createTexture();
+        $this->target = .texture2D;
+        $this->name = $name;
+        $this->owned = true;
+        $this->dead = false;
+        $this->width = 0;
+        $this->height = 0;
+    }
+
+    destructor()
+    {
+        assert(!$this->owned || $this->dead, 'Texture dropped without destroy');
+    }
+
+    /**
+     * Deletes the GL name. No-op for an already-destroyed object.
+     */
+    public function destroy(Gpu& $state) : void
+    {
+        if (!$this->owned || $this->dead) {
+            return;
+        }
+
+        $state->deleteTexture($this->id);
+        $this->dead = true;
+    }
+
+    public const function width() : int32
+    {
+        return $this->width;
+    }
+
+    public const function height() : int32
+    {
+        return $this->height;
+    }
+
+    /**
+     * Binds this texture to `$unit` (TEXTURE0, TEXTURE1, …).
+     */
+    public function bind(Gpu& $state, uint32 $unit = TEXTURE0) : void
+    {
+        $state->bindTexture($unit, $this->target, $this->id);
+    }
+
+    /**
+     * Allocates empty storage and applies filter / wrap.
+     */
+    public function allocateEmpty(Gpu& $state, int32 $width, int32 $height, TextureOptions $opt) : void
+    {
+        assert($width > 0 && $height > 0, 'texture size must be positive');
+        assert($opt->mipmaps || !$opt->min->mipmapped(), 'mipmapped min filter needs mipmaps');
+
+        $this->bind($state);
+        $state->texFilter($this->target, $opt->min, $opt->mag);
+        $state->texWrap($this->target, $opt->wrapS, $opt->wrapT);
+        $state->texImage2D($this->target, $opt->format, $width, $height);
+
+        if ($opt->mipmaps) {
+            $state->generateMipmap($this->target);
+        }
+
+        $this->width = $width;
+        $this->height = $height;
+    }
+}

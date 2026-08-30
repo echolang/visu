@@ -1,0 +1,145 @@
+/**
+ * Attachment points, pixel formats, texture targets, framebuffer status.
+ * GLenums stay in the OpenGL impl; call sites write .rgba and ColorAttachment(0) + 1.
+ */
+
+namespace visu::graphics;
+
+public struct ColorAttachment
+{
+    public const uint32 $index;
+
+    public constructor(int32 $index)
+    {
+        assert($index >= 0 && $index < 32, 'color attachment 0..31');
+        $this->index = $index as uint32;
+    }
+
+    #[implicit]
+    public const function attachment() : Attachment
+    {
+        return Attachment::color($this);
+    }
+}
+
+operator (ColorAttachment $a) + (int32 $i) : ColorAttachment
+{
+    return ColorAttachment($a->index as int32 + $i);
+}
+
+operator (ColorAttachment $a) == (ColorAttachment $b) : bool
+{
+    return $a->index == $b->index;
+}
+
+public enum Attachment
+{
+    case color(ColorAttachment $slot);
+    case depth;
+    case stencil;
+    case depthStencil;
+}
+
+operator (Attachment $a) == (Attachment $b) : bool
+{
+    return match ($a) {
+        Attachment::color($slotA) => match ($b) {
+            Attachment::color($slotB) => $slotA == $slotB,
+            else => false,
+        },
+        Attachment::depth => match ($b) {
+            Attachment::depth => true,
+            else => false,
+        },
+        Attachment::stencil => match ($b) {
+            Attachment::stencil => true,
+            else => false,
+        },
+        Attachment::depthStencil => match ($b) {
+            Attachment::depthStencil => true,
+            else => false,
+        },
+    };
+}
+
+public struct ColorSpan
+{
+    public uint32 $from;
+    public uint32 $toExclusive;
+}
+
+operator (ColorAttachment $a) .. (ColorAttachment $b) : ColorSpan
+{
+    return ColorSpan($a->index, $b->index);
+}
+
+operator (ColorAttachment $a) ..= (ColorAttachment $b) : ColorSpan
+{
+    return ColorSpan($a->index, ($b->index + 1) as uint32);
+}
+
+public enum PixelFormat
+{
+    case rgba;
+    case r32f;
+    case depthComponent;
+    case depthStencil;
+}
+
+public enum TextureTarget
+{
+    case texture2D;
+    case cubeMap;
+}
+
+/**
+ * Framebuffer completeness. `str::from` is the status as a string.
+ */
+public enum FramebufferStatus
+{
+    case complete;
+    case undefined;
+    case incompleteAttachment;
+    case incompleteMissingAttachment;
+    case incompleteDrawBuffer;
+    case incompleteReadBuffer;
+    case unsupported;
+    case incompleteMultisample;
+    case incompleteLayerTargets;
+    case unknown(uint32 $code);
+}
+
+namespace hash;
+
+public function of(const visu::graphics::ColorAttachment& $a) : uint64
+{
+    return hash::of($a->index);
+}
+
+public function of(const visu::graphics::Attachment& $a) : uint64
+{
+    return match ($a) {
+        visu::graphics::Attachment::color($slot) => hash::combine(hash::of(0 as uint32), hash::of($slot)),
+        visu::graphics::Attachment::depth => hash::of(1 as uint32),
+        visu::graphics::Attachment::stencil => hash::of(2 as uint32),
+        visu::graphics::Attachment::depthStencil => hash::of(3 as uint32),
+    };
+}
+
+namespace str;
+
+public function from(const visu::graphics::FramebufferStatus& $s) : string
+{
+    return match ($s) {
+        visu::graphics::FramebufferStatus::complete => 'complete',
+        visu::graphics::FramebufferStatus::undefined => 'undefined',
+        visu::graphics::FramebufferStatus::incompleteAttachment => 'incomplete attachment',
+        visu::graphics::FramebufferStatus::incompleteMissingAttachment => 'incomplete missing attachment',
+        visu::graphics::FramebufferStatus::incompleteDrawBuffer => 'incomplete draw buffer',
+        visu::graphics::FramebufferStatus::incompleteReadBuffer => 'incomplete read buffer',
+        visu::graphics::FramebufferStatus::unsupported => 'unsupported',
+        visu::graphics::FramebufferStatus::incompleteMultisample => 'incomplete multisample',
+        visu::graphics::FramebufferStatus::incompleteLayerTargets => 'incomplete layer targets',
+        visu::graphics::FramebufferStatus::unknown($code) => "unknown ({$code})",
+    };
+}

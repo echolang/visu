@@ -1,0 +1,41 @@
+/**
+ * Named closures as a pass. Capture class handles (Frame, Pool);
+ * never capture Gpu — execute receives it.
+ */
+
+namespace visu::graphics;
+
+public class CallbackPass : Pass
+{
+    private string $label;
+    private function<void(Pipeline, Frame, IoSink)> $onSetup;
+    private function<result<bool, PipelineError>(Gpu&, Context)> $onExecute;
+
+    public constructor(
+        string $label,
+        setup: function<void(Pipeline, Frame, IoSink)> $onSetup,
+        execute: function<result<bool, PipelineError>(Gpu&, Context)> $onExecute
+    )
+    {
+        $this->label = $label;
+        $this->onSetup = $onSetup;
+        $this->onExecute = $onExecute;
+    }
+
+    public function name() : string
+    {
+        return $this->label;
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        function<void(Pipeline, Frame, IoSink)> $fn = $this->onSetup;
+        $fn($pipeline, $frame, $io);
+    }
+
+    public function execute(Gpu& $state, Context $ctx) : result<bool, PipelineError>
+    {
+        function<result<bool, PipelineError>(Gpu&, Context)> $fn = $this->onExecute;
+        return $fn($state, $ctx);
+    }
+}

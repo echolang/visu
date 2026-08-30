@@ -1,0 +1,95 @@
+test identity_is_diagonal
+{
+    visu::math::Mat4 $m = visu::math::Mat4();
+
+    assert(visu::math::equal($m->c0->x, 1.0f));
+    assert(visu::math::equal($m->c1->y, 1.0f));
+    assert(visu::math::equal($m->c2->z, 1.0f));
+    assert(visu::math::equal($m->c3->w, 1.0f));
+    assert(visu::math::equal($m->c0->y, 0.0f));
+    assert(visu::math::equal($m->c3->x, 0.0f));
+}
+
+test multiply_by_identity_is_unchanged
+{
+    visu::math::Mat4 $t = visu::math::translate(2.0f, 3.0f, 4.0f);
+    visu::math::Mat4 $out = $t * visu::math::Mat4();
+
+    assert(visu::math::equal($out->c3->x, 2.0f));
+    assert(visu::math::equal($out->c3->y, 3.0f));
+    assert(visu::math::equal($out->c3->z, 4.0f));
+    assert(visu::math::equal($out->c0->x, 1.0f));
+}
+
+test translate_writes_the_last_column
+{
+    visu::math::Mat4 $t = visu::math::translate(-1.0f, 0.5f, 8.0f);
+
+    assert(visu::math::equal($t->c3->x, -1.0f));
+    assert(visu::math::equal($t->c3->y, 0.5f));
+    assert(visu::math::equal($t->c3->z, 8.0f));
+    assert(visu::math::equal($t->c3->w, 1.0f));
+}
+
+test rotateY_zero_is_identity
+{
+    visu::math::Mat4 $m = visu::math::rotateY(0.0f);
+
+    assert(visu::math::equal($m->c0->x, 1.0f));
+    assert(visu::math::equal($m->c2->z, 1.0f));
+    assert(visu::math::equal($m->c0->z, 0.0f));
+    assert(visu::math::equal($m->c2->x, 0.0f));
+}
+
+test perspective_sets_clip_row
+{
+    visu::math::Mat4 $p = visu::math::perspective(fovY: std::math::PI_F32 / 2.0f, aspect: 1.0f, near: 1.0f, far: 3.0f);
+
+    assert(visu::math::equal($p->c2->w, -1.0f));
+    assert(visu::math::equal($p->c3->w, 0.0f));
+    assert(visu::math::equal($p->c0->x, 1.0f));
+    assert(visu::math::equal($p->c1->y, 1.0f));
+}
+
+test mat4_is_sixty_four_packed_bytes
+{
+    assert(mem::size<visu::math::Vec4>() == 16);
+    assert(mem::size<visu::math::Mat4>() == 64);
+}
+
+test lookAt_from_positive_z_matches_translate
+{
+    visu::math::Mat4 $view = visu::math::lookAt(
+        eye: visu::math::Vec3(0.0f, 0.0f, 3.0f),
+        center: visu::math::Vec3(0.0f, 0.0f, 0.0f),
+        up: visu::math::Vec3(0.0f, 1.0f, 0.0f)
+    );
+
+    assert(visu::math::equal($view, visu::math::translate(0.0f, 0.0f, -3.0f)));
+}
+
+test inverse_undoes_translate
+{
+    visu::math::Mat4 $t = visu::math::translate(visu::math::Vec3(2.0f, -4.0f, 8.0f));
+    visu::math::Mat4 $id = $t * visu::math::inverse($t);
+
+    assert(visu::math::equal($id, visu::math::Mat4(), 0.001f));
+}
+
+test transform_point_with_translate
+{
+    visu::math::Vec4 $p = visu::math::translate(visu::math::Vec3(1.0f, 2.0f, 3.0f)) * visu::math::Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+
+    assert(visu::math::equal($p, visu::math::Vec4(1.0f, 2.0f, 3.0f, 1.0f)));
+}
+
+test column_index_matches_fields
+{
+    visu::math::Mat4 $m = visu::math::translate(5.0f, 6.0f, 7.0f);
+
+    assert(visu::math::equal($m[3][0], 5.0f));
+    assert(visu::math::equal($m[3][1], 6.0f));
+    assert(visu::math::equal($m[3][2], 7.0f));
+}
+
+

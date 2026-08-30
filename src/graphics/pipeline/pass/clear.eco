@@ -1,0 +1,70 @@
+/**
+ * Bind and clear a target's color and depth.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+public struct ClearPassOptions
+{
+    public bool $clearColor;
+    public bool $clearDepth;
+    public Vec4 $color;
+
+    public constructor(bool $clearColor = true, bool $clearDepth = true)
+    {
+        $this->clearColor = $clearColor;
+        $this->clearDepth = $clearDepth;
+        $this->color = Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+
+    public constructor(color: Vec4 $color, bool $clearColor = true, bool $clearDepth = true)
+    {
+        $this->clearColor = $clearColor;
+        $this->clearDepth = $clearDepth;
+        $this->color = $color;
+    }
+}
+
+public class ClearPass : Pass
+{
+    private TargetRef $target;
+    private ClearPassOptions $options;
+
+    public constructor(TargetRef $target, ClearPassOptions $options)
+    {
+        $this->target = $target;
+        $this->options = $options;
+    }
+
+    public function name() : string
+    {
+        return 'ClearPass';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        $io->writes($this->target);
+    }
+
+    public function execute(Gpu& $state, Context $ctx) : result<bool, PipelineError>
+    {
+        RenderTarget $rt = guard $ctx->pool->getTarget($state, $this->target) else ($e) {
+            return .error(.pool($e));
+        }
+
+        uint32 $mask = 0;
+
+        if ($this->options->clearColor) {
+            $mask = $mask | COLOR_BUFFER_BIT;
+        }
+
+        if ($this->options->clearDepth) {
+            $mask = $mask | DEPTH_BUFFER_BIT;
+        }
+
+        $rt->framebuffer->clear($state, $mask, $this->options->color);
+        return .ok(true);
+    }
+}

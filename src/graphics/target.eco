@@ -1,0 +1,130 @@
+/**
+ * A place to draw: pixel size, content scale, and a Framebuffer.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec2;
+
+public struct RenderTarget
+{
+    private int32 $width;
+    private int32 $height;
+
+    /**
+     * The render target's pixel density (for high dpi displays) on the x axis.
+     */
+    public float32 $contentScaleX;
+
+    /**
+     * The render target's pixel density (for high dpi displays) on the y axis.
+     */
+    public float32 $contentScaleY;
+
+    /**
+     * The render target's framebuffer.
+     */
+    public Framebuffer $framebuffer;
+
+    public constructor(int32 $width, int32 $height, Framebuffer $framebuffer)
+    {
+        $this->width = $width;
+        $this->height = $height;
+        $this->contentScaleX = 1.0f;
+        $this->contentScaleY = 1.0f;
+        $this->framebuffer = $framebuffer;
+    }
+
+    /**
+     * Returns the render target's width in device pixels.
+     */
+    public const function width() : int32
+    {
+        return $this->width;
+    }
+
+    /**
+     * Returns the render target's height in device pixels.
+     */
+    public const function height() : int32
+    {
+        return $this->height;
+    }
+
+    /**
+     * Returns the render target's logical width (in points).
+     */
+    public const function effectiveWidth() : int32
+    {
+        return ($this->width as float32 / $this->contentScaleX) as int32;
+    }
+
+    /**
+     * Returns the render target's logical height (in points).
+     */
+    public const function effectiveHeight() : int32
+    {
+        return ($this->height as float32 / $this->contentScaleY) as int32;
+    }
+
+    /**
+     * Returns a Vec2 with effectiveWidth and effectiveHeight.
+     */
+    public const function effectiveSize() : Vec2
+    {
+        return Vec2($this->effectiveWidth() as float32, $this->effectiveHeight() as float32);
+    }
+
+    /**
+     * Returns true if the render target is offscreen (owns its framebuffer).
+     */
+    public const function isOffscreen() : bool
+    {
+        return $this->framebuffer->owned;
+    }
+
+    /**
+     * Updates the viewport to the render target's dimensions.
+     */
+    public function updateViewport(Gpu& $state) : void
+    {
+        $state->viewport(0, 0, $this->width, $this->height);
+    }
+
+    /**
+     * Prepares a render pass to the render target.
+     * This will bind the render target's framebuffer and update the viewport.
+     */
+    public function preparePass(Gpu& $state) : void
+    {
+        $this->framebuffer->bind($state, .readDraw);
+        $this->updateViewport($state);
+    }
+
+    /**
+     * Bind the framebuffer for reading.
+     */
+    public function bindForRead(Gpu& $state) : bool
+    {
+        return $this->framebuffer->bind($state, .read);
+    }
+
+    /**
+     * Resizes the render target to new dimensions.
+     *
+     * `$width` / `$height` are the new size in pixels.
+     * Updates the internal size and viewport, and resizes renderbuffer
+     * attachments. Texture attachments are left as-is.
+     */
+    public function resize(Gpu& $state, int32 $width, int32 $height) : void
+    {
+        $this->width = $width;
+        $this->height = $height;
+        $this->framebuffer->bind($state, .readDraw);
+        $this->updateViewport($state);
+
+        if ($this->framebuffer->owned) {
+            $this->framebuffer->resize($state, $width, $height);
+        }
+    }
+}

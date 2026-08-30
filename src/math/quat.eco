@@ -1,0 +1,266 @@
+namespace visu::math;
+
+public struct Quat
+{
+    public float32 $x;
+    public float32 $y;
+    public float32 $z;
+    public float32 $w;
+
+    public constructor(float32 $x, float32 $y, float32 $z, float32 $w)
+    {
+        $this->x = $x;
+        $this->y = $y;
+        $this->z = $z;
+        $this->w = $w;
+    }
+
+    public static function identity() : Quat
+    {
+        return Quat(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+
+    public constructor(angleAxis: float32 $radians, Vec3 $axis)
+    {
+        $a = normalize($axis);
+        $half = $radians * 0.5f;
+        $s = std::math::sin($half);
+
+        $this->x = $a->x * $s;
+        $this->y = $a->y * $s;
+        $this->z = $a->z * $s;
+        $this->w = std::math::cos($half);
+    }
+
+    public constructor(euler: Vec3 $euler)
+    {
+        $hx = $euler->x * 0.5f;
+        $hy = $euler->y * 0.5f;
+        $hz = $euler->z * 0.5f;
+        $cx = std::math::cos($hx);
+        $cy = std::math::cos($hy);
+        $cz = std::math::cos($hz);
+        $sx = std::math::sin($hx);
+        $sy = std::math::sin($hy);
+        $sz = std::math::sin($hz);
+
+        $this->x = $sx * $cy * $cz - $cx * $sy * $sz;
+        $this->y = $cx * $sy * $cz + $sx * $cy * $sz;
+        $this->z = $cx * $cy * $sz - $sx * $sy * $cz;
+        $this->w = $cx * $cy * $cz + $sx * $sy * $sz;
+    }
+
+    public constructor(const Mat4& $m)
+    {
+        $fourX = $m->c0->x - $m->c1->y - $m->c2->z;
+        $fourY = $m->c1->y - $m->c0->x - $m->c2->z;
+        $fourZ = $m->c2->z - $m->c0->x - $m->c1->y;
+        $fourW = $m->c0->x + $m->c1->y + $m->c2->z;
+
+        int32 $biggest = 0;
+        $best = $fourW;
+
+        if ($fourX > $best) {
+            $best = $fourX;
+            $biggest = 1;
+        }
+
+        if ($fourY > $best) {
+            $best = $fourY;
+            $biggest = 2;
+        }
+
+        if ($fourZ > $best) {
+            $best = $fourZ;
+            $biggest = 3;
+        }
+
+        $biggestVal = std::math::sqrt($best + 1.0f) * 0.5f;
+        $mult = 0.25f / $biggestVal;
+
+        if ($biggest == 0) {
+            $this->x = ($m->c1->z - $m->c2->y) * $mult;
+            $this->y = ($m->c2->x - $m->c0->z) * $mult;
+            $this->z = ($m->c0->y - $m->c1->x) * $mult;
+            $this->w = $biggestVal;
+        } else if ($biggest == 1) {
+            $this->x = $biggestVal;
+            $this->y = ($m->c0->y + $m->c1->x) * $mult;
+            $this->z = ($m->c2->x + $m->c0->z) * $mult;
+            $this->w = ($m->c1->z - $m->c2->y) * $mult;
+        } else if ($biggest == 2) {
+            $this->x = ($m->c0->y + $m->c1->x) * $mult;
+            $this->y = $biggestVal;
+            $this->z = ($m->c1->z + $m->c2->y) * $mult;
+            $this->w = ($m->c2->x - $m->c0->z) * $mult;
+        } else {
+            $this->x = ($m->c2->x + $m->c0->z) * $mult;
+            $this->y = ($m->c1->z + $m->c2->y) * $mult;
+            $this->z = $biggestVal;
+            $this->w = ($m->c0->y - $m->c1->x) * $mult;
+        }
+    }
+}
+
+#[inline]
+operator (Quat $a) + (Quat $b) : Quat
+{
+    return Quat($a->x + $b->x, $a->y + $b->y, $a->z + $b->z, $a->w + $b->w);
+}
+
+#[inline]
+operator (Quat $a) - (Quat $b) : Quat
+{
+    return Quat($a->x - $b->x, $a->y - $b->y, $a->z - $b->z, $a->w - $b->w);
+}
+
+#[inline]
+operator (Quat $a) * (Quat $b) : Quat
+{
+    return Quat(
+        $a->w * $b->x + $a->x * $b->w + $a->y * $b->z - $a->z * $b->y,
+        $a->w * $b->y + $a->y * $b->w + $a->z * $b->x - $a->x * $b->z,
+        $a->w * $b->z + $a->z * $b->w + $a->x * $b->y - $a->y * $b->x,
+        $a->w * $b->w - $a->x * $b->x - $a->y * $b->y - $a->z * $b->z
+    );
+}
+
+#[inline]
+operator (Quat $q) * (Vec3 $v) : Vec3
+{
+    $qvec = Vec3($q->x, $q->y, $q->z);
+    $uv = cross($qvec, $v);
+    $uuv = cross($qvec, $uv);
+
+    return $v + ($uv * $q->w + $uuv) * 2.0f;
+}
+
+#[inline]
+operator (Quat $q) * (float32 $s) : Quat
+{
+    return Quat($q->x * $s, $q->y * $s, $q->z * $s, $q->w * $s);
+}
+
+#[inline]
+operator (float32 $s) * (Quat $q) : Quat
+{
+    return $q * $s;
+}
+
+#[inline]
+operator (Quat $q) / (float32 $s) : Quat
+{
+    return Quat($q->x / $s, $q->y / $s, $q->z / $s, $q->w / $s);
+}
+
+#[inline]
+operator -(Quat $q) : Quat
+{
+    return Quat(-$q->x, -$q->y, -$q->z, -$q->w);
+}
+
+#[inline]
+operator (Quat $a) == (Quat $b) : bool
+{
+    return $a->x == $b->x && $a->y == $b->y && $a->z == $b->z && $a->w == $b->w;
+}
+
+#[inline]
+operator (Quat $a) != (Quat $b) : bool
+{
+    return !($a == $b);
+}
+
+#[inline]
+public function dot(Quat $a, Quat $b) : float32
+{
+    return $a->x * $b->x + $a->y * $b->y + $a->z * $b->z + $a->w * $b->w;
+}
+
+#[inline]
+public function length2(Quat $q) : float32
+{
+    return dot($q, $q);
+}
+
+#[inline]
+public function length(Quat $q) : float32
+{
+    return std::math::sqrt(length2($q));
+}
+
+#[inline]
+public function normalize(Quat $q) : Quat
+{
+    return $q / length($q);
+}
+
+#[inline]
+public function conjugate(Quat $q) : Quat
+{
+    return Quat(-$q->x, -$q->y, -$q->z, $q->w);
+}
+
+#[inline]
+public function inverse(Quat $q) : Quat
+{
+    return conjugate($q) / length2($q);
+}
+
+public function euler(Quat $q) : Vec3
+{
+    $sinp = std::math::clamp(-2.0f * ($q->x * $q->z - $q->w * $q->y), -1.0f, 1.0f);
+
+    return Vec3(
+        std::math::atan2(2.0f * ($q->y * $q->z + $q->w * $q->x), $q->w * $q->w - $q->x * $q->x - $q->y * $q->y + $q->z * $q->z),
+        std::math::asin($sinp),
+        std::math::atan2(2.0f * ($q->x * $q->y + $q->w * $q->z), $q->w * $q->w + $q->x * $q->x - $q->y * $q->y - $q->z * $q->z)
+    );
+}
+
+public function mix(Quat $a, Quat $b, float32 $t) : Quat
+{
+    $cosTheta = dot($a, $b);
+    Quat $end = $b;
+
+    if ($cosTheta < 0.0f) {
+        $end = -$b;
+        $cosTheta = -$cosTheta;
+    }
+
+    if ($cosTheta > 0.9995f) {
+        return normalize($a * (1.0f - $t) + $end * $t);
+    }
+
+    $angle = std::math::acos($cosTheta);
+
+    return ($a * std::math::sin((1.0f - $t) * $angle) + $end * std::math::sin($t * $angle)) / std::math::sin($angle);
+}
+
+public function slerp(Quat $a, Quat $b, float32 $t) : Quat
+{
+    return mix($a, $b, $t);
+}
+
+#[inline]
+public function equal(Quat $a, Quat $b, float32 $eps) : bool
+{
+    return equal($a->x, $b->x, $eps)
+        && equal($a->y, $b->y, $eps)
+        && equal($a->z, $b->z, $eps)
+        && equal($a->w, $b->w, $eps);
+}
+
+#[inline]
+public function equal(Quat $a, Quat $b) : bool
+{
+    return equal($a, $b, 0.0001f);
+}
+
+#[inline]
+public function valuePtr(const Quat& $q) : ptr<const float32>
+{
+    const float32& $first = &$q->x;
+
+    return $first:$ as ptr<const float32>;
+}

@@ -1,0 +1,71 @@
+/**
+ * Graph handles. Distinct types so a texture cannot be passed where a
+ * target is required. Classes because width / attachments are mutated
+ * after create (PHP RenderTargetResource).
+ */
+
+namespace visu::graphics;
+
+public class TargetRef
+{
+    public const int32 $id;
+    public const string $name;
+    public int32 $width;
+    public int32 $height;
+    public float32 $contentScaleX;
+    public float32 $contentScaleY;
+    public array<TextureRef> $colorAttachments;
+    public TextureRef? $depthAttachment;
+    public bool $rboDepthStencil;
+    public bool $rboColor;
+    public const bool $imported;
+
+    public constructor(int32 $id, string $name, int32 $width, int32 $height, bool $imported = false)
+    {
+        $this->id = $id;
+        $this->name = $name;
+        $this->width = $width;
+        $this->height = $height;
+        $this->contentScaleX = 1.0f;
+        $this->contentScaleY = 1.0f;
+        $this->colorAttachments = array<TextureRef>();
+        $this->depthAttachment = null;
+        $this->rboDepthStencil = false;
+        $this->rboColor = false;
+        $this->imported = $imported;
+    }
+
+    /**
+     * Color attachments then optional depth. Used by the scheduler and
+     * the pool so a target write implies its textures.
+     */
+    public const function textures() : array<TextureRef>
+    {
+        array<TextureRef> $out = $this->colorAttachments;
+        TextureRef $depth = guard $this->depthAttachment else {
+            return $out;
+        }
+        $out->push($depth);
+        return $out;
+    }
+}
+
+public class TextureRef
+{
+    public const int32 $id;
+    public const string $name;
+    public int32 $width;
+    public int32 $height;
+    public TextureOptions $options;
+    public const bool $imported;
+
+    public constructor(int32 $id, string $name, int32 $width, int32 $height, TextureOptions $options, bool $imported = false)
+    {
+        $this->id = $id;
+        $this->name = $name;
+        $this->width = $width;
+        $this->height = $height;
+        $this->options = $options;
+        $this->imported = $imported;
+    }
+}

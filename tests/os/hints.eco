@@ -1,0 +1,51 @@
+/**
+ * WindowHints defaults match PHP VISU (OpenGL 4.1 core, forward compat).
+ */
+
+use visu::os::{WindowHints, GlProfile};
+
+test hints_defaults_are_gl_4_1_core
+{
+    WindowHints $h = WindowHints::defaults();
+    int32 $major = $h->contextVersionMajor ?? 0;
+    int32 $minor = $h->contextVersionMinor ?? 0;
+    bool $forward = $h->forwardCompatible ?? false;
+    GlProfile $profile = $h->profile ?? .any;
+    bool $core = match ($profile) {
+        GlProfile::core => true,
+        else => false,
+    };
+
+    assert($major == 4, 'major');
+    assert($minor == 1, 'minor');
+    assert($forward, 'forward compatible');
+    assert($core, 'core profile');
+}
+
+test hints_unmarked_is_all_null
+{
+    WindowHints $h = WindowHints();
+    assert($h->contextVersionMajor == null, 'no major');
+    assert($h->profile == null, 'no profile');
+    assert($h->samples == null, 'no samples');
+}
+
+test hints_unset_fields_stay_null
+{
+    WindowHints $h = WindowHints::defaults();
+    assert($h->resizable == null, 'resizable left to glfw');
+    assert($h->visible == null, 'visible left to glfw');
+    assert($h->samples == null, 'samples left to glfw');
+}
+
+test hints_fields_are_writable
+{
+    WindowHints $h = WindowHints::defaults();
+    $h->visible = false;
+    $h->resizable = true;
+    $h->samples = 4;
+    assert(($h->visible ?? true) == false, 'hidden');
+    assert($h->resizable ?? false, 'resizable');
+    int32 $samples = $h->samples ?? 0;
+    assert($samples == 4, 'samples');
+}

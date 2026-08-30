@@ -1,0 +1,69 @@
+/**
+ * Offscreen FBO against a real context.
+ */
+
+use visu::os::{Window, WindowHints, init, terminate};
+use visu::graphics::{Gpu, Framebuffer, RenderTarget, ColorAttachment, Attachment, PixelFormat, FramebufferTarget};
+
+#[group: "glfw"]
+test offscreen_framebuffer_is_complete
+{
+    bool $ok = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('fbo', 320, 240, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    Framebuffer $fb = Framebuffer($state);
+    $fb->attachRenderbuffer($state, ColorAttachment(0)->attachment(), .rgba, 320, 240);
+    $fb->attachRenderbuffer($state, .depthStencil, .depthStencil, 320, 240);
+    bool $valid = guard $fb->valid($state) else ($s) {
+        $window->destroy();
+        terminate();
+        die("incomplete: {$s}");
+    }
+
+    assert($valid, 'complete');
+    RenderTarget $rt = RenderTarget(320, 240, $fb);
+    assert($rt->isOffscreen(), 'offscreen');
+    $rt->resize($state, 160, 120);
+    assert($rt->width() == 160, 'resized');
+    $fb->destroy($state);
+    $window->destroy();
+    terminate();
+}
+
+#[group: "glfw"]
+test unbind_framebuffer_zeros_only_the_matching_point
+{
+    bool $ok = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('fbo-unbind', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    Framebuffer $a = Framebuffer($state);
+    Framebuffer $b = Framebuffer($state);
+    assert($a->bind($state, .read), 'bind A read');
+    assert($b->bind($state, .draw), 'bind B draw');
+    $b->destroy($state);
+    assert(!$a->bind($state, .read), 'read A still cached');
+    assert(!$state->bindFramebuffer(.draw, 0), 'draw already unbound to 0');
+    $a->destroy($state);
+    $window->destroy();
+    terminate();
+}

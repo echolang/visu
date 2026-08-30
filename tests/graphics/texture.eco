@@ -1,0 +1,84 @@
+/**
+ * Real Texture against a GL context.
+ */
+
+use visu::os::{Window, WindowHints, init, terminate};
+use visu::graphics::{Gpu, Texture, TextureOptions, TEXTURE0, Filter, Wrap, PixelFormat, TextureTarget};
+
+test texture_options_color_defaults
+{
+    TextureOptions $o = TextureOptions::color();
+    bool $rgba = match ($o->format) {
+        PixelFormat::rgba => true,
+        else => false,
+    };
+    bool $linear = match ($o->min) {
+        Filter::linear => true,
+        else => false,
+    };
+    bool $clamp = match ($o->wrapS) {
+        Wrap::clampToEdge => true,
+        else => false,
+    };
+    assert($rgba, 'rgba');
+    assert($linear, 'linear');
+    assert($clamp, 'clamp');
+    assert($o->mipmaps == false, 'no mips');
+}
+
+test filter_mipmapped
+{
+    assert(!Filter::nearest->mipmapped(), 'nearest');
+    assert(!Filter::linear->mipmapped(), 'linear');
+    assert(Filter::linearMipmapLinear->mipmapped(), 'mip');
+}
+
+#[group: "glfw"]
+test texture_allocate_empty_and_bind
+{
+    bool $ok = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('tex', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    Texture $tex = Texture($state, 'scene');
+    $tex->allocateEmpty($state, 128, 64, TextureOptions::color());
+    assert($tex->width() == 128, 'width');
+    assert($tex->height() == 64, 'height');
+    $tex->bind($state);
+    assert($state->boundTexture(TEXTURE0, TextureTarget::texture2D) == $tex->id, 'bound');
+    $tex->destroy($state);
+    assert($state->boundTexture(TEXTURE0, TextureTarget::texture2D) == 0, 'forgotten');
+    $window->destroy();
+    terminate();
+}
+
+#[group: "glfw"]
+#[tests: expects death]
+test texture_drop_without_destroy_dies
+{
+    bool $ok = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('tex-drop', 64, 64, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    Texture $tex = Texture($state, 'leaked');
+    $window->destroy();
+    terminate();
+}

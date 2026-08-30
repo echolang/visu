@@ -1,0 +1,40 @@
+/**
+ * Per-frame bundle. The object a draw holds: pipeline, blackboard,
+ * pool, and compensation (lag between ticks).
+ *
+ * Compensation is where we are between two updates — 0 just after a
+ * tick, approaching 1 just before the next. Interpolate motion with
+ * lerp() so variable frame rates stay smooth. Gpu is unique and is
+ * borrowed into execute, not stored here.
+ */
+
+namespace visu::graphics;
+
+public struct Context
+{
+    public Pipeline $pipeline;
+    public Frame $frame;
+    public Pool $pool;
+
+    /**
+     * Interpolation factor between the previous and current tick.
+     */
+    public float32 $compensation = 0.0f;
+
+    /**
+     * `$prev + ($curr - $prev) * compensation`. Scalar stand-in for
+     * PHP VISU's slerp/lerp until this tree has quats.
+     */
+    public const function lerp(float32 $prev, float32 $curr) : float32
+    {
+        return $prev + ($curr - $prev) * $this->compensation;
+    }
+
+    /**
+     * Run the pipeline with this context's compensation.
+     */
+    public function execute(Gpu& $state, int32 $tick) : result<bool, PipelineError>
+    {
+        return $this->pipeline->execute($state, $tick, $this->compensation);
+    }
+}

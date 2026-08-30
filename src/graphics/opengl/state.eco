@@ -1,0 +1,686 @@
+/**
+ * OpenGL `Gpu`. `#[unique]` so the cache cannot be copied. The app
+ * owns one value and everything else borrows it (`Gpu&`).
+ */
+
+namespace visu::graphics;
+
+#[unique]
+public struct Gpu
+{
+    /**
+     * Currently used shader program object.
+     * You should never manually manipulate this value.
+     */
+    private uint32 $program;
+
+    /**
+     * Currently bound READ framebuffer object.
+     * You should never manually manipulate this value.
+     */
+    private uint32 $readFramebuffer;
+
+    /**
+     * Currently bound DRAW framebuffer object.
+     * You should never manually manipulate this value.
+     */
+    private uint32 $drawFramebuffer;
+
+    /**
+     * Currently bound vertex array object.
+     * You should never manually manipulate this value.
+     */
+    private uint32 $vertexArray;
+
+    /**
+     * Currently bound vertex buffer object.
+     * You should never manually manipulate this value.
+     */
+    private uint32 $vertexBuffer;
+
+    /**
+     * Currently bound index buffer object.
+     * You should never manually manipulate this value.
+     */
+    private uint32 $indexBuffer;
+
+    /**
+     * Currently bound texture unit.
+     * You should never manually manipulate this value.
+     */
+    private uint32 $textureUnit;
+
+    /**
+     * Currently bound textures per unit and target.
+     * You should never manually manipulate this value.
+     */
+    private map<uint32, map<uint32, uint32>> $textures;
+    private bool $viewportSet;
+    private int32 $viewportX;
+    private int32 $viewportY;
+    private int32 $viewportWidth;
+    private int32 $viewportHeight;
+    private bool $clearColorSet;
+    private float32 $clearR;
+    private float32 $clearG;
+    private float32 $clearB;
+    private float32 $clearA;
+    private uint32 $renderbuffer;
+    private array<uint32> $drawBufferList;
+    private bool $drawBuffersSet;
+
+    public constructor()
+    {
+        $this->clearCache();
+    }
+
+    public function load() : bool
+    {
+        usize $n = gl::load(&glfw::getProcAddress);
+        return $n != 0;
+    }
+
+    public function reset() : void
+    {
+        $this->clearCache();
+
+        gl::UseProgram(0);
+        gl::BindFramebuffer(gl::READ_FRAMEBUFFER, 0);
+        gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, 0);
+        gl::BindVertexArray(0);
+        gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+        gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
+        gl::BindTexture(gl::TEXTURE_2D, 0);
+        gl::BindTexture(gl::TEXTURE_CUBE_MAP, 0);
+        gl::ActiveTexture(gl::TEXTURE0);
+        gl::BindRenderbuffer(gl::RENDERBUFFER, 0);
+    }
+
+    private function clearCache() : void
+    {
+        $this->program = 0;
+        $this->readFramebuffer = 0;
+        $this->drawFramebuffer = 0;
+        $this->vertexArray = 0;
+        $this->vertexBuffer = 0;
+        $this->indexBuffer = 0;
+        $this->textures = map<uint32, map<uint32, uint32>>();
+        $this->textureUnit = gl::TEXTURE0;
+        $this->viewportSet = false;
+        $this->viewportX = 0;
+        $this->viewportY = 0;
+        $this->viewportWidth = 0;
+        $this->viewportHeight = 0;
+        $this->clearColorSet = false;
+        $this->clearR = 0.0f;
+        $this->clearG = 0.0f;
+        $this->clearB = 0.0f;
+        $this->clearA = 0.0f;
+        $this->renderbuffer = 0;
+        $this->drawBufferList = array<uint32>();
+        $this->drawBuffersSet = false;
+    }
+
+    public function useProgram(uint32 $program) : void
+    {
+        if ($this->program == $program) {
+            return;
+        }
+
+        $this->program = $program;
+        gl::UseProgram($program);
+    }
+
+    public function bindFramebuffer(FramebufferTarget $target, uint32 $id) : bool
+    {
+        return match ($target) {
+            FramebufferTarget::readDraw => $this->bindReadDraw($id),
+            FramebufferTarget::read => $this->bindRead($id),
+            FramebufferTarget::draw => $this->bindDraw($id),
+        };
+    }
+
+    private function bindReadDraw(uint32 $id) : bool
+    {
+        if ($this->readFramebuffer == $id && $this->drawFramebuffer == $id) {
+            return false;
+        }
+
+        gl::BindFramebuffer(gl::FRAMEBUFFER, $id);
+        $this->readFramebuffer = $id;
+        $this->drawFramebuffer = $id;
+        return true;
+    }
+
+    private function bindRead(uint32 $id) : bool
+    {
+        if ($this->readFramebuffer == $id) {
+            return false;
+        }
+
+        gl::BindFramebuffer(gl::READ_FRAMEBUFFER, $id);
+        $this->readFramebuffer = $id;
+        return true;
+    }
+
+    private function bindDraw(uint32 $id) : bool
+    {
+        if ($this->drawFramebuffer == $id) {
+            return false;
+        }
+
+        gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, $id);
+        $this->drawFramebuffer = $id;
+        return true;
+    }
+
+    public function bindVertexArray(uint32 $vao) : void
+    {
+        if ($this->vertexArray == $vao) {
+            return;
+        }
+
+        $this->vertexArray = $vao;
+        gl::BindVertexArray($vao);
+    }
+
+    public function bindVertexBuffer(uint32 $vbo) : void
+    {
+        if ($this->vertexBuffer == $vbo) {
+            return;
+        }
+
+        $this->vertexBuffer = $vbo;
+        gl::BindBuffer(gl::ARRAY_BUFFER, $vbo);
+    }
+
+    public function bindIndexBuffer(uint32 $ibo) : void
+    {
+        if ($this->indexBuffer == $ibo) {
+            return;
+        }
+
+        $this->indexBuffer = $ibo;
+        gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, $ibo);
+    }
+
+    public function bindTexture(uint32 $unit, TextureTarget $target, uint32 $texture) : void
+    {
+        $this->bindTextureGl($unit, glTextureTarget($target), $texture);
+    }
+
+    private function bindTextureGl(uint32 $unit, uint32 $target, uint32 $texture) : void
+    {
+        if ($this->textureUnit != $unit) {
+            gl::ActiveTexture($unit);
+            $this->textureUnit = $unit;
+        }
+
+        if (!$this->textures->has($unit)) {
+            $this->textures[$unit] = map<uint32, uint32>();
+        }
+
+        map<uint32, uint32>& $bound = $this->textures->at($unit);
+
+        if ($bound->has($target) && $bound[$target] == $texture) {
+            return;
+        }
+
+        gl::BindTexture($target, $texture);
+        $bound[$target] = $texture;
+    }
+
+    public const function boundTexture(uint32 $unit, TextureTarget $target) : uint32
+    {
+        uint32 $glTarget = glTextureTarget($target);
+
+        if (!$this->textures->has($unit)) {
+            return 0;
+        }
+
+        map<uint32, uint32> $bound = $this->textures[$unit];
+
+        if (!$bound->has($glTarget)) {
+            return 0;
+        }
+
+        return $bound[$glTarget];
+    }
+
+    public function forgetTexture(uint32 $texture) : void
+    {
+        array<uint32> $units = $this->textures->keys();
+
+        foreach ($units as $unit) {
+            map<uint32, uint32>& $bound = $this->textures->at($unit);
+            array<uint32> $targets = $bound->keys();
+
+            foreach ($targets as $target) {
+                if ($bound[$target] == $texture) {
+                    $bound[$target] = 0;
+                }
+            }
+        }
+    }
+
+    public function createVertexArray() : uint32
+    {
+        uint32 $id = 0;
+        gl::GenVertexArrays(1, &$id);
+        return $id;
+    }
+
+    public function deleteVertexArray(uint32 $id) : void
+    {
+        uint32 $name = $id;
+        gl::DeleteVertexArrays(1, &$name);
+
+        if ($this->vertexArray == $id) {
+            $this->vertexArray = 0;
+        }
+    }
+
+    public function createBuffer() : uint32
+    {
+        uint32 $id = 0;
+        gl::GenBuffers(1, &$id);
+        return $id;
+    }
+
+    public function deleteBuffer(uint32 $id) : void
+    {
+        uint32 $name = $id;
+        gl::DeleteBuffers(1, &$name);
+
+        if ($this->vertexBuffer == $id) {
+            $this->vertexBuffer = 0;
+        }
+
+        if ($this->indexBuffer == $id) {
+            $this->indexBuffer = 0;
+        }
+    }
+
+    public function bufferFloats(array<float32>& $data) : void
+    {
+        usize $n = $data->count();
+        isize $bytes = ($n * mem::size<float32>()) as isize;
+        ptr<const uint8> $ptr = null;
+
+        if ($n > 0) {
+            $ptr:$ = ptr<const uint8>(&$data[0]);
+        }
+
+        gl::BufferData(gl::ARRAY_BUFFER, $bytes, $ptr, gl::STATIC_DRAW);
+    }
+
+    public function vertexAttrib(uint32 $index, int32 $size, int32 $strideBytes, int32 $offsetBytes) : void
+    {
+        ptr<const uint8> $offset = null;
+
+        if ($offsetBytes != 0) {
+            $offset:$ = $offset:$ + ($offsetBytes as isize);
+        }
+
+        gl::VertexAttribPointer($index, $size, gl::FLOAT, 0, $strideBytes, $offset);
+    }
+
+    public function enableVertexAttrib(uint32 $index) : void
+    {
+        gl::EnableVertexAttribArray($index);
+    }
+
+    public function drawTriangles(int32 $first, int32 $count) : void
+    {
+        gl::DrawArrays(gl::TRIANGLES, $first, $count);
+    }
+
+    public function createTexture() : uint32
+    {
+        uint32 $id = 0;
+        gl::GenTextures(1, &$id);
+        return $id;
+    }
+
+    public function deleteTexture(uint32 $id) : void
+    {
+        uint32 $name = $id;
+        gl::DeleteTextures(1, &$name);
+        $this->forgetTexture($id);
+    }
+
+    public function texImage2D(TextureTarget $target, PixelFormat $format, int32 $width, int32 $height) : void
+    {
+        uint32 $glTarget = glTextureTarget($target);
+        ptr<const uint8> $pixels = null;
+        gl::TexImage2D(
+            $glTarget,
+            0,
+            glPixelFormat($format) as int32,
+            $width,
+            $height,
+            0,
+            glPixelDataFormat($format),
+            glPixelDataType($format),
+            $pixels
+        );
+    }
+
+    public function texFilter(TextureTarget $target, Filter $min, Filter $mag) : void
+    {
+        uint32 $glTarget = glTextureTarget($target);
+        gl::TexParameteri($glTarget, gl::TEXTURE_MIN_FILTER, glFilter($min) as int32);
+        gl::TexParameteri($glTarget, gl::TEXTURE_MAG_FILTER, glFilter($mag) as int32);
+    }
+
+    public function texWrap(TextureTarget $target, Wrap $s, Wrap $t) : void
+    {
+        uint32 $glTarget = glTextureTarget($target);
+        gl::TexParameteri($glTarget, gl::TEXTURE_WRAP_S, glWrap($s) as int32);
+        gl::TexParameteri($glTarget, gl::TEXTURE_WRAP_T, glWrap($t) as int32);
+    }
+
+    public function generateMipmap(TextureTarget $target) : void
+    {
+        gl::GenerateMipmap(glTextureTarget($target));
+    }
+
+    /**
+     * Drop `$id` from the bind cache and unbind it on the GPU if it is
+     * currently bound. Read and draw are independent.
+     */
+    public function unbindFramebuffer(uint32 $id) : void
+    {
+        if ($this->readFramebuffer == $id && $this->drawFramebuffer == $id) {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            $this->readFramebuffer = 0;
+            $this->drawFramebuffer = 0;
+            return;
+        }
+
+        if ($this->readFramebuffer == $id) {
+            gl::BindFramebuffer(gl::READ_FRAMEBUFFER, 0);
+            $this->readFramebuffer = 0;
+        }
+
+        if ($this->drawFramebuffer == $id) {
+            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, 0);
+            $this->drawFramebuffer = 0;
+        }
+    }
+
+    public function viewport(int32 $x, int32 $y, int32 $width, int32 $height) : void
+    {
+        if ($this->viewportSet && $this->viewportX == $x && $this->viewportY == $y && $this->viewportWidth == $width && $this->viewportHeight == $height) {
+            return;
+        }
+
+        $this->viewportSet = true;
+        $this->viewportX = $x;
+        $this->viewportY = $y;
+        $this->viewportWidth = $width;
+        $this->viewportHeight = $height;
+        gl::Viewport($x, $y, $width, $height);
+    }
+
+    public function clearColor(float32 $r, float32 $g, float32 $b, float32 $a) : void
+    {
+        if ($this->clearColorSet && $this->clearR == $r && $this->clearG == $g && $this->clearB == $b && $this->clearA == $a) {
+            return;
+        }
+
+        $this->clearColorSet = true;
+        $this->clearR = $r;
+        $this->clearG = $g;
+        $this->clearB = $b;
+        $this->clearA = $a;
+        gl::ClearColor($r, $g, $b, $a);
+    }
+
+    public function clear(uint32 $mask) : void
+    {
+        gl::Clear($mask);
+    }
+
+    public function createFramebuffer() : uint32
+    {
+        uint32 $id = 0;
+        gl::GenFramebuffers(1, &$id);
+        return $id;
+    }
+
+    public function deleteFramebuffer(uint32 $id) : void
+    {
+        uint32 $name = $id;
+        gl::DeleteFramebuffers(1, &$name);
+        $this->unbindFramebuffer($id);
+    }
+
+    public function createRenderbuffer() : uint32
+    {
+        uint32 $id = 0;
+        gl::GenRenderbuffers(1, &$id);
+        return $id;
+    }
+
+    public function deleteRenderbuffer(uint32 $id) : void
+    {
+        uint32 $name = $id;
+        gl::DeleteRenderbuffers(1, &$name);
+
+        if ($this->renderbuffer == $id) {
+            $this->renderbuffer = 0;
+        }
+    }
+
+    public function bindRenderbuffer(uint32 $id) : void
+    {
+        if ($this->renderbuffer == $id) {
+            return;
+        }
+
+        $this->renderbuffer = $id;
+        gl::BindRenderbuffer(gl::RENDERBUFFER, $id);
+    }
+
+    public function renderbufferStorage(PixelFormat $format, int32 $width, int32 $height) : void
+    {
+        gl::RenderbufferStorage(gl::RENDERBUFFER, glPixelFormat($format), $width, $height);
+    }
+
+    public function framebufferRenderbuffer(Attachment $point, uint32 $renderbuffer) : void
+    {
+        gl::FramebufferRenderbuffer(gl::FRAMEBUFFER, glAttachment($point), gl::RENDERBUFFER, $renderbuffer);
+    }
+
+    public function framebufferTexture2D(Attachment $point, TextureTarget $target, uint32 $texture, int32 $level) : void
+    {
+        gl::FramebufferTexture2D(gl::FRAMEBUFFER, glAttachment($point), glTextureTarget($target), $texture, $level);
+    }
+
+    public function renderbufferFormat() : uint32
+    {
+        int32 $format = 0;
+        gl::GetRenderbufferParameteriv(gl::RENDERBUFFER, gl::RENDERBUFFER_INTERNAL_FORMAT, &$format);
+        return $format as uint32;
+    }
+
+    public function framebufferStatus() : FramebufferStatus
+    {
+        uint32 $code = gl::CheckFramebufferStatus(gl::FRAMEBUFFER);
+        return framebufferStatusFrom($code);
+    }
+
+    public function drawBuffers(const array<Attachment>& $colors) : void
+    {
+        array<uint32> $bufs = array<uint32>();
+
+        foreach ($colors as $a) {
+            $bufs->push(glAttachment($a));
+        }
+
+        $this->applyDrawBuffers($bufs);
+    }
+
+    public function drawBuffers(ColorSpan $colors) : void
+    {
+        array<uint32> $bufs = array<uint32>();
+
+        uint32 $i = $colors->from;
+
+        while ($i < $colors->toExclusive) {
+            $bufs->push(gl::COLOR_ATTACHMENT0 + $i);
+            $i = $i + 1;
+        }
+
+        $this->applyDrawBuffers($bufs);
+    }
+
+    private function applyDrawBuffers(array<uint32> $bufs) : void
+    {
+        if ($this->drawBuffersSet && drawBufferListsEqual($this->drawBufferList, $bufs)) {
+            return;
+        }
+
+        $this->drawBuffersSet = true;
+        $this->drawBufferList = $bufs;
+        int32 $n = $bufs->count() as int32;
+
+        if ($n == 0) {
+            return;
+        }
+
+        gl::DrawBuffers($n, &$bufs[0]);
+    }
+}
+
+internal function glAttachment(Attachment $a) : uint32
+{
+    return match ($a) {
+        Attachment::color($slot) => gl::COLOR_ATTACHMENT0 + $slot->index,
+        Attachment::depth => gl::DEPTH_ATTACHMENT,
+        Attachment::stencil => gl::STENCIL_ATTACHMENT,
+        Attachment::depthStencil => gl::DEPTH_STENCIL_ATTACHMENT,
+    };
+}
+
+internal function glPixelFormat(PixelFormat $format) : uint32
+{
+    return match ($format) {
+        PixelFormat::rgba => gl::RGBA,
+        PixelFormat::r32f => gl::R32F,
+        PixelFormat::depthComponent => gl::DEPTH_COMPONENT,
+        PixelFormat::depthStencil => gl::DEPTH24_STENCIL8,
+    };
+}
+
+internal function glTextureTarget(TextureTarget $target) : uint32
+{
+    return match ($target) {
+        TextureTarget::texture2D => gl::TEXTURE_2D,
+        TextureTarget::cubeMap => gl::TEXTURE_CUBE_MAP,
+    };
+}
+
+internal function glPixelDataFormat(PixelFormat $format) : uint32
+{
+    return match ($format) {
+        PixelFormat::rgba => gl::RGBA,
+        PixelFormat::r32f => gl::RED,
+        PixelFormat::depthComponent => gl::DEPTH_COMPONENT,
+        PixelFormat::depthStencil => gl::DEPTH_STENCIL,
+    };
+}
+
+internal function glPixelDataType(PixelFormat $format) : uint32
+{
+    return match ($format) {
+        PixelFormat::rgba => gl::UNSIGNED_BYTE,
+        PixelFormat::r32f => gl::FLOAT,
+        PixelFormat::depthComponent => gl::FLOAT,
+        PixelFormat::depthStencil => gl::UNSIGNED_INT_24_8,
+    };
+}
+
+internal function glFilter(Filter $filter) : uint32
+{
+    return match ($filter) {
+        Filter::nearest => gl::NEAREST,
+        Filter::linear => gl::LINEAR,
+        Filter::nearestMipmapNearest => gl::NEAREST_MIPMAP_NEAREST,
+        Filter::nearestMipmapLinear => gl::NEAREST_MIPMAP_LINEAR,
+        Filter::linearMipmapNearest => gl::LINEAR_MIPMAP_NEAREST,
+        Filter::linearMipmapLinear => gl::LINEAR_MIPMAP_LINEAR,
+    };
+}
+
+internal function glWrap(Wrap $wrap) : uint32
+{
+    return match ($wrap) {
+        Wrap::repeat => gl::REPEAT,
+        Wrap::mirroredRepeat => gl::MIRRORED_REPEAT,
+        Wrap::clampToEdge => gl::CLAMP_TO_EDGE,
+        Wrap::clampToBorder => gl::CLAMP_TO_BORDER,
+    };
+}
+
+internal function framebufferStatusFrom(uint32 $code) : FramebufferStatus
+{
+    if ($code == gl::FRAMEBUFFER_COMPLETE) {
+        return .complete;
+    }
+
+    if ($code == gl::FRAMEBUFFER_UNDEFINED) {
+        return .undefined;
+    }
+
+    if ($code == gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT) {
+        return .incompleteAttachment;
+    }
+
+    if ($code == gl::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT) {
+        return .incompleteMissingAttachment;
+    }
+
+    if ($code == gl::FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER) {
+        return .incompleteDrawBuffer;
+    }
+
+    if ($code == gl::FRAMEBUFFER_INCOMPLETE_READ_BUFFER) {
+        return .incompleteReadBuffer;
+    }
+
+    if ($code == gl::FRAMEBUFFER_UNSUPPORTED) {
+        return .unsupported;
+    }
+
+    if ($code == gl::FRAMEBUFFER_INCOMPLETE_MULTISAMPLE) {
+        return .incompleteMultisample;
+    }
+
+    if ($code == gl::FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS) {
+        return .incompleteLayerTargets;
+    }
+
+    return .unknown($code);
+}
+
+internal function drawBufferListsEqual(const array<uint32>& $a, const array<uint32>& $b) : bool
+{
+    if ($a->count() != $b->count()) {
+        return false;
+    }
+
+    usize $i = 0;
+    usize $n = $a->count();
+
+    while ($i < $n) {
+        if ($a[$i] != $b[$i]) {
+            return false;
+        }
+
+        $i = $i + 1;
+    }
+
+    return true;
+}

@@ -1,0 +1,176 @@
+/**
+ * Per-frame pass list. setup() runs at add(); execute() runs in
+ * scheduled I/O order.
+ */
+
+namespace visu::graphics;
+
+// public: stdlib array<T> / map<K,V> must name T, so module-internal is not enough
+public enum Access
+{
+    case read;
+    case write;
+}
+
+public enum ResourceIo
+{
+    case target(TargetRef $ref);
+    case texture(TextureRef $ref);
+}
+
+public struct Io
+{
+    public int32 $passIndex;
+    public ResourceIo $resource;
+    public Access $access;
+}
+
+public class Pipeline
+{
+    private Pool $pool;
+    private Frame $frame;
+    private array<Pass> $passes;
+    private map<string, int32> $names;
+    private array<Io> $io;
+    private int32 $nextId;
+
+    public constructor(Pool $pool, Frame $frame, RenderTarget $backbuffer)
+    {
+        $this->pool = $pool;
+        $this->frame = $frame;
+        $this->passes = array<Pass>();
+        $this->names = map<string, int32>();
+        $this->io = array<Io>();
+        $this->nextId = 0;
+
+        TargetRef $bb = $this->importTarget('backbuffer', $backbuffer);
+        $this->frame->set(Backbuffer($bb));
+    }
+
+    public function createTarget(string $name, int32 $width, int32 $height) : TargetRef
+    {
+        return $this->makeTarget($name, $width, $height, false);
+    }
+
+    public function createTargetLike(string $name, const RenderTarget& $like) : TargetRef
+    {
+        TargetRef $ref = $this->makeTarget($name, $like->width(), $like->height(), false);
+        $ref->contentScaleX = $like->contentScaleX;
+        $ref->contentScaleY = $like->contentScaleY;
+        return $ref;
+    }
+
+    public function importTarget(string $name, RenderTarget $target) : TargetRef
+    {
+        TargetRef $ref = $this->makeTarget($name, $target->width(), $target->height(), $imported: true);
+        $ref->contentScaleX = $target->contentScaleX;
+        $ref->contentScaleY = $target->contentScaleY;
+        $this->pool->setTarget($ref, $target);
+        return $ref;
+    }
+
+    public function createColor(TargetRef $target, string $name, TextureOptions $options) : TextureRef
+    {
+        string $full = "{$target->name}.attachment.color_{$name}";
+        TextureRef $ref = $this->makeTexture($full, $target->width, $target->height, $options, false);
+        $target->colorAttachments->push($ref);
+        return $ref;
+    }
+
+    public function createDepth(TargetRef $target) : TextureRef
+    {
+        return $this->createDepth($target, TextureOptions::depth());
+    }
+
+    public function createDepth(TargetRef $target, TextureOptions $options) : TextureRef
+    {
+        string $full = "{$target->name}.attachment.depth";
+        TextureRef $ref = $this->makeTexture($full, $target->width, $target->height, $options, false);
+        $target->depthAttachment = $ref;
+        return $ref;
+    }
+
+    public function importTexture(string $name, Texture $texture) : TextureRef
+    {
+        TextureRef $ref = $this->makeTexture($name, $texture->width(), $texture->height(), TextureOptions::color(), $imported: true);
+        $this->pool->setTexture($ref, $texture);
+        return $ref;
+    }
+
+    /**
+     * Append `$pass` and run setup() immediately so later passes can
+     * get() data this one published.
+     */
+    public function add(Pass $pass) : void
+    {
+        int32 $index = $this->passes->count() as int32;
+        $this->passes->push($pass);
+        IoSink $io = IoSink($this, $index);
+        $pass->setup($this, $this->frame, $io);
+    }
+
+    /**
+     * Run every pass in scheduled I/O order. `$compensation` defaults
+     * to 0 (no interpolation).
+     */
+    public function execute(Gpu& $state, int32 $tick, float32 $compensation = 0.0f) : result<bool, PipelineError>
+    {
+        $this->pool->setCurrentTick($tick);
+        array<int32> $order = guard schedule($this->passes->count() as int32, $this->io) else ($e) {
+            return .error($e);
+        }
+        $this->touchIo();
+
+        Context $ctx = Context($this, $this->frame, $this->pool, $compensation);
+
+        foreach ($order as $index) {
+            Pass $pass = $this->passes[$index as usize];
+            bool $ran = guard $pass->execute($state, $ctx) else ($e) {
+                return .error($e);
+            }
+        }
+
+        $this->pool->collect($state);
+        return .ok(true);
+    }
+
+    internal function record(int32 $passIndex, ResourceIo $resource, Access $access) : void
+    {
+        $this->io->push(Io($passIndex, $resource, $access));
+    }
+
+    private function makeTarget(string $name, int32 $width, int32 $height, bool $imported) : TargetRef
+    {
+        $this->claimName($name);
+        int32 $id = $this->nextId;
+        $this->nextId = $this->nextId + 1;
+        return TargetRef($id, $name, $width, $height, $imported);
+    }
+
+    private function makeTexture(string $name, int32 $width, int32 $height, TextureOptions $options, bool $imported) : TextureRef
+    {
+        $this->claimName($name);
+        int32 $id = $this->nextId;
+        $this->nextId = $this->nextId + 1;
+        return TextureRef($id, $name, $width, $height, $options, $imported);
+    }
+
+    private function claimName(string $name) : void
+    {
+        assert(!$this->names->has($name), 'pipeline: duplicate resource name');
+        $this->names[$name] = $this->nextId;
+    }
+
+    private function touchIo() : void
+    {
+        array<Io> $edges = $this->io;
+
+        foreach ($edges as $edge) {
+            array<GraphRes> $res = expandIo($edge->resource);
+
+            foreach ($res as $r) {
+                $this->pool->touch($r->name);
+            }
+        }
+    }
+}

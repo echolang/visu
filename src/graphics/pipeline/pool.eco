@@ -1,0 +1,383 @@
+/**
+ * Persistent GPU objects for the render graph. Keyed by resource name
+ * (handle ids reset every Pipeline). Does not store Gpu; every GPU
+ * call takes Gpu&.
+ */
+
+namespace visu::graphics;
+
+public enum PoolError
+{
+    case missingImport(string $name);
+    case incomplete(string $name, FramebufferStatus $status);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            PoolError::missingImport($name) => "pool: imported '{$name}' was never set",
+            PoolError::incomplete($name, $status) => "pool: failed to create '{$name}': {$status}",
+        };
+    }
+}
+
+// public: stored in map<string, StoredTarget>; stdlib must name the value type
+public class StoredTarget
+{
+    public RenderTarget $target;
+    public array<string> $ownedTextures;
+    public bool $imported;
+    public string $fingerprint;
+
+    public constructor(RenderTarget $target, array<string> $ownedTextures, bool $imported, string $fingerprint)
+    {
+        $this->target = $target;
+        $this->ownedTextures = $ownedTextures;
+        $this->imported = $imported;
+        $this->fingerprint = $fingerprint;
+    }
+}
+
+public class StoredTexture
+{
+    public Texture $texture;
+    public bool $imported;
+
+    public constructor(Texture $texture, bool $imported)
+    {
+        $this->texture = $texture;
+        $this->imported = $imported;
+    }
+}
+
+public class Pool
+{
+    private map<string, StoredTarget> $targets;
+    private map<string, StoredTexture> $textures;
+    private map<string, int32> $used;
+    private map<string, erased> $cached;
+    private array<GpuObject> $cachedOwned;
+    private int32 $tick;
+
+    public constructor()
+    {
+        $this->targets = map<string, StoredTarget>();
+        $this->textures = map<string, StoredTexture>();
+        $this->used = map<string, int32>();
+        $this->cached = map<string, erased>();
+        $this->cachedOwned = array<GpuObject>();
+        $this->tick = 0;
+    }
+
+    public function setCurrentTick(int32 $tick) : void
+    {
+        $this->tick = $tick;
+    }
+
+    public function touch(string $name) : void
+    {
+        $this->used[$name] = $this->tick;
+    }
+
+    /**
+     * Import an already-created render target (the window backbuffer).
+     */
+    public function setTarget(TargetRef $ref, RenderTarget $target) : void
+    {
+        array<string> $none = array<string>();
+        $this->targets[$ref->name] = StoredTarget($target, $none, true, targetFingerprint($ref));
+        $this->touch($ref->name);
+    }
+
+    /**
+     * Import an already-created texture.
+     */
+    public function setTexture(TextureRef $ref, Texture $texture) : void
+    {
+        $this->textures[$ref->name] = StoredTexture($texture, true);
+        $this->touch($ref->name);
+    }
+
+    /**
+     * The GPU render target for `$ref`, allocating or resizing if needed.
+     */
+    public function getTarget(Gpu& $state, TargetRef $ref) : result<RenderTarget, PoolError>
+    {
+        $this->touchExpanded($ref);
+
+        if ($ref->imported) {
+            if (!$this->targets->has($ref->name)) {
+                return .error(.missingImport($ref->name));
+            }
+
+            StoredTarget $imported = $this->targets[$ref->name];
+            return .ok($imported->target);
+        }
+
+        if ($this->targets->has($ref->name)) {
+            StoredTarget $held = $this->targets[$ref->name];
+            if ($held->fingerprint == targetFingerprint($ref)) {
+                return .ok($held->target);
+            }
+
+            $this->dropTarget($state, $ref->name);
+        }
+
+        RenderTarget $fresh = guard $this->createTarget($state, $ref) else ($e) {
+            return .error($e);
+        }
+        return .ok($fresh);
+    }
+
+    /**
+     * Bind `$ref` and set the viewport to its size.
+     */
+    public function activate(Gpu& $state, TargetRef $ref) : result<RenderTarget, PoolError>
+    {
+        RenderTarget $target = guard $this->getTarget($state, $ref) else ($e) {
+            return .error($e);
+        }
+        $target->preparePass($state);
+        return .ok($target);
+    }
+
+    /**
+     * The GPU texture for `$ref`. Attachments are created by getTarget.
+     */
+    public function getTexture(Gpu& $state, TextureRef $ref) : result<Texture, PoolError>
+    {
+        $this->touch($ref->name);
+
+        if ($this->textures->has($ref->name)) {
+            StoredTexture $held = $this->textures[$ref->name];
+            return .ok($held->texture);
+        }
+
+        if ($ref->imported) {
+            return .error(.missingImport($ref->name));
+        }
+
+        Texture $tex = Texture($state, $ref->name);
+        $tex->allocateEmpty($state, $ref->width, $ref->height, $ref->options);
+        $this->textures[$ref->name] = StoredTexture($tex, false);
+        return .ok($tex);
+    }
+
+    /**
+     * Named static cache for the lifetime of the pool (PHP
+     * cacheStaticResource). Same name returns the same object. Not
+     * tick-collected; destroy() tears GPU objects down.
+     */
+    public function cache<T : GpuObject>(string $name, Gpu& $state, function<T(Gpu&)> $make) : T
+    {
+        if ($this->cached->has($name)) {
+            erased $held = $this->cached->get($name);
+            unsafe {
+                return assume<T>($held);
+            }
+        }
+
+        T $value = $make($state);
+        $this->cached[$name] = erased::from($value);
+        GpuObject $owned = $value;
+        $this->cachedOwned->push($owned);
+        return $value;
+    }
+
+    /**
+     * Destroy created GPU objects that were not touched this tick.
+     * Imported resources and the static cache are never collected.
+     */
+    public function collect(Gpu& $state) : void
+    {
+        array<string> $names = $this->used->keys();
+
+        foreach ($names as $name) {
+            if ($this->used[$name] >= $this->tick) {
+                continue;
+            }
+
+            $this->dropTarget($state, $name);
+            $this->dropTexture($state, $name);
+            $this->used->remove($name);
+        }
+    }
+
+    /**
+     * Destroy every owned GPU object. Call at shutdown.
+     */
+    public function destroy(Gpu& $state) : void
+    {
+        array<string> $targetNames = $this->targets->keys();
+
+        foreach ($targetNames as $name) {
+            $this->dropTarget($state, $name);
+        }
+
+        array<string> $textureNames = $this->textures->keys();
+
+        foreach ($textureNames as $name) {
+            $this->dropTexture($state, $name);
+        }
+
+        array<GpuObject> $owned = $this->cachedOwned;
+
+        foreach ($owned as $obj) {
+            $obj->destroy($state);
+        }
+
+        $this->used->clear();
+        $this->cached->clear();
+        $this->cachedOwned->clear();
+    }
+
+    public const function hasTarget(string $name) : bool
+    {
+        return $this->targets->has($name);
+    }
+
+    public const function hasTexture(string $name) : bool
+    {
+        return $this->textures->has($name);
+    }
+
+    private function touchExpanded(TargetRef $ref) : void
+    {
+        array<GraphRes> $res = expandIo(.target($ref));
+
+        foreach ($res as $r) {
+            $this->touch($r->name);
+        }
+    }
+
+    private function createTarget(Gpu& $state, TargetRef $ref) : result<RenderTarget, PoolError>
+    {
+        Framebuffer $fb = Framebuffer($state);
+        RenderTarget $target = RenderTarget($ref->width, $ref->height, $fb);
+        $target->contentScaleX = $ref->contentScaleX;
+        $target->contentScaleY = $ref->contentScaleY;
+
+        array<string> $owned = array<string>();
+        array<Attachment> $draw = array<Attachment>();
+        int32 $i = 0;
+        array<TextureRef> $colors = $ref->colorAttachments;
+
+        foreach ($colors as $color) {
+            $color->width = $ref->width;
+            $color->height = $ref->height;
+            Texture $tex = Texture($state, $color->name);
+            $tex->allocateEmpty($state, $ref->width, $ref->height, $color->options);
+            $this->textures[$color->name] = StoredTexture($tex, false);
+            $owned->push($color->name);
+            ColorAttachment $slot = ColorAttachment($i);
+            $fb->attachTexture($state, $slot->attachment(), .texture2D, $tex->id, 0);
+            $draw->push($slot->attachment());
+            $i = $i + 1;
+        }
+
+        if ($draw->count() > 0) {
+            $state->drawBuffers($draw);
+        }
+
+        TextureRef $depth = guard $ref->depthAttachment else {
+            return $this->finishTarget($state, $ref, $target, $fb, $owned);
+        }
+        $depth->width = $ref->width;
+        $depth->height = $ref->height;
+        Texture $depthTex = Texture($state, $depth->name);
+        $depthTex->allocateEmpty($state, $ref->width, $ref->height, $depth->options);
+        $this->textures[$depth->name] = StoredTexture($depthTex, false);
+        $owned->push($depth->name);
+        $fb->attachTexture($state, .depth, .texture2D, $depthTex->id, 0);
+        return $this->finishTarget($state, $ref, $target, $fb, $owned);
+    }
+
+    private function finishTarget(
+        Gpu& $state,
+        TargetRef $ref,
+        RenderTarget $target,
+        Framebuffer $fb,
+        array<string> $owned
+    ) : result<RenderTarget, PoolError>
+    {
+        if ($ref->rboDepthStencil) {
+            $fb->attachRenderbuffer($state, .depthStencil, .depthStencil, $ref->width, $ref->height);
+        } else if ($ref->rboColor) {
+            $fb->attachRenderbuffer($state, ColorAttachment(0)->attachment(), .rgba, $ref->width, $ref->height);
+        }
+
+        bool $ok = guard $fb->valid($state) else ($status) {
+            $this->abandonTarget($state, $fb, $owned);
+            return .error(.incomplete($ref->name, $status));
+        }
+
+        $this->targets[$ref->name] = StoredTarget($target, $owned, false, targetFingerprint($ref));
+        return .ok($target);
+    }
+
+    private function abandonTarget(Gpu& $state, Framebuffer $fb, array<string> $owned) : void
+    {
+        foreach ($owned as $texName) {
+            $this->dropTexture($state, $texName);
+        }
+
+        $fb->destroy($state);
+    }
+
+    private function dropTarget(Gpu& $state, string $name) : void
+    {
+        if (!$this->targets->has($name)) {
+            return;
+        }
+
+        StoredTarget $held = $this->targets[$name];
+        if ($held->imported) {
+            return;
+        }
+
+        array<string> $owned = $held->ownedTextures;
+
+        foreach ($owned as $texName) {
+            $this->dropTexture($state, $texName);
+        }
+
+        $held->target->framebuffer->destroy($state);
+        $this->targets->remove($name);
+    }
+
+    private function dropTexture(Gpu& $state, string $name) : void
+    {
+        if (!$this->textures->has($name)) {
+            return;
+        }
+
+        StoredTexture $held = $this->textures[$name];
+        if ($held->imported) {
+            return;
+        }
+
+        $held->texture->destroy($state);
+        $this->textures->remove($name);
+    }
+}
+
+internal function targetFingerprint(TargetRef $ref) : string
+{
+    string $fp = "{$ref->width}x{$ref->height}";
+
+    if ($ref->rboDepthStencil) {
+        $fp->append('|rboDS');
+    }
+
+    if ($ref->rboColor) {
+        $fp->append('|rboC');
+    }
+
+    array<TextureRef> $texes = $ref->textures();
+
+    foreach ($texes as $tex) {
+        $fp->append('|');
+        $fp->append($tex->name);
+    }
+
+    return $fp;
+}

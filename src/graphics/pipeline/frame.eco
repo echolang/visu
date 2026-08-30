@@ -1,0 +1,66 @@
+/**
+ * Per-frame type-keyed blackboard. A producer set()s exactly one
+ * instance per type; a consumer get()s by type. Duplicate set or a
+ * missing get is a wiring bug (assert).
+ */
+
+namespace visu::graphics;
+
+public class Frame
+{
+    private map<type_id, erased> $slots;
+
+    public constructor()
+    {
+        $this->slots = map<type_id, erased>();
+    }
+
+    /**
+     * Exactly one producer per type per frame.
+     */
+    public function set<T : class>(T $value) : void
+    {
+        type_id $id = type_id<T>();
+        assert(!$this->slots->has($id), 'frame: a second producer for this type');
+        $this->slots[$id] = erased::from($value);
+    }
+
+    /**
+     * An undeclared dependency is a wiring bug.
+     */
+    public function get<T : class>() : T
+    {
+        type_id $id = type_id<T>();
+        assert($this->slots->has($id), 'frame: dependency was never produced');
+        erased $held = $this->slots->get($id);
+        unsafe {
+            return assume<T>($held);
+        }
+    }
+
+    public const function has<T : class>() : bool
+    {
+        return $this->slots->has(type_id<T>());
+    }
+
+    /**
+     * For genuinely optional data.
+     */
+    public function find<T : class>() : T?
+    {
+        type_id $id = type_id<T>();
+        if (!$this->slots->has($id)) {
+            return null;
+        }
+
+        erased $held = $this->slots->get($id);
+        unsafe {
+            return assume<T>($held);
+        }
+    }
+
+    public function clear() : void
+    {
+        $this->slots->clear();
+    }
+}

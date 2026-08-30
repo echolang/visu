@@ -1,0 +1,80 @@
+/**
+ * Camera viewport math. GPU-free. Numbers from PHP ViewportTest.
+ */
+
+use visu::graphics::Viewport;
+use visu::math::Vec2;
+
+function yUp() : Viewport
+{
+    return Viewport(left: -50.0f, right: 50.0f, bottom: -50.0f, top: 50.0f, 1000.0f, 1000.0f);
+}
+
+function yDown() : Viewport
+{
+    return Viewport(left: -50.0f, right: 50.0f, bottom: 50.0f, top: -50.0f, 1000.0f, 1000.0f);
+}
+
+test viewport_contains
+{
+    Viewport $up = yUp();
+    assert($up->contains(Vec2(0.0f, 0.0f)), 'origin up');
+    assert($up->contains(Vec2(0.0f, 45.0f)), 'north up');
+    assert($up->contains(Vec2(0.0f, -45.0f)), 'south up');
+
+    Viewport $down = yDown();
+    assert($down->contains(Vec2(0.0f, 0.0f)), 'origin down');
+    assert($down->contains(Vec2(0.0f, 45.0f)), 'north down');
+    assert($down->contains(Vec2(0.0f, -45.0f)), 'south down');
+}
+
+test viewport_screen_to_view
+{
+    Viewport $up = yUp();
+    Vec2 $c = $up->screenSpaceToViewSpace(Vec2(500.0f, 500.0f));
+    Vec2 $top = $up->screenSpaceToViewSpace(Vec2(500.0f, 0.0f));
+    Vec2 $bot = $up->screenSpaceToViewSpace(Vec2(500.0f, 1000.0f));
+    assert($c->x == 0.0f && $c->y == 0.0f, 'center up');
+    assert($top->x == 0.0f && $top->y == 50.0f, 'top up');
+    assert($bot->x == 0.0f && $bot->y == -50.0f, 'bottom up');
+
+    Viewport $down = yDown();
+    Vec2 $dc = $down->screenSpaceToViewSpace(Vec2(500.0f, 500.0f));
+    Vec2 $dTop = $down->screenSpaceToViewSpace(Vec2(500.0f, 1000.0f));
+    Vec2 $dBot = $down->screenSpaceToViewSpace(Vec2(500.0f, 0.0f));
+    assert($dc->x == 0.0f && $dc->y == 0.0f, 'center down');
+    assert($dTop->x == 0.0f && $dTop->y == 50.0f, 'top down');
+    assert($dBot->x == 0.0f && $dBot->y == -50.0f, 'bottom down');
+}
+
+test viewport_view_to_screen
+{
+    Viewport $up = yUp();
+    Vec2 $c = $up->viewSpaceToScreenSpace(Vec2(0.0f, 0.0f));
+    Vec2 $top = $up->viewSpaceToScreenSpace(Vec2(0.0f, 50.0f));
+    Vec2 $bot = $up->viewSpaceToScreenSpace(Vec2(0.0f, -50.0f));
+    assert($c->x == 500.0f && $c->y == 500.0f, 'center up');
+    assert($top->x == 500.0f && $top->y == 0.0f, 'top up');
+    assert($bot->x == 500.0f && $bot->y == 1000.0f, 'bottom up');
+}
+
+test viewport_anchors
+{
+    Viewport $up = yUp();
+    Vec2 $tl = $up->topLeft();
+    Vec2 $tr = $up->topRight();
+    Vec2 $bl = $up->bottomLeft();
+    Vec2 $br = $up->bottomRight();
+    Vec2 $bc = $up->bottomCenter();
+    Vec2 $tc = $up->topCenter();
+    Vec2 $lc = $up->leftCenter();
+    Vec2 $rc = $up->rightCenter();
+    assert($tl->x == -50.0f && $tl->y == 50.0f, 'top left');
+    assert($tr->x == 50.0f && $tr->y == 50.0f, 'top right');
+    assert($bl->x == -50.0f && $bl->y == -50.0f, 'bottom left');
+    assert($br->x == 50.0f && $br->y == -50.0f, 'bottom right');
+    assert($bc->x == 0.0f && $bc->y == -50.0f, 'bottom center');
+    assert($tc->x == 0.0f && $tc->y == 50.0f, 'top center');
+    assert($lc->x == -50.0f && $lc->y == 0.0f, 'left center');
+    assert($rc->x == 50.0f && $rc->y == 0.0f, 'right center');
+}

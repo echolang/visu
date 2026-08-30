@@ -1,0 +1,194 @@
+/**
+ * Camera / world rectangle. Not glViewport — that is Gpu::viewport.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec2;
+
+public struct Viewport
+{
+    public const float32 $left;
+    public const float32 $right;
+    public const float32 $bottom;
+    public const float32 $top;
+    public const float32 $screenSpaceWidth;
+    public const float32 $screenSpaceHeight;
+
+    /**
+     * Viewport width. Can be negative if the viewport is flipped.
+     */
+    public const float32 $width;
+
+    /**
+     * Viewport height. Can be negative if the viewport is flipped.
+     */
+    public const float32 $height;
+
+    /**
+     * Constructs a new viewport.
+     */
+    public constructor(
+        left: float32 $left,
+        right: float32 $right,
+        bottom: float32 $bottom,
+        top: float32 $top,
+        float32 $screenSpaceWidth,
+        float32 $screenSpaceHeight
+    )
+    {
+        $this->left = $left;
+        $this->right = $right;
+        $this->bottom = $bottom;
+        $this->top = $top;
+        $this->screenSpaceWidth = $screenSpaceWidth;
+        $this->screenSpaceHeight = $screenSpaceHeight;
+        $this->width = $right - $left;
+        $this->height = $bottom - $top;
+    }
+
+    /**
+     * Returns the absolute width of the viewport. The stored width can be
+     * negative if the viewport is flipped.
+     */
+    public const function absWidth() : float32
+    {
+        return std::math::abs($this->width);
+    }
+
+    /**
+     * Returns the absolute height of the viewport. The stored height can be
+     * negative if the viewport is flipped.
+     */
+    public const function absHeight() : float32
+    {
+        return std::math::abs($this->height);
+    }
+
+    /**
+     * Returns the aspect ratio of the viewport.
+     */
+    public const function aspectRatio() : float32
+    {
+        return $this->absWidth() / $this->absHeight();
+    }
+
+    /**
+     * Returns the center of the viewport.
+     */
+    public const function center() : Vec2
+    {
+        return Vec2(($this->left + $this->right) / 2.0f, ($this->bottom + $this->top) / 2.0f);
+    }
+
+    /**
+     * Returns the top left corner of the viewport.
+     */
+    public const function topLeft() : Vec2
+    {
+        return Vec2($this->left, $this->top);
+    }
+
+    /**
+     * Returns the top right corner of the viewport.
+     */
+    public const function topRight() : Vec2
+    {
+        return Vec2($this->right, $this->top);
+    }
+
+    /**
+     * Returns the bottom left corner of the viewport.
+     */
+    public const function bottomLeft() : Vec2
+    {
+        return Vec2($this->left, $this->bottom);
+    }
+
+    /**
+     * Returns the bottom right corner of the viewport.
+     */
+    public const function bottomRight() : Vec2
+    {
+        return Vec2($this->right, $this->bottom);
+    }
+
+    /**
+     * Returns the bottom center of the viewport.
+     */
+    public const function bottomCenter() : Vec2
+    {
+        return Vec2(($this->left + $this->right) / 2.0f, $this->bottom);
+    }
+
+    /**
+     * Returns the top center of the viewport.
+     */
+    public const function topCenter() : Vec2
+    {
+        return Vec2(($this->left + $this->right) / 2.0f, $this->top);
+    }
+
+    /**
+     * Returns the left center of the viewport.
+     */
+    public const function leftCenter() : Vec2
+    {
+        return Vec2($this->left, ($this->bottom + $this->top) / 2.0f);
+    }
+
+    /**
+     * Returns the right center of the viewport.
+     */
+    public const function rightCenter() : Vec2
+    {
+        return Vec2($this->right, ($this->bottom + $this->top) / 2.0f);
+    }
+
+    /**
+     * Returns boolean indicating if the given point is inside the viewport.
+     */
+    public const function contains(const Vec2& $point) : bool
+    {
+        float32 $minX = $this->left;
+        float32 $maxX = $this->right;
+        float32 $minY = $this->bottom;
+        float32 $maxY = $this->top;
+
+        if ($minX > $maxX) {
+            float32 $t = $minX;
+            $minX = $maxX;
+            $maxX = $t;
+        }
+
+        if ($minY > $maxY) {
+            float32 $t = $minY;
+            $minY = $maxY;
+            $maxY = $t;
+        }
+
+        return $point->x >= $minX && $point->x <= $maxX && $point->y >= $minY && $point->y <= $maxY;
+    }
+
+    /**
+     * Converts the given screen space point to viewport space.
+     */
+    public const function screenSpaceToViewSpace(const Vec2& $point) : Vec2
+    {
+        return Vec2(
+            $this->left + $point->x * $this->width / $this->screenSpaceWidth,
+            $this->top + $point->y * $this->height / $this->screenSpaceHeight
+        );
+    }
+
+    /**
+     * Converts the given viewport space point to screen space.
+     */
+    public const function viewSpaceToScreenSpace(const Vec2& $point) : Vec2
+    {
+        return Vec2(
+            ($point->x - $this->left) * $this->screenSpaceWidth / $this->width,
+            ($point->y - $this->top) * $this->screenSpaceHeight / $this->height
+        );
+    }
+}

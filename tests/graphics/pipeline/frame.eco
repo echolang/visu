@@ -1,0 +1,66 @@
+/**
+ * Frame blackboard. No GPU.
+ */
+
+use visu::graphics::Frame;
+
+class Note
+{
+    public int32 $n;
+
+    public constructor(int32 $n)
+    {
+        $this->n = $n;
+    }
+}
+
+class Other
+{
+    public int32 $n;
+
+    public constructor(int32 $n)
+    {
+        $this->n = $n;
+    }
+}
+
+test frame_set_get
+{
+    Frame $frame = Frame();
+    $frame->set(Note(7));
+    assert($frame->has<Note>(), 'has');
+    assert(!$frame->has<Other>(), 'no other');
+    Note $note = $frame->get<Note>();
+    assert($note->n == 7, 'n');
+    Other? $missing = $frame->find<Other>();
+    assert($missing == null, 'find miss');
+    $frame->set(Other(3));
+    Other? $maybe = $frame->find<Other>();
+    Other $found = guard $maybe else {
+        die('should be there');
+    }
+    assert($found->n == 3, 'find hit');
+}
+
+test frame_clear_drops_slots
+{
+    Frame $frame = Frame();
+    $frame->set(Note(1));
+    $frame->clear();
+    assert(!$frame->has<Note>(), 'cleared');
+}
+
+#[tests: expects death]
+test frame_duplicate_set_dies
+{
+    Frame $frame = Frame();
+    $frame->set(Note(1));
+    $frame->set(Note(2));
+}
+
+#[tests: expects death]
+test frame_missing_get_dies
+{
+    Frame $frame = Frame();
+    Note $note = $frame->get<Note>();
+}

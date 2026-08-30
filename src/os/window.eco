@@ -1,0 +1,410 @@
+/**
+ * An OS window. Construct does not create the GLFW resource; initialize
+ * does. GLFW stays in this file — typical code never writes glfw::.
+ */
+
+namespace visu::os;
+
+use visu::graphics::{Gpu, RenderTarget, Framebuffer};
+use visu::math::Vec2;
+
+public class Window
+{
+    private string $title;
+    private int32 $width;
+    private int32 $height;
+    public const WindowHints $hints;
+    private ptr<glfw::Window> $handle;
+    private Framebuffer $framebuffer;
+    private WindowEventHandler? $handler;
+
+    public constructor(string $title, int32 $width, int32 $height, WindowHints $hints = WindowHints::defaults())
+    {
+        $this->title = $title;
+        $this->width = $width;
+        $this->height = $height;
+        $this->hints = $hints;
+        $this->handle:$ = null;
+        $this->framebuffer = Framebuffer::backbuffer();
+        $this->handler = null;
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function initialize(Gpu& $state) : result<bool, WindowError>
+    {
+        if ($this->handle:$ != null) {
+            return .error(.alreadyInitialized);
+        }
+
+        $this->hints->apply();
+
+        ptr<glfw::Window> $created = glfw::createWindow($this->width, $this->height, $this->title, null, null);
+
+        if ($created:$ == null) {
+            return .error(.createFailed(glfw::error_message()));
+        }
+
+        $this->handle:$ = $created:$;
+        glfw::makeContextCurrent($this->handle);
+
+        if (!$state->load()) {
+            glfw::destroyWindow($this->handle);
+            $this->handle:$ = null;
+            return .error(.gpuLoad);
+        }
+
+        $this->framebuffer = Framebuffer::backbuffer();
+        $state->reset();
+        windowRegister($this);
+
+        if ($this->handler != null) {
+            $this->installCallbacks();
+        }
+
+        return .ok(true);
+    }
+
+    public function destroy() : void
+    {
+        if ($this->handle:$ == null) {
+            return;
+        }
+
+        windowUnregister($this);
+        glfw::destroyWindow($this->handle);
+        $this->handle:$ = null;
+        $this->handler = null;
+    }
+
+    internal const function glfwHandle() : ptr<glfw::Window>
+    {
+        return $this->handle;
+    }
+
+    private const function requireHandle() : ptr<glfw::Window>
+    {
+        assert($this->handle:$ != null, 'window is not initialized, call initialize first');
+        return $this->handle;
+    }
+
+    public function activate() : void
+    {
+        glfw::makeContextCurrent($this->requireHandle());
+    }
+
+    public function swap() : void
+    {
+        glfw::swapBuffers($this->requireHandle());
+    }
+
+    public function poll() : void
+    {
+        $this->requireHandle();
+        WindowEventHandler $handler = guard $this->handler else {
+            glfw::pollEvents();
+            return;
+        }
+        $handler->handleWillPoll($this);
+        glfw::pollEvents();
+        $handler->handleDidPoll($this);
+    }
+
+    public const function shouldClose() : bool
+    {
+        return glfw::windowShouldClose($this->requireHandle()) == glfw::TRUE;
+    }
+
+    public function setShouldClose(bool $value) : void
+    {
+        glfw::setWindowShouldClose($this->requireHandle(), glfwFlag($value));
+    }
+
+    public const function title() : string
+    {
+        return $this->title;
+    }
+
+    public function setTitle(string $title) : void
+    {
+        $this->title = $title;
+        glfw::setWindowTitle($this->requireHandle(), $title);
+    }
+
+    public const function width() : int32
+    {
+        return $this->width;
+    }
+
+    public const function height() : int32
+    {
+        return $this->height;
+    }
+
+    public function pullSize() : void
+    {
+        int32 $w = 0;
+        int32 $h = 0;
+        glfw::getWindowSize($this->requireHandle(), &$w, &$h);
+        $this->width = $w;
+        $this->height = $h;
+    }
+
+    public const function size() : Vec2
+    {
+        return Vec2($this->width as float32, $this->height as float32);
+    }
+
+    public function setSize(int32 $width, int32 $height) : void
+    {
+        $this->width = $width;
+        $this->height = $height;
+        glfw::setWindowSize($this->requireHandle(), $width, $height);
+    }
+
+    public const function position() : Vec2
+    {
+        int32 $x = 0;
+        int32 $y = 0;
+        glfw::getWindowPos($this->requireHandle(), &$x, &$y);
+        return Vec2($x as float32, $y as float32);
+    }
+
+    public function setPosition(int32 $x, int32 $y) : void
+    {
+        glfw::setWindowPos($this->requireHandle(), $x, $y);
+    }
+
+    public const function framebufferSize() : Vec2
+    {
+        int32 $x = 0;
+        int32 $y = 0;
+        glfw::getFramebufferSize($this->requireHandle(), &$x, &$y);
+        return Vec2($x as float32, $y as float32);
+    }
+
+    public const function framebufferWidth() : int32
+    {
+        int32 $x = 0;
+        int32 $y = 0;
+        glfw::getFramebufferSize($this->requireHandle(), &$x, &$y);
+        return $x;
+    }
+
+    public const function framebufferHeight() : int32
+    {
+        int32 $x = 0;
+        int32 $y = 0;
+        glfw::getFramebufferSize($this->requireHandle(), &$x, &$y);
+        return $y;
+    }
+
+    public const function framebuffer() : Framebuffer
+    {
+        return $this->framebuffer;
+    }
+
+    public function renderTarget() : RenderTarget
+    {
+        ptr<glfw::Window> $glfwWindow = $this->requireHandle();
+        int32 $w = $this->framebufferWidth();
+        int32 $h = $this->framebufferHeight();
+        RenderTarget $rt = RenderTarget($w, $h, $this->framebuffer);
+        float32 $sx = 1.0f;
+        float32 $sy = 1.0f;
+        glfw::getWindowContentScale($glfwWindow, &$sx, &$sy);
+        $rt->contentScaleX = $sx;
+        $rt->contentScaleY = $sy;
+        return $rt;
+    }
+
+    public function setHandler(WindowEventHandler $handler) : void
+    {
+        $this->handler = $handler;
+
+        if ($this->handle:$ != null) {
+            $this->installCallbacks();
+        }
+    }
+
+    private function installCallbacks() : void
+    {
+        ptr<glfw::Window> $glfwWindow = $this->requireHandle();
+        glfw::setKeyCallback($glfwWindow, &onKey);
+        glfw::setCharCallback($glfwWindow, &onChar);
+        glfw::setCharModsCallback($glfwWindow, &onCharMods);
+        glfw::setMouseButtonCallback($glfwWindow, &onMouseButton);
+        glfw::setCursorPosCallback($glfwWindow, &onCursorPos);
+        glfw::setCursorEnterCallback($glfwWindow, &onCursorEnter);
+        glfw::setScrollCallback($glfwWindow, &onScroll);
+        glfw::setDropCallback($glfwWindow, &onDrop);
+        glfw::setWindowSizeCallback($glfwWindow, &onSize);
+    }
+
+    internal function triggerKey(int32 $key, int32 $scancode, int32 $action, int32 $mods) : void
+    {
+        WindowEventHandler $handler = guard $this->handler else {
+            return;
+        }
+        $handler->handleKey($this, $key, $scancode, $action, $mods);
+    }
+
+    internal function triggerChar(int32 $codepoint) : void
+    {
+        WindowEventHandler $handler = guard $this->handler else {
+            return;
+        }
+        $handler->handleChar($this, $codepoint);
+    }
+
+    internal function triggerCharMods(int32 $codepoint, int32 $mods) : void
+    {
+        WindowEventHandler $handler = guard $this->handler else {
+            return;
+        }
+        $handler->handleCharMods($this, $codepoint, $mods);
+    }
+
+    internal function triggerMouseButton(int32 $button, int32 $action, int32 $mods) : void
+    {
+        WindowEventHandler $handler = guard $this->handler else {
+            return;
+        }
+        $handler->handleMouseButton($this, $button, $action, $mods);
+    }
+
+    internal function triggerCursorPos(float64 $x, float64 $y) : void
+    {
+        WindowEventHandler $handler = guard $this->handler else {
+            return;
+        }
+        $handler->handleCursorPos($this, $x, $y);
+    }
+
+    internal function triggerCursorEnter(bool $entered) : void
+    {
+        WindowEventHandler $handler = guard $this->handler else {
+            return;
+        }
+        $handler->handleCursorEnter($this, $entered);
+    }
+
+    internal function triggerScroll(float64 $x, float64 $y) : void
+    {
+        WindowEventHandler $handler = guard $this->handler else {
+            return;
+        }
+        $handler->handleScroll($this, $x, $y);
+    }
+
+    internal function triggerDrop(array<string> $paths) : void
+    {
+        WindowEventHandler $handler = guard $this->handler else {
+            return;
+        }
+        $handler->handleDrop($this, $paths);
+    }
+
+    internal function noteSize(int32 $width, int32 $height) : void
+    {
+        $this->width = $width;
+        $this->height = $height;
+    }
+
+    public const function attribute(WindowAttrib $attribute) : bool
+    {
+        return glfw::getWindowAttrib($this->requireHandle(), glfwAttrib($attribute)) == glfw::TRUE;
+    }
+
+    public function setAttribute(WindowAttrib $attribute, bool $value) : void
+    {
+        glfw::setWindowAttrib($this->requireHandle(), glfwAttrib($attribute), glfwFlag($value));
+    }
+
+    public function setSizeLimits(int32 $minWidth, int32 $minHeight, int32 $maxWidth, int32 $maxHeight) : void
+    {
+        glfw::setWindowSizeLimits($this->requireHandle(), $minWidth, $minHeight, $maxWidth, $maxHeight);
+    }
+
+    public function setAspectRatio(int32 $numerator, int32 $denominator) : void
+    {
+        glfw::setWindowAspectRatio($this->requireHandle(), $numerator, $denominator);
+    }
+
+    public function maximize() : void
+    {
+        glfw::maximizeWindow($this->requireHandle());
+    }
+
+    public const function isMaximized() : bool
+    {
+        return glfw::getWindowAttrib($this->requireHandle(), glfw::MAXIMIZED) == glfw::TRUE;
+    }
+
+    public function iconify() : void
+    {
+        glfw::iconifyWindow($this->requireHandle());
+    }
+
+    public const function isIconified() : bool
+    {
+        return glfw::getWindowAttrib($this->requireHandle(), glfw::ICONIFIED) == glfw::TRUE;
+    }
+
+    public function restore() : void
+    {
+        glfw::restoreWindow($this->requireHandle());
+    }
+
+    public function show() : void
+    {
+        glfw::showWindow($this->requireHandle());
+    }
+
+    public function hide() : void
+    {
+        glfw::hideWindow($this->requireHandle());
+    }
+
+    public const function isVisible() : bool
+    {
+        return glfw::getWindowAttrib($this->requireHandle(), glfw::VISIBLE) == glfw::TRUE;
+    }
+
+    public function focus() : void
+    {
+        glfw::focusWindow($this->requireHandle());
+    }
+
+    public const function hasFocus() : bool
+    {
+        return glfw::getWindowAttrib($this->requireHandle(), glfw::FOCUSED) == glfw::TRUE;
+    }
+
+    public function requestAttention() : void
+    {
+        glfw::requestWindowAttention($this->requireHandle());
+    }
+
+    public function setSwapInterval(int32 $interval) : void
+    {
+        glfw::swapInterval($interval);
+    }
+
+    public function setFullscreen(int32 $width, int32 $height, int32 $refreshRate) : void
+    {
+        ptr<glfw::Monitor> $monitor = glfw::getPrimaryMonitor();
+        assert($monitor:$ != null, 'glfw has no primary monitor');
+        glfw::setWindowMonitor($this->requireHandle(), $monitor, 0, 0, $width, $height, $refreshRate);
+    }
+
+    public function setWindowed(int32 $width, int32 $height, int32 $x, int32 $y) : void
+    {
+        glfw::setWindowMonitor($this->requireHandle(), null, $x, $y, $width, $height, glfw::DONT_CARE);
+        $this->width = $width;
+        $this->height = $height;
+    }
+}

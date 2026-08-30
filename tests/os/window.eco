@@ -1,0 +1,82 @@
+/**
+ * Real GLFW window. Hidden, so it can run without a click. Skip on
+ * machines without a display via --filter group:glfw.
+ */
+
+use visu::os::{Window, WindowHints, init, terminate, WindowError, WindowAttrib};
+use visu::graphics::Gpu;
+
+#[group: "glfw"]
+test window_initialize_sets_title_and_size
+{
+    bool $ok = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('Test Window', 640, 480, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    assert($window->title() == 'Test Window', 'title');
+    assert($window->width() == 640, 'width');
+    assert($window->height() == 480, 'height');
+    assert($window->framebufferWidth() >= 640, 'fb width');
+    assert($window->framebufferHeight() >= 480, 'fb height');
+    visu::graphics::RenderTarget $rt = $window->renderTarget();
+    assert($rt->width() >= 640, 'render target width');
+    assert($rt->height() >= 480, 'render target height');
+    assert(!$window->shouldClose(), 'open');
+    $window->setShouldClose(true);
+    assert($window->shouldClose(), 'close requested');
+    $window->destroy();
+    terminate();
+}
+
+#[group: "glfw"]
+test window_initialize_twice_is_already_initialized
+{
+    bool $ok = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('twice', 320, 240, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    result<bool, WindowError> $again = $window->initialize($state);
+    assert($again->failed(), 'second initialize fails');
+    $window->destroy();
+    terminate();
+}
+
+#[group: "glfw"]
+test window_set_attribute_visible
+{
+    bool $ok = guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('attr', 320, 240, $hints);
+    Gpu $state = Gpu();
+    bool $ready = guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    $window->setAttribute(.visible, false);
+    assert(!$window->attribute(.visible), 'hidden');
+    $window->destroy();
+    terminate();
+}

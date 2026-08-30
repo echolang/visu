@@ -1,0 +1,397 @@
+namespace visu::math;
+
+// column-major 4x4, matching OpenGL's default uniform layout
+public struct Mat4
+{
+    public Vec4 $c0;
+    public Vec4 $c1;
+    public Vec4 $c2;
+    public Vec4 $c3;
+
+    public constructor()
+    {
+        $this->c0 = Vec4(1.0f, 0.0f, 0.0f, 0.0f);
+        $this->c1 = Vec4(0.0f, 1.0f, 0.0f, 0.0f);
+        $this->c2 = Vec4(0.0f, 0.0f, 1.0f, 0.0f);
+        $this->c3 = Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+
+    public constructor(Vec4 $c0, Vec4 $c1, Vec4 $c2, Vec4 $c3)
+    {
+        $this->c0 = $c0;
+        $this->c1 = $c1;
+        $this->c2 = $c2;
+        $this->c3 = $c3;
+    }
+
+    public constructor(float32 $s)
+    {
+        $this->c0 = Vec4($s, 0.0f, 0.0f, 0.0f);
+        $this->c1 = Vec4(0.0f, $s, 0.0f, 0.0f);
+        $this->c2 = Vec4(0.0f, 0.0f, $s, 0.0f);
+        $this->c3 = Vec4(0.0f, 0.0f, 0.0f, $s);
+    }
+
+    public constructor(Quat $q)
+    {
+        $xx = $q->x * $q->x;
+        $yy = $q->y * $q->y;
+        $zz = $q->z * $q->z;
+        $xz = $q->x * $q->z;
+        $xy = $q->x * $q->y;
+        $yz = $q->y * $q->z;
+        $wx = $q->w * $q->x;
+        $wy = $q->w * $q->y;
+        $wz = $q->w * $q->z;
+
+        $this->c0 = Vec4(1.0f - 2.0f * ($yy + $zz), 2.0f * ($xy + $wz), 2.0f * ($xz - $wy), 0.0f);
+        $this->c1 = Vec4(2.0f * ($xy - $wz), 1.0f - 2.0f * ($xx + $zz), 2.0f * ($yz + $wx), 0.0f);
+        $this->c2 = Vec4(2.0f * ($xz + $wy), 2.0f * ($yz - $wx), 1.0f - 2.0f * ($xx + $yy), 0.0f);
+        $this->c3 = Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+}
+
+#[inline]
+operator (const Mat4& $a) + (const Mat4& $b) : Mat4
+{
+    return Mat4($a->c0 + $b->c0, $a->c1 + $b->c1, $a->c2 + $b->c2, $a->c3 + $b->c3);
+}
+
+#[inline]
+operator (const Mat4& $a) - (const Mat4& $b) : Mat4
+{
+    return Mat4($a->c0 - $b->c0, $a->c1 - $b->c1, $a->c2 - $b->c2, $a->c3 - $b->c3);
+}
+
+#[inline]
+operator (const Mat4& $m) * (float32 $s) : Mat4
+{
+    return Mat4($m->c0 * $s, $m->c1 * $s, $m->c2 * $s, $m->c3 * $s);
+}
+
+#[inline]
+operator (float32 $s) * (const Mat4& $m) : Mat4
+{
+    return $m * $s;
+}
+
+#[inline]
+operator (const Mat4& $m) / (float32 $s) : Mat4
+{
+    return Mat4($m->c0 / $s, $m->c1 / $s, $m->c2 / $s, $m->c3 / $s);
+}
+
+#[inline]
+operator -(const Mat4& $m) : Mat4
+{
+    return Mat4(-$m->c0, -$m->c1, -$m->c2, -$m->c3);
+}
+
+#[inline]
+operator (const Mat4& $m) * (Vec4 $v) : Vec4
+{
+    return $m->c0 * $v->x + $m->c1 * $v->y + $m->c2 * $v->z + $m->c3 * $v->w;
+}
+
+#[inline]
+operator (const Mat4& $a) * (const Mat4& $b) : Mat4
+{
+    return Mat4($a * $b->c0, $a * $b->c1, $a * $b->c2, $a * $b->c3);
+}
+
+#[inline]
+operator (const Mat4& $a) == (const Mat4& $b) : bool
+{
+    return $a->c0 == $b->c0 && $a->c1 == $b->c1 && $a->c2 == $b->c2 && $a->c3 == $b->c3;
+}
+
+#[inline]
+operator (const Mat4& $a) != (const Mat4& $b) : bool
+{
+    return !($a == $b);
+}
+
+#[inline]
+operator (Mat4& $m)[usize $i] : Vec4&
+{
+    assert($i < 4, 'Mat4 index out of range');
+
+    if ($i == 0) {
+        return &$m->c0;
+    }
+
+    if ($i == 1) {
+        return &$m->c1;
+    }
+
+    if ($i == 2) {
+        return &$m->c2;
+    }
+
+    return &$m->c3;
+}
+
+#[inline]
+operator (const Mat4& $m)[usize $i] : const Vec4&
+{
+    assert($i < 4, 'Mat4 index out of range');
+
+    if ($i == 0) {
+        return &$m->c0;
+    }
+
+    if ($i == 1) {
+        return &$m->c1;
+    }
+
+    if ($i == 2) {
+        return &$m->c2;
+    }
+
+    return &$m->c3;
+}
+
+#[inline]
+public function translate(Vec3 $v) : Mat4
+{
+    Mat4 $m = Mat4();
+    $m->c3 = Vec4($v, 1.0f);
+
+    return $m;
+}
+
+#[inline]
+public function translate(float32 $x, float32 $y, float32 $z) : Mat4
+{
+    return translate(Vec3($x, $y, $z));
+}
+
+#[inline]
+public function translate(const Mat4& $m, Vec3 $v) : Mat4
+{
+    return $m * translate($v);
+}
+
+#[inline]
+public function scale(Vec3 $v) : Mat4
+{
+    return Mat4(
+        Vec4($v->x, 0.0f, 0.0f, 0.0f),
+        Vec4(0.0f, $v->y, 0.0f, 0.0f),
+        Vec4(0.0f, 0.0f, $v->z, 0.0f),
+        Vec4(0.0f, 0.0f, 0.0f, 1.0f)
+    );
+}
+
+#[inline]
+public function scale(const Mat4& $m, Vec3 $v) : Mat4
+{
+    return $m * scale($v);
+}
+
+public function rotateX(float32 $radians) : Mat4
+{
+    $c = std::math::cos($radians);
+    $s = std::math::sin($radians);
+
+    return Mat4(
+        Vec4(1.0f, 0.0f, 0.0f, 0.0f),
+        Vec4(0.0f, $c, $s, 0.0f),
+        Vec4(0.0f, -$s, $c, 0.0f),
+        Vec4(0.0f, 0.0f, 0.0f, 1.0f)
+    );
+}
+
+public function rotateY(float32 $radians) : Mat4
+{
+    $c = std::math::cos($radians);
+    $s = std::math::sin($radians);
+
+    return Mat4(
+        Vec4($c, 0.0f, -$s, 0.0f),
+        Vec4(0.0f, 1.0f, 0.0f, 0.0f),
+        Vec4($s, 0.0f, $c, 0.0f),
+        Vec4(0.0f, 0.0f, 0.0f, 1.0f)
+    );
+}
+
+public function rotateZ(float32 $radians) : Mat4
+{
+    $c = std::math::cos($radians);
+    $s = std::math::sin($radians);
+
+    return Mat4(
+        Vec4($c, $s, 0.0f, 0.0f),
+        Vec4(-$s, $c, 0.0f, 0.0f),
+        Vec4(0.0f, 0.0f, 1.0f, 0.0f),
+        Vec4(0.0f, 0.0f, 0.0f, 1.0f)
+    );
+}
+
+public function rotate(radians: float32 $radians, axis: Vec3 $axis) : Mat4
+{
+    $a = normalize($axis);
+    $c = std::math::cos($radians);
+    $s = std::math::sin($radians);
+    $t = $a * (1.0f - $c);
+
+    return Mat4(
+        Vec4($c + $t->x * $a->x, $t->x * $a->y + $s * $a->z, $t->x * $a->z - $s * $a->y, 0.0f),
+        Vec4($t->y * $a->x - $s * $a->z, $c + $t->y * $a->y, $t->y * $a->z + $s * $a->x, 0.0f),
+        Vec4($t->z * $a->x + $s * $a->y, $t->z * $a->y - $s * $a->x, $c + $t->z * $a->z, 0.0f),
+        Vec4(0.0f, 0.0f, 0.0f, 1.0f)
+    );
+}
+
+#[inline]
+public function rotate(const Mat4& $m, radians: float32 $radians, axis: Vec3 $axis) : Mat4
+{
+    return $m * rotate(radians: $radians, axis: $axis);
+}
+
+public function perspective(fovY: float32 $fovY, aspect: float32 $aspect, near: float32 $near, far: float32 $far) : Mat4
+{
+    $f = 1.0f / std::math::tan($fovY * 0.5f);
+    Mat4 $m = Mat4();
+    $m->c0->x = $f / $aspect;
+    $m->c1->y = $f;
+    $m->c2->z = ($far + $near) / ($near - $far);
+    $m->c2->w = -1.0f;
+    $m->c3->z = (2.0f * $far * $near) / ($near - $far);
+    $m->c3->w = 0.0f;
+
+    return $m;
+}
+
+public function ortho(
+    left: float32 $left,
+    right: float32 $right,
+    bottom: float32 $bottom,
+    top: float32 $top,
+    near: float32 $near,
+    far: float32 $far
+) : Mat4
+{
+    Mat4 $m = Mat4();
+    $m->c0->x = 2.0f / ($right - $left);
+    $m->c1->y = 2.0f / ($top - $bottom);
+    $m->c2->z = -2.0f / ($far - $near);
+    $m->c3->x = -($right + $left) / ($right - $left);
+    $m->c3->y = -($top + $bottom) / ($top - $bottom);
+    $m->c3->z = -($far + $near) / ($far - $near);
+
+    return $m;
+}
+
+public function lookAt(eye: Vec3 $eye, center: Vec3 $center, up: Vec3 $up) : Mat4
+{
+    $f = normalize($center - $eye);
+    $s = normalize(cross($f, $up));
+    $u = cross($s, $f);
+
+    return Mat4(
+        Vec4($s->x, $u->x, -$f->x, 0.0f),
+        Vec4($s->y, $u->y, -$f->y, 0.0f),
+        Vec4($s->z, $u->z, -$f->z, 0.0f),
+        Vec4(-dot($s, $eye), -dot($u, $eye), dot($f, $eye), 1.0f)
+    );
+}
+
+#[inline]
+public function transpose(const Mat4& $m) : Mat4
+{
+    return Mat4(
+        Vec4($m->c0->x, $m->c1->x, $m->c2->x, $m->c3->x),
+        Vec4($m->c0->y, $m->c1->y, $m->c2->y, $m->c3->y),
+        Vec4($m->c0->z, $m->c1->z, $m->c2->z, $m->c3->z),
+        Vec4($m->c0->w, $m->c1->w, $m->c2->w, $m->c3->w)
+    );
+}
+
+public function determinant(const Mat4& $m) : float32
+{
+    $sf00 = $m->c2->z * $m->c3->w - $m->c3->z * $m->c2->w;
+    $sf01 = $m->c2->y * $m->c3->w - $m->c3->y * $m->c2->w;
+    $sf02 = $m->c2->y * $m->c3->z - $m->c3->y * $m->c2->z;
+    $sf03 = $m->c2->x * $m->c3->w - $m->c3->x * $m->c2->w;
+    $sf04 = $m->c2->x * $m->c3->z - $m->c3->x * $m->c2->z;
+    $sf05 = $m->c2->x * $m->c3->y - $m->c3->x * $m->c2->y;
+
+    $c0 = $m->c1->y * $sf00 - $m->c1->z * $sf01 + $m->c1->w * $sf02;
+    $c1 = $m->c1->x * $sf00 - $m->c1->z * $sf03 + $m->c1->w * $sf04;
+    $c2 = $m->c1->x * $sf01 - $m->c1->y * $sf03 + $m->c1->w * $sf05;
+    $c3 = $m->c1->x * $sf02 - $m->c1->y * $sf04 + $m->c1->z * $sf05;
+
+    return $m->c0->x * $c0 - $m->c0->y * $c1 + $m->c0->z * $c2 - $m->c0->w * $c3;
+}
+
+public function inverse(const Mat4& $m) : Mat4
+{
+    $coef00 = $m->c2->z * $m->c3->w - $m->c3->z * $m->c2->w;
+    $coef02 = $m->c1->z * $m->c3->w - $m->c3->z * $m->c1->w;
+    $coef03 = $m->c1->z * $m->c2->w - $m->c2->z * $m->c1->w;
+    $coef04 = $m->c2->y * $m->c3->w - $m->c3->y * $m->c2->w;
+    $coef06 = $m->c1->y * $m->c3->w - $m->c3->y * $m->c1->w;
+    $coef07 = $m->c1->y * $m->c2->w - $m->c2->y * $m->c1->w;
+    $coef08 = $m->c2->y * $m->c3->z - $m->c3->y * $m->c2->z;
+    $coef10 = $m->c1->y * $m->c3->z - $m->c3->y * $m->c1->z;
+    $coef11 = $m->c1->y * $m->c2->z - $m->c2->y * $m->c1->z;
+    $coef12 = $m->c2->x * $m->c3->w - $m->c3->x * $m->c2->w;
+    $coef14 = $m->c1->x * $m->c3->w - $m->c3->x * $m->c1->w;
+    $coef15 = $m->c1->x * $m->c2->w - $m->c2->x * $m->c1->w;
+    $coef16 = $m->c2->x * $m->c3->z - $m->c3->x * $m->c2->z;
+    $coef18 = $m->c1->x * $m->c3->z - $m->c3->x * $m->c1->z;
+    $coef19 = $m->c1->x * $m->c2->z - $m->c2->x * $m->c1->z;
+    $coef20 = $m->c2->x * $m->c3->y - $m->c3->x * $m->c2->y;
+    $coef22 = $m->c1->x * $m->c3->y - $m->c3->x * $m->c1->y;
+    $coef23 = $m->c1->x * $m->c2->y - $m->c2->x * $m->c1->y;
+
+    $fac0 = Vec4($coef00, $coef00, $coef02, $coef03);
+    $fac1 = Vec4($coef04, $coef04, $coef06, $coef07);
+    $fac2 = Vec4($coef08, $coef08, $coef10, $coef11);
+    $fac3 = Vec4($coef12, $coef12, $coef14, $coef15);
+    $fac4 = Vec4($coef16, $coef16, $coef18, $coef19);
+    $fac5 = Vec4($coef20, $coef20, $coef22, $coef23);
+
+    $vec0 = Vec4($m->c1->x, $m->c0->x, $m->c0->x, $m->c0->x);
+    $vec1 = Vec4($m->c1->y, $m->c0->y, $m->c0->y, $m->c0->y);
+    $vec2 = Vec4($m->c1->z, $m->c0->z, $m->c0->z, $m->c0->z);
+    $vec3 = Vec4($m->c1->w, $m->c0->w, $m->c0->w, $m->c0->w);
+
+    $inv0 = $vec1 * $fac0 - $vec2 * $fac1 + $vec3 * $fac2;
+    $inv1 = $vec0 * $fac0 - $vec2 * $fac3 + $vec3 * $fac4;
+    $inv2 = $vec0 * $fac1 - $vec1 * $fac3 + $vec3 * $fac5;
+    $inv3 = $vec0 * $fac2 - $vec1 * $fac4 + $vec2 * $fac5;
+
+    $signA = Vec4(1.0f, -1.0f, 1.0f, -1.0f);
+    $signB = Vec4(-1.0f, 1.0f, -1.0f, 1.0f);
+    $inverse = Mat4($inv0 * $signA, $inv1 * $signB, $inv2 * $signA, $inv3 * $signB);
+
+    $row0 = Vec4($inverse->c0->x, $inverse->c1->x, $inverse->c2->x, $inverse->c3->x);
+    $det = dot($m->c0, $row0);
+
+    return $inverse * (1.0f / $det);
+}
+
+#[inline]
+public function equal(const Mat4& $a, const Mat4& $b, float32 $eps) : bool
+{
+    return equal($a->c0, $b->c0, $eps)
+        && equal($a->c1, $b->c1, $eps)
+        && equal($a->c2, $b->c2, $eps)
+        && equal($a->c3, $b->c3, $eps);
+}
+
+#[inline]
+public function equal(const Mat4& $a, const Mat4& $b) : bool
+{
+    return equal($a, $b, 0.0001f);
+}
+
+#[inline]
+public function valuePtr(const Mat4& $m) : ptr<const float32>
+{
+    const float32& $first = &$m->c0->x;
+
+    return $first:$ as ptr<const float32>;
+}
