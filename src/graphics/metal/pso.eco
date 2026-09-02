@@ -1,0 +1,183 @@
+/**
+ * Metal render-pipeline cache. Baked at draw from the bound
+ * program + VAO + attachment formats — GpuPass is the CPU
+ * bundle, this is the MTLRenderPipelineState.
+ */
+
+namespace visu::graphics;
+
+internal class MetalPsoCache
+{
+    private map<string, mtl::RenderPipelineState> $psos;
+
+    public constructor()
+    {
+        $this->psos = map<string, mtl::RenderPipelineState>();
+    }
+
+    public function bind(
+        mtl::RenderCommandEncoder $enc,
+        mtl::Device? $device,
+        MetalStore $store,
+        GpuBinds $binds
+    ) : bool
+    {
+        if ($binds->program == 0 || !$store->programs->has($binds->program)) {
+            return false;
+        }
+
+        if ($binds->vertexArray == 0 || !$store->vaos->has($binds->vertexArray)) {
+            return false;
+        }
+
+        ProgRec $prog = $store->programs[$binds->program];
+        mtl::Function $vs = guard $prog->vsFn else {
+            return false;
+        }
+        mtl::Function $fs = guard $prog->fsFn else {
+            return false;
+        }
+        VaoRec $vao = $store->vaos[$binds->vertexArray];
+        mtl::PixelFormat $colorFmt = mtl::PixelFormat::bgra8Unorm;
+        mtl::PixelFormat $depthFmt = mtl::PixelFormat::invalid;
+
+        if ($binds->drawFramebuffer != 0 && $store->fbos->has($binds->drawFramebuffer)) {
+            FboRec $fbo = $store->fbos[$binds->drawFramebuffer];
+            $colorFmt = mtlPixelFormat($fbo->colorFormat);
+
+            if ($fbo->depth != 0) {
+                $depthFmt = mtlPixelFormat($fbo->depthFormat);
+            }
+        }
+
+        string $key = metalPsoKey($binds->program, $vao, $colorFmt, $depthFmt);
+        mtl::RenderPipelineState? $cached = $this->lookup($key);
+
+        if ($cached == null) {
+            mtl::RenderPipelineState $made = guard $this->make($device, $vs, $fs, $vao, $colorFmt, $depthFmt) else {
+                return false;
+            }
+            $this->psos[$key] = $made;
+            $enc->setRenderPipelineState($made);
+            return true;
+        }
+
+        mtl::RenderPipelineState $pso = guard $cached;
+        $enc->setRenderPipelineState($pso);
+        return true;
+    }
+
+    public function forget(uint32 $program) : void
+    {
+        string $prefix = "{$program}|";
+        array<string> $keys = $this->psos->keys();
+
+        foreach ($keys as $key) {
+            if ($key->starts($prefix)) {
+                $this->psos->remove($key);
+            }
+        }
+    }
+
+    private function lookup(string $key) : mtl::RenderPipelineState?
+    {
+        if (!$this->psos->has($key)) {
+            return null;
+        }
+
+        return $this->psos[$key];
+    }
+
+    private function make(
+        mtl::Device? $device,
+        mtl::Function $vs,
+        mtl::Function $fs,
+        VaoRec $vao,
+        mtl::PixelFormat $colorFmt,
+        mtl::PixelFormat $depthFmt
+    ) : mtl::RenderPipelineState?
+    {
+        mtl::Device $held = guard $device else {
+            return null;
+        }
+        mtl::VertexDescriptor $vd = metalVertexDescriptor($vao);
+        mtl::RenderPipelineDescriptor $desc = mtl::RenderPipelineDescriptor($vs, $vertexDescriptor: $vd);
+        $desc->fragmentFunction = $fs;
+        $desc->colorPixelFormats[] = $colorFmt;
+        $desc->depthPixelFormat = $depthFmt;
+        mtl::RenderPipelineState $pso = guard $held->newRenderPipelineState($desc) else {
+            return null;
+        }
+        return $pso;
+    }
+}
+
+internal function metalPsoKey(
+    uint32 $program,
+    VaoRec $vao,
+    mtl::PixelFormat $color,
+    mtl::PixelFormat $depth
+) : string
+{
+    string $layout = '';
+
+    foreach ($vao->attrs as $attr) {
+        if (!$attr->enabled) {
+            continue;
+        }
+
+        $layout = "{$layout}{$attr->location}:{$attr->components}:{$attr->offset}:{$attr->stride}:{$attr->divisor};";
+    }
+
+    uint32 $cf = $color->value();
+    uint32 $df = $depth->value();
+    return "{$program}|{$layout}|{$cf}|{$df}";
+}
+
+internal function metalVertexDescriptor(VaoRec $vao) : mtl::VertexDescriptor
+{
+    mtl::VertexDescriptor $vd = mtl::VertexDescriptor();
+    bool $hasVertex = false;
+    bool $hasInstance = false;
+    uint32 $vertexStride = 0;
+    uint32 $instanceStride = 0;
+
+    foreach ($vao->attrs as $attr) {
+        if (!$attr->enabled) {
+            continue;
+        }
+
+        uint32 $bufIndex = MTL_VERTEX_BUFFER;
+
+        if ($attr->divisor != 0) {
+            $bufIndex = MTL_INSTANCE_BUFFER;
+            $hasInstance = true;
+            $instanceStride = $attr->stride as uint32;
+        } else {
+            $hasVertex = true;
+            $vertexStride = $attr->stride as uint32;
+        }
+
+        $vd->attributes[] = mtl::VertexAttribute(
+            $attr->location,
+            mtlVertexFormat($attr->components),
+            $attr->offset as uint32,
+            $bufIndex
+        );
+    }
+
+    if ($hasVertex) {
+        $vd->layouts[] = mtl::VertexBufferLayout(MTL_VERTEX_BUFFER, $vertexStride);
+    }
+
+    if ($hasInstance) {
+        $vd->layouts[] = mtl::VertexBufferLayout(
+            MTL_INSTANCE_BUFFER,
+            $instanceStride,
+            mtl::VertexStepFunction::perInstance,
+            1
+        );
+    }
+
+    return $vd;
+}

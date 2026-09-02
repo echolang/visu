@@ -30,7 +30,8 @@ class Marker
 
 test pipeline_publishes_backbuffer
 {
-    Pool $pool = Pool();
+    Gpu $gpu = Gpu();
+    Pool $pool = Pool($gpu);
     Frame $frame = Frame();
     Framebuffer $fb = Framebuffer();
     RenderTarget $rt = RenderTarget(64, 64, $fb);
@@ -43,7 +44,8 @@ test pipeline_publishes_backbuffer
 
 test pipeline_setup_sees_earlier_mailbox
 {
-    Pool $pool = Pool();
+    Gpu $gpu = Gpu();
+    Pool $pool = Pool($gpu);
     Frame $frame = Frame();
     Framebuffer $fb = Framebuffer();
     RenderTarget $rt = RenderTarget(64, 64, $fb);
@@ -54,7 +56,7 @@ test pipeline_setup_sees_earlier_mailbox
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $f->set(Marker(9));
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             return .ok(true);
         }
     ));
@@ -65,13 +67,13 @@ test pipeline_setup_sees_earlier_mailbox
             Marker $m = $f->get<Marker>();
             assert($m->n == 9, 'mailbox');
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             return .ok(true);
         }
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute($state, 0) else ($e) {
+    bool $ok = guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
     assert($ok, 'executed');
@@ -79,7 +81,8 @@ test pipeline_setup_sees_earlier_mailbox
 
 test pipeline_execute_order
 {
-    Pool $pool = Pool();
+    Gpu $gpu = Gpu();
+    Pool $pool = Pool($gpu);
     Frame $frame = Frame();
     Framebuffer $fb = Framebuffer();
     RenderTarget $rt = RenderTarget(64, 64, $fb);
@@ -90,7 +93,7 @@ test pipeline_execute_order
     $pipeline->add(CallbackPass(
         'a',
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {},
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('a');
             return .ok(true);
@@ -100,7 +103,7 @@ test pipeline_execute_order
     $pipeline->add(CallbackPass(
         'b',
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {},
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('b');
             return .ok(true);
@@ -108,7 +111,7 @@ test pipeline_execute_order
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute($state, 0) else ($e) {
+    bool $ok = guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
     Log $out = $frame->get<Log>();
@@ -119,7 +122,8 @@ test pipeline_execute_order
 
 test pipeline_unread_created_target_is_an_error
 {
-    Pool $pool = Pool();
+    Gpu $gpu = Gpu();
+    Pool $pool = Pool($gpu);
     Frame $frame = Frame();
     Framebuffer $fb = Framebuffer();
     RenderTarget $rt = RenderTarget(64, 64, $fb);
@@ -131,19 +135,20 @@ test pipeline_unread_created_target_is_an_error
             TargetRef $t = $pipe->createTarget('orphan', 8, 8);
             $io->reads( $t);
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             return .ok(true);
         }
     ));
 
     Gpu $state = Gpu();
-    result<bool, PipelineError> $r = $pipeline->execute($state, 0);
+    result<bool, PipelineError> $r = $pipeline->execute( 0);
     assert($r->failed(), 'unread');
 }
 
 test pipeline_imported_backbuffer_readable_without_writer
 {
-    Pool $pool = Pool();
+    Gpu $gpu = Gpu();
+    Pool $pool = Pool($gpu);
     Frame $frame = Frame();
     Framebuffer $fb = Framebuffer();
     RenderTarget $rt = RenderTarget(64, 64, $fb);
@@ -155,13 +160,13 @@ test pipeline_imported_backbuffer_readable_without_writer
             Backbuffer $bb = $f->get<Backbuffer>();
             $io->reads( $bb->target);
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             return .ok(true);
         }
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute($state, 0) else ($e) {
+    bool $ok = guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
     assert($ok, 'imported read');
@@ -169,7 +174,8 @@ test pipeline_imported_backbuffer_readable_without_writer
 
 test pipeline_reader_of_shared_target_waits_for_writer
 {
-    Pool $pool = Pool();
+    Gpu $gpu = Gpu();
+    Pool $pool = Pool($gpu);
     Frame $frame = Frame();
     Framebuffer $fb = Framebuffer();
     RenderTarget $rt = RenderTarget(64, 64, $fb);
@@ -182,7 +188,7 @@ test pipeline_reader_of_shared_target_waits_for_writer
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->reads( $x);
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('reader');
             return .ok(true);
@@ -194,7 +200,7 @@ test pipeline_reader_of_shared_target_waits_for_writer
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->writes( $x);
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('writer');
             return .ok(true);
@@ -202,7 +208,7 @@ test pipeline_reader_of_shared_target_waits_for_writer
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute($state, 0) else ($e) {
+    bool $ok = guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
     Log $out = $frame->get<Log>();
@@ -213,7 +219,8 @@ test pipeline_reader_of_shared_target_waits_for_writer
 
 test pipeline_two_writers_keep_add_order
 {
-    Pool $pool = Pool();
+    Gpu $gpu = Gpu();
+    Pool $pool = Pool($gpu);
     Frame $frame = Frame();
     Framebuffer $fb = Framebuffer();
     RenderTarget $rt = RenderTarget(64, 64, $fb);
@@ -226,7 +233,7 @@ test pipeline_two_writers_keep_add_order
             Backbuffer $bb = $f->get<Backbuffer>();
             $io->writes( $bb->target);
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('clear');
             return .ok(true);
@@ -239,7 +246,7 @@ test pipeline_two_writers_keep_add_order
             Backbuffer $bb = $f->get<Backbuffer>();
             $io->writes( $bb->target);
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('draw');
             return .ok(true);
@@ -247,7 +254,7 @@ test pipeline_two_writers_keep_add_order
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute($state, 0) else ($e) {
+    bool $ok = guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
     Log $out = $frame->get<Log>();
@@ -257,7 +264,8 @@ test pipeline_two_writers_keep_add_order
 
 test pipeline_cycle_is_an_error
 {
-    Pool $pool = Pool();
+    Gpu $gpu = Gpu();
+    Pool $pool = Pool($gpu);
     Frame $frame = Frame();
     Framebuffer $fb = Framebuffer();
     RenderTarget $rt = RenderTarget(64, 64, $fb);
@@ -271,7 +279,7 @@ test pipeline_cycle_is_an_error
             $io->reads( $x);
             $io->writes( $y);
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             return .ok(true);
         }
     ));
@@ -282,19 +290,20 @@ test pipeline_cycle_is_an_error
             $io->reads( $y);
             $io->writes( $x);
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             return .ok(true);
         }
     ));
 
     Gpu $state = Gpu();
-    result<bool, PipelineError> $r = $pipeline->execute($state, 0);
+    result<bool, PipelineError> $r = $pipeline->execute( 0);
     assert($r->failed(), 'cycle');
 }
 
 test pipeline_writing_target_happens_before_reading_color
 {
-    Pool $pool = Pool();
+    Gpu $gpu = Gpu();
+    Pool $pool = Pool($gpu);
     Frame $frame = Frame();
     Framebuffer $fb = Framebuffer();
     RenderTarget $rt = RenderTarget(64, 64, $fb);
@@ -308,7 +317,7 @@ test pipeline_writing_target_happens_before_reading_color
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->reads( $color);
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('reader');
             return .ok(true);
@@ -320,7 +329,7 @@ test pipeline_writing_target_happens_before_reading_color
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->writes( $g);
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('writer');
             return .ok(true);
@@ -328,7 +337,7 @@ test pipeline_writing_target_happens_before_reading_color
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute($state, 0) else ($e) {
+    bool $ok = guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
     Log $out = $frame->get<Log>();
@@ -339,7 +348,8 @@ test pipeline_writing_target_happens_before_reading_color
 #[tests: expects death]
 test pipeline_duplicate_name_dies
 {
-    Pool $pool = Pool();
+    Gpu $gpu = Gpu();
+    Pool $pool = Pool($gpu);
     Frame $frame = Frame();
     Framebuffer $fb = Framebuffer();
     RenderTarget $rt = RenderTarget(64, 64, $fb);

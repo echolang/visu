@@ -1,0 +1,159 @@
+/**
+ * Tilde / Ctrl+C command line. Types into a buffer, dispatches
+ * ConsoleCommand on enter. Overlay drawing waits on bitmap fonts;
+ * claiming the input-context mutex waits on Input.
+ */
+
+namespace visu::runtime;
+
+use visu::os::key;
+use visu::signal::{Char, ConsoleCommand, Dispatcher, Flow, Key};
+
+internal const HISTORY_LIMIT = 100;
+
+public class DebugConsole
+{
+    private Dispatcher $dispatcher;
+    private bool $enabled;
+    private string $line;
+    private array<string> $history;
+    private int32 $historyIndex;
+    private int32? $charListener;
+
+    public constructor(Dispatcher $dispatcher)
+    {
+        $this->dispatcher = $dispatcher;
+        $this->enabled = false;
+        $this->line = '';
+        $this->history = array<string>();
+        $this->historyIndex = 0;
+        $this->charListener = null;
+        $this->dispatcher->register<Key>(function(const Key& $signal) : Flow {
+            return $this->handleKey($signal);
+        }, -1000);
+    }
+
+    public const function enabled() : bool
+    {
+        return $this->enabled;
+    }
+
+    public const function line() : string
+    {
+        return $this->line;
+    }
+
+    public function writeLine(string $text) : void
+    {
+        $this->history->push($text);
+        if (($this->history->count() as int32) > (HISTORY_LIMIT as int32)) {
+            $this->history->remove(0);
+        }
+
+        $this->historyIndex = $this->history->count() as int32;
+    }
+
+    public function clearHistory() : void
+    {
+        $this->history->clear();
+        $this->historyIndex = 0;
+    }
+
+    /**
+     * Submit `$raw` as if enter was pressed (tests, and later a
+     * typed line).
+     */
+    public function submit(string $raw) : void
+    {
+        $this->writeLine($raw);
+        $this->line = '';
+        $this->dispatcher->dispatch(ConsoleCommand($raw));
+    }
+
+    internal function handleKey(const Key& $signal) : Flow
+    {
+        if ($this->enabled) {
+            if ($signal->key == key::ENTER && $signal->action == key::RELEASE) {
+                string $raw = $this->line;
+                $this->submit($raw);
+            }
+
+            if ($signal->key == key::UP && $signal->action == key::RELEASE) {
+                $this->historyIndex = $this->historyIndex - 1;
+                if ($this->historyIndex < 0) {
+                    $this->historyIndex = 0;
+                }
+
+                $this->line = $this->historyLine($this->historyIndex);
+            }
+
+            if ($signal->key == key::DOWN && $signal->action == key::RELEASE) {
+                int32 $end = $this->history->count() as int32;
+                $this->historyIndex = $this->historyIndex + 1;
+                if ($this->historyIndex > $end) {
+                    $this->historyIndex = $end;
+                }
+
+                $this->line = $this->historyLine($this->historyIndex);
+            }
+
+            if ($signal->key == key::BACKSPACE && ($signal->action == key::PRESS || $signal->action == key::REPEAT)) {
+                usize $n = $this->line->size();
+                if ($n > 0) {
+                    $this->line = $this->line->sub(0, $n - 1);
+                }
+            }
+        }
+
+        if ($signal->key == key::C && $signal->isControl() && $signal->action == key::PRESS) {
+            $this->setEnabled(!$this->enabled);
+            return .stop;
+        }
+
+        return .proceed;
+    }
+
+    internal function handleChar(const Char& $signal) : Flow
+    {
+        string $ch = guard $signal->text() else {
+            return .proceed;
+        }
+        $this->line->append($ch);
+        return .proceed;
+    }
+
+    private function setEnabled(bool $on) : void
+    {
+        $this->enabled = $on;
+        if ($on) {
+            if ($this->charListener != null) {
+                return;
+            }
+
+            int32 $id = $this->dispatcher->register<Char>(function(const Char& $signal) : Flow {
+                return $this->handleChar($signal);
+            }, -1000);
+            $this->charListener = $id;
+            return;
+        }
+
+        int32 $id = guard $this->charListener else {
+            return;
+        }
+        $this->dispatcher->unregister<Char>($id);
+        $this->charListener = null;
+    }
+
+    private const function historyLine(int32 $index) : string
+    {
+        if ($index < 0) {
+            return '';
+        }
+
+        if ($index >= ($this->history->count() as int32)) {
+            return '';
+        }
+
+        return $this->history[$index as usize];
+    }
+}

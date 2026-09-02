@@ -1,0 +1,64 @@
+/*
+ * Window + fixed-timestep loop + pipeline, behind closures.
+ * Hold a QuadRenderer; ready compiles the shader and setShader;
+ * render mints a pass onto this frame's pipeline.
+ *
+ *   echoc run -m examples --target quickstart
+ *   echoc run -m examples --target quickstart --define VISU_FINITE
+ */
+
+use std::env;
+use std::io;
+use visu::app::{Paths, Services, bootstrap};
+use visu::math::Vec4;
+use visu::graphics::{Context, QuadRenderer, ShaderProgram, TargetRef};
+use visu::quickstart::{App, Options, Quickstart};
+
+Quickstart $qs = Quickstart(function(Options $opt) : void 
+{
+    $opt->windowTitle = 'visu quickstart';
+    $opt->windowWidth = 800;
+    $opt->windowHeight = 600;
+    $opt->clearColor = Vec4(0.08f, 0.08f, 0.1f, 1.0f);
+
+    $opt->services = bootstrap(Paths(root: exampleRoot()), function(Services $ctn) : void {
+        $ctn->create<QuadRenderer>();
+    });
+
+    $opt->ready = function(App $app) : void {
+        $quadShader = guard $app->shaders->shader('quad');
+        ShaderProgram $prog = guard $quadShader->load();
+        $app->services->get<QuadRenderer>()
+            ->setShader($quadShader);
+    };
+
+    $opt->render = function(App $app, Context $ctx, TargetRef $target) : void {
+        $phase = std::math::sin(visu::runtime::seconds());
+        $phase = ($phase + 1.0f) / 2.0f;
+        $app->services->get<QuadRenderer>()
+            ->pass($ctx->pipeline, $target, TintParams(Vec4(0.2f, 0.55f, $phase, 1.0f)));
+    };
+});
+$qs->run();
+
+internal function exampleRoot() : string
+{
+    if (fileExists('resources/shader/quad.vert.glsl')) {
+        return env::cwd();
+    }
+
+    if (fileExists('quickstart/resources/shader/quad.vert.glsl')) {
+        return 'quickstart';
+    }
+
+    return 'examples/quickstart';
+}
+
+internal function fileExists(string $path) : bool
+{
+    bool $here = guard io::exists($path) else {
+        return false;
+    }
+
+    return $here;
+}

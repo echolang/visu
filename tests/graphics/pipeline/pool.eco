@@ -6,7 +6,7 @@ use visu::os::{Window, WindowHints, init, terminate};
 use visu::graphics::{
     Gpu, Pipeline, Pool, Frame, CallbackPass, TargetRef, TextureRef, IoSink, Context,
     TextureOptions, FramebufferStatus, RenderTarget, PipelineError,
-    QuadVertexArray, Texture, PoolError
+    Mesh, Texture, PoolError
 };
 
 class Offscreen
@@ -35,7 +35,7 @@ test pool_creates_complete_offscreen_target
         die($e->message());
     }
 
-    Pool $pool = Pool();
+    Pool $pool = Pool($state);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -48,14 +48,14 @@ test pool_creates_complete_offscreen_target
             $io->writes($t);
             $f->set(Offscreen($t));
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             Offscreen $off = $ctx->frame->get<Offscreen>();
-            RenderTarget $rt = guard $ctx->pool->getTarget($s, $off->target) else ($e) {
+            RenderTarget $rt = guard $ctx->pool->getTarget($off->target) else ($e) {
                 return .error(.pool($e));
             }
             assert($rt->width == 32, 'width');
             assert($rt->isOffscreen(), 'offscreen');
-            FramebufferStatus $status = $rt->framebuffer->status($s);
+            FramebufferStatus $status = $rt->framebuffer->status();
             bool $complete = match ($status) {
                 FramebufferStatus::complete => true,
                 else => false,
@@ -67,8 +67,8 @@ test pool_creates_complete_offscreen_target
         }
     ));
 
-    bool $ran = guard $pipeline->execute($state, 0) else ($e) {
-        $pool->destroy($state);
+    bool $ran = guard $pipeline->execute( 0) else ($e) {
+        $pool->destroy();
         $window->destroy();
         terminate();
         die($e->message());
@@ -77,8 +77,8 @@ test pool_creates_complete_offscreen_target
 
     Frame $frame2 = Frame();
     Pipeline $next = Pipeline($pool, $frame2, $window->renderTarget());
-    bool $ran2 = guard $next->execute($state, 1) else ($e) {
-        $pool->destroy($state);
+    bool $ran2 = guard $next->execute(1) else ($e) {
+        $pool->destroy();
         $window->destroy();
         terminate();
         die($e->message());
@@ -86,7 +86,7 @@ test pool_creates_complete_offscreen_target
     assert(!$pool->hasTarget('gbuffer'), 'collected');
     assert($pool->hasTarget('backbuffer'), 'imported lives');
 
-    $pool->destroy($state);
+    $pool->destroy();
     $window->destroy();
     terminate();
 }
@@ -107,7 +107,7 @@ test pool_resizes_when_desc_changes
         die($e->message());
     }
 
-    Pool $pool = Pool();
+    Pool $pool = Pool($state);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -119,15 +119,15 @@ test pool_resizes_when_desc_changes
             $io->writes($t);
             $f->set(Offscreen($t));
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             Offscreen $off = $ctx->frame->get<Offscreen>();
-            RenderTarget $rt = guard $ctx->pool->getTarget($s, $off->target) else ($e) {
+            RenderTarget $rt = guard $ctx->pool->getTarget($off->target) else ($e) {
                 return .error(.pool($e));
             }
             assert($rt->width == 16, 'first');
             $off->target->width = 48;
             $off->target->height = 24;
-            RenderTarget $again = guard $ctx->pool->getTarget($s, $off->target) else ($e) {
+            RenderTarget $again = guard $ctx->pool->getTarget($off->target) else ($e) {
                 return .error(.pool($e));
             }
             assert($again->width == 48, 'resized');
@@ -135,13 +135,13 @@ test pool_resizes_when_desc_changes
         }
     ));
 
-    bool $ran = guard $pipeline->execute($state, 0) else ($e) {
-        $pool->destroy($state);
+    bool $ran = guard $pipeline->execute( 0) else ($e) {
+        $pool->destroy();
         $window->destroy();
         terminate();
         die($e->message());
     }
-    $pool->destroy($state);
+    $pool->destroy();
     $window->destroy();
     terminate();
 }
@@ -162,7 +162,7 @@ test pool_recreates_when_attachments_change
         die($e->message());
     }
 
-    Pool $pool = Pool();
+    Pool $pool = Pool($state);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -174,19 +174,19 @@ test pool_recreates_when_attachments_change
             $io->writes($t);
             $f->set(Offscreen($t));
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             Offscreen $off = $ctx->frame->get<Offscreen>();
-            RenderTarget $first = guard $ctx->pool->getTarget($s, $off->target) else ($e) {
+            RenderTarget $first = guard $ctx->pool->getTarget($off->target) else ($e) {
                 return .error(.pool($e));
             }
             string $before = visu::graphics::targetFingerprint($off->target);
             $off->target->rboDepthStencil = true;
             $off->target->rboColor = false;
             assert($before != visu::graphics::targetFingerprint($off->target), 'fingerprint changed');
-            RenderTarget $again = guard $ctx->pool->getTarget($s, $off->target) else ($e) {
+            RenderTarget $again = guard $ctx->pool->getTarget($off->target) else ($e) {
                 return .error(.pool($e));
             }
-            FramebufferStatus $status = $again->framebuffer->status($s);
+            FramebufferStatus $status = $again->framebuffer->status();
             bool $complete = match ($status) {
                 FramebufferStatus::complete => true,
                 else => false,
@@ -196,13 +196,13 @@ test pool_recreates_when_attachments_change
         }
     ));
 
-    bool $ran = guard $pipeline->execute($state, 0) else ($e) {
-        $pool->destroy($state);
+    bool $ran = guard $pipeline->execute( 0) else ($e) {
+        $pool->destroy();
         $window->destroy();
         terminate();
         die($e->message());
     }
-    $pool->destroy($state);
+    $pool->destroy();
     $window->destroy();
     terminate();
 }
@@ -223,20 +223,19 @@ test pool_caches_quad_by_name
         die($e->message());
     }
 
-    Pool $pool = Pool();
-    QuadVertexArray $a = $pool->cache<QuadVertexArray>('quadva', $state, function(Gpu& $gl) : QuadVertexArray {
-        return QuadVertexArray($gl);
+    Pool $pool = Pool($state);
+    Mesh $a = $pool->cache<Mesh>('quadva', function() : Mesh {
+        return .quad($state);
     });
-    QuadVertexArray $b = $pool->cache<QuadVertexArray>('quadva', $state, function(Gpu& $gl) : QuadVertexArray {
-        return QuadVertexArray($gl);
+    Mesh $b = $pool->cache<Mesh>('quadva', function() : Mesh {
+        return .quad($state);
     });
     assert($a->vao == $b->vao, 'same name same vao');
-    QuadVertexArray $c = $pool->cache<QuadVertexArray>('ibl_quad_va', $state, function(Gpu& $gl) : QuadVertexArray {
-        return QuadVertexArray($gl);
+    Mesh $c = $pool->cache<Mesh>('ibl_quad_va', function() : Mesh {
+        return .quad($state);
     });
     assert($a->vao != $c->vao, 'different name different vao');
-    $a->bind($state);
-    $pool->destroy($state);
+    $pool->destroy();
     $window->destroy();
     terminate();
 }
@@ -269,7 +268,7 @@ test pool_get_texture_does_not_allocate
         die($e->message());
     }
 
-    Pool $pool = Pool();
+    Pool $pool = Pool($state);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -281,14 +280,14 @@ test pool_get_texture_does_not_allocate
             $io->writes($t);
             $f->set(ColorTex($c, $t));
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             ColorTex $held = $ctx->frame->get<ColorTex>();
-            result<Texture, PoolError> $before = $ctx->pool->getTexture($s, $held->tex);
+            result<Texture, PoolError> $before = $ctx->pool->getTexture($held->tex);
             assert($before->failed(), 'not allocated yet');
-            RenderTarget $rt = guard $ctx->pool->getTarget($s, $held->target) else ($e) {
+            RenderTarget $rt = guard $ctx->pool->getTarget($held->target) else ($e) {
                 return .error(.pool($e));
             }
-            Texture $tex = guard $ctx->pool->getTexture($s, $held->tex) else ($e) {
+            Texture $tex = guard $ctx->pool->getTexture($held->tex) else ($e) {
                 return .error(.pool($e));
             }
             assert($tex->width == 16, 'color size');
@@ -296,13 +295,13 @@ test pool_get_texture_does_not_allocate
         }
     ));
 
-    bool $ran = guard $pipeline->execute($state, 0) else ($e) {
-        $pool->destroy($state);
+    bool $ran = guard $pipeline->execute( 0) else ($e) {
+        $pool->destroy();
         $window->destroy();
         terminate();
         die($e->message());
     }
-    $pool->destroy($state);
+    $pool->destroy();
     $window->destroy();
     terminate();
 }
@@ -323,7 +322,7 @@ test pool_keeps_target_when_attachment_is_read
         die($e->message());
     }
 
-    Pool $pool = Pool();
+    Pool $pool = Pool($state);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -335,17 +334,17 @@ test pool_keeps_target_when_attachment_is_read
             $io->writes($t);
             $f->set(ColorTex($c, $t));
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             ColorTex $held = $ctx->frame->get<ColorTex>();
-            RenderTarget $rt = guard $ctx->pool->getTarget($s, $held->target) else ($e) {
+            RenderTarget $rt = guard $ctx->pool->getTarget($held->target) else ($e) {
                 return .error(.pool($e));
             }
             return .ok(true);
         }
     ));
 
-    bool $ran = guard $pipeline->execute($state, 0) else ($e) {
-        $pool->destroy($state);
+    bool $ran = guard $pipeline->execute( 0) else ($e) {
+        $pool->destroy();
         $window->destroy();
         terminate();
         die($e->message());
@@ -353,18 +352,18 @@ test pool_keeps_target_when_attachment_is_read
 
     $pool->setCurrentTick(1);
     TextureRef $albedo = TextureRef('gbuffer.attachment.color_albedo', 16, 16, TextureOptions());
-    Texture $tex = guard $pool->getTexture($state, $albedo) else ($e) {
-        $pool->destroy($state);
+    Texture $tex = guard $pool->getTexture($albedo) else ($e) {
+        $pool->destroy();
         $window->destroy();
         terminate();
         die($e->message());
     }
-    $pool->collect($state);
+    $pool->collect();
     assert($tex->width == 16, 'history');
     assert($pool->hasTarget('gbuffer'), 'parent lived');
     assert($pool->hasTexture('gbuffer.attachment.color_albedo'), 'color lived');
 
-    $pool->destroy($state);
+    $pool->destroy();
     $window->destroy();
     terminate();
 }
@@ -381,6 +380,8 @@ class TwoTargets
     }
 }
 
+#[if: VISU_BACKEND_METAL]
+#[else]
 #[group: "glfw"]
 test pool_two_mrts_both_complete
 {
@@ -397,7 +398,7 @@ test pool_two_mrts_both_complete
         die($e->message());
     }
 
-    Pool $pool = Pool();
+    Pool $pool = Pool($state);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -414,16 +415,16 @@ test pool_two_mrts_both_complete
             $io->writes($b);
             $f->set(TwoTargets($a, $b));
         },
-        execute: function(Gpu& $s, Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : result<bool, PipelineError> {
             TwoTargets $held = $ctx->frame->get<TwoTargets>();
-            RenderTarget $ra = guard $ctx->pool->getTarget($s, $held->a) else ($e) {
+            RenderTarget $ra = guard $ctx->pool->getTarget($held->a) else ($e) {
                 return .error(.pool($e));
             }
-            RenderTarget $rb = guard $ctx->pool->getTarget($s, $held->b) else ($e) {
+            RenderTarget $rb = guard $ctx->pool->getTarget($held->b) else ($e) {
                 return .error(.pool($e));
             }
-            FramebufferStatus $sa = $ra->framebuffer->status($s);
-            FramebufferStatus $sb = $rb->framebuffer->status($s);
+            FramebufferStatus $sa = $ra->framebuffer->status();
+            FramebufferStatus $sb = $rb->framebuffer->status();
             bool $okA = match ($sa) {
                 FramebufferStatus::complete => true,
                 else => false,
@@ -438,13 +439,14 @@ test pool_two_mrts_both_complete
         }
     ));
 
-    bool $ran = guard $pipeline->execute($state, 0) else ($e) {
-        $pool->destroy($state);
+    bool $ran = guard $pipeline->execute( 0) else ($e) {
+        $pool->destroy();
         $window->destroy();
         terminate();
         die($e->message());
     }
-    $pool->destroy($state);
+    $pool->destroy();
     $window->destroy();
     terminate();
 }
+#[end]

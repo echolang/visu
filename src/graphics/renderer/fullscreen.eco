@@ -1,0 +1,74 @@
+/**
+ * Blit a texture onto a target as a fullscreen quad. Owns the
+ * program (inline vs/fs, both backends). load() after the GPU
+ * context exists; pass() mints FullscreenQuadPass.
+ */
+
+namespace visu::graphics;
+
+public class FullscreenTextureRenderer
+{
+    private ShaderProgram? $program;
+
+    public constructor()
+    {
+        $this->program = null;
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function load(Gpu $gpu) : result<bool, ShaderError>
+    {
+        $this->destroy();
+        ShaderProgram $program = ShaderProgram($gpu);
+        $program->attach(ShaderStage($gpu, .vertex, fullscreenBlitVert()));
+        $program->attach(ShaderStage($gpu, .fragment, fullscreenBlitFrag()));
+        bool $ok = guard $program->link('fullscreen-blit') else ($e) {
+            $program->destroy();
+            return .error($e);
+        }
+        $this->program = $program;
+        return .ok(true);
+    }
+
+    /**
+     * Per-frame graph node: reads `$texture`, writes `$target`.
+     */
+    public function pass(Pipeline $pipeline, TargetRef $target, TextureRef $texture) : void
+    {
+        ShaderProgram? $maybe = $this->program;
+        assert($maybe != null, 'fullscreen: load before pass');
+        ShaderProgram $program = guard $maybe;
+        $pipeline->add(FullscreenQuadPass($program, $target, $texture));
+    }
+
+    public function destroy() : void
+    {
+        ShaderProgram $held = guard $this->program else {
+            return;
+        }
+        $held->destroy();
+        $this->program = null;
+    }
+}
+
+internal function fullscreenBlitVert() : string
+{
+    #[if: VISU_BACKEND_METAL]
+    return "#include <metal_stdlib>\n#include <simd/simd.h>\n\nusing namespace metal;\n\nstruct vs_out\n{\n    float2 vUv [[user(locn0)]];\n    float4 gl_Position [[position]];\n};\n\nstruct vs_in\n{\n    float3 aPos [[attribute(0)]];\n    float2 aUv [[attribute(1)]];\n};\n\nvertex vs_out vs(vs_in in [[stage_in]])\n{\n    vs_out out = {};\n    out.gl_Position = float4(in.aPos, 1.0);\n    out.vUv = in.aUv;\n    return out;\n}\n";
+    #[else]
+    return "#version 330 core\nlayout (location = 0) in vec3 aPos;\nlayout (location = 1) in vec2 aUv;\nout vec2 vUv;\nvoid main()\n{\n    gl_Position = vec4(aPos, 1.0);\n    vUv = aUv;\n}\n";
+    #[end]
+}
+
+internal function fullscreenBlitFrag() : string
+{
+    #[if: VISU_BACKEND_METAL]
+    return "#include <metal_stdlib>\n#include <simd/simd.h>\n\nusing namespace metal;\n\nstruct fs_out\n{\n    float4 FragColor [[color(0)]];\n};\n\nstruct fs_in\n{\n    float2 vUv [[user(locn0)]];\n};\n\nfragment fs_out fs(fs_in in [[stage_in]], texture2d<float> u_texture [[texture(0)]], sampler u_samp [[sampler(0)]])\n{\n    fs_out out = {};\n    out.FragColor = u_texture.sample(u_samp, float2(in.vUv.x, 1.0 - in.vUv.y));\n    return out;\n}\n";
+    #[else]
+    return "#version 330 core\nin vec2 vUv;\nout vec4 FragColor;\nuniform sampler2D u_texture;\nvoid main()\n{\n    FragColor = texture(u_texture, vUv);\n}\n";
+    #[end]
+}

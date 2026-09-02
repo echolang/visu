@@ -1,0 +1,102 @@
+/**
+ * Fixed-timestep GameLoop: advance() drives lag without sleeping.
+ */
+
+use visu::runtime::{Delegate, GameLoop};
+
+class LoopCounter : Delegate
+{
+    public int32 $updates;
+    public int32 $renders;
+    public float32 $lastCompensation;
+    public int32 $stopAfterRenders;
+
+    public constructor()
+    {
+        $this->updates = 0;
+        $this->renders = 0;
+        $this->lastCompensation = 0.0f;
+        $this->stopAfterRenders = 0;
+    }
+
+    public function update() : void
+    {
+        $this->updates = $this->updates + 1;
+    }
+
+    public function render(float32 $compensation) : void
+    {
+        $this->renders = $this->renders + 1;
+        $this->lastCompensation = $compensation;
+    }
+
+    public function shouldStop() : bool
+    {
+        if ($this->stopAfterRenders <= 0) {
+            return false;
+        }
+
+        return $this->renders >= $this->stopAfterRenders;
+    }
+}
+
+test loop_first_advance_renders_without_update
+{
+    LoopCounter $c = LoopCounter();
+    GameLoop $loop = GameLoop($c, 60.0, 10);
+    $loop->advance(0);
+    assert($c->updates == 0, 'no update');
+    assert($c->renders == 1, 'one render');
+}
+
+test loop_one_timestep_runs_one_update
+{
+    LoopCounter $c = LoopCounter();
+    GameLoop $loop = GameLoop($c, 60.0, 10);
+    $loop->advance(0);
+    $loop->advance($loop->timestepNs);
+    assert($c->updates == 1, 'one update');
+    assert($c->renders == 2, 'two renders');
+}
+
+test loop_caps_updates_per_frame
+{
+    LoopCounter $c = LoopCounter();
+    GameLoop $loop = GameLoop($c, 60.0, 3);
+    $loop->advance(0);
+    int64 $jump = $loop->timestepNs * 20;
+    $loop->advance($jump);
+    assert($c->updates == 3, 'capped');
+    assert($c->renders == 2, 'still one render for the jump');
+    assert($c->lastCompensation <= 1.0f, 'unit');
+    $loop->advance($jump + 1);
+    assert($c->updates == 4, 'recovered');
+}
+
+test loop_start_stops_when_delegate_asks
+{
+    LoopCounter $c = LoopCounter();
+    $c->stopAfterRenders = 3;
+    GameLoop $loop = GameLoop($c, 60.0, 10);
+    $loop->start();
+    assert($c->renders == 3, 'three frames');
+}
+
+test loop_force_stop_exits_immediately
+{
+    LoopCounter $c = LoopCounter();
+    GameLoop $loop = GameLoop($c, 60.0, 10);
+    $loop->forceStop();
+    $loop->start();
+    assert($c->renders == 0, 'never ran');
+}
+
+test loop_averages_after_samples
+{
+    LoopCounter $c = LoopCounter();
+    GameLoop $loop = GameLoop($c, 60.0, 10);
+    $loop->advance(0);
+    $loop->advance($loop->timestepNs);
+    assert($loop->averageTickCount() > 0.0, 'ticks');
+    assert($loop->averageFrameTimeFormatted()->size() > 0, 'formatted');
+}

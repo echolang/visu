@@ -3,8 +3,8 @@
  * generated offscreen FBO (owned). The backbuffer is the default
  * framebuffer, the one used when no other framebuffer is bound.
  *
- * An owned framebuffer must be `destroy`ed with a `Gpu&` before it
- * is dropped.
+ * Stores Gpu when constructed with one. The no-arg constructor is a
+ * placeholder (window, before initialize; graph tests).
  */
 
 namespace visu::graphics;
@@ -31,54 +31,80 @@ public class Framebuffer : GpuObject
      */
     public const bool $owned;
 
+    private Gpu? $device;
     private bool $dead;
     private map<Attachment, RboAttach> $rbos;
 
     /**
-     * The window backbuffer (id 0).
+     * The window backbuffer (id 0). Placeholder until a Gpu is known.
      */
     public constructor()
     {
         $this->id = 0;
         $this->owned = false;
+        $this->device = null;
         $this->dead = true;
+        $this->rbos = map<Attachment, RboAttach>();
+    }
+
+    /**
+     * Window backbuffer with a Gpu so bind / clear work.
+     */
+    public constructor(backbuffer: Gpu $gpu)
+    {
+        $this->id = 0;
+        $this->owned = false;
+        $this->device = $gpu;
+        $this->dead = false;
         $this->rbos = map<Attachment, RboAttach>();
     }
 
     /**
      * Creates a new framebuffer object.
      */
-    public constructor(Gpu& $state)
+    public constructor(Gpu $gpu)
     {
-        $this->id = $state->createFramebuffer();
+        $this->id = $gpu->createFramebuffer();
         $this->owned = true;
+        $this->device = $gpu;
         $this->dead = false;
         $this->rbos = map<Attachment, RboAttach>();
     }
 
     destructor()
     {
-        assert(!$this->owned || $this->dead, 'Framebuffer dropped without destroy');
+        $this->destroy();
+    }
+
+    public function gpu() : Gpu
+    {
+        Gpu $gpu = guard $this->device;
+        return $gpu;
     }
 
     /**
      * Deletes the GL name and renderbuffer attachments.
      * No-op for the backbuffer, and for an already-destroyed object.
      */
-    public function destroy(Gpu& $state) : void
+    public function destroy() : void
     {
         if (!$this->owned || $this->dead) {
             return;
         }
 
-        $state->unbindFramebuffer($this->id);
-        array<RboAttach> $rbos = $this->rbos->values();
+        Gpu $gpu = $this->gpu();
 
-        foreach ($rbos as $rbo) {
-            $state->deleteRenderbuffer($rbo->id);
+        if (!$gpu->lost()) {
+            $gpu->unbindFramebuffer($this->id);
+            array<RboAttach> $rbos = $this->rbos->values();
+
+            foreach ($rbos as $rbo) {
+                $gpu->deleteRenderbuffer($rbo->id);
+            }
+
+            $gpu->deleteFramebuffer($this->id);
         }
 
-        $state->deleteFramebuffer($this->id);
         $this->rbos->clear();
         $this->dead = true;
     }
@@ -89,29 +115,30 @@ public class Framebuffer : GpuObject
      * `$target` specifies the target to which the framebuffer is bound.
      * Returns true if the framebuffer was bound, false if it was already bound.
      */
-    public function bind(Gpu& $state, FramebufferTarget $target) : bool
+    public function bind(FramebufferTarget $target) : bool
     {
-        return $state->bindFramebuffer($target, $this->id);
+        return $this->gpu()->bindFramebuffer($target, $this->id);
     }
 
     /**
      * Clears the framebuffer.
      * Note: this will bind the framebuffer to the current context.
      */
-    public function clear(Gpu& $state, uint32 $mask, Vec4 $color) : void
+    public function clear(uint32 $mask, Vec4 $color) : void
     {
-        $this->bind($state, .readDraw);
-        $state->clearColor($color->x, $color->y, $color->z, $color->w);
-        $state->clear($mask);
+        Gpu $gpu = $this->gpu();
+        $this->bind(.readDraw);
+        $gpu->clearColor($color->x, $color->y, $color->z, $color->w);
+        $gpu->clear($mask);
     }
 
     /**
      * Clears color, depth, and stencil.
      * Note: this will bind the framebuffer to the current context.
      */
-    public function clear(Gpu& $state, Vec4 $color) : void
+    public function clear(Vec4 $color) : void
     {
-        $this->clear($state, COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT | STENCIL_BUFFER_BIT, $color);
+        $this->clear(COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT | STENCIL_BUFFER_BIT, $color);
     }
 
     /**
@@ -130,19 +157,19 @@ public class Framebuffer : GpuObject
      * - incompleteLayerTargets
      * - unknown
      */
-    public function status(Gpu& $state) : FramebufferStatus
+    public function status() : FramebufferStatus
     {
-        $this->bind($state, .readDraw);
-        return $state->framebufferStatus();
+        $this->bind(.readDraw);
+        return $this->gpu()->framebufferStatus();
     }
 
     /**
      * Performs a status check on the framebuffer.
      * `.ok(true)` when complete; `.error($status)` otherwise.
      */
-    public function valid(Gpu& $state) : result<bool, FramebufferStatus>
+    public function valid() : result<bool, FramebufferStatus>
     {
-        FramebufferStatus $s = $this->status($state);
+        FramebufferStatus $s = $this->status();
 
         match ($s) {
             FramebufferStatus::complete => {
@@ -158,53 +185,60 @@ public class Framebuffer : GpuObject
      * Creates a renderbuffer attachment.
      * Replaces an existing renderbuffer on the same attachment point.
      */
-    public function attachRenderbuffer(Gpu& $state, Attachment $point, PixelFormat $format, int32 $width, int32 $height) : void
+    public function attachRenderbuffer(Attachment $point, PixelFormat $format, int32 $width, int32 $height) : void
     {
-        $this->bind($state, .readDraw);
-        $this->dropRbo($state, $point);
+        Gpu $gpu = $this->gpu();
+        $this->bind(.readDraw);
+        $this->dropRbo($point);
 
-        uint32 $rbo = $state->createRenderbuffer();
-        $state->bindRenderbuffer($rbo);
-        $state->renderbufferStorage($format, $width, $height);
-        $state->framebufferRenderbuffer($point, $rbo);
+        uint32 $rbo = $gpu->createRenderbuffer();
+        $gpu->bindRenderbuffer($rbo);
+        $gpu->renderbufferStorage($format, $width, $height);
+        $gpu->framebufferRenderbuffer($point, $rbo);
         $this->rbos[$point] = RboAttach($rbo, $format, $width, $height);
     }
 
     /**
      * Attaches an existing texture to the framebuffer.
      */
-    public function attachTexture(Gpu& $state, Attachment $point, TextureTarget $target, uint32 $texture, int32 $level) : void
+    public function attachTexture(Attachment $point, TextureTarget $target, uint32 $texture, int32 $level) : void
     {
-        $this->bind($state, .readDraw);
-        $this->dropRbo($state, $point);
-        $state->framebufferTexture2D($point, $target, $texture, $level);
+        $this->bind(.readDraw);
+        $this->dropRbo($point);
+        $this->gpu()->framebufferTexture2D($point, $target, $texture, $level);
     }
 
     /**
      * Resizes the framebuffer's renderbuffer attachments.
      * Texture attachments are left as-is.
      */
-    public function resize(Gpu& $state, int32 $width, int32 $height) : void
+    public function resize(int32 $width, int32 $height) : void
     {
-        $this->bind($state, .readDraw);
+        Gpu $gpu = $this->gpu();
+        $this->bind(.readDraw);
         array<Attachment> $points = $this->rbos->keys();
 
         foreach ($points as $point) {
             RboAttach $rbo = $this->rbos[$point];
-            $state->bindRenderbuffer($rbo->id);
-            $state->renderbufferStorage($rbo->format, $width, $height);
+            $gpu->bindRenderbuffer($rbo->id);
+            $gpu->renderbufferStorage($rbo->format, $width, $height);
             $this->rbos[$point] = RboAttach($rbo->id, $rbo->format, $width, $height);
         }
     }
 
-    private function dropRbo(Gpu& $state, Attachment $point) : void
+    private function dropRbo(Attachment $point) : void
     {
         if (!$this->rbos->has($point)) {
             return;
         }
 
         RboAttach $old = $this->rbos[$point];
-        $state->deleteRenderbuffer($old->id);
+        Gpu $gpu = $this->gpu();
+
+        if (!$gpu->lost()) {
+            $gpu->deleteRenderbuffer($old->id);
+        }
+
         $this->rbos->remove($point);
     }
 }

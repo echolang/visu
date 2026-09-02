@@ -1,0 +1,206 @@
+/**
+ * Fixed-timestep loop. 0..n update() ticks then one
+ * render(compensation), with a spiral-of-death cap. Compensation is
+ * lag / timestep — 0 just after a tick, approaching 1 before the
+ * next. Hitting the cap clamps leftover lag to one timestep so
+ * interpolation stays in [0, 1]. Time is monotonic
+ * (std::time::instant). The clock for start() begins at start(), not
+ * construct — initialize time is not first-frame lag.
+ */
+
+namespace visu::runtime;
+
+use std::time;
+
+public class GameLoop
+{
+    public const float64 $targetTickRate;
+    public const int32 $maxUpdatesPerFrame;
+    public const int64 $timestepNs;
+
+    /**
+     * Rolling window for average frame time / fps.
+     */
+    public int32 $frameTimeSampleCount = 32;
+
+    /**
+     * Rolling window for average ticks per frame.
+     */
+    public int32 $tickCountSampleCount = 32;
+
+    /**
+     * Rolling window for average update duration.
+     */
+    public int32 $tickTimeSampleCount = 60;
+
+    private Delegate $delegate;
+    private time::instant $origin;
+    private int64 $lastNs;
+    private int64 $lag;
+    private bool $forceStop;
+    private array<int64> $frameTimes;
+    private array<int32> $tickCounts;
+    private array<int64> $tickTimes;
+
+    public constructor(
+        Delegate $delegate,
+        float64 $targetTickRate = 60.0,
+        int32 $maxUpdatesPerFrame = 10
+    )
+    {
+        assert($targetTickRate > 0.0, 'game loop: tick rate must be positive');
+        assert($maxUpdatesPerFrame > 0, 'game loop: max updates per frame must be positive');
+        $this->delegate = $delegate;
+        $this->targetTickRate = $targetTickRate;
+        $this->maxUpdatesPerFrame = $maxUpdatesPerFrame;
+        $this->timestepNs = ((1.0 / $targetTickRate) * 1000000000.0) as int64;
+        $this->origin = time::instant::now();
+        $this->lastNs = 0;
+        $this->lag = 0;
+        $this->forceStop = false;
+        $this->frameTimes = array<int64>();
+        $this->tickCounts = array<int32>();
+        $this->tickTimes = array<int64>();
+    }
+
+    public const function averageFrameTime() : float64
+    {
+        return $this->mean64($this->frameTimes);
+    }
+
+    public const function averageFps() : float64
+    {
+        float64 $ft = $this->averageFrameTime();
+        if ($ft <= 0.0) {
+            return 0.0;
+        }
+
+        return 1000000000.0 / $ft;
+    }
+
+    public const function averageTickCount() : float64
+    {
+        if ($this->tickCounts->empty()) {
+            return 0.0;
+        }
+
+        int64 $sum = 0;
+        foreach ($this->tickCounts as $n) {
+            int32 $count = $n;
+            $sum = $sum + ($count as int64);
+        }
+
+        return ($sum as float64) / ($this->tickCounts->count() as float64);
+    }
+
+    public const function averageTickTime() : float64
+    {
+        return $this->mean64($this->tickTimes);
+    }
+
+    public const function averageTickTimeFormatted() : string
+    {
+        return $this->formatNs($this->averageTickTime() as int64);
+    }
+
+    public const function averageFrameTimeFormatted() : string
+    {
+        return $this->formatNs($this->averageFrameTime() as int64);
+    }
+
+    public function forceStop() : void
+    {
+        $this->forceStop = true;
+    }
+
+    /**
+     * One frame at `$nowNs` (nanoseconds since this loop's origin).
+     * Tests drive lag with this; start() calls it on the wall clock.
+     */
+    public function advance(int64 $nowNs) : void
+    {
+        int64 $delta = $nowNs - $this->lastNs;
+        $this->lastNs = $nowNs;
+        if ($delta < 0) {
+            $delta = 0;
+        }
+
+        $this->lag = $this->lag + $delta;
+
+        int32 $ticks = 0;
+        while ($this->lag >= $this->timestepNs && $ticks < $this->maxUpdatesPerFrame) {
+            $this->lag = $this->lag - $this->timestepNs;
+            int64 $t0 = $this->nowNs();
+            $this->delegate->update();
+            $this->push64($this->tickTimes, $this->nowNs() - $t0, $this->tickTimeSampleCount);
+            $ticks = $ticks + 1;
+        }
+
+        if ($ticks == $this->maxUpdatesPerFrame && $this->lag > $this->timestepNs) {
+            $this->lag = $this->timestepNs;
+        }
+
+        float32 $compensation = 0.0f;
+        if ($this->timestepNs > 0) {
+            $compensation = ($this->lag as float32) / ($this->timestepNs as float32);
+        }
+
+        $this->delegate->render($compensation);
+        $this->push64($this->frameTimes, $this->nowNs() - $nowNs, $this->frameTimeSampleCount);
+        $this->push32($this->tickCounts, $ticks, $this->tickCountSampleCount);
+    }
+
+    /**
+     * Run until the delegate shouldStop()s or forceStop(). The
+     * clock starts here so construct-to-start (window init, ready)
+     * is not a catch-up burst.
+     */
+    public function start() : void
+    {
+        $this->lastNs = $this->nowNs();
+        while (!$this->delegate->shouldStop() && !$this->forceStop) {
+            $this->advance($this->nowNs());
+        }
+    }
+
+    private function nowNs() : int64
+    {
+        return (time::instant::now() - $this->origin)->as_nanos();
+    }
+
+    private const function mean64(const array<int64>& $samples) : float64
+    {
+        if ($samples->empty()) {
+            return 0.0;
+        }
+
+        int64 $sum = 0;
+        foreach ($samples as $n) {
+            $sum = $sum + $n;
+        }
+
+        return ($sum as float64) / ($samples->count() as float64);
+    }
+
+    private function push64(array<int64>& $samples, int64 $value, int32 $cap) : void
+    {
+        $samples->push($value);
+        while (($samples->count() as int32) > $cap) {
+            $samples->remove(0);
+        }
+    }
+
+    private function push32(array<int32>& $samples, int32 $value, int32 $cap) : void
+    {
+        $samples->push($value);
+        while (($samples->count() as int32) > $cap) {
+            $samples->remove(0);
+        }
+    }
+
+    private const function formatNs(int64 $ns) : string
+    {
+        time::duration $d = time::duration::nanos($ns);
+        return "{$d}";
+    }
+}

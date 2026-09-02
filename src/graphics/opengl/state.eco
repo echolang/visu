@@ -1,77 +1,38 @@
 /**
- * OpenGL `Gpu`. `#[unique]` so the cache cannot be copied. The app
- * owns one value and everything else borrows it (`Gpu&`).
+ * OpenGL `Gpu`. A class so GPU objects share one cache handle.
+ * The app constructs one; everyone else stores it. Call lose()
+ * when the GL context dies so late destroy() skips GL deletes.
  */
 
 namespace visu::graphics;
 
 use visu::math::Mat4;
 
-#[unique]
-public struct Gpu
+public class Gpu : GpuProtocol
 {
-    /**
-     * Currently used shader program object.
-     * You should never manually manipulate this value.
-     */
-    private uint32 $program;
-
-    /**
-     * Currently bound READ framebuffer object.
-     * You should never manually manipulate this value.
-     */
-    private uint32 $readFramebuffer;
-
-    /**
-     * Currently bound DRAW framebuffer object.
-     * You should never manually manipulate this value.
-     */
-    private uint32 $drawFramebuffer;
-
-    /**
-     * Currently bound vertex array object.
-     * You should never manually manipulate this value.
-     */
-    private uint32 $vertexArray;
-
-    /**
-     * Currently bound vertex buffer object.
-     * You should never manually manipulate this value.
-     */
-    private uint32 $vertexBuffer;
-
-    /**
-     * Currently bound index buffer object.
-     * You should never manually manipulate this value.
-     */
-    private uint32 $indexBuffer;
-
-    /**
-     * Currently bound texture unit.
-     * You should never manually manipulate this value.
-     */
-    private uint32 $textureUnit;
-
-    /**
-     * Currently bound textures per unit and target.
-     * You should never manually manipulate this value.
-     */
+    private GpuBinds $binds;
     private map<uint32, map<uint32, uint32>> $textures;
-    private bool $viewportSet;
-    private int32 $viewportX;
-    private int32 $viewportY;
-    private int32 $viewportWidth;
-    private int32 $viewportHeight;
-    private bool $clearColorSet;
-    private float32 $clearR;
-    private float32 $clearG;
-    private float32 $clearB;
-    private float32 $clearA;
-    private uint32 $renderbuffer;
+    private bool $lost;
 
     public constructor()
     {
+        $this->lost = false;
+        $this->binds = GpuBinds();
         $this->clearCache();
+    }
+
+    /**
+     * The GL context is gone. Later destroy() on GPU objects
+     * skips deletes.
+     */
+    public function lose() : void
+    {
+        $this->lost = true;
+    }
+
+    public const function lost() : bool
+    {
+        return $this->lost;
     }
 
     /**
@@ -81,6 +42,7 @@ public struct Gpu
      */
     public function load(extern function<ptr<uint8>(ptr<const uint8>)> $getProc) : bool
     {
+        $this->lost = false;
         usize $n = gl::load($getProc);
         return $n != 0;
     }
@@ -96,6 +58,12 @@ public struct Gpu
         gl::BindVertexArray(0);
         gl::BindBuffer(gl::ARRAY_BUFFER, 0);
         gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
+        gl::BindBuffer(gl::UNIFORM_BUFFER, 0);
+        gl::Disable(gl::BLEND);
+        gl::Disable(gl::DEPTH_TEST);
+        gl::Disable(gl::CULL_FACE);
+        gl::DepthMask(1);
+        gl::ColorMask(1, 1, 1, 1);
         gl::ActiveTexture(gl::TEXTURE0);
         gl::BindRenderbuffer(gl::RENDERBUFFER, 0);
     }
@@ -121,34 +89,18 @@ public struct Gpu
 
     private function clearCache() : void
     {
-        $this->program = 0;
-        $this->readFramebuffer = 0;
-        $this->drawFramebuffer = 0;
-        $this->vertexArray = 0;
-        $this->vertexBuffer = 0;
-        $this->indexBuffer = 0;
+        $this->binds->clear();
         $this->textures = map<uint32, map<uint32, uint32>>();
-        $this->textureUnit = gl::TEXTURE0;
-        $this->viewportSet = false;
-        $this->viewportX = 0;
-        $this->viewportY = 0;
-        $this->viewportWidth = 0;
-        $this->viewportHeight = 0;
-        $this->clearColorSet = false;
-        $this->clearR = 0.0f;
-        $this->clearG = 0.0f;
-        $this->clearB = 0.0f;
-        $this->clearA = 0.0f;
-        $this->renderbuffer = 0;
+        $this->binds->textureUnit = gl::TEXTURE0;
     }
 
     public function useProgram(uint32 $program) : void
     {
-        if ($this->program == $program) {
+        if ($this->binds->program == $program) {
             return;
         }
 
-        $this->program = $program;
+        $this->binds->program = $program;
         gl::UseProgram($program);
     }
 
@@ -163,66 +115,183 @@ public struct Gpu
 
     private function bindReadDraw(uint32 $id) : bool
     {
-        if ($this->readFramebuffer == $id && $this->drawFramebuffer == $id) {
+        if ($this->binds->readFramebuffer == $id && $this->binds->drawFramebuffer == $id) {
             return false;
         }
 
         gl::BindFramebuffer(gl::FRAMEBUFFER, $id);
-        $this->readFramebuffer = $id;
-        $this->drawFramebuffer = $id;
+        $this->binds->readFramebuffer = $id;
+        $this->binds->drawFramebuffer = $id;
         return true;
     }
 
     private function bindRead(uint32 $id) : bool
     {
-        if ($this->readFramebuffer == $id) {
+        if ($this->binds->readFramebuffer == $id) {
             return false;
         }
 
         gl::BindFramebuffer(gl::READ_FRAMEBUFFER, $id);
-        $this->readFramebuffer = $id;
+        $this->binds->readFramebuffer = $id;
         return true;
     }
 
     private function bindDraw(uint32 $id) : bool
     {
-        if ($this->drawFramebuffer == $id) {
+        if ($this->binds->drawFramebuffer == $id) {
             return false;
         }
 
         gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, $id);
-        $this->drawFramebuffer = $id;
+        $this->binds->drawFramebuffer = $id;
         return true;
     }
 
     public function bindVertexArray(uint32 $vao) : void
     {
-        if ($this->vertexArray == $vao) {
+        if ($this->binds->vertexArray == $vao) {
             return;
         }
 
-        $this->vertexArray = $vao;
+        $this->binds->vertexArray = $vao;
         gl::BindVertexArray($vao);
     }
 
     public function bindVertexBuffer(uint32 $vbo) : void
     {
-        if ($this->vertexBuffer == $vbo) {
+        if ($this->binds->vertexBuffer == $vbo) {
             return;
         }
 
-        $this->vertexBuffer = $vbo;
+        $this->binds->vertexBuffer = $vbo;
         gl::BindBuffer(gl::ARRAY_BUFFER, $vbo);
     }
 
     public function bindIndexBuffer(uint32 $ibo) : void
     {
-        if ($this->indexBuffer == $ibo) {
+        if ($this->binds->indexBuffer == $ibo) {
             return;
         }
 
-        $this->indexBuffer = $ibo;
+        $this->binds->indexBuffer = $ibo;
         gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, $ibo);
+    }
+
+    public function bindUniformBuffer(uint32 $ubo) : void
+    {
+        if ($this->binds->uniformBuffer == $ubo) {
+            return;
+        }
+
+        $this->binds->uniformBuffer = $ubo;
+        gl::BindBuffer(gl::UNIFORM_BUFFER, $ubo);
+    }
+
+    public function bindUniformSlot(uint32 $slot, uint32 $id) : void
+    {
+        if ($this->binds->boundSlots->has($slot) && $this->binds->boundSlots[$slot] == $id) {
+            return;
+        }
+
+        $this->bindUniformBuffer($id);
+        gl::BindBufferBase(gl::UNIFORM_BUFFER, $slot, $id);
+        $this->binds->boundSlots[$slot] = $id;
+    }
+
+    public function pushUniform(uint32 $slot, ptr<const uint8> $ptr, isize $bytes) : void
+    {
+        fillUniformScratch($this, $this->binds, $slot, $ptr, $bytes);
+    }
+
+    public function uploadBytes(BufferUse $use, uint32 $id, ptr<const uint8> $ptr, isize $bytes) : void
+    {
+        if ($use == BufferUse::vertex) {
+            $this->bindVertexBuffer($id);
+        } else if ($use == BufferUse::index) {
+            $this->bindIndexBuffer($id);
+        } else {
+            $this->bindUniformBuffer($id);
+        }
+
+        gl::BufferData(glBufferTarget($use), $bytes, $ptr, gl::DYNAMIC_DRAW);
+    }
+
+    private function uniformBlockIndex(uint32 $program, string $name) : uint32
+    {
+        string $term = $name;
+
+        if (!$term->terminated()) {
+            $term = $name->clone();
+        }
+
+        return gl::GetUniformBlockIndex($program, $term->cstr());
+    }
+
+    private function uniformBlockBinding(uint32 $program, uint32 $index, uint32 $slot) : void
+    {
+        gl::UniformBlockBinding($program, $index, $slot);
+    }
+
+    public function bindUniformBlock(uint32 $program, string $name, uint32 $slot) : bool
+    {
+        $this->useProgram($program);
+        uint32 $index = $this->uniformBlockIndex($program, $name);
+
+        if ($index == gl::INVALID_INDEX) {
+            return false;
+        }
+
+        $this->uniformBlockBinding($program, $index, $slot);
+        return true;
+    }
+
+    public function applyRaster(const Raster& $raster) : void
+    {
+        if ($this->binds->sameRaster($raster)) {
+            return;
+        }
+
+        if ($raster->depthTest) {
+            gl::Enable(gl::DEPTH_TEST);
+        } else {
+            gl::Disable(gl::DEPTH_TEST);
+        }
+
+        uint8 $depthWrite = 0;
+
+        if ($raster->depthWrite) {
+            $depthWrite = 1;
+        }
+
+        gl::DepthMask($depthWrite);
+
+        if ($raster->cull == CullMode::none) {
+            gl::Disable(gl::CULL_FACE);
+        } else {
+            gl::Enable(gl::CULL_FACE);
+
+            if ($raster->cull == CullMode::front) {
+                gl::CullFace(gl::FRONT);
+            } else {
+                gl::CullFace(gl::BACK);
+            }
+        }
+
+        if ($raster->blend == BlendMode::alpha) {
+            gl::Enable(gl::BLEND);
+            gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+        } else {
+            gl::Disable(gl::BLEND);
+        }
+
+        uint8 $color = 0;
+
+        if ($raster->colorWrite) {
+            $color = 1;
+        }
+
+        gl::ColorMask($color, $color, $color, $color);
+        $this->binds->rememberRaster($raster);
     }
 
     public function bindTexture(uint32 $unit, TextureTarget $target, uint32 $texture) : void
@@ -232,9 +301,9 @@ public struct Gpu
 
     private function bindTextureGl(uint32 $unit, uint32 $target, uint32 $texture) : void
     {
-        if ($this->textureUnit != $unit) {
+        if ($this->binds->textureUnit != $unit) {
             gl::ActiveTexture($unit);
-            $this->textureUnit = $unit;
+            $this->binds->textureUnit = $unit;
         }
 
         if (!$this->textures->has($unit)) {
@@ -296,8 +365,8 @@ public struct Gpu
         uint32 $name = $id;
         gl::DeleteVertexArrays(1, &$name);
 
-        if ($this->vertexArray == $id) {
-            $this->vertexArray = 0;
+        if ($this->binds->vertexArray == $id) {
+            $this->binds->vertexArray = 0;
         }
     }
 
@@ -312,17 +381,10 @@ public struct Gpu
     {
         uint32 $name = $id;
         gl::DeleteBuffers(1, &$name);
-
-        if ($this->vertexBuffer == $id) {
-            $this->vertexBuffer = 0;
-        }
-
-        if ($this->indexBuffer == $id) {
-            $this->indexBuffer = 0;
-        }
+        $this->binds->dropBuffer($id);
     }
 
-    public function bufferFloats(array<float32>& $data) : void
+    private function bufferFloatsAt(uint32 $target, array<float32>& $data) : void
     {
         usize $n = $data->count();
         isize $bytes = ($n * mem::size<float32>()) as isize;
@@ -332,28 +394,63 @@ public struct Gpu
             $ptr:$ = ptr<const uint8>(&$data[0]);
         }
 
-        gl::BufferData(gl::ARRAY_BUFFER, $bytes, $ptr, gl::STATIC_DRAW);
+        gl::BufferData($target, $bytes, $ptr, gl::STATIC_DRAW);
     }
 
-    public function vertexAttrib(uint32 $index, int32 $size, int32 $strideBytes, int32 $offsetBytes) : void
+    public function uploadFloats(BufferUse $use, uint32 $id, array<float32>& $data) : void
     {
-        ptr<const uint8> $offset = null;
+        uint32 $target = glBufferTarget($use);
 
-        if ($offsetBytes != 0) {
-            $offset:$ = $offset:$ + ($offsetBytes as isize);
+        if ($use == BufferUse::vertex) {
+            $this->bindVertexBuffer($id);
+        } else if ($use == BufferUse::index) {
+            $this->bindIndexBuffer($id);
+        } else {
+            $this->bindUniformBuffer($id);
         }
 
-        gl::VertexAttribPointer($index, $size, gl::FLOAT, 0, $strideBytes, $offset);
+        $this->bufferFloatsAt($target, $data);
     }
 
-    public function enableVertexAttrib(uint32 $index) : void
+    public function applyLayout(uint32 $vao, const VertexLayout& $layout, uint32 $vertexBuf, uint32 $instanceBuf) : void
     {
-        gl::EnableVertexAttribArray($index);
+        $this->bindVertexArray($vao);
+        uint32 $i = 0;
+
+        while ($i < 16) {
+            gl::DisableVertexAttribArray($i);
+            $i = $i + 1;
+        }
+
+        foreach ($layout->attrs as $attr) {
+            uint32 $buf = $vertexBuf;
+
+            if ($attr->divisor != 0) {
+                assert($instanceBuf != 0, 'mesh: instance attrib without instance buffer');
+                $buf = $instanceBuf;
+            }
+
+            $this->bindVertexBuffer($buf);
+            ptr<const uint8> $offset = null;
+
+            if ($attr->offset != 0) {
+                $offset:$ = $offset:$ + ($attr->offset as isize);
+            }
+
+            gl::VertexAttribPointer($attr->location, $attr->components, gl::FLOAT, 0, $attr->stride, $offset);
+            gl::EnableVertexAttribArray($attr->location);
+            gl::VertexAttribDivisor($attr->location, $attr->divisor);
+        }
     }
 
-    public function drawTriangles(int32 $first, int32 $count) : void
+    public function drawArrays(DrawMode $mode, int32 $first, int32 $count) : void
     {
-        gl::DrawArrays(gl::TRIANGLES, $first, $count);
+        glDrawArrays(glDrawMode($mode), $first, $count);
+    }
+
+    public function drawInstanced(DrawMode $mode, int32 $first, int32 $count, int32 $instances) : void
+    {
+        glDrawInstanced(glDrawMode($mode), $first, $count, $instances);
     }
 
     public function createTexture() : uint32
@@ -412,49 +509,49 @@ public struct Gpu
      */
     public function unbindFramebuffer(uint32 $id) : void
     {
-        if ($this->readFramebuffer == $id && $this->drawFramebuffer == $id) {
+        if ($this->binds->readFramebuffer == $id && $this->binds->drawFramebuffer == $id) {
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            $this->readFramebuffer = 0;
-            $this->drawFramebuffer = 0;
+            $this->binds->readFramebuffer = 0;
+            $this->binds->drawFramebuffer = 0;
             return;
         }
 
-        if ($this->readFramebuffer == $id) {
+        if ($this->binds->readFramebuffer == $id) {
             gl::BindFramebuffer(gl::READ_FRAMEBUFFER, 0);
-            $this->readFramebuffer = 0;
+            $this->binds->readFramebuffer = 0;
         }
 
-        if ($this->drawFramebuffer == $id) {
+        if ($this->binds->drawFramebuffer == $id) {
             gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, 0);
-            $this->drawFramebuffer = 0;
+            $this->binds->drawFramebuffer = 0;
         }
     }
 
     public function viewport(int32 $x, int32 $y, int32 $width, int32 $height) : void
     {
-        if ($this->viewportSet && $this->viewportX == $x && $this->viewportY == $y && $this->viewportWidth == $width && $this->viewportHeight == $height) {
+        if ($this->binds->viewportSet && $this->binds->viewportX == $x && $this->binds->viewportY == $y && $this->binds->viewportWidth == $width && $this->binds->viewportHeight == $height) {
             return;
         }
 
-        $this->viewportSet = true;
-        $this->viewportX = $x;
-        $this->viewportY = $y;
-        $this->viewportWidth = $width;
-        $this->viewportHeight = $height;
+        $this->binds->viewportSet = true;
+        $this->binds->viewportX = $x;
+        $this->binds->viewportY = $y;
+        $this->binds->viewportWidth = $width;
+        $this->binds->viewportHeight = $height;
         gl::Viewport($x, $y, $width, $height);
     }
 
     public function clearColor(float32 $r, float32 $g, float32 $b, float32 $a) : void
     {
-        if ($this->clearColorSet && $this->clearR == $r && $this->clearG == $g && $this->clearB == $b && $this->clearA == $a) {
+        if ($this->binds->clearColorSet && $this->binds->clearR == $r && $this->binds->clearG == $g && $this->binds->clearB == $b && $this->binds->clearA == $a) {
             return;
         }
 
-        $this->clearColorSet = true;
-        $this->clearR = $r;
-        $this->clearG = $g;
-        $this->clearB = $b;
-        $this->clearA = $a;
+        $this->binds->clearColorSet = true;
+        $this->binds->clearR = $r;
+        $this->binds->clearG = $g;
+        $this->binds->clearB = $b;
+        $this->binds->clearA = $a;
         gl::ClearColor($r, $g, $b, $a);
     }
 
@@ -489,18 +586,18 @@ public struct Gpu
         uint32 $name = $id;
         gl::DeleteRenderbuffers(1, &$name);
 
-        if ($this->renderbuffer == $id) {
-            $this->renderbuffer = 0;
+        if ($this->binds->renderbuffer == $id) {
+            $this->binds->renderbuffer = 0;
         }
     }
 
     public function bindRenderbuffer(uint32 $id) : void
     {
-        if ($this->renderbuffer == $id) {
+        if ($this->binds->renderbuffer == $id) {
             return;
         }
 
-        $this->renderbuffer = $id;
+        $this->binds->renderbuffer = $id;
         gl::BindRenderbuffer(gl::RENDERBUFFER, $id);
     }
 
@@ -517,13 +614,6 @@ public struct Gpu
     public function framebufferTexture2D(Attachment $point, TextureTarget $target, uint32 $texture, int32 $level) : void
     {
         gl::FramebufferTexture2D(gl::FRAMEBUFFER, glAttachment($point), glTextureTarget($target), $texture, $level);
-    }
-
-    public function renderbufferFormat() : uint32
-    {
-        int32 $format = 0;
-        gl::GetRenderbufferParameteriv(gl::RENDERBUFFER, gl::RENDERBUFFER_INTERNAL_FORMAT, &$format);
-        return $format as uint32;
     }
 
     public function framebufferStatus() : FramebufferStatus
@@ -623,8 +713,8 @@ public struct Gpu
     {
         gl::DeleteProgram($id);
 
-        if ($this->program == $id) {
-            $this->program = 0;
+        if ($this->binds->program == $id) {
+            $this->binds->program = 0;
         }
     }
 
@@ -706,6 +796,11 @@ public struct Gpu
         gl::Uniform4i($location, $a, $b, $c, $d);
     }
 
+    public function uniform4fv(int32 $location, int32 $count, ptr<const float32> $ptr) : void
+    {
+        gl::Uniform4fv($location, $count, $ptr);
+    }
+
     public function uniformMat4(int32 $location, bool $transpose, const Mat4& $m) : void
     {
         uint8 $t = 0;
@@ -716,4 +811,18 @@ public struct Gpu
 
         gl::UniformMatrix4fv($location, 1, $t, &$m->c0->x);
     }
+}
+
+internal function glDrawArrays(uint32 $mode, int32 $first, int32 $count) : void
+{
+    // copy the proc off the commands struct first. calling
+    // DrawArrays through that field drops the draw
+    extern function<void(uint32, int32, int32)> $draw = gl::state::$commands->DrawArrays;
+    $draw($mode, $first, $count);
+}
+
+internal function glDrawInstanced(uint32 $mode, int32 $first, int32 $count, int32 $instances) : void
+{
+    extern function<void(uint32, int32, int32, int32)> $draw = gl::state::$commands->DrawArraysInstanced;
+    $draw($mode, $first, $count, $instances);
 }

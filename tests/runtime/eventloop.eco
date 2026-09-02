@@ -1,0 +1,110 @@
+/**
+ * EventLoop timers: tickAt drives a synthetic millisecond clock.
+ */
+
+use visu::runtime::{EventLoop, Timer, currentLoop, defer, hasMain, registerMain, unregisterMain};
+
+class EventHits
+{
+    public int32 $n;
+    public array<int32> $order;
+
+    public constructor()
+    {
+        $this->n = 0;
+        $this->order = array<int32>();
+    }
+}
+
+test eventloop_zero_delay_runs_on_tick
+{
+    EventLoop $loop = EventLoop();
+    EventHits $hits = EventHits();
+    $loop->tickAt(0);
+    $loop->schedule(0, function() : void {
+        $hits->n = $hits->n + 1;
+    });
+    assert($hits->n == 0, 'not yet');
+    $loop->tickAt(0);
+    assert($hits->n == 1, 'ran');
+}
+
+test eventloop_future_delay_waits
+{
+    EventLoop $loop = EventLoop();
+    EventHits $hits = EventHits();
+    $loop->tickAt(0);
+    $loop->schedule(10, function() : void {
+        $hits->n = $hits->n + 1;
+    });
+    $loop->tickAt(9);
+    assert($hits->n == 0, 'not due');
+    $loop->tickAt(10);
+    assert($hits->n == 1, 'due');
+}
+
+test eventloop_cancel_skips_callback
+{
+    EventLoop $loop = EventLoop();
+    EventHits $hits = EventHits();
+    $loop->tickAt(0);
+    Timer $t = $loop->schedule(5, function() : void {
+        $hits->n = $hits->n + 1;
+    });
+    $t->cancel();
+    $loop->tickAt(5);
+    assert($hits->n == 0, 'cancelled');
+}
+
+test eventloop_heap_earlier_first
+{
+    EventLoop $loop = EventLoop();
+    EventHits $hits = EventHits();
+    $loop->tickAt(0);
+    $loop->schedule(10, function() : void {
+        $hits->order->push(10);
+    });
+    $loop->schedule(5, function() : void {
+        $hits->order->push(5);
+    });
+    $loop->tickAt(10);
+    assert($hits->order->count() == 2, 'both');
+    assert($hits->order[0] == 5, 'five first');
+    assert($hits->order[1] == 10, 'ten second');
+}
+
+test eventloop_defer_uses_main
+{
+    EventLoop $loop = EventLoop();
+    registerMain($loop);
+    EventHits $hits = EventHits();
+    $loop->tickAt(0);
+    defer(0, function() : void {
+        $hits->n = $hits->n + 1;
+    });
+    $loop->tickAt(0);
+    assert($hits->n == 1, 'deferred');
+    assert(hasMain(), 'has main');
+    unregisterMain();
+    assert(!hasMain(), 'cleared');
+}
+
+test eventloop_tick_clears_frozen_clock
+{
+    EventLoop $loop = EventLoop();
+    EventHits $hits = EventHits();
+    $loop->tickAt(1000);
+    $loop->schedule(0, function() : void {
+        $hits->n = $hits->n + 1;
+    });
+    $loop->tick();
+    assert($hits->n == 0, 'wall not 1000ms yet');
+    $loop->tickAt(1000);
+    assert($hits->n == 1, 'due on frozen clock');
+}
+
+#[tests: expects death]
+test eventloop_current_without_register_dies
+{
+    currentLoop();
+}

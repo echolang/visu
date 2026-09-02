@@ -1,7 +1,8 @@
 /**
  * Load GLSL, inject #define after #version, and expand #include "path".
  * Builtins (baked VISU includes) are tried before files. Include
- * matching is a line walk.
+ * matching is a line walk. scan names programs from
+ * `.vert|.frag|...` stems.
  */
 
 namespace visu::graphics;
@@ -64,7 +65,18 @@ public class ShaderLoader
         usize $ver = $source->find('#version');
 
         if ($ver == $source->size()) {
+            #[if: VISU_BACKEND_METAL]
+            string $out = '';
+
+            foreach ($defines as $d) {
+                $out->append("#define {$d->name} {$d->value}\n");
+            }
+
+            $out->append($source);
+            return .ok($out);
+            #[else]
             return .error(.missingVersion);
+            #[end]
         }
 
         usize $nl = $source->find("\n", $ver);
@@ -284,4 +296,95 @@ internal function slashDir(string $path) : string
     string $out = $path;
     $out->append('/');
     return $out;
+}
+
+internal struct ShaderStem
+{
+    public ShaderKind $kind;
+    public string $name;
+}
+
+internal function relativeShaderPath(string $path, string $prefix) : string
+{
+    if (!$path->starts($prefix)) {
+        return slashName($path);
+    }
+
+    usize $len = $path->size() - $prefix->size();
+    return slashName($path->sub($prefix->size(), $len));
+}
+
+internal function slashName(string $name) : string
+{
+    if (!$name->contains("\\")) {
+        return $name;
+    }
+
+    string $out = '';
+    usize $i = 0;
+    usize $n = $name->size();
+
+    while ($i < $n) {
+        uint8 $b = $name->byte($i);
+
+        if ($b == 0x5C) {
+            $out->push(0x2F);
+        } else {
+            $out->push($b);
+        }
+
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function matchStage(string $relative, string $suffix, ShaderKind $kind) : ShaderStem?
+{
+    if (!$relative->ends($suffix)) {
+        return null;
+    }
+
+    usize $n = $relative->size() - $suffix->size();
+
+    if ($n == 0) {
+        return null;
+    }
+
+    return ShaderStem($kind, slashName($relative->sub(0, $n)));
+}
+
+internal function shaderStem(string $relative, string $ext) : ShaderStem?
+{
+    ShaderStem? $tessc = matchStage($relative, ".tessc.{$ext}", .tessControl);
+
+    if ($tessc != null) {
+        return $tessc;
+    }
+
+    ShaderStem? $tesse = matchStage($relative, ".tesse.{$ext}", .tessEvaluation);
+
+    if ($tesse != null) {
+        return $tesse;
+    }
+
+    ShaderStem? $vert = matchStage($relative, ".vert.{$ext}", .vertex);
+
+    if ($vert != null) {
+        return $vert;
+    }
+
+    ShaderStem? $frag = matchStage($relative, ".frag.{$ext}", .fragment);
+
+    if ($frag != null) {
+        return $frag;
+    }
+
+    ShaderStem? $geo = matchStage($relative, ".geo.{$ext}", .geometry);
+
+    if ($geo != null) {
+        return $geo;
+    }
+
+    return null;
 }

@@ -1,32 +1,12 @@
 /*
  * Open a window through visu, clear dark grey.
  *
- *   echoc run -m examples --target clear -- --frames 120
- *   echoc run -m examples --target clear -- --help
+ *   echoc run -m examples --target clear
+ *   echoc run -m examples --target clear --define VISU_FINITE
  */
 
-use command;
-use std::env;
 use visu::os::{Window, init, terminate};
 use visu::graphics::{Gpu, COLOR_BUFFER_BIT};
-
-command::Command $app = command::Command('clear', '0.1.0', 'open a window and clear dark grey');
-command::Arg $framesArg = $app->arg('frames', '', '<n>', 'close after this many swaps');
-$app->fallback($framesArg, '300');
-
-$r = $app->parse(env::argv());
-
-if ($r->error != null) {
-    command::Error $e = $r->error ?? .noCommand;
-    command::CLIContext $err = .from($r->parsed, $app, .stderr);
-    $err->print(command::renderError($e, $app, $r->parsed, $err));
-    env::exit(1);
-}
-
-$parsed = $r->parsed;
-$frames = guard str::int($parsed->value($framesArg)) else {
-    die('--frames needs an integer');
-}
 
 bool $booted = guard init() else ($e) {
     die($e->message());
@@ -42,7 +22,7 @@ bool $ready = guard $window->initialize($state) else ($e) {
 $window->setSwapInterval(1);
 
 int32 $frame = 0;
-while ($frame < $frames && !$window->shouldClose()) {
+while (!$window->shouldClose() && !visu::finiteDone($frame)) {
     $state->clearColor(0.25f, 0.25f, 0.25f, 1.0f);
     $state->clear(COLOR_BUFFER_BIT);
     $window->swap();

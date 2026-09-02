@@ -1,0 +1,337 @@
+/**
+ * Metal swapchain and encoder. Gpu owns one; beginPass / present
+ * live here so state.eco stays the protocol surface.
+ */
+
+namespace visu::graphics;
+
+internal class MetalPass
+{
+    public mtl::Device? $device;
+    public mtl::CommandQueue? $queue;
+    public mtl::Layer? $layer;
+    public mtl::Drawable? $drawable;
+    public mtl::CommandBuffer? $cmd;
+    public mtl::RenderCommandEncoder? $enc;
+    public bool $passOpen;
+    public uint32 $passFbo;
+    public int32 $drawableWidth;
+    public int32 $drawableHeight;
+    public bool $pendingColorClear;
+    public bool $pendingDepthClear;
+    private map<uint32, mtl::DepthStencilState> $depthStates;
+
+    public constructor()
+    {
+        $this->device = null;
+        $this->queue = null;
+        $this->layer = null;
+        $this->drawable = null;
+        $this->cmd = null;
+        $this->enc = null;
+        $this->passOpen = false;
+        $this->passFbo = 0;
+        $this->drawableWidth = 0;
+        $this->drawableHeight = 0;
+        $this->pendingColorClear = false;
+        $this->pendingDepthClear = false;
+        $this->depthStates = map<uint32, mtl::DepthStencilState>();
+    }
+
+    public function dropSurface() : void
+    {
+        $this->endEncoder();
+        $this->cmd = null;
+        $this->drawable = null;
+        $this->layer = null;
+    }
+
+    public function connect(ptr<uint8> $view, int32 $width, int32 $height) : bool
+    {
+        mtl::Device $device = guard $this->device else {
+            return false;
+        }
+
+        if ($view:$ == null) {
+            return false;
+        }
+
+        mtl::Layer $layer = mtl::Layer(attachView: $view, $device);
+        $this->layer = $layer;
+        $this->resize($width, $height);
+        return true;
+    }
+
+    public function resize(int32 $width, int32 $height) : void
+    {
+        if ($width <= 0 || $height <= 0) {
+            return;
+        }
+
+        mtl::Layer $layer = guard $this->layer else {
+            return;
+        }
+
+        if ($this->drawableWidth == $width && $this->drawableHeight == $height) {
+            return;
+        }
+
+        $layer->setDrawableSize(mtl::Size($width as usize, $height as usize));
+        $this->drawableWidth = $width;
+        $this->drawableHeight = $height;
+    }
+
+    public function present(GpuBinds $binds, MetalStore $store) : void
+    {
+        if ($this->pendingColorClear || $this->pendingDepthClear) {
+            $this->begin($binds, $store, false);
+        }
+
+        $this->endEncoder();
+        mtl::CommandBuffer $cmd = guard $this->cmd else {
+            $this->drawable = null;
+            return;
+        }
+        mtl::Drawable $drawable = guard $this->drawable else {
+            $this->cmd = null;
+            return;
+        }
+        $cmd->present($drawable);
+        $cmd->commit();
+        $this->cmd = null;
+        $this->drawable = null;
+        $this->pendingColorClear = false;
+        $this->pendingDepthClear = false;
+    }
+
+    public function endEncoder() : void
+    {
+        mtl::RenderCommandEncoder $enc = guard $this->enc else {
+            $this->passOpen = false;
+            return;
+        }
+        $enc->endEncoding();
+        $this->enc = null;
+        $this->passOpen = false;
+    }
+
+    public function begin(GpuBinds $binds, MetalStore $store, bool $lost) : bool
+    {
+        if ($lost) {
+            return false;
+        }
+
+        if ($this->passOpen && $this->passFbo == $binds->drawFramebuffer) {
+            if (!$this->pendingColorClear && !$this->pendingDepthClear) {
+                return true;
+            }
+
+            $this->endEncoder();
+        }
+
+        if ($this->passOpen) {
+            $this->endEncoder();
+        }
+
+        mtl::CommandQueue $queue = guard $this->queue else {
+            return false;
+        }
+
+        PassTarget $target = guard $this->color($binds, $store) else {
+            return false;
+        }
+        mtl::Texture $color = $target->color;
+        mtl::Texture? $depth = $target->depth;
+        int32 $pw = $target->width;
+        int32 $ph = $target->height;
+
+        mtl::LoadAction $colorLoad = mtl::LoadAction::load;
+        mtl::LoadAction $depthLoad = mtl::LoadAction::load;
+
+        if ($this->pendingColorClear) {
+            $colorLoad = .clear;
+        } else if ($binds->drawFramebuffer == 0 && $this->drawable != null) {
+            // first use of a fresh drawable
+            if ($this->cmd == null) {
+                $colorLoad = .dontCare;
+            }
+        }
+
+        if ($this->pendingDepthClear) {
+            $depthLoad = .clear;
+        }
+
+        mtl::ClearColor $clear = mtl::ClearColor(
+            $binds->clearR as float64,
+            $binds->clearG as float64,
+            $binds->clearB as float64,
+            $binds->clearA as float64
+        );
+        mtl::ColorAttachment $att = mtl::ColorAttachment(
+            $color,
+            $colorLoad,
+            .store,
+            $clear
+        );
+        mtl::RenderPassDescriptor $pass = mtl::RenderPassDescriptor();
+        $pass->colorAttachments[] = $att;
+        $pass->depthLoadAction = $depthLoad;
+        $pass->depthStoreAction = .store;
+        mtl::Texture $depthTex = guard $depth else {
+            $pass->depthTexture = null;
+            $this->openEncoder($queue, $pass, $binds, $pw, $ph);
+            return $this->passOpen;
+        }
+        $pass->depthTexture = $depthTex;
+        $this->openEncoder($queue, $pass, $binds, $pw, $ph);
+        return $this->passOpen;
+    }
+
+    public function applyViewportNow(mtl::RenderCommandEncoder $enc, GpuBinds $binds, int32 $pw, int32 $ph) : void
+    {
+        int32 $x = 0;
+        int32 $y = 0;
+        int32 $w = $pw;
+        int32 $h = $ph;
+
+        if ($binds->viewportSet) {
+            $x = $binds->viewportX;
+            $y = $binds->viewportY;
+            $w = $binds->viewportWidth;
+            $h = $binds->viewportHeight;
+        }
+
+        $enc->setViewport(mtl::Viewport(
+            $x as float64,
+            $y as float64,
+            $w as float64,
+            $h as float64
+        ));
+    }
+
+    public function applyRasterNow(mtl::RenderCommandEncoder $enc, GpuBinds $binds) : void
+    {
+        metalAssertRaster($binds->blend, $binds->colorWrite);
+        mtl::CullMode $cull = match ($binds->cull) {
+            CullMode::none => mtl::CullMode::none,
+            CullMode::front => mtl::CullMode::front,
+            CullMode::back => mtl::CullMode::back,
+        };
+        $enc->setCullMode($cull);
+        mtl::Device $device = guard $this->device else {
+            return;
+        }
+        mtl::DepthStencilDescriptor $ds = mtl::DepthStencilDescriptor();
+
+        if ($binds->depthTest) {
+            $ds->depthCompareFunction = .less;
+        } else {
+            $ds->depthCompareFunction = .always;
+        }
+
+        $ds->depthWriteEnabled = $binds->depthWrite;
+        uint32 $key = 0;
+
+        if ($binds->depthTest) {
+            $key = $key | 1;
+        }
+
+        if ($binds->depthWrite) {
+            $key = $key | 2;
+        }
+
+        if (!$this->depthStates->has($key)) {
+            mtl::DepthStencilState $made = guard $device->newDepthStencilState($ds) else {
+                return;
+            }
+            $this->depthStates[$key] = $made;
+        }
+
+        $enc->setDepthStencilState($this->depthStates[$key]);
+    }
+
+    private function color(GpuBinds $binds, MetalStore $store) : PassTarget?
+    {
+        if ($binds->drawFramebuffer == 0) {
+            mtl::Layer $layer = guard $this->layer else {
+                return null;
+            }
+
+            if ($this->drawable == null) {
+                mtl::Drawable $next = guard $layer->nextDrawable() else {
+                    return null;
+                }
+                $this->drawable = $next;
+            }
+
+            mtl::Drawable $held = guard $this->drawable else {
+                return null;
+            }
+            return PassTarget($held->texture(), null, $this->drawableWidth, $this->drawableHeight);
+        }
+
+        if (!$store->fbos->has($binds->drawFramebuffer)) {
+            return null;
+        }
+
+        FboRec $fbo = $store->fbos[$binds->drawFramebuffer];
+
+        if ($fbo->color == 0 || !$store->textures->has($fbo->color)) {
+            return null;
+        }
+
+        TexRec $colorRec = $store->textures[$fbo->color];
+        mtl::Texture $color = guard $colorRec->obj else {
+            return null;
+        }
+        mtl::Texture? $depth = null;
+
+        if ($fbo->depth != 0 && $store->textures->has($fbo->depth)) {
+            TexRec $depthRec = $store->textures[$fbo->depth];
+            $depth = $depthRec->obj;
+        }
+
+        return PassTarget($color, $depth, $fbo->width, $fbo->height);
+    }
+
+    private function openEncoder(
+        mtl::CommandQueue $queue,
+        mtl::RenderPassDescriptor $pass,
+        GpuBinds $binds,
+        int32 $pw,
+        int32 $ph
+    ) : void
+    {
+        if ($this->cmd == null) {
+            mtl::CommandBuffer $fresh = guard $queue->commandBuffer() else {
+                return;
+            }
+            $this->cmd = $fresh;
+        }
+
+        mtl::CommandBuffer $cmd = guard $this->cmd else {
+            return;
+        }
+        mtl::RenderCommandEncoder $enc = guard $cmd->renderCommandEncoder($pass) else {
+            return;
+        }
+        $this->enc = $enc;
+        $this->passOpen = true;
+        $this->passFbo = $binds->drawFramebuffer;
+        $this->pendingColorClear = false;
+        $this->pendingDepthClear = false;
+        $this->applyViewportNow($enc, $binds, $pw, $ph);
+        $this->applyRasterNow($enc, $binds);
+    }
+}
+
+internal function metalAssertRaster(BlendMode $blend, bool $colorWrite) : void
+{
+    if ($blend != BlendMode::none) {
+        assert(false, 'metal: blend is not implemented');
+    }
+
+    if (!$colorWrite) {
+        assert(false, 'metal: colorWrite disable is not implemented');
+    }
+}

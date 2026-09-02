@@ -1,0 +1,291 @@
+/**
+ * Metal handle table. uint32 names on Texture / GpuBuffer /
+ * ShaderStage index these maps. Shader compile / link live here
+ * so Gpu stays the protocol surface.
+ */
+
+namespace visu::graphics;
+
+internal class MetalStore
+{
+    private uint32 $nextId;
+    public map<uint32, TexRec> $textures;
+    public map<uint32, BufRec> $buffers;
+    public map<uint32, FboRec> $fbos;
+    public map<uint32, VaoRec> $vaos;
+    public map<uint32, ShdRec> $shaders;
+    public map<uint32, ProgRec> $programs;
+
+    public constructor()
+    {
+        $this->nextId = 1;
+        $this->textures = map<uint32, TexRec>();
+        $this->buffers = map<uint32, BufRec>();
+        $this->fbos = map<uint32, FboRec>();
+        $this->vaos = map<uint32, VaoRec>();
+        $this->shaders = map<uint32, ShdRec>();
+        $this->programs = map<uint32, ProgRec>();
+    }
+
+    public function alloc() : uint32
+    {
+        uint32 $id = $this->nextId;
+        $this->nextId = $this->nextId + 1;
+        return $id;
+    }
+
+    public function writeBuffer(BufRec $rec, ptr<const uint8> $ptr, isize $bytes, mtl::Device? $device) : void
+    {
+        mtl::Device $held = guard $device else {
+            return;
+        }
+
+        if ($bytes <= 0) {
+            $rec->obj = null;
+            $rec->bytes = 0;
+            return;
+        }
+
+        usize $n = $bytes as usize;
+
+        if ($rec->obj != null && $rec->bytes >= $bytes) {
+            if ($ptr:$ == null) {
+                return;
+            }
+
+            mtl::Buffer $heldBuf = guard $rec->obj else {
+                return;
+            }
+            ptr<uint8> $dst = $heldBuf->contents();
+
+            if ($dst:$ != null) {
+                mem::copy<uint8>($dst, ptr<uint8>($ptr:$), $n);
+            }
+
+            return;
+        }
+
+        mtl::Buffer $buf = guard $held->newBuffer($n) else {
+            return;
+        }
+
+        if ($ptr:$ != null) {
+            ptr<uint8> $dst = $buf->contents();
+
+            if ($dst:$ != null) {
+                mem::copy<uint8>($dst, ptr<uint8>($ptr:$), $n);
+            }
+        }
+
+        $rec->obj = $buf;
+        $rec->bytes = $bytes;
+    }
+
+    public function allocTexture(
+        PixelFormat $format,
+        int32 $width,
+        int32 $height,
+        mtl::Device? $device
+    ) : mtl::Texture?
+    {
+        mtl::Device $held = guard $device else {
+            return null;
+        }
+
+        if ($width <= 0 || $height <= 0) {
+            return null;
+        }
+
+        uint32 $usage = mtl::TEXTURE_USAGE_SHADER_READ | mtl::TEXTURE_USAGE_RENDER_TARGET;
+        mtl::TextureDescriptor $desc = mtl::TextureDescriptor(
+            $pixelFormat: mtlPixelFormat($format),
+            $width: $width as usize,
+            $height: $height as usize,
+            $usage: $usage
+        );
+        return $held->newTexture($desc);
+    }
+
+    public function rebuildSampler(TexRec $rec, mtl::Device? $device) : void
+    {
+        mtl::Device $held = guard $device else {
+            return;
+        }
+        mtl::SamplerDescriptor $desc = mtl::SamplerDescriptor();
+        $desc->minFilter = mtlMinMag($rec->min);
+        $desc->magFilter = mtlMinMag($rec->mag);
+        $desc->mipFilter = mtlMip($rec->min);
+        $desc->sAddressMode = mtlAddress($rec->wrapS);
+        $desc->tAddressMode = mtlAddress($rec->wrapT);
+        $rec->sampler = $held->newSamplerState($desc);
+    }
+
+    public function createShader(ShaderKind $kind) : uint32
+    {
+        uint32 $id = $this->alloc();
+        $this->shaders[$id] = ShdRec($kind);
+        return $id;
+    }
+
+    public function deleteShader(uint32 $id) : void
+    {
+        $this->shaders->remove($id);
+    }
+
+    public function shaderSource(uint32 $id, string $source) : void
+    {
+        if (!$this->shaders->has($id)) {
+            return;
+        }
+
+        ShdRec $rec = $this->shaders[$id];
+        $rec->source = $source;
+        $rec->compiled = false;
+        $rec->library = null;
+        $rec->entry = null;
+        $rec->log = '';
+    }
+
+    public function compileShader(uint32 $id, mtl::Device? $device) : void
+    {
+        if (!$this->shaders->has($id)) {
+            return;
+        }
+
+        ShdRec $rec = $this->shaders[$id];
+        string $fn = metalFunctionName($rec->kind);
+
+        if ($fn->empty()) {
+            $rec->compiled = false;
+            $rec->log = 'metal: this shader kind is not supported';
+            return;
+        }
+
+        mtl::Device $held = guard $device else {
+            $rec->compiled = false;
+            $rec->log = 'metal: no device';
+            return;
+        }
+        mtl::Library $lib = guard $held->newLibrary(source: $rec->source) else ($e) {
+            $rec->compiled = false;
+            $rec->log = $e->message();
+            return;
+        }
+        mtl::Function $entry = guard $lib->newFunction($fn) else {
+            $rec->compiled = false;
+            $rec->log = "metal: missing function '{$fn}'";
+            return;
+        }
+        $rec->library = $lib;
+        $rec->entry = $entry;
+        $rec->compiled = true;
+        $rec->log = '';
+    }
+
+    public function shaderCompiled(uint32 $id) : bool
+    {
+        if (!$this->shaders->has($id)) {
+            return false;
+        }
+
+        return $this->shaders[$id]->compiled;
+    }
+
+    public function shaderInfoLog(uint32 $id) : string
+    {
+        if (!$this->shaders->has($id)) {
+            return '';
+        }
+
+        return $this->shaders[$id]->log;
+    }
+
+    public function createProgram() : uint32
+    {
+        uint32 $id = $this->alloc();
+        $this->programs[$id] = ProgRec();
+        return $id;
+    }
+
+    public function deleteProgram(uint32 $id) : void
+    {
+        $this->programs->remove($id);
+    }
+
+    public function attachShader(uint32 $program, uint32 $shader) : void
+    {
+        if (!$this->programs->has($program) || !$this->shaders->has($shader)) {
+            return;
+        }
+
+        ProgRec $prog = $this->programs[$program];
+        ShdRec $shd = $this->shaders[$shader];
+
+        match ($shd->kind) {
+            ShaderKind::vertex => {
+                $prog->vs = $shader;
+            },
+            ShaderKind::fragment => {
+                $prog->fs = $shader;
+            },
+            else => {
+            },
+        };
+    }
+
+    public function linkProgram(uint32 $id) : void
+    {
+        if (!$this->programs->has($id)) {
+            return;
+        }
+
+        ProgRec $prog = $this->programs[$id];
+
+        if ($prog->vs == 0 || !$this->shaders->has($prog->vs)) {
+            $prog->linked = false;
+            $prog->log = 'metal: missing vertex stage';
+            return;
+        }
+
+        if ($prog->fs == 0 || !$this->shaders->has($prog->fs)) {
+            $prog->linked = false;
+            $prog->log = 'metal: missing fragment stage';
+            return;
+        }
+
+        ShdRec $vs = $this->shaders[$prog->vs];
+        ShdRec $fs = $this->shaders[$prog->fs];
+        mtl::Function $vsFn = guard $vs->entry else {
+            $prog->linked = false;
+            $prog->log = 'metal: vertex function was not compiled';
+            return;
+        }
+        mtl::Function $fsFn = guard $fs->entry else {
+            $prog->linked = false;
+            $prog->log = 'metal: fragment function was not compiled';
+            return;
+        }
+        $prog->vsFn = $vsFn;
+        $prog->fsFn = $fsFn;
+        $prog->linked = true;
+        $prog->log = '';
+    }
+
+    public function programLinked(uint32 $id) : bool
+    {
+        if (!$this->programs->has($id)) {
+            return false;
+        }
+
+        return $this->programs[$id]->linked;
+    }
+
+    public function programInfoLog(uint32 $id) : string
+    {
+        if (!$this->programs->has($id)) {
+            return '';
+        }
+
+        return $this->programs[$id]->log;
+    }
+}

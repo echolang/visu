@@ -1,0 +1,136 @@
+/**
+ * Process-lifetime type-keyed locator. A producer create()s /
+ * set()s an instance or once()s a factory; a consumer get()s by
+ * type. Duplicate set or a missing get is a wiring bug (assert).
+ * Gpu is unique and is never stored here.
+ */
+
+namespace visu::app;
+
+internal class Thunk
+{
+    public function<erased(Services)> $make;
+
+    public constructor(function<erased(Services)> $make)
+    {
+        $this->make = $make;
+    }
+
+    public function run(Services $s) : erased
+    {
+        function<erased(Services)> $fn = $this->make;
+        return $fn($s);
+    }
+}
+
+public class Services
+{
+    private map<type_id, erased> $instances;
+    private map<type_id, erased> $factories;
+    private map<type_id, bool> $resolving;
+
+    public constructor()
+    {
+        $this->instances = map<type_id, erased>();
+        $this->factories = map<type_id, erased>();
+        $this->resolving = map<type_id, bool>();
+    }
+
+    /**
+     * Eager instance. Occupied slot is a second producer.
+     */
+    public function set<T : class>(T $value) : void
+    {
+        type_id $id = type_id<T>();
+        assert(!$this->instances->has($id) && !$this->factories->has($id), 'services: a second producer for this type');
+        $this->instances[$id] = erased::from($value);
+    }
+
+    /**
+     * Construct T, store it, return the handle. Occupied slot is a
+     * second producer. Arity is an overload — T() / T($a) / T($a, $b).
+     */
+    public function create<T : class>() : T
+    {
+        T $value = T();
+        $this->set($value);
+        return $value;
+    }
+
+    public function create<T : class, A>(A $arg) : T
+    {
+        T $value = T($arg);
+        $this->set($value);
+        return $value;
+    }
+
+    public function create<T : class, A, B>(A $a, B $b) : T
+    {
+        T $value = T($a, $b);
+        $this->set($value);
+        return $value;
+    }
+
+    /**
+     * Lazy singleton. No-op if the type is already bound, so the app
+     * can occupy a slot before framework defaults.
+     */
+    public function once<T : class>(function<T(Services)> $make) : void
+    {
+        type_id $id = type_id<T>();
+        if ($this->instances->has($id) || $this->factories->has($id)) {
+            return;
+        }
+
+        $this->factories[$id] = erased::from(Thunk(function(Services $s) : erased {
+            return erased::from($make($s));
+        }));
+    }
+
+    /**
+     * Resolve the singleton, running the factory at most once.
+     */
+    public function get<T : class>() : T
+    {
+        type_id $id = type_id<T>();
+        if ($this->instances->has($id)) {
+            erased $held = $this->instances->get($id);
+            unsafe {
+                return assume<T>($held);
+            }
+        }
+
+        assert($this->factories->has($id), 'services: dependency was never produced');
+        assert(!$this->resolving->has($id), 'services: circular get for this type');
+        $this->resolving[$id] = true;
+        erased $thunkHeld = $this->factories->get($id);
+        Thunk $thunk;
+        unsafe {
+            $thunk = assume<Thunk>($thunkHeld);
+        }
+        erased $built = $thunk->run($this);
+        $this->resolving->remove($id);
+        $this->instances[$id] = $built;
+        unsafe {
+            return assume<T>($built);
+        }
+    }
+
+    public const function has<T : class>() : bool
+    {
+        type_id $id = type_id<T>();
+        return $this->instances->has($id) || $this->factories->has($id);
+    }
+
+    /**
+     * Resolve if bound; genuinely optional otherwise.
+     */
+    public function find<T : class>() : T?
+    {
+        if (!$this->has<T>()) {
+            return null;
+        }
+
+        return $this->get<T>();
+    }
+}

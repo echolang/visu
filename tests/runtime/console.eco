@@ -1,0 +1,107 @@
+/**
+ * DebugConsole command side: Key / Char facts, no overlay.
+ */
+
+use visu::os::key;
+use visu::runtime::DebugConsole;
+use visu::signal::{Char, ConsoleCommand, Dispatcher, Flow, Key};
+
+class ConsoleCaught
+{
+    public string $raw;
+    public int32 $n;
+
+    public constructor()
+    {
+        $this->raw = '';
+        $this->n = 0;
+    }
+}
+
+function consoleToggle(Dispatcher $d) : void
+{
+    $d->dispatch(Key(key::C, 0, key::PRESS, key::MOD_CONTROL));
+}
+
+test console_ctrl_c_toggles
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d);
+    assert(!$c->enabled(), 'off');
+    consoleToggle($d);
+    assert($c->enabled(), 'on');
+    consoleToggle($d);
+    assert(!$c->enabled(), 'off again');
+}
+
+test console_char_appends_when_enabled
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d);
+    $d->dispatch(Char(65));
+    assert($c->line() == '', 'disabled ignores');
+    consoleToggle($d);
+    $d->dispatch(Char(65));
+    $d->dispatch(Char(66));
+    assert($c->line() == 'AB', 'typed');
+}
+
+test console_enter_dispatches_command
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d);
+    ConsoleCaught $caught = ConsoleCaught();
+    $d->register<ConsoleCommand>(function(const ConsoleCommand& $cmd) : Flow {
+        $caught->raw = $cmd->raw;
+        $caught->n = $caught->n + 1;
+        return .proceed;
+    });
+    consoleToggle($d);
+    $d->dispatch(Char(104));
+    $d->dispatch(Char(105));
+    $d->dispatch(Key(key::ENTER, 0, key::RELEASE, 0));
+    assert($caught->n == 1, 'once');
+    assert($caught->raw == 'hi', 'raw');
+    assert($c->line() == '', 'cleared');
+}
+
+test console_backspace_trims
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d);
+    consoleToggle($d);
+    $d->dispatch(Char(65));
+    $d->dispatch(Char(66));
+    $d->dispatch(Key(key::BACKSPACE, 0, key::PRESS, 0));
+    assert($c->line() == 'A', 'trimmed');
+}
+
+test console_history_up_down
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d);
+    consoleToggle($d);
+    $c->submit('one');
+    $c->submit('two');
+    $d->dispatch(Key(key::UP, 0, key::RELEASE, 0));
+    assert($c->line() == 'two', 'last');
+    $d->dispatch(Key(key::UP, 0, key::RELEASE, 0));
+    assert($c->line() == 'one', 'prev');
+    $d->dispatch(Key(key::DOWN, 0, key::RELEASE, 0));
+    assert($c->line() == 'two', 'next');
+    $d->dispatch(Key(key::DOWN, 0, key::RELEASE, 0));
+    assert($c->line() == '', 'past end');
+}
+
+test console_ctrl_c_stops_other_key_handlers
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d);
+    ConsoleCaught $caught = ConsoleCaught();
+    $d->register<Key>(function(const Key& $k) : Flow {
+        $caught->n = $caught->n + 1;
+        return .proceed;
+    }, 0);
+    consoleToggle($d);
+    assert($caught->n == 0, 'console swallowed ctrl+c');
+}

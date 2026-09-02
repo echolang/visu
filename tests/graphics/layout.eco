@@ -1,0 +1,187 @@
+/**
+ * VertexLayout builder: packed streams, of<T> field offsets, join.
+ */
+
+use visu::graphics::{VertexLayout, VertexBuilder, VertexAttr};
+use visu::math::{Vec2, Vec3, Vec4};
+
+struct LayoutQuadVertex
+{
+    public Vec3 $position;
+    public Vec2 $uv;
+}
+
+struct LayoutPaddedVertex
+{
+    public Vec3 $position;
+    public float32 $pad;
+    public Vec2 $uv;
+}
+
+struct LayoutInstance
+{
+    public Vec3 $offset;
+}
+
+test build_packs_vec3_vec2
+{
+    $layout = VertexLayout::build(function(VertexBuilder $b) : void {
+        $b->attr<Vec3>(0);
+        $b->attr<Vec2>(1);
+    });
+
+    assert($layout->attrs->count() == 2, 'count');
+    VertexAttr $a = $layout->attrs[0];
+    VertexAttr $b = $layout->attrs[1];
+    assert($a->location == 0, 'loc0');
+    assert($a->components == 3, 'pos');
+    assert($a->offset == 0, 'pos off');
+    assert($a->stride == 20, 'pos stride');
+    assert($a->divisor == 0, 'pos div');
+    assert($b->location == 1, 'loc1');
+    assert($b->components == 2, 'uv');
+    assert($b->offset == 12, 'uv off');
+    assert($b->stride == 20, 'uv stride');
+    assert($b->divisor == 0, 'uv div');
+}
+
+test build_instance_stream
+{
+    $layout = VertexLayout::build(function(VertexBuilder $b) : void {
+        $b->attr<Vec3>(0);
+        $b->stream(divisor: 1);
+        $b->attr<Vec3>(1);
+    });
+
+    assert($layout->attrs->count() == 2, 'count');
+    VertexAttr $a = $layout->attrs[0];
+    VertexAttr $b = $layout->attrs[1];
+    assert($a->stride == 12, 'vertex stride');
+    assert($a->divisor == 0, 'vertex div');
+    assert($b->location == 1, 'inst loc');
+    assert($b->components == 3, 'inst size');
+    assert($b->offset == 0, 'inst off');
+    assert($b->stride == 12, 'inst stride');
+    assert($b->divisor == 1, 'inst div');
+}
+
+test of_quad_vertex_matches_packed
+{
+    $layout = VertexLayout::of<LayoutQuadVertex>(function(VertexBuilder $b) : void {
+        ptr<LayoutQuadVertex> $v = $b->vertex<LayoutQuadVertex>();
+        $b->attr(0, &$v->position);
+        $b->attr(1, &$v->uv);
+    });
+
+    assert($layout->attrs->count() == 2, 'count');
+    VertexAttr $a = $layout->attrs[0];
+    VertexAttr $b = $layout->attrs[1];
+    assert($a->components == 3, 'pos');
+    assert($a->offset == 0, 'pos off');
+    assert($a->stride == (mem::size<LayoutQuadVertex>() as int32), 'stride');
+    assert($b->components == 2, 'uv');
+    assert($b->offset == 12, 'uv off');
+    assert($b->stride == $a->stride, 'same stride');
+}
+
+test of_padded_vertex_skips_hole
+{
+    $layout = VertexLayout::of<LayoutPaddedVertex>(function(VertexBuilder $b) : void {
+        ptr<LayoutPaddedVertex> $v = $b->vertex<LayoutPaddedVertex>();
+        $b->attr(0, &$v->position);
+        $b->attr(1, &$v->uv);
+    });
+
+    int32 $stride = mem::size<LayoutPaddedVertex>() as int32;
+    VertexAttr $a = $layout->attrs[0];
+    VertexAttr $b = $layout->attrs[1];
+    assert($a->offset == 0, 'pos off');
+    assert($b->offset == 16, 'uv past pad');
+    assert($a->stride == $stride, 'pos stride');
+    assert($b->stride == $stride, 'uv stride');
+    assert($stride == 24, 'size');
+}
+
+test join_vertex_and_instance
+{
+    $vertex = VertexLayout::of<LayoutQuadVertex>(function(VertexBuilder $b) : void {
+        ptr<LayoutQuadVertex> $v = $b->vertex<LayoutQuadVertex>();
+        $b->attr(0, &$v->position);
+        $b->attr(1, &$v->uv);
+    });
+    $instance = VertexLayout::of<LayoutInstance>(function(VertexBuilder $b) : void {
+        ptr<LayoutInstance> $v = $b->vertex<LayoutInstance>();
+        $b->attr(2, &$v->offset);
+    }, divisor: 1);
+    $layout = $vertex->join($instance);
+
+    assert($layout->attrs->count() == 3, 'count');
+    VertexAttr $inst = $layout->attrs[2];
+    assert($inst->location == 2, 'loc');
+    assert($inst->components == 3, 'size');
+    assert($inst->divisor == 1, 'div');
+    assert($inst->stride == (mem::size<LayoutInstance>() as int32), 'stride');
+}
+
+test presets_match_builder
+{
+    $quad = VertexLayout::pos3uv2();
+    $built = VertexLayout::build(function(VertexBuilder $b) : void {
+        $b->attr<Vec3>(0);
+        $b->attr<Vec2>(1);
+    });
+    assert($quad->fingerprint() == $built->fingerprint(), 'pos3uv2');
+
+    $pos = VertexLayout::pos3();
+    assert($pos->attrs->count() == 1, 'pos3 count');
+    assert($pos->attrs[0]->components == 3, 'pos3 size');
+    assert($pos->attrs[0]->stride == 12, 'pos3 stride');
+
+    $inst = VertexLayout::pos3Instance3();
+    $fromBuild = VertexLayout::build(function(VertexBuilder $b) : void {
+        $b->attr<Vec3>(0);
+        $b->stream(divisor: 1);
+        $b->attr<Vec3>(1);
+    });
+    assert($inst->fingerprint() == $fromBuild->fingerprint(), 'instance');
+}
+
+test float32_is_one_component
+{
+    $layout = VertexLayout::build(function(VertexBuilder $b) : void {
+        $b->attr<Vec3>(0);
+        $b->attr<float32>(1);
+        $b->attr<Vec4>(2);
+    });
+
+    assert($layout->attrs->count() == 3, 'count');
+    assert($layout->attrs[1]->components == 1, 'float');
+    assert($layout->attrs[2]->components == 4, 'vec4');
+    assert($layout->attrs[0]->stride == 32, 'stride');
+}
+
+#[tests: expects death]
+test empty_build_dies
+{
+    VertexLayout $layout = VertexLayout::build(function(VertexBuilder $b) : void {
+    });
+}
+
+#[tests: expects death]
+test bad_attr_type_dies
+{
+    VertexLayout $layout = VertexLayout::build(function(VertexBuilder $b) : void {
+        $b->attr<int32>(0);
+    });
+}
+
+#[tests: expects death]
+test vertex_stream_dies
+{
+    VertexLayout $layout = VertexLayout::build(function(VertexBuilder $b) : void {
+        $b->attr<Vec3>(0);
+        $b->stream(divisor: 0);
+        $b->attr<Vec2>(1);
+    });
+}
+

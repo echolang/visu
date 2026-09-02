@@ -1,6 +1,6 @@
 /**
- * Named closures as a pass. Capture class handles (Frame, Pool);
- * never capture Gpu — execute receives it.
+ * Named closures as a pass. Capture class handles (Frame, Pool,
+ * Gpu objects). execute receives Context (gpu is on it).
  */
 
 namespace visu::graphics;
@@ -9,12 +9,12 @@ public class CallbackPass : Pass
 {
     private string $label;
     private function<void(Pipeline, Frame, IoSink)> $onSetup;
-    private function<result<bool, PipelineError>(Gpu&, Context)> $onExecute;
+    private function<result<bool, PipelineError>(Context)> $onExecute;
 
     public constructor(
         string $label,
         setup: function<void(Pipeline, Frame, IoSink)> $onSetup,
-        execute: function<result<bool, PipelineError>(Gpu&, Context)> $onExecute
+        execute: function<result<bool, PipelineError>(Context)> $onExecute
     )
     {
         $this->label = $label;
@@ -33,9 +33,9 @@ public class CallbackPass : Pass
         $fn($pipeline, $frame, $io);
     }
 
-    public function execute(Gpu& $state, Context $ctx) : result<bool, PipelineError>
+    public function execute(Context $ctx) : result<bool, PipelineError>
     {
-        function<result<bool, PipelineError>(Gpu&, Context)> $fn = $this->onExecute;
-        return $fn($state, $ctx);
+        function<result<bool, PipelineError>(Context)> $fn = $this->onExecute;
+        return $fn($ctx);
     }
 }

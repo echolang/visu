@@ -1,0 +1,323 @@
+/**
+ * Mesh: layout bind, upload, and a draw that paints pixels.
+ */
+
+use visu::graphics::{
+    Mesh, VertexLayout, ShaderProgram, ShaderStage, COLOR_BUFFER_BIT
+};
+use visu::math::Vec4;
+
+#[if: VISU_BACKEND_METAL]
+#[else]
+#[group: "glfw"]
+test basic_upload_sets_buffer_and_attribs
+{
+    GlContext $gl = glHidden('basic-upload');
+
+    array<float32> $verts = [
+        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,
+         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,
+        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f
+    ];
+    Mesh $va = Mesh($gl->gpu, $verts, stride: 20);
+    $va->bind(VertexLayout::pos3uv2());
+
+    int32 $bytes = 0;
+    gl::GetBufferParameteriv(gl::ARRAY_BUFFER, gl::BUFFER_SIZE, &$bytes);
+
+    int32 $size0 = 0;
+    int32 $size1 = 0;
+    int32 $en0 = 0;
+    int32 $en1 = 0;
+    int32 $stride = 0;
+    int32 $div1 = 0;
+    gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_ARRAY_SIZE, &$size0);
+    gl::GetVertexAttribiv(1, gl::VERTEX_ATTRIB_ARRAY_SIZE, &$size1);
+    gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_ARRAY_ENABLED, &$en0);
+    gl::GetVertexAttribiv(1, gl::VERTEX_ATTRIB_ARRAY_ENABLED, &$en1);
+    gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_ARRAY_STRIDE, &$stride);
+    gl::GetVertexAttribiv(1, gl::VERTEX_ATTRIB_ARRAY_DIVISOR, &$div1);
+    uint32 $err = gl::GetError();
+
+    $va->destroy();
+    $gl->end();
+
+    assert($err == gl::NO_ERROR, 'gl error');
+    assert($bytes == 60, 'size');
+    assert($size0 == 3, 'pos');
+    assert($size1 == 2, 'uv');
+    assert($en0 == 1, 'pos on');
+    assert($en1 == 1, 'uv on');
+    assert($stride == 20, 'stride');
+    assert($div1 == 0, 'divisor');
+}
+
+#[group: "glfw"]
+test instance_upload_sets_divisor
+{
+    GlContext $gl = glHidden('instance-upload');
+
+    array<float32> $verts = [
+        -0.2f, -0.2f, 0.0f,
+         0.2f, -0.2f, 0.0f,
+         0.0f,  0.2f, 0.0f
+    ];
+    Mesh $va = Mesh($gl->gpu, $verts, stride: 12);
+    array<float32> $offsets = [
+        -0.5f, 0.0f, 0.0f,
+         0.5f, 0.0f, 0.0f
+    ];
+    $va->instances($offsets, stride: 12);
+    $va->bind(VertexLayout::pos3Instance3());
+
+    int32 $instBytes = 0;
+    gl::GetBufferParameteriv(gl::ARRAY_BUFFER, gl::BUFFER_SIZE, &$instBytes);
+
+    int32 $size0 = 0;
+    int32 $size1 = 0;
+    int32 $div0 = 0;
+    int32 $div1 = 0;
+    gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_ARRAY_SIZE, &$size0);
+    gl::GetVertexAttribiv(1, gl::VERTEX_ATTRIB_ARRAY_SIZE, &$size1);
+    gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_ARRAY_DIVISOR, &$div0);
+    gl::GetVertexAttribiv(1, gl::VERTEX_ATTRIB_ARRAY_DIVISOR, &$div1);
+    uint32 $err = gl::GetError();
+
+    $va->destroy();
+    $gl->end();
+
+    assert($err == gl::NO_ERROR, 'gl error');
+    assert($instBytes == 24, 'instance size');
+    assert($size0 == 3, 'pos');
+    assert($size1 == 3, 'offset');
+    assert($div0 == 0, 'vertex divisor');
+    assert($div1 == 1, 'instance divisor');
+}
+
+#[group: "glfw"]
+test basic_draw_overwrites_clear_color
+{
+    GlContext $gl = glHidden('basic');
+    $gl->window->renderTarget()->preparePass();
+
+    ShaderProgram $program = ShaderProgram($gl->gpu);
+    ShaderStage $vs = ShaderStage($gl->gpu, .vertex, "#version 330 core\nlayout (location = 0) in vec3 aPos;\nlayout (location = 1) in vec2 aUv;\nout vec2 vUv;\nvoid main()\n{\n    gl_Position = vec4(aPos, 1.0);\n    vUv = aUv;\n}\n");
+    ShaderStage $fs = ShaderStage($gl->gpu, .fragment, "#version 330 core\nin vec2 vUv;\nout vec4 FragColor;\nuniform vec4 u_color;\nvoid main()\n{\n    FragColor = vec4(vUv, u_color.b, 1.0);\n}\n");
+    $program->attach($vs);
+    $program->attach($fs);
+    bool $ok = guard $program->link('basic') else ($e) {
+        $program->destroy();
+        $gl->end();
+        die($e->message());
+    }
+
+    array<float32> $verts = [
+        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,
+        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,
+         1.0f,  1.0f, 0.0f,  1.0f, 1.0f,
+         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,
+         1.0f,  1.0f, 0.0f,  1.0f, 1.0f,
+        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f
+    ];
+    Mesh $va = Mesh($gl->gpu, $verts, stride: 20);
+    VertexLayout $layout = VertexLayout::pos3uv2();
+    $va->bind($layout);
+
+    $gl->gpu->clearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    $gl->gpu->clear(COLOR_BUFFER_BIT);
+    $program->bind();
+    $program->set('u_color', Vec4(0.0f, 0.0f, 0.5f, 1.0f));
+    $gl->gpu->drawArrays(.triangles, 0, 6);
+
+    array<uint8> $pixels = readRgba($gl->window);
+    uint32 $err = gl::GetError();
+    uint8 $r = $pixels[0];
+    uint8 $g = $pixels[1];
+    uint8 $b = $pixels[2];
+
+    $va->destroy();
+    $program->destroy();
+    $gl->end();
+
+    assert($err == gl::NO_ERROR, 'gl error');
+    assert($r < 16, 'bottom-left r');
+    assert($g < 16, 'bottom-left g');
+    assert($b > 100 && $b < 160, 'bottom-left b');
+}
+
+#[group: "glfw"]
+test basic_draw_range
+{
+    GlContext $gl = glHidden('basic-range');
+    $gl->window->renderTarget()->preparePass();
+
+    ShaderProgram $program = ShaderProgram($gl->gpu);
+    ShaderStage $vs = ShaderStage($gl->gpu, .vertex, "#version 330 core\nlayout (location = 0) in vec3 aPos;\nlayout (location = 1) in vec2 aUv;\nout vec2 vUv;\nvoid main()\n{\n    gl_Position = vec4(aPos, 1.0);\n    vUv = aUv;\n}\n");
+    ShaderStage $fs = ShaderStage($gl->gpu, .fragment, "#version 330 core\nin vec2 vUv;\nout vec4 FragColor;\nuniform vec4 u_color;\nvoid main()\n{\n    FragColor = u_color;\n}\n");
+    $program->attach($vs);
+    $program->attach($fs);
+    bool $ok = guard $program->link('range') else ($e) {
+        $program->destroy();
+        $gl->end();
+        die($e->message());
+    }
+
+    array<float32> $verts = [
+        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,
+        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,
+         1.0f,  1.0f, 0.0f,  1.0f, 1.0f,
+         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,
+         1.0f,  1.0f, 0.0f,  1.0f, 1.0f,
+        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f
+    ];
+    Mesh $va = Mesh($gl->gpu, $verts, stride: 20);
+    $va->bind(VertexLayout::pos3uv2());
+
+    $gl->gpu->clearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    $gl->gpu->clear(COLOR_BUFFER_BIT);
+    $program->bind();
+    $program->set('u_color', Vec4(1.0f, 0.0f, 0.0f, 1.0f));
+    $va->drawRange(0, 6);
+
+    array<uint8> $pixels = readRgba($gl->window);
+    uint32 $err = gl::GetError();
+    int32 $w = $gl->window->framebufferWidth();
+    uint8 $lr = $pixels[0];
+    uint8 $lg = $pixels[1];
+    usize $right = (($w - 1) * 4) as usize;
+    uint8 $rr = $pixels[$right];
+    uint8 $rg = $pixels[$right + 1];
+
+    $va->destroy();
+    $program->destroy();
+    $gl->end();
+
+    assert($err == gl::NO_ERROR, 'gl error');
+    assert($lr > 240, 'left r');
+    assert($lg < 16, 'left g');
+    assert($rr > 240, 'right r');
+    assert($rg < 16, 'right g');
+}
+
+#[group: "glfw"]
+test instance_draw_two_offsets
+{
+    GlContext $gl = glHidden('instance');
+    $gl->window->renderTarget()->preparePass();
+
+    ShaderProgram $program = ShaderProgram($gl->gpu);
+    ShaderStage $vs = ShaderStage($gl->gpu, .vertex, "#version 330 core\nlayout (location = 0) in vec3 aPos;\nlayout (location = 1) in vec3 aOffset;\nvoid main()\n{\n    gl_Position = vec4(aPos + aOffset, 1.0);\n}\n");
+    ShaderStage $fs = ShaderStage($gl->gpu, .fragment, "#version 330 core\nout vec4 FragColor;\nuniform vec4 u_color;\nvoid main()\n{\n    FragColor = u_color;\n}\n");
+    $program->attach($vs);
+    $program->attach($fs);
+    bool $ok = guard $program->link('instance') else ($e) {
+        $program->destroy();
+        $gl->end();
+        die($e->message());
+    }
+
+    array<float32> $verts = [
+        -0.45f, -0.45f, 0.0f,
+         0.45f, -0.45f, 0.0f,
+         0.0f,  0.45f, 0.0f
+    ];
+    Mesh $va = Mesh($gl->gpu, $verts, stride: 12);
+    array<float32> $offsets = [
+        -0.5f, 0.0f, 0.0f,
+         0.5f, 0.0f, 0.0f
+    ];
+    $va->instances($offsets, stride: 12);
+    $va->bind(VertexLayout::pos3Instance3());
+
+    $gl->gpu->clearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    $gl->gpu->clear(COLOR_BUFFER_BIT);
+    $program->bind();
+    $program->set('u_color', Vec4(1.0f, 0.0f, 0.0f, 1.0f));
+    $gl->gpu->drawInstanced(.triangles, 0, 3, 2);
+    uint32 $err = gl::GetError();
+
+    $va->destroy();
+    $program->destroy();
+    $gl->end();
+
+    assert($err == gl::NO_ERROR, 'gl error');
+}
+
+#[group: "glfw"]
+test cube_draw_overwrites_clear_color
+{
+    GlContext $gl = glHidden('cube');
+    $gl->window->renderTarget()->preparePass();
+
+    ShaderProgram $program = ShaderProgram($gl->gpu);
+    ShaderStage $vs = ShaderStage($gl->gpu, .vertex, "#version 330 core\nlayout (location = 0) in vec3 aPos;\nvoid main()\n{\n    gl_Position = vec4(aPos.x, aPos.y, 0.0, 1.0);\n}\n");
+    ShaderStage $fs = ShaderStage($gl->gpu, .fragment, "#version 330 core\nout vec4 FragColor;\nuniform vec4 u_color;\nvoid main()\n{\n    FragColor = u_color;\n}\n");
+    $program->attach($vs);
+    $program->attach($fs);
+    bool $ok = guard $program->link('cube') else ($e) {
+        $program->destroy();
+        $gl->end();
+        die($e->message());
+    }
+
+    Mesh $cube = .cube($gl->gpu);
+    $cube->bind(VertexLayout::pos3());
+
+    $gl->gpu->clearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    $gl->gpu->clear(COLOR_BUFFER_BIT);
+    $program->bind();
+    $program->set('u_color', Vec4(1.0f, 0.0f, 0.0f, 1.0f));
+    $gl->gpu->bindVertexBuffer($cube->vertices->id);
+    int32 $bytes = 0;
+    gl::GetBufferParameteriv(gl::ARRAY_BUFFER, gl::BUFFER_SIZE, &$bytes);
+    int32 $size0 = 0;
+    int32 $en0 = 0;
+    gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_ARRAY_SIZE, &$size0);
+    gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_ARRAY_ENABLED, &$en0);
+    $gl->gpu->drawArrays(.triangles, 0, 36);
+    uint32 $err = gl::GetError();
+
+    $cube->destroy();
+    $program->destroy();
+    $gl->end();
+
+    assert($err == gl::NO_ERROR, 'gl error');
+    assert($bytes == 432, 'size');
+    assert($size0 == 3, 'pos');
+    assert($en0 == 1, 'pos on');
+}
+
+#[group: "glfw"]
+test rebind_layout_resets_divisor
+{
+    GlContext $gl = glHidden('rebind-layout');
+
+    array<float32> $verts = [
+        -1.0f, -1.0f, 0.0f,
+         1.0f, -1.0f, 0.0f,
+        -1.0f,  1.0f, 0.0f
+    ];
+    Mesh $va = Mesh($gl->gpu, $verts, stride: 12);
+    array<float32> $offsets = [
+        0.0f, 0.0f, 0.0f
+    ];
+    $va->instances($offsets, stride: 12);
+    $va->bind(VertexLayout::pos3Instance3());
+    $va->bind(VertexLayout::pos3());
+
+    int32 $div0 = 1;
+    int32 $en1 = 1;
+    gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_ARRAY_DIVISOR, &$div0);
+    gl::GetVertexAttribiv(1, gl::VERTEX_ATTRIB_ARRAY_ENABLED, &$en1);
+    uint32 $err = gl::GetError();
+
+    $va->destroy();
+    $gl->end();
+
+    assert($err == gl::NO_ERROR, 'gl error');
+    assert($div0 == 0, 'pos divisor');
+    assert($en1 == 0, 'instance loc off');
+}
+#[end]
+
+

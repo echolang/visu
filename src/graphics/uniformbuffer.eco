@@ -1,0 +1,77 @@
+/**
+ * Persistent uniform buffer. App-owned, GpuObject, cacheable on
+ * Pool. Slot is the binding identity (GL BindBufferBase, Metal
+ * [[buffer(2+slot)]]). upload writes bytes; bind attaches the
+ * slot; push is both. Gpu.pushUniform is the per-draw scratch
+ * sibling — this type is for data that lives across draws.
+ */
+
+namespace visu::graphics;
+
+public class UniformBuffer : GpuObject
+{
+    public Gpu $gpu;
+    public const uint32 $id;
+    public const uint32 $slot;
+    private GpuBuffer $buffer;
+    private isize $bytes;
+    private bool $dead;
+
+    public constructor(Gpu $gpu, slot: uint32 $slot = 0, bytes: isize $bytes = 256)
+    {
+        assert($bytes > 0, 'uniform buffer size');
+        isize $size = $bytes;
+
+        if ($size < 256) {
+            $size = 256;
+        }
+
+        GpuBuffer $buffer = GpuBuffer($gpu, .uniform);
+        $buffer->uploadBytes(null, $size);
+        $this->gpu = $gpu;
+        $this->buffer = $buffer;
+        $this->id = $buffer->id;
+        $this->slot = $slot;
+        $this->bytes = $size;
+        $this->dead = false;
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function upload<T>(T $value) : void
+    {
+        isize $n = mem::size<T>() as isize;
+        assert($n > 0 && ($n % 16) == 0, 'uniform buffer size');
+
+        if ($n > $this->bytes) {
+            $this->bytes = $n;
+        }
+
+        ptr<const uint8> $ptr = ptr<const uint8>(&$value);
+        $this->buffer->uploadBytes($ptr, $n);
+    }
+
+    public function bind() : void
+    {
+        $this->gpu->bindUniformSlot($this->slot, $this->id);
+    }
+
+    public function push<T>(T $value) : void
+    {
+        $this->upload($value);
+        $this->bind();
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->buffer->destroy();
+        $this->dead = true;
+    }
+}

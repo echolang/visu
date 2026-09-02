@@ -1,7 +1,6 @@
 /**
  * A 2D GPU texture. Construct allocates a name; allocateEmpty fills
- * storage. An owned texture must be destroy()ed with a Gpu& before
- * it is dropped.
+ * storage. Stores Gpu; destroy() uses the handle.
  */
 
 namespace visu::graphics;
@@ -69,6 +68,8 @@ public struct TextureOptions
 
 public class Texture : GpuObject
 {
+    public Gpu $gpu;
+
     /**
      * GPU texture name.
      */
@@ -96,9 +97,10 @@ public class Texture : GpuObject
     /**
      * Allocates a 2D texture name.
      */
-    public constructor(Gpu& $state, string $name)
+    public constructor(Gpu $gpu, string $name)
     {
-        $this->id = $state->createTexture();
+        $this->gpu = $gpu;
+        $this->id = $gpu->createTexture();
         $this->target = .texture2D;
         $this->name = $name;
         $this->owned = true;
@@ -109,46 +111,49 @@ public class Texture : GpuObject
 
     destructor()
     {
-        assert(!$this->owned || $this->dead, 'Texture dropped without destroy');
+        $this->destroy();
     }
 
     /**
      * Deletes the GL name. No-op for an already-destroyed object.
      */
-    public function destroy(Gpu& $state) : void
+    public function destroy() : void
     {
         if (!$this->owned || $this->dead) {
             return;
         }
 
-        $state->deleteTexture($this->id);
+        if (!$this->gpu->lost()) {
+            $this->gpu->deleteTexture($this->id);
+        }
+
         $this->dead = true;
     }
 
     /**
      * Bind to texture unit `$index` (0 is TEXTURE0).
      */
-    public function bind(Gpu& $state, int32 $index = 0) : void
+    public function bind(int32 $index = 0) : void
     {
         assert($index >= 0, 'texture unit index must be >= 0');
-        $state->bindTexture(TEXTURE0 + ($index as uint32), $this->target, $this->id);
+        $this->gpu->bindTexture(TEXTURE0 + ($index as uint32), $this->target, $this->id);
     }
 
     /**
      * Allocates empty storage and applies filter / wrap.
      */
-    public function allocateEmpty(Gpu& $state, int32 $width, int32 $height, TextureOptions $opt) : void
+    public function allocateEmpty(int32 $width, int32 $height, TextureOptions $opt) : void
     {
         assert($width > 0 && $height > 0, 'texture size must be positive');
         assert($opt->mipmaps || !$opt->min->mipmapped(), 'mipmapped min filter needs mipmaps');
 
-        $this->bind($state);
-        $state->texFilter($this->target, $opt->min, $opt->mag);
-        $state->texWrap($this->target, $opt->wrapS, $opt->wrapT);
-        $state->texImage2D($this->target, $opt->format, $width, $height);
+        $this->bind();
+        $this->gpu->texFilter($this->target, $opt->min, $opt->mag);
+        $this->gpu->texWrap($this->target, $opt->wrapS, $opt->wrapT);
+        $this->gpu->texImage2D($this->target, $opt->format, $width, $height);
 
         if ($opt->mipmaps) {
-            $state->generateMipmap($this->target);
+            $this->gpu->generateMipmap($this->target);
         }
 
         $this->width = $width;

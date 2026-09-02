@@ -1,0 +1,56 @@
+/**
+ * Graph node minted by FullscreenTextureRenderer.pass. Reads a
+ * texture, writes a target, draws a fullscreen quad.
+ */
+
+namespace visu::graphics;
+
+public class FullscreenQuadPass : Pass
+{
+    private ShaderProgram $program;
+    private TargetRef $target;
+    private TextureRef $texture;
+
+    public constructor(ShaderProgram $program, TargetRef $target, TextureRef $texture)
+    {
+        $this->program = $program;
+        $this->target = $target;
+        $this->texture = $texture;
+    }
+
+    public function name() : string
+    {
+        return 'FullscreenQuadPass';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        $io->reads($this->texture);
+        $io->writes($this->target);
+    }
+
+    public function execute(Context $ctx) : result<bool, PipelineError>
+    {
+        RenderTarget $rt = guard $ctx->pool->activate($this->target) else ($e) {
+            return .error(.pool($e));
+        }
+        Texture $tex = guard $ctx->pool->getTexture($this->texture) else ($e) {
+            return .error(.pool($e));
+        }
+
+        Gpu $gpu = $ctx->gpu;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($gpu);
+        });
+
+        $this->program->bind();
+        $gpu->applyRaster(Raster::none());
+        $tex->bind(0);
+        #[if: VISU_BACKEND_METAL]
+        #[else]
+        $this->program->set('u_texture', 0);
+        #[end]
+        $mesh->draw(VertexLayout::pos3uv2());
+        return .ok(true);
+    }
+}

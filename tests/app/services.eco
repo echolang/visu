@@ -1,0 +1,222 @@
+/**
+ * Services container. No GPU.
+ */
+
+use visu::app::{Services, Paths, Logger, bootstrap, hasLogger, currentLogger, uninstallLogger};
+use std::env;
+
+class AppNote
+{
+    public int32 $n;
+
+    public constructor(int32 $n)
+    {
+        $this->n = $n;
+    }
+}
+
+class AppOther
+{
+    public int32 $n;
+
+    public constructor(int32 $n)
+    {
+        $this->n = $n;
+    }
+}
+
+class AppCalls
+{
+    public int32 $n;
+
+    public constructor()
+    {
+        $this->n = 0;
+    }
+}
+
+class AppPair
+{
+    public int32 $a;
+    public int32 $b;
+
+    public constructor(int32 $a, int32 $b)
+    {
+        $this->a = $a;
+        $this->b = $b;
+    }
+}
+
+test services_set_get
+{
+    Services $s = Services();
+    $s->set(AppNote(7));
+    assert($s->has<AppNote>(), 'has');
+    assert(!$s->has<AppOther>(), 'no other');
+    AppNote $note = $s->get<AppNote>();
+    assert($note->n == 7, 'n');
+    AppOther? $missing = $s->find<AppOther>();
+    assert($missing == null, 'find miss');
+    $s->set(AppOther(3));
+    AppOther? $maybe = $s->find<AppOther>();
+    AppOther $found = guard $maybe else {
+        die('should be there');
+    }
+    assert($found->n == 3, 'find hit');
+}
+
+test services_create_returns_same_instance
+{
+    Services $s = Services();
+    AppCalls $c = $s->create<AppCalls>();
+    assert($s->has<AppCalls>(), 'has');
+    assert($c->n == 0, 'n');
+    $c->n = 99;
+    AppCalls $got = $s->get<AppCalls>();
+    assert($got->n == 99, 'same');
+}
+
+test services_create_constructs_with_arg
+{
+    Services $s = Services();
+    AppNote $note = $s->create<AppNote>(7);
+    assert($note->n == 7, 'n');
+    AppNote $got = $s->get<AppNote>();
+    assert($got->n == 7, 'stored');
+}
+
+test services_create_constructs_with_two_args
+{
+    Services $s = Services();
+    AppPair $pair = $s->create<AppPair>(2, 3);
+    assert($pair->a == 2, 'a');
+    assert($pair->b == 3, 'b');
+}
+
+test services_get_returns_same_instance
+{
+    Services $s = Services();
+    $s->set(AppNote(1));
+    AppNote $a = $s->get<AppNote>();
+    $a->n = 99;
+    AppNote $b = $s->get<AppNote>();
+    assert($b->n == 99, 'same');
+}
+
+test services_once_is_lazy
+{
+    Services $s = Services();
+    AppCalls $c = AppCalls();
+    $s->once(function(Services $s) : AppNote {
+        $c->n = $c->n + 1;
+        return AppNote($c->n);
+    });
+    assert($s->has<AppNote>(), 'bound');
+    assert($c->n == 0, 'not run');
+    AppNote $note = $s->get<AppNote>();
+    assert($c->n == 1, 'ran');
+    assert($note->n == 1, 'n');
+    AppNote $again = $s->get<AppNote>();
+    assert($c->n == 1, 'once');
+    $again->n = 4;
+    assert($note->n == 4, 'cached');
+}
+
+test services_once_noop_when_set
+{
+    Services $s = Services();
+    $s->set(AppNote(5));
+    $s->once(function(Services $s) : AppNote {
+        return AppNote(0);
+    });
+    AppNote $note = $s->get<AppNote>();
+    assert($note->n == 5, 'kept');
+}
+
+test services_factory_can_get_other
+{
+    Services $s = Services();
+    $s->set(AppOther(11));
+    $s->once(function(Services $s) : AppNote {
+        AppOther $other = $s->get<AppOther>();
+        return AppNote($other->n);
+    });
+    AppNote $note = $s->get<AppNote>();
+    assert($note->n == 11, 'dep');
+}
+
+test bootstrap_provides_paths_and_logger
+{
+    Paths $paths = Paths(root: '/tmp/visu');
+    Services $s = bootstrap($paths, function(Services $s) : void {
+    });
+    Paths $got = $s->get<Paths>();
+    $ds = env::DS;
+    assert($got->root == '/tmp/visu', 'root');
+    assert($got->cache == "/tmp/visu{$ds}var{$ds}cache", 'cache');
+    Logger $log = $s->get<Logger>();
+    assert(hasLogger(), 'installed');
+    Logger $process = currentLogger();
+    $log->infoEnabled = false;
+    assert(!$process->infoEnabled, 'same');
+    $log->info('quiet');
+    array<string> $msgs = $log->messages();
+    assert($msgs->count() == 0, 'disabled');
+    uninstallLogger();
+}
+
+test bootstrap_app_set_wins_over_defaults
+{
+    Logger $custom = Logger();
+    $custom->infoEnabled = false;
+    Paths $paths = Paths(root: '/tmp/visu');
+    Services $s = bootstrap($paths, function(Services $s) : void {
+        $s->set($custom);
+    });
+    Logger $got = $s->get<Logger>();
+    Logger $process = currentLogger();
+    $got->info('x');
+    array<string> $msgs = $got->messages();
+    assert($msgs->count() == 0, 'custom');
+    $process->warnEnabled = false;
+    assert(!$custom->warnEnabled, 'same');
+    uninstallLogger();
+}
+
+#[tests: expects death]
+test services_duplicate_set_dies
+{
+    Services $s = Services();
+    $s->set(AppNote(1));
+    $s->set(AppNote(2));
+}
+
+#[tests: expects death]
+test services_duplicate_create_dies
+{
+    Services $s = Services();
+    $s->create<AppNote>(1);
+    $s->create<AppNote>(2);
+}
+
+#[tests: expects death]
+test services_missing_get_dies
+{
+    Services $s = Services();
+    AppNote $note = $s->get<AppNote>();
+}
+
+#[tests: expects death]
+test services_circular_get_dies
+{
+    Services $s = Services();
+    $s->once(function(Services $s) : AppNote {
+        AppOther $other = $s->get<AppOther>();
+        return AppNote($other->n);
+    });
+    $s->once(function(Services $s) : AppOther {
+        AppNote $note = $s->get<AppNote>();
+        return AppOther($note->n);
+    });
+    AppNote $note = $s->get<AppNote>();
+}

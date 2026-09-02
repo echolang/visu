@@ -1,0 +1,107 @@
+/**
+ * A named shader slot. Created at register / definePermutation /
+ * shader(name). Draw objects hold this, not the collection. program()
+ * is a field read — the string map is only the collection directory.
+ */
+
+namespace visu::graphics;
+
+public class ShaderRef
+{
+    public const string $name;
+    public const string? $variant;
+    private weak<ShaderCollection> $shaders;
+    internal ShaderProgram? $compiled;
+    internal array<ShaderFile> $files;
+    internal array<Define> $defines;
+    internal ordered_map<string, ShaderRef> $variants;
+
+    internal constructor(ShaderCollection $shaders, string $name)
+    {
+        $this->shaders = &$shaders;
+        $this->name = $name;
+        $this->variant = null;
+        $this->compiled = null;
+        $this->files = array<ShaderFile>();
+        $this->defines = array<Define>();
+        $this->variants = ordered_map<string, ShaderRef>();
+    }
+
+    internal constructor(ShaderCollection $shaders, string $name, variant: string $variant)
+    {
+        $this->shaders = &$shaders;
+        $this->name = $name;
+        $this->variant = $variant;
+        $this->compiled = null;
+        $this->files = array<ShaderFile>();
+        $this->defines = array<Define>();
+        $this->variants = ordered_map<string, ShaderRef>();
+    }
+
+    /**
+     * Compile if needed and return the program.
+     */
+    public function load() : result<ShaderProgram, ShaderError>
+    {
+        ShaderCollection $col = guard strong($this->shaders);
+
+        if ($this->variant != null) {
+            return $col->compileVariant($this);
+        }
+
+        return $col->compileBase($this);
+    }
+
+    /**
+     * Hot-path lookup. Asserts the program was load()ed.
+     */
+    public function program() : ShaderProgram
+    {
+        ShaderProgram? $held = $this->compiled;
+        assert($held != null, 'shader: program was never loaded');
+        ShaderProgram $p = guard $held;
+        assert(!$p->destroyed(), 'shader: program was destroyed');
+        return $p;
+    }
+
+    /**
+     * Drop the compiled program. A base ref also drops every
+     * variant program. The slot stays.
+     */
+    public function forget() : void
+    {
+        ShaderProgram $held = guard $this->compiled else {
+            $this->forgetVariants();
+            return;
+        }
+        $held->destroy();
+        $this->compiled = null;
+        $this->forgetVariants();
+    }
+
+    public function permutation(string $variant) : result<ShaderRef, ShaderError>
+    {
+        if ($this->variant != null) {
+            return .error(.missingPermutation($this->name, $variant));
+        }
+
+        if (!$this->variants->has($variant)) {
+            return .error(.missingPermutation($this->name, $variant));
+        }
+
+        return .ok($this->variants[$variant]);
+    }
+
+    private function forgetVariants() : void
+    {
+        if ($this->variant != null) {
+            return;
+        }
+
+        array<string> $keys = $this->variants->keys();
+
+        foreach ($keys as $key) {
+            $this->variants[$key]->forget();
+        }
+    }
+}

@@ -1,0 +1,227 @@
+/**
+ * Prototyping app the GameLoop drives. Owns Gpu (class handle);
+ * GPU objects store it. Scene goes to an offscreen target:
+ * `$opt->render` adds graph passes, `$opt->draw` (and FlyUI later)
+ * runs with that target bound, then a fullscreen blit to the
+ * backbuffer.
+ */
+
+namespace visu::quickstart;
+
+use std::env;
+use visu::app::{Paths, Services};
+use visu::ecs::{Entities, Systems};
+use visu::graphics::{
+    Backbuffer, CallbackPass, ClearPass, ClearPassOptions, Context, Frame,
+    FullscreenTextureRenderer, Gpu, IoSink, Pipeline, PipelineError, Pool,
+    RenderTarget, ShaderCollection, TargetRef, TextureOptions, TextureRef
+};
+use visu::math::Vec2;
+use visu::os::{Window, WindowError, WindowHints};
+use visu::runtime::{Delegate, EventLoop};
+use visu::signal::Dispatcher;
+
+public class App : Delegate
+{
+    public Gpu $gpu;
+    public Window $window;
+    public Pool $pool;
+    public Entities $entities;
+    public Systems $systems;
+    public Dispatcher $dispatcher;
+    public ShaderCollection $shaders;
+    public Services $services;
+    public Options $options;
+    public EventLoop $events;
+    public int32 $frameIndex;
+    public int32 $tickIndex;
+    public PipelineError? $fail;
+    private FullscreenTextureRenderer $blit;
+
+    public constructor(Options $options, Services $services)
+    {
+        $this->options = $options;
+        $this->services = $services;
+        $this->gpu = Gpu();
+        $this->window = Window(
+            $options->windowTitle,
+            $options->windowWidth,
+            $options->windowHeight,
+            $this->hints($options)
+        );
+        $this->pool = Pool($this->gpu);
+        $this->entities = Entities();
+        $this->systems = Systems();
+        $this->dispatcher = Dispatcher();
+        $this->shaders = ShaderCollection($this->gpu, $this->shaderDir($services));
+        $this->events = EventLoop();
+        $this->frameIndex = 0;
+        $this->tickIndex = 0;
+        $this->fail = null;
+        $this->blit = FullscreenTextureRenderer();
+    }
+
+    public function initialize() : result<bool, WindowError>
+    {
+        bool $ok = guard $this->window->initialize($this->gpu) else ($e) {
+            return .error($e);
+        }
+
+        if ($this->options->windowVsync) {
+            $this->window->setSwapInterval(1);
+        } else {
+            $this->window->setSwapInterval(0);
+        }
+
+        bool $blit = guard $this->blit->load($this->gpu) else ($e) {
+            $this->fail = .shader($e);
+            return .ok(true);
+        }
+
+        return .ok(true);
+    }
+
+    public function ready() : void
+    {
+        $this->runCallback($this->options->ready);
+        $this->systems->register($this->entities);
+        $this->runCallback($this->options->initializeScene);
+    }
+
+    public function update() : void
+    {
+        $this->window->poll();
+        $this->events->tick();
+        $this->systems->update($this->entities);
+        $this->runCallback($this->options->update);
+        $this->tickIndex = $this->tickIndex + 1;
+    }
+
+    public function render(float32 $compensation) : void
+    {
+        Frame $frame = Frame();
+        RenderTarget $windowRt = $this->window->renderTarget();
+        Pipeline $pipeline = Pipeline($this->pool, $frame, $windowRt);
+        Context $ctx = Context($this->gpu, $pipeline, $frame, $this->pool, $compensation);
+        Backbuffer $back = $frame->get<Backbuffer>();
+        TargetRef $scene = $this->sceneTarget($pipeline, $windowRt);
+        $scene->rboDepthStencil = true;
+        TextureRef $color = $pipeline->createColor($scene, 'quickstartColor', TextureOptions());
+        $frame->set(QuickstartPassData($scene, $color));
+        $pipeline->add(ClearPass($scene, ClearPassOptions(color: $this->options->clearColor)));
+
+        $this->runRender($ctx, $scene);
+        $this->systems->render($this->entities, $ctx);
+        $this->addDraw($pipeline);
+        $pipeline->add(ClearPass($back->target, ClearPassOptions()));
+        $this->blit->pass($pipeline, $back->target, $color);
+        $this->finishFrame($pipeline, $compensation);
+    }
+
+    public function shouldStop() : bool
+    {
+        if ($this->fail != null) {
+            return true;
+        }
+
+        int32 $cap = guard $this->options->maxFrames else {
+            return $this->window->shouldClose();
+        }
+        if ($this->frameIndex >= $cap) {
+            return true;
+        }
+
+        return $this->window->shouldClose();
+    }
+
+    public function destroy() : void
+    {
+        $this->systems->unregister($this->entities);
+        $this->shaders->destroy();
+        $this->blit->destroy();
+        $this->pool->destroy();
+        $this->window->destroy();
+    }
+
+    private function sceneTarget(Pipeline $pipeline, RenderTarget $windowRt) : TargetRef
+    {
+        Vec2 $fixed = guard $this->options->renderResolution else {
+            return $pipeline->createTargetLike('quickstartTarget', $windowRt);
+        }
+
+        return $pipeline->createTarget('quickstartTarget', $fixed->x as int32, $fixed->y as int32);
+    }
+
+    private function addDraw(Pipeline $pipeline) : void
+    {
+        $pipeline->add(CallbackPass(
+            'quickstart.draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                QuickstartPassData $data = $frame->get<QuickstartPassData>();
+                $io->writes($data->renderTarget);
+            },
+            execute: function(Context $ctx) : result<bool, PipelineError> {
+                QuickstartPassData $data = $ctx->frame->get<QuickstartPassData>();
+                RenderTarget $rt = guard $ctx->pool->activate($data->renderTarget) else ($e) {
+                    return .error(.pool($e));
+                }
+                function<void(App, Context, RenderTarget)> $draw = guard $this->options->draw else {
+                    return .ok(true);
+                }
+                $draw($this, $ctx, $rt);
+                return .ok(true);
+            }
+        ));
+    }
+
+    private function finishFrame(Pipeline $pipeline, float32 $compensation) : void
+    {
+        bool $ok = guard $pipeline->execute($this->frameIndex, $compensation) else ($e) {
+            $this->fail = $e;
+            return;
+        }
+        $this->window->swap();
+        $this->frameIndex = $this->frameIndex + 1;
+    }
+
+    private function runCallback(function<void(App)>? $cb) : void
+    {
+        function<void(App)> $fn = guard $cb else {
+            return;
+        }
+        $fn($this);
+    }
+
+    private function runRender(Context $ctx, TargetRef $target) : void
+    {
+        function<void(App, Context, TargetRef)> $fn = guard $this->options->render else {
+            return;
+        }
+        $fn($this, $ctx, $target);
+    }
+
+    private function hints(Options $options) : WindowHints
+    {
+        WindowHints $hints = WindowHints::defaults();
+        if ($options->windowHeadless) {
+            $hints->visible = false;
+            $hints->resizable = false;
+            $hints->focusOnShow = false;
+            $hints->cocoaRetinaFramebuffer = false;
+            $hints->scaleToMonitor = false;
+        } else {
+            $hints->focusOnShow = true;
+            $hints->resizable = true;
+        }
+
+        return $hints;
+    }
+
+    private function shaderDir(Services $services) : string
+    {
+        Paths $paths = guard $services->find<Paths>() else {
+            return env::cwd();
+        }
+        return $paths->resourcesShader;
+    }
+}

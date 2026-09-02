@@ -1,0 +1,234 @@
+/**
+ * Vertex data. Layout lives on GpuPass; this owns the buffers.
+ * Two buffers: vertices (divisor 0) and one instance stream.
+ * Stride is bytes. The VAO is private and is rebuilt when the
+ * layout fingerprint changes. PHP VISU QuadVertexArray /
+ * CubeVertexArray / BasicVertexArray.
+ */
+
+namespace visu::graphics;
+
+public class Mesh : GpuObject
+{
+    public Gpu $gpu;
+    public GpuBuffer $vertices;
+    public GpuBuffer? $instances;
+    public int32 $vertexCount;
+    public int32 $instanceCount;
+    public DrawMode $mode;
+    public uint32 $vao;
+    private int32 $vertexStride;
+    private int32 $instanceStride;
+    private bool $vaoBuilt;
+    private string $layoutKey;
+    private bool $dead;
+
+    public constructor(Gpu $gpu, array<float32>& $data, stride: int32 $stride)
+    {
+        $this->initEmpty($gpu, $stride);
+        $this->upload($data);
+    }
+
+    public static function quad(Gpu $gpu) : Mesh
+    {
+        array<float32> $verts = [
+            -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,
+            -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,
+             1.0f,  1.0f, 0.0f,  1.0f, 1.0f,
+             1.0f, -1.0f, 0.0f,  1.0f, 0.0f,
+             1.0f,  1.0f, 0.0f,  1.0f, 1.0f,
+            -1.0f, -1.0f, 0.0f,  0.0f, 0.0f
+        ];
+        return Mesh($gpu, $verts, stride: (mem::size<float32>() as int32) * 5);
+    }
+
+    public static function cube(Gpu $gpu) : Mesh
+    {
+        array<float32> $verts = cubePositions();
+        return Mesh($gpu, $verts, stride: (mem::size<float32>() as int32) * 3);
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->vertices->destroy();
+
+        if ($this->instances != null) {
+            GpuBuffer $instances = guard $this->instances;
+            $instances->destroy();
+        }
+
+        if (!$this->gpu->lost()) {
+            $this->gpu->deleteVertexArray($this->vao);
+        }
+
+        $this->dead = true;
+        $this->vaoBuilt = false;
+    }
+
+    public function upload(array<float32>& $data) : void
+    {
+        usize $n = $data->count();
+        int32 $bytes = ($n as int32) * (mem::size<float32>() as int32);
+        assert($this->vertexStride > 0 && $bytes % $this->vertexStride == 0, 'upload size');
+        $this->vertexCount = $bytes / $this->vertexStride;
+        $this->vertices->upload($data);
+    }
+
+    public function instances(array<float32>& $data, stride: int32 $stride) : void
+    {
+        assert($stride > 0, 'instance stride');
+        $this->instanceStride = $stride;
+        usize $n = $data->count();
+        int32 $bytes = ($n as int32) * (mem::size<float32>() as int32);
+        assert($bytes % $stride == 0, 'instance size');
+        $this->instanceCount = $bytes / $stride;
+
+        if ($this->instances == null) {
+            $this->instances = GpuBuffer($this->gpu, .vertex);
+        }
+
+        GpuBuffer $buf = guard $this->instances;
+        $buf->upload($data);
+        $this->vaoBuilt = false;
+    }
+
+    public function bind(const VertexLayout& $layout) : void
+    {
+        $this->checkLayout($layout);
+        $this->gpu->bindVertexArray($this->vao);
+        string $key = $layout->fingerprint();
+
+        if ($this->vaoBuilt && $this->layoutKey == $key) {
+            return;
+        }
+
+        uint32 $instanceId = 0;
+
+        if ($this->instances != null) {
+            GpuBuffer $inst = guard $this->instances;
+            $instanceId = $inst->id;
+        }
+
+        $this->gpu->applyLayout($this->vao, $layout, $this->vertices->id, $instanceId);
+        $this->vaoBuilt = true;
+        $this->layoutKey = $key;
+    }
+
+    public function draw() : void
+    {
+        assert($this->vaoBuilt, 'mesh: bind a VertexLayout before draw');
+        $this->gpu->bindVertexArray($this->vao);
+
+        if ($this->instanceCount > 0) {
+            $this->gpu->drawInstanced($this->mode, 0, $this->vertexCount, $this->instanceCount);
+            return;
+        }
+
+        $this->gpu->drawArrays($this->mode, 0, $this->vertexCount);
+    }
+
+    public function draw(const VertexLayout& $layout) : void
+    {
+        $this->bind($layout);
+        $this->draw();
+    }
+
+    public function drawRange(int32 $offset, int32 $count) : void
+    {
+        assert($this->vaoBuilt, 'mesh: bind a VertexLayout before draw');
+        $this->gpu->bindVertexArray($this->vao);
+
+        if ($this->instanceCount > 0) {
+            $this->gpu->drawInstanced($this->mode, $offset, $count, $this->instanceCount);
+            return;
+        }
+
+        $this->gpu->drawArrays($this->mode, $offset, $count);
+    }
+
+    private function initEmpty(Gpu $gpu, int32 $stride) : void
+    {
+        assert($stride > 0, 'mesh stride');
+        $this->gpu = $gpu;
+        $this->vertices = GpuBuffer($gpu, .vertex);
+        $this->instances = null;
+        $this->vertexCount = 0;
+        $this->instanceCount = 0;
+        $this->mode = .triangles;
+        $this->vao = $gpu->createVertexArray();
+        $this->vertexStride = $stride;
+        $this->instanceStride = 0;
+        $this->vaoBuilt = false;
+        $this->layoutKey = '';
+        $this->dead = false;
+    }
+
+    private function checkLayout(const VertexLayout& $layout) : void
+    {
+        foreach ($layout->attrs as $attr) {
+            if ($attr->divisor == 0) {
+                assert($attr->stride == $this->vertexStride, 'mesh: vertex stride');
+            } else {
+                assert($this->instanceStride > 0, 'mesh: instance attrib without instance buffer');
+                assert($attr->stride == $this->instanceStride, 'mesh: instance stride');
+            }
+        }
+    }
+}
+
+internal function cubePositions() : array<float32>
+{
+    array<float32> $verts = [
+        -1.0f, -1.0f, -1.0f,
+         1.0f,  1.0f, -1.0f,
+         1.0f, -1.0f, -1.0f,
+         1.0f,  1.0f, -1.0f,
+        -1.0f, -1.0f, -1.0f,
+        -1.0f,  1.0f, -1.0f,
+
+        -1.0f, -1.0f,  1.0f,
+         1.0f, -1.0f,  1.0f,
+         1.0f,  1.0f,  1.0f,
+         1.0f,  1.0f,  1.0f,
+        -1.0f,  1.0f,  1.0f,
+        -1.0f, -1.0f,  1.0f,
+
+        -1.0f,  1.0f,  1.0f,
+        -1.0f,  1.0f, -1.0f,
+        -1.0f, -1.0f, -1.0f,
+        -1.0f, -1.0f, -1.0f,
+        -1.0f, -1.0f,  1.0f,
+        -1.0f,  1.0f,  1.0f,
+
+         1.0f,  1.0f,  1.0f,
+         1.0f, -1.0f, -1.0f,
+         1.0f,  1.0f, -1.0f,
+         1.0f, -1.0f, -1.0f,
+         1.0f,  1.0f,  1.0f,
+         1.0f, -1.0f,  1.0f,
+
+        -1.0f, -1.0f, -1.0f,
+         1.0f, -1.0f, -1.0f,
+         1.0f, -1.0f,  1.0f,
+         1.0f, -1.0f,  1.0f,
+        -1.0f, -1.0f,  1.0f,
+        -1.0f, -1.0f, -1.0f,
+
+        -1.0f,  1.0f, -1.0f,
+         1.0f,  1.0f,  1.0f,
+         1.0f,  1.0f, -1.0f,
+         1.0f,  1.0f,  1.0f,
+        -1.0f,  1.0f, -1.0f,
+        -1.0f,  1.0f,  1.0f
+    ];
+    return $verts;
+}

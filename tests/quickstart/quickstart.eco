@@ -1,0 +1,58 @@
+/**
+ * Headless Quickstart smoke. Hidden window; skip without a display
+ * via --filter group:glfw.
+ */
+
+use visu::graphics::{Context, RenderTarget, TargetRef};
+use visu::quickstart::{App, Options, Quickstart};
+
+class QuickHits
+{
+    public int32 $updates;
+    public int32 $renders;
+    public int32 $draws;
+
+    public constructor()
+    {
+        $this->updates = 0;
+        $this->renders = 0;
+        $this->draws = 0;
+    }
+}
+
+#[if: VISU_BACKEND_METAL]
+#[else]
+#[group: "glfw"]
+test quickstart_runs_two_frames
+{
+    QuickHits $hits = QuickHits();
+    CountingSystem $sys = CountingSystem();
+    Quickstart $qs = Quickstart(function(Options $opt) : void {
+        $opt->windowHeadless = true;
+        $opt->windowVsync = false;
+        $opt->maxFrames = 2;
+        $opt->windowTitle = 'quickstart test';
+        $opt->windowWidth = 320;
+        $opt->windowHeight = 240;
+        $opt->update = function(App $app) : void {
+            $hits->updates = $hits->updates + 1;
+        };
+        $opt->ready = function(App $app) : void {
+            $app->systems->bind($sys);
+        };
+        $opt->render = function(App $app, Context $ctx, TargetRef $target) : void {
+            $hits->renders = $hits->renders + 1;
+            assert($target->name == 'quickstartTarget', 'offscreen');
+        };
+        $opt->draw = function(App $app, Context $ctx, RenderTarget $rt) : void {
+            $hits->draws = $hits->draws + 1;
+        };
+    });
+    $qs->run();
+    assert($qs->app()->frameIndex == 2, 'frames');
+    assert($hits->renders == 2, 'renders');
+    assert($hits->draws == 2, 'draws');
+    assert($sys->renders == 2, 'systems');
+    assert($hits->updates >= 0, 'updates ran or not depending on lag');
+}
+#[end]

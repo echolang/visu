@@ -1,0 +1,239 @@
+/**
+ * Logger buffer, conduits, and level flags. No GPU.
+ */
+
+use visu::app::{Logger, LogLevel, Conduit, FileConduit, StdoutConduit, Paths, installLogger, uninstallLogger, hasLogger, currentLogger, info, warn, error};
+use std::env;
+use std::io;
+
+class CollectingConduit : Conduit
+{
+    public array<LogLevel> $levels = array<LogLevel>();
+    public array<string> $seen = array<string>();
+
+    public function write(LogLevel $level, string $message) : void
+    {
+        $this->levels->push($level);
+        $this->seen->push($message);
+    }
+}
+
+function loggerTestPath(string $name) : string
+{
+    string::view $dir = env::tmp();
+    $ds = env::DS;
+    int32 $pid = env::pid();
+    return "{$dir}{$ds}visu-{$name}-{$pid}.log";
+}
+
+test logger_records_and_rolls
+{
+    Logger $log = Logger();
+    $log->maxMessages = 2;
+    $log->info('a');
+    $log->warn('b');
+    $log->error('c');
+    array<string> $msgs = $log->messages();
+    assert($msgs->count() == 2, 'rolled');
+    assert($msgs[0] == 'b', 'b');
+    assert($msgs[1] == 'c', 'c');
+}
+
+test logger_roll_keeps_latest_across_trim
+{
+    Logger $log = Logger();
+    $log->maxMessages = 3;
+    $log->info('a');
+    $log->info('b');
+    $log->info('c');
+    $log->info('d');
+    $log->info('e');
+    $log->info('f');
+    $log->info('g');
+    array<string> $msgs = $log->messages();
+    assert($msgs->count() == 3, 'window');
+    assert($msgs[0] == 'e', 'e');
+    assert($msgs[1] == 'f', 'f');
+    assert($msgs[2] == 'g', 'g');
+}
+
+test logger_disabled_level_is_silent
+{
+    Logger $log = Logger();
+    $log->infoEnabled = false;
+    $log->warnEnabled = false;
+    $log->errorEnabled = false;
+    $log->info('i');
+    $log->warn('w');
+    $log->error('e');
+    array<string> $msgs = $log->messages();
+    assert($msgs->count() == 0, 'silent');
+}
+
+test logger_forwards_to_attached_conduit
+{
+    Logger $log = Logger();
+    CollectingConduit $sink = CollectingConduit();
+    $log->attach($sink);
+    $log->info('booted');
+    $log->warn('hot');
+    $log->error('dead');
+    array<string> $msgs = $log->messages();
+    assert($msgs->count() == 3, 'buffered');
+    assert($msgs[0] == 'booted', 'raw');
+    assert($sink->seen->count() == 3, 'forwarded');
+    assert($sink->seen[0] == 'booted', 'info msg');
+    assert($sink->levels[0] == LogLevel::info, 'info');
+    assert($sink->seen[1] == 'hot', 'warn msg');
+    assert($sink->levels[1] == LogLevel::warn, 'warn');
+    assert($sink->seen[2] == 'dead', 'error msg');
+    assert($sink->levels[2] == LogLevel::error, 'error');
+}
+
+test logger_disabled_level_does_not_forward
+{
+    Logger $log = Logger();
+    CollectingConduit $sink = CollectingConduit();
+    $log->attach($sink);
+    $log->infoEnabled = false;
+    $log->info('quiet');
+    assert($sink->seen->count() == 0, 'silent');
+    array<string> $msgs = $log->messages();
+    assert($msgs->count() == 0, 'unbuffered');
+}
+
+test logger_forwards_to_every_conduit
+{
+    Logger $log = Logger();
+    CollectingConduit $a = CollectingConduit();
+    CollectingConduit $b = CollectingConduit();
+    $log->attach($a);
+    $log->attach($b);
+    $log->info('hi');
+    assert($a->seen->count() == 1, 'a');
+    assert($b->seen->count() == 1, 'b');
+    assert($a->seen[0] == 'hi', 'a msg');
+    assert($b->seen[0] == 'hi', 'b msg');
+}
+
+test logger_process_forwards_to_installed
+{
+    assert(!hasLogger(), 'none');
+    Logger $log = Logger();
+    CollectingConduit $sink = CollectingConduit();
+    $log->attach($sink);
+    installLogger($log);
+    assert(hasLogger(), 'installed');
+    currentLogger()->info('booted');
+    currentLogger()->warn('hot');
+    currentLogger()->error('dead');
+    Logger $got = currentLogger();
+    $got->infoEnabled = false;
+    assert(!$log->infoEnabled, 'same');
+    assert($sink->seen->count() == 3, 'forwarded');
+    assert($sink->seen[0] == 'booted', 'info');
+    assert($sink->levels[0] == LogLevel::info, 'info level');
+    assert($sink->seen[1] == 'hot', 'warn');
+    assert($sink->seen[2] == 'dead', 'error');
+    uninstallLogger();
+}
+
+test logger_stdout_conduit_does_not_corrupt
+{
+    Logger $log = Logger();
+    $log->attach(StdoutConduit());
+    $log->info('ok');
+    $log->warn('hot');
+    $log->error('dead');
+    array<string> $msgs = $log->messages();
+    assert($msgs->count() == 3, 'buffered');
+}
+
+test logger_info_without_install_is_noop
+{
+    info('quiet');
+    warn('quiet');
+    error('quiet');
+}
+
+test logger_info_forwards_when_installed
+{
+    Logger $log = Logger();
+    CollectingConduit $sink = CollectingConduit();
+    $log->attach($sink);
+    installLogger($log);
+    info('booted');
+    warn('hot');
+    error('dead');
+    assert($sink->seen->count() == 3, 'forwarded');
+    assert($sink->seen[0] == 'booted', 'info');
+    assert($sink->levels[0] == LogLevel::info, 'info level');
+    uninstallLogger();
+}
+
+#[tests: expects death]
+test logger_process_without_install_dies
+{
+    currentLogger();
+}
+
+test file_conduit_appends_uncolored_lines
+{
+    string $path = loggerTestPath('append');
+    FileConduit $file = guard FileConduit::append($path) else ($e) {
+        die($e->message());
+    }
+    Logger $log = Logger();
+    $log->attach($file);
+    $log->info('booted');
+    $log->warn('hot');
+    $log->error('dead');
+    string $text = guard io::readfile($path) else ($e) {
+        die($e->message());
+    }
+    assert($text->contains('[info]: booted'), 'info');
+    assert($text->contains('[warn]: hot'), 'warn');
+    assert($text->contains('[error]: dead'), 'error');
+    assert(!$text->contains('[33m'), 'no ansi');
+    bool $removed = guard io::remove($path) else ($e) {
+        die($e->message());
+    }
+    assert($removed, 'removed');
+}
+
+test file_conduit_append_extends
+{
+    string $path = loggerTestPath('extend');
+    FileConduit $first = guard FileConduit::append($path) else ($e) {
+        die($e->message());
+    }
+    Logger $a = Logger();
+    $a->attach($first);
+    $a->info('first');
+    FileConduit $second = guard FileConduit::append($path) else ($e) {
+        die($e->message());
+    }
+    Logger $b = Logger();
+    $b->attach($second);
+    $b->info('second');
+    string $text = guard io::readfile($path) else ($e) {
+        die($e->message());
+    }
+    assert($text->contains('[info]: first'), 'first');
+    assert($text->contains('[info]: second'), 'second');
+    bool $removed = guard io::remove($path) else ($e) {
+        die($e->message());
+    }
+    assert($removed, 'removed');
+}
+
+test paths_derives_from_root
+{
+    Paths $p = Paths(root: '/game');
+    $ds = env::DS;
+    assert($p->root == '/game', 'root');
+    assert($p->cache == "/game{$ds}var{$ds}cache", 'cache');
+    assert($p->store == "/game{$ds}var{$ds}storage", 'store');
+    assert($p->resources == "/game{$ds}resources", 'resources');
+    assert($p->resourcesShader == "/game{$ds}resources{$ds}shader", 'shader');
+}

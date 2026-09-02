@@ -1,0 +1,57 @@
+/**
+ * A GPU buffer. Vertex, index, or uniform. Stores Gpu; upload /
+ * destroy use the handle.
+ */
+
+namespace visu::graphics;
+
+public enum BufferUse
+{
+    case vertex;
+    case index;
+    case uniform;
+}
+
+public class GpuBuffer : GpuObject
+{
+    public Gpu $gpu;
+    public const uint32 $id;
+    public const BufferUse $kind;
+    private bool $dead;
+
+    public constructor(Gpu $gpu, BufferUse $kind)
+    {
+        $this->gpu = $gpu;
+        $this->id = $gpu->createBuffer();
+        $this->kind = $kind;
+        $this->dead = false;
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function upload(array<float32>& $data) : void
+    {
+        $this->gpu->uploadFloats($this->kind, $this->id, $data);
+    }
+
+    public function uploadBytes(ptr<const uint8> $ptr, isize $bytes) : void
+    {
+        $this->gpu->uploadBytes($this->kind, $this->id, $ptr, $bytes);
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        if (!$this->gpu->lost()) {
+            $this->gpu->deleteBuffer($this->id);
+        }
+
+        $this->dead = true;
+    }
+}

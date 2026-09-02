@@ -1,0 +1,49 @@
+/**
+ * Bind + upload + draw. Program + layout + raster, optional
+ * payload slot/block. Distinct from the render-graph Pipeline.
+ * Does not own the ShaderProgram (ShaderCollection does).
+ */
+
+namespace visu::graphics;
+
+public struct GpuPass
+{
+    public ShaderProgram $program;
+    public VertexLayout $layout;
+    public Raster $raster;
+    public uint32 $slot;
+    public string $block;
+
+    public constructor(
+        ShaderProgram $program,
+        VertexLayout $layout,
+        Raster $raster,
+        slot: uint32 $slot = 0,
+        block: string $block = ''
+    )
+    {
+        $this->program = $program;
+        $this->layout = $layout;
+        $this->raster = $raster;
+        $this->slot = $slot;
+        $this->block = $block;
+    }
+
+    public function bind() : void
+    {
+        $this->program->bind();
+        $this->program->gpu->applyRaster($this->raster);
+    }
+
+    public function draw<T>(Mesh $mesh, T $params) : void
+    {
+        $this->bind();
+
+        if (!$this->block->empty()) {
+            $this->program->bindSlot($this->slot, $this->block);
+        }
+
+        $this->program->upload($params, slot: $this->slot);
+        $mesh->draw($this->layout);
+    }
+}

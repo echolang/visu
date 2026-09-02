@@ -26,22 +26,24 @@ private class Slot<T>
     }
 }
 
+/**
+ * Type-erased View<T> for destroy / listener release. Built once per
+ * component type at register, never on the view/get/attach path.
+ * View.remove already no-ops when the entity is absent.
+ */
 private class StoreBox
 {
-    public function<bool(Entity)> $contains;
-    public function<void(Entities, Entity)> $remove;
+    public function<void(Entities, Entity)> $unbind;
     public function<void(int32)> $releaseAttach;
     public function<void(int32)> $releaseDetach;
 
     public constructor(
-        function<bool(Entity)> $contains,
-        function<void(Entities, Entity)> $remove,
+        function<void(Entities, Entity)> $unbind,
         function<void(int32)> $releaseAttach,
         function<void(int32)> $releaseDetach
     )
     {
-        $this->contains = $contains;
-        $this->remove = $remove;
+        $this->unbind = $unbind;
         $this->releaseAttach = $releaseAttach;
         $this->releaseDetach = $releaseDetach;
     }
@@ -120,9 +122,6 @@ public class Entities
         View<T> $view = View<T>();
         $this->views[$id] = erased::from($view);
         $this->stores->push(StoreBox(
-            function(Entity $e) : bool {
-                return $view->contains($e);
-            },
             function(Entities $world, Entity $e) : void {
                 $view->remove($world, $e);
             },
@@ -164,12 +163,8 @@ public class Entities
     public function detachAll(Entity $e) : void
     {
         foreach ($this->stores as $store) {
-            function<bool(Entity)> $contains = $store->contains;
-            if (!$contains($e)) {
-                continue;
-            }
-            function<void(Entities, Entity)> $remove = $store->remove;
-            $remove($this, $e);
+            function<void(Entities, Entity)> $unbind = $store->unbind;
+            $unbind($this, $e);
         }
     }
 

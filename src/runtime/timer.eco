@@ -1,0 +1,143 @@
+/**
+ * A scheduled callback and the min-heap EventLoop pops from. Cancel
+ * marks the timer; extract skips it. Time is milliseconds since the
+ * loop's origin.
+ */
+
+namespace visu::runtime;
+
+public class Timer
+{
+    public const int64 $time;
+    public const int32 $id;
+    public const function<void()> $callback;
+    private bool $cancelled;
+
+    public constructor(int64 $time, int32 $id, function<void()> $callback)
+    {
+        $this->time = $time;
+        $this->id = $id;
+        $this->callback = $callback;
+        $this->cancelled = false;
+    }
+
+    public function cancel() : void
+    {
+        $this->cancelled = true;
+    }
+
+    public const function cancelled() : bool
+    {
+        return $this->cancelled;
+    }
+}
+
+/**
+ * Earlier due time first; equal time keeps the lower id.
+ */
+internal class TimerHeap
+{
+    private array<Timer> $items;
+
+    public constructor()
+    {
+        $this->items = array<Timer>();
+    }
+
+    public const function count() : usize
+    {
+        return $this->items->count();
+    }
+
+    public const function empty() : bool
+    {
+        return $this->items->empty();
+    }
+
+    public function insert(Timer $timer) : void
+    {
+        $this->items->push($timer);
+        $this->siftUp($this->items->count() - 1);
+    }
+
+    public const function top() : Timer
+    {
+        assert(!$this->items->empty(), 'timer heap: top of an empty heap');
+        return $this->items[0];
+    }
+
+    public function extract() : Timer
+    {
+        assert(!$this->items->empty(), 'timer heap: extract of an empty heap');
+        Timer $head = $this->items[0];
+        usize $last = $this->items->count() - 1;
+        if ($last == 0) {
+            $this->items->clear();
+            return $head;
+        }
+
+        $this->items[0] = $this->items[$last];
+        $this->items->pop();
+        $this->siftDown(0);
+        return $head;
+    }
+
+    private function siftUp(usize $index) : void
+    {
+        usize $i = $index;
+        while ($i > 0) {
+            usize $parent = ($i - 1) / 2;
+            if (!$this->sooner($this->items[$i], $this->items[$parent])) {
+                return;
+            }
+
+            $this->swap($i, $parent);
+            $i = $parent;
+        }
+    }
+
+    private function siftDown(usize $index) : void
+    {
+        usize $i = $index;
+        usize $n = $this->items->count();
+        while (true) {
+            usize $left = $i * 2 + 1;
+            if ($left >= $n) {
+                return;
+            }
+
+            usize $pick = $left;
+            usize $right = $left + 1;
+            if ($right < $n && $this->sooner($this->items[$right], $this->items[$left])) {
+                $pick = $right;
+            }
+
+            if (!$this->sooner($this->items[$pick], $this->items[$i])) {
+                return;
+            }
+
+            $this->swap($i, $pick);
+            $i = $pick;
+        }
+    }
+
+    private function swap(usize $a, usize $b) : void
+    {
+        Timer $tmp = $this->items[$a];
+        $this->items[$a] = $this->items[$b];
+        $this->items[$b] = $tmp;
+    }
+
+    private const function sooner(Timer $a, Timer $b) : bool
+    {
+        if ($a->time < $b->time) {
+            return true;
+        }
+
+        if ($a->time > $b->time) {
+            return false;
+        }
+
+        return $a->id < $b->id;
+    }
+}

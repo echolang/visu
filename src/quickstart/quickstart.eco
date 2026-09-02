@@ -1,0 +1,94 @@
+/**
+ * Prototyping harness: window + loop + pipeline behind closures.
+ * Not for large apps. Cuts corners (die at the process edge).
+ */
+
+namespace visu::quickstart;
+
+use std::env;
+use std::io;
+use visu::app::{Paths, Services, bootstrap};
+use visu::graphics::PipelineError;
+use visu::os::{init, terminate};
+use visu::runtime::{GameLoop, registerMain, unregisterMain};
+
+public class Quickstart
+{
+    private Options $options;
+    private App $app;
+    private GameLoop $loop;
+
+    public constructor(function<void(Options)> $configure)
+    {
+        Options $options = Options();
+        $configure($options);
+        $this->options = $options;
+
+        Services $services = $options->services ?? bootstrap(Paths(root: env::cwd()), function(Services $s) : void {
+        });
+        $this->app = App($options, $services);
+        $this->loop = GameLoop($this->app, $options->tickRate, $options->maxUpdatesPerFrame);
+    }
+
+    public function app() : App
+    {
+        return $this->app;
+    }
+
+    /**
+     * glfwInit, initialize the window, ready(), run the loop, tear
+     * down. Dies on WindowError / PipelineError — this is the process
+     * edge.
+     */
+    public function run() : void
+    {
+        bool $booted = guard init() else ($e) {
+            die($e->message());
+        }
+
+        bool $ready = guard $this->app->initialize() else ($e) {
+            terminate();
+            die($e->message());
+        }
+
+        registerMain($this->app->events);
+        $this->loadShaders();
+        $this->app->ready();
+        $this->loop->start();
+
+        PipelineError? $maybeFail = $this->app->fail;
+        $this->app->destroy();
+        unregisterMain();
+        terminate();
+        PipelineError $fail = guard $maybeFail else {
+            return;
+        }
+        die($fail->message());
+    }
+
+    private function loadShaders() : void
+    {
+        $this->app->shaders->enableVisuIncludes();
+        string $dir = $this->app->shaders->loader->directory;
+        bool $here = guard io::exists($dir) else ($e) {
+            $this->teardown();
+            die($e->message());
+        }
+
+        if (!$here) {
+            return;
+        }
+
+        bool $ok = guard $this->app->shaders->scan() else ($e) {
+            $this->teardown();
+            die($e->message());
+        }
+    }
+
+    private function teardown() : void
+    {
+        $this->app->destroy();
+        unregisterMain();
+        terminate();
+    }
+}

@@ -68,6 +68,17 @@ test loader_define_injection
     assert($out->contains("#version 330 core\n#define NUM_OF_ITERATIONS 42"), 'define after version');
 }
 
+#[if: VISU_BACKEND_METAL]
+test loader_define_without_version
+{
+    ShaderLoader $loader = ShaderLoader(testShaderDir());
+    array<Define> $defs = [Define('NUM_OF_ITERATIONS', 42)];
+    string $out = guard $loader->process('foo', $defs) else ($e) {
+        die($e->message());
+    }
+    assert($out->contains("#define NUM_OF_ITERATIONS 42\nfoo"), 'define at start');
+}
+#[else]
 test loader_define_without_version
 {
     ShaderLoader $loader = ShaderLoader(testShaderDir());
@@ -75,6 +86,7 @@ test loader_define_without_version
     result<string, ShaderError> $r = $loader->process('foo', $defs);
     assert($r->failed(), 'no version is an error');
 }
+#[end]
 
 test loader_define_version_without_newline
 {

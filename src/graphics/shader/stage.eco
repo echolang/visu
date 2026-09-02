@@ -1,67 +1,71 @@
 /**
  * One compiled shader object (vertex, fragment, …). Construct
- * allocates a GL name; an owned stage must be destroy()ed with a
- * Gpu& before it is dropped. After attach, ShaderProgram.destroy
- * takes the stages with it.
+ * allocates a GPU name. After attach, ShaderProgram.destroy takes
+ * the stages with it.
  */
 
 namespace visu::graphics;
 
 public class ShaderStage : GpuObject
 {
+    public Gpu $gpu;
     public const uint32 $id;
     public const ShaderKind $kind;
     private bool $dead;
     private bool $compiled;
 
-    public constructor(Gpu& $state, ShaderKind $kind, string $source = '')
+    public constructor(Gpu $gpu, ShaderKind $kind, string $source = '')
     {
-        $this->id = $state->createShader($kind);
+        $this->gpu = $gpu;
+        $this->id = $gpu->createShader($kind);
         $this->kind = $kind;
         $this->dead = false;
         $this->compiled = false;
 
         if (!$source->empty()) {
-            $state->shaderSource($this->id, $source);
+            $gpu->shaderSource($this->id, $source);
         }
     }
 
     destructor()
     {
-        assert($this->dead, 'ShaderStage dropped without destroy');
+        $this->destroy();
     }
 
-    public function source(Gpu& $state, string $source) : void
+    public function source(string $source) : void
     {
-        $state->shaderSource($this->id, $source);
+        $this->gpu->shaderSource($this->id, $source);
         $this->compiled = false;
     }
 
-    public function compiled(Gpu& $state) : bool
+    public const function compiled() : bool
     {
         return $this->compiled;
     }
 
-    public function compile(Gpu& $state) : result<bool, ShaderError>
+    public function compile() : result<bool, ShaderError>
     {
-        $state->compileShader($this->id);
+        $this->gpu->compileShader($this->id);
 
-        if (!$state->shaderCompiled($this->id)) {
+        if (!$this->gpu->shaderCompiled($this->id)) {
             $this->compiled = false;
-            return .error(.compile($state->shaderInfoLog($this->id)));
+            return .error(.compile($this->gpu->shaderInfoLog($this->id)));
         }
 
         $this->compiled = true;
         return .ok(true);
     }
 
-    public function destroy(Gpu& $state) : void
+    public function destroy() : void
     {
         if ($this->dead) {
             return;
         }
 
-        $state->deleteShader($this->id);
+        if (!$this->gpu->lost()) {
+            $this->gpu->deleteShader($this->id);
+        }
+
         $this->dead = true;
         $this->compiled = false;
     }

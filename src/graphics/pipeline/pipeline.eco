@@ -121,7 +121,7 @@ public class Pipeline
      * Run every pass in scheduled I/O order. `$compensation` defaults
      * to 0 (no interpolation).
      */
-    public function execute(Gpu& $state, int32 $tick, float32 $compensation = 0.0f) : result<bool, PipelineError>
+    public function execute(int32 $tick, float32 $compensation = 0.0f) : result<bool, PipelineError>
     {
         $this->pool->setCurrentTick($tick);
         array<int32> $order = guard schedule($this->passes->count() as int32, $this->io) else ($e) {
@@ -129,16 +129,16 @@ public class Pipeline
         }
         $this->touchIo();
 
-        Context $ctx = Context($this, $this->frame, $this->pool, $compensation);
+        Context $ctx = Context($this->pool->gpu, $this, $this->frame, $this->pool, $compensation);
 
         foreach ($order as $index) {
             Pass $pass = $this->passes[$index as usize];
-            bool $ran = guard $pass->execute($state, $ctx) else ($e) {
+            bool $ran = guard $pass->execute($ctx) else ($e) {
                 return .error($e);
             }
         }
 
-        $this->pool->collect($state);
+        $this->pool->collect();
         return .ok(true);
     }
 

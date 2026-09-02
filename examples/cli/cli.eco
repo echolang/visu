@@ -1,0 +1,69 @@
+/*
+ * Framework CLI over a type-keyed Services container.
+ *
+ *   echoc run -m examples --target cli -- paths
+ *   echoc run -m examples --target cli -- log --message hi
+ *   echoc run -m examples --target cli -- --help
+ */
+
+use command;
+use std::env;
+use std::io;
+use visu::app::{Services, Paths, bootstrap, info};
+
+command::Command $app = command::Command('visu', '0.1.0', 'framework tools wired through Services');
+command::Subcommand $pathsCmd = $app->command('paths', 'print application roots', 'Shows the Paths fact from the container.');
+command::Subcommand $logCmd = $app->command('log', 'write a line through Logger', 'Resolves Logger and writes one info line.');
+
+command::Arg $rootArg = $app->arg('root', '', '<dir>', 'application root');
+$app->accept($rootArg, $pathsCmd);
+$app->fallback($rootArg, env::cwd());
+
+command::Arg $msgArg = $app->arg('message', 'm', '<text>', 'line to write');
+$app->accept($msgArg, $logCmd);
+$app->fallback($msgArg, 'hello from visu');
+
+$r = $app->parse(env::argv());
+
+if ($r->error != null) {
+    command::Error $e = $r->error ?? .noCommand;
+    command::CLIContext $err = .from($r->parsed, $app, .stderr);
+    $err->print(command::renderError($e, $app, $r->parsed, $err));
+    env::exit(1);
+}
+
+$parsed = $r->parsed;
+
+if ($parsed->wantsVersion) {
+    io::println(command::renderVersion($app));
+    env::exit(0);
+}
+
+if ($parsed->wantsHelp || !$parsed->hasCommand) {
+    command::CLIContext $help = .from($parsed, $app, .stdout);
+    $help->print(command::renderHelp($app, $parsed, $help));
+    env::exit(0);
+}
+
+string $root = env::cwd();
+if ($parsed->command->id == $pathsCmd->id) {
+    $root = $parsed->value($rootArg);
+}
+
+Services $s = bootstrap(Paths(root: $root), function(Services $s) : void {
+    define($s);
+});
+
+if ($parsed->command->id == $pathsCmd->id) {
+    Paths $paths = $s->get<Paths>();
+    AppInfo $info = $s->get<AppInfo>();
+    echo "app: {$info->name}";
+    echo "root: {$paths->root}";
+    echo "cache: {$paths->cache}";
+    echo "store: {$paths->store}";
+    echo "resources: {$paths->resources}";
+    echo "shaders: {$paths->resourcesShader}";
+    env::exit(0);
+}
+
+info($parsed->value($msgArg));

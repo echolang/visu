@@ -1,6 +1,6 @@
 /**
  * Persistent GPU objects for the render graph. Keyed by resource name.
- * Does not store Gpu; every GPU call takes Gpu&.
+ * Stores Gpu; getTarget / cache / collect use the handle.
  */
 
 namespace visu::graphics;
@@ -54,6 +54,7 @@ public class StoredTexture
 
 public class Pool
 {
+    public Gpu $gpu;
     private map<string, StoredTarget> $targets;
     private map<string, StoredTexture> $textures;
     private map<string, int32> $used;
@@ -61,8 +62,9 @@ public class Pool
     private array<GpuObject> $cachedOwned;
     private int32 $tick;
 
-    public constructor()
+    public constructor(Gpu $gpu)
     {
+        $this->gpu = $gpu;
         $this->targets = map<string, StoredTarget>();
         $this->textures = map<string, StoredTexture>();
         $this->used = map<string, int32>();
@@ -103,7 +105,7 @@ public class Pool
     /**
      * The GPU render target for `$ref`, allocating or resizing if needed.
      */
-    public function getTarget(Gpu& $state, TargetRef $ref) : result<RenderTarget, PoolError>
+    public function getTarget(TargetRef $ref) : result<RenderTarget, PoolError>
     {
         $this->touchExpanded($ref);
 
@@ -122,10 +124,10 @@ public class Pool
                 return .ok($held->target);
             }
 
-            $this->dropTarget($state, $ref->name);
+            $this->dropTarget($ref->name);
         }
 
-        RenderTarget $fresh = guard $this->createTarget($state, $ref) else ($e) {
+        RenderTarget $fresh = guard $this->createTarget($ref) else ($e) {
             return .error($e);
         }
         return .ok($fresh);
@@ -134,12 +136,12 @@ public class Pool
     /**
      * Bind `$ref` and set the viewport to its size.
      */
-    public function activate(Gpu& $state, TargetRef $ref) : result<RenderTarget, PoolError>
+    public function activate(TargetRef $ref) : result<RenderTarget, PoolError>
     {
-        RenderTarget $target = guard $this->getTarget($state, $ref) else ($e) {
+        RenderTarget $target = guard $this->getTarget($ref) else ($e) {
             return .error($e);
         }
-        $target->preparePass($state);
+        $target->preparePass();
         return .ok($target);
     }
 
@@ -147,7 +149,7 @@ public class Pool
      * The GPU texture for `$ref`. Attachments are created by getTarget;
      * this never allocates.
      */
-    public function getTexture(Gpu& $state, TextureRef $ref) : result<Texture, PoolError>
+    public function getTexture(TextureRef $ref) : result<Texture, PoolError>
     {
         $this->touch($ref->name);
 
@@ -172,7 +174,7 @@ public class Pool
      * cacheStaticResource). Same (name, type) returns the same object.
      * Not tick-collected; destroy() tears GPU objects down.
      */
-    public function cache<T : GpuObject>(string $name, Gpu& $state, function<T(Gpu&)> $make) : T
+    public function cache<T : GpuObject>(string $name, function<T()> $make) : T
     {
         type_id $id = type_id<T>();
 
@@ -189,7 +191,7 @@ public class Pool
             $this->cached[$name] = map<type_id, erased>();
         }
 
-        T $value = $make($state);
+        T $value = $make();
         map<type_id, erased>& $into = $this->cached->at($name);
         $into[$id] = erased::from($value);
         GpuObject $owned = $value;
@@ -202,7 +204,7 @@ public class Pool
      * A target stays if any owned texture was touched. Imported
      * resources and the static cache are never collected.
      */
-    public function collect(Gpu& $state) : void
+    public function collect() : void
     {
         array<string> $names = $this->used->keys();
 
@@ -219,7 +221,7 @@ public class Pool
                 continue;
             }
 
-            $this->dropTarget($state, $name);
+            $this->dropTarget($name);
             $this->used->remove($name);
         }
 
@@ -236,13 +238,13 @@ public class Pool
 
             StoredTexture $held = $this->textures[$name];
             string $parent = guard $held->parent else {
-                $this->dropTexture($state, $name);
+                $this->dropTexture($name);
                 $this->used->remove($name);
                 continue;
             }
 
             if (!$this->targets->has($parent)) {
-                $this->dropTexture($state, $name);
+                $this->dropTexture($name);
                 $this->used->remove($name);
             }
         }
@@ -251,29 +253,34 @@ public class Pool
     /**
      * Destroy every owned GPU object. Call at shutdown.
      */
-    public function destroy(Gpu& $state) : void
+    public function destroy() : void
     {
         array<string> $targetNames = $this->targets->keys();
 
         foreach ($targetNames as $name) {
-            $this->dropTarget($state, $name);
+            $this->dropTarget($name);
         }
 
         array<string> $textureNames = $this->textures->keys();
 
         foreach ($textureNames as $name) {
-            $this->dropTexture($state, $name);
+            $this->dropTexture($name);
         }
 
         array<GpuObject> $owned = $this->cachedOwned;
 
         foreach ($owned as $obj) {
-            $obj->destroy($state);
+            $obj->destroy();
         }
 
         $this->used->clear();
         $this->cached->clear();
         $this->cachedOwned->clear();
+    }
+
+    destructor()
+    {
+        $this->destroy();
     }
 
     public const function hasTarget(string $name) : bool
@@ -309,9 +316,9 @@ public class Pool
         }
     }
 
-    private function createTarget(Gpu& $state, TargetRef $ref) : result<RenderTarget, PoolError>
+    private function createTarget(TargetRef $ref) : result<RenderTarget, PoolError>
     {
-        Framebuffer $fb = Framebuffer($state);
+        Framebuffer $fb = Framebuffer($this->gpu);
         RenderTarget $target = RenderTarget($ref->width, $ref->height, $fb);
         $target->contentScaleX = $ref->contentScaleX;
         $target->contentScaleY = $ref->contentScaleY;
@@ -324,37 +331,36 @@ public class Pool
         foreach ($colors as $color) {
             $color->width = $ref->width;
             $color->height = $ref->height;
-            $this->dropTexture($state, $color->name);
-            Texture $tex = Texture($state, $color->name);
-            $tex->allocateEmpty($state, $ref->width, $ref->height, $color->options);
+            $this->dropTexture($color->name);
+            Texture $tex = Texture($this->gpu, $color->name);
+            $tex->allocateEmpty($ref->width, $ref->height, $color->options);
             $this->textures[$color->name] = StoredTexture($tex, false, $ref->name);
             $owned->push($color->name);
             ColorAttachment $slot = ColorAttachment($i);
-            $fb->attachTexture($state, $slot->attachment(), .texture2D, $tex->id, 0);
+            $fb->attachTexture($slot->attachment(), .texture2D, $tex->id, 0);
             $draw->push($slot->attachment());
             $i = $i + 1;
         }
 
         if ($draw->count() > 0) {
-            $state->drawBuffers($draw);
+            $this->gpu->drawBuffers($draw);
         }
 
         TextureRef $depth = guard $ref->depthAttachment else {
-            return $this->finishTarget($state, $ref, $target, $fb, $owned);
+            return $this->finishTarget($ref, $target, $fb, $owned);
         }
         $depth->width = $ref->width;
         $depth->height = $ref->height;
-        $this->dropTexture($state, $depth->name);
-        Texture $depthTex = Texture($state, $depth->name);
-        $depthTex->allocateEmpty($state, $ref->width, $ref->height, $depth->options);
+        $this->dropTexture($depth->name);
+        Texture $depthTex = Texture($this->gpu, $depth->name);
+        $depthTex->allocateEmpty($ref->width, $ref->height, $depth->options);
         $this->textures[$depth->name] = StoredTexture($depthTex, false, $ref->name);
         $owned->push($depth->name);
-        $fb->attachTexture($state, .depth, .texture2D, $depthTex->id, 0);
-        return $this->finishTarget($state, $ref, $target, $fb, $owned);
+        $fb->attachTexture(.depth, .texture2D, $depthTex->id, 0);
+        return $this->finishTarget($ref, $target, $fb, $owned);
     }
 
     private function finishTarget(
-        Gpu& $state,
         TargetRef $ref,
         RenderTarget $target,
         Framebuffer $fb,
@@ -362,13 +368,13 @@ public class Pool
     ) : result<RenderTarget, PoolError>
     {
         if ($ref->rboDepthStencil) {
-            $fb->attachRenderbuffer($state, .depthStencil, .depthStencil, $ref->width, $ref->height);
+            $fb->attachRenderbuffer(.depthStencil, .depthStencil, $ref->width, $ref->height);
         } else if ($ref->rboColor) {
-            $fb->attachRenderbuffer($state, ColorAttachment(0)->attachment(), .rgba, $ref->width, $ref->height);
+            $fb->attachRenderbuffer(ColorAttachment(0)->attachment(), .rgba, $ref->width, $ref->height);
         }
 
-        bool $ok = guard $fb->valid($state) else ($status) {
-            $this->abandonTarget($state, $fb, $owned);
+        bool $ok = guard $fb->valid() else ($status) {
+            $this->abandonTarget($fb, $owned);
             return .error(.incomplete($ref->name, $status));
         }
 
@@ -376,16 +382,16 @@ public class Pool
         return .ok($target);
     }
 
-    private function abandonTarget(Gpu& $state, Framebuffer $fb, array<string> $owned) : void
+    private function abandonTarget(Framebuffer $fb, array<string> $owned) : void
     {
         foreach ($owned as $texName) {
-            $this->dropTexture($state, $texName);
+            $this->dropTexture($texName);
         }
 
-        $fb->destroy($state);
+        $fb->destroy();
     }
 
-    private function dropTarget(Gpu& $state, string $name) : void
+    private function dropTarget(string $name) : void
     {
         if (!$this->targets->has($name)) {
             return;
@@ -399,14 +405,14 @@ public class Pool
         array<string> $owned = $held->ownedTextures;
 
         foreach ($owned as $texName) {
-            $this->dropTexture($state, $texName);
+            $this->dropTexture($texName);
         }
 
-        $held->target->framebuffer->destroy($state);
+        $held->target->framebuffer->destroy();
         $this->targets->remove($name);
     }
 
-    private function dropTexture(Gpu& $state, string $name) : void
+    private function dropTexture(string $name) : void
     {
         if (!$this->textures->has($name)) {
             return;
@@ -417,7 +423,7 @@ public class Pool
             return;
         }
 
-        $held->texture->destroy($state);
+        $held->texture->destroy();
         $this->textures->remove($name);
     }
 }

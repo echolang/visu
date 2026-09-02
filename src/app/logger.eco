@@ -1,0 +1,244 @@
+/**
+ * Instance logger with attachable conduits. Tests construct one;
+ * bootstrap installLogger()s the Services logger as the process
+ * logger so any file can info() / currentLogger() without holding
+ * Services. Buffer append is amortized O(1): dropped prefix stays
+ * until it is as large as the window, then one copy.
+ */
+
+namespace visu::app;
+
+use std::io;
+
+public enum LogLevel
+{
+    case info;
+    case warn;
+    case error;
+
+    public const function tag() : string
+    {
+        return match ($this) {
+            .info => 'info',
+            .warn => 'warn',
+            .error => 'error',
+        };
+    }
+
+    /**
+     * `[level]: message` with no color — file and stdout share this.
+     */
+    public const function line(string $message) : string
+    {
+        string $tag = $this->tag();
+        return "[{$tag}]: {$message}";
+    }
+}
+
+/**
+ * A sink Logger forwards to. Implementations are classes — only a
+ * class can be stored as an interface value.
+ */
+public interface Conduit
+{
+    function write(LogLevel $level, string $message) : void;
+}
+
+internal class ProcessLog
+{
+    public static Logger? $log = null;
+}
+
+public class Logger
+{
+    private array<string> $buf = array<string>();
+    private usize $head = 0;
+    private array<Conduit> $conduits = array<Conduit>();
+    public usize $maxMessages = 2048;
+    public bool $infoEnabled = true;
+    public bool $warnEnabled = true;
+    public bool $errorEnabled = true;
+
+    public const function messages() : array<string>
+    {
+        return $this->live();
+    }
+
+    public function attach(Conduit $conduit) : void
+    {
+        $this->conduits->push($conduit);
+    }
+
+    public function info(string $message) : void
+    {
+        $this->write($this->infoEnabled, .info, $message);
+    }
+
+    public function warn(string $message) : void
+    {
+        $this->write($this->warnEnabled, .warn, $message);
+    }
+
+    public function error(string $message) : void
+    {
+        $this->write($this->errorEnabled, .error, $message);
+    }
+
+    private function write(bool $enabled, LogLevel $level, string $message) : void
+    {
+        if (!$enabled) {
+            return;
+        }
+
+        $this->buf->push($message);
+        if ($this->buf->count() - $this->head > $this->maxMessages) {
+            $this->head = $this->head + 1;
+        }
+
+        if ($this->head > 0 && $this->head >= $this->maxMessages) {
+            $this->trim();
+        }
+
+        foreach ($this->conduits as $conduit) {
+            $conduit->write($level, $message);
+        }
+    }
+
+    private const function live() : array<string>
+    {
+        usize $n = $this->buf->count();
+        if ($this->head >= $n) {
+            return array<string>();
+        }
+
+        usize $nLive = $n - $this->head;
+        array<string> $out = arr::room<string>($nLive);
+        usize $i = $this->head;
+        while ($i < $n) {
+            $out->push($this->buf[$i]);
+            $i = $i + 1;
+        }
+
+        return $out;
+    }
+
+    private function trim() : void
+    {
+        $this->buf = $this->live();
+        $this->head = 0;
+    }
+}
+
+/**
+ * Colored `[level]: message` on stdout. Attached by defaults().
+ */
+public class StdoutConduit : Conduit
+{
+    public function write(LogLevel $level, string $message) : void
+    {
+        string $plain = $level->line($message);
+        match ($level) {
+            .info => {
+                io::stdout->writeline($plain);
+            },
+            .warn => {
+                io::stdout->writeline("\033[33m{$plain}\033[0m");
+            },
+            .error => {
+                io::stdout->writeline("\033[31m{$plain}\033[0m");
+            },
+        };
+    }
+}
+
+/**
+ * Uncolored `[level]: message` appended to a path. Open with
+ * `append()`; write errors on a live handle are dropped.
+ */
+public class FileConduit : Conduit
+{
+    public const string $path;
+    private io::file $handle;
+
+    public constructor(string $path, io::file $handle)
+    {
+        $this->path = $path;
+        $this->handle = $handle;
+    }
+
+    /**
+     * Create the file if missing; writes go at the end.
+     */
+    public static function append(string $path) : result<FileConduit, io::ioerror>
+    {
+        io::file $handle = guard io::append($path) else ($e) {
+            return .error($e);
+        }
+
+        return .ok(FileConduit($path, $handle));
+    }
+
+    public function write(LogLevel $level, string $message) : void
+    {
+        string $line = $level->line($message);
+        $line->append(io::NEWLINE);
+        if ($this->handle->write($line)->failed()) {
+            return;
+        }
+        if ($this->handle->flush()->failed()) {
+            return;
+        }
+    }
+}
+
+public function installLogger(Logger $log) : void
+{
+    ProcessLog::$log = $log;
+}
+
+public function uninstallLogger() : void
+{
+    ProcessLog::$log = null;
+}
+
+public function hasLogger() : bool
+{
+    return ProcessLog::$log != null;
+}
+
+public function currentLogger() : Logger
+{
+    Logger $log = guard ProcessLog::$log;
+    return $log;
+}
+
+/**
+ * Process logger. No-op until installLogger / bootstrap so library
+ * code can log without dying in tests.
+ */
+public function info(string $message) : void
+{
+    if (!hasLogger()) {
+        return;
+    }
+
+    currentLogger()->info($message);
+}
+
+public function warn(string $message) : void
+{
+    if (!hasLogger()) {
+        return;
+    }
+
+    currentLogger()->warn($message);
+}
+
+public function error(string $message) : void
+{
+    if (!hasLogger()) {
+        return;
+    }
+
+    currentLogger()->error($message);
+}

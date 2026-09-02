@@ -1,0 +1,196 @@
+/**
+ * QuadRenderer is a pass factory; QuadPass draws. Compile on
+ * ShaderRef, not the renderer.
+ */
+
+use visu::graphics::{
+    QuadRenderer, QuadPass, ShaderCollection, ShaderFile, ShaderKind, ShaderProgram, ShaderRef,
+    Pool, Frame, Pipeline, Backbuffer, ClearPass, ClearPassOptions, Gpu, Framebuffer, RenderTarget
+};
+use visu::math::Vec4;
+
+struct FsParams
+{
+    public Vec4 $color;
+}
+
+function registeredQuad(ShaderCollection $shaders) : ShaderRef
+{
+    array<ShaderFile> $files = [
+        ShaderFile(ShaderKind::vertex, 'quad.vert.glsl'),
+        ShaderFile(ShaderKind::fragment, 'quad.frag.glsl')
+    ];
+    ShaderRef $shader = guard $shaders->register('quad', $files) else ($e) {
+        die($e->message());
+    }
+
+    return $shader;
+}
+
+test quadpass_constructs_without_renderer
+{
+    Gpu $gpu = Gpu();
+    ShaderCollection $shaders = ShaderCollection($gpu, 'tests/resources/shaders');
+    ShaderRef $shader = registeredQuad($shaders);
+
+    Pool $pool = Pool($gpu);
+    Frame $frame = Frame();
+    Framebuffer $fb = Framebuffer();
+    RenderTarget $rt = RenderTarget(64, 64, $fb);
+    Pipeline $pipeline = Pipeline($pool, $frame, $rt);
+    Backbuffer $back = $frame->get<Backbuffer>();
+    QuadPass<FsParams> $node = QuadPass($shader, $back->target, FsParams(Vec4(0.0f, 0.0f, 0.5f, 1.0f)));
+    $pipeline->add($node);
+
+    assert($node->target->name == 'backbuffer', 'target');
+    assert($node->name() == 'QuadPass', 'name');
+
+    $pool->destroy();
+    $shaders->destroy();
+}
+
+#[if: VISU_BACKEND_METAL]
+#[else]
+#[group: "glfw"]
+test quadrenderer_pass_overwrites_clear_color
+{
+    GlContext $gl = glHidden('quadrenderer-pass');
+
+    ShaderCollection $shaders = ShaderCollection($gl->gpu, 'tests/resources/shaders');
+    ShaderRef $shader = registeredQuad($shaders);
+    ShaderProgram $prog = guard $shader->load() else ($e) {
+        $shaders->destroy();
+        $gl->end();
+        die($e->message());
+    }
+
+    QuadRenderer $quad = QuadRenderer($shader);
+
+    Pool $pool = Pool($gl->gpu);
+    Frame $frame = Frame();
+    Pipeline $pipeline = Pipeline($pool, $frame, $gl->window->renderTarget());
+    Backbuffer $back = $frame->get<Backbuffer>();
+    $pipeline->add(ClearPass($back->target, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+    $quad->pass($pipeline, $back->target, FsParams(Vec4(0.0f, 0.0f, 0.5f, 1.0f)));
+    bool $ran = guard $pipeline->execute(0) else ($e) {
+        $shaders->destroy();
+        $pool->destroy();
+        $gl->end();
+        die($e->message());
+    }
+
+    array<uint8> $pixels = readRgba($gl->window);
+    uint32 $err = gl::GetError();
+    uint8 $r = $pixels[0];
+    uint8 $g = $pixels[1];
+    uint8 $b = $pixels[2];
+
+    $shaders->destroy();
+    $pool->destroy();
+    $gl->end();
+
+    assert($err == gl::NO_ERROR, 'gl error');
+    assert($r < 16, 'bottom-left r');
+    assert($g < 16, 'bottom-left g');
+    assert($b > 100 && $b < 160, 'bottom-left b');
+}
+
+#[group: "glfw"]
+test quadrenderer_pass_survives_shader_forget
+{
+    GlContext $gl = glHidden('quadrenderer-forget');
+
+    ShaderCollection $shaders = ShaderCollection($gl->gpu, 'tests/resources/shaders');
+    ShaderRef $shader = registeredQuad($shaders);
+    ShaderProgram $old = guard $shader->load() else ($e) {
+        $shaders->destroy();
+        $gl->end();
+        die($e->message());
+    }
+
+    QuadRenderer $quad = QuadRenderer($shader);
+    $shader->forget();
+    assert($old->destroyed(), 'old program dead');
+    ShaderProgram $fresh = guard $shader->load() else ($e) {
+        $shaders->destroy();
+        $gl->end();
+        die($e->message());
+    }
+    assert($fresh != $old, 'new program object');
+    assert(!$fresh->destroyed(), 'new program live');
+
+    Pool $pool = Pool($gl->gpu);
+    Frame $frame = Frame();
+    Pipeline $pipeline = Pipeline($pool, $frame, $gl->window->renderTarget());
+    Backbuffer $back = $frame->get<Backbuffer>();
+    $pipeline->add(ClearPass($back->target, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+    $quad->pass($pipeline, $back->target, FsParams(Vec4(0.0f, 0.0f, 0.5f, 1.0f)));
+    bool $ran = guard $pipeline->execute(0) else ($e) {
+        $shaders->destroy();
+        $pool->destroy();
+        $gl->end();
+        die($e->message());
+    }
+
+    array<uint8> $pixels = readRgba($gl->window);
+    uint32 $err = gl::GetError();
+    uint8 $r = $pixels[0];
+    uint8 $g = $pixels[1];
+    uint8 $b = $pixels[2];
+
+    $shaders->destroy();
+    $pool->destroy();
+    $gl->end();
+
+    assert($err == gl::NO_ERROR, 'gl error');
+    assert($r < 16, 'bottom-left r');
+    assert($g < 16, 'bottom-left g');
+    assert($b > 100 && $b < 160, 'bottom-left b');
+}
+
+#[group: "glfw"]
+test quadrenderer_later_pass_wins
+{
+    GlContext $gl = glHidden('quadrenderer-two-pass');
+
+    ShaderCollection $shaders = ShaderCollection($gl->gpu, 'tests/resources/shaders');
+    ShaderRef $shader = registeredQuad($shaders);
+    ShaderProgram $prog = guard $shader->load() else ($e) {
+        $shaders->destroy();
+        $gl->end();
+        die($e->message());
+    }
+
+    QuadRenderer $quad = QuadRenderer();
+    $quad->setShader($shader);
+
+    Pool $pool = Pool($gl->gpu);
+    Frame $frame = Frame();
+    Pipeline $pipeline = Pipeline($pool, $frame, $gl->window->renderTarget());
+    Backbuffer $back = $frame->get<Backbuffer>();
+    $pipeline->add(ClearPass($back->target, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+    $quad->pass($pipeline, $back->target, FsParams(Vec4(0.0f, 0.0f, 0.25f, 1.0f)));
+    $quad->pass($pipeline, $back->target, FsParams(Vec4(0.0f, 0.0f, 0.5f, 1.0f)));
+    bool $ran = guard $pipeline->execute(0) else ($e) {
+        $shaders->destroy();
+        $pool->destroy();
+        $gl->end();
+        die($e->message());
+    }
+
+    array<uint8> $pixels = readRgba($gl->window);
+    uint32 $err = gl::GetError();
+    uint8 $r = $pixels[0];
+    uint8 $g = $pixels[1];
+    uint8 $b = $pixels[2];
+
+    $shaders->destroy();
+    $pool->destroy();
+    $gl->end();
+
+    assert($err == gl::NO_ERROR, 'gl error');
+    assert($r < 16, 'bottom-left r');
+    assert($g < 16, 'bottom-left g');
+    assert($b > 100 && $b < 160, 'bottom-left b');
+}
+#[end]

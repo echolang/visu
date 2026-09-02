@@ -8,6 +8,15 @@ namespace visu::os;
 use visu::graphics::{Gpu, RenderTarget, Framebuffer};
 use visu::math::Vec2;
 
+#[if: VISU_BACKEND_METAL]
+#[if: os == darwin]
+internal extern {
+    function glfwGetCocoaWindow as visuCocoaWindow(ptr<glfw::Window> $window) : ptr<uint8>;
+    function visu_set_display_sync as visuSetDisplaySync(ptr<uint8> $nsWindow, int32 $enabled) : void;
+}
+#[end]
+#[end]
+
 public class Window
 {
     private string $title;
@@ -18,6 +27,7 @@ public class Window
     public Framebuffer $framebuffer;
     private RenderTarget $target;
     private WindowEventHandler? $handler;
+    private Gpu? $gpu;
 
     public constructor(string $title, int32 $width, int32 $height, WindowHints $hints = WindowHints::defaults())
     {
@@ -29,6 +39,7 @@ public class Window
         $this->framebuffer = Framebuffer();
         $this->target = RenderTarget($width, $height, $this->framebuffer);
         $this->handler = null;
+        $this->gpu = null;
     }
 
     destructor()
@@ -36,7 +47,7 @@ public class Window
         $this->destroy();
     }
 
-    public function initialize(Gpu& $state) : result<bool, WindowError>
+    public function initialize(Gpu $gpu) : result<bool, WindowError>
     {
         if ($this->handle:$ != null) {
             return .error(.alreadyInitialized);
@@ -51,18 +62,18 @@ public class Window
         }
 
         $this->handle:$ = $created:$;
-        glfw::makeContextCurrent($this->handle);
 
-        if (!$state->load(&glfw::getProcAddress)) {
+        if (!$this->loadBackend($gpu)) {
             glfw::destroyWindow($this->handle);
             $this->handle:$ = null;
             return .error(.gpuLoad);
         }
 
-        $this->framebuffer = Framebuffer();
+        $this->framebuffer = Framebuffer(backbuffer: $gpu);
         $this->target->framebuffer = $this->framebuffer;
         $this->syncTarget();
-        $state->reset();
+        $gpu->reset();
+        $this->gpu = $gpu;
         windowRegister($this);
 
         if ($this->handler != null) {
@@ -79,6 +90,14 @@ public class Window
         }
 
         windowUnregister($this);
+        Gpu? $gpu = $this->gpu;
+
+        if ($gpu != null) {
+            Gpu $held = guard $gpu;
+            $held->lose();
+            $this->gpu = null;
+        }
+
         glfw::destroyWindow($this->handle);
         $this->handle:$ = null;
         $this->handler = null;
@@ -97,12 +116,12 @@ public class Window
 
     public function activate() : void
     {
-        glfw::makeContextCurrent($this->requireHandle());
+        $this->activateBackend();
     }
 
     public function swap() : void
     {
-        glfw::swapBuffers($this->requireHandle());
+        $this->swapBackend();
     }
 
     public function poll() : void
@@ -388,8 +407,76 @@ public class Window
 
     public function setSwapInterval(int32 $interval) : void
     {
+        $this->setSwapBackend($interval);
+    }
+
+    #[if: VISU_BACKEND_METAL]
+    private function loadBackend(Gpu $gpu) : bool
+    {
+        if (!$gpu->load()) {
+            return false;
+        }
+
+        int32 $fbW = 0;
+        int32 $fbH = 0;
+        glfw::getFramebufferSize($this->handle, &$fbW, &$fbH);
+        #[if: os == darwin]
+        return $gpu->connect(visuCocoaWindow($this->handle), $fbW, $fbH);
+        #[else]
+        return false;
+        #[end]
+    }
+
+    private function activateBackend() : void
+    {
+        $this->requireHandle();
+    }
+
+    private function swapBackend() : void
+    {
+        $this->requireHandle();
+        Gpu $gpu = guard $this->gpu else {
+            return;
+        }
+        $gpu->present();
+        Vec2 $px = $this->framebufferSize();
+        $gpu->resizeDrawable($px->x as int32, $px->y as int32);
+    }
+
+    private function setSwapBackend(int32 $interval) : void
+    {
+        #[if: os == darwin]
+        int32 $on = 0;
+
+        if ($interval != 0) {
+            $on = 1;
+        }
+
+        visuSetDisplaySync(visuCocoaWindow($this->requireHandle()), $on);
+        #[end]
+    }
+    #[else]
+    private function loadBackend(Gpu $gpu) : bool
+    {
+        glfw::makeContextCurrent($this->handle);
+        return $gpu->load(&glfw::getProcAddress);
+    }
+
+    private function activateBackend() : void
+    {
+        glfw::makeContextCurrent($this->requireHandle());
+    }
+
+    private function swapBackend() : void
+    {
+        glfw::swapBuffers($this->requireHandle());
+    }
+
+    private function setSwapBackend(int32 $interval) : void
+    {
         glfw::swapInterval($interval);
     }
+    #[end]
 
     public function setFullscreen(int32 $width, int32 $height, int32 $refreshRate) : void
     {

@@ -1,0 +1,304 @@
+/**
+ * Vertex attribute layout. Lives on GpuPass, not on Mesh.
+ * Offset and stride are bytes. Divisor 0 is per vertex, 1 is
+ * per instance. Build with VertexLayout::build / of; presets
+ * are one-liners for the common packed shapes.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Vec2, Vec3, Vec4};
+
+public struct VertexAttr
+{
+    public uint32 $location = 0;
+    public int32 $components = 3;
+    public int32 $offset = 0;
+    public int32 $stride = 0;
+    public uint32 $divisor = 0;
+}
+
+/**
+ * Session for VertexLayout::build / of. A class so the closure
+ * receives a handle; methods return void (not a fluent chain).
+ */
+public class VertexBuilder
+{
+    private array<VertexAttr> $attrs;
+    private int32 $offset;
+    private usize $streamStart;
+    private uint32 $divisor;
+    private ptr<const uint8> $base;
+    private ptr<uint8> $raw;
+    private bool $owned;
+    private int32 $fixedStride;
+    private bool $structMode;
+
+    public constructor()
+    {
+        $this->attrs = array<VertexAttr>();
+        $this->offset = 0;
+        $this->streamStart = 0;
+        $this->divisor = 0;
+        $this->base:$ = null;
+        $this->raw:$ = null;
+        $this->owned = false;
+        $this->fixedStride = 0;
+        $this->structMode = false;
+    }
+
+    destructor()
+    {
+        $this->release();
+    }
+
+    /**
+     * Packed attrib. T is float32 / Vec2 / Vec3 / Vec4. Offset
+     * is sequential in the current stream.
+     */
+    public function attr<T>(uint32 $location, divisor: uint32? $divisor = null) : void
+    {
+        assert(!$this->structMode, 'layout: packed attr inside of<T>');
+        int32 $bytes = mem::size<T>() as int32;
+        int32 $components = componentsOf<T>();
+        $this->push($location, $components, $this->offset, $divisor);
+        $this->offset = $this->offset + $bytes;
+    }
+
+    /**
+     * Struct-backed attrib. Offset is the field pointer minus
+     * the probe base; only legal inside of<T>. Takes a pointer
+     * because a generic `const F&` copies the field.
+     */
+    public function attr(uint32 $location, ptr<const float32> $field, divisor: uint32? $divisor = null) : void
+    {
+        $this->pushField($location, $field:$ as ptr<const uint8>, 1, mem::size<float32>() as int32, $divisor);
+    }
+
+    public function attr(uint32 $location, ptr<const Vec2> $field, divisor: uint32? $divisor = null) : void
+    {
+        $this->pushField($location, $field:$ as ptr<const uint8>, 2, mem::size<Vec2>() as int32, $divisor);
+    }
+
+    public function attr(uint32 $location, ptr<const Vec3> $field, divisor: uint32? $divisor = null) : void
+    {
+        $this->pushField($location, $field:$ as ptr<const uint8>, 3, mem::size<Vec3>() as int32, $divisor);
+    }
+
+    public function attr(uint32 $location, ptr<const Vec4> $field, divisor: uint32? $divisor = null) : void
+    {
+        $this->pushField($location, $field:$ as ptr<const uint8>, 4, mem::size<Vec4>() as int32, $divisor);
+    }
+
+    /**
+     * The of<T> probe. Field addresses come from this storage
+     * so padding matches the CPU struct. A pointer, not a
+     * borrow: Echo refuses returning an address into alloc.
+     */
+    public function vertex<T>() : ptr<T>
+    {
+        assert($this->structMode, 'layout: vertex() outside of<T>');
+        assert((mem::size<T>() as int32) == $this->fixedStride, 'layout: vertex type');
+        return $this->base:$ as ptr<T>;
+    }
+
+    /**
+     * Close the vertex stream and open the instance buffer.
+     * `$divisor` must be non-zero (Mesh has one instance VBO).
+     */
+    public function stream(divisor: uint32 $divisor = 1) : void
+    {
+        assert(!$this->structMode, 'layout: stream inside of<T>');
+        assert($divisor != 0, 'layout: stream is the instance buffer');
+        $this->closeStream();
+        $this->offset = 0;
+        $this->streamStart = $this->attrs->count();
+        $this->divisor = $divisor;
+        $this->fixedStride = 0;
+    }
+
+    internal function allocProbe<T>(uint32 $divisor) : void
+    {
+        usize $n = mem::size<T>();
+        assert($n > 0, 'layout: struct size');
+        ptr<uint8> $bytes = mem::alloc<uint8>($n);
+        $this->raw:$ = $bytes:$;
+        $this->owned = true;
+        $this->base:$ = $bytes:$ as ptr<const uint8>;
+        $this->fixedStride = $n as int32;
+        $this->divisor = $divisor;
+        $this->structMode = true;
+        $this->offset = 0;
+        $this->streamStart = $this->attrs->count();
+    }
+
+    internal function finish() : VertexLayout
+    {
+        $this->closeStream();
+        assert($this->attrs->count() > 0, 'vertex layout is empty');
+        return VertexLayout($this->attrs);
+    }
+
+    private function pushField(uint32 $location, ptr<const uint8> $fieldPtr, int32 $components, int32 $bytes, uint32? $divisor) : void
+    {
+        assert($this->structMode, 'layout: field attr outside of<T>');
+        isize $delta = $fieldPtr:$ - $this->base:$;
+        int32 $off = $delta as int32;
+        assert($off >= 0, 'layout: field offset');
+        assert($off + $bytes <= $this->fixedStride, 'layout: field past stride');
+        $this->push($location, $components, $off, $divisor);
+    }
+
+    private function push(uint32 $location, int32 $components, int32 $offset, uint32? $divisor) : void
+    {
+        foreach ($this->attrs as $attr) {
+            assert($attr->location != $location, 'layout: duplicate location');
+        }
+
+        uint32 $div = $divisor ?? $this->divisor;
+        $this->attrs[] = VertexAttr($location, $components, $offset, $this->fixedStride, $div);
+    }
+
+    private function closeStream() : void
+    {
+        if ($this->streamStart == $this->attrs->count()) {
+            return;
+        }
+
+        int32 $stride = $this->fixedStride;
+
+        if ($stride == 0) {
+            $stride = $this->offset;
+        }
+
+        usize $n = $this->attrs->count();
+
+        for ($i = $this->streamStart; $i < $n; $i = $i + 1) {
+            VertexAttr& $attr = $this->attrs->at($i);
+            $attr->stride = $stride;
+        }
+    }
+
+    private function release() : void
+    {
+        if (!$this->owned) {
+            return;
+        }
+
+        if ($this->raw:$ != null) {
+            mem::free($this->raw);
+        }
+
+        $this->raw:$ = null;
+        $this->base:$ = null;
+        $this->owned = false;
+    }
+}
+
+public struct VertexLayout
+{
+    public array<VertexAttr> $attrs;
+
+    /**
+     * Packed streams. Sequential offsets, stride is the stream
+     * byte total. `stream()` starts the instance buffer.
+     */
+    public static function build(function<void(VertexBuilder)> $fn) : VertexLayout
+    {
+        VertexBuilder $b = VertexBuilder();
+        $fn($b);
+        return $b->finish();
+    }
+
+    /**
+     * One stream whose stride is `mem::size<T>()` and whose
+     * offsets are real field addresses. `$divisor` applies to
+     * every attr unless an attr overrides it. Take the probe
+     * with `$b->vertex<T>()` and pass `&$v->field` to attr.
+     */
+    public static function of<T>(function<void(VertexBuilder)> $fn, divisor: uint32 $divisor = 0) : VertexLayout
+    {
+        VertexBuilder $b = VertexBuilder();
+        $b->allocProbe<T>($divisor);
+        $fn($b);
+        return $b->finish();
+    }
+
+    public const function join(const VertexLayout& $other) : VertexLayout
+    {
+        array<VertexAttr> $attrs = $this->attrs;
+
+        foreach ($other->attrs as $attr) {
+            foreach ($attrs as $have) {
+                assert($have->location != $attr->location, 'layout: duplicate location');
+            }
+
+            $attrs[] = $attr;
+        }
+
+        return VertexLayout($attrs);
+    }
+
+    public static function pos3uv2() : VertexLayout
+    {
+        return VertexLayout::build(function(VertexBuilder $b) : void {
+            $b->attr<Vec3>(0);
+            $b->attr<Vec2>(1);
+        });
+    }
+
+    public static function pos3() : VertexLayout
+    {
+        return VertexLayout::build(function(VertexBuilder $b) : void {
+            $b->attr<Vec3>(0);
+        });
+    }
+
+    /**
+     * Location 0: packed vec3. Location 1: packed vec3 with
+     * divisor 1 (instance offset).
+     */
+    public static function pos3Instance3() : VertexLayout
+    {
+        return VertexLayout::build(function(VertexBuilder $b) : void {
+            $b->attr<Vec3>(0);
+            $b->stream(divisor: 1);
+            $b->attr<Vec3>(1);
+        });
+    }
+
+    public const function fingerprint() : string
+    {
+        string $out = '';
+
+        foreach ($this->attrs as $attr) {
+            $out = "{$out}{$attr->location}:{$attr->components}:{$attr->offset}:{$attr->stride}:{$attr->divisor};";
+        }
+
+        return $out;
+    }
+}
+
+internal function componentsOf<T>() : int32
+{
+    type_id $id = type_id<T>();
+
+    if ($id == type_id<float32>()) {
+        return 1;
+    }
+
+    if ($id == type_id<Vec2>()) {
+        return 2;
+    }
+
+    if ($id == type_id<Vec3>()) {
+        return 3;
+    }
+
+    if ($id == type_id<Vec4>()) {
+        return 4;
+    }
+
+    assert(false, 'layout: attr type');
+    return 0;
+}

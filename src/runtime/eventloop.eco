@@ -1,0 +1,121 @@
+/**
+ * Deferred callbacks for the game loop. schedule() delay is
+ * milliseconds. tick() from update(). Time is monotonic
+ * (std::time::instant), not GLFW. Missing main is a wiring bug.
+ */
+
+namespace visu::runtime;
+
+use std::time;
+
+internal class EventLoopMain
+{
+    public static EventLoop? $loop = null;
+}
+
+public class EventLoop
+{
+    private TimerHeap $timers;
+    private int32 $nextId;
+    private time::instant $origin;
+    private int64? $frozenMs;
+
+    public constructor()
+    {
+        $this->timers = TimerHeap();
+        $this->nextId = 0;
+        $this->origin = time::instant::now();
+        $this->frozenMs = null;
+    }
+
+    /**
+     * Run `$callback` after `$delayMs` milliseconds. Returns the
+     * timer so the caller can cancel().
+     */
+    public function schedule(int64 $delayMs, function<void()> $callback) : Timer
+    {
+        int64 $delay = $delayMs;
+        if ($delay < 0) {
+            $delay = 0;
+        }
+
+        $this->nextId = $this->nextId + 1;
+        int32 $id = $this->nextId;
+        Timer $timer = Timer($this->nowMs() + $delay, $id, $callback);
+        $this->timers->insert($timer);
+        return $timer;
+    }
+
+    /**
+     * Drain due timers on the wall clock. Clears a tickAt freeze
+     * so later schedule() uses real time again.
+     */
+    public function tick() : void
+    {
+        $this->frozenMs = null;
+        $this->drain($this->nowMs());
+    }
+
+    /**
+     * Drain at a synthetic millisecond clock. Later schedule()
+     * calls use this clock until a later tickAt, or tick() goes
+     * back to the wall.
+     */
+    public function tickAt(int64 $nowMs) : void
+    {
+        $this->frozenMs = $nowMs;
+        $this->drain($nowMs);
+    }
+
+    private function drain(int64 $nowMs) : void
+    {
+        while (!$this->timers->empty()) {
+            Timer $next = $this->timers->top();
+            if ($next->time > $nowMs) {
+                return;
+            }
+
+            $this->timers->extract();
+            if ($next->cancelled()) {
+                continue;
+            }
+
+            function<void()> $fn = $next->callback;
+            $fn();
+        }
+    }
+
+    private function nowMs() : int64
+    {
+        int64 $frozen = guard $this->frozenMs else {
+            return (time::instant::now() - $this->origin)->as_millis();
+        }
+        return $frozen;
+    }
+}
+
+public function registerMain(EventLoop $loop) : void
+{
+    EventLoopMain::$loop = $loop;
+}
+
+public function unregisterMain() : void
+{
+    EventLoopMain::$loop = null;
+}
+
+public function hasMain() : bool
+{
+    return EventLoopMain::$loop != null;
+}
+
+public function currentLoop() : EventLoop
+{
+    EventLoop $loop = guard EventLoopMain::$loop;
+    return $loop;
+}
+
+public function defer(int64 $delayMs, function<void()> $callback) : Timer
+{
+    return currentLoop()->schedule($delayMs, $callback);
+}
