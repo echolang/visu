@@ -1,0 +1,111 @@
+/**
+ * Cube / sphere / cone / cylinder / plane emit whole triangles.
+ */
+
+use visu::geo::{
+    PrimitiveBuilder,
+    PrimitiveLayout,
+    cone,
+    cube,
+    cylinder,
+    plane,
+    sphere,
+};
+use visu::math::{Vec3, cross, dot, equal, length};
+
+test primitives_emit_whole_triangles
+{
+    PrimitiveLayout $layout = PrimitiveLayout::pos3n3();
+
+    PrimitiveBuilder $sphereB = PrimitiveBuilder($layout);
+    sphere($sphereB, 0.5f, 16, 8);
+    assertTriangleList($sphereB, $layout);
+
+    PrimitiveBuilder $cubeB = PrimitiveBuilder($layout);
+    cube($cubeB, 2.0f, 1.0f, 3.0f);
+    assertTriangleList($cubeB, $layout);
+
+    PrimitiveBuilder $planeB = PrimitiveBuilder($layout);
+    plane($planeB, 4.0f, 4.0f, 3);
+    assertTriangleList($planeB, $layout);
+
+    PrimitiveBuilder $cylB = PrimitiveBuilder($layout);
+    cylinder($cylB, 1.0f, 2.0f, 12);
+    assertTriangleList($cylB, $layout);
+
+    PrimitiveBuilder $coneB = PrimitiveBuilder($layout);
+    cone($coneB, 1.0f, 2.0f, 12);
+    assertTriangleList($coneB, $layout);
+}
+
+test primitives_pos_norm_uv_stride
+{
+    PrimitiveLayout $layout = PrimitiveLayout::pos3n3uv2();
+    assert($layout->stride() == 8, '8');
+
+    PrimitiveBuilder $b = PrimitiveBuilder($layout);
+    cube($b);
+    sphere($b, 1.0f, 8, 4);
+    usize $stride = $layout->stride() as usize;
+    assert($b->data->count() > 0, 'wrote');
+    assert($b->data->count() % $stride == 0, 'verts');
+    assert($b->data->count() % ($stride * 3) == 0, 'tris');
+}
+
+test cube_then_sphere_appends
+{
+    PrimitiveLayout $layout = PrimitiveLayout::pos3n3();
+    PrimitiveBuilder $b = PrimitiveBuilder($layout);
+    cube($b);
+    usize $afterCube = $b->data->count();
+    sphere($b);
+    assert($b->data->count() > $afterCube, 'appended');
+}
+
+test sphere_normals_unit_positions_on_radius
+{
+    float32 $radius = 0.5f;
+    PrimitiveLayout $layout = PrimitiveLayout::pos3n3();
+    PrimitiveBuilder $b = PrimitiveBuilder($layout);
+    sphere($b, $radius, 16, 8);
+    usize $n = $b->data->count();
+
+    for ($i = 0 as usize; $i < $n; $i = $i + 6) {
+        Vec3 $pos = Vec3($b->data[$i], $b->data[$i + 1], $b->data[$i + 2]);
+        Vec3 $normal = Vec3($b->data[$i + 3], $b->data[$i + 4], $b->data[$i + 5]);
+        assert(equal(length($normal), 1.0f, 0.0001f), 'unit n');
+        assert(equal(length($pos), $radius, 0.0001f), 'radius');
+    }
+}
+
+test sphere_triangles_outward_and_non_degenerate
+{
+    PrimitiveLayout $layout = PrimitiveLayout::pos3n3();
+    PrimitiveBuilder $b = PrimitiveBuilder($layout);
+    sphere($b, 0.5f, 32, 16);
+    usize $stride = 6;
+    usize $n = $b->data->count();
+
+    for ($i = 0 as usize; $i < $n; $i = $i + 3 * $stride) {
+        Vec3 $p0 = Vec3($b->data[$i], $b->data[$i + 1], $b->data[$i + 2]);
+        Vec3 $p1 = Vec3($b->data[$i + $stride], $b->data[$i + $stride + 1], $b->data[$i + $stride + 2]);
+        Vec3 $p2 = Vec3($b->data[$i + 2 * $stride], $b->data[$i + 2 * $stride + 1], $b->data[$i + 2 * $stride + 2]);
+        Vec3 $face = cross($p1 - $p0, $p2 - $p0);
+        assert(length($face) > 0.000000001f, 'degenerate');
+
+        Vec3 $avg = Vec3(
+            $b->data[$i + 3] + $b->data[$i + $stride + 3] + $b->data[$i + 2 * $stride + 3],
+            $b->data[$i + 4] + $b->data[$i + $stride + 4] + $b->data[$i + 2 * $stride + 4],
+            $b->data[$i + 5] + $b->data[$i + $stride + 5] + $b->data[$i + 2 * $stride + 5]
+        );
+        assert(dot($face, $avg) > 0.0f, 'outward');
+    }
+}
+
+internal function assertTriangleList(const PrimitiveBuilder& $b, const PrimitiveLayout& $layout) : void
+{
+    usize $stride = $layout->stride() as usize;
+    assert($b->data->count() > 0, 'wrote');
+    assert($b->data->count() % $stride == 0, 'verts');
+    assert($b->data->count() % ($stride * 3) == 0, 'tris');
+}

@@ -1,0 +1,118 @@
+/**
+ * Transform TRS, parent world matrix, interpolation, lookAt.
+ */
+
+use visu::ecs::{Entities, Entity};
+use visu::geo::Transform;
+use visu::math::{Mat4, Quat, Vec3, Vec4, equal, mix, rotateY, scale, translate};
+
+test transform_default_trs
+{
+    Transform $t = Transform();
+    assert(equal($t->position, Vec3(0.0f, 0.0f, 0.0f)), 'pos');
+    assert(equal($t->scale, Vec3(1.0f, 1.0f, 1.0f)), 'scale');
+    assert($t->parent == Entity::none(), 'no parent');
+    Mat4 $m = $t->local();
+    assert(equal($m, Mat4()), 'identity');
+}
+
+test transform_local_is_translate_rotate_scale
+{
+    Transform $t = Transform();
+    $t->position = Vec3(2.0f, 3.0f, 4.0f);
+    $t->scale = Vec3(2.0f, 2.0f, 2.0f);
+    Mat4 $expect = translate($t->position) * Mat4($t->orientation) * scale($t->scale);
+    assert(equal($t->local(), $expect), 'trs');
+}
+
+test transform_move_forward_along_neg_z
+{
+    Transform $t = Transform();
+    $t->moveForward(5.0f);
+    assert(equal($t->position, Vec3(0.0f, 0.0f, -5.0f)), 'fwd');
+    assert(equal($t->forward(), Transform::worldForward()), 'dir');
+}
+
+test transform_parent_world_applies_rotation
+{
+    Entities $world = Entities();
+    Entity $parent = $world->create();
+    Entity $child = $world->create();
+    Transform $pt = Transform();
+    $pt->orientation = Quat(angleAxis: std::math::PI_F32 / 2.0f, Vec3(0.0f, 1.0f, 0.0f));
+    $world->attach($parent, $pt);
+    Transform $ct = Transform();
+    $ct->position = Vec3(1.0f, 0.0f, 0.0f);
+    $ct->parent($world, $parent);
+    $world->attach($child, $ct);
+
+    Transform& $got = $world->get<Transform>($child);
+    Vec3 $wp = $got->worldPosition($world);
+    Vec4 $expect = rotateY(std::math::PI_F32 / 2.0f) * Vec4(1.0f, 0.0f, 0.0f, 1.0f);
+    assert(equal($wp, Vec3($expect->x, $expect->y, $expect->z), 0.01f), 'rotated parent');
+}
+
+test transform_store_previous_mixes
+{
+    Transform $t = Transform();
+    $t->storePrevious();
+    $t->position = Vec3(10.0f, 0.0f, 0.0f);
+    assert(equal($t->mixPosition(0.5f), mix(Vec3(0.0f, 0.0f, 0.0f), Vec3(10.0f, 0.0f, 0.0f), 0.5f)), 'mid');
+    Mat4 $mid = $t->local(0.5f);
+    assert(equal($mid->c3->x, 5.0f), 'mat x');
+    $t->resetPrevious();
+    assert(equal($t->mixPosition(0.5f), $t->position), 'no prev');
+}
+
+test transform_look_at_points_forward_at_target
+{
+    Transform $t = Transform();
+    $t->lookAt(Vec3(0.0f, 0.0f, -10.0f));
+    assert(equal($t->forward(), Vec3(0.0f, 0.0f, -1.0f), 0.05f), '-z');
+
+    Transform $side = Transform();
+    $side->lookAt(Vec3(10.0f, 0.0f, 0.0f));
+    assert(equal($side->forward(), Vec3(1.0f, 0.0f, 0.0f), 0.05f), '+x');
+}
+
+test transform_attaches_as_component
+{
+    Entities $world = Entities();
+    Entity $e = $world->create();
+    $world->attach($e, Transform());
+    assert($world->has<Transform>($e), 'has');
+    $world->get<Transform>($e)->moveUp(3.0f);
+    assert(equal($world->get<Transform>($e)->position->y, 3.0f), 'mut');
+}
+
+#[tests: expects death]
+test transform_parent_without_transform_dies
+{
+    Entities $world = Entities();
+    Entity $p = $world->create();
+    Transform $t = Transform();
+    $t->parent($world, $p);
+}
+
+#[tests: expects death]
+test transform_self_parent_dies
+{
+    Entities $world = Entities();
+    Entity $e = $world->create();
+    $world->attach($e, Transform());
+    $world->get<Transform>($e)->parent($world, $e);
+    Mat4 $m = $world->get<Transform>($e)->world($world);
+}
+
+#[tests: expects death]
+test transform_parent_cycle_world_dies
+{
+    Entities $world = Entities();
+    Entity $a = $world->create();
+    Entity $b = $world->create();
+    $world->attach($a, Transform());
+    $world->attach($b, Transform());
+    $world->get<Transform>($a)->parent = $b;
+    $world->get<Transform>($b)->parent = $a;
+    Mat4 $m = $world->get<Transform>($a)->world($world);
+}

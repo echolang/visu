@@ -1,0 +1,274 @@
+/**
+ * Position, orientation, and scale. An ECS component. Local matrix
+ * is rebuilt from TRS on read — Mat4 is a struct, so there is no
+ * dirty cache. Parent is `Entity::none()` when unparented. Previous
+ * pose is a `Pose` snapshot, not a nested Transform.
+ */
+
+namespace visu::geo;
+
+use visu::ecs::{Entities, Entity};
+use visu::math::{Mat4, Quat, Vec3, conjugate, lookAt, scale, slerp, translate};
+
+internal const TRANSFORM_PARENT_LIMIT = 64;
+
+public struct Pose
+{
+    public Vec3 $position;
+    public Quat $orientation;
+    public Vec3 $scale;
+}
+
+public struct Transform
+{
+    public Vec3 $position;
+    public Quat $orientation;
+    public Vec3 $scale;
+    public Entity $parent;
+    private Pose? $previous;
+
+    public constructor()
+    {
+        $this->position = Vec3(0.0f, 0.0f, 0.0f);
+        $this->orientation = Quat();
+        $this->scale = Vec3(1.0f, 1.0f, 1.0f);
+        $this->parent = Entity::none();
+        $this->previous = null;
+    }
+
+    public static function worldUp() : Vec3
+    {
+        return Vec3(0.0f, 1.0f, 0.0f);
+    }
+
+    public static function worldDown() : Vec3
+    {
+        return Vec3(0.0f, -1.0f, 0.0f);
+    }
+
+    public static function worldRight() : Vec3
+    {
+        return Vec3(1.0f, 0.0f, 0.0f);
+    }
+
+    public static function worldLeft() : Vec3
+    {
+        return Vec3(-1.0f, 0.0f, 0.0f);
+    }
+
+    public static function worldForward() : Vec3
+    {
+        return Vec3(0.0f, 0.0f, -1.0f);
+    }
+
+    public static function worldBackward() : Vec3
+    {
+        return Vec3(0.0f, 0.0f, 1.0f);
+    }
+
+    public function parent(Entities $world, Entity $e) : void
+    {
+        if ($e != Entity::none()) {
+            assert($world->has<Transform>($e), 'transform: parent has no Transform');
+            Entity $walk = $e;
+            int32 $n = 0;
+            while ($walk != Entity::none()) {
+                assert($n < TRANSFORM_PARENT_LIMIT, 'transform: parent cycle');
+                Transform $ancestor = $world->get<Transform>($walk);
+                $walk = $ancestor->parent;
+                $n = $n + 1;
+            }
+        }
+
+        $this->parent = $e;
+    }
+
+    public const function local() : Mat4
+    {
+        return translate($this->position) * Mat4($this->orientation) * scale($this->scale);
+    }
+
+    public const function local(float32 $alpha) : Mat4
+    {
+        Pose $p = $this->mix($alpha);
+        return translate($p->position) * Mat4($p->orientation) * scale($p->scale);
+    }
+
+    public const function world(Entities $world) : Mat4
+    {
+        return $this->worldAt($world, 0);
+    }
+
+    public const function worldPosition(Entities $world) : Vec3
+    {
+        Mat4 $m = $this->world($world);
+        return Vec3($m->c3->x, $m->c3->y, $m->c3->z);
+    }
+
+    public const function worldOrientation(Entities $world) : Quat
+    {
+        return $this->orientAt($world, 0);
+    }
+
+    public const function worldScale(Entities $world) : Vec3
+    {
+        return $this->scaleAt($world, 0);
+    }
+
+    private const function worldAt(Entities $world, int32 $depth) : Mat4
+    {
+        assert($depth < TRANSFORM_PARENT_LIMIT, 'transform: parent cycle');
+        Mat4 $local = $this->local();
+        if ($this->parent == Entity::none()) {
+            return $local;
+        }
+
+        assert($world->has<Transform>($this->parent), 'transform: parent has no Transform');
+        Transform $parent = $world->get<Transform>($this->parent);
+        return $parent->worldAt($world, $depth + 1) * $local;
+    }
+
+    private const function orientAt(Entities $world, int32 $depth) : Quat
+    {
+        assert($depth < TRANSFORM_PARENT_LIMIT, 'transform: parent cycle');
+        if ($this->parent == Entity::none()) {
+            return $this->orientation;
+        }
+
+        assert($world->has<Transform>($this->parent), 'transform: parent has no Transform');
+        Transform $parent = $world->get<Transform>($this->parent);
+        return $parent->orientAt($world, $depth + 1) * $this->orientation;
+    }
+
+    private const function scaleAt(Entities $world, int32 $depth) : Vec3
+    {
+        assert($depth < TRANSFORM_PARENT_LIMIT, 'transform: parent cycle');
+        if ($this->parent == Entity::none()) {
+            return $this->scale;
+        }
+
+        assert($world->has<Transform>($this->parent), 'transform: parent has no Transform');
+        Transform $parent = $world->get<Transform>($this->parent);
+        return $parent->scaleAt($world, $depth + 1) * $this->scale;
+    }
+
+    public const function euler() : Vec3
+    {
+        return visu::math::euler($this->orientation);
+    }
+
+    public const function euler(Entities $world) : Vec3
+    {
+        return visu::math::euler($this->worldOrientation($world));
+    }
+
+    public const function forward() : Vec3
+    {
+        return $this->orientation * Transform::worldForward();
+    }
+
+    public const function backward() : Vec3
+    {
+        return $this->orientation * Transform::worldBackward();
+    }
+
+    public const function right() : Vec3
+    {
+        return $this->orientation * Transform::worldRight();
+    }
+
+    public const function left() : Vec3
+    {
+        return $this->orientation * Transform::worldLeft();
+    }
+
+    public const function up() : Vec3
+    {
+        return $this->orientation * Transform::worldUp();
+    }
+
+    public const function down() : Vec3
+    {
+        return $this->orientation * Transform::worldDown();
+    }
+
+    public function moveForward(float32 $distance) : void
+    {
+        $this->position = $this->position + $this->forward() * $distance;
+    }
+
+    public function moveBackward(float32 $distance) : void
+    {
+        $this->position = $this->position + $this->backward() * $distance;
+    }
+
+    public function moveRight(float32 $distance) : void
+    {
+        $this->position = $this->position + $this->right() * $distance;
+    }
+
+    public function moveLeft(float32 $distance) : void
+    {
+        $this->position = $this->position + $this->left() * $distance;
+    }
+
+    public function moveUp(float32 $distance) : void
+    {
+        $this->position = $this->position + $this->up() * $distance;
+    }
+
+    public function moveDown(float32 $distance) : void
+    {
+        $this->position = $this->position + $this->down() * $distance;
+    }
+
+    public function lookAt(Vec3 $point) : void
+    {
+        Mat4 $view = lookAt(eye: $this->position, center: $point, up: Transform::worldUp());
+        $this->orientation = conjugate(Quat($view));
+    }
+
+    public function lookIn(Vec3 $direction) : void
+    {
+        $this->lookAt($this->position + $direction);
+    }
+
+    public function storePrevious() : void
+    {
+        $this->previous = Pose($this->position, $this->orientation, $this->scale);
+    }
+
+    public function resetPrevious() : void
+    {
+        $this->previous = null;
+    }
+
+    public const function mix(float32 $alpha) : Pose
+    {
+        if ($this->previous == null) {
+            return Pose($this->position, $this->orientation, $this->scale);
+        }
+
+        Pose $prev = guard $this->previous;
+        return Pose(
+            visu::math::mix($prev->position, $this->position, $alpha),
+            slerp($prev->orientation, $this->orientation, $alpha),
+            visu::math::mix($prev->scale, $this->scale, $alpha)
+        );
+    }
+
+    public const function mixPosition(float32 $alpha) : Vec3
+    {
+        return $this->mix($alpha)->position;
+    }
+
+    public const function mixOrientation(float32 $alpha) : Quat
+    {
+        return $this->mix($alpha)->orientation;
+    }
+
+    public const function mixScale(float32 $alpha) : Vec3
+    {
+        return $this->mix($alpha)->scale;
+    }
+}

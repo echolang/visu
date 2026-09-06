@@ -1,0 +1,74 @@
+/**
+ * AABB size, contains, ray hit, union, avoid.
+ */
+
+use visu::geo::{AABB, Ray};
+use visu::math::{Vec3, equal};
+
+test aabb_size_center_contains
+{
+    AABB $box = AABB(Vec3(0.0f, 0.0f, 0.0f), Vec3(2.0f, 4.0f, 6.0f));
+    assert(equal($box->width(), 2.0f), 'w');
+    assert(equal($box->height(), 4.0f), 'h');
+    assert(equal($box->depth(), 6.0f), 'd');
+    assert(equal($box->center(), Vec3(1.0f, 2.0f, 3.0f)), 'center');
+    assert($box->contains(Vec3(1.0f, 2.0f, 3.0f)), 'in');
+    assert(!$box->contains(Vec3(-1.0f, 0.0f, 0.0f)), 'out');
+}
+
+test aabb_intersects_and_union
+{
+    AABB $a = AABB(Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 1.0f, 1.0f));
+    AABB $b = AABB(Vec3(0.5f, 0.5f, 0.5f), Vec3(2.0f, 2.0f, 2.0f));
+    AABB $c = AABB(Vec3(3.0f, 3.0f, 3.0f), Vec3(4.0f, 4.0f, 4.0f));
+    assert($a->intersects($b), 'overlap');
+    assert(!$a->intersects($c), 'apart');
+    AABB $u = $a->union($b);
+    assert(equal($u->min, Vec3(0.0f, 0.0f, 0.0f)), 'umin');
+    assert(equal($u->max, Vec3(2.0f, 2.0f, 2.0f)), 'umax');
+}
+
+test aabb_ray_hit
+{
+    AABB $box = AABB(Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 1.0f, 1.0f));
+    Ray $r = Ray(Vec3(-1.0f, 0.5f, 0.5f), Vec3(1.0f, 0.0f, 0.0f));
+    Vec3? $p = $box->hit($r);
+    assert($p != null, 'hit');
+    Vec3 $hit = $p ?? Vec3(0.0f, 0.0f, 0.0f);
+    assert(equal($hit, Vec3(0.0f, 0.5f, 0.5f)), 'point');
+
+    Ray $miss = Ray(Vec3(-1.0f, 2.0f, 0.5f), Vec3(1.0f, 0.0f, 0.0f));
+    assert($box->hit($miss) == null, 'miss');
+}
+
+test aabb_ray_axis_aligned_zero_dir
+{
+    AABB $box = AABB(Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 1.0f, 1.0f));
+    Ray $r = Ray(Vec3(0.5f, 0.5f, -1.0f), Vec3(0.0f, 0.0f, 1.0f));
+    Vec3? $p = $box->hit($r);
+    assert($p != null, 'z hit');
+}
+
+test aabb_ray_behind_and_inside
+{
+    AABB $box = AABB(Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 1.0f, 1.0f));
+    Ray $away = Ray(Vec3(2.0f, 0.5f, 0.5f), Vec3(1.0f, 0.0f, 0.0f));
+    assert($box->hit($away) == null, 'behind');
+
+    Ray $inside = Ray(Vec3(0.5f, 0.5f, 0.5f), Vec3(1.0f, 0.0f, 0.0f));
+    float32? $t = $box->hitDistance($inside);
+    assert($t != null, 'inside');
+    assert(equal($t ?? -1.0f, 0.0f), 't0');
+    Vec3 $p = $box->hit($inside) ?? Vec3(0.0f, 0.0f, 0.0f);
+    assert(equal($p, Vec3(0.5f, 0.5f, 0.5f)), 'origin');
+}
+
+test aabb_avoid_and_corners
+{
+    AABB $a = AABB(Vec3(0.0f, 0.0f, 0.0f), Vec3(2.0f, 1.0f, 1.0f));
+    AABB $b = AABB(Vec3(1.0f, 0.0f, 0.0f), Vec3(3.0f, 1.0f, 1.0f));
+    Vec3 $nudge = $a->avoid($b);
+    assert(equal($nudge->x, -1.0f), 'push left');
+    array<Vec3> $c = $a->corners();
+    assert($c->count() == 8, '8 corners');
+}

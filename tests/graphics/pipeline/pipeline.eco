@@ -56,8 +56,8 @@ test pipeline_setup_sees_earlier_mailbox
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $f->set(Marker(9));
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
-            return .ok(true);
+        execute: function(Context $ctx) : status<PipelineError> {
+            return .ok;
         }
     ));
 
@@ -67,16 +67,15 @@ test pipeline_setup_sees_earlier_mailbox
             Marker $m = $f->get<Marker>();
             assert($m->n == 9, 'mailbox');
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
-            return .ok(true);
+        execute: function(Context $ctx) : status<PipelineError> {
+            return .ok;
         }
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute( 0) else ($e) {
+    guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
-    assert($ok, 'executed');
 }
 
 test pipeline_execute_order
@@ -93,25 +92,25 @@ test pipeline_execute_order
     $pipeline->add(CallbackPass(
         'a',
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {},
-        execute: function(Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('a');
-            return .ok(true);
+            return .ok;
         }
     ));
 
     $pipeline->add(CallbackPass(
         'b',
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {},
-        execute: function(Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('b');
-            return .ok(true);
+            return .ok;
         }
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute( 0) else ($e) {
+    guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
     Log $out = $frame->get<Log>();
@@ -135,13 +134,13 @@ test pipeline_unread_created_target_is_an_error
             TargetRef $t = $pipe->createTarget('orphan', 8, 8);
             $io->reads( $t);
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
-            return .ok(true);
+        execute: function(Context $ctx) : status<PipelineError> {
+            return .ok;
         }
     ));
 
     Gpu $state = Gpu();
-    result<bool, PipelineError> $r = $pipeline->execute( 0);
+    status<PipelineError> $r = $pipeline->execute( 0);
     assert($r->failed(), 'unread');
 }
 
@@ -160,16 +159,15 @@ test pipeline_imported_backbuffer_readable_without_writer
             Backbuffer $bb = $f->get<Backbuffer>();
             $io->reads( $bb->target);
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
-            return .ok(true);
+        execute: function(Context $ctx) : status<PipelineError> {
+            return .ok;
         }
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute( 0) else ($e) {
+    guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
-    assert($ok, 'imported read');
 }
 
 test pipeline_reader_of_shared_target_waits_for_writer
@@ -188,10 +186,10 @@ test pipeline_reader_of_shared_target_waits_for_writer
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->reads( $x);
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('reader');
-            return .ok(true);
+            return .ok;
         }
     ));
 
@@ -200,15 +198,15 @@ test pipeline_reader_of_shared_target_waits_for_writer
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->writes( $x);
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('writer');
-            return .ok(true);
+            return .ok;
         }
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute( 0) else ($e) {
+    guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
     Log $out = $frame->get<Log>();
@@ -233,10 +231,10 @@ test pipeline_two_writers_keep_add_order
             Backbuffer $bb = $f->get<Backbuffer>();
             $io->writes( $bb->target);
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('clear');
-            return .ok(true);
+            return .ok;
         }
     ));
 
@@ -246,15 +244,15 @@ test pipeline_two_writers_keep_add_order
             Backbuffer $bb = $f->get<Backbuffer>();
             $io->writes( $bb->target);
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('draw');
-            return .ok(true);
+            return .ok;
         }
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute( 0) else ($e) {
+    guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
     Log $out = $frame->get<Log>();
@@ -279,8 +277,8 @@ test pipeline_cycle_is_an_error
             $io->reads( $x);
             $io->writes( $y);
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
-            return .ok(true);
+        execute: function(Context $ctx) : status<PipelineError> {
+            return .ok;
         }
     ));
 
@@ -290,13 +288,13 @@ test pipeline_cycle_is_an_error
             $io->reads( $y);
             $io->writes( $x);
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
-            return .ok(true);
+        execute: function(Context $ctx) : status<PipelineError> {
+            return .ok;
         }
     ));
 
     Gpu $state = Gpu();
-    result<bool, PipelineError> $r = $pipeline->execute( 0);
+    status<PipelineError> $r = $pipeline->execute( 0);
     assert($r->failed(), 'cycle');
 }
 
@@ -317,10 +315,10 @@ test pipeline_writing_target_happens_before_reading_color
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->reads( $color);
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('reader');
-            return .ok(true);
+            return .ok;
         }
     ));
 
@@ -329,15 +327,15 @@ test pipeline_writing_target_happens_before_reading_color
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->writes( $g);
         },
-        execute: function(Context $ctx) : result<bool, PipelineError> {
+        execute: function(Context $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('writer');
-            return .ok(true);
+            return .ok;
         }
     ));
 
     Gpu $state = Gpu();
-    bool $ok = guard $pipeline->execute( 0) else ($e) {
+    guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
     Log $out = $frame->get<Log>();

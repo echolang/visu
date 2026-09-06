@@ -1,0 +1,53 @@
+/**
+ * Layout-aware vertex writer. Owns the float buffer; primitives
+ * append through `add`. A requested attrib that the primitive
+ * did not supply is an assert — that is a layout bug.
+ */
+
+namespace visu::geo;
+
+use visu::math::{Vec2, Vec3};
+
+public struct PrimitiveBuilder
+{
+    public PrimitiveLayout $layout;
+    public array<float32> $data;
+
+    public constructor(const PrimitiveLayout& $layout)
+    {
+        $this->layout = $layout;
+        $this->data = array<float32>();
+    }
+
+    public function room(int32 $vertices) : void
+    {
+        usize $need = $this->data->count() + ($vertices as usize) * ($this->layout->stride() as usize);
+        $this->data->reserve($need);
+    }
+
+    public function add(Vec3 $position, Vec3? $normal = null, Vec2? $uv = null) : void
+    {
+        foreach ($this->layout->attribs as $attrib) {
+            match ($attrib) {
+                Attrib::position => {
+                    $this->data[] = $position->x;
+                    $this->data[] = $position->y;
+                    $this->data[] = $position->z;
+                },
+                Attrib::normal => {
+                    assert($normal != null, 'primitive: layout requests a normal');
+                    Vec3 $n = guard $normal;
+                    $this->data[] = $n->x;
+                    $this->data[] = $n->y;
+                    $this->data[] = $n->z;
+                },
+                Attrib::uv => {
+                    assert($uv != null, 'primitive: layout requests a uv');
+                    Vec2 $uv0 = guard $uv;
+                    $this->data[] = $uv0->x;
+                    $this->data[] = $uv0->y;
+                },
+            };
+        }
+    }
+}

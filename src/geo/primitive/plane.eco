@@ -1,0 +1,51 @@
+/**
+ * Flat XZ plane centered at the origin, facing +Y. Optionally
+ * subdivided. UVs span 0..1.
+ */
+
+namespace visu::geo;
+
+use visu::math::{Vec2, Vec3};
+
+public function plane(
+    PrimitiveBuilder& $b,
+    float32 $width = 1.0f,
+    float32 $depth = 1.0f,
+    int32 $subdivisions = 1
+) : void
+{
+    int32 $cells = std::math::max($subdivisions, 1);
+    $b->room($cells * $cells * 6);
+    Vec3 $normal = Vec3(0.0f, 1.0f, 0.0f);
+    float32 $hw = $width * 0.5f;
+    float32 $hd = $depth * 0.5f;
+
+    for ($ix = 0; $ix < $cells; $ix = $ix + 1) {
+        float32 $fx0 = ($ix as float32) / ($cells as float32);
+        int32 $ix1 = $ix + 1;
+        float32 $fx1 = ($ix1 as float32) / ($cells as float32);
+
+        for ($iz = 0; $iz < $cells; $iz = $iz + 1) {
+            float32 $fz0 = ($iz as float32) / ($cells as float32);
+            int32 $iz1 = $iz + 1;
+            float32 $fz1 = ($iz1 as float32) / ($cells as float32);
+            float32 $x0 = -$hw + $fx0 * $width;
+            float32 $x1 = -$hw + $fx1 * $width;
+            float32 $z0 = -$hd + $fz0 * $depth;
+            float32 $z1 = -$hd + $fz1 * $depth;
+
+            Vec3 $p00 = Vec3($x0, 0.0f, $z0);
+            Vec3 $p01 = Vec3($x0, 0.0f, $z1);
+            Vec3 $p10 = Vec3($x1, 0.0f, $z0);
+            Vec3 $p11 = Vec3($x1, 0.0f, $z1);
+
+            $b->add($p00, $normal, Vec2($fx0, $fz0));
+            $b->add($p01, $normal, Vec2($fx0, $fz1));
+            $b->add($p11, $normal, Vec2($fx1, $fz1));
+
+            $b->add($p00, $normal, Vec2($fx0, $fz0));
+            $b->add($p11, $normal, Vec2($fx1, $fz1));
+            $b->add($p10, $normal, Vec2($fx1, $fz0));
+        }
+    }
+}

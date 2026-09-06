@@ -1,0 +1,88 @@
+/**
+ * Cone aligned to Y, centered at the origin. Base at the bottom,
+ * apex at the top. Side normals follow the slope; the optional
+ * cap is flat.
+ */
+
+namespace visu::geo;
+
+use visu::math::{Vec2, Vec3, normalize};
+
+public function cone(
+    PrimitiveBuilder& $b,
+    float32 $radius = 1.0f,
+    float32 $height = 1.0f,
+    int32 $segments = 32,
+    bool $cap = true
+) : void
+{
+    int32 $segN = std::math::max($segments, 3);
+    int32 $vertexCount = $segN * 3;
+    if ($cap) {
+        $vertexCount = $vertexCount + $segN * 3;
+    }
+
+    $b->room($vertexCount);
+    float32 $hy = $height * 0.5f;
+    Vec3 $apex = Vec3(0.0f, $hy, 0.0f);
+
+    array<float32> $cosTheta = array<float32>();
+    array<float32> $sinTheta = array<float32>();
+    int32 $cols = $segN + 1;
+    $cosTheta->reserve($cols as usize);
+    $sinTheta->reserve($cols as usize);
+
+    for ($seg = 0; $seg <= $segN; $seg = $seg + 1) {
+        float32 $theta = 2.0f * std::math::PI_F32 * ($seg as float32) / ($segN as float32);
+        $cosTheta[] = std::math::cos($theta);
+        $sinTheta[] = std::math::sin($theta);
+    }
+
+    array<float32> $cosMid = array<float32>();
+    array<float32> $sinMid = array<float32>();
+    $cosMid->reserve($segN as usize);
+    $sinMid->reserve($segN as usize);
+
+    for ($seg = 0; $seg < $segN; $seg = $seg + 1) {
+        float32 $theta = 2.0f * std::math::PI_F32 * (($seg as float32) + 0.5f) / ($segN as float32);
+        $cosMid[] = std::math::cos($theta);
+        $sinMid[] = std::math::sin($theta);
+    }
+
+    Vec3 $bottomNormal = Vec3(0.0f, -1.0f, 0.0f);
+    Vec3 $bottomCenter = Vec3(0.0f, -$hy, 0.0f);
+
+    for ($seg = 0; $seg < $segN; $seg = $seg + 1) {
+        int32 $seg1 = $seg + 1;
+        float32 $c0 = $cosTheta[$seg as usize];
+        float32 $s0 = $sinTheta[$seg as usize];
+        float32 $c1 = $cosTheta[$seg1 as usize];
+        float32 $s1 = $sinTheta[$seg1 as usize];
+        float32 $u0 = ($seg as float32) / ($segN as float32);
+        float32 $u1 = ($seg1 as float32) / ($segN as float32);
+        float32 $uMid = ($u0 + $u1) * 0.5f;
+
+        Vec3 $b0 = Vec3($radius * $c0, -$hy, $radius * $s0);
+        Vec3 $b1 = Vec3($radius * $c1, -$hy, $radius * $s1);
+        Vec3 $n0 = coneSideNormal($c0, $s0, $radius, $height);
+        Vec3 $n1 = coneSideNormal($c1, $s1, $radius, $height);
+        Vec3 $nApex = coneSideNormal($cosMid[$seg as usize], $sinMid[$seg as usize], $radius, $height);
+
+        $b->add($b0, $n0, Vec2($u0, 0.0f));
+        $b->add($apex, $nApex, Vec2($uMid, 1.0f));
+        $b->add($b1, $n1, Vec2($u1, 0.0f));
+
+        if (!$cap) {
+            continue;
+        }
+
+        $b->add($bottomCenter, $bottomNormal, Vec2(0.5f, 0.5f));
+        $b->add($b0, $bottomNormal, Vec2(0.5f + 0.5f * $c0, 0.5f + 0.5f * $s0));
+        $b->add($b1, $bottomNormal, Vec2(0.5f + 0.5f * $c1, 0.5f + 0.5f * $s1));
+    }
+}
+
+internal function coneSideNormal(float32 $cosTheta, float32 $sinTheta, float32 $radius, float32 $height) : Vec3
+{
+    return normalize(Vec3($height * $cosTheta, $radius, $height * $sinTheta));
+}

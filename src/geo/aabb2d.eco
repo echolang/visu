@@ -1,0 +1,104 @@
+/**
+ * Axis-aligned box in 2D. `apply` scales and translates from a
+ * Transform and ignores rotation — a 2D AABB cannot stay tight
+ * under an arbitrary yaw.
+ */
+
+namespace visu::geo;
+
+use visu::math::{Vec2, max, min};
+
+public struct AABB2D
+{
+    public Vec2 $min;
+    public Vec2 $max;
+
+    public static function union(const AABB2D& $a, const AABB2D& $b) : AABB2D
+    {
+        AABB2D $out = $a;
+        $out->extend($b);
+        return $out;
+    }
+
+    public static function union(const array<AABB2D>& $boxes) : AABB2D
+    {
+        assert($boxes->count() >= 2, 'aabb2d: union needs two boxes');
+        AABB2D $out = $boxes[0];
+        usize $n = $boxes->count();
+
+        for ($i = 1 as usize; $i < $n; $i = $i + 1) {
+            $out->extend($boxes[$i]);
+        }
+
+        return $out;
+    }
+
+    public const function width() : float32
+    {
+        return $this->max->x - $this->min->x;
+    }
+
+    public const function height() : float32
+    {
+        return $this->max->y - $this->min->y;
+    }
+
+    public const function center() : Vec2
+    {
+        return ($this->min + $this->max) * 0.5f;
+    }
+
+    public function extend(const AABB2D& $aabb) : void
+    {
+        $this->min = min($this->min, $aabb->min);
+        $this->max = max($this->max, $aabb->max);
+    }
+
+    public const function intersects(const AABB2D& $aabb) : bool
+    {
+        return !(
+            $this->min->x > $aabb->max->x
+            || $this->max->x < $aabb->min->x
+            || $this->min->y > $aabb->max->y
+            || $this->max->y < $aabb->min->y
+        );
+    }
+
+    public const function contains(Vec2 $point) : bool
+    {
+        return !(
+            $point->x < $this->min->x
+            || $point->x > $this->max->x
+            || $point->y < $this->min->y
+            || $point->y > $this->max->y
+        );
+    }
+
+    public const function contains(const AABB2D& $aabb) : bool
+    {
+        return !(
+            $aabb->min->x < $this->min->x
+            || $aabb->max->x > $this->max->x
+            || $aabb->min->y < $this->min->y
+            || $aabb->max->y > $this->max->y
+        );
+    }
+
+    public function apply(const Transform& $transform) : void
+    {
+        Vec2 $s = Vec2($transform->scale->x, $transform->scale->y);
+        Vec2 $minScaled = $this->min * $s;
+        Vec2 $maxScaled = $this->max * $s;
+        $this->min = Vec2(
+            std::math::min($minScaled->x, $maxScaled->x),
+            std::math::min($minScaled->y, $maxScaled->y)
+        );
+        $this->max = Vec2(
+            std::math::max($minScaled->x, $maxScaled->x),
+            std::math::max($minScaled->y, $maxScaled->y)
+        );
+        Vec2 $p = Vec2($transform->position->x, $transform->position->y);
+        $this->min = $this->min + $p;
+        $this->max = $this->max + $p;
+    }
+}

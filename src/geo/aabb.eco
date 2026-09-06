@@ -1,0 +1,193 @@
+/**
+ * Axis-aligned box in 3D.
+ */
+
+namespace visu::geo;
+
+use visu::math::{Vec3, max, min};
+
+public struct AABB
+{
+    public Vec3 $min;
+    public Vec3 $max;
+
+    public const function width() : float32
+    {
+        return $this->max->x - $this->min->x;
+    }
+
+    public const function height() : float32
+    {
+        return $this->max->y - $this->min->y;
+    }
+
+    public const function depth() : float32
+    {
+        return $this->max->z - $this->min->z;
+    }
+
+    public const function center() : Vec3
+    {
+        return ($this->min + $this->max) * 0.5f;
+    }
+
+    public function extend(const AABB& $aabb) : void
+    {
+        $this->min = min($this->min, $aabb->min);
+        $this->max = max($this->max, $aabb->max);
+    }
+
+    public const function union(const AABB& $aabb) : AABB
+    {
+        AABB $out = $this;
+        $out->extend($aabb);
+        return $out;
+    }
+
+    public const function intersects(const AABB& $aabb) : bool
+    {
+        return !(
+            $this->min->x > $aabb->max->x
+            || $this->max->x < $aabb->min->x
+            || $this->min->y > $aabb->max->y
+            || $this->max->y < $aabb->min->y
+            || $this->min->z > $aabb->max->z
+            || $this->max->z < $aabb->min->z
+        );
+    }
+
+    public const function contains(Vec3 $point) : bool
+    {
+        return !(
+            $point->x < $this->min->x
+            || $point->x > $this->max->x
+            || $point->y < $this->min->y
+            || $point->y > $this->max->y
+            || $point->z < $this->min->z
+            || $point->z > $this->max->z
+        );
+    }
+
+    /**
+     * Translation that would push this box out of `$aabb` along
+     * each overlapping axis. Zero on an axis that does not overlap.
+     */
+    public const function avoid(const AABB& $aabb) : Vec3
+    {
+        Vec3 $translation = Vec3(0.0f, 0.0f, 0.0f);
+
+        if ($this->max->x > $aabb->min->x && $this->min->x < $aabb->min->x) {
+            $translation->x = $aabb->min->x - $this->max->x;
+        } else if ($this->min->x < $aabb->max->x && $this->max->x > $aabb->max->x) {
+            $translation->x = $aabb->max->x - $this->min->x;
+        }
+
+        if ($this->max->y > $aabb->min->y && $this->min->y < $aabb->min->y) {
+            $translation->y = $aabb->min->y - $this->max->y;
+        } else if ($this->min->y < $aabb->max->y && $this->max->y > $aabb->max->y) {
+            $translation->y = $aabb->max->y - $this->min->y;
+        }
+
+        if ($this->max->z > $aabb->min->z && $this->min->z < $aabb->min->z) {
+            $translation->z = $aabb->min->z - $this->max->z;
+        } else if ($this->min->z < $aabb->max->z && $this->max->z > $aabb->max->z) {
+            $translation->z = $aabb->max->z - $this->min->z;
+        }
+
+        return $translation;
+    }
+
+    public const function hit(const Ray& $ray) : Vec3?
+    {
+        float32? $t = $this->hitDistance($ray);
+        if ($t == null) {
+            return null;
+        }
+
+        float32 $d = guard $t;
+        return $ray->at($d);
+    }
+
+    public const function hitDistance(const Ray& $ray) : float32?
+    {
+        float32 $tmin = 0.0f;
+        float32 $tmax = 0.0f;
+        bool $started = false;
+
+        if (!slab($ray->origin->x, $ray->direction->x, $this->min->x, $this->max->x, $tmin, $tmax, $started)) {
+            return null;
+        }
+
+        if (!slab($ray->origin->y, $ray->direction->y, $this->min->y, $this->max->y, $tmin, $tmax, $started)) {
+            return null;
+        }
+
+        if (!slab($ray->origin->z, $ray->direction->z, $this->min->z, $this->max->z, $tmin, $tmax, $started)) {
+            return null;
+        }
+
+        if (!$started) {
+            return 0.0f;
+        }
+
+        if ($tmax < 0.0f) {
+            return null;
+        }
+
+        if ($tmin < 0.0f) {
+            return 0.0f;
+        }
+
+        return $tmin;
+    }
+
+    public const function corners() : array<Vec3>
+    {
+        array<Vec3> $out = [
+            Vec3($this->min->x, $this->min->y, $this->min->z),
+            Vec3($this->max->x, $this->min->y, $this->min->z),
+            Vec3($this->max->x, $this->max->y, $this->min->z),
+            Vec3($this->min->x, $this->max->y, $this->min->z),
+            Vec3($this->min->x, $this->min->y, $this->max->z),
+            Vec3($this->max->x, $this->min->y, $this->max->z),
+            Vec3($this->max->x, $this->max->y, $this->max->z),
+            Vec3($this->min->x, $this->max->y, $this->max->z),
+        ];
+        return $out;
+    }
+}
+
+internal function slab(
+    float32 $origin,
+    float32 $dir,
+    float32 $min,
+    float32 $max,
+    float32& $tmin,
+    float32& $tmax,
+    bool& $started
+) : bool
+{
+    if (std::math::abs($dir) < 0.00000001f) {
+        return $origin >= $min && $origin <= $max;
+    }
+
+    float32 $t0 = ($min - $origin) / $dir;
+    float32 $t1 = ($max - $origin) / $dir;
+
+    if ($t0 > $t1) {
+        float32 $tmp = $t0;
+        $t0 = $t1;
+        $t1 = $tmp;
+    }
+
+    if (!$started) {
+        $tmin = $t0;
+        $tmax = $t1;
+        $started = true;
+        return $tmin <= $tmax;
+    }
+
+    $tmin = std::math::max($tmin, $t0);
+    $tmax = std::math::min($tmax, $t1);
+    return $tmin <= $tmax;
+}

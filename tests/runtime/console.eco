@@ -2,7 +2,7 @@
  * DebugConsole command side: Key / Char facts, no overlay.
  */
 
-use visu::os::key;
+use visu::os::{Input, Window, key};
 use visu::runtime::DebugConsole;
 use visu::signal::{Char, ConsoleCommand, Dispatcher, Flow, Key};
 
@@ -23,10 +23,15 @@ function consoleToggle(Dispatcher $d) : void
     $d->dispatch(Key(key::C, 0, key::PRESS, key::MOD_CONTROL));
 }
 
+function consolePair(Dispatcher $d) : DebugConsole
+{
+    return DebugConsole($d, Input(Window('console', 64, 64), $d));
+}
+
 test console_ctrl_c_toggles
 {
     Dispatcher $d = Dispatcher();
-    DebugConsole $c = DebugConsole($d);
+    DebugConsole $c = consolePair($d);
     assert(!$c->enabled(), 'off');
     consoleToggle($d);
     assert($c->enabled(), 'on');
@@ -37,7 +42,7 @@ test console_ctrl_c_toggles
 test console_char_appends_when_enabled
 {
     Dispatcher $d = Dispatcher();
-    DebugConsole $c = DebugConsole($d);
+    DebugConsole $c = consolePair($d);
     $d->dispatch(Char(65));
     assert($c->line() == '', 'disabled ignores');
     consoleToggle($d);
@@ -49,7 +54,7 @@ test console_char_appends_when_enabled
 test console_enter_dispatches_command
 {
     Dispatcher $d = Dispatcher();
-    DebugConsole $c = DebugConsole($d);
+    DebugConsole $c = consolePair($d);
     ConsoleCaught $caught = ConsoleCaught();
     $d->register<ConsoleCommand>(function(const ConsoleCommand& $cmd) : Flow {
         $caught->raw = $cmd->raw;
@@ -68,7 +73,7 @@ test console_enter_dispatches_command
 test console_backspace_trims
 {
     Dispatcher $d = Dispatcher();
-    DebugConsole $c = DebugConsole($d);
+    DebugConsole $c = consolePair($d);
     consoleToggle($d);
     $d->dispatch(Char(65));
     $d->dispatch(Char(66));
@@ -79,7 +84,7 @@ test console_backspace_trims
 test console_history_up_down
 {
     Dispatcher $d = Dispatcher();
-    DebugConsole $c = DebugConsole($d);
+    DebugConsole $c = consolePair($d);
     consoleToggle($d);
     $c->submit('one');
     $c->submit('two');
@@ -96,7 +101,7 @@ test console_history_up_down
 test console_ctrl_c_stops_other_key_handlers
 {
     Dispatcher $d = Dispatcher();
-    DebugConsole $c = DebugConsole($d);
+    DebugConsole $c = consolePair($d);
     ConsoleCaught $caught = ConsoleCaught();
     $d->register<Key>(function(const Key& $k) : Flow {
         $caught->n = $caught->n + 1;
@@ -104,4 +109,41 @@ test console_ctrl_c_stops_other_key_handlers
     }, 0);
     consoleToggle($d);
     assert($caught->n == 0, 'console swallowed ctrl+c');
+}
+
+test console_toggle_claims_and_releases_input
+{
+    Dispatcher $d = Dispatcher();
+    Window $w = Window('console', 64, 64);
+    Input $in = Input($w, $d);
+    DebugConsole $c = DebugConsole($d, $in);
+    assert($in->unclaimed(), 'free');
+    consoleToggle($d);
+    assert($c->enabled(), 'on');
+    assert($in->holds('visu/dev/console'), 'claimed');
+    consoleToggle($d);
+    assert(!$c->enabled(), 'off');
+    assert($in->unclaimed(), 'released');
+}
+
+test console_toggle_stays_off_when_claim_is_taken
+{
+    Dispatcher $d = Dispatcher();
+    Window $w = Window('console', 64, 64);
+    Input $in = Input($w, $d);
+    guard $in->claim('camera') else ($e) {
+        die($e->message());
+    }
+    DebugConsole $c = DebugConsole($d, $in);
+    consoleToggle($d);
+    assert(!$c->enabled(), 'stays off');
+    assert($in->holds('camera'), 'still camera');
+    $d->dispatch(Char(65));
+    assert($c->line() == '', 'no char listener');
+    guard $in->release('camera') else ($e) {
+        die($e->message());
+    }
+    consoleToggle($d);
+    assert($c->enabled(), 'on after free');
+    assert($in->holds('visu/dev/console'), 'claimed');
 }

@@ -17,7 +17,7 @@ use visu::graphics::{
     RenderTarget, ShaderCollection, TargetRef, TextureOptions, TextureRef
 };
 use visu::math::Vec2;
-use visu::os::{Window, WindowError, WindowHints};
+use visu::os::{ContextMap, Input, Window, WindowError, WindowHints};
 use visu::runtime::{Delegate, EventLoop};
 use visu::signal::Dispatcher;
 
@@ -29,6 +29,8 @@ public class App : Delegate
     public Entities $entities;
     public Systems $systems;
     public Dispatcher $dispatcher;
+    public Input $input;
+    public ContextMap $inputContext;
     public ShaderCollection $shaders;
     public Services $services;
     public Options $options;
@@ -53,6 +55,9 @@ public class App : Delegate
         $this->entities = Entities();
         $this->systems = Systems();
         $this->dispatcher = Dispatcher();
+        $this->input = Input($this->window, $this->dispatcher);
+        $this->inputContext = ContextMap($this->dispatcher, $this->input);
+        $this->window->setHandler($this->input);
         $this->shaders = ShaderCollection($this->gpu, $this->shaderDir($services));
         $this->events = EventLoop();
         $this->frameIndex = 0;
@@ -61,9 +66,9 @@ public class App : Delegate
         $this->blit = FullscreenTextureRenderer();
     }
 
-    public function initialize() : result<bool, WindowError>
+    public function initialize() : status<WindowError>
     {
-        bool $ok = guard $this->window->initialize($this->gpu) else ($e) {
+        guard $this->window->initialize($this->gpu) else ($e) {
             return .error($e);
         }
 
@@ -73,12 +78,12 @@ public class App : Delegate
             $this->window->setSwapInterval(0);
         }
 
-        bool $blit = guard $this->blit->load($this->gpu) else ($e) {
+        guard $this->blit->load($this->gpu) else ($e) {
             $this->fail = .shader($e);
-            return .ok(true);
+            return .ok;
         }
 
-        return .ok(true);
+        return .ok;
     }
 
     public function ready() : void
@@ -90,6 +95,7 @@ public class App : Delegate
 
     public function update() : void
     {
+        $this->inputContext->reset();
         $this->window->poll();
         $this->events->tick();
         $this->systems->update($this->entities);
@@ -160,27 +166,28 @@ public class App : Delegate
                 QuickstartPassData $data = $frame->get<QuickstartPassData>();
                 $io->writes($data->renderTarget);
             },
-            execute: function(Context $ctx) : result<bool, PipelineError> {
+            execute: function(Context $ctx) : status<PipelineError> {
                 QuickstartPassData $data = $ctx->frame->get<QuickstartPassData>();
                 RenderTarget $rt = guard $ctx->pool->activate($data->renderTarget) else ($e) {
                     return .error(.pool($e));
                 }
                 function<void(App, Context, RenderTarget)> $draw = guard $this->options->draw else {
-                    return .ok(true);
+                    return .ok;
                 }
                 $draw($this, $ctx, $rt);
-                return .ok(true);
+                return .ok;
             }
         ));
     }
 
     private function finishFrame(Pipeline $pipeline, float32 $compensation) : void
     {
-        bool $ok = guard $pipeline->execute($this->frameIndex, $compensation) else ($e) {
+        guard $pipeline->execute($this->frameIndex, $compensation) else ($e) {
             $this->fail = $e;
             return;
         }
         $this->window->swap();
+        $this->input->endFrame();
         $this->frameIndex = $this->frameIndex + 1;
     }
 

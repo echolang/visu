@@ -1,0 +1,81 @@
+/**
+ * Cylinder aligned to Y, centered at the origin. Radial side
+ * normals; optional caps are flat. Side UVs wrap the circumference
+ * (u) and the height (v).
+ */
+
+namespace visu::geo;
+
+use visu::math::{Vec2, Vec3};
+
+public function cylinder(
+    PrimitiveBuilder& $b,
+    float32 $radius = 1.0f,
+    float32 $height = 1.0f,
+    int32 $segments = 32,
+    bool $caps = true
+) : void
+{
+    int32 $segN = std::math::max($segments, 3);
+    int32 $vertexCount = $segN * 6;
+    if ($caps) {
+        $vertexCount = $vertexCount + $segN * 6;
+    }
+
+    $b->room($vertexCount);
+    float32 $hy = $height * 0.5f;
+
+    array<float32> $cosTheta = array<float32>();
+    array<float32> $sinTheta = array<float32>();
+    int32 $cols = $segN + 1;
+    $cosTheta->reserve($cols as usize);
+    $sinTheta->reserve($cols as usize);
+
+    for ($seg = 0; $seg <= $segN; $seg = $seg + 1) {
+        float32 $theta = 2.0f * std::math::PI_F32 * ($seg as float32) / ($segN as float32);
+        $cosTheta[] = std::math::cos($theta);
+        $sinTheta[] = std::math::sin($theta);
+    }
+
+    Vec3 $topNormal = Vec3(0.0f, 1.0f, 0.0f);
+    Vec3 $topCenter = Vec3(0.0f, $hy, 0.0f);
+    Vec3 $bottomNormal = Vec3(0.0f, -1.0f, 0.0f);
+    Vec3 $bottomCenter = Vec3(0.0f, -$hy, 0.0f);
+
+    for ($seg = 0; $seg < $segN; $seg = $seg + 1) {
+        int32 $seg1 = $seg + 1;
+        float32 $c0 = $cosTheta[$seg as usize];
+        float32 $s0 = $sinTheta[$seg as usize];
+        float32 $c1 = $cosTheta[$seg1 as usize];
+        float32 $s1 = $sinTheta[$seg1 as usize];
+        float32 $u0 = ($seg as float32) / ($segN as float32);
+        float32 $u1 = ($seg1 as float32) / ($segN as float32);
+
+        Vec3 $n0 = Vec3($c0, 0.0f, $s0);
+        Vec3 $n1 = Vec3($c1, 0.0f, $s1);
+        Vec3 $bottom0 = Vec3($radius * $c0, -$hy, $radius * $s0);
+        Vec3 $bottom1 = Vec3($radius * $c1, -$hy, $radius * $s1);
+        Vec3 $top0 = Vec3($radius * $c0, $hy, $radius * $s0);
+        Vec3 $top1 = Vec3($radius * $c1, $hy, $radius * $s1);
+
+        $b->add($bottom0, $n0, Vec2($u0, 0.0f));
+        $b->add($top0, $n0, Vec2($u0, 1.0f));
+        $b->add($bottom1, $n1, Vec2($u1, 0.0f));
+
+        $b->add($bottom1, $n1, Vec2($u1, 0.0f));
+        $b->add($top0, $n0, Vec2($u0, 1.0f));
+        $b->add($top1, $n1, Vec2($u1, 1.0f));
+
+        if (!$caps) {
+            continue;
+        }
+
+        $b->add($topCenter, $topNormal, Vec2(0.5f, 0.5f));
+        $b->add($top1, $topNormal, Vec2(0.5f + 0.5f * $c1, 0.5f + 0.5f * $s1));
+        $b->add($top0, $topNormal, Vec2(0.5f + 0.5f * $c0, 0.5f + 0.5f * $s0));
+
+        $b->add($bottomCenter, $bottomNormal, Vec2(0.5f, 0.5f));
+        $b->add($bottom0, $bottomNormal, Vec2(0.5f + 0.5f * $c0, 0.5f + 0.5f * $s0));
+        $b->add($bottom1, $bottomNormal, Vec2(0.5f + 0.5f * $c1, 0.5f + 0.5f * $s1));
+    }
+}

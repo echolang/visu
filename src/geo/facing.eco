@@ -1,0 +1,57 @@
+/**
+ * Direction helpers that did not belong on Transform: project a
+ * vector onto a plane, the shortest rotation between two vectors,
+ * and an orientation that faces a target.
+ */
+
+namespace visu::geo;
+
+use visu::math::{Quat, Vec3, cross, dot, length, normalize};
+
+public function projectOnPlane(Vec3 $dir, Vec3 $normal) : Vec3
+{
+    Vec3 $along = $normal * dot($dir, $normal);
+    if (length($along) >= 1.0f) {
+        return $dir;
+    }
+
+    return normalize($dir - $along);
+}
+
+public function rotationBetween(Vec3 $start, Vec3 $dest) : Quat
+{
+    Vec3 $a = normalize($start);
+    Vec3 $b = normalize($dest);
+    float32 $cosTheta = dot($a, $b);
+
+    if ($cosTheta < -1.0f + 0.001f) {
+        Vec3 $axis = cross(Vec3(0.0f, 0.0f, 1.0f), $a);
+        if (length($axis) < 0.01f) {
+            $axis = cross(Vec3(1.0f, 0.0f, 0.0f), $a);
+        }
+
+        return Quat(angleAxis: std::math::PI_F32, normalize($axis));
+    }
+
+    Vec3 $rotationAxis = cross($a, $b);
+    float32 $s = std::math::sqrt((1.0f + $cosTheta) * 2.0f);
+    float32 $invs = 1.0f / $s;
+
+    return Quat(
+        $rotationAxis->x * $invs,
+        $rotationAxis->y * $invs,
+        $rotationAxis->z * $invs,
+        $s * 0.5f
+    );
+}
+
+public function facing(Vec3 $position, Vec3 $target, forward: Vec3 $forward, up: Vec3 $up) : Quat
+{
+    Vec3 $direction = $target - $position;
+    Quat $rot1 = rotationBetween($forward, $direction);
+    Vec3 $right = cross($direction, $up);
+    Vec3 $desiredUp = cross($right, $direction);
+    Vec3 $newUp = $rot1 * $up;
+    Quat $rot2 = rotationBetween($newUp, $desiredUp);
+    return $rot2 * $rot1;
+}

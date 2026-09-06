@@ -63,7 +63,7 @@ public class ShaderCollection
      * `.vert|.frag|.geo|.tessc|.tesse.{suffix}` stripped. Already-registered
      * names are left alone. Does not compile.
      */
-    public function scan(string? $directory = null) : result<bool, ShaderError>
+    public function scan(string? $directory = null) : status<ShaderError>
     {
         string $root = guard $directory else {
             return $this->collect($this->loader->directory);
@@ -164,7 +164,7 @@ public class ShaderCollection
         $this->shaders[$shader]->forget();
     }
 
-    public function load() : result<bool, ShaderError>
+    public function load() : status<ShaderError>
     {
         array<string> $names = $this->shaders->keys();
 
@@ -180,13 +180,13 @@ public class ShaderCollection
             }
         }
 
-        return .ok(true);
+        return .ok;
     }
 
-    public function loadPermutations(string $shader) : result<bool, ShaderError>
+    public function loadPermutations(string $shader) : status<ShaderError>
     {
         if (!$this->shaders->has($shader)) {
-            return .ok(true);
+            return .ok;
         }
 
         array<string> $names = $this->permutations($shader);
@@ -200,7 +200,7 @@ public class ShaderCollection
             }
         }
 
-        return .ok(true);
+        return .ok;
     }
 
     public function destroy() : void
@@ -226,11 +226,11 @@ public class ShaderCollection
         return $this->shaders[$name];
     }
 
-    private function collect(string $directory) : result<bool, ShaderError>
+    private function collect(string $directory) : status<ShaderError>
     {
         string $root = slashDir($directory);
         map<string, array<ShaderFile>> $programs = map<string, array<ShaderFile>>();
-        bool $ok = guard $this->walk($root, $root, shaderSuffix(), $programs) else ($e) {
+        guard $this->walk($root, $root, shaderSuffix(), $programs) else ($e) {
             return .error($e);
         }
         array<string> $names = $programs->keys();
@@ -245,7 +245,7 @@ public class ShaderCollection
             $entry->files = $programs[$name];
         }
 
-        return .ok(true);
+        return .ok;
     }
 
     private function walk(
@@ -253,7 +253,7 @@ public class ShaderCollection
         string $prefix,
         string $ext,
         map<string, array<ShaderFile>>& $programs,
-    ) : result<bool, ShaderError>
+    ) : status<ShaderError>
     {
         io::dir $d = guard io::opendir($dir) else ($e) {
             return .error(.scan($dir, $e->message()));
@@ -291,12 +291,12 @@ public class ShaderCollection
         }
 
         foreach ($subs as $sub) {
-            bool $ok = guard $this->walk($sub, $prefix, $ext, $programs) else ($e) {
+            guard $this->walk($sub, $prefix, $ext, $programs) else ($e) {
                 return .error($e);
             }
         }
 
-        return .ok(true);
+        return .ok;
     }
 
     internal function compileBase(ShaderRef $ref) : result<ShaderProgram, ShaderError>
@@ -405,7 +405,7 @@ public class ShaderCollection
             $program->attach($stage);
         }
 
-        bool $ok = guard $program->link($linkName) else ($e) {
+        guard $program->link($linkName) else ($e) {
             $program->destroy();
             return .error($e);
         }

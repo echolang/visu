@@ -1,0 +1,44 @@
+/**
+ * sgn, scalar mix, rotationBetween, projectOnPlane.
+ */
+
+use visu::geo::{facing, projectOnPlane, rotationBetween};
+use visu::math::{Quat, Vec3, dot, equal, mix, sgn};
+
+test sgn_and_scalar_mix
+{
+    assert(sgn(2.0f) == 1, 'pos');
+    assert(sgn(-3.0f) == -1, 'neg');
+    assert(sgn(0.0f) == 0, 'zero');
+    assert(equal(mix(0.0f, 10.0f, 0.25f), 2.5f), 'mix');
+}
+
+test rotation_between_identity_and_opposite
+{
+    Vec3 $x = Vec3(1.0f, 0.0f, 0.0f);
+    Quat $id = rotationBetween($x, $x);
+    assert(equal($id * $x, $x), 'same');
+
+    Vec3 $nx = Vec3(-1.0f, 0.0f, 0.0f);
+    Quat $flip = rotationBetween($x, $nx);
+    assert(equal($flip * $x, $nx, 0.01f), 'opposite');
+}
+
+test facing_uses_caller_up
+{
+    Vec3 $pos = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 $target = Vec3(1.0f, 0.0f, 0.0f);
+    Vec3 $forward = Vec3(0.0f, 0.0f, -1.0f);
+    Quat $yUp = facing($pos, $target, forward: $forward, up: Vec3(0.0f, 1.0f, 0.0f));
+    Quat $zUp = facing($pos, $target, forward: $forward, up: Vec3(0.0f, 0.0f, 1.0f));
+    assert($yUp != $zUp, 'roll');
+}
+
+test project_on_plane_drops_the_normal
+{
+    Vec3 $p = projectOnPlane(Vec3(1.0f, 0.5f, 0.0f), Vec3(0.0f, 1.0f, 0.0f));
+    assert(equal(dot($p, Vec3(0.0f, 1.0f, 0.0f)), 0.0f, 0.01f), 'ortho');
+
+    Vec3 $along = Vec3(0.0f, 2.0f, 0.0f);
+    assert(equal(projectOnPlane($along, Vec3(0.0f, 1.0f, 0.0f)), $along), 'keep');
+}

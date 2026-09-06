@@ -1,0 +1,111 @@
+/**
+ * CPU write recipe for a mesh primitive: which attributes, in
+ * which order, stride in floats. Distinct from the GPU
+ * `visu::graphics::VertexLayout` (byte offsets, locations,
+ * divisors).
+ */
+
+namespace visu::geo;
+
+public enum Attrib
+{
+    case position;
+    case normal;
+    case uv;
+
+    public const function size() : int32
+    {
+        return match ($this) {
+            Attrib::position => 3,
+            Attrib::normal => 3,
+            Attrib::uv => 2,
+        };
+    }
+}
+
+public struct PrimitiveLayout
+{
+    public array<Attrib> $attribs;
+
+    public constructor(array<Attrib> $attribs)
+    {
+        assert($attribs->count() > 0, 'primitive layout is empty');
+        array<Attrib> $unique = array<Attrib>();
+
+        foreach ($attribs as $attrib) {
+            foreach ($unique as $have) {
+                assert($have != $attrib, 'primitive layout: duplicate attrib');
+            }
+
+            $unique[] = $attrib;
+        }
+
+        $this->attribs = $unique;
+    }
+
+    public static function pos3() : PrimitiveLayout
+    {
+        array<Attrib> $attribs = array<Attrib>();
+        $attribs[] = Attrib::position;
+        return PrimitiveLayout($attribs);
+    }
+
+    public static function pos3n3() : PrimitiveLayout
+    {
+        array<Attrib> $attribs = array<Attrib>();
+        $attribs[] = Attrib::position;
+        $attribs[] = Attrib::normal;
+        return PrimitiveLayout($attribs);
+    }
+
+    public static function pos3n3uv2() : PrimitiveLayout
+    {
+        array<Attrib> $attribs = array<Attrib>();
+        $attribs[] = Attrib::position;
+        $attribs[] = Attrib::normal;
+        $attribs[] = Attrib::uv;
+        return PrimitiveLayout($attribs);
+    }
+
+    public const function stride() : int32
+    {
+        int32 $stride = 0;
+
+        foreach ($this->attribs as $attrib) {
+            $stride = $stride + $attrib->size();
+        }
+
+        return $stride;
+    }
+
+    public const function bytes() : int32
+    {
+        return $this->stride() * (mem::size<float32>() as int32);
+    }
+
+    public const function has(Attrib $attrib) : bool
+    {
+        foreach ($this->attribs as $have) {
+            if ($have == $attrib) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public const function offset(Attrib $attrib) : int32?
+    {
+        int32 $offset = 0;
+
+        foreach ($this->attribs as $have) {
+            if ($have == $attrib) {
+                return $offset;
+            }
+
+            $offset = $offset + $have->size();
+        }
+
+        return null;
+    }
+}

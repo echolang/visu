@@ -1,0 +1,85 @@
+/**
+ * View frustum as six planes. `Frustum($viewProjection)` is
+ * Gribb/Hartmann; the six-plane constructor is the unmarked path.
+ */
+
+namespace visu::geo;
+
+use visu::math::{Mat4, Vec3, dot};
+
+public struct Frustum
+{
+    public Plane $left;
+    public Plane $right;
+    public Plane $top;
+    public Plane $bottom;
+    public Plane $near;
+    public Plane $far;
+
+    public constructor(Plane $left, Plane $right, Plane $top, Plane $bottom, Plane $near, Plane $far)
+    {
+        $this->left = $left;
+        $this->right = $right;
+        $this->top = $top;
+        $this->bottom = $bottom;
+        $this->near = $near;
+        $this->far = $far;
+    }
+
+    public constructor(const Mat4& $m)
+    {
+        $this->left = Plane(
+            Vec3($m->c0->w + $m->c0->x, $m->c1->w + $m->c1->x, $m->c2->w + $m->c2->x),
+            $m->c3->w + $m->c3->x
+        );
+        $this->right = Plane(
+            Vec3($m->c0->w - $m->c0->x, $m->c1->w - $m->c1->x, $m->c2->w - $m->c2->x),
+            $m->c3->w - $m->c3->x
+        );
+        $this->top = Plane(
+            Vec3($m->c0->w - $m->c0->y, $m->c1->w - $m->c1->y, $m->c2->w - $m->c2->y),
+            $m->c3->w - $m->c3->y
+        );
+        $this->bottom = Plane(
+            Vec3($m->c0->w + $m->c0->y, $m->c1->w + $m->c1->y, $m->c2->w + $m->c2->y),
+            $m->c3->w + $m->c3->y
+        );
+        $this->near = Plane(
+            Vec3($m->c0->w + $m->c0->z, $m->c1->w + $m->c1->z, $m->c2->w + $m->c2->z),
+            $m->c3->w + $m->c3->z
+        );
+        $this->far = Plane(
+            Vec3($m->c0->w - $m->c0->z, $m->c1->w - $m->c1->z, $m->c2->w - $m->c2->z),
+            $m->c3->w - $m->c3->z
+        );
+    }
+
+    public const function contains(Vec3 $center, float32 $radius) : bool
+    {
+        if (dot($this->left->normal, $center) + $this->left->distance < -$radius) {
+            return false;
+        }
+
+        if (dot($this->right->normal, $center) + $this->right->distance < -$radius) {
+            return false;
+        }
+
+        if (dot($this->top->normal, $center) + $this->top->distance < -$radius) {
+            return false;
+        }
+
+        if (dot($this->bottom->normal, $center) + $this->bottom->distance < -$radius) {
+            return false;
+        }
+
+        if (dot($this->near->normal, $center) + $this->near->distance < -$radius) {
+            return false;
+        }
+
+        if (dot($this->far->normal, $center) + $this->far->distance < -$radius) {
+            return false;
+        }
+
+        return true;
+    }
+}

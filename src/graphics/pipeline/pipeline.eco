@@ -121,7 +121,7 @@ public class Pipeline
      * Run every pass in scheduled I/O order. `$compensation` defaults
      * to 0 (no interpolation).
      */
-    public function execute(int32 $tick, float32 $compensation = 0.0f) : result<bool, PipelineError>
+    public function execute(int32 $tick, float32 $compensation = 0.0f) : status<PipelineError>
     {
         $this->pool->setCurrentTick($tick);
         array<int32> $order = guard schedule($this->passes->count() as int32, $this->io) else ($e) {
@@ -133,13 +133,13 @@ public class Pipeline
 
         foreach ($order as $index) {
             Pass $pass = $this->passes[$index as usize];
-            bool $ran = guard $pass->execute($ctx) else ($e) {
+            guard $pass->execute($ctx) else ($e) {
                 return .error($e);
             }
         }
 
         $this->pool->collect();
-        return .ok(true);
+        return .ok;
     }
 
     internal function record(int32 $passIndex, ResourceIo $resource, Access $access) : void

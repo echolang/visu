@@ -1,0 +1,194 @@
+/**
+ * Named ActionMap sets. Switch when the UI or a vehicle takes over.
+ * Forwards Key / MouseButton / Click to the active map. Inactive maps
+ * still update held state so down() cannot stick across a switch.
+ * When constructed with Input, handle is skipped while claimed
+ * (track still runs). Dispatcher closures capture a slot, not this.
+ */
+
+namespace visu::os;
+
+use visu::signal::{Click, Dispatcher, Flow, Key, MouseButton};
+
+internal class ActionSlot
+{
+    public ActionMap $current;
+    public map<string, ActionMap> $maps;
+    public Input? $input;
+
+    public constructor()
+    {
+        $this->current = ActionMap();
+        $this->maps = map<string, ActionMap>();
+        $this->input = null;
+    }
+
+    public const function claimed() : bool
+    {
+        Input? $held = $this->input;
+        if ($held == null) {
+            return false;
+        }
+
+        Input $input = guard $held;
+        return !$input->unclaimed();
+    }
+
+    public function handle(const Key& $signal) : Flow
+    {
+        foreach ($this->maps as $map) {
+            $map->track($signal);
+        }
+
+        if ($this->claimed()) {
+            return .proceed;
+        }
+
+        return $this->current->handle($signal);
+    }
+
+    public function handle(const MouseButton& $signal) : Flow
+    {
+        foreach ($this->maps as $map) {
+            $map->track($signal);
+        }
+
+        if ($this->claimed()) {
+            return .proceed;
+        }
+
+        return $this->current->handle($signal);
+    }
+
+    public function handle(const Click& $signal) : Flow
+    {
+        if ($this->claimed()) {
+            return .proceed;
+        }
+
+        return $this->current->handle($signal);
+    }
+}
+
+public class ContextMap
+{
+    private Dispatcher $dispatcher;
+    private ActionSlot $slot;
+    private string? $active;
+    private string? $pending;
+    private int32 $keyId;
+    private int32 $buttonId;
+    private int32 $clickId;
+
+    public constructor(Dispatcher $dispatcher, Input? $input = null)
+    {
+        $this->dispatcher = $dispatcher;
+        $this->slot = ActionSlot();
+        $this->slot->input = $input;
+        $this->active = null;
+        $this->pending = null;
+
+        ActionSlot $slot = $this->slot;
+        $this->keyId = $dispatcher->register<Key>(function(const Key& $signal) : Flow {
+            return $slot->handle($signal);
+        });
+        $this->buttonId = $dispatcher->register<MouseButton>(function(const MouseButton& $signal) : Flow {
+            return $slot->handle($signal);
+        });
+        $this->clickId = $dispatcher->register<Click>(function(const Click& $signal) : Flow {
+            return $slot->handle($signal);
+        });
+    }
+
+    destructor()
+    {
+        $this->dispatcher->unregister<Key>($this->keyId);
+        $this->dispatcher->unregister<MouseButton>($this->buttonId);
+        $this->dispatcher->unregister<Click>($this->clickId);
+    }
+
+    public const function actions() : ActionMap
+    {
+        return $this->slot->current;
+    }
+
+    public function register(string $name, ActionMap $map) : status<InputError>
+    {
+        if ($this->slot->maps->has($name)) {
+            return .error(.duplicate($name));
+        }
+
+        $this->slot->maps[$name] = $map;
+        return .ok;
+    }
+
+    public function activate(string $name, ActionMap $map) : status<InputError>
+    {
+        guard $this->register($name, $map) else ($e) {
+            return .error($e);
+        }
+
+        return $this->switch($name);
+    }
+
+    public function switch(string $name) : status<InputError>
+    {
+        if (!$this->slot->maps->has($name)) {
+            return .error(.missing($name));
+        }
+
+        $this->slot->current = $this->slot->maps->get($name);
+        $this->active = $name;
+        $this->pending = null;
+        return .ok;
+    }
+
+    public function switch(next: string $name) : status<InputError>
+    {
+        if (!$this->slot->maps->has($name)) {
+            return .error(.missing($name));
+        }
+
+        string $current = guard $this->active else {
+            $this->pending = $name;
+            return .ok;
+        }
+
+        if ($current == $name) {
+            $this->pending = null;
+            return .ok;
+        }
+
+        $this->pending = $name;
+        return .ok;
+    }
+
+    /**
+     * Apply a pending switch, then clear action edges on every
+     * map. Held state stays.
+     */
+    public function reset() : void
+    {
+        string $next = guard $this->pending else {
+            $this->clearEdges();
+            return;
+        }
+
+        $this->pending = null;
+        if ($this->slot->maps->has($next)) {
+            $this->slot->current = $this->slot->maps->get($next);
+            $this->active = $next;
+        }
+
+        $this->clearEdges();
+    }
+
+    private function clearEdges() : void
+    {
+        foreach ($this->slot->maps as $map) {
+            $map->reset();
+        }
+
+        $this->slot->current->reset();
+    }
+}

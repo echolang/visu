@@ -9,7 +9,7 @@ use visu::graphics::Gpu;
 #[group: "glfw"]
 test window_initialize_sets_title_and_size
 {
-    bool $ok = guard init() else ($e) {
+    guard init() else ($e) {
         die($e->message());
     }
 
@@ -17,7 +17,7 @@ test window_initialize_sets_title_and_size
     $hints->visible = false;
     Window $window = Window('Test Window', 640, 480, $hints);
     Gpu $state = Gpu();
-    bool $ready = guard $window->initialize($state) else ($e) {
+    guard $window->initialize($state) else ($e) {
         terminate();
         die($e->message());
     }
@@ -40,7 +40,7 @@ test window_initialize_sets_title_and_size
 #[group: "glfw"]
 test window_initialize_twice_is_already_initialized
 {
-    bool $ok = guard init() else ($e) {
+    guard init() else ($e) {
         die($e->message());
     }
 
@@ -48,12 +48,12 @@ test window_initialize_twice_is_already_initialized
     $hints->visible = false;
     Window $window = Window('twice', 320, 240, $hints);
     Gpu $state = Gpu();
-    bool $ready = guard $window->initialize($state) else ($e) {
+    guard $window->initialize($state) else ($e) {
         terminate();
         die($e->message());
     }
 
-    result<bool, WindowError> $again = $window->initialize($state);
+    status<WindowError> $again = $window->initialize($state);
     assert($again->failed(), 'second initialize fails');
     $window->destroy();
     terminate();
@@ -62,7 +62,7 @@ test window_initialize_twice_is_already_initialized
 #[group: "glfw"]
 test window_set_attribute_visible
 {
-    bool $ok = guard init() else ($e) {
+    guard init() else ($e) {
         die($e->message());
     }
 
@@ -70,13 +70,38 @@ test window_set_attribute_visible
     $hints->visible = false;
     Window $window = Window('attr', 320, 240, $hints);
     Gpu $state = Gpu();
-    bool $ready = guard $window->initialize($state) else ($e) {
+    guard $window->initialize($state) else ($e) {
         terminate();
         die($e->message());
     }
 
     $window->setAttribute(.visible, false);
     assert(!$window->attribute(.visible), 'hidden');
+    $window->destroy();
+    terminate();
+}
+
+#[group: "glfw"]
+test window_cursor_mode_and_key_state
+{
+    guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('cursor', 320, 240, $hints);
+    Gpu $state = Gpu();
+    guard $window->initialize($state) else ($e) {
+        terminate();
+        die($e->message());
+    }
+
+    $window->setCursorMode(.normal);
+    assert($window->cursorMode() == visu::os::CursorMode::normal, 'normal');
+    assert($window->keyState(visu::os::key::SPACE) == visu::os::key::RELEASE, 'key up');
+    assert($window->buttonState(visu::os::mouse::LEFT) == visu::os::key::RELEASE, 'button up');
+    $window->cursor();
     $window->destroy();
     terminate();
 }

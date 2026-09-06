@@ -1,0 +1,348 @@
+/**
+ * Pollable input helper. The window's event handler: records press /
+ * release edges (per poll and per frame), dispatches typed facts, and
+ * turns a left down+up that did not travel far into Click. Systems
+ * claim a mutex string so they do not steal each other's mouse.
+ */
+
+namespace visu::os;
+
+use visu::math::{Vec2, distance};
+use visu::os::key;
+use visu::os::mouse;
+use visu::signal::{
+    Char, CharMod, Click, Cursor, CursorEnter, Dispatcher, Drop, Key,
+    MouseButton, Scroll
+};
+
+public class Input : WindowEventHandler
+{
+    /**
+     * Max cursor travel between left down and up for a Click.
+     */
+    public float32 $clickSlop = 10.0f;
+
+    private Window $window;
+    private Dispatcher $dispatcher;
+    private string? $context;
+    private Vec2 $lastCursor;
+    private bool $cursorSeeded;
+    private Vec2 $lastLeftDown;
+    private Vec2 $lastLeftUp;
+    private map<int32, bool> $keyPress;
+    private map<int32, bool> $keyRelease;
+    private map<int32, bool> $keyPressFrame;
+    private map<int32, bool> $keyReleaseFrame;
+    private map<int32, bool> $buttonPress;
+    private map<int32, bool> $buttonRelease;
+    private map<int32, bool> $buttonPressFrame;
+    private map<int32, bool> $buttonReleaseFrame;
+
+    public constructor(Window $window, Dispatcher $dispatcher)
+    {
+        $this->window = $window;
+        $this->dispatcher = $dispatcher;
+        $this->context = null;
+        $this->lastCursor = Vec2(0.0f);
+        $this->cursorSeeded = false;
+        $this->lastLeftDown = Vec2(0.0f);
+        $this->lastLeftUp = Vec2(0.0f);
+        $this->keyPress = map<int32, bool>();
+        $this->keyRelease = map<int32, bool>();
+        $this->keyPressFrame = map<int32, bool>();
+        $this->keyReleaseFrame = map<int32, bool>();
+        $this->buttonPress = map<int32, bool>();
+        $this->buttonRelease = map<int32, bool>();
+        $this->buttonPressFrame = map<int32, bool>();
+        $this->buttonReleaseFrame = map<int32, bool>();
+    }
+
+    public const function state(int32 $key) : int32
+    {
+        return $this->window->keyState($key);
+    }
+
+    public const function state(button: int32 $button) : int32
+    {
+        return $this->window->buttonState($button);
+    }
+
+    public const function down(int32 $key) : bool
+    {
+        return $this->window->keyState($key) == key::PRESS;
+    }
+
+    public const function down(button: int32 $button) : bool
+    {
+        return $this->window->buttonState($button) == key::PRESS;
+    }
+
+    public const function up(int32 $key) : bool
+    {
+        return !$this->down($key);
+    }
+
+    public const function up(button: int32 $button) : bool
+    {
+        return !$this->down(button: $button);
+    }
+
+    public const function pressed(int32 $key) : bool
+    {
+        return $this->keyPress->has($key);
+    }
+
+    public const function pressed(button: int32 $button) : bool
+    {
+        return $this->buttonPress->has($button);
+    }
+
+    public const function released(int32 $key) : bool
+    {
+        return $this->keyRelease->has($key);
+    }
+
+    public const function released(button: int32 $button) : bool
+    {
+        return $this->buttonRelease->has($button);
+    }
+
+    public const function framePressed(int32 $key) : bool
+    {
+        return $this->keyPressFrame->has($key);
+    }
+
+    public const function framePressed(button: int32 $button) : bool
+    {
+        return $this->buttonPressFrame->has($button);
+    }
+
+    public const function frameReleased(int32 $key) : bool
+    {
+        return $this->keyReleaseFrame->has($key);
+    }
+
+    public const function frameReleased(button: int32 $button) : bool
+    {
+        return $this->buttonReleaseFrame->has($button);
+    }
+
+    public const function presses() : array<int32>
+    {
+        return $this->keyPress->keys();
+    }
+
+    public const function framePresses() : array<int32>
+    {
+        return $this->keyPressFrame->keys();
+    }
+
+    public const function cursor() : Vec2
+    {
+        return $this->window->cursor();
+    }
+
+    public function setCursor(Vec2 $position) : void
+    {
+        $this->window->setCursor($position);
+        $this->lastCursor = $position;
+        $this->cursorSeeded = true;
+    }
+
+    /**
+     * Cursor in [-1, 1] from the window's size.
+     */
+    public const function normalizedCursor() : Vec2
+    {
+        Vec2 $pos = $this->window->cursor();
+        float32 $w = $this->window->width() as float32;
+        float32 $h = $this->window->height() as float32;
+        return Vec2(
+            $pos->x / ($w * 0.5f) - 1.0f,
+            $pos->y / ($h * 0.5f) - 1.0f
+        );
+    }
+
+    public const function lastCursor() : Vec2
+    {
+        return $this->lastCursor;
+    }
+
+    public const function lastLeftDown() : Vec2
+    {
+        return $this->lastLeftDown;
+    }
+
+    public const function lastLeftUp() : Vec2
+    {
+        return $this->lastLeftUp;
+    }
+
+    public const function cursorMode() : CursorMode
+    {
+        return $this->window->cursorMode();
+    }
+
+    public function setCursorMode(CursorMode $mode) : void
+    {
+        $this->window->setCursorMode($mode);
+    }
+
+    public function endFrame() : void
+    {
+        $this->keyPressFrame->clear();
+        $this->keyReleaseFrame->clear();
+        $this->buttonPressFrame->clear();
+        $this->buttonReleaseFrame->clear();
+    }
+
+    public const function unclaimed() : bool
+    {
+        return $this->context == null;
+    }
+
+    public const function holds(string $name) : bool
+    {
+        string $held = guard $this->context else {
+            return false;
+        }
+
+        return $held == $name;
+    }
+
+    public const function claimed() : string?
+    {
+        return $this->context;
+    }
+
+    public function claim(string $name) : status<InputError>
+    {
+        string $by = guard $this->context else {
+            $this->context = $name;
+            return .ok;
+        }
+
+        return .error(.claimed($by));
+    }
+
+    public function release(string $name) : status<InputError>
+    {
+        string $held = guard $this->context else {
+            return .error(.notHeld($name, null));
+        }
+
+        if ($held != $name) {
+            return .error(.notHeld($name, $held));
+        }
+
+        $this->context = null;
+        return .ok;
+    }
+
+    public function handleKey(Window $window, int32 $key, int32 $scancode, int32 $action, int32 $mods) : void
+    {
+        if ($action == key::PRESS) {
+            $this->keyPress[$key] = true;
+            $this->keyPressFrame[$key] = true;
+        } else if ($action == key::RELEASE) {
+            $this->keyRelease[$key] = true;
+            $this->keyReleaseFrame[$key] = true;
+        }
+
+        $this->dispatcher->dispatch(Key($key, $scancode, $action, $mods));
+    }
+
+    public function handleChar(Window $window, int32 $codepoint) : void
+    {
+        $this->dispatcher->dispatch(Char($codepoint));
+    }
+
+    public function handleCharMods(Window $window, int32 $codepoint, int32 $mods) : void
+    {
+        $this->dispatcher->dispatch(CharMod($codepoint, $mods));
+    }
+
+    public function handleMouseButton(Window $window, int32 $button, int32 $action, int32 $mods) : void
+    {
+        if ($action == key::PRESS) {
+            $this->buttonPress[$button] = true;
+            $this->buttonPressFrame[$button] = true;
+        } else if ($action == key::RELEASE) {
+            $this->buttonRelease[$button] = true;
+            $this->buttonReleaseFrame[$button] = true;
+        }
+
+        $this->dispatcher->dispatch(MouseButton($button, $action, $mods));
+
+        if ($button != mouse::LEFT) {
+            return;
+        }
+
+        if ($action == key::PRESS) {
+            $this->lastLeftDown = $this->lastCursor;
+            return;
+        }
+
+        if ($action != key::RELEASE) {
+            return;
+        }
+
+        $this->lastLeftUp = $this->lastCursor;
+        float32 $travel = distance($this->lastCursor, $this->lastLeftDown);
+        if ($travel < $this->clickSlop) {
+            $this->dispatcher->dispatch(Click(
+                $mods,
+                $this->lastCursor,
+                $this->lastLeftDown,
+                $travel
+            ));
+        }
+    }
+
+    public function handleCursorPos(Window $window, float64 $x, float64 $y) : void
+    {
+        float64 $offsetX = $x - ($this->lastCursor->x as float64);
+        float64 $offsetY = $y - ($this->lastCursor->y as float64);
+        $this->dispatcher->dispatch(Cursor($x, $y, $offsetX, $offsetY));
+        $this->lastCursor = Vec2($x as float32, $y as float32);
+        $this->cursorSeeded = true;
+    }
+
+    public function handleCursorEnter(Window $window, bool $entered) : void
+    {
+        $this->dispatcher->dispatch(CursorEnter($entered));
+    }
+
+    public function handleScroll(Window $window, float64 $x, float64 $y) : void
+    {
+        $this->dispatcher->dispatch(Scroll($x, $y));
+    }
+
+    public function handleDrop(Window $window, array<string> $paths) : void
+    {
+        $this->dispatcher->dispatch(Drop($paths));
+    }
+
+    public function handleWillPoll(Window $window) : void
+    {
+        $this->keyPress->clear();
+        $this->keyRelease->clear();
+        $this->buttonPress->clear();
+        $this->buttonRelease->clear();
+        if ($this->cursorSeeded) {
+            return;
+        }
+
+        ptr<glfw::Window> $glfw = $window->glfwHandle();
+        if ($glfw:$ == null) {
+            return;
+        }
+
+        $this->lastCursor = $window->cursor();
+        $this->cursorSeeded = true;
+    }
+
+    public function handleDidPoll(Window $window) : void
+    {
+    }
+}

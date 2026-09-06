@@ -1,0 +1,96 @@
+/**
+ * UV sphere as a non-indexed triangle list. Normals are the
+ * normalized position (smooth). Pole rings are fans so the mesh
+ * has no degenerate triangles at the poles.
+ */
+
+namespace visu::geo;
+
+use visu::math::{Vec2, Vec3};
+
+public function sphere(
+    PrimitiveBuilder& $b,
+    float32 $radius = 1.0f,
+    int32 $segments = 32,
+    int32 $rings = 16
+) : void
+{
+    int32 $segN = std::math::max($segments, 3);
+    int32 $ringN = std::math::max($rings, 2);
+    int32 $vertexCount = 2 * $segN * 3 + std::math::max(0, $ringN - 2) * $segN * 6;
+    $b->room($vertexCount);
+
+    int32 $cols = $segN + 1;
+    array<float32> $cosTheta = array<float32>();
+    array<float32> $sinTheta = array<float32>();
+    $cosTheta->reserve($cols as usize);
+    $sinTheta->reserve($cols as usize);
+
+    for ($seg = 0; $seg <= $segN; $seg = $seg + 1) {
+        float32 $theta = 2.0f * std::math::PI_F32 * ($seg as float32) / ($segN as float32);
+        $cosTheta[] = std::math::cos($theta);
+        $sinTheta[] = std::math::sin($theta);
+    }
+
+    int32 $nodeCount = ($ringN + 1) * $cols;
+    array<Vec3> $positions = array<Vec3>();
+    array<Vec3> $normals = array<Vec3>();
+    array<Vec2> $uvs = array<Vec2>();
+    $positions->reserve($nodeCount as usize);
+    $normals->reserve($nodeCount as usize);
+    $uvs->reserve($nodeCount as usize);
+
+    for ($ring = 0; $ring <= $ringN; $ring = $ring + 1) {
+        float32 $phi = std::math::PI_F32 * ($ring as float32) / ($ringN as float32);
+        float32 $cosPhi = std::math::cos($phi);
+        float32 $sinPhi = std::math::sin($phi);
+        float32 $v = ($ring as float32) / ($ringN as float32);
+
+        for ($seg = 0; $seg <= $segN; $seg = $seg + 1) {
+            Vec3 $normal = Vec3($sinPhi * $cosTheta[$seg as usize], $cosPhi, $sinPhi * $sinTheta[$seg as usize]);
+            $normals[] = $normal;
+            $positions[] = $normal * $radius;
+            $uvs[] = Vec2(($seg as float32) / ($segN as float32), $v);
+        }
+    }
+
+    for ($ring = 0; $ring < $ringN; $ring = $ring + 1) {
+        float32 $v0 = ($ring as float32) / ($ringN as float32);
+        int32 $ring1 = $ring + 1;
+        float32 $v1 = ($ring1 as float32) / ($ringN as float32);
+        int32 $rowTop = $ring * $cols;
+        int32 $rowBottom = ($ring + 1) * $cols;
+        bool $isTopCap = $ring == 0;
+        bool $isBottomCap = $ring == $ringN - 1;
+
+        for ($seg = 0; $seg < $segN; $seg = $seg + 1) {
+            float32 $uMid = (($seg as float32) + 0.5f) / ($segN as float32);
+            int32 $t0i = $rowTop + $seg;
+            int32 $t1i = $rowTop + $seg + 1;
+            int32 $b0i = $rowBottom + $seg;
+            int32 $b1i = $rowBottom + $seg + 1;
+            usize $t0 = $t0i as usize;
+            usize $t1 = $t1i as usize;
+            usize $b0 = $b0i as usize;
+            usize $b1 = $b1i as usize;
+
+            if ($isTopCap) {
+                $b->add($positions[$t0], $normals[$t0], Vec2($uMid, $v0));
+                $b->add($positions[$b1], $normals[$b1], $uvs[$b1]);
+                $b->add($positions[$b0], $normals[$b0], $uvs[$b0]);
+            } else if ($isBottomCap) {
+                $b->add($positions[$t0], $normals[$t0], $uvs[$t0]);
+                $b->add($positions[$t1], $normals[$t1], $uvs[$t1]);
+                $b->add($positions[$b0], $normals[$b0], Vec2($uMid, $v1));
+            } else {
+                $b->add($positions[$t0], $normals[$t0], $uvs[$t0]);
+                $b->add($positions[$t1], $normals[$t1], $uvs[$t1]);
+                $b->add($positions[$b0], $normals[$b0], $uvs[$b0]);
+
+                $b->add($positions[$t1], $normals[$t1], $uvs[$t1]);
+                $b->add($positions[$b1], $normals[$b1], $uvs[$b1]);
+                $b->add($positions[$b0], $normals[$b0], $uvs[$b0]);
+            }
+        }
+    }
+}

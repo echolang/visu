@@ -1,36 +1,58 @@
 /**
  * Tilde / Ctrl+C command line. Types into a buffer, dispatches
- * ConsoleCommand on enter. Overlay drawing waits on bitmap fonts;
- * claiming the input-context mutex waits on Input.
+ * ConsoleCommand on enter. Overlay drawing waits on bitmap fonts.
+ * Toggle claims the input-context mutex. ContextMap then skips
+ * action handle so bound keys are not stolen while the line is
+ * open (`track` still updates down()).
  */
 
 namespace visu::runtime;
 
-use visu::os::key;
+use visu::os::{Input, key};
 use visu::signal::{Char, ConsoleCommand, Dispatcher, Flow, Key};
 
 internal const HISTORY_LIMIT = 100;
+internal const CONSOLE_CONTEXT = 'visu/dev/console';
 
 public class DebugConsole
 {
     private Dispatcher $dispatcher;
+    private Input $input;
     private bool $enabled;
     private string $line;
     private array<string> $history;
     private int32 $historyIndex;
+    private int32 $keyId;
     private int32? $charListener;
 
-    public constructor(Dispatcher $dispatcher)
+    public constructor(Dispatcher $dispatcher, Input $input)
     {
         $this->dispatcher = $dispatcher;
+        $this->input = $input;
         $this->enabled = false;
         $this->line = '';
         $this->history = array<string>();
         $this->historyIndex = 0;
         $this->charListener = null;
-        $this->dispatcher->register<Key>(function(const Key& $signal) : Flow {
+        $this->keyId = $this->dispatcher->register<Key>(function(const Key& $signal) : Flow {
             return $this->handleKey($signal);
         }, -1000);
+    }
+
+    destructor()
+    {
+        $this->dispatcher->unregister<Key>($this->keyId);
+        if ($this->charListener != null) {
+            int32 $id = guard $this->charListener;
+            $this->dispatcher->unregister<Char>($id);
+            $this->charListener = null;
+        }
+
+        if ($this->input->holds(CONSOLE_CONTEXT)) {
+            guard $this->input->release(CONSOLE_CONTEXT) else {
+                return;
+            }
+        }
     }
 
     public const function enabled() : bool
@@ -124,8 +146,11 @@ public class DebugConsole
 
     private function setEnabled(bool $on) : void
     {
-        $this->enabled = $on;
         if ($on) {
+            guard $this->input->claim(CONSOLE_CONTEXT) else {
+                return;
+            }
+            $this->enabled = true;
             if ($this->charListener != null) {
                 return;
             }
@@ -135,6 +160,13 @@ public class DebugConsole
             }, -1000);
             $this->charListener = $id;
             return;
+        }
+
+        $this->enabled = false;
+        if ($this->input->holds(CONSOLE_CONTEXT)) {
+            guard $this->input->release(CONSOLE_CONTEXT) else {
+                return;
+            }
         }
 
         int32 $id = guard $this->charListener else {
