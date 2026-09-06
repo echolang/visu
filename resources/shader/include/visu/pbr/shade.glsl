@@ -1,12 +1,3 @@
-/**
- * Baked visu/pbr/shade.glsl.
- */
-
-namespace visu::graphics;
-
-internal function visuGlslPbrShade() : string
-{
-    return '
 #ifndef PBR_SHADE_GLSL
 #define PBR_SHADE_GLSL
 
@@ -32,5 +23,4 @@ vec3 pbr_shade(in PBRSurface s, vec3 L, vec3 radiance)
     return (diff + spec) * radiance * NdotL;
 }
 
-#endif';
-}
+#endif

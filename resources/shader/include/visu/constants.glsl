@@ -1,13 +1,4 @@
 /**
- * Baked visu/constants.glsl.
- */
-
-namespace visu::graphics;
-
-internal function visuGlslConstants() : string
-{
-    return '
-/**
  * PI constant
  * ----------------------------------------------------------------------------
  */
@@ -16,5 +7,4 @@ internal function visuGlslConstants() : string
 
 const float PI = 3.14159265359;
 
-#endif';
-}
+#endif

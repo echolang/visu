@@ -1,12 +1,3 @@
-/**
- * Baked visu/functions/gamma_corr.glsl.
- */
-
-namespace visu::graphics;
-
-internal function visuGlslGammaCorr() : string
-{
-    return '
 #ifndef GAMMA_CORR_GLSL
 #define GAMMA_CORR_GLSL
 /**
@@ -25,5 +16,4 @@ vec3 gamma_correct(vec3 color)
     return pow(color, vec3(1.0 / u_display_gamma));
 }
 
-#endif';
-}
+#endif

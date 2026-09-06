@@ -1,12 +1,3 @@
-/**
- * Baked visu/functions/tone_mapping.glsl.
- */
-
-namespace visu::graphics;
-
-internal function visuGlslToneMapping() : string
-{
-    return '
 #ifndef TONE_MAPPING_GLSL
 #define TONE_MAPPING_GLSL
 /**
@@ -57,7 +48,7 @@ vec3 tonemap_reinhard(vec3 x)
 /**
  * Reinhard2 Tone Mapping
  */
-vec3 tonemap_reinhard2(vec3 x) 
+vec3 tonemap_reinhard2(vec3 x)
 {
     const float L_white = 4.0;
     return (x * (1.0 + x / (L_white * L_white))) / (1.0 + x);
@@ -67,7 +58,7 @@ vec3 tonemap_reinhard2(vec3 x)
  * Khronos PBR Neutral Tone Mapper
  * https://github.com/KhronosGroup/ToneMapping/tree/main/PBR_Neutral
  */
-vec3 tonemap_neutral(vec3 color) 
+vec3 tonemap_neutral(vec3 color)
 {
     const float startCompression = 0.8 - 0.04;
     const float desaturation = 0.15;
@@ -108,5 +99,4 @@ vec3 apply_tonemap(vec3 color)
 #endif
 }
 
-#endif';
-}
+#endif

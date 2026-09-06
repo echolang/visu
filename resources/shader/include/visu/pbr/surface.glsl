@@ -1,12 +1,3 @@
-/**
- * Baked visu/pbr/surface.glsl.
- */
-
-namespace visu::graphics;
-
-internal function visuGlslPbrSurface() : string
-{
-    return '
 #ifndef PBR_SURFACE_GLSL
 #define PBR_SURFACE_GLSL
 
@@ -49,5 +40,3 @@ PBRSurface pbr_surface_make(
 }
 
 #endif
-';
-}

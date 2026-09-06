@@ -1,13 +1,4 @@
 /**
- * Baked visu/gbuffer_uniform.glsl.
- */
-
-namespace visu::graphics;
-
-internal function visuGlslGbufferUniform() : string
-{
-    return '
-/**
  * GBuffer Uniforms
  * ----------------------------------------------------------------------------
  */
@@ -36,7 +27,7 @@ struct GBuffer
 
 /**
  * Fetches data from the GBuffer uniforms at the given UV coordinates.
- * 
+ *
  * Note: this really just gives you raw data, no normalisation or clamping is done.
  */
 GBuffer gbuffer_make(vec2 uv)
@@ -55,5 +46,3 @@ GBuffer gbuffer_make(vec2 uv)
 }
 
 #endif
-';
-}
