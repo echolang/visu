@@ -1,0 +1,402 @@
+/**
+ * Host-visible ring (uniforms, staging) and dedicated buffer
+ * memory. Each Buffer is its own VkBuffer + allocation; the
+ * ring is a bump allocator reset in beginFrame.
+ */
+
+namespace visu::graphics;
+
+internal const uint64 RING_BYTES = 4194304;
+internal const uint64 RING_SLACK = 65536;
+
+internal class HostRing
+{
+    public vk::Buffer $buffer;
+    public vk::DeviceMemory $memory;
+    public ptr<uint8> $mapped;
+    public uint64 $bytes;
+    public uint64 $bump;
+
+    public constructor()
+    {
+        $this->buffer = vk::Buffer::none();
+        $this->memory = vk::DeviceMemory::none();
+        $this->mapped:$ = null;
+        $this->bytes = 0;
+        $this->bump = 0;
+    }
+
+    public function reset() : void
+    {
+        $this->bump = 0;
+    }
+
+    public function allocate(Device $device, uint64 $bytes) : status<DeviceError>
+    {
+        $this->destroy($device);
+        BufferHandle $h = guard vkCreateBoundBuffer(
+            $device,
+            $bytes,
+            vk::BUFFER_USAGE_UNIFORM_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+            vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT
+        ) else ($e) {
+            return .error($e);
+        }
+
+        ptr<uint8> $mapped = null;
+        guard vkCheck(
+            vk::MapMemory($device->logical, $h->memory, 0 as uint64, vk::WHOLE_SIZE, 0, &$mapped),
+            'MapMemory'
+        ) else ($e) {
+            vk::DestroyBuffer($device->logical, $h->buffer, null);
+            vk::FreeMemory($device->logical, $h->memory, null);
+            return .error($e);
+        }
+
+        $this->buffer = $h->buffer;
+        $this->memory = $h->memory;
+        $this->mapped:$ = $mapped:$;
+        $this->bytes = $bytes;
+        $this->bump = 0;
+        return .ok;
+    }
+
+    public function destroy(Device $device) : void
+    {
+        if ($device->logical->handle == 0) {
+            $this->mapped:$ = null;
+            $this->buffer = vk::Buffer::none();
+            $this->memory = vk::DeviceMemory::none();
+            $this->bytes = 0;
+            $this->bump = 0;
+            return;
+        }
+
+        if ($this->mapped:$ != null && $this->memory->handle != 0) {
+            vk::UnmapMemory($device->logical, $this->memory);
+            $this->mapped:$ = null;
+        }
+
+        if ($this->buffer->handle != 0) {
+            vk::DestroyBuffer($device->logical, $this->buffer, null);
+            $this->buffer = vk::Buffer::none();
+        }
+
+        if ($this->memory->handle != 0) {
+            vk::FreeMemory($device->logical, $this->memory, null);
+            $this->memory = vk::DeviceMemory::none();
+        }
+
+        $this->bytes = 0;
+        $this->bump = 0;
+    }
+
+    public function bump(uint64 $bytes, uint64 $align, uint32 $frameSlot) : ScratchSlice
+    {
+        assert($this->mapped:$ != null, 'ring is not allocated');
+        uint64 $off = alignUp($this->bump, $align);
+        assert($off + $bytes + RING_SLACK <= $this->bytes, 'uniform ring overflow');
+        $this->bump = $off + $bytes;
+        ptr<uint8> $p = $this->mapped;
+        $p:$ = $this->mapped:$ + ($off as isize);
+        return ScratchSlice($p, $off, $bytes, $frameSlot);
+    }
+}
+
+internal function filledBytes(uint64 $n) : array<uint8>
+{
+    array<uint8> $out = array<uint8>();
+    $out->reserve($n as usize);
+    uint64 $i = 0;
+
+    while ($i < $n) {
+        $out[] = 0;
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function alignUp(uint64 $v, uint64 $a) : uint64
+{
+    if ($a <= 1) {
+        return $v;
+    }
+
+    uint64 $r = $v % $a;
+
+    if ($r == 0) {
+        return $v;
+    }
+
+    return $v + ($a - $r);
+}
+
+internal function vkFindMemoryType(Device $device, uint32 $typeBits, uint32 $flags) : result<uint32, DeviceError>
+{
+    vk::PhysicalDeviceMemoryProperties $props = vk::PhysicalDeviceMemoryProperties();
+    vk::GetPhysicalDeviceMemoryProperties($device->physical, &$props);
+    uint32 $i = 0;
+
+    while ($i < $props->memoryTypeCount) {
+        bool $okBits = ($typeBits & ((1 as uint32) << $i)) != 0;
+        bool $okFlags = ($props->memoryTypes[$i]->propertyFlags & $flags) == $flags;
+
+        if ($okBits && $okFlags) {
+            return .ok($i);
+        }
+
+        $i = $i + 1;
+    }
+
+    return .error(.outOfMemory(0 as uint64));
+}
+
+internal function vkAllocMemory(
+    Device $device,
+    const vk::MemoryRequirements& $req,
+    uint32 $flags
+) : result<vk::DeviceMemory, DeviceError>
+{
+    uint32 $type = guard vkFindMemoryType($device, $req->memoryTypeBits, $flags) else ($e) {
+        return .error($e);
+    }
+
+    vk::MemoryAllocateInfo $ai = vk::MemoryAllocateInfo();
+    $ai->allocationSize = $req->size;
+    $ai->memoryTypeIndex = $type;
+    vk::DeviceMemory $mem = vk::DeviceMemory::none();
+    guard vkCheck(
+        vk::AllocateMemory($device->logical, &$ai, null, &$mem),
+        'AllocateMemory'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    return .ok($mem);
+}
+
+internal function vkCreateBoundBuffer(
+    Device $device,
+    uint64 $bytes,
+    uint32 $usage,
+    uint32 $memFlags
+) : result<BufferHandle, DeviceError>
+{
+    assert($bytes > 0, 'buffer size');
+    vk::BufferCreateInfo $ci = vk::BufferCreateInfo();
+    $ci->size = $bytes;
+    $ci->usage = $usage;
+    $ci->sharingMode = vk::SHARING_MODE_EXCLUSIVE;
+    vk::Buffer $buffer = vk::Buffer::none();
+    guard vkCheck(
+        vk::CreateBuffer($device->logical, &$ci, null, &$buffer),
+        'CreateBuffer'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    vk::MemoryRequirements $req = vk::MemoryRequirements();
+    vk::GetBufferMemoryRequirements($device->logical, $buffer, &$req);
+    vk::DeviceMemory $mem = guard vkAllocMemory($device, $req, $memFlags) else ($e) {
+        vk::DestroyBuffer($device->logical, $buffer, null);
+        return .error($e);
+    }
+
+    guard vkCheck(
+        vk::BindBufferMemory($device->logical, $buffer, $mem, 0 as uint64),
+        'BindBufferMemory'
+    ) else ($e) {
+        vk::FreeMemory($device->logical, $mem, null);
+        vk::DestroyBuffer($device->logical, $buffer, null);
+        return .error($e);
+    }
+
+    return .ok(BufferHandle($buffer, $mem, 0 as uint64, $bytes));
+}
+
+internal function vkBufferUsage(BufferUsage $usage) : uint32
+{
+    uint32 $bits = vk::BUFFER_USAGE_TRANSFER_DST_BIT;
+    return match ($usage) {
+        BufferUsage::vertex => $bits | vk::BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        BufferUsage::index => $bits | vk::BUFFER_USAGE_INDEX_BUFFER_BIT,
+        BufferUsage::uniform => $bits | vk::BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        BufferUsage::storage => $bits | vk::BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    };
+}
+
+internal function vkOneShotCopy(
+    Device $device,
+    BufferHandle $src,
+    BufferHandle $dst,
+    uint64 $dstOffset,
+    uint64 $bytes
+) : void
+{
+    vk::CommandBuffer $cmd = $device->setupCmd;
+    guard vkCheck(vk::ResetCommandBuffer($cmd, 0), 'ResetCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    vk::CommandBufferBeginInfo $begin = vk::CommandBufferBeginInfo();
+    $begin->flags = vk::COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    guard vkCheck(vk::BeginCommandBuffer($cmd, &$begin), 'BeginCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    vk::BufferCopy $region = vk::BufferCopy();
+    $region->srcOffset = 0 as uint64;
+    $region->dstOffset = $dstOffset;
+    $region->size = $bytes;
+    vk::CmdCopyBuffer($cmd, $src->buffer, $dst->buffer, 1, &$region);
+    vk::MemoryBarrier $mb = vk::MemoryBarrier();
+    $mb->srcAccessMask = vk::ACCESS_TRANSFER_WRITE_BIT;
+    $mb->dstAccessMask = vk::ACCESS_VERTEX_ATTRIBUTE_READ_BIT | vk::ACCESS_INDEX_READ_BIT;
+    vk::CmdPipelineBarrier(
+        $cmd,
+        vk::PIPELINE_STAGE_TRANSFER_BIT,
+        vk::PIPELINE_STAGE_VERTEX_INPUT_BIT,
+        0,
+        1,
+        &$mb,
+        0,
+        null,
+        0,
+        null
+    );
+    guard vkCheck(vk::EndCommandBuffer($cmd), 'EndCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    vk::SubmitInfo $si = vk::SubmitInfo();
+    $si->commandBufferCount = 1;
+    $si->pCommandBuffers:$ = &$cmd;
+    guard vkCheck(vk::QueueSubmit($device->queue, 1, &$si, vk::Fence::none()), 'QueueSubmit') else ($e) {
+        die($e->message());
+    }
+
+    guard vkCheck(vk::QueueWaitIdle($device->queue), 'QueueWaitIdle') else ($e) {
+        die($e->message());
+    }
+}
+
+internal function vkSubmitSetup(Device $device) : void
+{
+    vk::CommandBuffer $cmd = $device->setupCmd;
+    vk::SubmitInfo $si = vk::SubmitInfo();
+    $si->commandBufferCount = 1;
+    $si->pCommandBuffers:$ = &$cmd;
+    guard vkCheck(vk::QueueSubmit($device->queue, 1, &$si, vk::Fence::none()), 'QueueSubmit') else ($e) {
+        die($e->message());
+    }
+
+    guard vkCheck(vk::QueueWaitIdle($device->queue), 'QueueWaitIdle') else ($e) {
+        die($e->message());
+    }
+}
+
+internal function vkBeginSetup(Device $device) : vk::CommandBuffer
+{
+    vk::CommandBuffer $cmd = $device->setupCmd;
+    guard vkCheck(vk::ResetCommandBuffer($cmd, 0), 'ResetCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    vk::CommandBufferBeginInfo $begin = vk::CommandBufferBeginInfo();
+    $begin->flags = vk::COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    guard vkCheck(vk::BeginCommandBuffer($cmd, &$begin), 'BeginCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    return $cmd;
+}
+
+internal function vkMipSize(int32 $base, int32 $mip) : int32
+{
+    int32 $s = $base >> $mip;
+
+    if ($s < 1) {
+        return 1;
+    }
+
+    return $s;
+}
+
+internal function vkFillBufferImageCopy(
+    Texture $texture,
+    int32 $mip,
+    uint64 $rowBytes,
+    uint32 $bpp
+) : vk::BufferImageCopy
+{
+    vk::BufferImageCopy $region = vk::BufferImageCopy();
+    int32 $w = vkMipSize($texture->width, $mip);
+    uint64 $tight = ($w as uint64) * ($bpp as uint64);
+
+    if ($rowBytes > $tight) {
+        $region->bufferRowLength = ($rowBytes / ($bpp as uint64)) as uint32;
+    }
+
+    $region->imageSubresource->aspectMask = vkAspect($texture->format);
+    $region->imageSubresource->mipLevel = $mip as uint32;
+    $region->imageSubresource->layerCount = 1;
+    $region->imageExtent->width = $w as uint32;
+    $region->imageExtent->height = vkMipSize($texture->height, $mip) as uint32;
+    $region->imageExtent->depth = 1;
+    return $region;
+}
+
+internal function vkOneShotCopyImageToBuffer(
+    Device $device,
+    Texture $texture,
+    BufferHandle $dst,
+    uint64 $rowBytes,
+    uint32 $bpp
+) : void
+{
+    vk::CommandBuffer $cmd = vkBeginSetup($device);
+    vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferSrc, vkAspect($texture->format));
+    vk::BufferImageCopy $region = vkFillBufferImageCopy($texture, 0, $rowBytes, $bpp);
+    vk::CmdCopyImageToBuffer(
+        $cmd,
+        $texture->handle->image,
+        vk::IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        $dst->buffer,
+        1,
+        &$region
+    );
+    guard vkCheck(vk::EndCommandBuffer($cmd), 'EndCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    vkSubmitSetup($device);
+}
+
+internal function vkOneShotCopyBufferToImage(
+    Device $device,
+    BufferHandle $src,
+    Texture $texture,
+    int32 $mip,
+    uint64 $rowBytes,
+    uint32 $bpp
+) : void
+{
+    vk::CommandBuffer $cmd = vkBeginSetup($device);
+    vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferDst, vkAspect($texture->format));
+    vk::BufferImageCopy $region = vkFillBufferImageCopy($texture, $mip, $rowBytes, $bpp);
+    vk::CmdCopyBufferToImage(
+        $cmd,
+        $src->buffer,
+        $texture->handle->image,
+        vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &$region
+    );
+    vkRecordBarrier($cmd, $texture->handle->image, .transferDst, .shaderRead, vkAspect($texture->format));
+    guard vkCheck(vk::EndCommandBuffer($cmd), 'EndCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    vkSubmitSetup($device);
+}

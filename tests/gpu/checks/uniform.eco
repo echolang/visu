@@ -1,0 +1,69 @@
+/**
+ * UniformBuffer slot 0 paints the same UV-quad blue tint.
+ */
+
+use visu::graphics::{
+    CallbackPass, ClearPass, ClearPassOptions, Context, Device, Frame, GpuPass,
+    IoSink, Mesh, Pipeline, PipelineError, Raster, RenderEncoder,
+    ShaderCollection, TargetRef, UniformBuffer, VertexLayout
+};
+use visu::math::Vec4;
+
+public function checkUniformSlots(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('quad') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'ubo');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'ubo-draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(Context $ctx) : status<PipelineError> {
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                Device $device = $ctx->device;
+                Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+                    return .quad($device);
+                });
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3uv2(), Raster::none());
+                $pass->bind($enc);
+                UniformBuffer $ubo = UniformBuffer($device, 0);
+                $ubo->push(QuadParams(Vec4(0.0f, 0.0f, 0.5f, 1.0f)));
+                $ubo->bind($enc);
+                $mesh->draw($enc);
+                $enc->end();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('ubo');
+    $shaders->destroy();
+    assert($pixels[0] < 16, 'bottom-left r');
+    assert($pixels[1] < 16, 'bottom-left g');
+    assert($pixels[2] > 100 && $pixels[2] < 160, 'bottom-left b');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_uniform_slots
+{
+    GpuContext $gpu = gpuHidden('ubo');
+    checkUniformSlots($gpu);
+    $gpu->end();
+}
+#[end]

@@ -1,0 +1,78 @@
+/**
+ * Phase 3a: create a graphics pipeline under echoc test's fork.
+ * MoltenVK compiles MSL through the XPC shader service here.
+ */
+
+use std::io;
+use visu::os::{Window, WindowHints, init, terminate};
+use visu::graphics::{Device, ShaderModuleHandle, PipelineHandle};
+
+// opt-in: echoc test --define VISU_XPC_SPIKE --filter vulkan_create_graphics_pipeline
+#[if: VISU_XPC_SPIKE]
+#[group: "xpc"]
+test vulkan_create_graphics_pipeline
+{
+    guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('pso', 64, 64, $hints);
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
+        terminate();
+        die($e->message());
+    }
+
+    string $vsBytes = guard io::readfile('tests/resources/shaders/triangle.vert.spv') else ($e) {
+        $window->destroy();
+        $device->shutdown();
+        terminate();
+        die($e->message());
+    }
+    string $fsBytes = guard io::readfile('tests/resources/shaders/triangle.frag.spv') else ($e) {
+        $window->destroy();
+        $device->shutdown();
+        terminate();
+        die($e->message());
+    }
+
+    ShaderModuleHandle $vs = guard $device->createShaderModule(.vertex, $vsBytes, 'triangle.vert') else ($e) {
+        $window->destroy();
+        $device->shutdown();
+        terminate();
+        die($e->message());
+    }
+    ShaderModuleHandle $fs = guard $device->createShaderModule(.fragment, $fsBytes, 'triangle.frag') else ($e) {
+        $device->destroyShaderModule($vs);
+        $window->destroy();
+        $device->shutdown();
+        terminate();
+        die($e->message());
+    }
+
+    PipelineHandle $pso = guard visu::graphics::vkCreateGraphicsPipeline(
+        $device,
+        $vs,
+        $fs,
+        $device->vkFormat
+    ) else ($e) {
+        $device->destroyShaderModule($vs);
+        $device->destroyShaderModule($fs);
+        $window->destroy();
+        $device->shutdown();
+        terminate();
+        die($e->message());
+    }
+
+    assert($pso->pipeline->handle != 0, 'pipeline');
+    $device->destroyPipeline($pso);
+    $device->destroyShaderModule($vs);
+    $device->destroyShaderModule($fs);
+    $window->destroy();
+    $device->shutdown();
+    terminate();
+}
+#[end]

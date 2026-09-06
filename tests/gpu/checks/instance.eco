@@ -1,0 +1,79 @@
+/**
+ * Two instanced triangles at x = ±0.5 paint solid red.
+ */
+
+use visu::graphics::{
+    CallbackPass, ClearPass, ClearPassOptions, Context, Device, Frame, GpuPass,
+    IoSink, Mesh, Pipeline, PipelineError, Raster, RenderEncoder,
+    ShaderCollection, TargetRef, VertexLayout
+};
+use visu::math::Vec4;
+
+public function checkInstanceOffsets(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('instance') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'inst');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'inst-draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(Context $ctx) : status<PipelineError> {
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                Device $device = $ctx->device;
+                Mesh $mesh = $ctx->pool->cache<Mesh>('inst', function() : Mesh {
+                    array<float32> $verts = [
+                        -0.45f, -0.45f, 0.0f,
+                        0.45f, -0.45f, 0.0f,
+                        0.0f, 0.45f, 0.0f
+                    ];
+                    Mesh $m = Mesh($device, $verts, stride: 12);
+                    array<float32> $offsets = [
+                        -0.5f, 0.0f, 0.0f,
+                        0.5f, 0.0f, 0.0f
+                    ];
+                    $m->instances($offsets, stride: 12);
+                    return $m;
+                });
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3Instance3(), Raster::none());
+                $pass->draw($enc, $mesh, QuadParams(Vec4(1.0f, 0.0f, 0.0f, 1.0f)));
+                $enc->end();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('inst');
+    $shaders->destroy();
+    usize $left = ((32 * 64 + 16) * 4) as usize;
+    usize $right = ((32 * 64 + 48) * 4) as usize;
+    assert($pixels[$left] > 240, 'left r');
+    assert($pixels[$left + 1] < 16, 'left g');
+    assert($pixels[$right] > 240, 'right r');
+    assert($pixels[$right + 1] < 16, 'right g');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_instance_offsets
+{
+    GpuContext $gpu = gpuHidden('inst');
+    checkInstanceOffsets($gpu);
+    $gpu->end();
+}
+#[end]

@@ -5,45 +5,64 @@
  *   echoc run -m examples --target pipeline --define VISU_FINITE
  */
 
+use visu::app::ensureLogger;
 use visu::os::{Window, init, terminate};
 use visu::math::Vec4;
 use visu::graphics::{
-    Gpu, Pool, Frame, Pipeline, Backbuffer, ClearPass, ClearPassOptions
+    Device, DeviceError, FrameStatus, Pool, Frame, Pipeline, Backbuffer,
+    ClearPass, ClearPassOptions
 };
 
+ensureLogger();
 guard init() else ($e) {
     die($e->message());
 }
 
 Window $window = Window('visu pipeline', 800, 600);
-Gpu $state = Gpu();
-guard $window->initialize($state) else ($e) {
+Device $device = Device();
+guard $window->initialize($device) else ($e) {
     terminate();
     die($e->message());
 }
 
 $window->setSwapInterval(1);
 
-Pool $pool = Pool($state);
+Pool $pool = Pool($device);
 int32 $tick = 0;
 int32 $n = 0;
 
 while (!$window->shouldClose() && !visu::finiteDone($n)) {
-    Frame $frame = Frame();
-    Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
-
-    Backbuffer $back = $frame->get<Backbuffer>();
-    $pipeline->add(ClearPass($back->target, ClearPassOptions(color: Vec4(0.25f, 0.25f, 0.25f, 1.0f))));
-    guard $pipeline->execute($tick) else ($e) {
-        die($e->message());
+    int32 $w = $window->framebufferWidth();
+    int32 $h = $window->framebufferHeight();
+    FrameStatus $status = guard $device->beginFrame($w, $h) else ($e) {
+        match ($e) {
+            DeviceError::surfaceLost => {
+                break;
+            },
+            else => {
+                die($e->message());
+            },
+        };
     }
 
-    $window->swap();
+    if ($status == FrameStatus::ready) {
+        Frame $frame = Frame();
+        Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
+        Backbuffer $back = $frame->get<Backbuffer>();
+        $pipeline->add(ClearPass($back->target, ClearPassOptions(color: Vec4(0.25f, 0.25f, 0.25f, 1.0f))));
+        guard $pipeline->execute($tick) else ($e) {
+            die($e->message());
+        }
+        $window->swap();
+    }
+
     $window->poll();
     $tick = $tick + 1;
     $n = $n + 1;
 }
 
+$device->waitIdle();
 $pool->destroy();
 $window->destroy();
+$device->shutdown();
 terminate();

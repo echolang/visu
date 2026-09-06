@@ -1,6 +1,6 @@
 /**
- * A place to draw: pixel size, content scale, and a Framebuffer.
- * Class so the pool, window, and callers share one identity.
+ * A place to draw: pixel size, content scale, color and depth
+ * textures. Constructible without a device (scheduler tests).
  */
 
 namespace visu::graphics;
@@ -11,42 +11,25 @@ public class RenderTarget
 {
     public int32 $width;
     public int32 $height;
+    public float32 $contentScaleX = 1.0f;
+    public float32 $contentScaleY = 1.0f;
+    public array<Texture> $colors;
+    public Texture? $depth = null;
 
-    /**
-     * Pixel density on the x axis (high-dpi).
-     */
-    public float32 $contentScaleX;
-
-    /**
-     * Pixel density on the y axis (high-dpi).
-     */
-    public float32 $contentScaleY;
-
-    /**
-     * The render target's framebuffer.
-     */
-    public Framebuffer $framebuffer;
-
-    public constructor(int32 $width, int32 $height, Framebuffer $framebuffer)
+    public constructor(int32 $width, int32 $height)
     {
         $this->width = $width;
         $this->height = $height;
         $this->contentScaleX = 1.0f;
         $this->contentScaleY = 1.0f;
-        $this->framebuffer = $framebuffer;
+        $this->colors = array<Texture>();
     }
 
-    /**
-     * Logical width in points.
-     */
     public const function effectiveWidth() : int32
     {
         return ($this->width as float32 / $this->contentScaleX) as int32;
     }
 
-    /**
-     * Logical height in points.
-     */
     public const function effectiveHeight() : int32
     {
         return ($this->height as float32 / $this->contentScaleY) as int32;
@@ -57,44 +40,43 @@ public class RenderTarget
         return Vec2($this->effectiveWidth() as float32, $this->effectiveHeight() as float32);
     }
 
-    public const function isOffscreen() : bool
+    public const function formats() : TargetFormats
     {
-        return $this->framebuffer->owned;
-    }
+        TargetFormats $out = TargetFormats();
+        uint32 $i = 0;
+        array<Texture> $colors = $this->colors;
 
-    public function updateViewport() : void
-    {
-        $this->framebuffer->gpu()->viewport(0, 0, $this->width, $this->height);
-    }
-
-    /**
-     * Bind the framebuffer and set the viewport. The verb for "I
-     * will draw here".
-     */
-    public function preparePass() : void
-    {
-        $this->framebuffer->bind(.readDraw);
-        $this->updateViewport();
-    }
-
-    public function bindForRead() : bool
-    {
-        return $this->framebuffer->bind(.read);
-    }
-
-    /**
-     * New size in pixels. Updates viewport and renderbuffer
-     * attachments; texture attachments are left as-is.
-     */
-    public function resize(int32 $width, int32 $height) : void
-    {
-        $this->width = $width;
-        $this->height = $height;
-        $this->framebuffer->bind(.readDraw);
-        $this->updateViewport();
-
-        if ($this->framebuffer->owned) {
-            $this->framebuffer->resize($width, $height);
+        foreach ($colors as $tex) {
+            assert($i < 4, 'render target color count');
+            $out->colors[$i] = $tex->format;
+            $i = $i + 1;
         }
+
+        $out->colorCount = $i;
+        // PixelFormat? assignment crashes LLVM (InsertValue type mismatch);
+        // depth format stays unset until that is fixed
+        return $out;
+    }
+
+    public const function pass(load: LoadOp $load = .load) : RenderPassDesc
+    {
+        RenderPassDesc $desc = RenderPassDesc();
+        array<Texture> $colors = $this->colors;
+
+        foreach ($colors as $tex) {
+            ColorTarget $slot = ColorTarget($tex);
+            $slot->load = $load;
+            $slot->store = .store;
+            $desc->colors[] = $slot;
+        }
+
+        Texture $depth = guard $this->depth else {
+            return $desc;
+        }
+        DepthTarget $d = DepthTarget($depth);
+        $d->load = $load;
+        $d->store = .store;
+        $desc->depth = $d;
+        return $desc;
     }
 }

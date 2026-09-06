@@ -1,0 +1,76 @@
+/**
+ * A GPU buffer. Always device-local; uploads are staged through
+ * a host-visible copy submitted on the setup command buffer.
+ */
+
+namespace visu::graphics;
+
+public class Buffer : GpuObject
+{
+    public Device $device;
+    public const BufferHandle $handle;
+    private bool $dead;
+
+    public constructor(Device $device, BufferDesc $desc)
+    {
+        result<BufferHandle, DeviceError> $made = $device->createBuffer($desc);
+        BufferHandle $handle = guard $made else ($e) {
+            die($e->message());
+        }
+        $this->device = $device;
+        $this->handle = $handle;
+        $this->dead = false;
+    }
+
+    public constructor(Device $device, BufferUsage $usage, const array<float32>& $data)
+    {
+        usize $n = $data->count();
+        assert($n > 0, 'buffer data');
+        uint64 $bytes = ($n as uint64) * (mem::size<float32>() as uint64);
+        BufferDesc $desc = BufferDesc($usage, $bytes);
+        result<BufferHandle, DeviceError> $made = $device->createBuffer($desc);
+        BufferHandle $handle = guard $made else ($e) {
+            die($e->message());
+        }
+        $this->device = $device;
+        $this->handle = $handle;
+        $this->dead = false;
+        ptr<const float32> $src = $data->data();
+        $device->uploadBuffer($handle, 0 as uint64, ptr<const uint8>($src:$), $bytes);
+    }
+
+    public constructor(Device $device, BufferUsage $usage, ptr<const uint8> $src, uint64 $bytes)
+    {
+        assert($bytes > 0, 'buffer data');
+        BufferDesc $desc = BufferDesc($usage, $bytes);
+        result<BufferHandle, DeviceError> $made = $device->createBuffer($desc);
+        BufferHandle $handle = guard $made else ($e) {
+            die($e->message());
+        }
+        $this->device = $device;
+        $this->handle = $handle;
+        $this->dead = false;
+        $device->uploadBuffer($handle, 0 as uint64, $src, $bytes);
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->dead = true;
+        $this->device->destroyBuffer($this->handle);
+    }
+
+    public function upload(ptr<const uint8> $src, uint64 $bytes, uint64 $offset = 0) : void
+    {
+        assert(!$this->dead, 'upload on destroyed buffer');
+        $this->device->uploadBuffer($this->handle, $offset, $src, $bytes);
+    }
+}

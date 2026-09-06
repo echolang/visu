@@ -1,0 +1,33 @@
+/**
+ * The one site that names glfw and a backend together.
+ */
+
+namespace visu::os;
+
+use visu::graphics::{Device, DeviceError, Surface};
+
+#[if: os == darwin && !VISU_BACKEND_VULKAN]
+internal function createSurface(Window $window, Device $device) : result<Surface, DeviceError>
+{
+    ptr<uint8> $view = glfw::getCocoaWindow($window->glfwHandle());
+
+    if ($view:$ == null) {
+        return .error(.metal('createSurface', 'no cocoa window'));
+    }
+
+    return .ok(Surface($view));
+}
+#[else]
+internal function createSurface(Window $window, Device $device) : result<Surface, DeviceError>
+{
+    uint64 $handle = 0;
+    int32 $code = glfw::createWindowSurface($device->instance->handle, $window->glfwHandle(), null, &$handle);
+    vk::Result $r = vk::Result::from($code);
+
+    if (!$r->ok()) {
+        return .error(.vulkan('createWindowSurface', $code));
+    }
+
+    return .ok(Surface(vk::SurfaceKHR($handle)));
+}
+#[end]

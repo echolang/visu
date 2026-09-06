@@ -1,0 +1,184 @@
+/**
+ * Open dynamic-rendering encoder. end() must run; the destructor
+ * asserts it did.
+ */
+
+namespace visu::graphics;
+
+public class RenderEncoder : RenderEncoderProtocol
+{
+    private Device $device;
+    private TargetFormats $formats;
+    private int32 $width;
+    private int32 $height;
+    private bool $ended;
+    private bool $viewportSet;
+    private bool $scissorSet;
+    private bool $pipelineSet;
+    private Texture? $boundTex;
+    private Sampler? $boundSamp;
+    private uint32 $boundSlot;
+
+    public constructor(Device $device, TargetFormats $formats, int32 $width, int32 $height)
+    {
+        $this->device = $device;
+        $this->formats = $formats;
+        $this->width = $width;
+        $this->height = $height;
+        $this->ended = false;
+        $this->viewportSet = false;
+        $this->scissorSet = false;
+        $this->pipelineSet = false;
+        $this->boundTex = null;
+        $this->boundSamp = null;
+        $this->boundSlot = 0;
+    }
+
+    destructor()
+    {
+        assert($this->ended, 'RenderEncoder dropped without end');
+    }
+
+    public const function formats() : TargetFormats
+    {
+        return $this->formats;
+    }
+
+    public const function width() : int32
+    {
+        return $this->width;
+    }
+
+    public const function height() : int32
+    {
+        return $this->height;
+    }
+
+    public function setPipeline(const GpuPass& $pass) : void
+    {
+        assert(!$this->ended, 'setPipeline after end');
+        PipelineHandle $pso = vkGetPipeline($this->device, $pass, $this->formats);
+        vk::CmdBindPipeline(
+            $this->device->currentCmd(),
+            vk::PIPELINE_BIND_POINT_GRAPHICS,
+            $pso->pipeline
+        );
+        $this->pipelineSet = true;
+        FrameSlot $slot = $this->device->slots[$this->device->slot];
+        $slot->uniformsDirty = true;
+
+        if (!$this->viewportSet) {
+            $this->setViewport(0, 0, $this->width, $this->height);
+        }
+
+        if (!$this->scissorSet) {
+            $this->setScissor(0, 0, $this->width, $this->height);
+        }
+    }
+
+    public function setViewport(int32 $x, int32 $y, int32 $w, int32 $h) : void
+    {
+        assert(!$this->ended, 'setViewport after end');
+        vk::Viewport $vp = vk::Viewport();
+        $vp->x = $x as float32;
+        $vp->y = ($y + $h) as float32;
+        $vp->width = $w as float32;
+        $vp->height = -($h as float32);
+        $vp->minDepth = 0.0f;
+        $vp->maxDepth = 1.0f;
+        vk::CmdSetViewport($this->device->currentCmd(), 0, 1, &$vp);
+        $this->viewportSet = true;
+    }
+
+    public function setScissor(int32 $x, int32 $y, int32 $w, int32 $h) : void
+    {
+        assert(!$this->ended, 'setScissor after end');
+        vk::Rect2D $scissor = vk::Rect2D();
+        $scissor->offset = vk::Offset2D($x, $y);
+        $scissor->extent = vk::Extent2D($w as uint32, $h as uint32);
+        vk::CmdSetScissor($this->device->currentCmd(), 0, 1, &$scissor);
+        $this->scissorSet = true;
+    }
+
+    public function setVertexBuffer(uint32 $binding, Buffer $buffer, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'setVertexBuffer after end');
+        vk::Buffer $buf = $buffer->handle->buffer;
+        uint64 $off = $offset;
+        vk::CmdBindVertexBuffers($this->device->currentCmd(), $binding, 1, &$buf, &$off);
+    }
+
+    public function setIndexBuffer(Buffer $buffer, IndexType $type, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'setIndexBuffer after end');
+        vk::CmdBindIndexBuffer(
+            $this->device->currentCmd(),
+            $buffer->handle->buffer,
+            $offset,
+            vkIndexType($type)
+        );
+    }
+
+    public function bindUniform(uint32 $slot, ScratchSlice $slice) : void
+    {
+        assert(!$this->ended, 'bindUniform after end');
+        assert($slot < UNIFORM_SLOTS, 'uniform slot');
+        assert($slice->frameSlot == $this->device->slot, 'scratch from another frame');
+        FrameSlot $fs = $this->device->slots[$this->device->slot];
+        $fs->dynOff[$slot] = $slice->offset as uint32;
+        $fs->uniformsDirty = true;
+    }
+
+    public function upload<T>(const T& $params, slot: uint32 $slot = 0) : void
+    {
+        uint64 $n = mem::size<T>() as uint64;
+        ScratchSlice $slice = $this->device->scratch($n, $this->device->limits->uniformAlign);
+        T $local = $params;
+        ptr<const uint8> $src = ptr<const uint8>(&$local);
+        mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $n);
+        $this->bindUniform($slot, $slice);
+    }
+
+    public function bindTexture(uint32 $slot, Texture $texture, Sampler $sampler) : void
+    {
+        assert(!$this->ended, 'bindTexture after end');
+        assert($slot < TEXTURE_SLOTS, 'texture slot');
+        assert($texture->state == ResourceState::shaderRead, 'bindTexture: texture is not shaderRead');
+        $this->boundTex = $texture;
+        $this->boundSamp = $sampler;
+        $this->boundSlot = $slot;
+    }
+
+    public function draw(int32 $first, int32 $count, int32 $instances = 1) : void
+    {
+        assert(!$this->ended, 'draw after end');
+        assert($this->pipelineSet, 'draw before setPipeline');
+        vkFlushUniforms($this->device);
+        vkFlushTextures($this->device, $this->boundTex, $this->boundSamp, $this->boundSlot);
+        vk::CmdDraw($this->device->currentCmd(), $count as uint32, $instances as uint32, $first as uint32, 0);
+    }
+
+    public function drawIndexed(int32 $firstIndex, int32 $count, int32 $instances = 1, int32 $vertexOffset = 0) : void
+    {
+        assert(!$this->ended, 'drawIndexed after end');
+        assert($this->pipelineSet, 'drawIndexed before setPipeline');
+        vkFlushUniforms($this->device);
+        vkFlushTextures($this->device, $this->boundTex, $this->boundSamp, $this->boundSlot);
+        vk::CmdDrawIndexed(
+            $this->device->currentCmd(),
+            $count as uint32,
+            $instances as uint32,
+            $firstIndex as uint32,
+            $vertexOffset,
+            0
+        );
+    }
+
+    public function end() : void
+    {
+        assert(!$this->ended, 'RenderEncoder.end twice');
+        $this->ended = true;
+        vk::CmdEndRendering($this->device->currentCmd());
+        $this->device->encoderClosed();
+    }
+}

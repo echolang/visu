@@ -1,0 +1,154 @@
+/**
+ * Metal render-pipeline cache. Baked at first setPipeline from
+ * GpuPass.key + encoder TargetFormats.
+ */
+
+namespace visu::graphics;
+
+internal function metalVertexDescriptor(const VertexLayout& $layout) : mtl::VertexDescriptor
+{
+    mtl::VertexDescriptor $vd = mtl::VertexDescriptor();
+    bool $hasVertex = false;
+    bool $hasInstance = false;
+    uint32 $vertexStride = 0;
+    uint32 $instanceStride = 0;
+    uint32 $n = 0;
+
+    foreach ($layout->attrs as $attr) {
+        assert($n < 8, 'too many vertex attributes');
+        uint32 $bufIndex = VERTEX_BINDING;
+
+        if ($attr->divisor != 0) {
+            $bufIndex = INSTANCE_BINDING;
+            $hasInstance = true;
+            $instanceStride = $attr->stride as uint32;
+        } else {
+            $hasVertex = true;
+            $vertexStride = $attr->stride as uint32;
+        }
+
+        $vd->attributes[] = mtl::VertexAttribute(
+            $attr->location,
+            mtlVertexFormat($attr->components),
+            $attr->offset as uint32,
+            $bufIndex
+        );
+        $n = $n + 1;
+    }
+
+    if ($hasVertex) {
+        $vd->layouts[] = mtl::VertexBufferLayout(VERTEX_BINDING, $vertexStride);
+    }
+
+    if ($hasInstance) {
+        $vd->layouts[] = mtl::VertexBufferLayout(
+            INSTANCE_BINDING,
+            $instanceStride,
+            mtl::VertexStepFunction::perInstance,
+            1
+        );
+    }
+
+    return $vd;
+}
+
+internal function metalPipelineFromPass(
+    Device $device,
+    const GpuPass& $pass,
+    const TargetFormats& $formats,
+    mtl::PixelFormat $depthFmt
+) : result<PipelineHandle, DeviceError>
+{
+    mtl::Device $gpu = guard $device->gpu else {
+        return .error(.noDevice);
+    }
+    mtl::Function $vs = guard $pass->program->vs->fn else {
+        return .error(.pipeline($pass->key(), 'missing vertex function'));
+    }
+    mtl::Function $fs = guard $pass->program->fs->fn else {
+        return .error(.pipeline($pass->key(), 'missing fragment function'));
+    }
+    mtl::VertexDescriptor $vd = metalVertexDescriptor($pass->layout);
+    mtl::RenderPipelineDescriptor $desc = mtl::RenderPipelineDescriptor($vs, $vertexDescriptor: $vd);
+    $desc->fragmentFunction = $fs;
+
+    if ($formats->colorCount > 0) {
+        $desc->colorPixelFormats[] = mtlPixelFormat($formats->colors[0]);
+    } else {
+        $desc->colorPixelFormats[] = mtl::PixelFormat::bgra8Unorm;
+    }
+
+    $desc->depthPixelFormat = $depthFmt;
+    mtl::RenderPipelineState $pso = guard $gpu->newRenderPipelineState($desc) else ($e) {
+        string $log = match ($e) {
+            mtl::Error::compile($m) => $m,
+            mtl::Error::pipeline($m) => $m,
+            mtl::Error::other($m) => $m,
+        };
+        return .error(.pipeline($pass->key(), $log));
+    }
+    return .ok(PipelineHandle($pso));
+}
+
+internal function metalGetPipeline(
+    Device $device,
+    const GpuPass& $pass,
+    const TargetFormats& $formats,
+    mtl::PixelFormat $depthFmt
+) : PipelineHandle
+{
+    uint32 $df = $depthFmt->value();
+    string $key = "{$pass->key()}|{$formats->fingerprint()}|{$df}";
+
+    if ($device->psos->has($key)) {
+        return $device->psos[$key];
+    }
+
+    PipelineHandle $made = guard metalPipelineFromPass($device, $pass, $formats, $depthFmt) else ($e) {
+        die($e->message());
+    }
+    $device->psos[$key] = $made;
+    return $made;
+}
+
+internal function metalDepthKey(const Raster& $raster) : uint32
+{
+    uint32 $key = compareCode($raster->depthCompare) as uint32;
+
+    if ($raster->depthTest) {
+        $key = $key | 16;
+    }
+
+    if ($raster->depthWrite) {
+        $key = $key | 32;
+    }
+
+    return $key;
+}
+
+internal function metalDepthState(Device $device, const Raster& $raster) : mtl::DepthStencilState?
+{
+    mtl::Device $gpu = guard $device->gpu else {
+        return null;
+    }
+    uint32 $key = metalDepthKey($raster);
+
+    if ($device->depthStates->has($key)) {
+        return $device->depthStates[$key];
+    }
+
+    mtl::DepthStencilDescriptor $ds = mtl::DepthStencilDescriptor();
+
+    if ($raster->depthTest) {
+        $ds->depthCompareFunction = mtlCompare($raster->depthCompare);
+    } else {
+        $ds->depthCompareFunction = .always;
+    }
+
+    $ds->depthWriteEnabled = $raster->depthWrite && $raster->depthTest;
+    mtl::DepthStencilState $made = guard $gpu->newDepthStencilState($ds) else {
+        return null;
+    }
+    $device->depthStates[$key] = $made;
+    return $made;
+}

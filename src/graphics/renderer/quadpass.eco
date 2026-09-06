@@ -1,9 +1,9 @@
 /**
  * Graph node minted by QuadRenderer.pass, or constructed with a
- * ShaderRef directly. Writes the target, prepares it, then draws
+ * ShaderRef directly. Writes the target, beginRender, then draws
  * the snapshotted payload T through GpuPass. Mesh comes from the
  * pool. Defaults are the fullscreen-quad shader (pos3uv2, no
- * raster, block QuadParams at slot 0).
+ * raster, slot 0).
  */
 
 namespace visu::graphics;
@@ -13,7 +13,6 @@ public class QuadPass<T> : Pass
     public const TargetRef $target;
     public const VertexLayout $layout;
     public const Raster $raster;
-    public const string $block;
     public const uint32 $slot;
     private ShaderRef $shader;
     private T $params;
@@ -25,7 +24,6 @@ public class QuadPass<T> : Pass
         $this->params = $params;
         $this->layout = VertexLayout::pos3uv2();
         $this->raster = Raster::none();
-        $this->block = 'QuadParams';
         $this->slot = 0;
     }
 
@@ -35,7 +33,6 @@ public class QuadPass<T> : Pass
         T $params,
         VertexLayout $layout,
         Raster $raster,
-        block: string $block = 'QuadParams',
         slot: uint32 $slot = 0
     )
     {
@@ -44,7 +41,6 @@ public class QuadPass<T> : Pass
         $this->params = $params;
         $this->layout = $layout;
         $this->raster = $raster;
-        $this->block = $block;
         $this->slot = $slot;
     }
 
@@ -60,23 +56,16 @@ public class QuadPass<T> : Pass
 
     public function execute(Context $ctx) : status<PipelineError>
     {
-        RenderTarget $rt = guard $ctx->pool->activate($this->target) else ($e) {
-            return .error(.pool($e));
+        RenderEncoder $enc = guard $ctx->beginRender($this->target) else ($e) {
+            return .error($e);
         }
-
-        Gpu $gpu = $ctx->gpu;
+        Device $device = $ctx->device;
         Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
-            return .quad($gpu);
+            return .quad($device);
         });
-
-        GpuPass $pass = GpuPass(
-            $this->shader->program(),
-            $this->layout,
-            $this->raster,
-            slot: $this->slot,
-            block: $this->block
-        );
-        $pass->draw($mesh, $this->params);
+        GpuPass $pass = GpuPass($this->shader->program(), $this->layout, $this->raster, slot: $this->slot);
+        $pass->draw($enc, $mesh, $this->params);
+        $enc->end();
         return .ok;
     }
 }

@@ -665,7 +665,7 @@ function bakeEco(string $vertSpv, string $fragSpv, string $vertMsl, string $frag
 
 namespace visu::graphics;
 
-#[if: VISU_BACKEND_METAL]
+#[if: os == darwin && !VISU_BACKEND_VULKAN]
 internal function blitVertexSource() : string
 {
     return {$vertMetal};

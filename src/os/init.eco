@@ -1,12 +1,25 @@
 /**
  * GLFW lifetime. Call init before creating a window; terminate after
- * the last one is gone.
+ * the last one is gone. Hands GLFW the Vulkan loader before glfwInit
+ * so MoltenVK is found on Darwin.
  */
 
 namespace visu::os;
 
+use visu::graphics::{needsVulkanLoader, vulkanLoaderProc};
+
 public function init() : status<OsError>
 {
+    if (needsVulkanLoader()) {
+        ptr<uint8> $proc = vulkanLoaderProc();
+
+        if ($proc:$ == null) {
+            return .error(.noVulkanLoader);
+        }
+
+        glfw::initVulkanLoader($proc);
+    }
+
     if (glfw::init() != glfw::TRUE) {
         return .error(.glfw(glfw::error_message()));
     }

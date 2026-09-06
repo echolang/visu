@@ -1,7 +1,7 @@
 /**
  * Blit a texture onto a target as a fullscreen quad. Owns the
- * program (inline vs/fs, both backends). load() after the GPU
- * context exists; pass() mints FullscreenQuadPass.
+ * program (baked SPIR-V / MSL). load() after the device exists;
+ * pass() mints FullscreenQuadPass.
  */
 
 namespace visu::graphics;
@@ -20,14 +20,15 @@ public class FullscreenTextureRenderer
         $this->destroy();
     }
 
-    public function load(Gpu $gpu) : status<ShaderError>
+    public function load(Device $device) : status<ShaderError>
     {
         $this->destroy();
-        ShaderProgram $program = ShaderProgram($gpu);
-        $program->attach(ShaderStage($gpu, .vertex, fullscreenBlitVert()));
-        $program->attach(ShaderStage($gpu, .fragment, fullscreenBlitFrag()));
-        guard $program->link('fullscreen-blit') else ($e) {
-            $program->destroy();
+        ShaderProgram $program = guard ShaderProgram::link(
+            $device,
+            'fullscreen-blit',
+            blitVertexBytes(),
+            blitFragmentBytes()
+        ) else ($e) {
             return .error($e);
         }
         $this->program = $program;
@@ -55,20 +56,57 @@ public class FullscreenTextureRenderer
     }
 }
 
-internal function fullscreenBlitVert() : string
+#[if: os == darwin && !VISU_BACKEND_VULKAN]
+internal function blitVertexBytes() : string
 {
-    #[if: VISU_BACKEND_METAL]
-    return "#include <metal_stdlib>\n#include <simd/simd.h>\n\nusing namespace metal;\n\nstruct vs_out\n{\n    float2 vUv [[user(locn0)]];\n    float4 gl_Position [[position]];\n};\n\nstruct vs_in\n{\n    float3 aPos [[attribute(0)]];\n    float2 aUv [[attribute(1)]];\n};\n\nvertex vs_out vs(vs_in in [[stage_in]])\n{\n    vs_out out = {};\n    out.gl_Position = float4(in.aPos, 1.0);\n    out.vUv = in.aUv;\n    return out;\n}\n";
-    #[else]
-    return "#version 330 core\nlayout (location = 0) in vec3 aPos;\nlayout (location = 1) in vec2 aUv;\nout vec2 vUv;\nvoid main()\n{\n    gl_Position = vec4(aPos, 1.0);\n    vUv = aUv;\n}\n";
-    #[end]
+    return blitVertexSource();
 }
 
-internal function fullscreenBlitFrag() : string
+internal function blitFragmentBytes() : string
 {
-    #[if: VISU_BACKEND_METAL]
-    return "#include <metal_stdlib>\n#include <simd/simd.h>\n\nusing namespace metal;\n\nstruct fs_out\n{\n    float4 FragColor [[color(0)]];\n};\n\nstruct fs_in\n{\n    float2 vUv [[user(locn0)]];\n};\n\nfragment fs_out fs(fs_in in [[stage_in]], texture2d<float> u_texture [[texture(0)]], sampler u_samp [[sampler(0)]])\n{\n    fs_out out = {};\n    out.FragColor = u_texture.sample(u_samp, float2(in.vUv.x, 1.0 - in.vUv.y));\n    return out;\n}\n";
-    #[else]
-    return "#version 330 core\nin vec2 vUv;\nout vec4 FragColor;\nuniform sampler2D u_texture;\nvoid main()\n{\n    FragColor = texture(u_texture, vUv);\n}\n";
-    #[end]
+    return blitFragmentSource();
+}
+#[else]
+internal function blitVertexBytes() : string
+{
+    return hexBytes(blitVertexSpvHex());
+}
+
+internal function blitFragmentBytes() : string
+{
+    return hexBytes(blitFragmentSpvHex());
+}
+#[end]
+
+internal function hexBytes(string $hex) : string
+{
+    string $out = '';
+    usize $i = 0;
+    usize $n = $hex->size();
+
+    while ($i + 1 < $n) {
+        uint8 $hi = hexNibble($hex->byte($i));
+        uint8 $lo = hexNibble($hex->byte($i + 1));
+        $out->push(($hi << 4) | $lo);
+        $i = $i + 2;
+    }
+
+    return $out;
+}
+
+internal function hexNibble(uint8 $b) : uint8
+{
+    if ($b >= 48 && $b <= 57) {
+        return $b - 48;
+    }
+
+    if ($b >= 97 && $b <= 102) {
+        return $b - 87;
+    }
+
+    if ($b >= 65 && $b <= 70) {
+        return $b - 55;
+    }
+
+    return 0;
 }

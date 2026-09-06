@@ -1,0 +1,36 @@
+/**
+ * CAMetalLayer attach / resize / next drawable. Device owns
+ * the layer; this file is the glfw-view glue.
+ */
+
+namespace visu::graphics;
+
+internal function mtlAttachLayer(
+    mtl::Device $gpu,
+    ptr<uint8> $view,
+    int32 $width,
+    int32 $height
+) : result<mtl::Layer, DeviceError>
+{
+    if ($view:$ == null) {
+        return .error(.metal('attach', 'no cocoa window'));
+    }
+
+    mtl::Layer $layer = mtl::Layer(attachView: $view, $gpu);
+    $layer->setFramebufferOnly(true);
+
+    if ($width > 0 && $height > 0) {
+        $layer->setDrawableSize(mtl::Size($width as usize, $height as usize));
+    }
+
+    return .ok($layer);
+}
+
+internal function mtlResizeLayer(mtl::Layer $layer, int32 $width, int32 $height) : void
+{
+    if ($width <= 0 || $height <= 0) {
+        return;
+    }
+
+    $layer->setDrawableSize(mtl::Size($width as usize, $height as usize));
+}

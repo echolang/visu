@@ -1,0 +1,40 @@
+/**
+ * Recreate a pool target at a new size and still clear it.
+ */
+
+use visu::graphics::{ClearPass, ClearPassOptions, Pipeline, TargetRef, TextureOptions};
+use visu::math::Vec4;
+
+public function checkRenderTargetResize(GpuContext $gpu) : void
+{
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = $p->createTarget('resize', 16, 16);
+        $p->createColor($t, 'color', TextureOptions());
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(1.0f, 0.0f, 0.0f, 1.0f))));
+    });
+
+    array<uint8> $first = $gpu->readOffscreen('resize', 16, 16);
+    assert($first->count() == 16 * 16 * 4, '16x16 bytes');
+    assert($first[0] > 240, 'first r');
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = $p->createTarget('resize', 32, 32);
+        $p->createColor($t, 'color', TextureOptions());
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 0.0f, 1.0f, 1.0f))));
+    });
+
+    array<uint8> $second = $gpu->readOffscreen('resize', 32, 32);
+    assert($second->count() == 32 * 32 * 4, '32x32 bytes');
+    assert($second[0] < 16, 'second r');
+    assert($second[2] > 240, 'second b');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_render_target_resize
+{
+    GpuContext $gpu = gpuHidden('resize');
+    checkRenderTargetResize($gpu);
+    $gpu->end();
+}
+#[end]

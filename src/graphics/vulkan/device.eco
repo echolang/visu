@@ -1,0 +1,909 @@
+/**
+ * Vulkan Device. The app constructs one; GPU objects store the
+ * handle. Construct-then-initialize; headless construct is legal.
+ */
+
+namespace visu::graphics;
+
+use visu::app::{announceVersion, info};
+
+public class Device : DeviceProtocol
+{
+    internal vk::Instance $instance;
+    internal vk::PhysicalDevice $physical;
+    internal vk::Device $logical;
+    internal vk::Queue $queue;
+    internal uint32 $family;
+    internal vk::SurfaceKHR $surface;
+    internal vk::SwapchainKHR $swapchain;
+    internal uint32 $vkFormat;
+    internal PixelFormat $bbFormat;
+    internal vk::Extent2D $extent;
+    internal array<vk::Image> $images;
+    internal array<vk::ImageView> $views;
+    internal array<vk::Semaphore> $renderDone;
+    internal array<FrameSlot> $slots;
+    internal uint32 $slot;
+    internal uint64 $frames;
+    internal uint32 $imageIndex;
+    internal bool $ready;
+    internal bool $lostFlag;
+    internal bool $pendingResize;
+    internal int32 $pendingW;
+    internal int32 $pendingH;
+    internal bool $vsync;
+    internal bool $encoderOpen;
+    internal bool $inFrame;
+    internal DeviceLimits $limits;
+    internal AdapterInfo $adapterInfo;
+    internal string $appName;
+    internal Texture? $bb;
+    internal vk::PipelineLayout $pipeLayout;
+    internal vk::DescriptorSetLayout $setLayout0;
+    internal vk::DescriptorSetLayout $setLayout1;
+    internal vk::DescriptorPool $set0pool;
+    internal vk::CommandPool $setupPool;
+    internal vk::CommandBuffer $setupCmd;
+    internal map<string, PipelineHandle> $psos;
+    internal map<string, SamplerHandle> $samplerHandles;
+    internal uint64 $uniformRange;
+    internal TextureHandle $dummyImage;
+    internal SamplerHandle $dummySampler;
+
+    public constructor()
+    {
+        $this->instance = vk::Instance::none();
+        $this->physical = vk::PhysicalDevice::none();
+        $this->logical = vk::Device::none();
+        $this->queue = vk::Queue::none();
+        $this->family = 0;
+        $this->surface = vk::SurfaceKHR::none();
+        $this->swapchain = vk::SwapchainKHR::none();
+        $this->vkFormat = 0;
+        $this->bbFormat = .bgra8;
+        $this->extent = vk::Extent2D();
+        $this->images = array<vk::Image>();
+        $this->views = array<vk::ImageView>();
+        $this->renderDone = array<vk::Semaphore>();
+        $this->slots = array<FrameSlot>();
+        $this->slot = 0;
+        $this->frames = 0;
+        $this->imageIndex = 0;
+        $this->ready = false;
+        $this->lostFlag = false;
+        $this->pendingResize = false;
+        $this->pendingW = 0;
+        $this->pendingH = 0;
+        $this->vsync = true;
+        $this->encoderOpen = false;
+        $this->inFrame = false;
+        $this->limits = DeviceLimits();
+        AdapterInfo $info = AdapterInfo();
+        $info->api = 'Vulkan';
+        $this->adapterInfo = $info;
+        $this->appName = 'visu';
+        $this->bb = null;
+        $this->pipeLayout = vk::PipelineLayout::none();
+        $this->setLayout0 = vk::DescriptorSetLayout::none();
+        $this->setLayout1 = vk::DescriptorSetLayout::none();
+        $this->set0pool = vk::DescriptorPool::none();
+        $this->setupPool = vk::CommandPool::none();
+        $this->setupCmd = vk::CommandBuffer::none();
+        $this->psos = map<string, PipelineHandle>();
+        $this->samplerHandles = map<string, SamplerHandle>();
+        $this->uniformRange = RING_SLACK;
+        $this->dummyImage = TextureHandle::none();
+        $this->dummySampler = SamplerHandle::none();
+    }
+
+    destructor()
+    {
+        $this->shutdown();
+    }
+
+    public function initialize(const DeviceOptions& $options) : status<DeviceError>
+    {
+        if ($this->ready) {
+            return .ok;
+        }
+
+        $this->vsync = $options->vsync;
+        guard vkCreateInstance($this, $options) else ($e) {
+            return .error($e);
+        }
+        guard vkPickDevice($this) else ($e) {
+            $this->shutdown();
+            return .error($e);
+        }
+        guard vkCreateDevice($this) else ($e) {
+            $this->shutdown();
+            return .error($e);
+        }
+        guard vkCreateSlots($this) else ($e) {
+            $this->shutdown();
+            return .error($e);
+        }
+        guard vkCreateDrawStack($this) else ($e) {
+            $this->shutdown();
+            return .error($e);
+        }
+        $this->ready = true;
+        announceVersion();
+        AdapterInfo $info = $this->adapterInfo;
+        string $line = $info->line();
+        info("graphics: {$line}");
+        return .ok;
+    }
+
+    public function attach(Surface $surface, int32 $width, int32 $height) : status<DeviceError>
+    {
+        assert($this->ready, 'Device.attach before initialize');
+        $this->surface = $surface->handle;
+        uint32 $ok = 0;
+        guard vkCheck(
+            vk::GetPhysicalDeviceSurfaceSupportKHR($this->physical, $this->family, $this->surface, &$ok),
+            'GetPhysicalDeviceSurfaceSupportKHR'
+        ) else ($e) {
+            return .error($e);
+        }
+
+        if ($ok == 0) {
+            return .error(.noDevice);
+        }
+
+        return vkBootSwapchain($this, $width, $height);
+    }
+
+    public function resize(int32 $width, int32 $height) : void
+    {
+        $this->pendingResize = true;
+        $this->pendingW = $width;
+        $this->pendingH = $height;
+    }
+
+    public function lose() : void
+    {
+        $this->lostFlag = true;
+        $this->abortFrame();
+        $this->bb = null;
+
+        if ($this->logical->handle != 0) {
+            vk::DeviceWaitIdle($this->logical);
+            vkDropSwapchain($this);
+        }
+
+        if ($this->surface->handle != 0 && $this->instance->handle != 0) {
+            vk::DestroySurfaceKHR($this->instance, $this->surface, null);
+            $this->surface = vk::SurfaceKHR::none();
+        }
+    }
+
+    public const function lost() : bool
+    {
+        return $this->lostFlag;
+    }
+
+    public function waitIdle() : void
+    {
+        if ($this->logical->handle != 0) {
+            vk::DeviceWaitIdle($this->logical);
+        }
+    }
+
+    public const function limits() : DeviceLimits
+    {
+        return $this->limits;
+    }
+
+    public const function adapter() : AdapterInfo
+    {
+        return $this->adapterInfo;
+    }
+
+    public function beginFrame(int32 $width, int32 $height) : result<FrameStatus, DeviceError>
+    {
+        assert($this->ready, 'Device.beginFrame before initialize');
+        assert(!$this->encoderOpen, 'beginFrame with an open encoder');
+        assert(!$this->inFrame, 'beginFrame twice');
+
+        if ($this->lostFlag) {
+            return .error(.surfaceLost);
+        }
+
+        if ($this->pendingResize || $width != $this->extent->width as int32 || $height != $this->extent->height as int32) {
+            $this->pendingResize = false;
+            guard vkBootSwapchain($this, $width, $height) else ($e) {
+                return .error($e);
+            }
+        }
+
+        if ($this->extent->width == 0 || $this->extent->height == 0 || $this->swapchain->handle == 0) {
+            return .ok(.skipped);
+        }
+
+        FrameSlot $slot = $this->slots[$this->slot];
+        guard vkCheck(
+            vk::WaitForFences($this->logical, 1, &$slot->fence, vk::TRUE, vk::WHOLE_SIZE),
+            'WaitForFences'
+        ) else ($e) {
+            return .error($e);
+        }
+
+        $slot->ring->reset();
+        $slot->uniformsDirty = true;
+
+        if ($slot->set1pool->handle != 0) {
+            vk::ResetDescriptorPool($this->logical, $slot->set1pool, 0);
+        }
+        uint32 $oi = 0;
+
+        while ($oi < 4) {
+            $slot->dynOff[$oi] = 0;
+            $oi = $oi + 1;
+        }
+
+        guard vkCheck(vk::ResetCommandPool($this->logical, $slot->pool, 0), 'ResetCommandPool') else ($e) {
+            return .error($e);
+        }
+
+        uint32 $index = 0;
+        vk::Result $acq = vk::AcquireNextImageKHR(
+            $this->logical,
+            $this->swapchain,
+            vk::WHOLE_SIZE,
+            $slot->acquire,
+            vk::Fence::none(),
+            &$index
+        );
+
+        if ($acq == vk::Result::errorDeviceLost || $acq == vk::Result::errorSurfaceLostKhr) {
+            $this->lostFlag = true;
+            return .error(.surfaceLost);
+        }
+
+        if ($acq == vk::Result::errorOutOfDateKhr) {
+            guard vkBootSwapchain($this, $width, $height) else ($e) {
+                return .error($e);
+            }
+
+            if ($this->extent->width == 0 || $this->swapchain->handle == 0) {
+                return .ok(.skipped);
+            }
+
+            $acq = vk::AcquireNextImageKHR(
+                $this->logical,
+                $this->swapchain,
+                vk::WHOLE_SIZE,
+                $slot->acquire,
+                vk::Fence::none(),
+                &$index
+            );
+        }
+
+        if (!$acq->ok() && $acq != vk::Result::suboptimalKhr) {
+            return .error(vkErr($acq, 'AcquireNextImageKHR'));
+        }
+
+        guard vkCheck(vk::ResetFences($this->logical, 1, &$slot->fence), 'ResetFences') else ($e) {
+            return .error($e);
+        }
+
+        $this->imageIndex = $index;
+        vk::CommandBufferBeginInfo $begin = vk::CommandBufferBeginInfo();
+        $begin->flags = vk::COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        guard vkCheck(vk::BeginCommandBuffer($slot->cmd, &$begin), 'BeginCommandBuffer') else ($e) {
+            return .error($e);
+        }
+
+        TextureHandle $th = TextureHandle(
+            $this->images[$index],
+            $this->views[$index],
+            vk::DeviceMemory::none(),
+            true
+        );
+        Texture $bb = Texture(
+            imported: $this,
+            $th,
+            $this->bbFormat,
+            $this->extent->width as int32,
+            $this->extent->height as int32
+        );
+        $bb->state = .undefined;
+        $this->bb = $bb;
+        $this->inFrame = true;
+        return .ok(.ready);
+    }
+
+    public function endFrame() : status<DeviceError>
+    {
+        assert($this->inFrame, 'endFrame outside beginFrame');
+        assert(!$this->encoderOpen, 'endFrame with an open encoder');
+        Texture $bb = guard $this->bb;
+        $this->transition($bb, .present);
+        FrameSlot $slot = $this->slots[$this->slot];
+        guard vkCheck(vk::EndCommandBuffer($slot->cmd), 'EndCommandBuffer') else ($e) {
+            return .error($e);
+        }
+
+        uint32 $waitStage = vk::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        vk::SubmitInfo $si = vk::SubmitInfo();
+        $si->waitSemaphoreCount = 1;
+        $si->pWaitSemaphores:$ = &$slot->acquire;
+        $si->pWaitDstStageMask:$ = &$waitStage;
+        $si->commandBufferCount = 1;
+        $si->pCommandBuffers:$ = &$slot->cmd;
+        $si->signalSemaphoreCount = 1;
+        $si->pSignalSemaphores:$ = &$this->renderDone[$this->imageIndex];
+        guard vkCheck(vk::QueueSubmit($this->queue, 1, &$si, $slot->fence), 'QueueSubmit') else ($e) {
+            $this->inFrame = false;
+            $this->bb = null;
+            return .error($e);
+        }
+
+        vk::PresentInfoKHR $pi = vk::PresentInfoKHR();
+        $pi->waitSemaphoreCount = 1;
+        $pi->pWaitSemaphores:$ = &$this->renderDone[$this->imageIndex];
+        $pi->swapchainCount = 1;
+        $pi->pSwapchains:$ = &$this->swapchain;
+        $pi->pImageIndices:$ = &$this->imageIndex;
+        vk::Result $pr = vk::QueuePresentKHR($this->queue, &$pi);
+
+        if ($pr == vk::Result::errorOutOfDateKhr || $pr == vk::Result::suboptimalKhr) {
+            $this->pendingResize = true;
+        } else if (!$pr->ok()) {
+            $this->inFrame = false;
+            $this->bb = null;
+            if ($pr == vk::Result::errorDeviceLost || $pr == vk::Result::errorSurfaceLostKhr) {
+                $this->lostFlag = true;
+            }
+
+            return .error(vkErr($pr, 'QueuePresentKHR'));
+        }
+
+        $this->inFrame = false;
+        $this->bb = null;
+        $this->frames = $this->frames + 1;
+        $this->slot = ($this->slot + 1) % FRAMES_IN_FLIGHT;
+        return .ok;
+    }
+
+    public const function inFrame() : bool
+    {
+        return $this->inFrame;
+    }
+
+    public const function frameSlot() : uint32
+    {
+        return $this->slot;
+    }
+
+    public const function frameIndex() : uint64
+    {
+        return $this->frames;
+    }
+
+    public function backbuffer() : Texture
+    {
+        Texture $bb = guard $this->bb else {
+            die('backbuffer outside beginFrame');
+        }
+        return $bb;
+    }
+
+    public const function backbufferFormat() : PixelFormat
+    {
+        return $this->bbFormat;
+    }
+
+    public function setVsync(bool $on) : void
+    {
+        if ($this->vsync == $on) {
+            return;
+        }
+
+        $this->vsync = $on;
+        $this->pendingResize = true;
+    }
+
+    public function beginRender(const RenderPassDesc& $desc) : RenderEncoder
+    {
+        assert($this->inFrame, 'beginRender outside beginFrame');
+        assert(!$this->encoderOpen, 'beginRender while an encoder is open');
+        uint32 $n = $desc->colors->count() as uint32;
+        assert($n > 0 && $n <= 4, 'beginRender needs 1..4 color targets');
+        vk::RenderingAttachmentInfo[4] $atts;
+        TargetFormats $formats = TargetFormats();
+        uint32 $i = 0;
+
+        while ($i < $n) {
+            ColorTarget $color = $desc->colors[$i as usize];
+            ResourceState $from = $color->texture->state;
+
+            if ($color->load != LoadOp::load) {
+                $from = .undefined;
+            }
+
+            vkBarrier(
+                $this,
+                $color->texture->handle->image,
+                $from,
+                .colorTarget,
+                vkAspect($color->texture->format)
+            );
+            $color->texture->state = .colorTarget;
+            $atts[$i] = vk::RenderingAttachmentInfo();
+            $atts[$i]->imageView = $color->texture->handle->view;
+            $atts[$i]->imageLayout = vk::IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            $atts[$i]->loadOp = vkLoadOp($color->load);
+            $atts[$i]->storeOp = vkStoreOp($color->store);
+            $atts[$i]->clearValue->color->float32[0] = $color->clear->x;
+            $atts[$i]->clearValue->color->float32[1] = $color->clear->y;
+            $atts[$i]->clearValue->color->float32[2] = $color->clear->z;
+            $atts[$i]->clearValue->color->float32[3] = $color->clear->w;
+            $formats->colors[$i] = $color->texture->format;
+            $i = $i + 1;
+        }
+
+        $formats->colorCount = $n;
+        $formats->samples = .one;
+        ColorTarget $first = $desc->colors[0];
+        vk::RenderingInfo $info = vk::RenderingInfo();
+        $info->renderArea->extent = vk::Extent2D($first->texture->width as uint32, $first->texture->height as uint32);
+        $info->layerCount = 1;
+        $info->colorAttachmentCount = $n;
+        $info->pColorAttachments:$ = &$atts[0];
+        DepthTarget $depth = guard $desc->depth else {
+            vk::CmdBeginRendering($this->currentCmd(), &$info);
+            $this->encoderOpen = true;
+            return RenderEncoder($this, $formats, $first->texture->width, $first->texture->height);
+        }
+        ResourceState $depthFrom = $depth->texture->state;
+
+        if ($depth->load != LoadOp::load) {
+            $depthFrom = .undefined;
+        }
+
+        vkBarrier(
+            $this,
+            $depth->texture->handle->image,
+            $depthFrom,
+            .depthTarget,
+            vkAspect($depth->texture->format)
+        );
+        $depth->texture->state = .depthTarget;
+        vk::RenderingAttachmentInfo $depthAtt = vk::RenderingAttachmentInfo();
+        $depthAtt->imageView = $depth->texture->handle->view;
+        $depthAtt->imageLayout = vk::IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        $depthAtt->loadOp = vkLoadOp($depth->load);
+        $depthAtt->storeOp = vkStoreOp($depth->store);
+        $depthAtt->clearValue = vk::ClearValue(depth: $depth->clearDepth, stencil: 0);
+        $info->pDepthAttachment:$ = &$depthAtt;
+        vk::CmdBeginRendering($this->currentCmd(), &$info);
+        $this->encoderOpen = true;
+        return RenderEncoder($this, $formats, $first->texture->width, $first->texture->height);
+    }
+
+    public function transition(Texture $texture, ResourceState $to) : void
+    {
+        assert(!$this->encoderOpen, 'transition inside a render pass');
+
+        if ($texture->state == $to) {
+            return;
+        }
+
+        vkBarrier($this, $texture->handle->image, $texture->state, $to, vkAspect($texture->format));
+        $texture->state = $to;
+    }
+
+    public function scratch(uint64 $bytes, uint64 $align) : ScratchSlice
+    {
+        assert($this->inFrame, 'scratch outside beginFrame');
+        uint64 $a = $align;
+
+        if ($a < $this->limits->uniformAlign) {
+            $a = $this->limits->uniformAlign;
+        }
+
+        if ($a == 0) {
+            $a = 256;
+        }
+
+        return $this->slots[$this->slot]->ring->bump($bytes, $a, $this->slot);
+    }
+
+    public function readback(Texture $texture) : result<array<uint8>, DeviceError>
+    {
+        assert($this->logical->handle != 0, 'readback before initialize');
+        assert(!$this->encoderOpen, 'readback with an open encoder');
+        assert(!$this->inFrame, 'readback inside a frame');
+
+        if ($texture->format->isDepth()) {
+            return .error(.unsupportedFormat($texture->format));
+        }
+
+        uint32 $bpp = pixelByteCount($texture->format);
+        $this->waitIdle();
+        vk::PhysicalDeviceProperties $props = vk::PhysicalDeviceProperties();
+        vk::GetPhysicalDeviceProperties($this->physical, &$props);
+        uint64 $align = $props->limits->optimalBufferCopyRowPitchAlignment;
+
+        if ($align < 4) {
+            $align = 4;
+        }
+
+        uint64 $rowBytes = ($texture->width as uint64) * ($bpp as uint64);
+        uint64 $pitched = alignUp($rowBytes, $align);
+        uint64 $total = $pitched * ($texture->height as uint64);
+        BufferHandle $staging = guard vkCreateBoundBuffer(
+            $this,
+            $total,
+            vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT
+        ) else ($e) {
+            return .error($e);
+        }
+
+        ResourceState $prev = $texture->state;
+        vkOneShotCopyImageToBuffer($this, $texture, $staging, $pitched, $bpp);
+        $texture->state = .transferSrc;
+        ptr<uint8> $mapped = null;
+        guard vkCheck(
+            vk::MapMemory($this->logical, $staging->memory, 0 as uint64, vk::WHOLE_SIZE, 0, &$mapped),
+            'MapMemory'
+        ) else ($e) {
+            vk::DestroyBuffer($this->logical, $staging->buffer, null);
+            vk::FreeMemory($this->logical, $staging->memory, null);
+            return .error($e);
+        }
+
+        uint64 $tight = $rowBytes * ($texture->height as uint64);
+        array<uint8> $scratch = filledBytes($total);
+        mem::copy<uint8>(ptr<uint8>(&$scratch[0]), $mapped, $total);
+        array<uint8> $pixels = filledBytes($tight);
+        int32 $y = 0;
+
+        while ($y < $texture->height) {
+            usize $srcOff = (($y as uint64) * $pitched) as usize;
+            usize $dstOff = (($y as uint64) * $rowBytes) as usize;
+            mem::copy<uint8>(ptr<uint8>(&$pixels[$dstOff]), ptr<uint8>(&$scratch[$srcOff]), $rowBytes);
+            $y = $y + 1;
+        }
+
+        vk::UnmapMemory($this->logical, $staging->memory);
+        vk::DestroyBuffer($this->logical, $staging->buffer, null);
+        vk::FreeMemory($this->logical, $staging->memory, null);
+
+        if ($prev != ResourceState::undefined && $prev != ResourceState::transferSrc) {
+            vkOneShotImageBarrier($this, $texture->handle->image, .transferSrc, $prev, vkAspect($texture->format));
+            $texture->state = $prev;
+        }
+
+        return .ok($pixels);
+    }
+
+    public function createBuffer(const BufferDesc& $desc) : result<BufferHandle, DeviceError>
+    {
+        assert($this->logical->handle != 0, 'createBuffer before initialize');
+        return vkCreateBoundBuffer(
+            $this,
+            $desc->bytes,
+            vkBufferUsage($desc->usage),
+            vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        );
+    }
+
+    public function destroyBuffer(BufferHandle $handle) : void
+    {
+        if ($this->logical->handle == 0) {
+            return;
+        }
+
+        if ($handle->buffer->handle != 0) {
+            vk::DestroyBuffer($this->logical, $handle->buffer, null);
+        }
+
+        if ($handle->memory->handle != 0) {
+            vk::FreeMemory($this->logical, $handle->memory, null);
+        }
+    }
+
+    public function uploadBuffer(BufferHandle $handle, uint64 $offset, ptr<const uint8> $src, uint64 $bytes) : void
+    {
+        assert($this->logical->handle != 0, 'uploadBuffer before initialize');
+        assert($bytes > 0, 'uploadBuffer size');
+        BufferHandle $staging = guard vkCreateBoundBuffer(
+            $this,
+            $bytes,
+            vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+            vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT
+        ) else ($e) {
+            die($e->message());
+        }
+
+        ptr<uint8> $mapped = null;
+        guard vkCheck(
+            vk::MapMemory($this->logical, $staging->memory, 0 as uint64, vk::WHOLE_SIZE, 0, &$mapped),
+            'MapMemory'
+        ) else ($e) {
+            die($e->message());
+        }
+
+        mem::copy<uint8>($mapped, ptr<uint8>($src:$), $bytes);
+        vk::UnmapMemory($this->logical, $staging->memory);
+        vkOneShotCopy($this, $staging, $handle, $offset, $bytes);
+        vk::DestroyBuffer($this->logical, $staging->buffer, null);
+        vk::FreeMemory($this->logical, $staging->memory, null);
+    }
+
+    public function createTexture(const TextureDesc& $desc) : result<TextureHandle, DeviceError>
+    {
+        assert($this->logical->handle != 0, 'createTexture before initialize');
+        uint32 $usage = 0;
+
+        if (($desc->usage & TEXTURE_SAMPLED) != 0) {
+            $usage = $usage | vk::IMAGE_USAGE_SAMPLED_BIT;
+        }
+
+        if (($desc->usage & TEXTURE_TRANSFER_SRC) != 0) {
+            $usage = $usage | vk::IMAGE_USAGE_TRANSFER_SRC_BIT;
+        }
+
+        if (($desc->usage & TEXTURE_TRANSFER_DST) != 0) {
+            $usage = $usage | vk::IMAGE_USAGE_TRANSFER_DST_BIT;
+        }
+
+        if (($desc->usage & TEXTURE_RENDER_TARGET) != 0) {
+            if ($desc->isDepth()) {
+                $usage = $usage | vk::IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            } else {
+                $usage = $usage | vk::IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            }
+        }
+
+        vk::ImageCreateInfo $ci = vk::ImageCreateInfo();
+        $ci->imageType = vk::IMAGE_TYPE_2D;
+        $ci->format = vkFormat($desc->format);
+        $ci->extent = vk::Extent3D($desc->width as uint32, $desc->height as uint32, 1 as uint32);
+        $ci->mipLevels = $desc->mips as uint32;
+        $ci->arrayLayers = 1;
+        $ci->samples = vkSampleCount($desc->samples);
+        $ci->tiling = vk::IMAGE_TILING_OPTIMAL;
+        $ci->usage = $usage;
+        $ci->sharingMode = vk::SHARING_MODE_EXCLUSIVE;
+        $ci->initialLayout = vk::IMAGE_LAYOUT_UNDEFINED;
+        vk::Image $image = vk::Image::none();
+        guard vkCheck(vk::CreateImage($this->logical, &$ci, null, &$image), 'CreateImage') else ($e) {
+            return .error($e);
+        }
+
+        vk::MemoryRequirements $req = vk::MemoryRequirements();
+        vk::GetImageMemoryRequirements($this->logical, $image, &$req);
+        vk::DeviceMemory $mem = guard vkAllocMemory($this, $req, vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT) else ($e) {
+            vk::DestroyImage($this->logical, $image, null);
+            return .error($e);
+        }
+
+        guard vkCheck(
+            vk::BindImageMemory($this->logical, $image, $mem, 0 as uint64),
+            'BindImageMemory'
+        ) else ($e) {
+            vk::FreeMemory($this->logical, $mem, null);
+            vk::DestroyImage($this->logical, $image, null);
+            return .error($e);
+        }
+
+        uint32 $aspect = vk::IMAGE_ASPECT_COLOR_BIT;
+
+        if ($desc->isDepth()) {
+            $aspect = vk::IMAGE_ASPECT_DEPTH_BIT;
+        }
+
+        vk::ImageViewCreateInfo $vci = vk::ImageViewCreateInfo();
+        $vci->image = $image;
+        $vci->viewType = vk::IMAGE_VIEW_TYPE_2D;
+        $vci->format = $ci->format;
+        $vci->subresourceRange->aspectMask = $aspect;
+        $vci->subresourceRange->levelCount = $desc->mips as uint32;
+        $vci->subresourceRange->layerCount = 1;
+        vk::ImageView $view = vk::ImageView::none();
+        guard vkCheck(
+            vk::CreateImageView($this->logical, &$vci, null, &$view),
+            'CreateImageView'
+        ) else ($e) {
+            vk::FreeMemory($this->logical, $mem, null);
+            vk::DestroyImage($this->logical, $image, null);
+            return .error($e);
+        }
+
+        return .ok(TextureHandle($image, $view, $mem, false));
+    }
+
+    public function destroyTexture(TextureHandle $handle) : void
+    {
+        if ($this->logical->handle == 0 || $handle->imported) {
+            return;
+        }
+
+        if ($handle->view->handle != 0) {
+            vk::DestroyImageView($this->logical, $handle->view, null);
+        }
+
+        if ($handle->image->handle != 0) {
+            vk::DestroyImage($this->logical, $handle->image, null);
+        }
+
+        if ($handle->memory->handle != 0) {
+            vk::FreeMemory($this->logical, $handle->memory, null);
+        }
+    }
+
+    public function uploadTexture(Texture $texture, int32 $mip, ptr<const uint8> $src, uint64 $bytes, int32 $bytesPerRow) : void
+    {
+        assert($this->logical->handle != 0, 'uploadTexture before initialize');
+        assert(!$this->encoderOpen, 'uploadTexture with an open encoder');
+        assert($bytes > 0, 'uploadTexture size');
+        uint32 $bpp = pixelByteCount($texture->format);
+        int32 $w = vkMipSize($texture->width, $mip);
+        uint64 $row = $bytesPerRow as uint64;
+
+        if ($row == 0) {
+            $row = ($w as uint64) * ($bpp as uint64);
+        }
+
+        BufferHandle $staging = guard vkCreateBoundBuffer(
+            $this,
+            $bytes,
+            vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+            vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT
+        ) else ($e) {
+            die($e->message());
+        }
+
+        ptr<uint8> $mapped = null;
+        guard vkCheck(
+            vk::MapMemory($this->logical, $staging->memory, 0 as uint64, vk::WHOLE_SIZE, 0, &$mapped),
+            'MapMemory'
+        ) else ($e) {
+            die($e->message());
+        }
+
+        mem::copy<uint8>($mapped, ptr<uint8>($src:$), $bytes);
+        vk::UnmapMemory($this->logical, $staging->memory);
+        vkOneShotCopyBufferToImage($this, $staging, $texture, $mip, $row, $bpp);
+        $texture->state = .shaderRead;
+        vk::DestroyBuffer($this->logical, $staging->buffer, null);
+        vk::FreeMemory($this->logical, $staging->memory, null);
+    }
+
+    public function generateMipmaps(Texture $texture) : void
+    {
+        assert(false, 'generateMipmaps is later');
+    }
+
+    public function sampler(const SamplerDesc& $desc) : Sampler
+    {
+        string $key = $desc->key();
+
+        if ($this->samplerHandles->has($key)) {
+            return Sampler($this, $this->samplerHandles[$key], $desc);
+        }
+
+        vk::SamplerCreateInfo $ci = vk::SamplerCreateInfo();
+        $ci->magFilter = vkFilter($desc->mag);
+        $ci->minFilter = vkFilter($desc->min);
+        $ci->mipmapMode = vkMipmapMode($desc->min);
+        $ci->addressModeU = vkWrap($desc->wrapS);
+        $ci->addressModeV = vkWrap($desc->wrapT);
+        $ci->addressModeW = vkWrap($desc->wrapT);
+        $ci->maxLod = 1.0f;
+        vk::Sampler $samp = vk::Sampler::none();
+        guard vkCheck(
+            vk::CreateSampler($this->logical, &$ci, null, &$samp),
+            'CreateSampler'
+        ) else ($e) {
+            die($e->message());
+        }
+
+        SamplerHandle $h = SamplerHandle($samp);
+        $this->samplerHandles[$key] = $h;
+        return Sampler($this, $h, $desc);
+    }
+
+    public function createShaderModule(ShaderKind $kind, const string& $bytes, string $name) : result<ShaderModuleHandle, DeviceError>
+    {
+        usize $n = $bytes->size();
+
+        if ($n == 0 || ($n % 4) != 0) {
+            return .error(.shader($name, 'spir-v is not a multiple of 4 bytes'));
+        }
+
+        usize $words = $n / 4;
+        ptr<uint32> $code = mem::alloc<uint32>($words);
+        ptr<const uint8> $src = $bytes->data();
+        mem::copy<uint8>($code:$ as ptr<uint8>, ptr<uint8>($src:$), $n);
+        vk::ShaderModuleCreateInfo $ci = vk::ShaderModuleCreateInfo();
+        $ci->codeSize = $n;
+        $ci->pCode:$ = ptr<const uint32>($code:$);
+        vk::ShaderModule $module = vk::ShaderModule::none();
+        vk::Result $r = vk::CreateShaderModule($this->logical, &$ci, null, &$module);
+        mem::free($code);
+
+        guard vkCheck($r, 'CreateShaderModule') else ($e) {
+            return .error($e);
+        }
+
+        return .ok(ShaderModuleHandle($module));
+    }
+
+    public function destroyShaderModule(ShaderModuleHandle $handle) : void
+    {
+        if ($this->logical->handle == 0 || $handle->module->handle == 0) {
+            return;
+        }
+
+        vk::DestroyShaderModule($this->logical, $handle->module, null);
+    }
+
+    public function destroyPipeline(PipelineHandle $handle) : void
+    {
+        if ($this->logical->handle == 0 || $handle->pipeline->handle == 0) {
+            return;
+        }
+
+        vk::DestroyPipeline($this->logical, $handle->pipeline, null);
+    }
+
+    internal function currentCmd() : vk::CommandBuffer
+    {
+        return $this->slots[$this->slot]->cmd;
+    }
+
+    internal function encoderClosed() : void
+    {
+        $this->encoderOpen = false;
+    }
+
+    public function shutdown() : void
+    {
+        // headless construct never loaded vk; destroy stubs SIGSEGV
+        if ($this->instance->handle == 0 && $this->logical->handle == 0) {
+            $this->ready = false;
+            return;
+        }
+
+        $this->lose();
+        vkDestroyDrawStack($this);
+        vkDestroySlots($this);
+
+        if ($this->logical->handle != 0) {
+            vk::DestroyDevice($this->logical, null);
+            $this->logical = vk::Device::none();
+        }
+
+        if ($this->instance->handle != 0) {
+            vk::DestroyInstance($this->instance, null);
+            $this->instance = vk::Instance::none();
+        }
+
+        $this->ready = false;
+    }
+
+    private function abortFrame() : void
+    {
+        if ($this->slots->count() == 0) {
+            $this->encoderOpen = false;
+            $this->inFrame = false;
+            return;
+        }
+
+        if ($this->encoderOpen) {
+            vk::CmdEndRendering($this->currentCmd());
+            $this->encoderOpen = false;
+        }
+
+        if ($this->inFrame) {
+            vk::EndCommandBuffer($this->currentCmd());
+            $this->inFrame = false;
+        }
+    }
+}

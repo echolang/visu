@@ -2,15 +2,14 @@
  * Context compensation lerp. No GPU.
  */
 
-use visu::graphics::{Gpu, Pool, Frame, Pipeline, Context, Framebuffer, RenderTarget, TargetRef, TextureRef, TextureOptions};
+use visu::graphics::{Device, Pool, Frame, Pipeline, Context, RenderTarget, TargetRef, TextureRef, TextureOptions};
 
 test context_lerp_uses_compensation
 {
-    Gpu $gpu = Gpu();
+    Device $gpu = Device();
     Pool $pool = Pool($gpu);
     Frame $frame = Frame();
-    Framebuffer $fb = Framebuffer();
-    RenderTarget $rt = RenderTarget(64, 64, $fb);
+    RenderTarget $rt = RenderTarget(64, 64);
     Pipeline $pipeline = Pipeline($pool, $frame, $rt);
 
     Context $start = Context($gpu, $pipeline, $frame, $pool);
@@ -27,13 +26,9 @@ test target_fingerprint_includes_attachments
 {
     TargetRef $t = TargetRef('x', 8, 8);
     string $plain = visu::graphics::targetFingerprint($t);
-    $t->rboColor = true;
-    string $color = visu::graphics::targetFingerprint($t);
-    assert($plain != $color, 'rbo color');
-    $t->rboDepthStencil = true;
-    $t->rboColor = false;
+    $t->depthStencil = true;
     string $depth = visu::graphics::targetFingerprint($t);
-    assert($color != $depth, 'rbo depth stencil');
+    assert($plain != $depth, 'depth stencil');
     $t->width = 16;
     assert($depth != visu::graphics::targetFingerprint($t), 'size');
 }

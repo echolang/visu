@@ -1,0 +1,39 @@
+/**
+ * Shader module creation. Does not bake a PSO, so it survives
+ * echoc test's fork on MoltenVK.
+ */
+
+use std::io;
+use visu::graphics::{ShaderKind, shaderSuffix};
+
+// Metal compiles MSL through XPC; echoc test's fork does not survive it.
+#[if: os != darwin || VISU_BACKEND_VULKAN]
+#[group: "glfw"]
+test shader_module_from_spv
+{
+    GpuContext $gpu = gpuHidden('module');
+    string $path = shaderDir();
+    string $suf = shaderSuffix();
+    $path->append("/triangle.vert.{$suf}");
+    string $bytes = guard io::readfile($path) else ($e) {
+        $gpu->end();
+        die($e->message());
+    }
+    $h = guard $gpu->device->createShaderModule(.vertex, $bytes, 'tri') else ($e) {
+        $gpu->end();
+        die($e->message());
+    }
+    $gpu->device->destroyShaderModule($h);
+    $gpu->end();
+}
+
+#[group: "glfw"]
+test shader_module_bad_spirv
+{
+    GpuContext $gpu = gpuHidden('module-bad');
+    string $bytes = 'xxxx';
+    $r = $gpu->device->createShaderModule(.vertex, $bytes, 'bad');
+    assert($r->failed(), 'bad spirv');
+    $gpu->end();
+}
+#[end]

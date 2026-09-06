@@ -1,5 +1,6 @@
 /**
- * Bind and clear a target's color and depth.
+ * Record a clear on a target. Context.beginRender consumes it
+ * into load ops; unconsumed requests flush at the end of execute.
  */
 
 namespace visu::graphics;
@@ -50,21 +51,7 @@ public class ClearPass : Pass
 
     public function execute(Context $ctx) : status<PipelineError>
     {
-        RenderTarget $rt = guard $ctx->pool->getTarget($this->target) else ($e) {
-            return .error(.pool($e));
-        }
-
-        uint32 $mask = 0;
-
-        if ($this->options->clearColor) {
-            $mask = $mask | COLOR_BUFFER_BIT;
-        }
-
-        if ($this->options->clearDepth) {
-            $mask = $mask | DEPTH_BUFFER_BIT;
-        }
-
-        $rt->framebuffer->clear($mask, $this->options->color);
+        $ctx->pipeline->requestClear($this->target, $this->options);
         return .ok;
     }
 }

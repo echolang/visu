@@ -1,0 +1,33 @@
+/**
+ * Device-layer failures. Match the case; `message()` is for logs.
+ */
+
+namespace visu::graphics;
+
+public enum DeviceError
+{
+    case noDevice;
+    case unsupportedVersion(uint32 $found);
+    case vulkan(string $what, int32 $code);
+    case metal(string $what, string $message);
+    case surfaceLost;
+    case outOfMemory(uint64 $bytes);
+    case unsupportedFormat(PixelFormat $format);
+    case shader(string $name, string $log);
+    case pipeline(string $key, string $log);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            DeviceError::noDevice => 'no suitable gpu',
+            DeviceError::unsupportedVersion($found) => "vulkan 1.2 required, found {$found}",
+            DeviceError::vulkan($what, $code) => "{$what}: vk result {$code}",
+            DeviceError::metal($what, $message) => "{$what}: {$message}",
+            DeviceError::surfaceLost => 'surface lost',
+            DeviceError::outOfMemory($bytes) => "out of gpu memory ({$bytes} bytes)",
+            DeviceError::unsupportedFormat($format) => "unsupported format {pixelCode($format)}",
+            DeviceError::shader($name, $log) => "shader '{$name}': {$log}",
+            DeviceError::pipeline($key, $log) => "pipeline '{$key}': {$log}",
+        };
+    }
+}

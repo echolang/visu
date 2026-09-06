@@ -1,0 +1,376 @@
+/**
+ * Instance, physical device, logical device. Ported from
+ * libvulkan examples/setup.eco; failures are DeviceError.
+ */
+
+namespace visu::graphics;
+
+internal struct ExtNames
+{
+    public static string $portability = 'VK_KHR_portability_enumeration';
+    public static string $subset = 'VK_KHR_portability_subset';
+    public static string $swapchain = 'VK_KHR_swapchain';
+    public static string $dynamicRendering = 'VK_KHR_dynamic_rendering';
+    public static string $sync2 = 'VK_KHR_synchronization2';
+    public static string $copy2 = 'VK_KHR_copy_commands2';
+    public static string $validation = 'VK_LAYER_KHRONOS_validation';
+}
+
+internal function roomExts(uint32 $n) : array<vk::ExtensionProperties>
+{
+    array<vk::ExtensionProperties> $exts = arr::room<vk::ExtensionProperties>($n as usize);
+    uint32 $i = 0;
+
+    while ($i < $n) {
+        $exts[] = vk::ExtensionProperties();
+        $i = $i + 1;
+    }
+
+    return $exts;
+}
+
+internal function extensionListed(
+    const array<vk::ExtensionProperties>& $exts,
+    uint32 $n,
+    const string& $wanted
+) : bool
+{
+    uint32 $i = 0;
+
+    while ($i < $n) {
+        ptr<const uint8> $p = &$exts[$i]->extensionName[0];
+        string $nm = str::from($p);
+
+        if ($nm == $wanted) {
+            return true;
+        }
+
+        $i = $i + 1;
+    }
+
+    return false;
+}
+
+internal function instanceHas(const string& $wanted) : bool
+{
+    uint32 $n = 0;
+    vk::Result $r = vk::EnumerateInstanceExtensionProperties(null, &$n, null);
+
+    if ($r != vk::Result::success || $n == 0) {
+        return false;
+    }
+
+    array<vk::ExtensionProperties> $exts = roomExts($n);
+    $r = vk::EnumerateInstanceExtensionProperties(null, &$n, &$exts[0]);
+
+    if ($r != vk::Result::success) {
+        return false;
+    }
+
+    return extensionListed($exts, $n, $wanted);
+}
+
+internal function deviceHas(vk::PhysicalDevice $physical, const string& $wanted) : bool
+{
+    uint32 $n = 0;
+    vk::Result $r = vk::EnumerateDeviceExtensionProperties($physical, null, &$n, null);
+
+    if ($r != vk::Result::success || $n == 0) {
+        return false;
+    }
+
+    array<vk::ExtensionProperties> $exts = roomExts($n);
+    $r = vk::EnumerateDeviceExtensionProperties($physical, null, &$n, &$exts[0]);
+
+    if ($r != vk::Result::success) {
+        return false;
+    }
+
+    return extensionListed($exts, $n, $wanted);
+}
+
+internal function vkCreateInstance(Device $device, const DeviceOptions& $options) : status<DeviceError>
+{
+    if (vk::loadDefault() == 0) {
+        return .error(.noDevice);
+    }
+
+    $device->appName = $options->appName;
+    vk::ApplicationInfo $app = vk::ApplicationInfo();
+    $app->pApplicationName:$ = $device->appName->cstr();
+    $app->apiVersion = vk::makeApiVersion(0, 1, 2, 0);
+
+    ptr<const uint8>[32] $extBuf;
+    uint32 $extN = 0;
+    uint32 $glfwCount = 0;
+    ptr<ptr<const uint8>> $glfwExts = glfw::getRequiredInstanceExtensions(&$glfwCount);
+    uint32 $gi = 0;
+
+    while ($gi < $glfwCount) {
+        if ($extN >= 32) {
+            return .error(.vulkan('instance extensions', 0));
+        }
+
+        $extBuf[$extN]:$ = $glfwExts:$[$gi];
+        $extN = $extN + 1;
+        $gi = $gi + 1;
+    }
+
+    bool $port = instanceHas(ExtNames::$portability);
+
+    if ($port) {
+        if ($extN >= 32) {
+            return .error(.vulkan('instance extensions', 0));
+        }
+
+        $extBuf[$extN]:$ = ExtNames::$portability->cstr();
+        $extN = $extN + 1;
+    }
+
+    vk::InstanceCreateInfo $ici = vk::InstanceCreateInfo();
+    $ici->pApplicationInfo:$ = &$app;
+    $ici->enabledExtensionCount = $extN;
+
+    if ($extN > 0) {
+        $ici->ppEnabledExtensionNames:$ = &$extBuf[0];
+    }
+
+    if ($port) {
+        $ici->flags = vk::INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+
+    string $layer = guard validationLayer() else {
+        guard vkCheck(vk::CreateInstance(&$ici, null, &$device->instance), 'CreateInstance') else ($e) {
+            return .error($e);
+        }
+        vk::loadInstance($device->instance);
+        return .ok;
+    }
+
+    ptr<const uint8>[1] $layers;
+    $layers[0]:$ = $layer->cstr();
+    $ici->enabledLayerCount = 1;
+    $ici->ppEnabledLayerNames:$ = &$layers[0];
+    guard vkCheck(vk::CreateInstance(&$ici, null, &$device->instance), 'CreateInstance') else ($e) {
+        return .error($e);
+    }
+
+    vk::loadInstance($device->instance);
+    return .ok;
+}
+
+internal function vkPickDevice(Device $device) : status<DeviceError>
+{
+    uint32 $devCount = 0;
+    guard vkCheck(
+        vk::EnumeratePhysicalDevices($device->instance, &$devCount, null),
+        'EnumeratePhysicalDevices'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    if ($devCount == 0) {
+        return .error(.noDevice);
+    }
+
+    array<vk::PhysicalDevice> $devs = arr::room<vk::PhysicalDevice>($devCount as usize);
+    uint32 $di = 0;
+
+    while ($di < $devCount) {
+        $devs[] = vk::PhysicalDevice::none();
+        $di = $di + 1;
+    }
+
+    guard vkCheck(
+        vk::EnumeratePhysicalDevices($device->instance, &$devCount, &$devs[0]),
+        'EnumeratePhysicalDevices'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    bool $found = false;
+    $di = 0;
+
+    while ($di < $devCount) {
+        uint32 $famCount = 0;
+        vk::GetPhysicalDeviceQueueFamilyProperties($devs[$di], &$famCount, null);
+        array<vk::QueueFamilyProperties> $fams = arr::room<vk::QueueFamilyProperties>($famCount as usize);
+        uint32 $fi = 0;
+
+        while ($fi < $famCount) {
+            $fams[] = vk::QueueFamilyProperties();
+            $fi = $fi + 1;
+        }
+
+        vk::GetPhysicalDeviceQueueFamilyProperties($devs[$di], &$famCount, &$fams[0]);
+        $fi = 0;
+
+        while ($fi < $famCount) {
+            bool $graphics = ($fams[$fi]->queueFlags & vk::QUEUE_GRAPHICS_BIT) != 0;
+            bool $present = true;
+
+            if ($device->surface->handle != 0) {
+                uint32 $ok = 0;
+                guard vkCheck(
+                    vk::GetPhysicalDeviceSurfaceSupportKHR($devs[$di], $fi, $device->surface, &$ok),
+                    'GetPhysicalDeviceSurfaceSupportKHR'
+                ) else ($e) {
+                    return .error($e);
+                }
+                $present = $ok != 0;
+            }
+
+            if ($graphics && $present) {
+                $device->physical = $devs[$di];
+                $device->family = $fi;
+                $found = true;
+                break;
+            }
+
+            $fi = $fi + 1;
+        }
+
+        if ($found) {
+            break;
+        }
+
+        $di = $di + 1;
+    }
+
+    if (!$found) {
+        return .error(.noDevice);
+    }
+
+    vk::PhysicalDeviceProperties $props = vk::PhysicalDeviceProperties();
+    vk::GetPhysicalDeviceProperties($device->physical, &$props);
+    uint32 $major = ($props->apiVersion >> 22) & 0x7F;
+    uint32 $minor = ($props->apiVersion >> 12) & 0x3FF;
+
+    if ($major < 1 || ($major == 1 && $minor < 2)) {
+        return .error(.unsupportedVersion($props->apiVersion));
+    }
+
+    $device->limits->uniformAlign = $props->limits->minUniformBufferOffsetAlignment;
+    $device->limits->maxUniformRange = $props->limits->maxUniformBufferRange as uint64;
+    $device->adapterInfo = vkAdapterInfo($props, $major, $minor);
+    return .ok;
+}
+
+internal function vkAdapterInfo(
+    const vk::PhysicalDeviceProperties& $props,
+    uint32 $major,
+    uint32 $minor
+) : AdapterInfo
+{
+    AdapterInfo $info = AdapterInfo();
+    $info->api = 'Vulkan';
+    $info->version = "{$major}.{$minor}";
+    ptr<const uint8> $name = &$props->deviceName[0];
+    $info->name = str::from($name);
+    $info->vendor = vkVendorName($props->vendorID);
+    $info->kind = vkAdapterKind($props->deviceType);
+    return $info;
+}
+
+internal function vkVendorName(uint32 $id) : string
+{
+    if ($id == 0x10DE as uint32) {
+        return 'NVIDIA';
+    }
+
+    if ($id == 0x1002 as uint32 || $id == 0x1022 as uint32) {
+        return 'AMD';
+    }
+
+    if ($id == 0x8086 as uint32) {
+        return 'Intel';
+    }
+
+    if ($id == 0x106B as uint32) {
+        return 'Apple';
+    }
+
+    if ($id == 0x13B5 as uint32) {
+        return 'ARM';
+    }
+
+    if ($id == 0x5143 as uint32) {
+        return 'Qualcomm';
+    }
+
+    return "0x{$id:X}";
+}
+
+internal function vkAdapterKind(uint32 $type) : AdapterKind
+{
+    if ($type == vk::PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        return .integrated;
+    }
+
+    if ($type == vk::PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+        return .discrete;
+    }
+
+    if ($type == vk::PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU) {
+        return .virtual;
+    }
+
+    if ($type == vk::PHYSICAL_DEVICE_TYPE_CPU) {
+        return .cpu;
+    }
+
+    return .unknown;
+}
+
+internal function vkCreateDevice(Device $device) : status<DeviceError>
+{
+    float32 $prio = 1.0f;
+    vk::DeviceQueueCreateInfo $qci = vk::DeviceQueueCreateInfo();
+    $qci->queueFamilyIndex = $device->family;
+    $qci->queueCount = 1;
+    $qci->pQueuePriorities:$ = &$prio;
+
+    ptr<const uint8>[8] $devBuf;
+    uint32 $devN = 0;
+    $devBuf[$devN]:$ = ExtNames::$swapchain->cstr();
+    $devN = $devN + 1;
+
+    if (deviceHas($device->physical, ExtNames::$subset)) {
+        $devBuf[$devN]:$ = ExtNames::$subset->cstr();
+        $devN = $devN + 1;
+    }
+
+    if (!deviceHas($device->physical, ExtNames::$dynamicRendering)) {
+        return .error(.vulkan('VK_KHR_dynamic_rendering', 0));
+    }
+
+    $devBuf[$devN]:$ = ExtNames::$dynamicRendering->cstr();
+    $devN = $devN + 1;
+
+    if (deviceHas($device->physical, ExtNames::$sync2)) {
+        $devBuf[$devN]:$ = ExtNames::$sync2->cstr();
+        $devN = $devN + 1;
+    }
+
+    if (deviceHas($device->physical, ExtNames::$copy2)) {
+        $devBuf[$devN]:$ = ExtNames::$copy2->cstr();
+        $devN = $devN + 1;
+    }
+
+    vk::PhysicalDeviceDynamicRenderingFeatures $dyn = vk::PhysicalDeviceDynamicRenderingFeatures();
+    $dyn->dynamicRendering = vk::TRUE;
+
+    vk::DeviceCreateInfo $dci = vk::DeviceCreateInfo();
+    $dci->pNext:$ = ptr<const uint8>(&$dyn);
+    $dci->queueCreateInfoCount = 1;
+    $dci->pQueueCreateInfos:$ = &$qci;
+    $dci->enabledExtensionCount = $devN;
+    $dci->ppEnabledExtensionNames:$ = &$devBuf[0];
+    guard vkCheck(vk::CreateDevice($device->physical, &$dci, null, &$device->logical), 'CreateDevice') else ($e) {
+        return .error($e);
+    }
+
+    vk::loadDevice($device->logical);
+    vk::GetDeviceQueue($device->logical, $device->family, 0, &$device->queue);
+    return .ok;
+}

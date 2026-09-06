@@ -1,6 +1,6 @@
 /**
  * Persistent GPU objects for the render graph. Keyed by resource name.
- * Stores Gpu; getTarget / cache / collect use the handle.
+ * Stores Device; getTarget / cache / collect use the handle.
  */
 
 namespace visu::graphics;
@@ -9,14 +9,14 @@ public enum PoolError
 {
     case missingImport(string $name);
     case missing(string $name);
-    case incomplete(string $name, FramebufferStatus $status);
+    case device(DeviceError $inner);
 
     public const function message() : string
     {
         return match ($this) {
             PoolError::missingImport($name) => "pool: imported '{$name}' was never set",
             PoolError::missing($name) => "pool: '{$name}' was never created",
-            PoolError::incomplete($name, $status) => "pool: failed to create '{$name}': {$status}",
+            PoolError::device($inner) => $inner->message(),
         };
     }
 }
@@ -54,7 +54,7 @@ public class StoredTexture
 
 public class Pool
 {
-    public Gpu $gpu;
+    public Device $device;
     private map<string, StoredTarget> $targets;
     private map<string, StoredTexture> $textures;
     private map<string, int32> $used;
@@ -62,9 +62,9 @@ public class Pool
     private array<GpuObject> $cachedOwned;
     private int32 $tick;
 
-    public constructor(Gpu $gpu)
+    public constructor(Device $device)
     {
-        $this->gpu = $gpu;
+        $this->device = $device;
         $this->targets = map<string, StoredTarget>();
         $this->textures = map<string, StoredTexture>();
         $this->used = map<string, int32>();
@@ -131,18 +131,6 @@ public class Pool
             return .error($e);
         }
         return .ok($fresh);
-    }
-
-    /**
-     * Bind `$ref` and set the viewport to its size.
-     */
-    public function activate(TargetRef $ref) : result<RenderTarget, PoolError>
-    {
-        RenderTarget $target = guard $this->getTarget($ref) else ($e) {
-            return .error($e);
-        }
-        $target->preparePass();
-        return .ok($target);
     }
 
     /**
@@ -318,77 +306,65 @@ public class Pool
 
     private function createTarget(TargetRef $ref) : result<RenderTarget, PoolError>
     {
-        Framebuffer $fb = Framebuffer($this->gpu);
-        RenderTarget $target = RenderTarget($ref->width, $ref->height, $fb);
+        RenderTarget $target = RenderTarget($ref->width, $ref->height);
         $target->contentScaleX = $ref->contentScaleX;
         $target->contentScaleY = $ref->contentScaleY;
 
         array<string> $owned = array<string>();
-        array<Attachment> $draw = array<Attachment>();
-        int32 $i = 0;
         array<TextureRef> $colors = $ref->colorAttachments;
 
         foreach ($colors as $color) {
             $color->width = $ref->width;
             $color->height = $ref->height;
             $this->dropTexture($color->name);
-            Texture $tex = Texture($this->gpu, $color->name);
-            $tex->allocateEmpty($ref->width, $ref->height, $color->options);
+            Texture $tex = $this->makeColor($color, $ref);
             $this->textures[$color->name] = StoredTexture($tex, false, $ref->name);
             $owned->push($color->name);
-            ColorAttachment $slot = ColorAttachment($i);
-            $fb->attachTexture($slot->attachment(), .texture2D, $tex->id, 0);
-            $draw->push($slot->attachment());
-            $i = $i + 1;
-        }
-
-        if ($draw->count() > 0) {
-            $this->gpu->drawBuffers($draw);
+            $target->colors[] = $tex;
         }
 
         TextureRef $depth = guard $ref->depthAttachment else {
-            return $this->finishTarget($ref, $target, $fb, $owned);
+            return $this->finishTarget($ref, $target, $owned);
         }
         $depth->width = $ref->width;
         $depth->height = $ref->height;
         $this->dropTexture($depth->name);
-        Texture $depthTex = Texture($this->gpu, $depth->name);
-        $depthTex->allocateEmpty($ref->width, $ref->height, $depth->options);
+        Texture $depthTex = $this->makeColor($depth, $ref);
         $this->textures[$depth->name] = StoredTexture($depthTex, false, $ref->name);
         $owned->push($depth->name);
-        $fb->attachTexture(.depth, .texture2D, $depthTex->id, 0);
-        return $this->finishTarget($ref, $target, $fb, $owned);
+        $target->depth = $depthTex;
+        return $this->finishTarget($ref, $target, $owned);
+    }
+
+    private function makeColor(TextureRef $ref, TargetRef $target) : Texture
+    {
+        TextureDesc $desc = $ref->options->desc($target->width, $target->height);
+        $desc->usage = TEXTURE_RENDER_TARGET | TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC;
+        $desc->label = $ref->name;
+        return Texture($this->device, $ref->name, $desc);
     }
 
     private function finishTarget(
         TargetRef $ref,
         RenderTarget $target,
-        Framebuffer $fb,
         array<string> $owned
     ) : result<RenderTarget, PoolError>
     {
-        if ($ref->rboDepthStencil) {
-            $fb->attachRenderbuffer(.depthStencil, .depthStencil, $ref->width, $ref->height);
-        } else if ($ref->rboColor) {
-            $fb->attachRenderbuffer(ColorAttachment(0)->attachment(), .rgba, $ref->width, $ref->height);
-        }
-
-        guard $fb->valid() else ($status) {
-            $this->abandonTarget($fb, $owned);
-            return .error(.incomplete($ref->name, $status));
+        if ($ref->depthStencil && $ref->depthAttachment == null && $target->depth == null) {
+            string $dsName = "{$ref->name}.attachment.depthStencil";
+            TextureOptions $opt = TextureOptions($format: .depth32fStencil8, $min: .nearest, $mag: .nearest);
+            TextureDesc $desc = $opt->desc($ref->width, $ref->height);
+            $desc->usage = TEXTURE_RENDER_TARGET | TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC;
+            $desc->label = $dsName;
+            $this->dropTexture($dsName);
+            Texture $ds = Texture($this->device, $dsName, $desc);
+            $this->textures[$dsName] = StoredTexture($ds, false, $ref->name);
+            $owned->push($dsName);
+            $target->depth = $ds;
         }
 
         $this->targets[$ref->name] = StoredTarget($target, $owned, false, targetFingerprint($ref));
         return .ok($target);
-    }
-
-    private function abandonTarget(Framebuffer $fb, array<string> $owned) : void
-    {
-        foreach ($owned as $texName) {
-            $this->dropTexture($texName);
-        }
-
-        $fb->destroy();
     }
 
     private function dropTarget(string $name) : void
@@ -408,7 +384,6 @@ public class Pool
             $this->dropTexture($texName);
         }
 
-        $held->target->framebuffer->destroy();
         $this->targets->remove($name);
     }
 
@@ -432,12 +407,8 @@ internal function targetFingerprint(TargetRef $ref) : string
 {
     string $fp = "{$ref->width}x{$ref->height}";
 
-    if ($ref->rboDepthStencil) {
+    if ($ref->depthStencil) {
         $fp->append('|rboDS');
-    }
-
-    if ($ref->rboColor) {
-        $fp->append('|rboC');
     }
 
     array<TextureRef> $texes = $ref->textures();

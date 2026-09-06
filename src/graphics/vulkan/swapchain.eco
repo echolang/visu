@@ -1,0 +1,276 @@
+/**
+ * Swapchain, image views, per-image render-done semaphores.
+ */
+
+namespace visu::graphics;
+
+internal function vkDropSwapchain(Device $device) : void
+{
+    if ($device->logical->handle == 0) {
+        return;
+    }
+
+    vk::DeviceWaitIdle($device->logical);
+    vkDropViews($device);
+
+    if ($device->swapchain->handle != 0) {
+        vk::DestroySwapchainKHR($device->logical, $device->swapchain, null);
+        $device->swapchain = vk::SwapchainKHR::none();
+    }
+}
+
+internal function vkDropViews(Device $device) : void
+{
+    if ($device->logical->handle == 0) {
+        return;
+    }
+
+    $device->bb = null;
+    uint32 $i = 0;
+    uint32 $n = $device->views->count() as uint32;
+
+    while ($i < $n) {
+        if ($device->views[$i]->handle != 0) {
+            vk::DestroyImageView($device->logical, $device->views[$i], null);
+        }
+
+        if ($i < $device->renderDone->count() as uint32 && $device->renderDone[$i]->handle != 0) {
+            vk::DestroySemaphore($device->logical, $device->renderDone[$i], null);
+        }
+
+        $i = $i + 1;
+    }
+
+    $device->views = array<vk::ImageView>();
+    $device->images = array<vk::Image>();
+    $device->renderDone = array<vk::Semaphore>();
+}
+
+internal function vkBootSwapchain(Device $device, int32 $fbW, int32 $fbH) : status<DeviceError>
+{
+    vkDropViews($device);
+    vk::SurfaceCapabilitiesKHR $caps = vk::SurfaceCapabilitiesKHR();
+    guard vkCheck(
+        vk::GetPhysicalDeviceSurfaceCapabilitiesKHR($device->physical, $device->surface, &$caps),
+        'GetPhysicalDeviceSurfaceCapabilitiesKHR'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    uint32 $fmtCount = 0;
+    guard vkCheck(
+        vk::GetPhysicalDeviceSurfaceFormatsKHR($device->physical, $device->surface, &$fmtCount, null),
+        'GetPhysicalDeviceSurfaceFormatsKHR'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    if ($fmtCount == 0) {
+        return .error(.surfaceLost);
+    }
+
+    array<vk::SurfaceFormatKHR> $fmts = arr::room<vk::SurfaceFormatKHR>($fmtCount as usize);
+    uint32 $i = 0;
+
+    while ($i < $fmtCount) {
+        $fmts[] = vk::SurfaceFormatKHR();
+        $i = $i + 1;
+    }
+
+    guard vkCheck(
+        vk::GetPhysicalDeviceSurfaceFormatsKHR($device->physical, $device->surface, &$fmtCount, &$fmts[0]),
+        'GetPhysicalDeviceSurfaceFormatsKHR'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    $device->vkFormat = $fmts[0]->format;
+    uint32 $colorSpace = $fmts[0]->colorSpace;
+    $i = 0;
+
+    while ($i < $fmtCount) {
+        if ($fmts[$i]->format == vk::FORMAT_B8G8R8A8_UNORM) {
+            $device->vkFormat = $fmts[$i]->format;
+            $colorSpace = $fmts[$i]->colorSpace;
+            break;
+        }
+
+        $i = $i + 1;
+    }
+
+    $device->bbFormat = .bgra8;
+
+    if ($caps->currentExtent->width != 0xFFFFFFFF) {
+        $device->extent = $caps->currentExtent;
+    } else {
+        uint32 $w = $fbW as uint32;
+        uint32 $h = $fbH as uint32;
+
+        if ($w < $caps->minImageExtent->width) {
+            $w = $caps->minImageExtent->width;
+        }
+
+        if ($w > $caps->maxImageExtent->width) {
+            $w = $caps->maxImageExtent->width;
+        }
+
+        if ($h < $caps->minImageExtent->height) {
+            $h = $caps->minImageExtent->height;
+        }
+
+        if ($h > $caps->maxImageExtent->height) {
+            $h = $caps->maxImageExtent->height;
+        }
+
+        $device->extent = vk::Extent2D($w, $h);
+    }
+
+    if ($device->extent->width == 0 || $device->extent->height == 0) {
+        return .ok;
+    }
+
+    uint32 $n = $caps->minImageCount + 1;
+
+    if ($caps->maxImageCount > 0 && $n > $caps->maxImageCount) {
+        $n = $caps->maxImageCount;
+    }
+
+    uint32 $transform = $caps->currentTransform;
+    uint32 $alpha = vk::COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+
+    if (($caps->supportedCompositeAlpha & $alpha) == 0) {
+        $alpha = 1;
+    }
+
+    uint32 $present = vk::PRESENT_MODE_FIFO_KHR;
+
+    if (!$device->vsync) {
+        $present = vkPickPresent($device, vk::PRESENT_MODE_MAILBOX_KHR, vk::PRESENT_MODE_IMMEDIATE_KHR);
+    }
+
+    vk::SwapchainCreateInfoKHR $sci = vk::SwapchainCreateInfoKHR();
+    $sci->surface = $device->surface;
+    $sci->minImageCount = $n;
+    $sci->imageFormat = $device->vkFormat;
+    $sci->imageColorSpace = $colorSpace;
+    $sci->imageExtent = $device->extent;
+    $sci->imageArrayLayers = 1;
+    $sci->imageUsage = vk::IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk::IMAGE_USAGE_TRANSFER_SRC_BIT;
+    $sci->imageSharingMode = vk::SHARING_MODE_EXCLUSIVE;
+    $sci->preTransform = $transform;
+    $sci->compositeAlpha = $alpha;
+    $sci->presentMode = $present;
+    $sci->clipped = vk::TRUE;
+    $sci->oldSwapchain = $device->swapchain;
+    vk::SwapchainKHR $old = $device->swapchain;
+    guard vkCheck(
+        vk::CreateSwapchainKHR($device->logical, &$sci, null, &$device->swapchain),
+        'CreateSwapchainKHR'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    if ($old->handle != 0) {
+        vk::DestroySwapchainKHR($device->logical, $old, null);
+    }
+
+    uint32 $imgCount = 0;
+    guard vkCheck(
+        vk::GetSwapchainImagesKHR($device->logical, $device->swapchain, &$imgCount, null),
+        'GetSwapchainImagesKHR'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    $device->images = arr::room<vk::Image>($imgCount as usize);
+    $i = 0;
+
+    while ($i < $imgCount) {
+        $device->images[] = vk::Image::none();
+        $i = $i + 1;
+    }
+
+    guard vkCheck(
+        vk::GetSwapchainImagesKHR($device->logical, $device->swapchain, &$imgCount, &$device->images[0]),
+        'GetSwapchainImagesKHR'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    $device->views = arr::room<vk::ImageView>($imgCount as usize);
+    $device->renderDone = arr::room<vk::Semaphore>($imgCount as usize);
+    $i = 0;
+
+    while ($i < $imgCount) {
+        vk::ImageViewCreateInfo $ivci = vk::ImageViewCreateInfo();
+        $ivci->image = $device->images[$i];
+        $ivci->viewType = vk::IMAGE_VIEW_TYPE_2D;
+        $ivci->format = $device->vkFormat;
+        $ivci->subresourceRange->aspectMask = vk::IMAGE_ASPECT_COLOR_BIT;
+        $ivci->subresourceRange->levelCount = 1;
+        $ivci->subresourceRange->layerCount = 1;
+        vk::ImageView $view = vk::ImageView::none();
+        guard vkCheck(vk::CreateImageView($device->logical, &$ivci, null, &$view), 'CreateImageView') else ($e) {
+            return .error($e);
+        }
+        $device->views[] = $view;
+        vk::SemaphoreCreateInfo $sciDone = vk::SemaphoreCreateInfo();
+        vk::Semaphore $done = vk::Semaphore::none();
+        guard vkCheck(
+            vk::CreateSemaphore($device->logical, &$sciDone, null, &$done),
+            'CreateSemaphore'
+        ) else ($e) {
+            return .error($e);
+        }
+        $device->renderDone[] = $done;
+        $i = $i + 1;
+    }
+
+    return .ok;
+}
+
+internal function vkPickPresent(Device $device, uint32 $prefer, uint32 $fallback) : uint32
+{
+    uint32 $n = 0;
+    vk::Result $r = vk::GetPhysicalDeviceSurfacePresentModesKHR($device->physical, $device->surface, &$n, null);
+
+    if (!$r->ok() || $n == 0) {
+        return vk::PRESENT_MODE_FIFO_KHR;
+    }
+
+    array<uint32> $modes = arr::room<uint32>($n as usize);
+    uint32 $i = 0;
+
+    while ($i < $n) {
+        $modes[] = 0;
+        $i = $i + 1;
+    }
+
+    $r = vk::GetPhysicalDeviceSurfacePresentModesKHR($device->physical, $device->surface, &$n, &$modes[0]);
+
+    if (!$r->ok()) {
+        return vk::PRESENT_MODE_FIFO_KHR;
+    }
+
+    $i = 0;
+
+    while ($i < $n) {
+        if ($modes[$i] == $prefer) {
+            return $prefer;
+        }
+
+        $i = $i + 1;
+    }
+
+    $i = 0;
+
+    while ($i < $n) {
+        if ($modes[$i] == $fallback) {
+            return $fallback;
+        }
+
+        $i = $i + 1;
+    }
+
+    return vk::PRESENT_MODE_FIFO_KHR;
+}

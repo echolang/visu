@@ -1,9 +1,8 @@
 /**
- * Named shader programs and their permutations. Stores Gpu; get /
- * permutation / load / destroy use the handle. scan walks a directory
- * tree; register names files by hand. ShaderRef is the slot: one
- * object per name (and per variant), held for the process lifetime.
- * forget drops the compiled program, not the ref.
+ * Named shader programs and their permutations. Stores Device;
+ * scan walks a directory of offline-compiled stages. ShaderRef is
+ * the slot: one object per name (and per variant), held for the
+ * process lifetime. forget drops the linked program, not the ref.
  */
 
 namespace visu::graphics;
@@ -12,32 +11,15 @@ use std::io;
 
 public class ShaderCollection
 {
-    public Gpu $gpu;
+    public Device $device;
     public ShaderLoader $loader;
-    private ordered_map<string, string> $globals;
     private map<string, ShaderRef> $shaders;
 
-    public constructor(Gpu $gpu, string $directory)
+    public constructor(Device $device, string $directory)
     {
-        $this->gpu = $gpu;
+        $this->device = $device;
         $this->loader = ShaderLoader($directory);
-        $this->globals = ordered_map<string, string>();
         $this->shaders = map<string, ShaderRef>();
-    }
-
-    public function define(string $name, int32 $value) : void
-    {
-        $this->globals[$name] = "{$value}";
-    }
-
-    public function define(string $name, float32 $value) : void
-    {
-        $this->globals[$name] = "{$value}";
-    }
-
-    public function define(string $name, string $value) : void
-    {
-        $this->globals[$name] = $value;
     }
 
     public function register(string $name, array<ShaderFile> $files) : result<ShaderRef, ShaderError>
@@ -55,8 +37,9 @@ public class ShaderCollection
     /**
      * Register every shader program under `$directory` (the collection
      * directory when omitted). Recurses. Name is the relative path with
-     * `.vert|.frag|.geo|.tessc|.tesse.{suffix}` stripped. Already-registered
-     * names are left alone. Does not compile.
+     * `.vert|.frag|.geo|.tessc|.tesse.{suffix}` stripped; `name+variant`
+     * files become permutation refs. Already-registered names are left
+     * alone. Does not compile.
      */
     public function scan(string? $directory = null) : status<ShaderError>
     {
@@ -106,20 +89,26 @@ public class ShaderCollection
         return $this->shaders[$name]->program();
     }
 
+    /**
+     * Resolve a scanned variant. Creates nothing; missing or
+     * manifest-mismatched defines are programmer errors.
+     */
     public function definePermutation(string $shader, string $variant, array<Define> $defines = array<Define>()) : ShaderRef
     {
-        ShaderRef $entry = $this->entry($shader);
+        assert($this->shaders->has($shader), 'shader: permutation base was never scanned');
+        ShaderRef $entry = $this->shaders[$shader];
+        assert($entry->variants->has($variant), 'shader: permutation was never scanned');
+        ShaderRef $held = $entry->variants[$variant];
 
-        if ($entry->variants->has($variant)) {
-            ShaderRef $held = $entry->variants[$variant];
-            $held->defines = $defines;
-            return $held;
+        if ($this->loader->hasManifest()) {
+            array<Define> $expected = guard $this->loader->variantDefines($shader, $variant) else {
+                die("shader: variant '{$variant}' of '{$shader}' does not match the manifest");
+            }
+            assert(definesMatch($defines, $expected), 'shader: stale variant defines');
         }
 
-        ShaderRef $ref = ShaderRef($this, $shader, variant: $variant);
-        $ref->defines = $defines;
-        $entry->variants[$variant] = $ref;
-        return $ref;
+        $held->defines = $defines;
+        return $held;
     }
 
     public function permutation(string $shader, string $variant) : result<ShaderRef, ShaderError>
@@ -225,7 +214,8 @@ public class ShaderCollection
     {
         string $root = slashDir($directory);
         map<string, array<ShaderFile>> $programs = map<string, array<ShaderFile>>();
-        guard $this->walk($root, $root, shaderSuffix(), $programs) else ($e) {
+        map<string, map<string, array<ShaderFile>>> $variants = map<string, map<string, array<ShaderFile>>>();
+        guard $this->walk($root, $root, shaderSuffix(), $programs, $variants) else ($e) {
             return .error($e);
         }
         array<string> $names = $programs->keys();
@@ -240,6 +230,24 @@ public class ShaderCollection
             $entry->files = $programs[$name];
         }
 
+        array<string> $bases = $variants->keys();
+
+        foreach ($bases as $base) {
+            ShaderRef $entry = $this->entry($base);
+            map<string, array<ShaderFile>> $vars = $variants[$base];
+            array<string> $vnames = $vars->keys();
+
+            foreach ($vnames as $vname) {
+                if ($entry->variants->has($vname)) {
+                    continue;
+                }
+
+                ShaderRef $ref = ShaderRef($this, $base, variant: $vname);
+                $ref->files = $vars[$vname];
+                $entry->variants[$vname] = $ref;
+            }
+        }
+
         return .ok;
     }
 
@@ -248,6 +256,7 @@ public class ShaderCollection
         string $prefix,
         string $ext,
         map<string, array<ShaderFile>>& $programs,
+        map<string, map<string, array<ShaderFile>>>& $variants,
     ) : status<ShaderError>
     {
         io::dir $d = guard io::opendir($dir) else ($e) {
@@ -266,14 +275,30 @@ public class ShaderCollection
             ShaderStem $stem = guard $maybe else {
                 continue;
             }
+            string $variant = guard $stem->variant else {
+                if (!$programs->has($stem->name)) {
+                    $programs[$stem->name] = array<ShaderFile>();
+                }
 
-            if (!$programs->has($stem->name)) {
-                $programs[$stem->name] = array<ShaderFile>();
+                array<ShaderFile> $files = $programs[$stem->name];
+                $files[] = ShaderFile($stem->kind, $entry->path());
+                $programs[$stem->name] = $files;
+                continue;
             }
 
-            array<ShaderFile> $files = $programs[$stem->name];
-            $files[] = ShaderFile($stem->kind, $entry->path());
-            $programs[$stem->name] = $files;
+            if (!$variants->has($stem->name)) {
+                $variants[$stem->name] = map<string, array<ShaderFile>>();
+            }
+
+            map<string, array<ShaderFile>>& $bucket = $variants->at($stem->name);
+
+            if (!$bucket->has($variant)) {
+                $bucket[$variant] = array<ShaderFile>();
+            }
+
+            array<ShaderFile> $vfiles = $bucket[$variant];
+            $vfiles[] = ShaderFile($stem->kind, $entry->path());
+            $bucket[$variant] = $vfiles;
         }
 
         io::ioerror? $readErr = $d->error();
@@ -286,7 +311,7 @@ public class ShaderCollection
         }
 
         foreach ($subs as $sub) {
-            guard $this->walk($sub, $prefix, $ext, $programs) else ($e) {
+            guard $this->walk($sub, $prefix, $ext, $programs, $variants) else ($e) {
                 return .error($e);
             }
         }
@@ -297,11 +322,11 @@ public class ShaderCollection
     internal function compileBase(ShaderRef $ref) : result<ShaderProgram, ShaderError>
     {
         ShaderProgram $held = guard $ref->compiled else {
-            return $this->buildBase($ref);
+            return $this->build($ref);
         }
 
         if ($held->destroyed()) {
-            return $this->buildBase($ref);
+            return $this->build($ref);
         }
 
         return .ok($held);
@@ -310,101 +335,79 @@ public class ShaderCollection
     internal function compileVariant(ShaderRef $ref) : result<ShaderProgram, ShaderError>
     {
         ShaderProgram $held = guard $ref->compiled else {
-            return $this->buildVariant($ref);
+            return $this->build($ref);
         }
 
         if ($held->destroyed()) {
-            return $this->buildVariant($ref);
+            return $this->build($ref);
         }
 
         return .ok($held);
     }
 
-    private function buildBase(ShaderRef $ref) : result<ShaderProgram, ShaderError>
+    private function build(ShaderRef $ref) : result<ShaderProgram, ShaderError>
     {
         if ($ref->files->count() == 0) {
-            return .error(.missing($ref->name));
+            string $v = guard $ref->variant else {
+                return .error(.missing($ref->name));
+            }
+            return .error(.missingPermutation($ref->name, $v));
         }
 
-        ShaderProgram $program = guard $this->build($ref->files, $this->globalDefines(), $ref->name) else ($e) {
-            return .error($e);
-        }
-        $ref->compiled = $program;
-        return .ok($program);
-    }
+        string $vs = '';
+        string $fs = '';
 
-    private function buildVariant(ShaderRef $ref) : result<ShaderProgram, ShaderError>
-    {
-        if (!$this->shaders->has($ref->name)) {
-            return .error(.missingBase($ref->name));
-        }
-
-        ShaderRef $base = $this->shaders[$ref->name];
-
-        if ($base->files->count() == 0) {
-            return .error(.missingBase($ref->name));
-        }
-
-        string $v = guard $ref->variant else {
-            return .error(.missingBase($ref->name));
-        }
-        string $key = "{$ref->name}#{$v}";
-        ShaderProgram $program = guard $this->build($base->files, $this->mergedDefines($ref->defines), $key) else ($e) {
-            return .error($e);
-        }
-        $ref->compiled = $program;
-        return .ok($program);
-    }
-
-    private function globalDefines() : array<Define>
-    {
-        array<Define> $out = array<Define>();
-        array<string> $keys = $this->globals->keys();
-
-        foreach ($keys as $k) {
-            $out[] = Define($k, $this->globals[$k]);
-        }
-
-        return $out;
-    }
-
-    private function mergedDefines(array<Define> $variant) : array<Define>
-    {
-        ordered_map<string, string> $merged = $this->globals->clone();
-
-        foreach ($variant as $d) {
-            $merged[$d->name] = $d->value;
-        }
-
-        array<Define> $out = array<Define>();
-        array<string> $keys = $merged->keys();
-
-        foreach ($keys as $k) {
-            $out[] = Define($k, $merged[$k]);
-        }
-
-        return $out;
-    }
-
-    private function build(array<ShaderFile> $files, array<Define> $defines, string $linkName) : result<ShaderProgram, ShaderError>
-    {
-        ShaderProgram $program = ShaderProgram($this->gpu);
-
-        foreach ($files as $file) {
-            string $src = guard $this->loader->load($file->path, $defines) else ($e) {
-                $program->destroy();
+        foreach ($ref->files as $file) {
+            string $bytes = guard $this->loader->read($file->path) else ($e) {
                 return .error($e);
             }
 
-            ShaderStage $stage = ShaderStage($this->gpu, $file->kind, $src);
-            $program->attach($stage);
+            if ($file->kind == ShaderKind::vertex) {
+                $vs = $bytes;
+            } else if ($file->kind == ShaderKind::fragment) {
+                $fs = $bytes;
+            } else {
+                return .error(.compile("shader '{$ref->name}': only vertex+fragment"));
+            }
         }
 
-        guard $program->link($linkName) else ($e) {
-            $program->destroy();
+        if ($vs->empty() || $fs->empty()) {
+            return .error(.missing($ref->name));
+        }
+
+        string $linkName = $ref->name;
+        string $v = guard $ref->variant else {
+            ShaderProgram $program = guard ShaderProgram::link($this->device, $linkName, $vs, $fs) else ($e) {
+                return .error($e);
+            }
+            $ref->compiled = $program;
+            return .ok($program);
+        }
+        $linkName = "{$ref->name}+{$v}";
+        ShaderProgram $program = guard ShaderProgram::link($this->device, $linkName, $vs, $fs) else ($e) {
             return .error($e);
         }
-
+        $ref->compiled = $program;
         return .ok($program);
     }
+}
+
+internal function definesMatch(const array<Define>& $got, const array<Define>& $want) : bool
+{
+    if ($got->count() != $want->count()) {
+        return false;
+    }
+
+    usize $i = 0;
+    usize $n = $got->count();
+
+    while ($i < $n) {
+        if ($got[$i]->name != $want[$i]->name || $got[$i]->value != $want[$i]->value) {
+            return false;
+        }
+
+        $i = $i + 1;
+    }
+
+    return true;
 }

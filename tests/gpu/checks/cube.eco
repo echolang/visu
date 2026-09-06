@@ -1,0 +1,64 @@
+/**
+ * Cube mesh projected on xy paints solid red over a green clear.
+ */
+
+use visu::graphics::{
+    CallbackPass, ClearPass, ClearPassOptions, Context, Device, Frame, GpuPass,
+    IoSink, Mesh, Pipeline, PipelineError, Raster, RenderEncoder,
+    ShaderCollection, TargetRef, VertexLayout
+};
+use visu::math::Vec4;
+
+public function checkCubeDraw(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('solid') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'cube');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'cube-draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(Context $ctx) : status<PipelineError> {
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                Device $device = $ctx->device;
+                Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
+                    return .cube($device);
+                });
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3(), Raster::none());
+                $pass->draw($enc, $mesh, QuadParams(Vec4(1.0f, 0.0f, 0.0f, 1.0f)));
+                $enc->end();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('cube');
+    $shaders->destroy();
+    assert($pixels[0] > 240, 'r');
+    assert($pixels[1] < 16, 'g');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_cube_draw
+{
+    GpuContext $gpu = gpuHidden('cube');
+    checkCubeDraw($gpu);
+    $gpu->end();
+}
+#[end]

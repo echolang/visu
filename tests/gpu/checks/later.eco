@@ -1,0 +1,48 @@
+/**
+ * Two QuadPasses on one target; the later tint wins (b ≈ 0.5).
+ */
+
+use visu::graphics::{
+    ClearPass, ClearPassOptions, Pipeline, QuadRenderer, ShaderCollection, TargetRef
+};
+use visu::math::Vec4;
+
+public function checkLaterPassWins(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('quad') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    QuadRenderer $quad = QuadRenderer();
+    $quad->setShader($ref);
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'later');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+        $quad->pass($p, $t, QuadParams(Vec4(0.0f, 0.0f, 0.25f, 1.0f)));
+        $quad->pass($p, $t, QuadParams(Vec4(0.0f, 0.0f, 0.5f, 1.0f)));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('later');
+    $shaders->destroy();
+    assert($pixels[0] < 16, 'bottom-left r');
+    assert($pixels[1] < 16, 'bottom-left g');
+    assert($pixels[2] > 100 && $pixels[2] < 160, 'bottom-left b');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_later_pass_wins
+{
+    GpuContext $gpu = gpuHidden('later');
+    checkLaterPassWins($gpu);
+    $gpu->end();
+}
+#[end]

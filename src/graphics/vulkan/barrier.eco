@@ -1,0 +1,136 @@
+/**
+ * ResourceState → layout + VkPipelineStage/Access (core 1.0
+ * CmdPipelineBarrier). Sync2 is optional on 1.2 ICDs.
+ */
+
+namespace visu::graphics;
+
+internal struct LayoutInfo
+{
+    public uint32 $layout;
+    public uint32 $stage;
+    public uint32 $access;
+}
+
+internal function layoutInfo(ResourceState $state) : LayoutInfo
+{
+    return match ($state) {
+        ResourceState::undefined => LayoutInfo(
+            vk::IMAGE_LAYOUT_UNDEFINED,
+            vk::PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            0
+        ),
+        ResourceState::colorTarget => LayoutInfo(
+            vk::IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            vk::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            vk::ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+        ),
+        ResourceState::depthTarget => LayoutInfo(
+            vk::IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            vk::PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            0
+        ),
+        ResourceState::shaderRead => LayoutInfo(
+            vk::IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            vk::PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            vk::ACCESS_SHADER_READ_BIT
+        ),
+        ResourceState::transferSrc => LayoutInfo(
+            vk::IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            vk::PIPELINE_STAGE_TRANSFER_BIT,
+            vk::ACCESS_TRANSFER_READ_BIT
+        ),
+        ResourceState::transferDst => LayoutInfo(
+            vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            vk::PIPELINE_STAGE_TRANSFER_BIT,
+            vk::ACCESS_TRANSFER_WRITE_BIT
+        ),
+        ResourceState::present => LayoutInfo(
+            vk::IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            vk::PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0
+        ),
+    };
+}
+
+internal function vkRecordBarrier(
+    vk::CommandBuffer $cmd,
+    vk::Image $image,
+    ResourceState $from,
+    ResourceState $to,
+    uint32 $aspect
+) : void
+{
+    LayoutInfo $src = layoutInfo($from);
+    LayoutInfo $dst = layoutInfo($to);
+    vk::ImageMemoryBarrier $b = vk::ImageMemoryBarrier();
+    $b->srcAccessMask = $src->access;
+    $b->dstAccessMask = $dst->access;
+    $b->oldLayout = $src->layout;
+    $b->newLayout = $dst->layout;
+    $b->srcQueueFamilyIndex = vk::QUEUE_FAMILY_IGNORED;
+    $b->dstQueueFamilyIndex = vk::QUEUE_FAMILY_IGNORED;
+    $b->image = $image;
+    $b->subresourceRange->aspectMask = $aspect;
+    $b->subresourceRange->levelCount = 1;
+    $b->subresourceRange->layerCount = 1;
+    vk::CmdPipelineBarrier(
+        $cmd,
+        $src->stage,
+        $dst->stage,
+        0,
+        0,
+        null,
+        0,
+        null,
+        1,
+        &$b
+    );
+}
+
+internal function vkBarrier(
+    Device $device,
+    vk::Image $image,
+    ResourceState $from,
+    ResourceState $to,
+    uint32 $aspect
+) : void
+{
+    vkRecordBarrier($device->currentCmd(), $image, $from, $to, $aspect);
+}
+
+internal function vkOneShotImageBarrier(
+    Device $device,
+    vk::Image $image,
+    ResourceState $from,
+    ResourceState $to,
+    uint32 $aspect
+) : void
+{
+    vk::CommandBuffer $cmd = $device->setupCmd;
+    guard vkCheck(vk::ResetCommandBuffer($cmd, 0), 'ResetCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    vk::CommandBufferBeginInfo $begin = vk::CommandBufferBeginInfo();
+    $begin->flags = vk::COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    guard vkCheck(vk::BeginCommandBuffer($cmd, &$begin), 'BeginCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    vkRecordBarrier($cmd, $image, $from, $to, $aspect);
+    guard vkCheck(vk::EndCommandBuffer($cmd), 'EndCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    vk::SubmitInfo $si = vk::SubmitInfo();
+    $si->commandBufferCount = 1;
+    $si->pCommandBuffers:$ = &$cmd;
+    guard vkCheck(vk::QueueSubmit($device->queue, 1, &$si, vk::Fence::none()), 'QueueSubmit') else ($e) {
+        die($e->message());
+    }
+
+    guard vkCheck(vk::QueueWaitIdle($device->queue), 'QueueWaitIdle') else ($e) {
+        die($e->message());
+    }
+}

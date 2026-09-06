@@ -47,6 +47,7 @@ public interface Conduit
 internal class ProcessLog
 {
     public static Logger? $log = null;
+    public static bool $version = false;
 }
 
 public class Logger
@@ -194,6 +195,35 @@ public class FileConduit : Conduit
 public function installLogger(Logger $log) : void
 {
     ProcessLog::$log = $log;
+}
+
+/**
+ * Fill-if-absent stdout logger so windowed examples that skip
+ * bootstrap still print the boot dump. No-op when one is installed.
+ */
+public function ensureLogger() : void
+{
+    if (hasLogger()) {
+        return;
+    }
+
+    Logger $log = Logger();
+    $log->attach(StdoutConduit());
+    installLogger($log);
+}
+
+/**
+ * `visu 0.2.0` once per process. No-op until a logger is installed.
+ */
+public function announceVersion() : void
+{
+    if (ProcessLog::$version || !hasLogger()) {
+        return;
+    }
+
+    ProcessLog::$version = true;
+    string $ver = visu::VERSION;
+    info("visu {$ver}");
 }
 
 public function uninstallLogger() : void

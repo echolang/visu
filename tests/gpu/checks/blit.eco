@@ -1,0 +1,40 @@
+/**
+ * Fullscreen blit of a 0.5-red offscreen onto another 64×64 target.
+ */
+
+use visu::graphics::{
+    ClearPass, ClearPassOptions, FullscreenTextureRenderer, Pipeline, TargetRef
+};
+use visu::math::Vec4;
+
+public function checkBlit(GpuContext $gpu) : void
+{
+    FullscreenTextureRenderer $blit = FullscreenTextureRenderer();
+    guard $blit->load($gpu->device) else ($e) {
+        $blit->destroy();
+        die($e->message());
+    }
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $src = offscreen64($p, 'blitSrc');
+        TargetRef $dst = offscreen64($p, 'blitDst');
+        $p->add(ClearPass($src, ClearPassOptions(color: Vec4(0.5f, 0.0f, 0.0f, 1.0f))));
+        $p->add(ClearPass($dst, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+        $blit->pass($p, $dst, $src->colorAttachments[0]);
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('blitDst');
+    $blit->destroy();
+    assert($pixels[0] > 100 && $pixels[0] < 160, 'blit r');
+    assert($pixels[1] < 16, 'blit g');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_blit
+{
+    GpuContext $gpu = gpuHidden('blit');
+    checkBlit($gpu);
+    $gpu->end();
+}
+#[end]

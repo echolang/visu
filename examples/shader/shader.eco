@@ -1,88 +1,112 @@
 /*
  * Compile a fullscreen-quad shader and draw it through the graph.
- * UVs go in red/green; QuadParams[0].b tints the blue channel.
+ * UVs go in red/green; QuadParams.b tints the blue channel.
  *
  *   echoc run -m examples --target shader
  *   echoc run -m examples --target shader --define VISU_FINITE
  */
 
 use std::io;
-use visu::app::{Logger, StdoutConduit, installLogger};
+use visu::app::ensureLogger;
 use visu::os::{Window, init, terminate};
 use visu::math::Vec4;
 use visu::graphics::{
-    Gpu, Pool, Frame, Pipeline, Backbuffer, ClearPass, ClearPassOptions,
-    QuadRenderer, ShaderCollection, ShaderProgram
+    Device, DeviceError, FrameStatus, Pool, Frame, Pipeline, Backbuffer,
+    ClearPass, ClearPassOptions, ShaderCollection, QuadRenderer
 };
 
+ensureLogger();
 guard init() else ($e) {
     die($e->message());
 }
 
 Window $window = Window('visu shader', 800, 600);
-Gpu $gpu = Gpu();
-guard $window->initialize($gpu) else ($e) {
+Device $device = Device();
+guard $window->initialize($device) else ($e) {
     terminate();
     die($e->message());
 }
 
 $window->setSwapInterval(1);
 
-Logger $log = Logger();
-$log->attach(StdoutConduit());
-installLogger($log);
-
-ShaderCollection $shaders = ShaderCollection($gpu, shaderDirectory());
+Pool $pool = Pool($device);
+ShaderCollection $shaders = ShaderCollection($device, shaderDirectory());
 guard $shaders->scan() else ($e) {
-    $window->destroy();
-    terminate();
-    die($e->message());
-}
-$shader = guard $shaders->shader('quad') else ($e) {
-    $window->destroy();
-    terminate();
-    die($e->message());
-}
-ShaderProgram $prog = guard $shader->load() else ($e) {
     $shaders->destroy();
+    $pool->destroy();
     $window->destroy();
+    $device->shutdown();
     terminate();
     die($e->message());
 }
 
-QuadRenderer $quad = QuadRenderer($shader);
-Pool $pool = Pool($gpu);
-int32 $tick = 0;
-int32 $n = 0;
+$quadShader = guard $shaders->shader('quad') else ($e) {
+    $shaders->destroy();
+    $pool->destroy();
+    $window->destroy();
+    $device->shutdown();
+    terminate();
+    die($e->message());
+}
+guard $quadShader->load() else ($e) {
+    $shaders->destroy();
+    $pool->destroy();
+    $window->destroy();
+    $device->shutdown();
+    terminate();
+    die($e->message());
+}
 
-while (!$window->shouldClose() && !visu::finiteDone($n)) {
-    Frame $frame = Frame();
-    Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
-    Backbuffer $back = $frame->get<Backbuffer>();
-    $pipeline->add(ClearPass($back->target, ClearPassOptions(color: Vec4(0.08f, 0.08f, 0.1f, 1.0f))));
-    $quad->pass($pipeline, $back->target, TintParams(Vec4(0.2f, 0.55f, 0.9f, 1.0f)));
-    guard $pipeline->execute($tick) else ($e) {
-        die($e->message());
+QuadRenderer $quad = QuadRenderer($quadShader);
+TintParams $params = TintParams(Vec4(0.2f, 0.55f, 0.9f, 1.0f));
+int32 $tick = 0;
+int32 $frame = 0;
+
+while (!$window->shouldClose() && !visu::finiteDone($frame)) {
+    int32 $w = $window->framebufferWidth();
+    int32 $h = $window->framebufferHeight();
+    FrameStatus $status = guard $device->beginFrame($w, $h) else ($e) {
+        match ($e) {
+            DeviceError::surfaceLost => {
+                break;
+            },
+            else => {
+                die($e->message());
+            },
+        };
     }
 
-    $window->swap();
+    if ($status == FrameStatus::ready) {
+        Frame $data = Frame();
+        Pipeline $pipeline = Pipeline($pool, $data, $window->renderTarget());
+        Backbuffer $back = $data->get<Backbuffer>();
+        $pipeline->add(ClearPass($back->target, ClearPassOptions(color: Vec4(0.08f, 0.08f, 0.1f, 1.0f))));
+        $quad->pass($pipeline, $back->target, $params);
+        guard $pipeline->execute($tick) else ($e) {
+            die($e->message());
+        }
+        $window->swap();
+    }
+
     $window->poll();
     $tick = $tick + 1;
-    $n = $n + 1;
+    $frame = $frame + 1;
 }
 
-$pool->destroy();
+$device->waitIdle();
 $shaders->destroy();
+$pool->destroy();
 $window->destroy();
+$device->shutdown();
 terminate();
 
 internal function shaderDirectory() : string
 {
-    if (shaderFileExists('shaders/quad.vert.spv')) {
+    if (shaderFileExists('shaders/quad.vert.spv') || shaderFileExists('shaders/quad.vert.metal')) {
         return 'shaders';
     }
 
-    if (shaderFileExists('shader/shaders/quad.vert.spv')) {
+    if (shaderFileExists('shader/shaders/quad.vert.spv') || shaderFileExists('shader/shaders/quad.vert.metal')) {
         return 'shader/shaders';
     }
 
@@ -91,7 +115,7 @@ internal function shaderDirectory() : string
 
 internal function shaderFileExists(string $path) : bool
 {
-    guard io::exists($path) else {
+    bool $here = guard io::exists($path) else {
         return false;
     }
 

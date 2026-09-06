@@ -1,0 +1,661 @@
+/**
+ * Metal Device. The app constructs one; GPU objects store the
+ * handle. Construct-then-initialize; headless construct is legal.
+ */
+
+namespace visu::graphics;
+
+use visu::app::{announceVersion, info};
+
+public class Device : DeviceProtocol
+{
+    internal mtl::Device? $gpu;
+    internal mtl::CommandQueue? $queue;
+    internal mtl::Layer? $layer;
+    internal mtl::Drawable? $drawable;
+    internal mtl::CommandBuffer? $cmd;
+    internal array<FrameSlot> $slots;
+    internal uint32 $slot;
+    internal uint64 $frames;
+    internal bool $ready;
+    internal bool $lostFlag;
+    internal bool $pendingResize;
+    internal int32 $pendingW;
+    internal int32 $pendingH;
+    internal int32 $drawableW;
+    internal int32 $drawableH;
+    internal bool $vsync;
+    internal bool $encoderOpen;
+    internal bool $inFrame;
+    internal DeviceLimits $limits;
+    internal AdapterInfo $adapterInfo;
+    internal Texture? $bb;
+    internal map<string, PipelineHandle> $psos;
+    internal map<string, SamplerHandle> $samplerHandles;
+    internal map<uint32, mtl::DepthStencilState> $depthStates;
+    internal ptr<uint8> $nsWindow;
+    internal PixelFormat $bbFormat;
+
+    public constructor()
+    {
+        $this->gpu = null;
+        $this->queue = null;
+        $this->layer = null;
+        $this->drawable = null;
+        $this->cmd = null;
+        $this->slots = array<FrameSlot>();
+        $this->slot = 0;
+        $this->frames = 0;
+        $this->ready = false;
+        $this->lostFlag = false;
+        $this->pendingResize = false;
+        $this->pendingW = 0;
+        $this->pendingH = 0;
+        $this->drawableW = 0;
+        $this->drawableH = 0;
+        $this->vsync = true;
+        $this->encoderOpen = false;
+        $this->inFrame = false;
+        $this->limits = DeviceLimits();
+        $this->limits->uniformAlign = 16;
+        AdapterInfo $info = AdapterInfo();
+        $info->api = 'Metal';
+        $this->adapterInfo = $info;
+        $this->bb = null;
+        $this->psos = map<string, PipelineHandle>();
+        $this->samplerHandles = map<string, SamplerHandle>();
+        $this->depthStates = map<uint32, mtl::DepthStencilState>();
+        $this->nsWindow:$ = null;
+        $this->bbFormat = .bgra8;
+    }
+
+    destructor()
+    {
+        $this->shutdown();
+    }
+
+    public function initialize(const DeviceOptions& $options) : status<DeviceError>
+    {
+        if ($this->ready) {
+            return .ok;
+        }
+
+        $this->vsync = $options->vsync;
+
+        if (!mtl::available()) {
+            return .error(.noDevice);
+        }
+
+        mtl::Device $gpu = guard mtl::Device::systemDefault() else {
+            return .error(.noDevice);
+        }
+        mtl::CommandQueue $queue = guard $gpu->newCommandQueue() else {
+            return .error(.noDevice);
+        }
+        $this->gpu = $gpu;
+        $this->queue = $queue;
+        guard mtlCreateSlots($this) else ($e) {
+            $this->shutdown();
+            return .error($e);
+        }
+
+        AdapterInfo $info = AdapterInfo();
+        $info->api = 'Metal';
+        $info->name = $gpu->name();
+        $info->vendor = 'Apple';
+        $this->adapterInfo = $info;
+        $this->ready = true;
+        announceVersion();
+        string $line = $info->line();
+        info("graphics: {$line}");
+        return .ok;
+    }
+
+    public function attach(Surface $surface, int32 $width, int32 $height) : status<DeviceError>
+    {
+        assert($this->ready, 'Device.attach before initialize');
+        mtl::Device $gpu = guard $this->gpu else {
+            return .error(.noDevice);
+        }
+        mtl::Layer $layer = guard mtlAttachLayer($gpu, $surface->view, $width, $height) else ($e) {
+            return .error($e);
+        }
+        $this->layer = $layer;
+        $this->nsWindow:$ = $surface->view:$;
+        $this->drawableW = $width;
+        $this->drawableH = $height;
+        $this->applyVsync();
+        return .ok;
+    }
+
+    public function resize(int32 $width, int32 $height) : void
+    {
+        $this->pendingResize = true;
+        $this->pendingW = $width;
+        $this->pendingH = $height;
+    }
+
+    public function lose() : void
+    {
+        $this->lostFlag = true;
+        $this->abortFrame();
+        $this->waitSlots();
+        $this->bb = null;
+        $this->drawable = null;
+        $this->layer = null;
+        $this->nsWindow:$ = null;
+    }
+
+    public const function lost() : bool
+    {
+        return $this->lostFlag;
+    }
+
+    public function waitIdle() : void
+    {
+        mtl::CommandBuffer $cmd = guard $this->cmd else {
+            $this->waitSlots();
+            return;
+        }
+        $cmd->waitUntilCompleted();
+        $this->waitSlots();
+    }
+
+    public const function limits() : DeviceLimits
+    {
+        return $this->limits;
+    }
+
+    public const function adapter() : AdapterInfo
+    {
+        return $this->adapterInfo;
+    }
+
+    public function beginFrame(int32 $width, int32 $height) : result<FrameStatus, DeviceError>
+    {
+        assert($this->ready, 'Device.beginFrame before initialize');
+        assert(!$this->encoderOpen, 'beginFrame with an open encoder');
+        assert(!$this->inFrame, 'beginFrame twice');
+
+        if ($this->lostFlag) {
+            return .error(.surfaceLost);
+        }
+
+        if ($this->pendingResize || $width != $this->drawableW || $height != $this->drawableH) {
+            $this->pendingResize = false;
+            $this->drawableW = $width;
+            $this->drawableH = $height;
+            mtl::Layer $layer = guard $this->layer else {
+                return .ok(.skipped);
+            }
+            mtlResizeLayer($layer, $width, $height);
+        }
+
+        if ($width <= 0 || $height <= 0) {
+            return .ok(.skipped);
+        }
+
+        FrameSlot $slot = $this->slots[$this->slot];
+        mtl::CommandBuffer $prev = guard $slot->prev else {
+            return $this->acquireFrame($width, $height);
+        }
+        $prev->waitUntilCompleted();
+        $slot->prev = null;
+        return $this->acquireFrame($width, $height);
+    }
+
+    public function endFrame() : status<DeviceError>
+    {
+        assert($this->inFrame, 'endFrame outside beginFrame');
+        assert(!$this->encoderOpen, 'endFrame with an open encoder');
+        $this->bb = null;
+        mtl::CommandBuffer $cmd = guard $this->cmd else {
+            $this->inFrame = false;
+            return .ok;
+        }
+        mtl::Drawable $drawable = guard $this->drawable else {
+            $cmd->commit();
+            $this->slots[$this->slot]->prev = $cmd;
+            $this->cmd = null;
+            $this->inFrame = false;
+            $this->frames = $this->frames + 1;
+            $this->slot = ($this->slot + 1) % FRAMES_IN_FLIGHT;
+            return .ok;
+        }
+        $cmd->present($drawable);
+        $cmd->commit();
+        $this->slots[$this->slot]->prev = $cmd;
+        $this->cmd = null;
+        $this->drawable = null;
+        $this->inFrame = false;
+        $this->frames = $this->frames + 1;
+        $this->slot = ($this->slot + 1) % FRAMES_IN_FLIGHT;
+        return .ok;
+    }
+
+    public const function inFrame() : bool
+    {
+        return $this->inFrame;
+    }
+
+    public const function frameSlot() : uint32
+    {
+        return $this->slot;
+    }
+
+    public const function frameIndex() : uint64
+    {
+        return $this->frames;
+    }
+
+    public function backbuffer() : Texture
+    {
+        Texture $bb = guard $this->bb else {
+            die('backbuffer outside beginFrame');
+        }
+        return $bb;
+    }
+
+    public const function backbufferFormat() : PixelFormat
+    {
+        return $this->bbFormat;
+    }
+
+    public function setVsync(bool $on) : void
+    {
+        if ($this->vsync == $on) {
+            return;
+        }
+
+        $this->vsync = $on;
+        $this->applyVsync();
+    }
+
+    public function beginRender(const RenderPassDesc& $desc) : RenderEncoder
+    {
+        assert($this->inFrame, 'beginRender outside beginFrame');
+        assert(!$this->encoderOpen, 'beginRender while an encoder is open');
+        mtl::CommandBuffer $cmd = guard $this->cmd else {
+            die('beginRender without a command buffer');
+        }
+        uint32 $n = $desc->colors->count() as uint32;
+        assert($n > 0 && $n <= 4, 'beginRender needs 1..4 color targets');
+        mtl::RenderPassDescriptor $pass = mtl::RenderPassDescriptor();
+        TargetFormats $formats = TargetFormats();
+        uint32 $i = 0;
+
+        while ($i < $n) {
+            ColorTarget $color = $desc->colors[$i as usize];
+            $color->texture->state = .colorTarget;
+            mtl::Texture $tex = guard $color->texture->handle->texture else {
+                die('beginRender color texture handle is empty');
+            }
+            mtl::ClearColor $clear = mtl::ClearColor(
+                $color->clear->x as float64,
+                $color->clear->y as float64,
+                $color->clear->z as float64,
+                $color->clear->w as float64
+            );
+            $pass->colorAttachments[] = mtl::ColorAttachment(
+                $tex,
+                mtlLoadOp($color->load),
+                mtlStoreOp($color->store),
+                $clear
+            );
+            $formats->colors[$i] = $color->texture->format;
+            $i = $i + 1;
+        }
+
+        $formats->colorCount = $n;
+        $formats->samples = .one;
+        ColorTarget $first = $desc->colors[0];
+        mtl::PixelFormat $depthFmt = mtl::PixelFormat::invalid;
+        DepthTarget $depth = guard $desc->depth else {
+            return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $first->texture->width, $first->texture->height);
+        }
+        $depth->texture->state = .depthTarget;
+        mtl::Texture $depthTex = guard $depth->texture->handle->texture else {
+            die('beginRender depth texture handle is empty');
+        }
+        $pass->depthTexture = $depthTex;
+        $pass->depthLoadAction = mtlLoadOp($depth->load);
+        $pass->depthStoreAction = mtlStoreOp($depth->store);
+        $pass->depthClear = $depth->clearDepth;
+        $depthFmt = mtlPixelFormat($depth->texture->format);
+        return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $first->texture->width, $first->texture->height);
+    }
+
+    public function transition(Texture $texture, ResourceState $to) : void
+    {
+        assert(!$this->encoderOpen, 'transition inside a render pass');
+        $texture->state = $to;
+    }
+
+    public function scratch(uint64 $bytes, uint64 $align) : ScratchSlice
+    {
+        assert($this->inFrame, 'scratch outside beginFrame');
+        uint64 $a = $align;
+
+        if ($a < $this->limits->uniformAlign) {
+            $a = $this->limits->uniformAlign;
+        }
+
+        if ($a == 0) {
+            $a = 16;
+        }
+
+        return $this->slots[$this->slot]->ring->take($bytes, $a, $this->slot);
+    }
+
+    public function readback(Texture $texture) : result<array<uint8>, DeviceError>
+    {
+        assert($this->gpu != null, 'readback before initialize');
+        assert(!$this->encoderOpen, 'readback with an open encoder');
+        assert(!$this->inFrame, 'readback inside a frame');
+
+        if ($texture->format->isDepth()) {
+            return .error(.unsupportedFormat($texture->format));
+        }
+
+        mtl::Texture $mt = guard $texture->handle->texture else {
+            return .error(.metal('readback', 'texture handle is empty'));
+        }
+        $this->waitIdle();
+        uint32 $bpp = pixelByteCount($texture->format);
+        uint64 $row = ($texture->width as uint64) * ($bpp as uint64);
+        uint64 $total = $row * ($texture->height as uint64);
+        array<uint8> $pixels = mtlFilledBytes($total);
+
+        if ($total == 0) {
+            return .ok($pixels);
+        }
+
+        mtl::Region $region = mtl::Region(
+            mtl::Origin(),
+            mtl::Size($texture->width as usize, $texture->height as usize)
+        );
+        $mt->getBytes(ptr<uint8>(&$pixels[0]), $row as usize, $region);
+        return .ok($pixels);
+    }
+
+    public function createBuffer(const BufferDesc& $desc) : result<BufferHandle, DeviceError>
+    {
+        mtl::Device $gpu = guard $this->gpu else {
+            return .error(.noDevice);
+        }
+        uint64 $n = $desc->bytes;
+
+        if ($n == 0) {
+            $n = 16;
+        }
+
+        mtl::Buffer $buf = guard $gpu->newBuffer($n as usize, .shared) else {
+            return .error(.outOfMemory($n));
+        }
+        return .ok(BufferHandle($buf, $n));
+    }
+
+    public function destroyBuffer(BufferHandle $handle) : void
+    {
+        // rc drop
+    }
+
+    public function uploadBuffer(BufferHandle $handle, uint64 $offset, ptr<const uint8> $src, uint64 $bytes) : void
+    {
+        assert($this->gpu != null, 'uploadBuffer before initialize');
+        assert($bytes > 0, 'uploadBuffer size');
+        mtl::Buffer $buf = guard $handle->buffer else {
+            die('uploadBuffer handle is empty');
+        }
+        ptr<uint8> $base = $buf->contents();
+        assert($base:$ != null, 'buffer is not host visible');
+        ptr<uint8> $dst = $base;
+        $dst:$ = $base:$ + ($offset as isize);
+        mem::copy<uint8>($dst, ptr<uint8>($src:$), $bytes);
+    }
+
+    public function createTexture(const TextureDesc& $desc) : result<TextureHandle, DeviceError>
+    {
+        mtl::Device $gpu = guard $this->gpu else {
+            return .error(.noDevice);
+        }
+        mtl::TextureDescriptor $td = mtl::TextureDescriptor(
+            $pixelFormat: mtlPixelFormat($desc->format),
+            $width: $desc->width as usize
+        );
+        $td->height = $desc->height as usize;
+        $td->mipmapLevelCount = $desc->mips as usize;
+        $td->usage = mtlTextureUsage($desc);
+
+        if ($desc->isDepth()) {
+            $td->storageMode = .devicePrivate;
+        } else {
+            $td->storageMode = .shared;
+        }
+
+        if ($desc->samples == SampleCount::four) {
+            $td->sampleCount = 4;
+            $td->textureType = .type2DMultisample;
+        }
+
+        mtl::Texture $tex = guard $gpu->newTexture($td) else {
+            return .error(.outOfMemory(($desc->width * $desc->height) as uint64));
+        }
+        return .ok(TextureHandle($tex, false));
+    }
+
+    public function destroyTexture(TextureHandle $handle) : void
+    {
+        // rc drop; imported drawable textures are owned by the layer
+    }
+
+    public function uploadTexture(Texture $texture, int32 $mip, ptr<const uint8> $src, uint64 $bytes, int32 $bytesPerRow) : void
+    {
+        assert($this->gpu != null, 'uploadTexture before initialize');
+        assert(!$this->encoderOpen, 'uploadTexture with an open encoder');
+        assert($bytes > 0, 'uploadTexture size');
+        mtl::Texture $mt = guard $texture->handle->texture else {
+            die('uploadTexture handle is empty');
+        }
+        uint32 $bpp = pixelByteCount($texture->format);
+        int32 $w = mtlMipSize($texture->width, $mip);
+        int32 $h = mtlMipSize($texture->height, $mip);
+        uint64 $row = $bytesPerRow as uint64;
+
+        if ($row == 0) {
+            $row = ($w as uint64) * ($bpp as uint64);
+        }
+
+        mtl::Region $region = mtl::Region(mtl::Origin(), mtl::Size($w as usize, $h as usize));
+        ptr<uint8> $p = ptr<uint8>($src:$);
+        $mt->replace($region, $p, $row as usize, $mip as uint32);
+        $texture->state = .shaderRead;
+    }
+
+    public function generateMipmaps(Texture $texture) : void
+    {
+        assert(false, 'generateMipmaps is later');
+    }
+
+    public function sampler(const SamplerDesc& $desc) : Sampler
+    {
+        string $key = $desc->key();
+
+        if ($this->samplerHandles->has($key)) {
+            return Sampler($this, $this->samplerHandles[$key], $desc);
+        }
+
+        mtl::Device $gpu = guard $this->gpu else {
+            die('sampler before initialize');
+        }
+        mtl::SamplerDescriptor $sd = mtl::SamplerDescriptor();
+        $sd->minFilter = mtlMinMag($desc->min);
+        $sd->magFilter = mtlMinMag($desc->mag);
+        $sd->mipFilter = mtlMip($desc->min);
+        $sd->sAddressMode = mtlAddress($desc->wrapS);
+        $sd->tAddressMode = mtlAddress($desc->wrapT);
+        $sd->rAddressMode = mtlAddress($desc->wrapT);
+        mtl::SamplerState $samp = guard $gpu->newSamplerState($sd) else {
+            die('metal: newSamplerState failed');
+        }
+        SamplerHandle $h = SamplerHandle($samp);
+        $this->samplerHandles[$key] = $h;
+        return Sampler($this, $h, $desc);
+    }
+
+    public function createShaderModule(ShaderKind $kind, const string& $bytes, string $name) : result<ShaderModuleHandle, DeviceError>
+    {
+        mtl::Device $gpu = guard $this->gpu else {
+            return .error(.noDevice);
+        }
+
+        if ($bytes->empty()) {
+            return .error(.shader($name, 'empty source'));
+        }
+
+        string $entry = mtlFunctionName($kind);
+
+        if ($entry->empty()) {
+            return .error(.shader($name, 'unsupported stage'));
+        }
+
+        mtl::Library $lib = guard $gpu->newLibrary(source: $bytes) else ($e) {
+            string $log = match ($e) {
+                mtl::Error::compile($m) => $m,
+                mtl::Error::pipeline($m) => $m,
+                mtl::Error::other($m) => $m,
+            };
+            return .error(.shader($name, $log));
+        }
+        mtl::Function $fn = guard $lib->newFunction($entry) else {
+            return .error(.shader($name, "missing entry '{$entry}'"));
+        }
+        return .ok(ShaderModuleHandle($lib, $fn));
+    }
+
+    public function destroyShaderModule(ShaderModuleHandle $handle) : void
+    {
+        // rc drop
+    }
+
+    public function destroyPipeline(PipelineHandle $handle) : void
+    {
+        // rc drop
+    }
+
+    internal function encoderClosed() : void
+    {
+        $this->encoderOpen = false;
+    }
+
+    public function shutdown() : void
+    {
+        if ($this->gpu == null) {
+            $this->ready = false;
+            return;
+        }
+
+        $this->lose();
+        $this->waitSlots();
+        mtlDestroySlots($this);
+        $this->psos = map<string, PipelineHandle>();
+        $this->samplerHandles = map<string, SamplerHandle>();
+        $this->depthStates = map<uint32, mtl::DepthStencilState>();
+        $this->queue = null;
+        $this->gpu = null;
+        $this->ready = false;
+    }
+
+    private function acquireFrame(int32 $width, int32 $height) : result<FrameStatus, DeviceError>
+    {
+        FrameSlot $slot = $this->slots[$this->slot];
+        $slot->ring->reset();
+        mtl::Layer $layer = guard $this->layer else {
+            return .ok(.skipped);
+        }
+        mtl::Drawable $next = guard $layer->nextDrawable() else {
+            return .ok(.skipped);
+        }
+        mtl::CommandQueue $queue = guard $this->queue else {
+            return .error(.noDevice);
+        }
+        mtl::CommandBuffer $cmd = guard $queue->commandBuffer() else {
+            return .error(.metal('beginFrame', 'command buffer'));
+        }
+        $this->drawable = $next;
+        $this->cmd = $cmd;
+        TextureHandle $th = TextureHandle($next->texture(), true);
+        Texture $bb = Texture(imported: $this, $th, $this->bbFormat, $width, $height);
+        $bb->state = .undefined;
+        $this->bb = $bb;
+        $this->inFrame = true;
+        return .ok(.ready);
+    }
+
+    private function openEncoder(
+        mtl::CommandBuffer $cmd,
+        mtl::RenderPassDescriptor $pass,
+        TargetFormats $formats,
+        mtl::PixelFormat $depthFmt,
+        int32 $width,
+        int32 $height
+    ) : RenderEncoder
+    {
+        mtl::RenderCommandEncoder $enc = guard $cmd->renderCommandEncoder($pass) else {
+            die('metal: renderCommandEncoder failed');
+        }
+        $this->encoderOpen = true;
+        return RenderEncoder($this, $formats, $width, $height, $enc, $depthFmt);
+    }
+
+    private function applyVsync() : void
+    {
+        if ($this->nsWindow:$ == null) {
+            return;
+        }
+
+        int32 $on = 0;
+
+        if ($this->vsync) {
+            $on = 1;
+        }
+
+        visu_set_display_sync($this->nsWindow, $on);
+    }
+
+    private function waitSlots() : void
+    {
+        if ($this->slots->count() == 0) {
+            return;
+        }
+
+        foreach ($this->slots as $slot) {
+            mtl::CommandBuffer $prev = guard $slot->prev else {
+                continue;
+            }
+            $prev->waitUntilCompleted();
+            $slot->prev = null;
+        }
+    }
+
+    private function abortFrame() : void
+    {
+        if ($this->encoderOpen) {
+            $this->encoderOpen = false;
+        }
+
+        if ($this->inFrame) {
+            mtl::CommandBuffer $cmd = guard $this->cmd else {
+                $this->inFrame = false;
+                $this->drawable = null;
+                return;
+            }
+            $cmd->commit();
+            $cmd->waitUntilCompleted();
+            $this->cmd = null;
+            $this->inFrame = false;
+        }
+
+        $this->drawable = null;
+    }
+}

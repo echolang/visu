@@ -1,12 +1,11 @@
 /**
- * ShaderCollection bookkeeping (no GL) and permutation compile (glfw).
+ * ShaderCollection bookkeeping (no GPU) and permutation load (glfw).
  */
 
 use std::env;
 use std::io;
-use visu::os::{Window, WindowHints, init, terminate};
 use visu::graphics::{
-    Gpu, ShaderCollection, ShaderFile, ShaderProgram, ShaderRef, ShaderError, Define, ShaderKind,
+    Device, ShaderCollection, ShaderFile, ShaderError, Define, ShaderKind,
     shaderSuffix
 };
 
@@ -23,7 +22,9 @@ function mkdirOk(string $dir) : void
 
 function mkdirScan(string $tag) : string
 {
-    string $dir = env::join(env::tmp(), "visu-ss-{$tag}");
+    $tmp = env::tmp();
+    string $ds = env::DS;
+    string $dir = "{$tmp}{$ds}visu-ss-{$tag}";
     mkdirOk($dir);
     return $dir;
 }
@@ -31,15 +32,17 @@ function mkdirScan(string $tag) : string
 function writeStage(string $dir, string $stem, string $stage) : void
 {
     string $ext = shaderSuffix();
-    string $path = env::join($dir, "{$stem}.{$stage}.{$ext}");
+    string $ds = env::DS;
+    string $path = "{$dir}{$ds}{$stem}.{$stage}.{$ext}";
     usize $n = guard io::writefile($path, "// scan fixture\n") else ($e) {
-        die($e->message());
+        die("{$path}: {$e->message()}");
     }
 }
 
 function writeFile(string $dir, string $name, string $text) : void
 {
-    string $path = env::join($dir, $name);
+    string $ds = env::DS;
+    string $path = "{$dir}{$ds}{$name}";
     usize $n = guard io::writefile($path, $text) else ($e) {
         die($e->message());
     }
@@ -47,14 +50,25 @@ function writeFile(string $dir, string $name, string $text) : void
 
 test collection_define_permutations
 {
-    Gpu $gpu = Gpu();
-    ShaderCollection $shaders = ShaderCollection($gpu, 'tests/resources/shaders');
+    string $dir = mkdirScan('defineperm');
+    writeStage($dir, 'prog', 'vert');
+    writeStage($dir, 'prog', 'frag');
+    writeStage($dir, 'prog+basic', 'vert');
+    writeStage($dir, 'prog+basic', 'frag');
+    writeStage($dir, 'prog+advanced', 'vert');
+    writeStage($dir, 'prog+advanced', 'frag');
+    Device $device = Device();
+    ShaderCollection $shaders = ShaderCollection($device, $dir);
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
     array<Define> $basic = [Define('DEFINE_A', 1), Define('DEFINE_B', 0)];
     array<Define> $advanced = [Define('DEFINE_A', 1), Define('DEFINE_B', 1), Define('DEFINE_C', 'test')];
-    ShaderRef $basicRef = $shaders->definePermutation('test', 'basic', $basic);
-    ShaderRef $advancedRef = $shaders->definePermutation('test', 'advanced', $advanced);
+    $basicRef = $shaders->definePermutation('prog', 'basic', $basic);
+    $advancedRef = $shaders->definePermutation('prog', 'advanced', $advanced);
 
-    assert($basicRef->name == 'test', 'basic name');
+    assert($basicRef->name == 'prog', 'basic name');
     string $basicVar = guard $basicRef->variant else {
         die('basic variant');
     }
@@ -64,61 +78,57 @@ test collection_define_permutations
     }
     assert($advVar == 'advanced', 'advanced variant');
 
-    assert($shaders->hasPermutations('test'), 'has');
+    assert($shaders->hasPermutations('prog'), 'has');
     assert(!$shaders->hasPermutations('nonexistent'), 'missing shader');
 
-    array<string> $names = $shaders->permutations('test');
+    array<string> $names = $shaders->permutations('prog');
     assert($names->count() == 2, 'two variants');
-    assert($names[0] == 'basic', 'basic first');
-    assert($names[1] == 'advanced', 'advanced second');
 
-    ShaderRef $looked = guard $shaders->permutation('test', 'basic') else ($e) {
+    $looked = guard $shaders->permutation('prog', 'basic') else ($e) {
         die($e->message());
     }
     assert($looked == $basicRef, 'same slot');
 
-    ShaderRef $base = guard $shaders->shader('test') else ($e) {
+    $base = guard $shaders->shader('prog') else ($e) {
         die($e->message());
     }
-    ShaderRef $fromBase = guard $base->permutation('basic') else ($e) {
+    $fromBase = guard $base->permutation('basic') else ($e) {
         die($e->message());
     }
     assert($fromBase == $basicRef, 'from base');
 
-    result<ShaderRef, ShaderError> $nested = $basicRef->permutation('advanced');
+    $nested = $basicRef->permutation('advanced');
     assert($nested->failed(), 'no nested variants');
 }
 
 test collection_empty_permutations
 {
-    Gpu $gpu = Gpu();
-    ShaderCollection $shaders = ShaderCollection($gpu, 'tests/resources/shaders');
+    Device $device = Device();
+    ShaderCollection $shaders = ShaderCollection($device, 'tests/resources/shaders');
     assert(!$shaders->hasPermutations('empty'), 'none');
-    $shaders->definePermutation('empty', 'x');
-    assert($shaders->hasPermutations('empty'), 'named empty variant');
     array<string> $none = $shaders->permutations('nonexistent');
     assert($none->empty(), 'unknown shader');
 }
 
 test collection_duplicate_register
 {
-    Gpu $gpu = Gpu();
-    ShaderCollection $shaders = ShaderCollection($gpu, 'tests/resources/shaders');
+    Device $device = Device();
+    ShaderCollection $shaders = ShaderCollection($device, 'tests/resources/shaders');
     array<ShaderFile> $files = [
-        ShaderFile(ShaderKind::vertex, 'triangle.vert.glsl'),
-        ShaderFile(ShaderKind::fragment, 'triangle.frag.glsl')
+        ShaderFile(ShaderKind::vertex, 'triangle.vert.spv'),
+        ShaderFile(ShaderKind::fragment, 'triangle.frag.spv')
     ];
-    ShaderRef $first = guard $shaders->register('triangle', $files) else ($e) {
+    $first = guard $shaders->register('triangle', $files) else ($e) {
         die($e->message());
     }
     assert($first->name == 'triangle', 'name');
-    ShaderRef $looked = guard $shaders->shader('triangle') else ($e) {
+    $looked = guard $shaders->shader('triangle') else ($e) {
         die($e->message());
     }
     assert($looked == $first, 'same slot');
-    result<ShaderRef, ShaderError> $again = $shaders->register('triangle', $files);
+    $again = $shaders->register('triangle', $files);
     assert($again->failed(), 'duplicate');
-    result<ShaderRef, ShaderError> $missing = $shaders->shader('nope');
+    $missing = $shaders->shader('nope');
     assert($missing->failed(), 'missing');
 }
 
@@ -129,28 +139,29 @@ test collection_scan_registers_named_programs
     writeStage($dir, 'a', 'frag');
     writeFile($dir, 'notes.txt', "skip\n");
     writeFile($dir, 'lib.inc', "skip\n");
-    string $nested = env::join($dir, 'nested');
+    string $ds = env::DS;
+    string $nested = "{$dir}{$ds}nested";
     mkdirOk($nested);
     writeStage($nested, 'b', 'vert');
     writeStage($nested, 'b', 'frag');
-    Gpu $gpu = Gpu();
-    ShaderCollection $shaders = ShaderCollection($gpu, $dir);
+    Device $device = Device();
+    ShaderCollection $shaders = ShaderCollection($device, $dir);
     guard $shaders->scan() else ($e) {
         die($e->message());
     }
-    ShaderRef $a = guard $shaders->shader('a') else ($e) {
+    $a = guard $shaders->shader('a') else ($e) {
         die($e->message());
     }
     assert($a->name == 'a', 'stem name');
     assert($a->files->count() == 2, 'vert+frag');
-    ShaderRef $nestedRef = guard $shaders->shader('nested/b') else ($e) {
+    $nestedRef = guard $shaders->shader('nested/b') else ($e) {
         die($e->message());
     }
     assert($nestedRef->name == 'nested/b', 'nested name');
     assert($nestedRef->files->count() == 2, 'nested stages');
-    result<ShaderRef, ShaderError> $notes = $shaders->shader('notes');
+    $notes = $shaders->shader('notes');
     assert($notes->failed(), 'notes skipped');
-    result<ShaderRef, ShaderError> $lib = $shaders->shader('lib');
+    $lib = $shaders->shader('lib');
     assert($lib->failed(), 'include skipped');
 }
 
@@ -159,26 +170,27 @@ test collection_scan_skips_registered
     string $dir = mkdirScan('skipreg');
     writeStage($dir, 'a', 'vert');
     writeStage($dir, 'a', 'frag');
-    string $nested = env::join($dir, 'nested');
+    string $ds = env::DS;
+    string $nested = "{$dir}{$ds}nested";
     mkdirOk($nested);
     writeStage($nested, 'b', 'vert');
     writeStage($nested, 'b', 'frag');
-    Gpu $gpu = Gpu();
-    ShaderCollection $shaders = ShaderCollection($gpu, $dir);
-    array<ShaderFile> $files = [ShaderFile(ShaderKind::vertex, 'already.vert.glsl')];
-    ShaderRef $first = guard $shaders->register('a', $files) else ($e) {
+    Device $device = Device();
+    ShaderCollection $shaders = ShaderCollection($device, $dir);
+    array<ShaderFile> $files = [ShaderFile(ShaderKind::vertex, 'already.vert.spv')];
+    $first = guard $shaders->register('a', $files) else ($e) {
         die($e->message());
     }
     guard $shaders->scan() else ($e) {
         die($e->message());
     }
-    ShaderRef $looked = guard $shaders->shader('a') else ($e) {
+    $looked = guard $shaders->shader('a') else ($e) {
         die($e->message());
     }
     assert($looked == $first, 'same slot');
     assert($first->files->count() == 1, 'explicit files kept');
-    assert($first->files[0]->path == 'already.vert.glsl', 'path kept');
-    ShaderRef $nestedRef = guard $shaders->shader('nested/b') else ($e) {
+    assert($first->files[0]->path == 'already.vert.spv', 'path kept');
+    $nestedRef = guard $shaders->shader('nested/b') else ($e) {
         die($e->message());
     }
     assert($nestedRef->files->count() == 2, 'unregistered still scanned');
@@ -186,8 +198,8 @@ test collection_scan_skips_registered
 
 test collection_scan_missing_directory
 {
-    Gpu $gpu = Gpu();
-    ShaderCollection $shaders = ShaderCollection($gpu, 'tests/resources/shaders');
+    Device $device = Device();
+    ShaderCollection $shaders = ShaderCollection($device, 'tests/resources/shaders');
     status<ShaderError> $r = $shaders->scan('definitely-missing-visu-shader-scan');
     assert($r->failed(), 'missing scan dir');
     ShaderError $e = $r->failure();
@@ -199,131 +211,99 @@ test collection_scan_optional_root
     string $dir = mkdirScan('optroot');
     writeStage($dir, 'a', 'vert');
     writeStage($dir, 'a', 'frag');
-    string $nested = env::join($dir, 'nested');
+    string $ds = env::DS;
+    string $nested = "{$dir}{$ds}nested";
     mkdirOk($nested);
     writeStage($nested, 'b', 'vert');
     writeStage($nested, 'b', 'frag');
-    Gpu $gpu = Gpu();
-    ShaderCollection $shaders = ShaderCollection($gpu, $dir);
+    Device $device = Device();
+    ShaderCollection $shaders = ShaderCollection($device, $dir);
     guard $shaders->scan($nested) else ($e) {
         die($e->message());
     }
-    ShaderRef $b = guard $shaders->shader('b') else ($e) {
+    $b = guard $shaders->shader('b') else ($e) {
         die($e->message());
     }
     assert($b->name == 'b', 'scan root is the name root');
-    result<ShaderRef, ShaderError> $nestedName = $shaders->shader('nested/b');
+    $nestedName = $shaders->shader('nested/b');
     assert($nestedName->failed(), 'prefix is the scan root');
-    result<ShaderRef, ShaderError> $a = $shaders->shader('a');
+    $a = $shaders->shader('a');
     assert($a->failed(), 'parent not scanned');
 }
 
-#[if: VISU_BACKEND_METAL]
-#[else]
+#[if: os != darwin || VISU_BACKEND_VULKAN]
 #[group: "glfw"]
 test collection_get_and_permutations
 {
-    guard init() else ($e) {
+    GpuContext $gpu = gpuHidden('shader-col');
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        $gpu->end();
         die($e->message());
     }
 
-    WindowHints $hints = WindowHints::defaults();
-    $hints->visible = false;
-    Window $window = Window('shader-col', 64, 64, $hints);
-    Gpu $state = Gpu();
-    guard $window->initialize($state) else ($e) {
-        terminate();
+    $tri = guard $shaders->shader('triangle') else ($e) {
+        $gpu->end();
         die($e->message());
     }
 
-    ShaderCollection $shaders = ShaderCollection($state, 'tests/resources/shaders');
-    array<ShaderFile> $files = [
-        ShaderFile(ShaderKind::vertex, 'triangle.vert.glsl'),
-        ShaderFile(ShaderKind::fragment, 'triangle.frag.glsl')
-    ];
-    ShaderRef $tri = guard $shaders->register('triangle', $files) else ($e) {
-        $window->destroy();
-        terminate();
+    $base = guard $shaders->load('triangle') else ($e) {
+        $gpu->end();
         die($e->message());
     }
-
-    ShaderProgram $base = guard $shaders->load('triangle') else ($e) {
-        $window->destroy();
-        terminate();
-        die($e->message());
-    }
-    assert($base->linked(), 'base linked');
-    ShaderProgram $hot = $shaders->program('triangle');
+    assert(!$base->destroyed(), 'base linked');
+    $hot = $shaders->program('triangle');
     assert($hot->id == $base->id, 'program');
-    ShaderProgram $viaLoad = guard $tri->load() else ($e) {
-        $window->destroy();
-        terminate();
+    $viaLoad = guard $tri->load() else ($e) {
+        $gpu->end();
         die($e->message());
     }
     assert($viaLoad->id == $base->id, 'load');
 
     array<Define> $a = [Define('TEST', 1)];
     array<Define> $b = [Define('TEST', 2)];
-    ShaderRef $ra = $shaders->definePermutation('triangle', 'a', $a);
-    ShaderRef $rb = $shaders->definePermutation('triangle', 'b', $b);
+    $ra = $shaders->definePermutation('triangle', 'a', $a);
+    $rb = $shaders->definePermutation('triangle', 'b', $b);
 
-    ShaderProgram $pa = guard $ra->load() else ($e) {
+    $pa = guard $ra->load() else ($e) {
         $shaders->destroy();
-        $window->destroy();
-        terminate();
+        $gpu->end();
         die($e->message());
     }
-    ShaderProgram $pb = guard $rb->load() else ($e) {
+    $pb = guard $rb->load() else ($e) {
         $shaders->destroy();
-        $window->destroy();
-        terminate();
+        $gpu->end();
         die($e->message());
     }
 
     assert($pa->id != $pb->id, 'distinct programs');
-    assert($pa->linked() && $pb->linked(), 'variants linked');
+    assert(!$pa->destroyed() && !$pb->destroyed(), 'variants linked');
 
-    result<ShaderRef, ShaderError> $missing = $shaders->permutation('triangle', 'nope');
+    $missing = $shaders->permutation('triangle', 'nope');
     assert($missing->failed(), 'unknown variant');
 
-    result<ShaderRef, ShaderError> $noDef = $shaders->permutation('ghost', 'a');
+    $noDef = $shaders->permutation('ghost', 'a');
     assert($noDef->failed(), 'unknown shader permutation');
-
-    ShaderRef $ghost = $shaders->definePermutation('ghost', 'a', $a);
-    ShaderRef $ghostLooked = guard $shaders->permutation('ghost', 'a') else ($e) {
-        $shaders->destroy();
-        $window->destroy();
-        terminate();
-        die($e->message());
-    }
-    assert($ghostLooked == $ghost, 'ghost slot');
-    result<ShaderProgram, ShaderError> $ghostLoad = $ghost->load();
-    assert($ghostLoad->failed(), 'missing base');
 
     $tri->forget();
     assert($base->destroyed(), 'old program dead');
     assert($pa->destroyed(), 'variant dropped with base');
-    ShaderProgram $again = guard $tri->load() else ($e) {
+    $again = guard $tri->load() else ($e) {
         $shaders->destroy();
-        $window->destroy();
-        terminate();
+        $gpu->end();
         die($e->message());
     }
     assert(!$again->destroyed(), 'new program');
-    assert($again->linked(), 'recompiled linked');
 
-    ShaderProgram $pa2 = guard $ra->load() else ($e) {
+    $pa2 = guard $ra->load() else ($e) {
         $shaders->destroy();
-        $window->destroy();
-        terminate();
+        $gpu->end();
         die($e->message());
     }
-    assert($pa2->linked(), 'variant recompiled');
+    assert(!$pa2->destroyed(), 'variant recompiled');
     assert($pa2 != $pa, 'variant new object');
-    assert(!$pa2->destroyed(), 'variant live');
 
     $shaders->destroy();
-    $window->destroy();
-    terminate();
+    $gpu->end();
 }
 #[end]

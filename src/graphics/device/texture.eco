@@ -1,0 +1,75 @@
+/**
+ * A 2D GPU texture. Stores Device; destroy() defers through the
+ * handle. Swapchain images use the `imported:` constructor.
+ */
+
+namespace visu::graphics;
+
+public class Texture : GpuObject
+{
+    public Device $device;
+    public TextureHandle $handle;
+    public ResourceState $state;
+    public const PixelFormat $format;
+    public const int32 $width;
+    public const int32 $height;
+    public const bool $imported;
+    private bool $dead;
+
+    public constructor(Device $device, string $name, TextureDesc $desc)
+    {
+        if ($desc->label->empty()) {
+            $desc->label = $name;
+        }
+
+        result<TextureHandle, DeviceError> $made = $device->createTexture($desc);
+        TextureHandle $handle = guard $made else ($e) {
+            die($e->message());
+        }
+        $this->device = $device;
+        $this->handle = $handle;
+        $this->state = .undefined;
+        $this->format = $desc->format;
+        $this->width = $desc->width;
+        $this->height = $desc->height;
+        $this->imported = false;
+        $this->dead = false;
+    }
+
+    public constructor(imported: Device $device, TextureHandle $handle, PixelFormat $format, int32 $width, int32 $height)
+    {
+        $this->device = $device;
+        $this->handle = $handle;
+        $this->state = .undefined;
+        $this->format = $format;
+        $this->width = $width;
+        $this->height = $height;
+        $this->imported = true;
+        $this->dead = false;
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->dead = true;
+
+        if ($this->imported) {
+            return;
+        }
+
+        $this->device->destroyTexture($this->handle);
+    }
+
+    public function upload(int32 $mip, ptr<const uint8> $src, uint64 $bytes, int32 $bytesPerRow = 0) : void
+    {
+        $this->device->uploadTexture($this, $mip, $src, $bytes, $bytesPerRow);
+    }
+}

@@ -1,0 +1,300 @@
+/**
+ * Open render encoder. end() must run; the destructor asserts
+ * it did. Uniforms are the frame ring at buffer index 2+N.
+ */
+
+namespace visu::graphics;
+
+public class RenderEncoder : RenderEncoderProtocol
+{
+    private Device $device;
+    private TargetFormats $formats;
+    private int32 $width;
+    private int32 $height;
+    private bool $ended;
+    private bool $viewportSet;
+    private bool $scissorSet;
+    private bool $pipelineSet;
+    internal mtl::RenderCommandEncoder $enc;
+    internal mtl::PixelFormat $depthFmt;
+    private Topology $topology;
+    private Buffer? $indexBuffer;
+    private IndexType $indexType;
+    private uint64 $indexOffset;
+    private Texture? $boundTex;
+    private Sampler? $boundSamp;
+    private uint32 $boundSlot;
+    private uint64[4] $uniformOff;
+    private bool[4] $uniformSet;
+
+    public constructor(
+        Device $device,
+        TargetFormats $formats,
+        int32 $width,
+        int32 $height,
+        mtl::RenderCommandEncoder $enc,
+        mtl::PixelFormat $depthFmt
+    )
+    {
+        $this->device = $device;
+        $this->formats = $formats;
+        $this->width = $width;
+        $this->height = $height;
+        $this->ended = false;
+        $this->viewportSet = false;
+        $this->scissorSet = false;
+        $this->pipelineSet = false;
+        $this->enc = $enc;
+        $this->depthFmt = $depthFmt;
+        $this->topology = .triangles;
+        $this->indexBuffer = null;
+        $this->indexType = .uint16;
+        $this->indexOffset = 0;
+        $this->boundTex = null;
+        $this->boundSamp = null;
+        $this->boundSlot = 0;
+        uint64[4] $off;
+        bool[4] $set;
+        uint32 $i = 0;
+
+        while ($i < 4) {
+            $off[$i] = 0;
+            $set[$i] = false;
+            $i = $i + 1;
+        }
+
+        $this->uniformOff = mv $off;
+        $this->uniformSet = mv $set;
+    }
+
+    destructor()
+    {
+        assert($this->ended, 'RenderEncoder dropped without end');
+    }
+
+    public const function formats() : TargetFormats
+    {
+        return $this->formats;
+    }
+
+    public const function width() : int32
+    {
+        return $this->width;
+    }
+
+    public const function height() : int32
+    {
+        return $this->height;
+    }
+
+    public function setPipeline(const GpuPass& $pass) : void
+    {
+        assert(!$this->ended, 'setPipeline after end');
+        PipelineHandle $pso = metalGetPipeline($this->device, $pass, $this->formats, $this->depthFmt);
+        mtl::RenderPipelineState $state = guard $pso->pipeline else {
+            die('metal: pipeline handle is empty');
+        }
+        $this->enc->setRenderPipelineState($state);
+        $this->enc->setCullMode(mtlCull($pass->raster->cull));
+        $this->enc->setFrontFacing(mtlWinding($pass->raster->front));
+        mtl::DepthStencilState $ds = guard metalDepthState($this->device, $pass->raster) else {
+            $this->pipelineSet = true;
+            $this->topology = $pass->topology;
+            $this->applyDefaults();
+            return;
+        }
+        $this->enc->setDepthStencilState($ds);
+        $this->pipelineSet = true;
+        $this->topology = $pass->topology;
+        $this->applyDefaults();
+    }
+
+    public function setViewport(int32 $x, int32 $y, int32 $w, int32 $h) : void
+    {
+        assert(!$this->ended, 'setViewport after end');
+        $this->enc->setViewport(mtl::Viewport(
+            $x as float64,
+            $y as float64,
+            $w as float64,
+            $h as float64
+        ));
+        $this->viewportSet = true;
+    }
+
+    public function setScissor(int32 $x, int32 $y, int32 $w, int32 $h) : void
+    {
+        assert(!$this->ended, 'setScissor after end');
+        int32 $sx = $x;
+        int32 $sy = $y;
+        int32 $sw = $w;
+        int32 $sh = $h;
+
+        if ($sx < 0) {
+            $sx = 0;
+        }
+
+        if ($sy < 0) {
+            $sy = 0;
+        }
+
+        if ($sw < 0) {
+            $sw = 0;
+        }
+
+        if ($sh < 0) {
+            $sh = 0;
+        }
+
+        $this->enc->setScissorRect(mtl::ScissorRect($sx as uint32, $sy as uint32, $sw as uint32, $sh as uint32));
+        $this->scissorSet = true;
+    }
+
+    public function setVertexBuffer(uint32 $binding, Buffer $buffer, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'setVertexBuffer after end');
+        mtl::Buffer $buf = guard $buffer->handle->buffer else {
+            die('metal: vertex buffer handle is empty');
+        }
+        $this->enc->setVertexBuffer($buf, $offset as uint32, index: $binding);
+    }
+
+    public function setIndexBuffer(Buffer $buffer, IndexType $type, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'setIndexBuffer after end');
+        $this->indexBuffer = $buffer;
+        $this->indexType = $type;
+        $this->indexOffset = $offset;
+    }
+
+    public function bindUniform(uint32 $slot, ScratchSlice $slice) : void
+    {
+        assert(!$this->ended, 'bindUniform after end');
+        assert($slot < UNIFORM_SLOTS, 'uniform slot');
+        assert($slice->frameSlot == $this->device->slot, 'scratch from another frame');
+        $this->uniformOff[$slot] = $slice->offset;
+        $this->uniformSet[$slot] = true;
+    }
+
+    public function upload<T>(const T& $params, slot: uint32 $slot = 0) : void
+    {
+        uint64 $n = mem::size<T>() as uint64;
+        ScratchSlice $slice = $this->device->scratch($n, $this->device->limits->uniformAlign);
+        T $local = $params;
+        ptr<const uint8> $src = ptr<const uint8>(&$local);
+        mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $n);
+        $this->bindUniform($slot, $slice);
+    }
+
+    public function bindTexture(uint32 $slot, Texture $texture, Sampler $sampler) : void
+    {
+        assert(!$this->ended, 'bindTexture after end');
+        assert($slot < TEXTURE_SLOTS, 'texture slot');
+        assert($texture->state == ResourceState::shaderRead, 'bindTexture: texture is not shaderRead');
+        $this->boundTex = $texture;
+        $this->boundSamp = $sampler;
+        $this->boundSlot = $slot;
+    }
+
+    public function draw(int32 $first, int32 $count, int32 $instances = 1) : void
+    {
+        assert(!$this->ended, 'draw after end');
+        assert($this->pipelineSet, 'draw before setPipeline');
+        $this->flushBindings();
+        uint32 $n = 1;
+
+        if ($instances > 1) {
+            $n = $instances as uint32;
+        }
+
+        $this->enc->drawPrimitives(mtlTopology($this->topology), $first as uint32, $count as uint32, $n);
+    }
+
+    public function drawIndexed(int32 $firstIndex, int32 $count, int32 $instances = 1, int32 $vertexOffset = 0) : void
+    {
+        assert(!$this->ended, 'drawIndexed after end');
+        assert($this->pipelineSet, 'drawIndexed before setPipeline');
+        assert($vertexOffset == 0, 'metal: base vertex is not implemented');
+        Buffer $idx = guard $this->indexBuffer else {
+            die('drawIndexed without setIndexBuffer');
+        }
+        mtl::Buffer $buf = guard $idx->handle->buffer else {
+            die('metal: index buffer handle is empty');
+        }
+        $this->flushBindings();
+        uint32 $n = 1;
+
+        if ($instances > 1) {
+            $n = $instances as uint32;
+        }
+
+        uint32 $elem = 2;
+
+        if ($this->indexType == IndexType::uint32) {
+            $elem = 4;
+        }
+
+        uint32 $off = ($this->indexOffset as uint32) + (($firstIndex as uint32) * $elem);
+        $this->enc->drawIndexedPrimitives(
+            mtlTopology($this->topology),
+            $count as uint32,
+            mtlIndexType($this->indexType),
+            $buf,
+            $off,
+            $n
+        );
+    }
+
+    public function end() : void
+    {
+        assert(!$this->ended, 'RenderEncoder.end twice');
+        $this->ended = true;
+        $this->enc->endEncoding();
+        $this->device->encoderClosed();
+    }
+
+    private function applyDefaults() : void
+    {
+        if (!$this->viewportSet) {
+            $this->setViewport(0, 0, $this->width, $this->height);
+        }
+
+        if (!$this->scissorSet) {
+            $this->setScissor(0, 0, $this->width, $this->height);
+        }
+    }
+
+    private function flushBindings() : void
+    {
+        FrameSlot $fs = $this->device->slots[$this->device->slot];
+        mtl::Buffer $ring = guard $fs->ring->buffer else {
+            die('metal: uniform ring is empty');
+        }
+        uint32 $i = 0;
+
+        while ($i < 4) {
+            if ($this->uniformSet[$i]) {
+                uint32 $off = $this->uniformOff[$i] as uint32;
+                uint32 $index = METAL_UNIFORM_BASE + $i;
+                $this->enc->setVertexBuffer($ring, $off, index: $index);
+                $this->enc->setFragmentBuffer($ring, $off, index: $index);
+            }
+
+            $i = $i + 1;
+        }
+
+        Texture $tex = guard $this->boundTex else {
+            return;
+        }
+        Sampler $samp = guard $this->boundSamp else {
+            return;
+        }
+        mtl::Texture $mt = guard $tex->handle->texture else {
+            return;
+        }
+        mtl::SamplerState $ss = guard $samp->handle->sampler else {
+            return;
+        }
+        $this->enc->setFragmentTexture($mt, index: $this->boundSlot);
+        $this->enc->setFragmentSamplerState($ss, index: $this->boundSlot);
+    }
+}

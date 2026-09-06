@@ -2,7 +2,7 @@
  * Logger buffer, conduits, and level flags. No GPU.
  */
 
-use visu::app::{Logger, LogLevel, Conduit, FileConduit, StdoutConduit, Paths, installLogger, uninstallLogger, hasLogger, currentLogger, info, warn, error};
+use visu::app::{Logger, LogLevel, Conduit, FileConduit, StdoutConduit, Paths, installLogger, uninstallLogger, hasLogger, currentLogger, info, warn, error, ensureLogger, announceVersion};
 use std::env;
 use std::io;
 
@@ -154,6 +154,35 @@ test logger_info_without_install_is_noop
     info('quiet');
     warn('quiet');
     error('quiet');
+}
+
+test ensure_logger_is_idempotent
+{
+    assert(!hasLogger(), 'none');
+    ensureLogger();
+    assert(hasLogger(), 'installed');
+    Logger $first = currentLogger();
+    $first->info('a');
+    ensureLogger();
+    currentLogger()->info('b');
+    array<string> $msgs = $first->messages();
+    assert($msgs->count() == 2, 'same logger');
+    assert($msgs[0] == 'a', 'a');
+    assert($msgs[1] == 'b', 'b');
+    uninstallLogger();
+}
+
+test announce_version_once_per_process
+{
+    Logger $log = Logger();
+    installLogger($log);
+    announceVersion();
+    announceVersion();
+    array<string> $msgs = $log->messages();
+    assert($msgs->count() == 1, 'once');
+    string $ver = visu::VERSION;
+    assert($msgs[0] == "visu {$ver}", 'line');
+    uninstallLogger();
 }
 
 test logger_info_forwards_when_installed

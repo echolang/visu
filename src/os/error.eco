@@ -7,11 +7,13 @@ namespace visu::os;
 public enum OsError
 {
     case glfw(string $message);
+    case noVulkanLoader;
 
     public const function message() : string
     {
         return match ($this) {
             .glfw($message) => $message,
+            .noVulkanLoader => 'no vulkan loader (on macOS: brew install molten-vk)',
         };
     }
 }
@@ -20,14 +22,14 @@ public enum WindowError
 {
     case alreadyInitialized;
     case createFailed(string $message);
-    case gpuLoad;
+    case device(visu::graphics::DeviceError $inner);
 
     public const function message() : string
     {
         return match ($this) {
             .alreadyInitialized => 'window already initialized, cannot initialize again',
             .createFailed($message) => $message,
-            .gpuLoad => 'gpu backend failed to load',
+            .device($inner) => $inner->message(),
         };
     }
 }
@@ -40,13 +42,6 @@ public enum WindowAttrib
     case visible;
     case autoIconify;
     case focusOnShow;
-}
-
-public enum GlProfile
-{
-    case any;
-    case core;
-    case compat;
 }
 
 public enum InputError

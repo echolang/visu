@@ -82,6 +82,46 @@ test loop_start_stops_when_delegate_asks
     assert($c->renders == 3, 'three frames');
 }
 
+class LoopStopOnUpdate : Delegate
+{
+    public int32 $updates;
+    public int32 $renders;
+    public bool $stop;
+
+    public constructor()
+    {
+        $this->updates = 0;
+        $this->renders = 0;
+        $this->stop = false;
+    }
+
+    public function update() : void
+    {
+        $this->updates = $this->updates + 1;
+        $this->stop = true;
+    }
+
+    public function render(float32 $compensation) : void
+    {
+        $this->renders = $this->renders + 1;
+    }
+
+    public function shouldStop() : bool
+    {
+        return $this->stop;
+    }
+}
+
+test loop_skips_render_when_update_asks_to_stop
+{
+    LoopStopOnUpdate $c = LoopStopOnUpdate();
+    GameLoop $loop = GameLoop($c, 60.0, 10);
+    $loop->advance(0);
+    $loop->advance($loop->timestepNs);
+    assert($c->updates == 1, 'one update');
+    assert($c->renders == 1, 'no render after stop');
+}
+
 test loop_force_stop_exits_immediately
 {
     LoopCounter $c = LoopCounter();

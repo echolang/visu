@@ -1,0 +1,82 @@
+/**
+ * Texture options (GPU-free) and sampling a 2×2 red upload.
+ */
+
+use visu::graphics::{
+    ClearPass, ClearPassOptions, Filter, FullscreenTextureRenderer, Pipeline,
+    PixelFormat, TargetRef, Texture, TextureDesc, TextureOptions, Wrap,
+    TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST
+};
+use visu::math::Vec4;
+
+test texture_options_color_defaults
+{
+    TextureOptions $o = TextureOptions();
+    bool $rgba = match ($o->format) {
+        PixelFormat::rgba8 => true,
+        else => false,
+    };
+    bool $linear = match ($o->min) {
+        Filter::linear => true,
+        else => false,
+    };
+    bool $clamp = match ($o->wrapS) {
+        Wrap::clampToEdge => true,
+        else => false,
+    };
+    assert($rgba, 'rgba8');
+    assert($linear, 'linear');
+    assert($clamp, 'clamp');
+    assert($o->mips == 1, 'one mip');
+}
+
+test filter_mipmapped
+{
+    assert(!Filter::nearest->mipmapped(), 'nearest');
+    assert(!Filter::linear->mipmapped(), 'linear');
+    assert(Filter::linearMipmapLinear->mipmapped(), 'mip');
+}
+
+public function checkTextureSampling(GpuContext $gpu) : void
+{
+    TextureDesc $desc = TextureDesc($width: 2, $height: 2);
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_DST;
+    Texture $tex = Texture($gpu->device, 'sample', $desc);
+    array<uint8> $px = [
+        255, 0, 0, 255,
+        255, 0, 0, 255,
+        255, 0, 0, 255,
+        255, 0, 0, 255
+    ];
+    $tex->upload(0, ptr<const uint8>(&$px[0]), 16 as uint64, 8);
+
+    FullscreenTextureRenderer $blit = FullscreenTextureRenderer();
+    guard $blit->load($gpu->device) else ($e) {
+        $tex->destroy();
+        $blit->destroy();
+        die($e->message());
+    }
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $dst = offscreen64($p, 'sampleDst');
+        $p->add(ClearPass($dst, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+        $src = $p->importTexture('sampleSrc', $tex);
+        $blit->pass($p, $dst, $src);
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('sampleDst');
+    $blit->destroy();
+    $tex->destroy();
+    assert($pixels[0] > 240, 'sampled r');
+    assert($pixels[1] < 16, 'sampled g');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_texture_sampling
+{
+    GpuContext $gpu = gpuHidden('tex');
+    checkTextureSampling($gpu);
+    $gpu->end();
+}
+#[end]

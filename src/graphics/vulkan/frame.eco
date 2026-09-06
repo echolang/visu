@@ -1,0 +1,119 @@
+/**
+ * One in-flight slot: command pool, primary buffer, fence,
+ * acquire semaphore. Render-finished semaphores live per
+ * swapchain image.
+ */
+
+namespace visu::graphics;
+
+internal class FrameSlot
+{
+    public vk::CommandPool $pool;
+    public vk::CommandBuffer $cmd;
+    public vk::Fence $fence;
+    public vk::Semaphore $acquire;
+    public HostRing $ring;
+    public vk::DescriptorSet $set0;
+    public vk::DescriptorPool $set1pool;
+    public uint32[4] $dynOff;
+    public bool $uniformsDirty;
+
+    public constructor()
+    {
+        $this->pool = vk::CommandPool::none();
+        $this->cmd = vk::CommandBuffer::none();
+        $this->fence = vk::Fence::none();
+        $this->acquire = vk::Semaphore::none();
+        $this->ring = HostRing();
+        $this->set0 = vk::DescriptorSet::none();
+        $this->set1pool = vk::DescriptorPool::none();
+        uint32[4] $off;
+        uint32 $i = 0;
+
+        while ($i < 4) {
+            $off[$i] = 0;
+            $i = $i + 1;
+        }
+
+        $this->dynOff = mv $off;
+        $this->uniformsDirty = true;
+    }
+}
+
+internal function vkCreateSlots(Device $device) : status<DeviceError>
+{
+    uint32 $i = 0;
+
+    while ($i < FRAMES_IN_FLIGHT) {
+        FrameSlot $slot = FrameSlot();
+        vk::CommandPoolCreateInfo $pci = vk::CommandPoolCreateInfo();
+        $pci->flags = vk::COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        $pci->queueFamilyIndex = $device->family;
+        guard vkCheck(
+            vk::CreateCommandPool($device->logical, &$pci, null, &$slot->pool),
+            'CreateCommandPool'
+        ) else ($e) {
+            return .error($e);
+        }
+
+        vk::CommandBufferAllocateInfo $ai = vk::CommandBufferAllocateInfo();
+        $ai->commandPool = $slot->pool;
+        $ai->level = vk::COMMAND_BUFFER_LEVEL_PRIMARY;
+        $ai->commandBufferCount = 1;
+        guard vkCheck(
+            vk::AllocateCommandBuffers($device->logical, &$ai, &$slot->cmd),
+            'AllocateCommandBuffers'
+        ) else ($e) {
+            return .error($e);
+        }
+
+        vk::SemaphoreCreateInfo $sci = vk::SemaphoreCreateInfo();
+        guard vkCheck(
+            vk::CreateSemaphore($device->logical, &$sci, null, &$slot->acquire),
+            'CreateSemaphore'
+        ) else ($e) {
+            return .error($e);
+        }
+
+        vk::FenceCreateInfo $fci = vk::FenceCreateInfo();
+        $fci->flags = vk::FENCE_CREATE_SIGNALED_BIT;
+        guard vkCheck(
+            vk::CreateFence($device->logical, &$fci, null, &$slot->fence),
+            'CreateFence'
+        ) else ($e) {
+            return .error($e);
+        }
+
+        $device->slots[] = $slot;
+        $i = $i + 1;
+    }
+
+    return .ok;
+}
+
+internal function vkDestroySlots(Device $device) : void
+{
+    if ($device->logical->handle == 0) {
+        return;
+    }
+
+    foreach ($device->slots as $slot) {
+        if ($slot->fence->handle != 0) {
+            vk::DestroyFence($device->logical, $slot->fence, null);
+            $slot->fence = vk::Fence::none();
+        }
+
+        if ($slot->acquire->handle != 0) {
+            vk::DestroySemaphore($device->logical, $slot->acquire, null);
+            $slot->acquire = vk::Semaphore::none();
+        }
+
+        if ($slot->pool->handle != 0) {
+            vk::DestroyCommandPool($device->logical, $slot->pool, null);
+            $slot->pool = vk::CommandPool::none();
+            $slot->cmd = vk::CommandBuffer::none();
+        }
+    }
+
+    $device->slots = array<FrameSlot>();
+}

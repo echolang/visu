@@ -1,6 +1,6 @@
 /**
- * Per-frame bundle. The object a draw holds: gpu, pipeline, blackboard,
- * pool, and compensation (lag between ticks).
+ * Per-frame bundle. The object a draw holds: device, pipeline,
+ * blackboard, pool, and compensation (lag between ticks).
  *
  * Compensation is where we are between two updates — 0 just after a
  * tick, approaching 1 just before the next. Interpolate motion with
@@ -11,7 +11,7 @@ namespace visu::graphics;
 
 public struct Context
 {
-    public Gpu $gpu;
+    public Device $device;
     public Pipeline $pipeline;
     public Frame $frame;
     public Pool $pool;
@@ -27,5 +27,65 @@ public struct Context
     public const function lerp(float32 $prev, float32 $curr) : float32
     {
         return $prev + ($curr - $prev) * $this->compensation;
+    }
+
+    /**
+     * Open a render encoder on `$target`. Consumes a pending
+     * `requestClear` into the load ops.
+     */
+    public function beginRender(TargetRef $target) : result<RenderEncoder, PipelineError>
+    {
+        RenderTarget $rt = guard $this->pool->getTarget($target) else ($e) {
+            return .error(.pool($e));
+        }
+
+        LoadOp $colorLoad = .load;
+        LoadOp $depthLoad = .load;
+        visu::math::Vec4 $clear = visu::math::Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        float32 $clearDepth = 1.0f;
+        ClearPassOptions $pending = guard $this->pipeline->takeClear($target) else {
+            return $this->open($rt, $colorLoad, $depthLoad, $clear, $clearDepth);
+        }
+
+        if ($pending->clearColor) {
+            $colorLoad = .clear;
+            $clear = $pending->color;
+        }
+
+        if ($pending->clearDepth) {
+            $depthLoad = .clear;
+        }
+
+        return $this->open($rt, $colorLoad, $depthLoad, $clear, $clearDepth);
+    }
+
+    private function open(
+        RenderTarget $rt,
+        LoadOp $colorLoad,
+        LoadOp $depthLoad,
+        visu::math::Vec4 $clear,
+        float32 $clearDepth
+    ) : result<RenderEncoder, PipelineError>
+    {
+        RenderPassDesc $desc = RenderPassDesc();
+        array<Texture> $colors = $rt->colors;
+
+        foreach ($colors as $tex) {
+            ColorTarget $slot = ColorTarget($tex);
+            $slot->load = $colorLoad;
+            $slot->store = .store;
+            $slot->clear = $clear;
+            $desc->colors[] = $slot;
+        }
+
+        Texture $depth = guard $rt->depth else {
+            return .ok($this->device->beginRender($desc));
+        }
+        DepthTarget $d = DepthTarget($depth);
+        $d->load = $depthLoad;
+        $d->store = .store;
+        $d->clearDepth = $clearDepth;
+        $desc->depth = $d;
+        return .ok($this->device->beginRender($desc));
     }
 }

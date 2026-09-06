@@ -1,0 +1,233 @@
+/**
+ * Create-info and pass descriptions. Typed structs, not maps.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+
+public enum BufferUsage
+{
+    case vertex;
+    case index;
+    case uniform;
+    case storage;
+}
+
+public struct BufferDesc
+{
+    public BufferUsage $usage;
+    public uint64 $bytes;
+    public string $label = '';
+}
+
+public const uint32 TEXTURE_SAMPLED = 1;
+public const uint32 TEXTURE_RENDER_TARGET = 2;
+public const uint32 TEXTURE_TRANSFER_SRC = 4;
+public const uint32 TEXTURE_TRANSFER_DST = 8;
+
+public struct TextureDesc
+{
+    public PixelFormat $format = .rgba8;
+    public int32 $width;
+    public int32 $height;
+    public int32 $mips = 1;
+    public uint32 $usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_DST;
+    public SampleCount $samples = .one;
+    public string $label = '';
+
+    public const function isDepth() : bool
+    {
+        return $this->format->isDepth();
+    }
+}
+
+public struct SamplerDesc
+{
+    public Filter $min = .linear;
+    public Filter $mag = .linear;
+    public Wrap $wrapS = .clampToEdge;
+    public Wrap $wrapT = .clampToEdge;
+
+    public const function key() : string
+    {
+        return "{filterCode($this->min)}|{filterCode($this->mag)}|{wrapCode($this->wrapS)}|{wrapCode($this->wrapT)}";
+    }
+}
+
+public struct ColorTarget
+{
+    public Texture $texture;
+    public LoadOp $load = .load;
+    public StoreOp $store = .store;
+    public Vec4 $clear;
+
+    public constructor(Texture $texture)
+    {
+        $this->texture = $texture;
+        $this->load = .load;
+        $this->store = .store;
+        $this->clear = visu::math::Vec4(0.0f);
+    }
+}
+
+public struct DepthTarget
+{
+    public Texture $texture;
+    public LoadOp $load = .load;
+    public StoreOp $store = .store;
+    public float32 $clearDepth = 1.0f;
+}
+
+public struct RenderPassDesc
+{
+    public array<ColorTarget> $colors = array<ColorTarget>();
+    public DepthTarget? $depth = null;
+    public string $label = '';
+}
+
+public struct TargetFormats
+{
+    public PixelFormat[4] $colors;
+    public uint32 $colorCount;
+    public PixelFormat? $depth;
+    public SampleCount $samples;
+
+    public constructor()
+    {
+        PixelFormat[4] $colors;
+        uint32 $i = 0;
+
+        while ($i < 4) {
+            $colors[$i] = .rgba8;
+            $i = $i + 1;
+        }
+
+        $this->colors = mv $colors;
+        $this->colorCount = 0;
+        $this->depth = null;
+        $this->samples = .one;
+    }
+
+    public const function fingerprint() : string
+    {
+        string $out = "{$this->colorCount}|";
+        uint32 $i = 0;
+
+        while ($i < $this->colorCount) {
+            $out = "{$out}{pixelCode($this->colors[$i])}|";
+            $i = $i + 1;
+        }
+
+        PixelFormat $depth = guard $this->depth else {
+            return "{$out}-|{sampleCode($this->samples)}";
+        }
+
+        return "{$out}{pixelCode($depth)}|{sampleCode($this->samples)}";
+    }
+}
+
+public struct DeviceOptions
+{
+    public bool $validation = false;
+    public bool $vsync = true;
+    public string $appName = 'visu';
+}
+
+public struct DeviceLimits
+{
+    public uint64 $uniformAlign = 256;
+    public uint64 $maxUniformRange = 65536;
+    public bool $vertexTextures = false;
+}
+
+public enum AdapterKind
+{
+    case unknown;
+    case integrated;
+    case discrete;
+    case virtual;
+    case cpu;
+}
+
+/**
+ * GPU identity for boot logs and debug overlays. Headless
+ * construct fills `$api` only; `initialize` fills the rest.
+ */
+public struct AdapterInfo
+{
+    public string $api = '';
+    public string $name = '';
+    public string $vendor = '';
+    public string $version = '';
+    public AdapterKind $kind = .unknown;
+
+    /**
+     * `Metal — Apple M4 Pro` / `Vulkan 1.2 — Apple M4 Pro`.
+     */
+    public const function line() : string
+    {
+        if ($this->api->empty()) {
+            return '';
+        }
+
+        string $head = $this->api;
+        if (!$this->version->empty()) {
+            $head = "{$head} {$this->version}";
+        }
+
+        if ($this->name->empty()) {
+            return $head;
+        }
+
+        return "{$head} — {$this->name}";
+    }
+}
+
+internal function pixelCode(PixelFormat $format) : int32
+{
+    return match ($format) {
+        PixelFormat::rgba8 => 0,
+        PixelFormat::bgra8 => 1,
+        PixelFormat::rgba8Srgb => 2,
+        PixelFormat::rgba16f => 3,
+        PixelFormat::rgba32f => 4,
+        PixelFormat::r8 => 5,
+        PixelFormat::r16f => 6,
+        PixelFormat::r32f => 7,
+        PixelFormat::rg16f => 8,
+        PixelFormat::depth32f => 9,
+        PixelFormat::depth32fStencil8 => 10,
+    };
+}
+
+internal function sampleCode(SampleCount $samples) : int32
+{
+    return match ($samples) {
+        SampleCount::one => 1,
+        SampleCount::four => 4,
+    };
+}
+
+internal function filterCode(Filter $filter) : int32
+{
+    return match ($filter) {
+        Filter::nearest => 0,
+        Filter::linear => 1,
+        Filter::nearestMipmapNearest => 2,
+        Filter::nearestMipmapLinear => 3,
+        Filter::linearMipmapNearest => 4,
+        Filter::linearMipmapLinear => 5,
+    };
+}
+
+internal function wrapCode(Wrap $wrap) : int32
+{
+    return match ($wrap) {
+        Wrap::repeat => 0,
+        Wrap::mirroredRepeat => 1,
+        Wrap::clampToEdge => 2,
+        Wrap::clampToBorder => 3,
+    };
+}

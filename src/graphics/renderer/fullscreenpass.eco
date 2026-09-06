@@ -31,26 +31,22 @@ public class FullscreenQuadPass : Pass
 
     public function execute(Context $ctx) : status<PipelineError>
     {
-        RenderTarget $rt = guard $ctx->pool->activate($this->target) else ($e) {
-            return .error(.pool($e));
+        RenderEncoder $enc = guard $ctx->beginRender($this->target) else ($e) {
+            return .error($e);
         }
         Texture $tex = guard $ctx->pool->getTexture($this->texture) else ($e) {
+            $enc->end();
             return .error(.pool($e));
         }
-
-        Gpu $gpu = $ctx->gpu;
+        Device $device = $ctx->device;
         Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
-            return .quad($gpu);
+            return .quad($device);
         });
-
-        $this->program->bind();
-        $gpu->applyRaster(Raster::none());
-        $tex->bind(0);
-        #[if: VISU_BACKEND_METAL]
-        #[else]
-        $this->program->set('u_texture', 0);
-        #[end]
-        $mesh->draw(VertexLayout::pos3uv2());
+        GpuPass $pass = GpuPass($this->program, VertexLayout::pos3uv2(), Raster::none());
+        $pass->bind($enc);
+        $enc->bindTexture(0, $tex, $device->sampler(SamplerDesc()));
+        $mesh->draw($enc);
+        $enc->end();
         return .ok;
     }
 }

@@ -1,0 +1,290 @@
+/**
+ * Graphics pipeline create. Phase 3a is a glfw-group spike:
+ * MoltenVK compiles MSL through XPC at CreateGraphicsPipelines.
+ */
+
+namespace visu::graphics;
+
+internal function vkCreateGraphicsPipeline(
+    Device $device,
+    ShaderModuleHandle $vs,
+    ShaderModuleHandle $fs,
+    uint32 $colorFormat
+) : result<PipelineHandle, DeviceError>
+{
+    string $entry = 'main';
+    vk::PipelineShaderStageCreateInfo $vsStage = vk::PipelineShaderStageCreateInfo();
+    $vsStage->stage = vk::SHADER_STAGE_VERTEX_BIT;
+    $vsStage->module = $vs->module;
+    $vsStage->pName:$ = $entry->cstr();
+    vk::PipelineShaderStageCreateInfo $fsStage = vk::PipelineShaderStageCreateInfo();
+    $fsStage->stage = vk::SHADER_STAGE_FRAGMENT_BIT;
+    $fsStage->module = $fs->module;
+    $fsStage->pName:$ = $entry->cstr();
+    vk::PipelineShaderStageCreateInfo[2] $stages;
+    $stages[0] = $vsStage;
+    $stages[1] = $fsStage;
+
+    vk::VertexInputBindingDescription $bind = vk::VertexInputBindingDescription();
+    $bind->binding = VERTEX_BINDING;
+    $bind->stride = 24;
+    $bind->inputRate = vk::VERTEX_INPUT_RATE_VERTEX;
+    vk::VertexInputAttributeDescription[2] $attrs;
+    $attrs[0]->location = 0;
+    $attrs[0]->binding = VERTEX_BINDING;
+    $attrs[0]->format = vk::FORMAT_R32G32B32_SFLOAT;
+    $attrs[0]->offset = 0;
+    $attrs[1]->location = 1;
+    $attrs[1]->binding = VERTEX_BINDING;
+    $attrs[1]->format = vk::FORMAT_R32G32B32_SFLOAT;
+    $attrs[1]->offset = 12;
+    vk::PipelineVertexInputStateCreateInfo $vertex = vk::PipelineVertexInputStateCreateInfo();
+    $vertex->vertexBindingDescriptionCount = 1;
+    $vertex->pVertexBindingDescriptions:$ = &$bind;
+    $vertex->vertexAttributeDescriptionCount = 2;
+    $vertex->pVertexAttributeDescriptions:$ = &$attrs[0];
+
+    vk::PipelineInputAssemblyStateCreateInfo $ia = vk::PipelineInputAssemblyStateCreateInfo();
+    $ia->topology = vk::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    vk::PipelineViewportStateCreateInfo $viewport = vk::PipelineViewportStateCreateInfo();
+    $viewport->viewportCount = 1;
+    $viewport->scissorCount = 1;
+
+    vk::PipelineRasterizationStateCreateInfo $raster = vk::PipelineRasterizationStateCreateInfo();
+    $raster->polygonMode = vk::POLYGON_MODE_FILL;
+    $raster->cullMode = vk::CULL_MODE_NONE;
+    $raster->frontFace = vk::FRONT_FACE_COUNTER_CLOCKWISE;
+    $raster->lineWidth = 1.0f;
+
+    vk::PipelineMultisampleStateCreateInfo $ms = vk::PipelineMultisampleStateCreateInfo();
+    $ms->rasterizationSamples = vk::SAMPLE_COUNT_1_BIT;
+
+    vk::PipelineColorBlendAttachmentState $blendAtt = vk::PipelineColorBlendAttachmentState();
+    $blendAtt->colorWriteMask = vk::COLOR_COMPONENT_R_BIT
+        | vk::COLOR_COMPONENT_G_BIT
+        | vk::COLOR_COMPONENT_B_BIT
+        | vk::COLOR_COMPONENT_A_BIT;
+    vk::PipelineColorBlendStateCreateInfo $blend = vk::PipelineColorBlendStateCreateInfo();
+    $blend->attachmentCount = 1;
+    $blend->pAttachments:$ = &$blendAtt;
+
+    uint32[2] $dyn;
+    $dyn[0] = vk::DYNAMIC_STATE_VIEWPORT;
+    $dyn[1] = vk::DYNAMIC_STATE_SCISSOR;
+    vk::PipelineDynamicStateCreateInfo $dynamic = vk::PipelineDynamicStateCreateInfo();
+    $dynamic->dynamicStateCount = 2;
+    $dynamic->pDynamicStates:$ = &$dyn[0];
+
+    vk::PipelineLayoutCreateInfo $plci = vk::PipelineLayoutCreateInfo();
+    vk::PipelineLayout $layout = vk::PipelineLayout::none();
+    guard vkCheck(
+        vk::CreatePipelineLayout($device->logical, &$plci, null, &$layout),
+        'CreatePipelineLayout'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    vk::PipelineRenderingCreateInfo $rendering = vk::PipelineRenderingCreateInfo();
+    $rendering->colorAttachmentCount = 1;
+    $rendering->pColorAttachmentFormats:$ = &$colorFormat;
+
+    vk::GraphicsPipelineCreateInfo $gpci = vk::GraphicsPipelineCreateInfo();
+    $gpci->pNext:$ = ptr<const uint8>(&$rendering);
+    $gpci->stageCount = 2;
+    $gpci->pStages:$ = &$stages[0];
+    $gpci->pVertexInputState:$ = &$vertex;
+    $gpci->pInputAssemblyState:$ = &$ia;
+    $gpci->pViewportState:$ = &$viewport;
+    $gpci->pRasterizationState:$ = &$raster;
+    $gpci->pMultisampleState:$ = &$ms;
+    $gpci->pColorBlendState:$ = &$blend;
+    $gpci->pDynamicState:$ = &$dynamic;
+    $gpci->layout = $layout;
+
+    vk::Pipeline $pipeline = vk::Pipeline::none();
+    vk::Result $r = vk::CreateGraphicsPipelines(
+        $device->logical,
+        vk::PipelineCache::none(),
+        1,
+        &$gpci,
+        null,
+        &$pipeline
+    );
+    vk::DestroyPipelineLayout($device->logical, $layout, null);
+
+    guard vkCheck($r, 'CreateGraphicsPipelines') else ($e) {
+        return .error($e);
+    }
+
+    return .ok(PipelineHandle($pipeline));
+}
+
+internal function vkPipelineFromPass(
+    Device $device,
+    const GpuPass& $pass,
+    const TargetFormats& $formats
+) : result<PipelineHandle, DeviceError>
+{
+    string $entry = 'main';
+    vk::PipelineShaderStageCreateInfo $vsStage = vk::PipelineShaderStageCreateInfo();
+    $vsStage->stage = vk::SHADER_STAGE_VERTEX_BIT;
+    $vsStage->module = $pass->program->vs->module;
+    $vsStage->pName:$ = $entry->cstr();
+    vk::PipelineShaderStageCreateInfo $fsStage = vk::PipelineShaderStageCreateInfo();
+    $fsStage->stage = vk::SHADER_STAGE_FRAGMENT_BIT;
+    $fsStage->module = $pass->program->fs->module;
+    $fsStage->pName:$ = $entry->cstr();
+    vk::PipelineShaderStageCreateInfo[2] $stages;
+    $stages[0] = $vsStage;
+    $stages[1] = $fsStage;
+
+    vk::VertexInputBindingDescription[2] $binds;
+    vk::VertexInputAttributeDescription[16] $attrs;
+    uint32 $bindN = 0;
+    uint32 $attrN = 0;
+    bool $hasVertex = false;
+    bool $hasInstance = false;
+
+    foreach ($pass->layout->attrs as $a) {
+        assert($attrN < 16, 'too many vertex attributes');
+        uint32 $binding = VERTEX_BINDING;
+        uint32 $rate = vk::VERTEX_INPUT_RATE_VERTEX;
+
+        if ($a->divisor != 0) {
+            $binding = INSTANCE_BINDING;
+            $rate = vk::VERTEX_INPUT_RATE_INSTANCE;
+
+            if (!$hasInstance) {
+                $binds[$bindN]->binding = $binding;
+                $binds[$bindN]->stride = $a->stride as uint32;
+                $binds[$bindN]->inputRate = $rate;
+                $bindN = $bindN + 1;
+                $hasInstance = true;
+            }
+        } else if (!$hasVertex) {
+            $binds[$bindN]->binding = $binding;
+            $binds[$bindN]->stride = $a->stride as uint32;
+            $binds[$bindN]->inputRate = $rate;
+            $bindN = $bindN + 1;
+            $hasVertex = true;
+        }
+
+        $attrs[$attrN]->location = $a->location;
+        $attrs[$attrN]->binding = $binding;
+        $attrs[$attrN]->format = vkAttrFormat($a->components);
+        $attrs[$attrN]->offset = $a->offset as uint32;
+        $attrN = $attrN + 1;
+    }
+
+    vk::PipelineVertexInputStateCreateInfo $vertex = vk::PipelineVertexInputStateCreateInfo();
+    $vertex->vertexBindingDescriptionCount = $bindN;
+    $vertex->vertexAttributeDescriptionCount = $attrN;
+
+    if ($bindN > 0) {
+        $vertex->pVertexBindingDescriptions:$ = &$binds[0];
+    }
+
+    if ($attrN > 0) {
+        $vertex->pVertexAttributeDescriptions:$ = &$attrs[0];
+    }
+
+    vk::PipelineInputAssemblyStateCreateInfo $ia = vk::PipelineInputAssemblyStateCreateInfo();
+    $ia->topology = vkTopology($pass->topology);
+
+    vk::PipelineViewportStateCreateInfo $viewport = vk::PipelineViewportStateCreateInfo();
+    $viewport->viewportCount = 1;
+    $viewport->scissorCount = 1;
+
+    vk::PipelineRasterizationStateCreateInfo $raster = vk::PipelineRasterizationStateCreateInfo();
+    $raster->polygonMode = vk::POLYGON_MODE_FILL;
+    $raster->cullMode = vkCull($pass->raster->cull);
+    $raster->frontFace = vkFront($pass->raster->front);
+    $raster->lineWidth = 1.0f;
+
+    vk::PipelineMultisampleStateCreateInfo $ms = vk::PipelineMultisampleStateCreateInfo();
+    $ms->rasterizationSamples = vkSampleCount($formats->samples);
+
+    vk::PipelineDepthStencilStateCreateInfo $depth = vk::PipelineDepthStencilStateCreateInfo();
+
+    if ($pass->raster->depthTest) {
+        $depth->depthTestEnable = vk::TRUE;
+    }
+
+    if ($pass->raster->depthWrite) {
+        $depth->depthWriteEnable = vk::TRUE;
+    }
+
+    $depth->depthCompareOp = vkCompare($pass->raster->depthCompare);
+
+    vk::PipelineColorBlendAttachmentState $blendAtt = vkFillBlend($pass->raster);
+    vk::PipelineColorBlendStateCreateInfo $blend = vk::PipelineColorBlendStateCreateInfo();
+    $blend->attachmentCount = 1;
+    $blend->pAttachments:$ = &$blendAtt;
+
+    uint32[2] $dyn;
+    $dyn[0] = vk::DYNAMIC_STATE_VIEWPORT;
+    $dyn[1] = vk::DYNAMIC_STATE_SCISSOR;
+    vk::PipelineDynamicStateCreateInfo $dynamic = vk::PipelineDynamicStateCreateInfo();
+    $dynamic->dynamicStateCount = 2;
+    $dynamic->pDynamicStates:$ = &$dyn[0];
+
+    uint32 $colorFormat = vkFormat($formats->colors[0]);
+    vk::PipelineRenderingCreateInfo $rendering = vk::PipelineRenderingCreateInfo();
+    $rendering->colorAttachmentCount = $formats->colorCount;
+    $rendering->pColorAttachmentFormats:$ = &$colorFormat;
+
+    if ($formats->depth != null) {
+        PixelFormat $depthFmt = guard $formats->depth;
+        $rendering->depthAttachmentFormat = vkFormat($depthFmt);
+    }
+
+    vk::GraphicsPipelineCreateInfo $gpci = vk::GraphicsPipelineCreateInfo();
+    $gpci->pNext:$ = ptr<const uint8>(&$rendering);
+    $gpci->stageCount = 2;
+    $gpci->pStages:$ = &$stages[0];
+    $gpci->pVertexInputState:$ = &$vertex;
+    $gpci->pInputAssemblyState:$ = &$ia;
+    $gpci->pViewportState:$ = &$viewport;
+    $gpci->pRasterizationState:$ = &$raster;
+    $gpci->pMultisampleState:$ = &$ms;
+    $gpci->pDepthStencilState:$ = &$depth;
+    $gpci->pColorBlendState:$ = &$blend;
+    $gpci->pDynamicState:$ = &$dynamic;
+    $gpci->layout = $device->pipeLayout;
+    vk::Pipeline $pipeline = vk::Pipeline::none();
+    guard vkCheck(
+        vk::CreateGraphicsPipelines(
+            $device->logical,
+            vk::PipelineCache::none(),
+            1,
+            &$gpci,
+            null,
+            &$pipeline
+        ),
+        'CreateGraphicsPipelines'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    return .ok(PipelineHandle($pipeline));
+}
+
+internal function vkGetPipeline(
+    Device $device,
+    const GpuPass& $pass,
+    const TargetFormats& $formats
+) : PipelineHandle
+{
+    string $key = "{$pass->key()}|{$formats->fingerprint()}";
+
+    if ($device->psos->has($key)) {
+        return $device->psos[$key];
+    }
+
+    PipelineHandle $made = guard vkPipelineFromPass($device, $pass, $formats) else ($e) {
+        die($e->message());
+    }
+    $device->psos[$key] = $made;
+    return $made;
+}

@@ -1,6 +1,6 @@
 /**
- * Per-pipeline raster state. Applied through Gpu so redundant
- * enable/disable calls are skipped.
+ * Per-pipeline raster state. Blend and colorWrite are PSO state;
+ * viewport, scissor, cull, front face, and depth are dynamic.
  */
 
 namespace visu::graphics;
@@ -16,28 +16,58 @@ public enum BlendMode
 {
     case none;
     case alpha;
+    case premultiplied;
+    case additive;
+}
+
+public enum Compare
+{
+    case never;
+    case less;
+    case equal;
+    case lessEqual;
+    case greater;
+    case notEqual;
+    case greaterEqual;
+    case always;
+}
+
+public enum FrontFace
+{
+    case ccw;
+    case cw;
 }
 
 public struct Raster
 {
     public bool $depthTest = false;
     public bool $depthWrite = true;
+    public Compare $depthCompare = .less;
     public CullMode $cull = .none;
+    public FrontFace $front = .ccw;
     public BlendMode $blend = .none;
     public bool $colorWrite = true;
 
     public static function opaque() : Raster
     {
-        return Raster(true, true, .back, .none, true);
+        Raster $r = Raster();
+        $r->depthTest = true;
+        $r->depthWrite = true;
+        $r->cull = .back;
+        return $r;
     }
 
     public static function alpha() : Raster
     {
-        return Raster(true, false, .none, .alpha, true);
+        Raster $r = Raster();
+        $r->depthTest = true;
+        $r->depthWrite = false;
+        $r->blend = .alpha;
+        return $r;
     }
 
     public static function none() : Raster
     {
-        return Raster(false, false, .none, .none, true);
+        return Raster();
     }
 }

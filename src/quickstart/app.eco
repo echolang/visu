@@ -1,9 +1,9 @@
 /**
- * Prototyping app the GameLoop drives. Owns Gpu (class handle);
+ * Prototyping app the GameLoop drives. Owns Device (class handle);
  * GPU objects store it. Scene goes to an offscreen target:
  * `$opt->render` adds graph passes, `$opt->draw` (and FlyUI later)
- * runs with that target bound, then a fullscreen blit to the
- * backbuffer.
+ * runs after beginRender on that target, then a fullscreen blit
+ * to the backbuffer.
  */
 
 namespace visu::quickstart;
@@ -12,9 +12,10 @@ use std::env;
 use visu::app::{Paths, Services};
 use visu::ecs::{Entities, Systems};
 use visu::graphics::{
-    Backbuffer, CallbackPass, ClearPass, ClearPassOptions, Context, Frame,
-    FullscreenTextureRenderer, Gpu, IoSink, Pipeline, PipelineError, Pool,
-    RenderTarget, ShaderCollection, TargetRef, TextureOptions, TextureRef
+    Backbuffer, CallbackPass, ClearPass, ClearPassOptions, Context, Device,
+    DeviceError, Frame, FrameStatus, FullscreenTextureRenderer, IoSink,
+    Pipeline, PipelineError, Pool, RenderEncoder, RenderTarget,
+    ShaderCollection, TargetRef, TextureOptions, TextureRef
 };
 use visu::math::Vec2;
 use visu::os::{ContextMap, Input, Window, WindowError, WindowHints};
@@ -23,7 +24,7 @@ use visu::signal::Dispatcher;
 
 public class App : Delegate
 {
-    public Gpu $gpu;
+    public Device $device;
     public Window $window;
     public Pool $pool;
     public Entities $entities;
@@ -44,21 +45,21 @@ public class App : Delegate
     {
         $this->options = $options;
         $this->services = $services;
-        $this->gpu = Gpu();
+        $this->device = Device();
         $this->window = Window(
             $options->windowTitle,
             $options->windowWidth,
             $options->windowHeight,
             $this->hints($options)
         );
-        $this->pool = Pool($this->gpu);
+        $this->pool = Pool($this->device);
         $this->entities = Entities();
         $this->systems = Systems();
         $this->dispatcher = Dispatcher();
         $this->input = Input($this->window, $this->dispatcher);
         $this->inputContext = ContextMap($this->dispatcher, $this->input);
         $this->window->setHandler($this->input);
-        $this->shaders = ShaderCollection($this->gpu, $this->shaderDir($services));
+        $this->shaders = ShaderCollection($this->device, $this->shaderDir($services));
         $this->events = EventLoop();
         $this->frameIndex = 0;
         $this->tickIndex = 0;
@@ -68,17 +69,13 @@ public class App : Delegate
 
     public function initialize() : status<WindowError>
     {
-        guard $this->window->initialize($this->gpu) else ($e) {
+        guard $this->window->initialize($this->device) else ($e) {
             return .error($e);
         }
 
-        if ($this->options->windowVsync) {
-            $this->window->setSwapInterval(1);
-        } else {
-            $this->window->setSwapInterval(0);
-        }
+        $this->device->setVsync($this->options->windowVsync);
 
-        guard $this->blit->load($this->gpu) else ($e) {
+        guard $this->blit->load($this->device) else ($e) {
             $this->fail = .shader($e);
             return .ok;
         }
@@ -105,13 +102,36 @@ public class App : Delegate
 
     public function render(float32 $compensation) : void
     {
+        if ($this->window->shouldClose()) {
+            return;
+        }
+
+        int32 $w = $this->window->framebufferWidth();
+        int32 $h = $this->window->framebufferHeight();
+        FrameStatus $status = guard $this->device->beginFrame($w, $h) else ($e) {
+            match ($e) {
+                DeviceError::surfaceLost => {
+                    $this->window->setShouldClose(true);
+                    return;
+                },
+                else => {
+                    $this->fail = .device($e);
+                    return;
+                },
+            };
+        }
+
+        if ($status == FrameStatus::skipped) {
+            return;
+        }
+
         Frame $frame = Frame();
         RenderTarget $windowRt = $this->window->renderTarget();
         Pipeline $pipeline = Pipeline($this->pool, $frame, $windowRt);
-        Context $ctx = Context($this->gpu, $pipeline, $frame, $this->pool, $compensation);
+        Context $ctx = Context($this->device, $pipeline, $frame, $this->pool, $compensation);
         Backbuffer $back = $frame->get<Backbuffer>();
         TargetRef $scene = $this->sceneTarget($pipeline, $windowRt);
-        $scene->rboDepthStencil = true;
+        $scene->depthStencil = true;
         TextureRef $color = $pipeline->createColor($scene, 'quickstartColor', TextureOptions());
         $frame->set(QuickstartPassData($scene, $color));
         $pipeline->add(ClearPass($scene, ClearPassOptions(color: $this->options->clearColor)));
@@ -142,11 +162,13 @@ public class App : Delegate
 
     public function destroy() : void
     {
+        $this->device->waitIdle();
         $this->systems->unregister($this->entities);
         $this->shaders->destroy();
         $this->blit->destroy();
         $this->pool->destroy();
         $this->window->destroy();
+        $this->device->shutdown();
     }
 
     private function sceneTarget(Pipeline $pipeline, RenderTarget $windowRt) : TargetRef
@@ -167,14 +189,19 @@ public class App : Delegate
                 $io->writes($data->renderTarget);
             },
             execute: function(Context $ctx) : status<PipelineError> {
-                QuickstartPassData $data = $ctx->frame->get<QuickstartPassData>();
-                RenderTarget $rt = guard $ctx->pool->activate($data->renderTarget) else ($e) {
-                    return .error(.pool($e));
-                }
                 function<void(App, Context, RenderTarget)> $draw = guard $this->options->draw else {
                     return .ok;
                 }
+                QuickstartPassData $data = $ctx->frame->get<QuickstartPassData>();
+                RenderEncoder $enc = guard $ctx->beginRender($data->renderTarget) else ($e) {
+                    return .error($e);
+                }
+                RenderTarget $rt = guard $ctx->pool->getTarget($data->renderTarget) else ($e) {
+                    $enc->end();
+                    return .error(.pool($e));
+                }
                 $draw($this, $ctx, $rt);
+                $enc->end();
                 return .ok;
             }
         ));

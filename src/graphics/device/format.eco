@@ -1,0 +1,117 @@
+/**
+ * Texture formats, shader stage kind, and the on-disk suffix
+ * `scan` looks for. The backend `#[if]` for the suffix is one
+ * of the four sites allowed outside the backend folders.
+ */
+
+namespace visu::graphics;
+
+public enum PixelFormat
+{
+    case rgba8;
+    case bgra8;
+    case rgba8Srgb;
+    case rgba16f;
+    case rgba32f;
+    case r8;
+    case r16f;
+    case r32f;
+    case rg16f;
+    case depth32f;
+    case depth32fStencil8;
+
+    public const function isDepth() : bool
+    {
+        return match ($this) {
+            PixelFormat::depth32f => true,
+            PixelFormat::depth32fStencil8 => true,
+            else => false,
+        };
+    }
+}
+
+public enum ShaderKind
+{
+    case vertex;
+    case fragment;
+    case geometry;
+    case tessControl;
+    case tessEvaluation;
+}
+
+public enum SampleCount
+{
+    case one;
+    case four;
+}
+
+public enum IndexType
+{
+    case uint16;
+    case uint32;
+}
+
+public enum Topology
+{
+    case points;
+    case lines;
+    case lineStrip;
+    case triangles;
+    case triangleStrip;
+}
+
+public enum Filter
+{
+    case nearest;
+    case linear;
+    case nearestMipmapNearest;
+    case nearestMipmapLinear;
+    case linearMipmapNearest;
+    case linearMipmapLinear;
+
+    public const function mipmapped() : bool
+    {
+        return match ($this) {
+            Filter::nearest => false,
+            Filter::linear => false,
+            else => true,
+        };
+    }
+}
+
+public enum Wrap
+{
+    case repeat;
+    case mirroredRepeat;
+    case clampToEdge;
+    case clampToBorder;
+}
+
+#[if: os == darwin && !VISU_BACKEND_VULKAN]
+internal function shaderSuffix() : string
+{
+    return 'metal';
+}
+#[else]
+internal function shaderSuffix() : string
+{
+    return 'spv';
+}
+#[end]
+
+internal function pixelByteCount(PixelFormat $format) : uint32
+{
+    return match ($format) {
+        PixelFormat::rgba8 => 4,
+        PixelFormat::bgra8 => 4,
+        PixelFormat::rgba8Srgb => 4,
+        PixelFormat::rgba16f => 8,
+        PixelFormat::rgba32f => 16,
+        PixelFormat::r8 => 1,
+        PixelFormat::r16f => 2,
+        PixelFormat::r32f => 4,
+        PixelFormat::rg16f => 4,
+        PixelFormat::depth32f => 4,
+        PixelFormat::depth32fStencil8 => 5,
+    };
+}

@@ -1,194 +1,51 @@
 /**
- * A 2D GPU texture. Construct allocates a name; allocateEmpty fills
- * storage. Stores Gpu; destroy() uses the handle.
+ * Graph-side texture create-info. `desc` / `sampler` feed the
+ * device types; identity for the pool fingerprint is `key()`.
  */
 
 namespace visu::graphics;
 
-public enum Filter
-{
-    case nearest;
-    case linear;
-    case nearestMipmapNearest;
-    case nearestMipmapLinear;
-    case linearMipmapNearest;
-    case linearMipmapLinear;
-
-    public const function mipmapped() : bool
-    {
-        return match ($this) {
-            Filter::nearest => false,
-            Filter::linear => false,
-            else => true,
-        };
-    }
-}
-
-public enum Wrap
-{
-    case repeat;
-    case mirroredRepeat;
-    case clampToEdge;
-    case clampToBorder;
-}
-
 public struct TextureOptions
 {
-    public PixelFormat $format = .rgba;
+    public PixelFormat $format = .rgba8;
     public Filter $min = .linear;
     public Filter $mag = .linear;
     public Wrap $wrapS = .clampToEdge;
     public Wrap $wrapT = .clampToEdge;
-    public bool $mipmaps = false;
+    public int32 $mips = 1;
 
     /**
-     * Depth attachment defaults: depthComponent, nearest, clamp, no mipmaps.
+     * Depth attachment defaults: depth32f, nearest, clamp, one mip.
      */
     public static function depth() : TextureOptions
     {
-        return TextureOptions($format: .depthComponent, $min: .nearest, $mag: .nearest);
+        return TextureOptions($format: .depth32f, $min: .nearest, $mag: .nearest);
+    }
+
+    public const function desc(int32 $width, int32 $height) : TextureDesc
+    {
+        TextureDesc $d = TextureDesc($format: $this->format, $width: $width, $height: $height);
+        $d->mips = $this->mips;
+        return $d;
+    }
+
+    public const function sampler() : SamplerDesc
+    {
+        SamplerDesc $s = SamplerDesc();
+        $s->min = $this->min;
+        $s->mag = $this->mag;
+        $s->wrapS = $this->wrapS;
+        $s->wrapT = $this->wrapT;
+        return $s;
     }
 
     public const function key() : string
     {
-        int32 $mip = 0;
-
-        if ($this->mipmaps) {
-            $mip = 1;
-        }
-
         int32 $fmt = pixelCode($this->format);
         int32 $min = filterCode($this->min);
         int32 $mag = filterCode($this->mag);
         int32 $ws = wrapCode($this->wrapS);
         int32 $wt = wrapCode($this->wrapT);
-        return "{$fmt}|{$min}|{$mag}|{$ws}|{$wt}|{$mip}";
+        return "{$fmt}|{$min}|{$mag}|{$ws}|{$wt}|{$this->mips}";
     }
-}
-
-public class Texture : GpuObject
-{
-    public Gpu $gpu;
-
-    /**
-     * GPU texture name.
-     */
-    public const uint32 $id;
-
-    /**
-     * Texture target this name is bound as.
-     */
-    public const TextureTarget $target;
-
-    /**
-     * Debug name. Identity for the GPU is $id.
-     */
-    public const string $name;
-
-    /**
-     * True when this object created the GL name and must delete it.
-     */
-    public const bool $owned;
-
-    private bool $dead;
-    public int32 $width;
-    public int32 $height;
-
-    /**
-     * Allocates a 2D texture name.
-     */
-    public constructor(Gpu $gpu, string $name)
-    {
-        $this->gpu = $gpu;
-        $this->id = $gpu->createTexture();
-        $this->target = .texture2D;
-        $this->name = $name;
-        $this->owned = true;
-        $this->dead = false;
-        $this->width = 0;
-        $this->height = 0;
-    }
-
-    destructor()
-    {
-        $this->destroy();
-    }
-
-    /**
-     * Deletes the GL name. No-op for an already-destroyed object.
-     */
-    public function destroy() : void
-    {
-        if (!$this->owned || $this->dead) {
-            return;
-        }
-
-        if (!$this->gpu->lost()) {
-            $this->gpu->deleteTexture($this->id);
-        }
-
-        $this->dead = true;
-    }
-
-    /**
-     * Bind to texture unit `$index` (0 is TEXTURE0).
-     */
-    public function bind(int32 $index = 0) : void
-    {
-        assert($index >= 0, 'texture unit index must be >= 0');
-        $this->gpu->bindTexture(TEXTURE0 + ($index as uint32), $this->target, $this->id);
-    }
-
-    /**
-     * Allocates empty storage and applies filter / wrap.
-     */
-    public function allocateEmpty(int32 $width, int32 $height, TextureOptions $opt) : void
-    {
-        assert($width > 0 && $height > 0, 'texture size must be positive');
-        assert($opt->mipmaps || !$opt->min->mipmapped(), 'mipmapped min filter needs mipmaps');
-
-        $this->bind();
-        $this->gpu->texFilter($this->target, $opt->min, $opt->mag);
-        $this->gpu->texWrap($this->target, $opt->wrapS, $opt->wrapT);
-        $this->gpu->texImage2D($this->target, $opt->format, $width, $height);
-
-        if ($opt->mipmaps) {
-            $this->gpu->generateMipmap($this->target);
-        }
-
-        $this->width = $width;
-        $this->height = $height;
-    }
-}
-
-internal function pixelCode(PixelFormat $format) : int32
-{
-    return match ($format) {
-        PixelFormat::rgba => 0,
-        PixelFormat::r32f => 1,
-        PixelFormat::depthComponent => 2,
-        PixelFormat::depthStencil => 3,
-    };
-}
-
-internal function filterCode(Filter $filter) : int32
-{
-    return match ($filter) {
-        Filter::nearest => 0,
-        Filter::linear => 1,
-        Filter::nearestMipmapNearest => 2,
-        Filter::nearestMipmapLinear => 3,
-        Filter::linearMipmapNearest => 4,
-        Filter::linearMipmapLinear => 5,
-    };
-}
-
-internal function wrapCode(Wrap $wrap) : int32
-{
-    return match ($wrap) {
-        Wrap::repeat => 0,
-        Wrap::mirroredRepeat => 1,
-        Wrap::clampToEdge => 2,
-        Wrap::clampToBorder => 3,
-    };
 }

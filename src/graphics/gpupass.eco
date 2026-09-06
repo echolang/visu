@@ -1,7 +1,7 @@
 /**
- * Bind + upload + draw. Program + layout + raster, optional
- * payload slot/block. Distinct from the render-graph Pipeline.
- * Does not own the ShaderProgram (ShaderCollection does).
+ * Bind + upload + draw. Program + layout + raster + topology.
+ * Distinct from the render-graph Pipeline. Slot is the payload
+ * identity; there is no uniform-block name.
  */
 
 namespace visu::graphics;
@@ -11,39 +11,116 @@ public struct GpuPass
     public ShaderProgram $program;
     public VertexLayout $layout;
     public Raster $raster;
+    public Topology $topology;
     public uint32 $slot;
-    public string $block;
+    private string $key;
 
     public constructor(
         ShaderProgram $program,
         VertexLayout $layout,
         Raster $raster,
-        slot: uint32 $slot = 0,
-        block: string $block = ''
+        topology: Topology $topology = .triangles,
+        slot: uint32 $slot = 0
     )
     {
         $this->program = $program;
         $this->layout = $layout;
         $this->raster = $raster;
+        $this->topology = $topology;
         $this->slot = $slot;
-        $this->block = $block;
     }
 
-    public function bind() : void
+    init
     {
-        $this->program->bind();
-        $this->program->gpu->applyRaster($this->raster);
-    }
+        int32 $blend = blendCode($this->raster->blend);
+        int32 $write = 0;
 
-    public function draw<T>(Mesh $mesh, T $params) : void
-    {
-        $this->bind();
-
-        if (!$this->block->empty()) {
-            $this->program->bindSlot($this->slot, $this->block);
+        if ($this->raster->colorWrite) {
+            $write = 1;
         }
 
-        $this->program->upload($params, slot: $this->slot);
-        $mesh->draw($this->layout);
+        int32 $topo = topologyCode($this->topology);
+        int32 $cull = cullCode($this->raster->cull);
+        int32 $front = 0;
+
+        if ($this->raster->front == FrontFace::cw) {
+            $front = 1;
+        }
+
+        int32 $depth = compareCode($this->raster->depthCompare);
+        int32 $dtest = 0;
+        int32 $dwrite = 0;
+
+        if ($this->raster->depthTest) {
+            $dtest = 1;
+        }
+
+        if ($this->raster->depthWrite) {
+            $dwrite = 1;
+        }
+
+        $this->key = "{$this->program->id}|{$this->layout->fingerprint()}|{$blend}|{$write}|{$topo}|{$cull}|{$front}|{$dtest}|{$dwrite}|{$depth}";
     }
+
+    public const function key() : string
+    {
+        return $this->key;
+    }
+
+    public function bind(RenderEncoder $enc) : void
+    {
+        $enc->setPipeline($this);
+    }
+
+    public function draw<T>(RenderEncoder $enc, Mesh $mesh, const T& $params) : void
+    {
+        $mesh->checkLayout($this->layout);
+        $this->bind($enc);
+        $enc->upload($params, slot: $this->slot);
+        $mesh->draw($enc);
+    }
+}
+
+internal function blendCode(BlendMode $blend) : int32
+{
+    return match ($blend) {
+        BlendMode::none => 0,
+        BlendMode::alpha => 1,
+        BlendMode::premultiplied => 2,
+        BlendMode::additive => 3,
+    };
+}
+
+internal function topologyCode(Topology $topology) : int32
+{
+    return match ($topology) {
+        Topology::points => 0,
+        Topology::lines => 1,
+        Topology::lineStrip => 2,
+        Topology::triangles => 3,
+        Topology::triangleStrip => 4,
+    };
+}
+
+internal function cullCode(CullMode $cull) : int32
+{
+    return match ($cull) {
+        CullMode::none => 0,
+        CullMode::front => 1,
+        CullMode::back => 2,
+    };
+}
+
+internal function compareCode(Compare $op) : int32
+{
+    return match ($op) {
+        Compare::never => 0,
+        Compare::less => 1,
+        Compare::equal => 2,
+        Compare::lessEqual => 3,
+        Compare::greater => 4,
+        Compare::notEqual => 5,
+        Compare::greaterEqual => 6,
+        Compare::always => 7,
+    };
 }

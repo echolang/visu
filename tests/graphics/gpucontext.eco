@@ -1,0 +1,165 @@
+/**
+ * Hidden window + Device for glfw-group tests and gpucheck.
+ * Pixel checks render into a 64×64 pool target, never the
+ * backbuffer. Call end() before returning.
+ */
+
+use std::io;
+use visu::os::{Window, WindowHints, init, terminate};
+use visu::graphics::{
+    Device, Frame, FrameStatus, Pipeline, Pool, TargetRef, Texture,
+    TextureOptions, TextureRef
+};
+use visu::math::Vec4;
+
+public struct QuadParams
+{
+    public Vec4 $color;
+}
+
+public class GpuContext
+{
+    public Window $window;
+    public Device $device;
+    public Pool $pool;
+    public int32 $tick;
+
+    public constructor(Window $window)
+    {
+        $this->window = $window;
+        $this->device = Device();
+        guard $this->window->initialize($this->device) else ($e) {
+            terminate();
+            die($e->message());
+        }
+        $this->pool = Pool($this->device);
+        $this->tick = 0;
+    }
+
+    public function end() : void
+    {
+        $this->device->waitIdle();
+        $this->pool->destroy();
+        $this->window->destroy();
+        $this->device->shutdown();
+        terminate();
+    }
+
+    public function runFrame(function<void(Pipeline)> $build) : void
+    {
+        int32 $w = $this->window->framebufferWidth();
+        int32 $h = $this->window->framebufferHeight();
+        FrameStatus $status = guard $this->device->beginFrame($w, $h) else ($e) {
+            die($e->message());
+        }
+
+        if ($status != FrameStatus::ready) {
+            die('gpu: frame skipped');
+        }
+
+        Frame $frame = Frame();
+        Pipeline $pipeline = Pipeline($this->pool, $frame, $this->window->renderTarget());
+        $build($pipeline);
+        int32 $tick = $this->tick;
+        $this->tick = $this->tick + 1;
+        guard $pipeline->execute($tick) else ($e) {
+            die($e->message());
+        }
+        $this->window->swap();
+    }
+
+    public function readOffscreen(string $name, int32 $width = 64, int32 $height = 64) : array<uint8>
+    {
+        TextureRef $ref = TextureRef("{$name}.attachment.color_color", $width, $height, TextureOptions());
+        Texture $tex = guard $this->pool->getTexture($ref) else ($e) {
+            die($e->message());
+        }
+        return readRgba($this->device, $tex);
+    }
+}
+
+public function gpuHidden(string $title, int32 $width = 64, int32 $height = 64) : GpuContext
+{
+    guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window($title, $width, $height, $hints);
+    return GpuContext($window);
+}
+
+/**
+ * Bottom-left origin so checks match the GL-era sample table.
+ * Device.readback is top-left (Vulkan/Metal).
+ */
+public function readRgba(Device $device, Texture $texture) : array<uint8>
+{
+    array<uint8> $raw = guard $device->readback($texture) else ($e) {
+        die($e->message());
+    }
+
+    int32 $w = $texture->width;
+    int32 $h = $texture->height;
+    int32 $stride = $w * 4;
+    assert($raw->count() == ($w * $h * 4) as usize, 'readback size');
+    array<uint8> $out = array<uint8>();
+    int32 $y = $h - 1;
+
+    while ($y >= 0) {
+        int32 $x = 0;
+
+        while ($x < $stride) {
+            $out[] = $raw[($y * $stride + $x) as usize];
+            $x = $x + 1;
+        }
+
+        $y = $y - 1;
+    }
+
+    return $out;
+}
+
+public function offscreen64(Pipeline $pipeline, string $name) : TargetRef
+{
+    TargetRef $t = $pipeline->createTarget($name, 64, 64);
+    $pipeline->createColor($t, 'color', TextureOptions());
+    return $t;
+}
+
+#[if: os == darwin && !VISU_BACKEND_VULKAN]
+internal function gpuShaderSuffix() : string
+{
+    return 'metal';
+}
+#[else]
+internal function gpuShaderSuffix() : string
+{
+    return 'spv';
+}
+#[end]
+
+public function shaderDir() : string
+{
+    string $suf = gpuShaderSuffix();
+
+    if (gpuPathExists("tests/resources/shaders/quad.vert.{$suf}")) {
+        return 'tests/resources/shaders';
+    }
+
+    if (gpuPathExists("../tests/resources/shaders/quad.vert.{$suf}")) {
+        return '../tests/resources/shaders';
+    }
+
+    return 'tests/resources/shaders';
+}
+
+internal function gpuPathExists(string $path) : bool
+{
+    bool $here = guard io::exists($path) else {
+        return false;
+    }
+
+    return $here;
+}

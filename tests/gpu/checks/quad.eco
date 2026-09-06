@@ -1,0 +1,50 @@
+/**
+ * UV-quad + blue tint: bottom-left dark, top-right bright, b ≈ 0.5.
+ */
+
+use visu::graphics::{
+    ClearPass, ClearPassOptions, Pipeline, QuadRenderer, ShaderCollection, TargetRef
+};
+use visu::math::Vec4;
+
+public function checkQuadDraw(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('quad') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    QuadRenderer $quad = QuadRenderer($ref);
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'quad');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+        $quad->pass($p, $t, QuadParams(Vec4(0.0f, 0.0f, 0.5f, 1.0f)));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('quad');
+    $shaders->destroy();
+    assert($pixels[0] < 16, 'bottom-left r');
+    assert($pixels[1] < 16, 'bottom-left g');
+    assert($pixels[2] > 100 && $pixels[2] < 160, 'bottom-left b');
+    usize $tr = ((64 * 63 + 63) * 4) as usize;
+    assert($pixels[$tr] > 240, 'top-right r');
+    assert($pixels[$tr + 1] > 240, 'top-right g');
+    assert($pixels[$tr + 2] > 100 && $pixels[$tr + 2] < 160, 'top-right b');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_quad_draw
+{
+    GpuContext $gpu = gpuHidden('quad');
+    checkQuadDraw($gpu);
+    $gpu->end();
+}
+#[end]

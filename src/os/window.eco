@@ -5,41 +5,35 @@
 
 namespace visu::os;
 
-use visu::graphics::{Gpu, RenderTarget, Framebuffer};
+use visu::app::info;
+use visu::graphics::{Device, DeviceOptions, RenderTarget, Surface, Texture};
 use visu::math::Vec2;
-
-#[if: VISU_BACKEND_METAL]
-#[if: os == darwin]
-internal extern {
-    function glfwGetCocoaWindow as visuCocoaWindow(ptr<glfw::Window> $window) : ptr<uint8>;
-    function visu_set_display_sync as visuSetDisplaySync(ptr<uint8> $nsWindow, int32 $enabled) : void;
-}
-#[end]
-#[end]
 
 public class Window
 {
     private string $title;
     private int32 $width;
     private int32 $height;
+    private int32 $fbWidth;
+    private int32 $fbHeight;
     public const WindowHints $hints;
     private ptr<glfw::Window> $handle;
-    public Framebuffer $framebuffer;
     private RenderTarget $target;
     private WindowEventHandler? $handler;
-    private Gpu? $gpu;
+    private Device? $device;
 
     public constructor(string $title, int32 $width, int32 $height, WindowHints $hints = WindowHints::defaults())
     {
         $this->title = $title;
         $this->width = $width;
         $this->height = $height;
+        $this->fbWidth = $width;
+        $this->fbHeight = $height;
         $this->hints = $hints;
         $this->handle:$ = null;
-        $this->framebuffer = Framebuffer();
-        $this->target = RenderTarget($width, $height, $this->framebuffer);
+        $this->target = RenderTarget($width, $height);
         $this->handler = null;
-        $this->gpu = null;
+        $this->device = null;
     }
 
     destructor()
@@ -47,10 +41,16 @@ public class Window
         $this->destroy();
     }
 
-    public function initialize(Gpu $gpu) : status<WindowError>
+    public function initialize(Device $device) : status<WindowError>
     {
         if ($this->handle:$ != null) {
             return .error(.alreadyInitialized);
+        }
+
+        DeviceOptions $options = DeviceOptions();
+        $options->appName = $this->title;
+        guard $device->initialize($options) else ($e) {
+            return .error(.device($e));
         }
 
         $this->hints->apply();
@@ -62,24 +62,34 @@ public class Window
         }
 
         $this->handle:$ = $created:$;
-
-        if (!$this->loadBackend($gpu)) {
+        Surface $surface = guard createSurface($this, $device) else ($e) {
             glfw::destroyWindow($this->handle);
             $this->handle:$ = null;
-            return .error(.gpuLoad);
+            return .error(.device($e));
         }
 
-        $this->framebuffer = Framebuffer(backbuffer: $gpu);
-        $this->target->framebuffer = $this->framebuffer;
+        int32 $fbW = 0;
+        int32 $fbH = 0;
+        glfw::getFramebufferSize($this->handle, &$fbW, &$fbH);
+        guard $device->attach($surface, $fbW, $fbH) else ($e) {
+            $device->lose();
+            glfw::destroyWindow($this->handle);
+            $this->handle:$ = null;
+            return .error(.device($e));
+        }
+
+        $this->fbWidth = $fbW;
+        $this->fbHeight = $fbH;
         $this->syncTarget();
-        $gpu->reset();
-        $this->gpu = $gpu;
+        $this->device = $device;
         windowRegister($this);
+        glfw::setFramebufferSizeCallback($this->handle, &onFramebufferSize);
 
         if ($this->handler != null) {
             $this->installCallbacks();
         }
 
+        info("window: '{$this->title}' {$this->width}x{$this->height} (fb {$fbW}x{$fbH})");
         return .ok;
     }
 
@@ -90,12 +100,13 @@ public class Window
         }
 
         windowUnregister($this);
-        Gpu? $gpu = $this->gpu;
+        Device? $device = $this->device;
 
-        if ($gpu != null) {
-            Gpu $held = guard $gpu;
+        if ($device != null) {
+            Device $held = guard $device;
+            $held->waitIdle();
             $held->lose();
-            $this->gpu = null;
+            $this->device = null;
         }
 
         glfw::destroyWindow($this->handle);
@@ -114,14 +125,15 @@ public class Window
         return $this->handle;
     }
 
-    public function activate() : void
-    {
-        $this->activateBackend();
-    }
-
     public function swap() : void
     {
-        $this->swapBackend();
+        $this->requireHandle();
+        Device $device = guard $this->device else {
+            return;
+        }
+        guard $device->endFrame() else ($e) {
+            die($e->message());
+        }
     }
 
     public function poll() : void
@@ -138,7 +150,11 @@ public class Window
 
     public const function shouldClose() : bool
     {
-        return glfw::windowShouldClose($this->requireHandle()) == glfw::TRUE;
+        if ($this->handle:$ == null) {
+            return true;
+        }
+
+        return glfw::windowShouldClose($this->handle) == glfw::TRUE;
     }
 
     public function setShouldClose(bool $value) : void
@@ -259,6 +275,20 @@ public class Window
     public function renderTarget() : RenderTarget
     {
         $this->syncTarget();
+        Device $device = guard $this->device else {
+            return $this->target;
+        }
+
+        if ($device->inFrame()) {
+            Texture $bb = $device->backbuffer();
+
+            if ($this->target->colors->empty()) {
+                $this->target->colors[] = $bb;
+            } else {
+                $this->target->colors[0] = $bb;
+            }
+        }
+
         return $this->target;
     }
 
@@ -367,6 +397,21 @@ public class Window
         $this->height = $height;
     }
 
+    internal function noteFramebuffer(int32 $width, int32 $height) : void
+    {
+        if ($width == $this->fbWidth && $height == $this->fbHeight) {
+            return;
+        }
+
+        $this->fbWidth = $width;
+        $this->fbHeight = $height;
+        Device $device = guard $this->device else {
+            return;
+        }
+        $device->resize($width, $height);
+        info("backbuffer: {$width}x{$height}");
+    }
+
     public const function attribute(WindowAttrib $attribute) : bool
     {
         return glfw::getWindowAttrib($this->requireHandle(), glfwAttrib($attribute)) == glfw::TRUE;
@@ -444,76 +489,11 @@ public class Window
 
     public function setSwapInterval(int32 $interval) : void
     {
-        $this->setSwapBackend($interval);
-    }
-
-    #[if: VISU_BACKEND_METAL]
-    private function loadBackend(Gpu $gpu) : bool
-    {
-        if (!$gpu->load()) {
-            return false;
-        }
-
-        int32 $fbW = 0;
-        int32 $fbH = 0;
-        glfw::getFramebufferSize($this->handle, &$fbW, &$fbH);
-        #[if: os == darwin]
-        return $gpu->connect(visuCocoaWindow($this->handle), $fbW, $fbH);
-        #[else]
-        return false;
-        #[end]
-    }
-
-    private function activateBackend() : void
-    {
-        $this->requireHandle();
-    }
-
-    private function swapBackend() : void
-    {
-        $this->requireHandle();
-        Gpu $gpu = guard $this->gpu else {
+        Device $device = guard $this->device else {
             return;
         }
-        $gpu->present();
-        Vec2 $px = $this->framebufferSize();
-        $gpu->resizeDrawable($px->x as int32, $px->y as int32);
+        $device->setVsync($interval != 0);
     }
-
-    private function setSwapBackend(int32 $interval) : void
-    {
-        #[if: os == darwin]
-        int32 $on = 0;
-
-        if ($interval != 0) {
-            $on = 1;
-        }
-
-        visuSetDisplaySync(visuCocoaWindow($this->requireHandle()), $on);
-        #[end]
-    }
-    #[else]
-    private function loadBackend(Gpu $gpu) : bool
-    {
-        glfw::makeContextCurrent($this->handle);
-        return $gpu->load(&glfw::getProcAddress);
-    }
-
-    private function activateBackend() : void
-    {
-        glfw::makeContextCurrent($this->requireHandle());
-    }
-
-    private function swapBackend() : void
-    {
-        glfw::swapBuffers($this->requireHandle());
-    }
-
-    private function setSwapBackend(int32 $interval) : void
-    {
-        glfw::swapInterval($interval);
-    }
-    #[end]
 
     public function setFullscreen(int32 $width, int32 $height, int32 $refreshRate) : void
     {

@@ -1,0 +1,72 @@
+/**
+ * Linked program. `id` is process-unique and part of the PSO key.
+ * Owns the vertex and fragment modules.
+ */
+
+namespace visu::graphics;
+
+internal struct ProgramIds
+{
+    public static uint32 $next = 1;
+}
+
+public class ShaderProgram : GpuObject
+{
+    public Device $device;
+    public const uint32 $id;
+    public const string $name;
+    internal ShaderModuleHandle $vs;
+    internal ShaderModuleHandle $fs;
+    private bool $dead;
+
+    public constructor(Device $device, string $name, ShaderModuleHandle $vs, ShaderModuleHandle $fs)
+    {
+        $this->device = $device;
+        $this->id = ProgramIds::$next;
+        ProgramIds::$next = ProgramIds::$next + 1;
+        $this->name = $name;
+        $this->vs = $vs;
+        $this->fs = $fs;
+        $this->dead = false;
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public static function link(
+        Device $device,
+        string $name,
+        const string& $vertexBytes,
+        const string& $fragmentBytes
+    ) : result<ShaderProgram, ShaderError>
+    {
+        ShaderModuleHandle $vs = guard $device->createShaderModule(.vertex, $vertexBytes, "{$name}.vert") else ($e) {
+            return .error(.compile($e->message()));
+        }
+        ShaderModuleHandle $fs = guard $device->createShaderModule(.fragment, $fragmentBytes, "{$name}.frag") else ($e) {
+            $device->destroyShaderModule($vs);
+            return .error(.compile($e->message()));
+        }
+        return .ok(ShaderProgram($device, $name, $vs, $fs));
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->dead = true;
+        $this->device->destroyShaderModule($this->vs);
+        $this->device->destroyShaderModule($this->fs);
+        $this->vs = ShaderModuleHandle::none();
+        $this->fs = ShaderModuleHandle::none();
+    }
+
+    public const function destroyed() : bool
+    {
+        return $this->dead;
+    }
+}

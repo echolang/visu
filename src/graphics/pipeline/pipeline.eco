@@ -1,6 +1,7 @@
 /**
  * Per-frame pass list. setup() runs at add(); execute() runs in
- * scheduled I/O order.
+ * scheduled I/O order. Pending clears live here until
+ * Context.beginRender consumes them.
  */
 
 namespace visu::graphics;
@@ -25,6 +26,18 @@ public struct Io
     public Access $access;
 }
 
+public class PendingClear
+{
+    public TargetRef $target;
+    public ClearPassOptions $options;
+
+    public constructor(TargetRef $target, ClearPassOptions $options)
+    {
+        $this->target = $target;
+        $this->options = $options;
+    }
+}
+
 public class Pipeline
 {
     private Pool $pool;
@@ -32,6 +45,7 @@ public class Pipeline
     private array<Pass> $passes;
     private map<string, bool> $names;
     private array<Io> $io;
+    private map<string, PendingClear> $clears;
 
     public constructor(Pool $pool, Frame $frame, RenderTarget $backbuffer)
     {
@@ -40,6 +54,7 @@ public class Pipeline
         $this->passes = array<Pass>();
         $this->names = map<string, bool>();
         $this->io = array<Io>();
+        $this->clears = map<string, PendingClear>();
 
         TargetRef $bb = $this->importTarget('backbuffer', $backbuffer);
         $this->frame->set(Backbuffer($bb));
@@ -106,6 +121,26 @@ public class Pipeline
     }
 
     /**
+     * Remember a clear until Context.beginRender or the unconsumed
+     * flush at the end of execute.
+     */
+    public function requestClear(TargetRef $target, ClearPassOptions $options) : void
+    {
+        $this->clears[$target->name] = PendingClear($target, $options);
+    }
+
+    internal function takeClear(TargetRef $target) : ClearPassOptions?
+    {
+        if (!$this->clears->has($target->name)) {
+            return null;
+        }
+
+        PendingClear $held = $this->clears[$target->name];
+        $this->clears->remove($target->name);
+        return $held->options;
+    }
+
+    /**
      * Append `$pass` and run setup() immediately so later passes can
      * get() data this one published.
      */
@@ -119,7 +154,8 @@ public class Pipeline
 
     /**
      * Run every pass in scheduled I/O order. `$compensation` defaults
-     * to 0 (no interpolation).
+     * to 0 (no interpolation). Unconsumed clears flush as empty
+     * render passes so a clear-only frame still clears.
      */
     public function execute(int32 $tick, float32 $compensation = 0.0f) : status<PipelineError>
     {
@@ -129,13 +165,21 @@ public class Pipeline
         }
         $this->touchIo();
 
-        Context $ctx = Context($this->pool->gpu, $this, $this->frame, $this->pool, $compensation);
+        Context $ctx = Context($this->pool->device, $this, $this->frame, $this->pool, $compensation);
 
         foreach ($order as $index) {
+            guard $this->flushClearsForReads($index, $ctx) else ($e) {
+                return .error($e);
+            }
+            $this->transitionReads($index);
             Pass $pass = $this->passes[$index as usize];
             guard $pass->execute($ctx) else ($e) {
                 return .error($e);
             }
+        }
+
+        guard $this->flushClears($ctx) else ($e) {
+            return .error($e);
         }
 
         $this->pool->collect();
@@ -176,5 +220,151 @@ public class Pipeline
                 $this->pool->touch($r->name);
             }
         }
+    }
+
+    private function transitionReads(int32 $passIndex) : void
+    {
+        array<Io> $edges = $this->io;
+
+        foreach ($edges as $edge) {
+            if ($edge->passIndex != $passIndex) {
+                continue;
+            }
+
+            bool $isRead = match ($edge->access) {
+                Access::read => true,
+                Access::write => false,
+            };
+
+            if (!$isRead) {
+                continue;
+            }
+
+            $this->transitionResource($edge->resource);
+        }
+    }
+
+    private function transitionResource(ResourceIo $resource) : void
+    {
+        match ($resource) {
+            ResourceIo::target($ref) => {
+                $this->transitionTarget($ref);
+            },
+            ResourceIo::texture($ref) => {
+                $this->transitionTexture($ref);
+            },
+        };
+    }
+
+    private function transitionTarget(TargetRef $ref) : void
+    {
+        RenderTarget $rt = guard $this->pool->getTarget($ref) else {
+            return;
+        }
+        array<Texture> $colors = $rt->colors;
+
+        foreach ($colors as $colorTex) {
+            $this->pool->device->transition($colorTex, .shaderRead);
+        }
+
+        Texture $depth = guard $rt->depth else {
+            return;
+        }
+        $this->pool->device->transition($depth, .shaderRead);
+    }
+
+    private function transitionTexture(TextureRef $ref) : void
+    {
+        Texture $tex = guard $this->pool->getTexture($ref) else {
+            return;
+        }
+        $this->pool->device->transition($tex, .shaderRead);
+    }
+
+    private function flushClearsForReads(int32 $passIndex, Context $ctx) : status<PipelineError>
+    {
+        array<Io> $edges = $this->io;
+
+        foreach ($edges as $edge) {
+            if ($edge->passIndex != $passIndex) {
+                continue;
+            }
+
+            bool $isRead = match ($edge->access) {
+                Access::read => true,
+                Access::write => false,
+            };
+
+            if (!$isRead) {
+                continue;
+            }
+
+            guard $this->flushClearOf($edge->resource, $ctx) else ($e) {
+                return .error($e);
+            }
+        }
+
+        return .ok;
+    }
+
+    private function flushClearOf(ResourceIo $resource, Context $ctx) : status<PipelineError>
+    {
+        match ($resource) {
+            ResourceIo::target($ref) => {
+                return $this->flushNamed($ref->name, $ctx);
+            },
+            ResourceIo::texture($ref) => {
+                return $this->flushParentOf($ref, $ctx);
+            },
+        };
+
+        return .ok;
+    }
+
+    private function flushParentOf(TextureRef $ref, Context $ctx) : status<PipelineError>
+    {
+        array<string> $names = $this->clears->keys();
+
+        foreach ($names as $name) {
+            PendingClear $held = $this->clears[$name];
+            array<TextureRef> $texes = $held->target->textures();
+
+            foreach ($texes as $tex) {
+                if ($tex->name == $ref->name) {
+                    return $this->flushNamed($name, $ctx);
+                }
+            }
+        }
+
+        return .ok;
+    }
+
+    private function flushNamed(string $name, Context $ctx) : status<PipelineError>
+    {
+        if (!$this->clears->has($name)) {
+            return .ok;
+        }
+
+        PendingClear $held = $this->clears[$name];
+        RenderEncoder $enc = guard $ctx->beginRender($held->target) else ($e) {
+            return .error($e);
+        }
+        $enc->end();
+        return .ok;
+    }
+
+    private function flushClears(Context $ctx) : status<PipelineError>
+    {
+        array<string> $names = $this->clears->keys();
+
+        foreach ($names as $name) {
+            PendingClear $held = $this->clears[$name];
+            RenderEncoder $enc = guard $ctx->beginRender($held->target) else ($e) {
+                return .error($e);
+            }
+            $enc->end();
+        }
+
+        return .ok;
     }
 }

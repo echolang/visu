@@ -1,0 +1,52 @@
+/**
+ * ShaderRef.forget + load still draws the UV-quad tint.
+ */
+
+use visu::graphics::{
+    ClearPass, ClearPassOptions, Pipeline, QuadRenderer, ShaderCollection, TargetRef
+};
+use visu::math::Vec4;
+
+public function checkForgetReload(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('quad') else ($e) {
+        die($e->message());
+    }
+    $old = guard $ref->load() else ($e) {
+        die($e->message());
+    }
+    QuadRenderer $quad = QuadRenderer($ref);
+    $ref->forget();
+    assert($old->destroyed(), 'old program dead');
+    $fresh = guard $ref->load() else ($e) {
+        die($e->message());
+    }
+    assert(!$fresh->destroyed(), 'new program live');
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'forget');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+        $quad->pass($p, $t, QuadParams(Vec4(0.0f, 0.0f, 0.5f, 1.0f)));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('forget');
+    $shaders->destroy();
+    assert($pixels[0] < 16, 'bottom-left r');
+    assert($pixels[1] < 16, 'bottom-left g');
+    assert($pixels[2] > 100 && $pixels[2] < 160, 'bottom-left b');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_forget_reload
+{
+    GpuContext $gpu = gpuHidden('forget');
+    checkForgetReload($gpu);
+    $gpu->end();
+}
+#[end]

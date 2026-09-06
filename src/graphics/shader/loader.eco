@@ -1,8 +1,6 @@
 /**
- * Load GLSL, inject #define after #version, and expand #include "path".
- * Builtins are tried before files. Include matching is a line walk.
- * visu includes live under resources/shader/include (offline tool);
- * scan names programs from `.vert|.frag|...` stems.
+ * File reader plus optional `shaders.manifest` parser. Offline
+ * compile owns variants; this never preprocesses text.
  */
 
 namespace visu::graphics;
@@ -12,137 +10,74 @@ use std::io;
 public class ShaderLoader
 {
     public const string $directory;
-    private array<string> $includePaths;
-    private map<string, string> $builtins;
+    private map<string, array<Define>> $manifest;
 
     public constructor(string $directory)
     {
         $this->directory = slashDir($directory);
-        $this->includePaths = array<string>();
-        $this->builtins = map<string, string>();
+        $this->manifest = map<string, array<Define>>();
+        $this->loadManifest();
     }
 
-    public function addInclude(string $path) : void
+    public function read(string $file) : result<string, ShaderError>
     {
-        $this->includePaths[] = slashDir($path);
+        string $fromDir = $this->directory;
+        $fromDir->append($file);
+        string $here = guard io::readfile($fromDir) else {
+            return $this->readAbs($file);
+        }
+        return .ok($here);
     }
 
-    public function addBuiltin(string $name, string $source) : void
+    public function variantDefines(string $shader, string $variant) : array<Define>?
     {
-        $this->builtins[$name] = $source;
+        string $key = "{$shader}+{$variant}";
+
+        if (!$this->manifest->has($key)) {
+            return null;
+        }
+
+        return $this->manifest[$key];
     }
 
-    public function load(string $file, array<Define> $defines = array<Define>()) : result<string, ShaderError>
+    public const function hasManifest() : bool
     {
-        string $text = guard $this->readShader($file) else ($e) {
-            return .error($e);
-        }
-
-        return $this->process($text, $defines);
+        return !$this->manifest->empty();
     }
 
-    public function process(string $source, array<Define> $defines = array<Define>()) : result<string, ShaderError>
+    private function readAbs(string $file) : result<string, ShaderError>
     {
-        if ($defines->empty()) {
-            array<string> $empty = array<string>();
-            return $this->expandIncludes($source, $empty);
+        string $text = guard io::readfile($file) else {
+            return .error(.missingFile($file));
         }
-
-        string $injected = guard $this->injectDefines($source, $defines) else ($e) {
-            return .error($e);
-        }
-        array<string> $none = array<string>();
-        return $this->expandIncludes($injected, $none);
+        return .ok($text);
     }
 
-    private function injectDefines(string $source, array<Define> $defines) : result<string, ShaderError>
+    private function loadManifest() : void
     {
-        usize $ver = $source->find('#version');
-
-        if ($ver == $source->size()) {
-            #[if: VISU_BACKEND_METAL]
-            string $out = '';
-
-            foreach ($defines as $d) {
-                $out->append("#define {$d->name} {$d->value}\n");
-            }
-
-            $out->append($source);
-            return .ok($out);
-            #[else]
-            return .error(.missingVersion);
-            #[end]
+        string $path = $this->directory;
+        $path->append('shaders.manifest');
+        string $text = guard io::readfile($path) else {
+            return;
         }
-
-        usize $nl = $source->find("\n", $ver);
-        usize $after = $source->size();
-
-        if ($nl != $source->size()) {
-            $after = $nl + 1;
-        }
-
-        string $out = $source->sub(0, $after);
-
-        if ($nl == $source->size()) {
-            $out->append("\n");
-        }
-
-        foreach ($defines as $d) {
-            $out->append("#define {$d->name} {$d->value}\n");
-        }
-
-        if ($after < $source->size()) {
-            $out->append($source->sub($after, $source->size() - $after));
-        }
-
-        return .ok($out);
+        $this->parseManifest($text);
     }
 
-    private function expandIncludes(string $source, array<string> $stack) : result<string, ShaderError>
+    private function parseManifest(string $text) : void
     {
-        string $out = '';
         usize $i = 0;
-        usize $n = $source->size();
+        usize $n = $text->size();
 
         while ($i < $n) {
-            usize $nl = $source->find("\n", $i);
+            usize $nl = $text->find("\n", $i);
             usize $end = $nl;
 
             if ($nl == $n) {
                 $end = $n;
             }
 
-            string $line = $source->sub($i, $end - $i);
-            LineInclude $inc = guard parseIncludeLine($line) else ($e) {
-                return .error($e);
-            }
-
-            match ($inc) {
-                LineInclude::none => {
-                    $out->append($line);
-
-                    if ($nl != $n) {
-                        $out->append("\n");
-                    }
-                },
-                LineInclude::path($path) => {
-                    if ($this->onStack($stack, $path)) {
-                        return .error(.includeCycle($path));
-                    }
-
-                    string $included = guard $this->findInclude($path) else ($err) {
-                        return .error($err);
-                    }
-
-                    array<string> $nested = $stack->clone();
-                    $nested[] = $path;
-                    string $expanded = guard $this->expandIncludes($included, $nested) else ($err) {
-                        return .error($err);
-                    }
-
-                    $out->append($expanded);
-                },
-            };
+            string $line = $text->sub($i, $end - $i);
+            $this->parseManifestLine($line);
 
             if ($nl == $n) {
                 break;
@@ -150,132 +85,46 @@ public class ShaderLoader
 
             $i = $nl + 1;
         }
-
-        return .ok($out);
     }
 
-    private function onStack(const array<string>& $stack, string $path) : bool
+    private function parseManifestLine(string $line) : void
     {
-        foreach ($stack as $s) {
-            if ($s == $path) {
-                return true;
-            }
+        string $trim = str::trim($line);
+
+        if ($trim->empty() || $trim->starts('#')) {
+            return;
         }
 
-        return false;
-    }
+        usize $sp = $trim->find(' ');
+        string $stem = $trim;
+        string $rest = '';
 
-    private function findInclude(string $path) : result<string, ShaderError>
-    {
-        if ($this->builtins->has($path)) {
-            return .ok($this->builtins[$path]);
+        if ($sp != $trim->size()) {
+            $stem = $trim->sub(0, $sp);
+            $rest = str::trim($trim->sub($sp + 1, $trim->size() - $sp - 1));
         }
 
-        string $fromDir = $this->directory;
-        $fromDir->append($path);
-        string $here = guard $this->tryRead($fromDir) else {
-            return $this->searchPaths($path);
+        usize $plus = $stem->find('+');
+
+        if ($plus == $stem->size()) {
+            return;
         }
 
-        return .ok($here);
-    }
+        array<Define> $defs = array<Define>();
 
-    private function searchPaths(string $path) : result<string, ShaderError>
-    {
-        foreach ($this->includePaths as $dir) {
-            string $candidate = $dir;
-            $candidate->append($path);
-            string $text = guard $this->tryRead($candidate) else {
-                continue;
-            }
-            return .ok($text);
+        if (!$rest->empty()) {
+            $defs = parseDefines($rest);
         }
 
-        return .error(.missingInclude($path));
-    }
-
-    private function tryRead(string $path) : result<string, ShaderError>
-    {
-        string $text = guard io::readfile($path) else {
-            return .error(.missingFile($path));
-        }
-
-        return .ok($text);
-    }
-
-    private function readShader(string $file) : result<string, ShaderError>
-    {
-        string $fromDir = $this->directory;
-        $fromDir->append($file);
-        string $text = guard $this->tryRead($fromDir) else {
-            return $this->tryRead($file);
-        }
-
-        return .ok($text);
+        $this->manifest[$stem] = $defs;
     }
 }
 
-internal enum LineInclude
+internal struct ShaderStem
 {
-    case none;
-    case path(string $path);
-}
-
-internal function parseIncludeLine(string $line) : result<LineInclude, ShaderError>
-{
-    usize $i = 0;
-    usize $n = $line->size();
-    uint8 $space = ' '->byte(0);
-    uint8 $tab = "\t"->byte(0);
-
-    while ($i < $n) {
-        uint8 $b = $line->byte($i);
-
-        if ($b != $space && $b != $tab) {
-            break;
-        }
-
-        $i = $i + 1;
-    }
-
-    string $rest = $line->sub($i, $n - $i);
-
-    if (!$rest->starts('#include')) {
-        return .ok(.none);
-    }
-
-    usize $at = 8;
-
-    if ($at > $rest->size()) {
-        return .ok(.none);
-    }
-
-    while ($at < $rest->size()) {
-        uint8 $b = $rest->byte($at);
-
-        if ($b != $space && $b != $tab) {
-            break;
-        }
-
-        $at = $at + 1;
-    }
-
-    if ($at >= $rest->size() || $rest->byte($at) != '"'->byte(0)) {
-        return .ok(.none);
-    }
-
-    $at = $at + 1;
-    usize $start = $at;
-
-    while ($at < $rest->size() && $rest->byte($at) != '"'->byte(0)) {
-        $at = $at + 1;
-    }
-
-    if ($at >= $rest->size()) {
-        return .error(.unterminatedInclude);
-    }
-
-    return .ok(LineInclude::path($rest->sub($start, $at - $start)));
+    public ShaderKind $kind;
+    public string $name;
+    public string? $variant;
 }
 
 internal function slashDir(string $path) : string
@@ -291,12 +140,6 @@ internal function slashDir(string $path) : string
     string $out = $path;
     $out->append('/');
     return $out;
-}
-
-internal struct ShaderStem
-{
-    public ShaderKind $kind;
-    public string $name;
 }
 
 internal function relativeShaderPath(string $path, string $prefix) : string
@@ -346,7 +189,18 @@ internal function matchStage(string $relative, string $suffix, ShaderKind $kind)
         return null;
     }
 
-    return ShaderStem($kind, slashName($relative->sub(0, $n)));
+    string $stem = slashName($relative->sub(0, $n));
+    usize $plus = $stem->find('+');
+
+    if ($plus == $stem->size()) {
+        return ShaderStem($kind, $stem, null);
+    }
+
+    if ($plus == 0 || $plus + 1 >= $stem->size()) {
+        return null;
+    }
+
+    return ShaderStem($kind, $stem->sub(0, $plus), $stem->sub($plus + 1, $stem->size() - $plus - 1));
 }
 
 internal function shaderStem(string $relative, string $ext) : ShaderStem?
@@ -382,4 +236,52 @@ internal function shaderStem(string $relative, string $ext) : ShaderStem?
     }
 
     return null;
+}
+
+internal function parseDefines(string $rest) : array<Define>
+{
+    array<Define> $out = array<Define>();
+    usize $i = 0;
+    usize $n = $rest->size();
+    uint8 $space = ' '->byte(0);
+    uint8 $tab = "\t"->byte(0);
+
+    while ($i < $n) {
+        while ($i < $n) {
+            uint8 $b = $rest->byte($i);
+
+            if ($b != $space && $b != $tab) {
+                break;
+            }
+
+            $i = $i + 1;
+        }
+
+        if ($i >= $n) {
+            break;
+        }
+
+        usize $start = $i;
+
+        while ($i < $n) {
+            uint8 $b = $rest->byte($i);
+
+            if ($b == $space || $b == $tab) {
+                break;
+            }
+
+            $i = $i + 1;
+        }
+
+        string $tok = $rest->sub($start, $i - $start);
+        usize $eq = $tok->find('=');
+
+        if ($eq == $tok->size()) {
+            $out[] = Define($tok, '1');
+        } else {
+            $out[] = Define($tok->sub(0, $eq), $tok->sub($eq + 1, $tok->size() - $eq - 1));
+        }
+    }
+
+    return $out;
 }

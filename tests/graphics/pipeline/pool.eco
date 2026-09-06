@@ -2,12 +2,11 @@
  * Pool allocation and tick GC against a real context.
  */
 
-use visu::os::{Window, WindowHints, init, terminate};
 use visu::graphics::{
-    Gpu, Pipeline, Pool, Frame, CallbackPass, TargetRef, TextureRef, IoSink, Context,
-    TextureOptions, FramebufferStatus, RenderTarget, PipelineError,
-    Mesh, Texture, PoolError
+    Device, Pipeline, Pool, Frame, CallbackPass, TargetRef, TextureRef, IoSink,
+    Context, TextureOptions, RenderTarget, PipelineError, Mesh, Texture, PoolError
 };
+use visu::os::{Window, WindowHints, init, terminate};
 
 class Offscreen
 {
@@ -19,8 +18,7 @@ class Offscreen
     }
 }
 
-#[group: "glfw"]
-test pool_creates_complete_offscreen_target
+function poolWindow(string $title) : Window
 {
     guard init() else ($e) {
         die($e->message());
@@ -28,14 +26,29 @@ test pool_creates_complete_offscreen_target
 
     WindowHints $hints = WindowHints::defaults();
     $hints->visible = false;
-    Window $window = Window('pool', 64, 64, $hints);
-    Gpu $state = Gpu();
-    guard $window->initialize($state) else ($e) {
+    return Window($title, 64, 64, $hints);
+}
+
+function poolEnd(Pool $pool, Window $window, Device $device) : void
+{
+    $pool->destroy();
+    $window->destroy();
+    $device->shutdown();
+    terminate();
+}
+
+#[group: "glfw"]
+test pool_creates_complete_offscreen_target
+{
+    Window $window = poolWindow('pool');
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
         terminate();
         die($e->message());
     }
 
-    Pool $pool = Pool($state);
+    Pool $pool = Pool($device);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -43,7 +56,7 @@ test pool_creates_complete_offscreen_target
         'gbuffer',
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             TargetRef $t = $pipe->createTarget('gbuffer', 32, 32);
-            $t->rboDepthStencil = true;
+            $t->depthStencil = true;
             $pipe->createColor($t, 'albedo', TextureOptions());
             $io->writes($t);
             $f->set(Offscreen($t));
@@ -54,23 +67,16 @@ test pool_creates_complete_offscreen_target
                 return .error(.pool($e));
             }
             assert($rt->width == 32, 'width');
-            assert($rt->isOffscreen(), 'offscreen');
-            FramebufferStatus $status = $rt->framebuffer->status();
-            bool $complete = match ($status) {
-                FramebufferStatus::complete => true,
-                else => false,
-            };
-            assert($complete, 'complete');
+            assert($rt->colors->count() == 1, 'color');
+            assert($rt->depth != null, 'depth');
             assert($ctx->pool->hasTarget('gbuffer'), 'stored');
-            assert($ctx->pool->hasTexture('gbuffer.attachment.color_albedo'), 'color');
+            assert($ctx->pool->hasTexture('gbuffer.attachment.color_albedo'), 'color name');
             return .ok;
         }
     ));
 
-    guard $pipeline->execute( 0) else ($e) {
-        $pool->destroy();
-        $window->destroy();
-        terminate();
+    guard $pipeline->execute(0) else ($e) {
+        poolEnd($pool, $window, $device);
         die($e->message());
     }
     assert($pool->hasTarget('gbuffer'), 'lived');
@@ -78,36 +84,27 @@ test pool_creates_complete_offscreen_target
     Frame $frame2 = Frame();
     Pipeline $next = Pipeline($pool, $frame2, $window->renderTarget());
     guard $next->execute(1) else ($e) {
-        $pool->destroy();
-        $window->destroy();
-        terminate();
+        poolEnd($pool, $window, $device);
         die($e->message());
     }
     assert(!$pool->hasTarget('gbuffer'), 'collected');
     assert($pool->hasTarget('backbuffer'), 'imported lives');
 
-    $pool->destroy();
-    $window->destroy();
-    terminate();
+    poolEnd($pool, $window, $device);
 }
 
 #[group: "glfw"]
 test pool_resizes_when_desc_changes
 {
-    guard init() else ($e) {
-        die($e->message());
-    }
-
-    WindowHints $hints = WindowHints::defaults();
-    $hints->visible = false;
-    Window $window = Window('pool-resize', 64, 64, $hints);
-    Gpu $state = Gpu();
-    guard $window->initialize($state) else ($e) {
+    Window $window = poolWindow('pool-resize');
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
         terminate();
         die($e->message());
     }
 
-    Pool $pool = Pool($state);
+    Pool $pool = Pool($device);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -115,7 +112,7 @@ test pool_resizes_when_desc_changes
         'scene',
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             TargetRef $t = $pipe->createTarget('scene', 16, 16);
-            $t->rboColor = true;
+            $pipe->createColor($t, 'color', TextureOptions());
             $io->writes($t);
             $f->set(Offscreen($t));
         },
@@ -135,34 +132,25 @@ test pool_resizes_when_desc_changes
         }
     ));
 
-    guard $pipeline->execute( 0) else ($e) {
-        $pool->destroy();
-        $window->destroy();
-        terminate();
+    guard $pipeline->execute(0) else ($e) {
+        poolEnd($pool, $window, $device);
         die($e->message());
     }
-    $pool->destroy();
-    $window->destroy();
-    terminate();
+    poolEnd($pool, $window, $device);
 }
 
 #[group: "glfw"]
 test pool_recreates_when_attachments_change
 {
-    guard init() else ($e) {
-        die($e->message());
-    }
-
-    WindowHints $hints = WindowHints::defaults();
-    $hints->visible = false;
-    Window $window = Window('pool-fp', 64, 64, $hints);
-    Gpu $state = Gpu();
-    guard $window->initialize($state) else ($e) {
+    Window $window = poolWindow('pool-fp');
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
         terminate();
         die($e->message());
     }
 
-    Pool $pool = Pool($state);
+    Pool $pool = Pool($device);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -170,7 +158,7 @@ test pool_recreates_when_attachments_change
         'scene',
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             TargetRef $t = $pipe->createTarget('scene', 16, 16);
-            $t->rboColor = true;
+            $pipe->createColor($t, 'color', TextureOptions());
             $io->writes($t);
             $f->set(Offscreen($t));
         },
@@ -180,64 +168,47 @@ test pool_recreates_when_attachments_change
                 return .error(.pool($e));
             }
             string $before = visu::graphics::targetFingerprint($off->target);
-            $off->target->rboDepthStencil = true;
-            $off->target->rboColor = false;
+            $off->target->depthStencil = true;
             assert($before != visu::graphics::targetFingerprint($off->target), 'fingerprint changed');
             RenderTarget $again = guard $ctx->pool->getTarget($off->target) else ($e) {
                 return .error(.pool($e));
             }
-            FramebufferStatus $status = $again->framebuffer->status();
-            bool $complete = match ($status) {
-                FramebufferStatus::complete => true,
-                else => false,
-            };
-            assert($complete, 'complete after rbo change');
+            assert($again->depth != null, 'depth after change');
             return .ok;
         }
     ));
 
-    guard $pipeline->execute( 0) else ($e) {
-        $pool->destroy();
-        $window->destroy();
-        terminate();
+    guard $pipeline->execute(0) else ($e) {
+        poolEnd($pool, $window, $device);
         die($e->message());
     }
-    $pool->destroy();
-    $window->destroy();
-    terminate();
+    poolEnd($pool, $window, $device);
 }
 
 #[group: "glfw"]
 test pool_caches_quad_by_name
 {
-    guard init() else ($e) {
-        die($e->message());
-    }
-
-    WindowHints $hints = WindowHints::defaults();
-    $hints->visible = false;
-    Window $window = Window('pool-cache', 64, 64, $hints);
-    Gpu $state = Gpu();
-    guard $window->initialize($state) else ($e) {
+    Window $window = poolWindow('pool-cache');
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
         terminate();
         die($e->message());
     }
 
-    Pool $pool = Pool($state);
+    Pool $pool = Pool($device);
     Mesh $a = $pool->cache<Mesh>('quadva', function() : Mesh {
-        return .quad($state);
+        return .quad($device);
     });
     Mesh $b = $pool->cache<Mesh>('quadva', function() : Mesh {
-        return .quad($state);
+        return .quad($device);
     });
-    assert($a->vao == $b->vao, 'same name same vao');
+    assert($a == $b, 'same name same mesh');
     Mesh $c = $pool->cache<Mesh>('ibl_quad_va', function() : Mesh {
-        return .quad($state);
+        return .quad($device);
     });
-    assert($a->vao != $c->vao, 'different name different vao');
-    $pool->destroy();
-    $window->destroy();
-    terminate();
+    assert($a != $c, 'different name different mesh');
+    poolEnd($pool, $window, $device);
 }
 
 class ColorTex
@@ -255,20 +226,15 @@ class ColorTex
 #[group: "glfw"]
 test pool_get_texture_does_not_allocate
 {
-    guard init() else ($e) {
-        die($e->message());
-    }
-
-    WindowHints $hints = WindowHints::defaults();
-    $hints->visible = false;
-    Window $window = Window('pool-gettex', 64, 64, $hints);
-    Gpu $state = Gpu();
-    guard $window->initialize($state) else ($e) {
+    Window $window = poolWindow('pool-gettex');
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
         terminate();
         die($e->message());
     }
 
-    Pool $pool = Pool($state);
+    Pool $pool = Pool($device);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -295,34 +261,25 @@ test pool_get_texture_does_not_allocate
         }
     ));
 
-    guard $pipeline->execute( 0) else ($e) {
-        $pool->destroy();
-        $window->destroy();
-        terminate();
+    guard $pipeline->execute(0) else ($e) {
+        poolEnd($pool, $window, $device);
         die($e->message());
     }
-    $pool->destroy();
-    $window->destroy();
-    terminate();
+    poolEnd($pool, $window, $device);
 }
 
 #[group: "glfw"]
 test pool_keeps_target_when_attachment_is_read
 {
-    guard init() else ($e) {
-        die($e->message());
-    }
-
-    WindowHints $hints = WindowHints::defaults();
-    $hints->visible = false;
-    Window $window = Window('pool-hist', 64, 64, $hints);
-    Gpu $state = Gpu();
-    guard $window->initialize($state) else ($e) {
+    Window $window = poolWindow('pool-hist');
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
         terminate();
         die($e->message());
     }
 
-    Pool $pool = Pool($state);
+    Pool $pool = Pool($device);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -343,19 +300,15 @@ test pool_keeps_target_when_attachment_is_read
         }
     ));
 
-    guard $pipeline->execute( 0) else ($e) {
-        $pool->destroy();
-        $window->destroy();
-        terminate();
+    guard $pipeline->execute(0) else ($e) {
+        poolEnd($pool, $window, $device);
         die($e->message());
     }
 
     $pool->setCurrentTick(1);
     TextureRef $albedo = TextureRef('gbuffer.attachment.color_albedo', 16, 16, TextureOptions());
     Texture $tex = guard $pool->getTexture($albedo) else ($e) {
-        $pool->destroy();
-        $window->destroy();
-        terminate();
+        poolEnd($pool, $window, $device);
         die($e->message());
     }
     $pool->collect();
@@ -363,9 +316,7 @@ test pool_keeps_target_when_attachment_is_read
     assert($pool->hasTarget('gbuffer'), 'parent lived');
     assert($pool->hasTexture('gbuffer.attachment.color_albedo'), 'color lived');
 
-    $pool->destroy();
-    $window->destroy();
-    terminate();
+    poolEnd($pool, $window, $device);
 }
 
 class TwoTargets
@@ -380,25 +331,18 @@ class TwoTargets
     }
 }
 
-#[if: VISU_BACKEND_METAL]
-#[else]
 #[group: "glfw"]
 test pool_two_mrts_both_complete
 {
-    guard init() else ($e) {
-        die($e->message());
-    }
-
-    WindowHints $hints = WindowHints::defaults();
-    $hints->visible = false;
-    Window $window = Window('pool-mrt', 64, 64, $hints);
-    Gpu $state = Gpu();
-    guard $window->initialize($state) else ($e) {
+    Window $window = poolWindow('pool-mrt');
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
         terminate();
         die($e->message());
     }
 
-    Pool $pool = Pool($state);
+    Pool $pool = Pool($device);
     Frame $frame = Frame();
     Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
 
@@ -423,30 +367,15 @@ test pool_two_mrts_both_complete
             RenderTarget $rb = guard $ctx->pool->getTarget($held->b) else ($e) {
                 return .error(.pool($e));
             }
-            FramebufferStatus $sa = $ra->framebuffer->status();
-            FramebufferStatus $sb = $rb->framebuffer->status();
-            bool $okA = match ($sa) {
-                FramebufferStatus::complete => true,
-                else => false,
-            };
-            bool $okB = match ($sb) {
-                FramebufferStatus::complete => true,
-                else => false,
-            };
-            assert($okA, 'a complete');
-            assert($okB, 'b complete');
+            assert($ra->colors->count() == 2, 'a colors');
+            assert($rb->colors->count() == 2, 'b colors');
             return .ok;
         }
     ));
 
-    guard $pipeline->execute( 0) else ($e) {
-        $pool->destroy();
-        $window->destroy();
-        terminate();
+    guard $pipeline->execute(0) else ($e) {
+        poolEnd($pool, $window, $device);
         die($e->message());
     }
-    $pool->destroy();
-    $window->destroy();
-    terminate();
+    poolEnd($pool, $window, $device);
 }
-#[end]
