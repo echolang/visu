@@ -7,7 +7,7 @@ namespace visu::ui;
 
 use visu::graphics::{
     Device, GpuPass, IndexType, Raster, RenderEncoder, ResourceState,
-    Sampler, SamplerDesc, ScratchSlice, ShaderProgram, Texture, TextureDesc,
+    Sampler, SamplerDesc, TransientSlice, ShaderProgram, Texture, TextureDesc,
     VertexBuilder, VertexLayout
 };
 use visu::math::{Vec2, Vec4};
@@ -311,8 +311,8 @@ internal function uiMakeGpu(
     $px[] = 255;
     $px[] = 255;
     $tex->upload(0, $px->data(), 4, 4);
-    $device->transition($tex, ResourceState::shaderRead);
-    return .ok(UiGpu($prog, $pass, $tex, $device->sampler(SamplerDesc()), $canvas, $regular, $semibold));
+    $device->transitionTexture($tex, ResourceState::shaderRead);
+    return .ok(UiGpu($prog, $pass, $tex, $device->createSampler(SamplerDesc()), $canvas, $regular, $semibold));
 }
 
 internal function uiFont(Ui $ui, bool $bold) : Font?
@@ -347,12 +347,12 @@ internal function flushBatch(Ui $ui, RenderEncoder $enc) : void
     usize $ni = $batch->indices->count();
     uint64 $vb = ($nv as uint64) * (mem::size<UiVertex>() as uint64);
     uint64 $ib = ($ni as uint64) * (mem::size<uint32>() as uint64);
-    ScratchSlice $vs = $ui->device->scratch($vb, 16);
-    ScratchSlice $is = $ui->device->scratch($ib, 4);
+    TransientSlice $vs = $ui->device->allocTransient($vb, 16);
+    TransientSlice $is = $ui->device->allocTransient($ib, 4);
     mem::copy<UiVertex>(ptr<UiVertex>($vs->data:$), $batch->verts->data(), $nv);
     mem::copy<uint32>(ptr<uint32>($is->data:$), $batch->indices->data(), $ni);
-    $enc->setVertexScratch(0, $vs);
-    $enc->setIndexScratch($is, .uint32);
+    $enc->setVertexTransient(0, $vs);
+    $enc->setIndexTransient($is, .uint32);
     $enc->setViewport(0, 0, $enc->width(), $enc->height());
     UiFrag $frag = UiFrag();
     $frag->view = Vec4($ui->frame->x, $ui->frame->y, 0.0f, 0.0f);

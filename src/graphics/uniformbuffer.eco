@@ -10,20 +10,20 @@ public class UniformBuffer
     public Device $device;
     public const uint32 $slot;
     private uint64 $pushedFrame;
-    private ScratchSlice $slice;
+    private TransientSlice $slice;
 
     public constructor(Device $device, uint32 $slot = 1)
     {
         $this->device = $device;
         $this->slot = $slot;
         $this->pushedFrame = vk::WHOLE_SIZE;
-        $this->slice = ScratchSlice(null, 0 as uint64, 0 as uint64, 0);
+        $this->slice = TransientSlice(null, 0 as uint64, 0 as uint64, 0);
     }
 
     public function push<T>(const T& $params) : void
     {
         uint64 $n = mem::size<T>() as uint64;
-        ScratchSlice $slice = $this->device->scratch($n, $this->device->limits->uniformAlign);
+        TransientSlice $slice = $this->device->allocTransient($n, $this->device->limits->uniformAlign);
         T $local = $params;
         ptr<const uint8> $src = ptr<const uint8>(&$local);
         mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $n);

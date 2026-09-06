@@ -6,7 +6,7 @@ namespace visu::vg;
 
 use visu::graphics::{
     Device, GpuPass, Raster, RenderEncoder, ResourceState, Sampler, SamplerDesc,
-    ScratchSlice, ShaderProgram, Texture, TextureDesc, VertexBuilder, VertexLayout
+    TransientSlice, ShaderProgram, Texture, TextureDesc, VertexBuilder, VertexLayout
 };
 use visu::math::{Vec2, Vec4};
 
@@ -52,9 +52,9 @@ internal function ensureWhite(Canvas $vg) : void
     $px[] = 255;
     $px[] = 255;
     $tex->upload(0, $px->data(), 4, 4);
-    $vg->device->transition($tex, ResourceState::shaderRead);
+    $vg->device->transitionTexture($tex, ResourceState::shaderRead);
     $vg->white = $tex;
-    $vg->sampler = $vg->device->sampler(SamplerDesc());
+    $vg->sampler = $vg->device->createSampler(SamplerDesc());
 }
 
 internal function uploadMesh(Device $device, RenderEncoder $enc, TessMesh $mesh) : void
@@ -64,14 +64,14 @@ internal function uploadMesh(Device $device, RenderEncoder $enc, TessMesh $mesh)
     assert($nv > 0 && $ni > 0, 'vg empty mesh');
     uint64 $vb = ($nv as uint64) * (mem::size<VgVertex>() as uint64);
     uint64 $ib = ($ni as uint64) * (mem::size<uint32>() as uint64);
-    ScratchSlice $vs = $device->scratch($vb, 4);
-    ScratchSlice $is = $device->scratch($ib, 4);
+    TransientSlice $vs = $device->allocTransient($vb, 4);
+    TransientSlice $is = $device->allocTransient($ib, 4);
     ptr<VgVertex> $vsrc = $mesh->verts->data();
     ptr<uint32> $isrc = $mesh->indices->data();
     mem::copy<VgVertex>(ptr<VgVertex>($vs->data:$), $vsrc, $nv);
     mem::copy<uint32>(ptr<uint32>($is->data:$), $isrc, $ni);
-    $enc->setVertexScratch(0, $vs);
-    $enc->setIndexScratch($is, .uint32);
+    $enc->setVertexTransient(0, $vs);
+    $enc->setIndexTransient($is, .uint32);
 }
 
 internal function makeFrag(const VgCall& $call, float32 $pxW, float32 $pxH) : VgFrag

@@ -37,7 +37,7 @@ public class Device : DeviceProtocol
     internal bool $encoderOpen;
     internal bool $inFrame;
     internal DeviceLimits $limits;
-    internal AdapterInfo $adapterInfo;
+    internal AdapterInfo $adapter;
     internal string $appName;
     internal Texture? $bb;
     internal vk::PipelineLayout $pipeLayout;
@@ -86,7 +86,7 @@ public class Device : DeviceProtocol
         $this->limits = DeviceLimits();
         AdapterInfo $info = AdapterInfo();
         $info->api = 'Vulkan';
-        $this->adapterInfo = $info;
+        $this->adapter = $info;
         $this->appName = 'visu';
         $this->bb = null;
         $this->pipeLayout = vk::PipelineLayout::none();
@@ -137,15 +137,15 @@ public class Device : DeviceProtocol
         }
         $this->ready = true;
         announceVersion();
-        AdapterInfo $info = $this->adapterInfo;
+        AdapterInfo $info = $this->adapter;
         string $line = $info->line();
         info("graphics: {$line}");
         return .ok;
     }
 
-    public function attach(Surface $surface, int32 $width, int32 $height) : status<DeviceError>
+    public function attachSurface(Surface $surface, int32 $width, int32 $height) : status<DeviceError>
     {
-        assert($this->ready, 'Device.attach before initialize');
+        assert($this->ready, 'Device.attachSurface before initialize');
         $this->surface = $surface->handle;
         uint32 $ok = 0;
         guard vkCheck(
@@ -162,14 +162,14 @@ public class Device : DeviceProtocol
         return vkBootSwapchain($this, $width, $height);
     }
 
-    public function resize(int32 $width, int32 $height) : void
+    public function resizeSurface(int32 $width, int32 $height) : void
     {
         $this->pendingResize = true;
         $this->pendingW = $width;
         $this->pendingH = $height;
     }
 
-    public function lose() : void
+    public function loseSurface() : void
     {
         $this->lostFlag = true;
         vkAbortFrame($this);
@@ -186,7 +186,7 @@ public class Device : DeviceProtocol
         }
     }
 
-    public const function lost() : bool
+    public const function surfaceLost() : bool
     {
         return $this->lostFlag;
     }
@@ -205,12 +205,12 @@ public class Device : DeviceProtocol
         return $this->limits;
     }
 
-    public const function adapter() : AdapterInfo
+    public const function adapterInfo() : AdapterInfo
     {
-        return $this->adapterInfo;
+        return $this->adapter;
     }
 
-    public const function memory() : MemoryStats
+    public const function memoryStats() : MemoryStats
     {
         return vkMemoryStats($this);
     }
@@ -336,7 +336,7 @@ public class Device : DeviceProtocol
         assert($this->inFrame, 'endFrame outside beginFrame');
         assert(!$this->encoderOpen, 'endFrame with an open encoder');
         Texture $bb = guard $this->bb;
-        $this->transition($bb, .present);
+        $this->transitionTexture($bb, .present);
         FrameSlot $slot = $this->slots[$this->slot];
         guard vkCheck(vk::EndCommandBuffer($slot->cmd), 'EndCommandBuffer') else ($e) {
             vkRecreateSignaledFence($this, $slot);
@@ -536,9 +536,9 @@ public class Device : DeviceProtocol
         return RenderEncoder($this, $formats, $first->texture->width, $first->texture->height);
     }
 
-    public function transition(Texture $texture, ResourceState $to) : void
+    public function transitionTexture(Texture $texture, ResourceState $to) : void
     {
-        assert(!$this->encoderOpen, 'transition inside a render pass');
+        assert(!$this->encoderOpen, 'transitionTexture inside a render pass');
 
         if ($texture->state == $to) {
             return;
@@ -548,9 +548,9 @@ public class Device : DeviceProtocol
         $texture->state = $to;
     }
 
-    public function scratch(uint64 $bytes, uint64 $align) : ScratchSlice
+    public function allocTransient(uint64 $bytes, uint64 $align) : TransientSlice
     {
-        assert($this->inFrame, 'scratch outside beginFrame');
+        assert($this->inFrame, 'allocTransient outside beginFrame');
         uint64 $a = $align;
 
         if ($a < $this->limits->uniformAlign) {
@@ -564,11 +564,11 @@ public class Device : DeviceProtocol
         return $this->slots[$this->slot]->ring->bump($bytes, $a, $this->slot);
     }
 
-    public function readback(Texture $texture) : result<array<uint8>, DeviceError>
+    public function readbackTexture(Texture $texture) : result<array<uint8>, DeviceError>
     {
-        assert($this->logical->handle != 0, 'readback before initialize');
-        assert(!$this->encoderOpen, 'readback with an open encoder');
-        assert(!$this->inFrame, 'readback inside a frame');
+        assert($this->logical->handle != 0, 'readbackTexture before initialize');
+        assert(!$this->encoderOpen, 'readbackTexture with an open encoder');
+        assert(!$this->inFrame, 'readbackTexture inside a frame');
 
         if ($texture->imported || ($texture->usage & TEXTURE_TRANSFER_SRC) == 0) {
             return .error(.missingUsage);
@@ -638,11 +638,11 @@ public class Device : DeviceProtocol
         return .ok($pixels);
     }
 
-    public function copy(Texture $src, Texture $dst) : status<DeviceError>
+    public function copyTexture(Texture $src, Texture $dst) : status<DeviceError>
     {
-        assert($this->logical->handle != 0, 'copy before initialize');
-        assert(!$this->encoderOpen, 'copy with an open encoder');
-        assert(!$this->inFrame, 'copy inside a frame');
+        assert($this->logical->handle != 0, 'copyTexture before initialize');
+        assert(!$this->encoderOpen, 'copyTexture with an open encoder');
+        assert(!$this->inFrame, 'copyTexture inside a frame');
         guard textureCopyOk($src, $dst) else ($e) {
             return .error($e);
         }
@@ -868,7 +868,7 @@ public class Device : DeviceProtocol
         assert(false, 'generateMipmaps is later');
     }
 
-    public function sampler(const SamplerDesc& $desc) : Sampler
+    public function createSampler(const SamplerDesc& $desc) : Sampler
     {
         string $key = $desc->key();
 
@@ -959,7 +959,7 @@ public class Device : DeviceProtocol
             return;
         }
 
-        $this->lose();
+        $this->loseSurface();
         vkDestroyDrawStack($this);
         vkDestroySlots($this);
 

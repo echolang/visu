@@ -31,7 +31,7 @@ public class Device : DeviceProtocol
     internal mtl::RenderCommandEncoder? $activeEnc;
     internal bool $inFrame;
     internal DeviceLimits $limits;
-    internal AdapterInfo $adapterInfo;
+    internal AdapterInfo $adapter;
     internal Texture? $bb;
     internal map<string, PipelineHandle> $psos;
     internal map<string, SamplerHandle> $samplerHandles;
@@ -65,7 +65,7 @@ public class Device : DeviceProtocol
         $this->limits->uniformAlign = 16;
         AdapterInfo $info = AdapterInfo();
         $info->api = 'Metal';
-        $this->adapterInfo = $info;
+        $this->adapter = $info;
         $this->bb = null;
         $this->psos = map<string, PipelineHandle>();
         $this->samplerHandles = map<string, SamplerHandle>();
@@ -107,7 +107,7 @@ public class Device : DeviceProtocol
         $info->api = 'Metal';
         $info->name = $gpu->name();
         $info->vendor = 'Apple';
-        $this->adapterInfo = $info;
+        $this->adapter = $info;
         $this->ready = true;
         announceVersion();
         string $line = $info->line();
@@ -115,9 +115,9 @@ public class Device : DeviceProtocol
         return .ok;
     }
 
-    public function attach(Surface $surface, int32 $width, int32 $height) : status<DeviceError>
+    public function attachSurface(Surface $surface, int32 $width, int32 $height) : status<DeviceError>
     {
-        assert($this->ready, 'Device.attach before initialize');
+        assert($this->ready, 'Device.attachSurface before initialize');
         mtl::Device $gpu = guard $this->gpu else {
             return .error(.noDevice);
         }
@@ -131,14 +131,14 @@ public class Device : DeviceProtocol
         return .ok;
     }
 
-    public function resize(int32 $width, int32 $height) : void
+    public function resizeSurface(int32 $width, int32 $height) : void
     {
         $this->pendingResize = true;
         $this->pendingW = $width;
         $this->pendingH = $height;
     }
 
-    public function lose() : void
+    public function loseSurface() : void
     {
         $this->lostFlag = true;
         $this->abortFrame();
@@ -148,7 +148,7 @@ public class Device : DeviceProtocol
         $this->layer = null;
     }
 
-    public const function lost() : bool
+    public const function surfaceLost() : bool
     {
         return $this->lostFlag;
     }
@@ -164,12 +164,12 @@ public class Device : DeviceProtocol
         return $this->limits;
     }
 
-    public const function adapter() : AdapterInfo
+    public const function adapterInfo() : AdapterInfo
     {
-        return $this->adapterInfo;
+        return $this->adapter;
     }
 
-    public const function memory() : MemoryStats
+    public const function memoryStats() : MemoryStats
     {
         if (!$this->ready) {
             return MemoryStats();
@@ -381,15 +381,15 @@ public class Device : DeviceProtocol
         return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $first->texture->width, $first->texture->height);
     }
 
-    public function transition(Texture $texture, ResourceState $to) : void
+    public function transitionTexture(Texture $texture, ResourceState $to) : void
     {
-        assert(!$this->encoderOpen, 'transition inside a render pass');
+        assert(!$this->encoderOpen, 'transitionTexture inside a render pass');
         $texture->state = $to;
     }
 
-    public function scratch(uint64 $bytes, uint64 $align) : ScratchSlice
+    public function allocTransient(uint64 $bytes, uint64 $align) : TransientSlice
     {
-        assert($this->inFrame, 'scratch outside beginFrame');
+        assert($this->inFrame, 'allocTransient outside beginFrame');
         uint64 $a = $align;
 
         if ($a < $this->limits->uniformAlign) {
@@ -403,11 +403,11 @@ public class Device : DeviceProtocol
         return $this->slots[$this->slot]->ring->take($bytes, $a, $this->slot);
     }
 
-    public function readback(Texture $texture) : result<array<uint8>, DeviceError>
+    public function readbackTexture(Texture $texture) : result<array<uint8>, DeviceError>
     {
-        assert($this->gpu != null, 'readback before initialize');
-        assert(!$this->encoderOpen, 'readback with an open encoder');
-        assert(!$this->inFrame, 'readback inside a frame');
+        assert($this->gpu != null, 'readbackTexture before initialize');
+        assert(!$this->encoderOpen, 'readbackTexture with an open encoder');
+        assert(!$this->inFrame, 'readbackTexture inside a frame');
 
         if ($texture->imported || ($texture->usage & TEXTURE_TRANSFER_SRC) == 0) {
             return .error(.missingUsage);
@@ -438,11 +438,11 @@ public class Device : DeviceProtocol
         return .ok($pixels);
     }
 
-    public function copy(Texture $src, Texture $dst) : status<DeviceError>
+    public function copyTexture(Texture $src, Texture $dst) : status<DeviceError>
     {
-        assert($this->gpu != null, 'copy before initialize');
-        assert(!$this->encoderOpen, 'copy with an open encoder');
-        assert(!$this->inFrame, 'copy inside a frame');
+        assert($this->gpu != null, 'copyTexture before initialize');
+        assert(!$this->encoderOpen, 'copyTexture with an open encoder');
+        assert(!$this->inFrame, 'copyTexture inside a frame');
         guard textureCopyOk($src, $dst) else ($e) {
             return .error($e);
         }
@@ -574,7 +574,7 @@ public class Device : DeviceProtocol
         assert(false, 'generateMipmaps is later');
     }
 
-    public function sampler(const SamplerDesc& $desc) : Sampler
+    public function createSampler(const SamplerDesc& $desc) : Sampler
     {
         string $key = $desc->key();
 
@@ -583,7 +583,7 @@ public class Device : DeviceProtocol
         }
 
         mtl::Device $gpu = guard $this->gpu else {
-            die('sampler before initialize');
+            die('createSampler before initialize');
         }
         mtl::SamplerDescriptor $sd = mtl::SamplerDescriptor();
         $sd->minFilter = mtlMinMag($desc->min);
@@ -653,7 +653,7 @@ public class Device : DeviceProtocol
             return;
         }
 
-        $this->lose();
+        $this->loseSurface();
         $this->waitSlots();
         mtlDestroySlots($this);
         $this->psos = map<string, PipelineHandle>();

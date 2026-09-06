@@ -1,5 +1,5 @@
 /**
- * Open render encoder. end() must run; the destructor asserts
+ * Open render encoder. endRender() must run; the destructor asserts
  * it did. Uniforms are the frame ring at buffer index 2+N.
  */
 
@@ -19,7 +19,7 @@ public class RenderEncoder : RenderEncoderProtocol
     internal mtl::PixelFormat $depthFmt;
     private Topology $topology;
     private Buffer? $indexBuffer;
-    private mtl::Buffer? $indexScratch;
+    private mtl::Buffer? $indexTransient;
     private IndexType $indexType;
     private uint64 $indexOffset;
     private Texture? $boundTex;
@@ -49,7 +49,7 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->depthFmt = $depthFmt;
         $this->topology = .triangles;
         $this->indexBuffer = null;
-        $this->indexScratch = null;
+        $this->indexTransient = null;
         $this->indexType = .uint16;
         $this->indexOffset = 0;
         $this->boundTex = null;
@@ -71,10 +71,10 @@ public class RenderEncoder : RenderEncoderProtocol
 
     destructor()
     {
-        assert($this->ended, 'RenderEncoder dropped without end');
+        assert($this->ended, 'RenderEncoder dropped without endRender');
     }
 
-    public const function formats() : TargetFormats
+    public const function targetFormats() : TargetFormats
     {
         return $this->formats;
     }
@@ -89,9 +89,9 @@ public class RenderEncoder : RenderEncoderProtocol
         return $this->height;
     }
 
-    public function setPipeline(const GpuPass& $pass) : void
+    public function setGpuPass(const GpuPass& $pass) : void
     {
-        assert(!$this->ended, 'setPipeline after end');
+        assert(!$this->ended, 'setGpuPass after endRender');
         PipelineHandle $pso = metalGetPipeline($this->device, $pass, $this->formats, $this->depthFmt);
         mtl::RenderPipelineState $state = guard $pso->pipeline else {
             die('metal: pipeline handle is empty');
@@ -113,7 +113,7 @@ public class RenderEncoder : RenderEncoderProtocol
 
     public function setViewport(int32 $x, int32 $y, int32 $w, int32 $h) : void
     {
-        assert(!$this->ended, 'setViewport after end');
+        assert(!$this->ended, 'setViewport after endRender');
         $this->enc->setViewport(mtl::Viewport(
             $x as float64,
             $y as float64,
@@ -125,7 +125,7 @@ public class RenderEncoder : RenderEncoderProtocol
 
     public function setScissor(int32 $x, int32 $y, int32 $w, int32 $h) : void
     {
-        assert(!$this->ended, 'setScissor after end');
+        assert(!$this->ended, 'setScissor after endRender');
         GpuScissor $s = clampScissor($x, $y, $w, $h, $this->width, $this->height);
         $this->enc->setScissorRect(mtl::ScissorRect(
             $s->x as uint32,
@@ -138,7 +138,7 @@ public class RenderEncoder : RenderEncoderProtocol
 
     public function setVertexBuffer(uint32 $binding, Buffer $buffer, uint64 $offset = 0) : void
     {
-        assert(!$this->ended, 'setVertexBuffer after end');
+        assert(!$this->ended, 'setVertexBuffer after endRender');
         mtl::Buffer $buf = guard $buffer->handle->buffer else {
             die('metal: vertex buffer handle is empty');
         }
@@ -147,41 +147,41 @@ public class RenderEncoder : RenderEncoderProtocol
 
     public function setIndexBuffer(Buffer $buffer, IndexType $type, uint64 $offset = 0) : void
     {
-        assert(!$this->ended, 'setIndexBuffer after end');
+        assert(!$this->ended, 'setIndexBuffer after endRender');
         $this->indexBuffer = $buffer;
-        $this->indexScratch = null;
+        $this->indexTransient = null;
         $this->indexType = $type;
         $this->indexOffset = $offset;
     }
 
-    public function setVertexScratch(uint32 $binding, ScratchSlice $slice) : void
+    public function setVertexTransient(uint32 $binding, TransientSlice $slice) : void
     {
-        assert(!$this->ended, 'setVertexScratch after end');
-        assert($slice->frameSlot == $this->device->slot, 'scratch from another frame');
+        assert(!$this->ended, 'setVertexTransient after endRender');
+        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
         mtl::Buffer $buf = guard $this->device->slots[$this->device->slot]->ring->buffer else {
             die('metal: ring is empty');
         }
         $this->enc->setVertexBuffer($buf, $slice->offset as uint32, index: $binding);
     }
 
-    public function setIndexScratch(ScratchSlice $slice, IndexType $type) : void
+    public function setIndexTransient(TransientSlice $slice, IndexType $type) : void
     {
-        assert(!$this->ended, 'setIndexScratch after end');
-        assert($slice->frameSlot == $this->device->slot, 'scratch from another frame');
+        assert(!$this->ended, 'setIndexTransient after endRender');
+        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
         mtl::Buffer $buf = guard $this->device->slots[$this->device->slot]->ring->buffer else {
             die('metal: ring is empty');
         }
         $this->indexBuffer = null;
-        $this->indexScratch = $buf;
+        $this->indexTransient = $buf;
         $this->indexType = $type;
         $this->indexOffset = $slice->offset;
     }
 
-    public function bindUniform(uint32 $slot, ScratchSlice $slice) : void
+    public function bindUniform(uint32 $slot, TransientSlice $slice) : void
     {
-        assert(!$this->ended, 'bindUniform after end');
+        assert(!$this->ended, 'bindUniform after endRender');
         assert($slot < UNIFORM_SLOTS, 'uniform slot');
-        assert($slice->frameSlot == $this->device->slot, 'scratch from another frame');
+        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
         $this->uniformOff[$slot] = $slice->offset;
         $this->uniformSet[$slot] = true;
     }
@@ -189,7 +189,7 @@ public class RenderEncoder : RenderEncoderProtocol
     public function upload<T>(const T& $params, slot: uint32 $slot = 0) : void
     {
         uint64 $n = mem::size<T>() as uint64;
-        ScratchSlice $slice = $this->device->scratch($n, $this->device->limits->uniformAlign);
+        TransientSlice $slice = $this->device->allocTransient($n, $this->device->limits->uniformAlign);
         T $local = $params;
         ptr<const uint8> $src = ptr<const uint8>(&$local);
         mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $n);
@@ -198,7 +198,7 @@ public class RenderEncoder : RenderEncoderProtocol
 
     public function bindTexture(uint32 $slot, Texture $texture, Sampler $sampler) : void
     {
-        assert(!$this->ended, 'bindTexture after end');
+        assert(!$this->ended, 'bindTexture after endRender');
         assert($slot < TEXTURE_SLOTS, 'texture slot');
         assert($texture->state == ResourceState::shaderRead, 'bindTexture: texture is not shaderRead');
         $this->boundTex = $texture;
@@ -208,8 +208,8 @@ public class RenderEncoder : RenderEncoderProtocol
 
     public function draw(int32 $first, int32 $count, int32 $instances = 1) : void
     {
-        assert(!$this->ended, 'draw after end');
-        assert($this->pipelineSet, 'draw before setPipeline');
+        assert(!$this->ended, 'draw after endRender');
+        assert($this->pipelineSet, 'draw before setGpuPass');
         $this->flushBindings();
         uint32 $n = 1;
 
@@ -222,10 +222,10 @@ public class RenderEncoder : RenderEncoderProtocol
 
     public function drawIndexed(int32 $firstIndex, int32 $count, int32 $instances = 1, int32 $vertexOffset = 0) : void
     {
-        assert(!$this->ended, 'drawIndexed after end');
-        assert($this->pipelineSet, 'drawIndexed before setPipeline');
+        assert(!$this->ended, 'drawIndexed after endRender');
+        assert($this->pipelineSet, 'drawIndexed before setGpuPass');
         assert($vertexOffset == 0, 'metal: base vertex is not implemented');
-        mtl::Buffer? $chosen = $this->indexScratch;
+        mtl::Buffer? $chosen = $this->indexTransient;
 
         if ($chosen == null) {
             Buffer $idx = guard $this->indexBuffer else {
@@ -262,9 +262,9 @@ public class RenderEncoder : RenderEncoderProtocol
         );
     }
 
-    public function end() : void
+    public function endRender() : void
     {
-        assert(!$this->ended, 'RenderEncoder.end twice');
+        assert(!$this->ended, 'RenderEncoder.endRender twice');
         $this->ended = true;
         $this->enc->endEncoding();
         $this->device->encoderClosed();
