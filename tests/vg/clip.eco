@@ -1,0 +1,75 @@
+/**
+ * Rounded-box SDF and AABB intersect.
+ */
+
+use visu::geo::AABB2D;
+use visu::graphics::Device;
+use visu::math::{Vec2, equal};
+use visu::vg::{
+    Canvas, Scissor, Xform, intersectAabb, roundBoxContains, roundBoxSdf, scissorContains
+};
+
+test round_box_center_inside
+{
+    Vec2 $c = Vec2(10.0f, 10.0f);
+    Vec2 $half = Vec2(5.0f, 5.0f);
+    assert(roundBoxContains(Vec2(10.0f, 10.0f), $c, $half, 0.0f), 'center');
+    assert(roundBoxContains(Vec2(14.9f, 10.0f), $c, $half, 0.0f), 'edge in');
+    assert(!roundBoxContains(Vec2(16.0f, 10.0f), $c, $half, 0.0f), 'out');
+}
+
+test round_box_corner_cut
+{
+    Vec2 $c = Vec2(0.0f, 0.0f);
+    Vec2 $half = Vec2(10.0f, 10.0f);
+    assert(roundBoxContains(Vec2(9.0f, 9.0f), $c, $half, 0.0f), 'square corner');
+    assert(!roundBoxContains(Vec2(9.0f, 9.0f), $c, $half, 8.0f), 'rounded out');
+    assert(roundBoxSdf(Vec2(0.0f, 0.0f), $half, 8.0f) < 0.0f, 'sdf in');
+}
+
+test intersect_aabb_overlap
+{
+    AABB2D $a = AABB2D(Vec2(0.0f, 0.0f), Vec2(10.0f, 10.0f));
+    AABB2D $b = AABB2D(Vec2(5.0f, 5.0f), Vec2(20.0f, 20.0f));
+    AABB2D? $i = intersectAabb($a, $b);
+    assert($i != null, 'hit');
+    AABB2D $box = guard $i;
+    assert(equal($box->min, Vec2(5.0f, 5.0f)), 'min');
+    assert(equal($box->max, Vec2(10.0f, 10.0f)), 'max');
+}
+
+test intersect_aabb_miss
+{
+    AABB2D $a = AABB2D(Vec2(0.0f, 0.0f), Vec2(1.0f, 1.0f));
+    AABB2D $b = AABB2D(Vec2(2.0f, 2.0f), Vec2(3.0f, 3.0f));
+    assert(intersectAabb($a, $b) == null, 'miss');
+}
+
+test scissor_full_contains_everything
+{
+    Scissor $s = Scissor();
+    assert(scissorContains($s, Vec2(999.0f, -4.0f)), 'full');
+}
+
+test scissor_identity_rect
+{
+    Scissor $s = Scissor();
+    $s->full = false;
+    $s->box = AABB2D(Vec2(0.0f, 0.0f), Vec2(20.0f, 10.0f));
+    $s->extent = Vec2(10.0f, 5.0f);
+    $s->radius = 0.0f;
+    $s->xform = Xform(translate: Vec2(10.0f, 5.0f));
+    assert(scissorContains($s, Vec2(10.0f, 5.0f)), 'center');
+    assert(scissorContains($s, Vec2(1.0f, 1.0f)), 'in');
+    assert(!scissorContains($s, Vec2(30.0f, 5.0f)), 'out');
+}
+
+test scissor_intersects_rotated_uses_four_corners
+{
+    Device $device = Device();
+    Canvas $vg = Canvas($device);
+    $vg->begin(100.0f, 100.0f, 1.0f);
+    $vg->scissor(Vec2(16.0f, 16.0f), Vec2(9.0f, 9.0f));
+    $vg->rotate(std::math::PI_F32 * 0.25f);
+    assert($vg->scissorIntersects(Vec2(20.0f, 0.0f), Vec2(10.0f, 10.0f)), 'diamond hits');
+}

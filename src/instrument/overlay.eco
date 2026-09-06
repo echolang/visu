@@ -1,0 +1,116 @@
+/**
+ * VG HUD on the backbuffer. Draws a Sample plus extra row()
+ * lines at the top-left. F1 toggles. Extra rows drain even
+ * when hidden. Sampling lives on Instruments, not here.
+ */
+
+namespace visu::instrument;
+
+use visu::graphics::{Device, Pipeline, TargetRef};
+use visu::math::Vec2;
+use visu::os::key;
+use visu::signal::{Dispatcher, Flow, Key};
+use visu::vg::{Canvas, Color, TextAlign, VgError, VgRenderer};
+
+public class Overlay
+{
+    public bool $enabled = true;
+
+    private VgRenderer $vg;
+    private array<string> $rows;
+    private bool $loaded;
+    private bool $dead;
+
+    public constructor(Device $device)
+    {
+        $this->vg = VgRenderer($device);
+        $this->rows = array<string>();
+        $this->loaded = false;
+        $this->dead = false;
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function load() : status<VgError>
+    {
+        guard $this->vg->load() else ($e) {
+            return .error($e);
+        }
+        string $bytes = debugFontBytes();
+        guard $this->vg->canvas->createFont(name: 'debug', bytes: $bytes) else ($e) {
+            return .error($e);
+        }
+        $this->loaded = true;
+        return .ok;
+    }
+
+    public function listen(Dispatcher $dispatcher) : void
+    {
+        Overlay $overlay = $this;
+        $dispatcher->register(function(const Key& $key) : Flow {
+            if ($key->key == key::F1 && $key->action == key::PRESS) {
+                $overlay->enabled = !$overlay->enabled;
+            }
+
+            return .proceed;
+        });
+    }
+
+    public function row(string $line) : void
+    {
+        $this->rows[] = $line;
+    }
+
+    public function pass(Pipeline $pipeline, TargetRef $target, Sample $sample) : void
+    {
+        if (!$this->enabled || !$this->loaded) {
+            $this->rows->clear();
+            return;
+        }
+
+        array<string> $lines = array<string>();
+        $lines[] = formatLine($sample);
+        array<Gauge> $gauges = $sample->gauges;
+
+        foreach ($gauges as $g) {
+            $lines[] = formatGauge($g);
+        }
+
+        array<string> $extra = $this->rows;
+
+        foreach ($extra as $line) {
+            $lines[] = $line;
+        }
+
+        $this->rows->clear();
+        $this->vg->pass($pipeline, $target, function(Canvas $vg) : void {
+            guard $vg->fontFace('debug') else {
+                return;
+            }
+            $vg->fontSize(14.0f);
+            $vg->textAlign(TextAlign(.left, .top));
+            $vg->fillColor(Color(1.0f, 1.0f, 1.0f, 1.0f));
+            float32 $y = 10.0f;
+            array<string> $drawn = $lines;
+
+            foreach ($drawn as $line) {
+                $vg->text(Vec2(10.0f, $y), $line);
+                $y = $y + 18.0f;
+            }
+        });
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->dead = true;
+        $this->loaded = false;
+        $this->vg->destroy();
+    }
+}

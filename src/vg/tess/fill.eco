@@ -1,0 +1,175 @@
+/**
+ * Polygon fill: ear-clip the interior, then a coverage fringe
+ * around each original contour.
+ */
+
+namespace visu::vg;
+
+use visu::math::{Vec2, length};
+
+internal function tessConvex(const array<Vec2>& $pts, float32 $fringe, TessMesh& $out) : void
+{
+    usize $n = $pts->count();
+
+    if ($n < 3) {
+        return;
+    }
+
+    uint32 $base = $out->verts->count() as uint32;
+    usize $i = 0;
+
+    while ($i < $n) {
+        $out->verts[] = VgVertex($pts[$i], Vec2(1.0f, 1.0f));
+        $i = $i + 1;
+    }
+
+    usize $t = 1;
+
+    uint32 $one = 1 as uint32;
+
+    while ($t + 1 < $n) {
+        uint32 $b = $t as uint32;
+        $out->indices[] = $base;
+        $out->indices[] = $base + $b;
+        $out->indices[] = $base + $b + $one;
+        $t = $t + 1;
+    }
+
+    if ($fringe > 0.0f) {
+        tessFringe($pts, true, $fringe, $out);
+    }
+}
+
+internal function tessFill(const array<Contour>& $contours, float32 $fringe, TessMesh& $out) : void
+{
+    array<int32> $parent = contourParent($contours);
+    usize $n = $contours->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        if ($contours[$i]->pts->count() >= 3 && (contourDepth($parent, $i) % 2) == 0) {
+            array<Vec2> $poly = copyPoints($contours[$i]->pts);
+            ensureCcw($poly);
+            usize $j = 0;
+
+            while ($j < $n) {
+                if ($parent[$j] == ($i as int32) && $contours[$j]->pts->count() >= 3) {
+                    array<Vec2> $hole = copyPoints($contours[$j]->pts);
+                    ensureCw($hole);
+                    $poly = linkHole($poly, $hole);
+                }
+
+                $j = $j + 1;
+            }
+
+            appendFillPoly($poly, $out);
+        }
+
+        $i = $i + 1;
+    }
+
+    if ($fringe <= 0.0f) {
+        return;
+    }
+
+    foreach ($contours as $c) {
+        if ($c->pts->count() >= 2) {
+            tessFringe($c->pts, $c->closed, $fringe, $out);
+        }
+    }
+}
+
+internal function appendFillPoly(const array<Vec2>& $poly, TessMesh& $out) : void
+{
+    usize $n = $poly->count();
+
+    if ($n < 3) {
+        return;
+    }
+
+    array<uint32> $tris = earClip($poly);
+    uint32 $base = $out->verts->count() as uint32;
+    usize $i = 0;
+
+    while ($i < $n) {
+        $out->verts[] = VgVertex($poly[$i], Vec2(1.0f, 1.0f));
+        $i = $i + 1;
+    }
+
+    usize $t = 0;
+    usize $tn = $tris->count();
+
+    while ($t < $tn) {
+        $out->indices[] = ($base + $tris[$t]) as uint32;
+        $t = $t + 1;
+    }
+}
+
+internal function tessFringe(
+    const array<Vec2>& $pts,
+    bool $closed,
+    float32 $w,
+    TessMesh& $out
+) : void
+{
+    usize $n = $pts->count();
+
+    if ($n < 2) {
+        return;
+    }
+
+    usize $edges = $n;
+
+    if (!$closed) {
+        $edges = $n - 1;
+    }
+
+    usize $e = 0;
+
+    while ($e < $edges) {
+        usize $i0 = $e;
+        usize $i1 = $e + 1;
+
+        if ($i1 == $n) {
+            $i1 = 0;
+        }
+
+        Vec2 $a = $pts[$i0];
+        Vec2 $b = $pts[$i1];
+        Vec2 $nrm = edgeNormal($a, $b);
+        Vec2 $out0 = $a + $nrm * $w;
+        Vec2 $out1 = $b + $nrm * $w;
+        uint32 $base = $out->verts->count() as uint32;
+        $out->verts[] = VgVertex($a, Vec2(1.0f, 1.0f));
+        $out->verts[] = VgVertex($b, Vec2(1.0f, 1.0f));
+        $out->verts[] = VgVertex($out1, Vec2(0.0f, 1.0f));
+        $out->verts[] = VgVertex($out0, Vec2(0.0f, 1.0f));
+        $out->indices[] = $base;
+        $out->indices[] = ($base + 1) as uint32;
+        $out->indices[] = ($base + 2) as uint32;
+        $out->indices[] = $base;
+        $out->indices[] = ($base + 2) as uint32;
+        $out->indices[] = ($base + 3) as uint32;
+        $e = $e + 1;
+    }
+}
+
+internal function edgeNormal(Vec2 $a, Vec2 $b) : Vec2
+{
+    Vec2 $d = $b - $a;
+    float32 $len = length($d);
+
+    if ($len < 0.000000000001f) {
+        return Vec2(0.0f, 1.0f);
+    }
+
+    return Vec2(-$d->y / $len, $d->x / $len);
+}
+
+internal function fillPath(Path $path, float32 $tessTol, float32 $fringe) : TessMesh
+{
+    TessMesh $mesh = TessMesh();
+    array<Contour> $cs = flattenPath($path, $tessTol);
+    tessFill($cs, $fringe, $mesh);
+    return $mesh;
+}

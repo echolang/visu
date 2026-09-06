@@ -1,0 +1,126 @@
+/**
+ * 2×3 affine. Maps (x, y) → (a x + c y + e, b x + d y + f).
+ * `mul` applies the argument first.
+ */
+
+namespace visu::vg;
+
+use visu::math::Vec2;
+
+public struct Xform
+{
+    public float32 $a = 1.0f;
+    public float32 $b = 0.0f;
+    public float32 $c = 0.0f;
+    public float32 $d = 1.0f;
+    public float32 $e = 0.0f;
+    public float32 $f = 0.0f;
+
+    public constructor()
+    {
+        $this->a = 1.0f;
+        $this->b = 0.0f;
+        $this->c = 0.0f;
+        $this->d = 1.0f;
+        $this->e = 0.0f;
+        $this->f = 0.0f;
+    }
+
+    public constructor(translate: Vec2 $d)
+    {
+        $this->a = 1.0f;
+        $this->b = 0.0f;
+        $this->c = 0.0f;
+        $this->d = 1.0f;
+        $this->e = $d->x;
+        $this->f = $d->y;
+    }
+
+    public constructor(scale: Vec2 $s)
+    {
+        $this->a = $s->x;
+        $this->b = 0.0f;
+        $this->c = 0.0f;
+        $this->d = $s->y;
+        $this->e = 0.0f;
+        $this->f = 0.0f;
+    }
+
+    public constructor(rotate: float32 $radians)
+    {
+        float32 $cs = std::math::cos($radians);
+        float32 $sn = std::math::sin($radians);
+        $this->a = $cs;
+        $this->b = $sn;
+        $this->c = -$sn;
+        $this->d = $cs;
+        $this->e = 0.0f;
+        $this->f = 0.0f;
+    }
+
+    public static function identity() : Xform
+    {
+        return Xform();
+    }
+
+    public const function apply(Vec2 $p) : Vec2
+    {
+        return Vec2(
+            $this->a * $p->x + $this->c * $p->y + $this->e,
+            $this->b * $p->x + $this->d * $p->y + $this->f
+        );
+    }
+
+    /**
+     * `this * other`: `$other` runs first.
+     */
+    public const function mul(const Xform& $other) : Xform
+    {
+        Xform $r = Xform();
+        $r->a = $this->a * $other->a + $this->c * $other->b;
+        $r->b = $this->b * $other->a + $this->d * $other->b;
+        $r->c = $this->a * $other->c + $this->c * $other->d;
+        $r->d = $this->b * $other->c + $this->d * $other->d;
+        $r->e = $this->a * $other->e + $this->c * $other->f + $this->e;
+        $r->f = $this->b * $other->e + $this->d * $other->f + $this->f;
+        return $r;
+    }
+
+    /**
+     * Inverse, or null if the linear part is singular.
+     */
+    public const function invert() : Xform?
+    {
+        float32 $det = $this->a * $this->d - $this->b * $this->c;
+
+        if (std::math::abs($det) < 0.00000001f) {
+            return null;
+        }
+
+        float32 $inv = 1.0f / $det;
+        Xform $r = Xform();
+        $r->a = $this->d * $inv;
+        $r->b = -$this->b * $inv;
+        $r->c = -$this->c * $inv;
+        $r->d = $this->a * $inv;
+        $r->e = ($this->c * $this->f - $this->d * $this->e) * $inv;
+        $r->f = ($this->b * $this->e - $this->a * $this->f) * $inv;
+        return $r;
+    }
+}
+
+internal function tessScale(const Xform& $x) : float32
+{
+    float32 $s = std::math::sqrt($x->a * $x->a + $x->b * $x->b);
+
+    if ($s < 0.0001f) {
+        return 0.0001f;
+    }
+
+    return $s;
+}
+
+internal function tessTol(const Xform& $x) : float32
+{
+    return 0.25f / tessScale($x);
+}

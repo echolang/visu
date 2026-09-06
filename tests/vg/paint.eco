@@ -1,0 +1,52 @@
+/**
+ * Paint xform invert and gradient type encoding.
+ */
+
+use visu::graphics::Device;
+use visu::math::{Vec2, equal};
+use visu::vg::{
+    Canvas, Color, Paint, PaintKind, Scissor, VgCall, VgFrag, Xform, makeFrag
+};
+
+test linear_gradient_kind_and_extent
+{
+    Device $device = Device();
+    Canvas $vg = Canvas($device);
+    Paint $p = $vg->linearGradient(
+        Vec2(0.0f, 0.0f),
+        Vec2(10.0f, 0.0f),
+        Color::white(),
+        Color::black()
+    );
+    assert($p->kind == PaintKind::linear, 'kind');
+    assert(equal($p->extent->x, 10.0f), 'len');
+}
+
+test paint_frag_inverts_xform
+{
+    Paint $p = Paint();
+    $p->kind = .box;
+    $p->xform = Xform(translate: Vec2(10.0f, 20.0f));
+    VgCall $c = VgCall(0, 3, $p, Scissor(), 1.0f);
+    VgFrag $f = makeFrag($c, 100.0f, 100.0f);
+    assert(equal($f->paint1->x, -10.0f), 'e');
+    assert(equal($f->paint1->y, -20.0f), 'f');
+}
+
+test paint_frag_linear_type
+{
+    Paint $p = Paint();
+    $p->kind = .linear;
+    VgCall $c = VgCall(0, 3, $p, Scissor(), 1.0f);
+    VgFrag $f = makeFrag($c, 100.0f, 100.0f);
+    assert(equal($f->stroke->x, 3.0f), 'typ');
+}
+
+test paint_frag_radial_type
+{
+    Paint $p = Paint();
+    $p->kind = .radial;
+    VgCall $c = VgCall(0, 3, $p, Scissor(), 1.0f);
+    VgFrag $f = makeFrag($c, 100.0f, 100.0f);
+    assert(equal($f->stroke->x, 4.0f), 'typ');
+}

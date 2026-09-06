@@ -1,0 +1,88 @@
+/**
+ * CPU font load and textBounds. No GPU — atlas upload is sync().
+ */
+
+use visu::graphics::Device;
+use visu::math::Vec2;
+use visu::vg::{Canvas, TextAlign, VgError};
+
+function fontCanvas() : Canvas
+{
+    Device $device = Device();
+    Canvas $vg = Canvas($device);
+    $vg->begin(400.0f, 300.0f, 1.0f);
+    return $vg;
+}
+
+test font_load_and_bounds
+{
+    Canvas $vg = fontCanvas();
+    guard $vg->createFont('sans', 'examples/vg/Inconsolata-Regular.ttf') else {
+        assert(false, 'load font');
+        return;
+    }
+    guard $vg->fontFace('sans') else {
+        assert(false, 'font face');
+        return;
+    }
+    $vg->fontSize(18.0f);
+    $bHi = $vg->textBounds(Vec2(0.0f, 0.0f), 'Hi');
+    $bH = $vg->textBounds(Vec2(0.0f, 0.0f), 'H');
+    assert($bHi->width() > $bH->width(), 'Hi wider than H');
+    $empty = $vg->textBounds(Vec2(10.0f, 20.0f), '');
+    assert($empty->width() == 0.0f, 'empty width');
+    assert($empty->height() == 0.0f, 'empty height');
+}
+
+test font_align_right
+{
+    Canvas $vg = fontCanvas();
+    guard $vg->createFont('sans', 'examples/vg/Inconsolata-Regular.ttf') else {
+        assert(false, 'load font');
+        return;
+    }
+    guard $vg->fontFace('sans') else {
+        assert(false, 'face');
+        return;
+    }
+    $vg->fontSize(18.0f);
+    $vg->textAlign(TextAlign(.right, .baseline));
+    $b = $vg->textBounds(Vec2(0.0f, 0.0f), 'Hi');
+    assert($b->max->x <= 0.5f, 'right-aligned max');
+    assert($b->min->x < -1.0f, 'right-aligned min');
+}
+
+test font_missing_name
+{
+    Canvas $vg = fontCanvas();
+    status<VgError> $r = $vg->fontFace('nope');
+    assert($r->failed(), 'missing');
+    VgError $e = $r->failure();
+    string $msg = $e->message();
+    assert($msg == "vg font 'nope' is not loaded", 'name');
+}
+
+test font_bad_bytes
+{
+    Canvas $vg = fontCanvas();
+    result<visu::vg::Font, VgError> $r = $vg->createFont(name: 'x', bytes: 'not a font');
+    assert($r->failed(), 'parse');
+    VgError $e = $r->failure();
+    match ($e) {
+        VgError::fontParse => {
+        },
+        else => {
+            assert(false, 'wrong error');
+        },
+    };
+}
+
+test font_missing_file
+{
+    Canvas $vg = fontCanvas();
+    result<visu::vg::Font, VgError> $r = $vg->createFont('sans', 'no/such/font.ttf');
+    assert($r->failed(), 'file');
+    VgError $e = $r->failure();
+    string $msg = $e->message();
+    assert($msg == "vg font file 'no/such/font.ttf'", 'path');
+}

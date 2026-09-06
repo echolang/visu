@@ -1,0 +1,241 @@
+/**
+ * Monitor video modes and the Darwin CAMetalLayer glue. GLFW lists
+ * discrete modes; ProMotion's panel cap comes from
+ * NSScreen.maximumFramesPerSecond.
+ */
+
+namespace visu::os;
+
+public struct VideoMode
+{
+    public int32 $width = 0;
+    public int32 $height = 0;
+    public int32 $refreshRate = 0;
+}
+
+#[if: os == darwin]
+internal extern {
+    function visu_window_max_refresh(ptr<uint8> $nsWindow) : int32;
+    function visu_set_display_sync(ptr<uint8> $nsWindow, int32 $enabled) : void;
+}
+#[end]
+
+internal function applyDisplaySync(ptr<glfw::Window> $window, bool $enabled) : void
+{
+    #[if: os == darwin]
+    if ($window:$ == null) {
+        return;
+    }
+
+    ptr<uint8> $ns = glfw::getCocoaWindow($window);
+
+    if ($ns:$ == null) {
+        return;
+    }
+
+    int32 $on = 0;
+
+    if ($enabled) {
+        $on = 1;
+    }
+
+    visu_set_display_sync($ns, $on);
+    #[end]
+}
+
+internal function cocoaRefresh(ptr<glfw::Window> $window) : int32
+{
+    #[if: os == darwin]
+    ptr<uint8> $ns = glfw::getCocoaWindow($window);
+
+    if ($ns:$ == null) {
+        return 0;
+    }
+
+    return visu_window_max_refresh($ns);
+    #[else]
+    return 0;
+    #[end]
+}
+
+internal function copyVideoMode(ptr<const glfw::Vidmode> $raw) : VideoMode?
+{
+    if ($raw:$ == null) {
+        return null;
+    }
+
+    return VideoMode($raw->width, $raw->height, $raw->refreshRate);
+}
+
+internal function glfwVideoModes(ptr<glfw::Monitor> $monitor) : array<VideoMode>
+{
+    array<VideoMode> $out = array<VideoMode>();
+
+    if ($monitor:$ == null) {
+        return $out;
+    }
+
+    int32 $n = 0;
+    ptr<const glfw::Vidmode> $modes = glfw::getVideoModes($monitor, &$n);
+
+    if ($modes:$ == null || $n <= 0) {
+        return $out;
+    }
+
+    int32 $i = 0;
+
+    while ($i < $n) {
+        glfw::Vidmode $raw = $modes:$[$i];
+        $out[] = VideoMode($raw->width, $raw->height, $raw->refreshRate);
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function windowCenter(ptr<glfw::Window> $window, int32& $cx, int32& $cy) : void
+{
+    int32 $wx = 0;
+    int32 $wy = 0;
+    int32 $ww = 0;
+    int32 $wh = 0;
+    glfw::getWindowPos($window, &$wx, &$wy);
+    glfw::getWindowSize($window, &$ww, &$wh);
+    $cx = $wx + $ww / 2;
+    $cy = $wy + $wh / 2;
+}
+
+internal function monitorContains(ptr<glfw::Monitor> $m, int32 $cx, int32 $cy) : bool
+{
+    int32 $mx = 0;
+    int32 $my = 0;
+    int32 $mw = 0;
+    int32 $mh = 0;
+    glfw::getMonitorWorkarea($m, &$mx, &$my, &$mw, &$mh);
+    return $cx >= $mx && $cy >= $my && $cx < $mx + $mw && $cy < $my + $mh;
+}
+
+internal function windowVideoModes(ptr<glfw::Window> $window) : array<VideoMode>
+{
+    ptr<glfw::Monitor> $exclusive = glfw::getWindowMonitor($window);
+
+    if ($exclusive:$ != null) {
+        return glfwVideoModes($exclusive);
+    }
+
+    int32 $cx = 0;
+    int32 $cy = 0;
+    windowCenter($window, $cx, $cy);
+    int32 $n = 0;
+    ptr<ptr<glfw::Monitor>> $mons = glfw::getMonitors(&$n);
+    int32 $i = 0;
+
+    while ($i < $n) {
+        ptr<glfw::Monitor> $m = $mons:$[$i];
+
+        if (monitorContains($m, $cx, $cy)) {
+            return glfwVideoModes($m);
+        }
+
+        $i = $i + 1;
+    }
+
+    return glfwVideoModes(glfw::getPrimaryMonitor());
+}
+
+internal function windowCurrentMode(ptr<glfw::Window> $window) : VideoMode?
+{
+    ptr<glfw::Monitor> $exclusive = glfw::getWindowMonitor($window);
+
+    if ($exclusive:$ != null) {
+        return copyVideoMode(glfw::getVideoMode($exclusive));
+    }
+
+    int32 $cx = 0;
+    int32 $cy = 0;
+    windowCenter($window, $cx, $cy);
+    int32 $n = 0;
+    ptr<ptr<glfw::Monitor>> $mons = glfw::getMonitors(&$n);
+    int32 $i = 0;
+
+    while ($i < $n) {
+        ptr<glfw::Monitor> $m = $mons:$[$i];
+
+        if (monitorContains($m, $cx, $cy)) {
+            return copyVideoMode(glfw::getVideoMode($m));
+        }
+
+        $i = $i + 1;
+    }
+
+    return copyVideoMode(glfw::getVideoMode(glfw::getPrimaryMonitor()));
+}
+
+internal function setWindowFullscreen(
+    ptr<glfw::Window> $window,
+    int32 $width,
+    int32 $height,
+    int32 $refreshRate
+) : void
+{
+    int32 $hz = $refreshRate;
+
+    if ($hz == 0) {
+        $hz = maxRefresh(windowVideoModes($window));
+    }
+
+    if ($hz == 0) {
+        $hz = glfw::DONT_CARE;
+    }
+
+    ptr<glfw::Monitor> $exclusive = glfw::getWindowMonitor($window);
+
+    if ($exclusive:$ != null) {
+        glfw::setWindowMonitor($window, $exclusive, 0, 0, $width, $height, $hz);
+        return;
+    }
+
+    int32 $cx = 0;
+    int32 $cy = 0;
+    windowCenter($window, $cx, $cy);
+    int32 $n = 0;
+    ptr<ptr<glfw::Monitor>> $mons = glfw::getMonitors(&$n);
+    int32 $i = 0;
+
+    while ($i < $n) {
+        ptr<glfw::Monitor> $m = $mons:$[$i];
+
+        if (monitorContains($m, $cx, $cy)) {
+            glfw::setWindowMonitor($window, $m, 0, 0, $width, $height, $hz);
+            return;
+        }
+
+        $i = $i + 1;
+    }
+
+    glfw::setWindowMonitor($window, glfw::getPrimaryMonitor(), 0, 0, $width, $height, $hz);
+}
+
+internal function hasRefresh(const array<VideoMode>& $modes, int32 $hz) : bool
+{
+    foreach ($modes as $mode) {
+        if ($mode->refreshRate == $hz) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+internal function maxRefresh(const array<VideoMode>& $modes) : int32
+{
+    int32 $best = 0;
+
+    foreach ($modes as $mode) {
+        if ($mode->refreshRate > $best) {
+            $best = $mode->refreshRate;
+        }
+    }
+
+    return $best;
+}

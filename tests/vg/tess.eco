@@ -1,0 +1,141 @@
+/**
+ * Flatten, convex fan, concave ear clip, hole, stroke.
+ */
+
+use visu::math::{Vec2, equal};
+use visu::graphics::Device;
+use visu::vg::{
+    Canvas, LineCap, LineJoin, Path, TessMesh, Winding, fillPath, flattenPath, strokePath,
+    tessConvex
+};
+
+test tess_convex_fan_rect
+{
+    array<Vec2> $pts = array<Vec2>();
+    $pts[] = Vec2(0.0f, 0.0f);
+    $pts[] = Vec2(1.0f, 0.0f);
+    $pts[] = Vec2(1.0f, 1.0f);
+    $pts[] = Vec2(0.0f, 1.0f);
+    TessMesh $m = TessMesh();
+    tessConvex($pts, 0.0f, $m);
+    assert($m->verts->count() == 4, 'verts');
+    assert($m->indices->count() == 6, 'two tris');
+}
+
+test fill_rounded_skips_path
+{
+    Device $device = Device();
+    Canvas $vg = Canvas($device);
+    $vg->begin(100.0f, 100.0f, 1.0f);
+    $vg->antiAlias(false);
+    $vg->fillRounded(Vec2(10.0f, 10.0f), Vec2(40.0f, 20.0f), 4.0f);
+    assert($vg->mesh->verts->count() == 4, 'sdf quad verts');
+    assert($vg->mesh->indices->count() == 6, 'sdf quad');
+    assert(equal($vg->mesh->verts[0]->shape->w, 1.0f), 'sdf flag');
+    assert($vg->calls->count() == 1, 'one call');
+}
+
+test tess_unit_square_two_tris
+{
+    Path $p = Path();
+    $p->rect(Vec2(0.0f, 0.0f), Vec2(1.0f, 1.0f));
+    TessMesh $m = fillPath($p, 0.25f, 0.0f);
+    assert($m->verts->count() == 4, 'verts');
+    assert($m->indices->count() == 6, 'two tris');
+}
+
+test tess_convex_coverage_one
+{
+    Path $p = Path();
+    $p->rect(Vec2(0.0f, 0.0f), Vec2(2.0f, 2.0f));
+    TessMesh $m = fillPath($p, 0.25f, 0.0f);
+    assert($m->verts->count() > 0, 'n');
+    assert(equal($m->verts[0]->uv->x, 1.0f), 'cover');
+}
+
+test tess_fringe_adds_outer_zero
+{
+    Path $p = Path();
+    $p->rect(Vec2(0.0f, 0.0f), Vec2(2.0f, 2.0f));
+    TessMesh $plain = fillPath($p, 0.25f, 0.0f);
+    TessMesh $aa = fillPath($p, 0.25f, 0.5f);
+    assert($aa->verts->count() > $plain->verts->count(), 'more verts');
+    bool $sawZero = false;
+    usize $i = 0;
+
+    while ($i < $aa->verts->count()) {
+        if (equal($aa->verts[$i]->uv->x, 0.0f)) {
+            $sawZero = true;
+            break;
+        }
+
+        $i = $i + 1;
+    }
+
+    assert($sawZero, 'outer cover');
+}
+
+test tess_concave_quad
+{
+    Path $p = Path();
+    $p->moveTo(Vec2(0.0f, 0.0f));
+    $p->lineTo(Vec2(3.0f, 1.0f));
+    $p->lineTo(Vec2(0.0f, 2.0f));
+    $p->lineTo(Vec2(1.0f, 1.0f));
+    $p->close();
+    TessMesh $m = fillPath($p, 0.25f, 0.0f);
+    assert($m->indices->count() == 6, 'two tris');
+    assert($m->verts->count() == 4, 'verts');
+}
+
+test tess_square_with_hole
+{
+    Path $p = Path();
+    $p->rect(Vec2(0.0f, 0.0f), Vec2(4.0f, 4.0f));
+    $p->rect(Vec2(1.0f, 1.0f), Vec2(1.0f, 1.0f));
+    $p->winding(.cw);
+    assert(flattenPath($p, 0.25f)->count() == 2, 'two contours');
+    TessMesh $m = fillPath($p, 0.25f, 0.0f);
+    assert($m->verts->count() >= 8, 'outer+hole');
+    assert($m->indices->count() >= 12, 'more than outer fan');
+}
+
+test tess_disjoint_rects_are_two_fills
+{
+    Path $p = Path();
+    $p->rect(Vec2(0.0f, 0.0f), Vec2(2.0f, 2.0f));
+    $p->rect(Vec2(10.0f, 10.0f), Vec2(1.0f, 1.0f));
+    TessMesh $m = fillPath($p, 0.25f, 0.0f);
+    assert($m->verts->count() == 8, 'two quads');
+    assert($m->indices->count() == 12, 'four tris');
+}
+
+test tess_circle_flatten_grows_with_tolerance
+{
+    Path $p = Path();
+    $p->circle(Vec2(0.0f, 0.0f), 10.0f);
+    usize $coarse = flattenPath($p, 1.0f)[0]->pts->count();
+    usize $fine = flattenPath($p, 0.1f)[0]->pts->count();
+    assert($fine > $coarse, 'finer');
+    assert($coarse >= 8, 'min');
+}
+
+test tess_stroke_line_has_quad
+{
+    Path $p = Path();
+    $p->moveTo(Vec2(0.0f, 0.0f));
+    $p->lineTo(Vec2(10.0f, 0.0f));
+    TessMesh $m = strokePath($p, 0.25f, 2.0f, .butt, .miter, 4.0f, 0.0f);
+    assert($m->indices->count() >= 6, 'quad');
+    assert($m->verts->count() >= 4, 'verts');
+}
+
+test tess_stroke_round_cap_more_than_butt
+{
+    Path $p = Path();
+    $p->moveTo(Vec2(0.0f, 0.0f));
+    $p->lineTo(Vec2(10.0f, 0.0f));
+    TessMesh $butt = strokePath($p, 0.25f, 2.0f, .butt, .miter, 4.0f, 0.0f);
+    TessMesh $round = strokePath($p, 0.25f, 2.0f, .round, .miter, 4.0f, 0.0f);
+    assert($round->verts->count() > $butt->verts->count(), 'caps');
+}

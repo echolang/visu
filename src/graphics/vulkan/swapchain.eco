@@ -48,6 +48,10 @@ internal function vkDropViews(Device $device) : void
 
 internal function vkBootSwapchain(Device $device, int32 $fbW, int32 $fbH) : status<DeviceError>
 {
+    if ($device->logical->handle != 0) {
+        vk::DeviceWaitIdle($device->logical);
+    }
+
     vkDropViews($device);
     vk::SurfaceCapabilitiesKHR $caps = vk::SurfaceCapabilitiesKHR();
     guard vkCheck(
@@ -126,6 +130,11 @@ internal function vkBootSwapchain(Device $device, int32 $fbW, int32 $fbH) : stat
     }
 
     if ($device->extent->width == 0 || $device->extent->height == 0) {
+        if ($device->swapchain->handle != 0) {
+            vk::DestroySwapchainKHR($device->logical, $device->swapchain, null);
+            $device->swapchain = vk::SwapchainKHR::none();
+        }
+
         return .ok;
     }
 

@@ -1,0 +1,355 @@
+/**
+ * Command buffer for a 2D path. Shape helpers append cubics and
+ * lines; `bounds` is a control-point AABB.
+ */
+
+namespace visu::vg;
+
+use visu::geo::AABB2D;
+use visu::math::Vec2;
+
+internal const float32 KAPPA90 = 0.5522847498f;
+
+internal enum PathVerb
+{
+    case move;
+    case line;
+    case cubic;
+    case close;
+    case winding;
+}
+
+internal struct PathOp
+{
+    public PathVerb $verb;
+    public Vec2 $p;
+    public Vec2 $c1;
+    public Vec2 $c2;
+    public Winding $wind;
+}
+
+public class Path
+{
+    internal array<PathOp> $ops;
+    private Vec2 $last;
+    private bool $hasLast;
+
+    public constructor()
+    {
+        $this->ops = array<PathOp>();
+        $this->last = Vec2(0.0f, 0.0f);
+        $this->hasLast = false;
+    }
+
+    public function clear() : void
+    {
+        $this->ops->clear();
+        $this->last = Vec2(0.0f, 0.0f);
+        $this->hasLast = false;
+    }
+
+    public function moveTo(Vec2 $p) : void
+    {
+        $this->ops[] = PathOp(.move, $p, Vec2(0.0f, 0.0f), Vec2(0.0f, 0.0f), .ccw);
+        $this->last = $p;
+        $this->hasLast = true;
+    }
+
+    public function lineTo(Vec2 $p) : void
+    {
+        if (!$this->hasLast) {
+            $this->moveTo($p);
+            return;
+        }
+
+        $this->ops[] = PathOp(.line, $p, Vec2(0.0f, 0.0f), Vec2(0.0f, 0.0f), .ccw);
+        $this->last = $p;
+    }
+
+    public function bezierTo(Vec2 $c1, Vec2 $c2, Vec2 $p) : void
+    {
+        if (!$this->hasLast) {
+            $this->moveTo($p);
+            return;
+        }
+
+        $this->ops[] = PathOp(.cubic, $p, $c1, $c2, .ccw);
+        $this->last = $p;
+    }
+
+    public function quadTo(Vec2 $c, Vec2 $p) : void
+    {
+        if (!$this->hasLast) {
+            $this->moveTo($p);
+            return;
+        }
+
+        Vec2 $p0 = $this->last;
+        Vec2 $c1 = $p0 + ($c - $p0) * (2.0f / 3.0f);
+        Vec2 $c2 = $p + ($c - $p) * (2.0f / 3.0f);
+        $this->bezierTo($c1, $c2, $p);
+    }
+
+    public function close() : void
+    {
+        $this->ops[] = PathOp(.close, Vec2(0.0f, 0.0f), Vec2(0.0f, 0.0f), Vec2(0.0f, 0.0f), .ccw);
+        $this->hasLast = false;
+    }
+
+    public function winding(Winding $w) : void
+    {
+        $this->ops[] = PathOp(.winding, Vec2(0.0f, 0.0f), Vec2(0.0f, 0.0f), Vec2(0.0f, 0.0f), $w);
+    }
+
+    public function rect(Vec2 $pos, Vec2 $size) : void
+    {
+        float32 $x = $pos->x;
+        float32 $y = $pos->y;
+        float32 $w = $size->x;
+        float32 $h = $size->y;
+        $this->moveTo(Vec2($x, $y));
+        $this->lineTo(Vec2($x + $w, $y));
+        $this->lineTo(Vec2($x + $w, $y + $h));
+        $this->lineTo(Vec2($x, $y + $h));
+        $this->close();
+    }
+
+    public function roundedRect(Vec2 $pos, Vec2 $size, float32 $r) : void
+    {
+        $this->roundedRect($pos, $size, $r, $r, $r, $r);
+    }
+
+    public function roundedRect(
+        Vec2 $pos,
+        Vec2 $size,
+        float32 $tl,
+        float32 $tr,
+        float32 $br,
+        float32 $bl
+    ) : void
+    {
+        float32 $w = $size->x;
+        float32 $h = $size->y;
+        float32 $rtl = clampCorner($tl, $w, $h);
+        float32 $rtr = clampCorner($tr, $w, $h);
+        float32 $rbr = clampCorner($br, $w, $h);
+        float32 $rbl = clampCorner($bl, $w, $h);
+        float32 $x = $pos->x;
+        float32 $y = $pos->y;
+
+        $this->moveTo(Vec2($x + $rtl, $y));
+        $this->lineTo(Vec2($x + $w - $rtr, $y));
+        cornerCubic($this, Vec2($x + $w - $rtr, $y), Vec2($x + $w, $y), Vec2($x + $w, $y + $rtr), $rtr);
+        $this->lineTo(Vec2($x + $w, $y + $h - $rbr));
+        cornerCubic($this, Vec2($x + $w, $y + $h - $rbr), Vec2($x + $w, $y + $h), Vec2($x + $w - $rbr, $y + $h), $rbr);
+        $this->lineTo(Vec2($x + $rbl, $y + $h));
+        cornerCubic($this, Vec2($x + $rbl, $y + $h), Vec2($x, $y + $h), Vec2($x, $y + $h - $rbl), $rbl);
+        $this->lineTo(Vec2($x, $y + $rtl));
+        cornerCubic($this, Vec2($x, $y + $rtl), Vec2($x, $y), Vec2($x + $rtl, $y), $rtl);
+        $this->close();
+    }
+
+    public function ellipse(Vec2 $center, Vec2 $radii) : void
+    {
+        float32 $cx = $center->x;
+        float32 $cy = $center->y;
+        float32 $rx = $radii->x;
+        float32 $ry = $radii->y;
+        float32 $kx = $rx * KAPPA90;
+        float32 $ky = $ry * KAPPA90;
+        $this->moveTo(Vec2($cx, $cy - $ry));
+        $this->bezierTo(Vec2($cx + $kx, $cy - $ry), Vec2($cx + $rx, $cy - $ky), Vec2($cx + $rx, $cy));
+        $this->bezierTo(Vec2($cx + $rx, $cy + $ky), Vec2($cx + $kx, $cy + $ry), Vec2($cx, $cy + $ry));
+        $this->bezierTo(Vec2($cx - $kx, $cy + $ry), Vec2($cx - $rx, $cy + $ky), Vec2($cx - $rx, $cy));
+        $this->bezierTo(Vec2($cx - $rx, $cy - $ky), Vec2($cx - $kx, $cy - $ry), Vec2($cx, $cy - $ry));
+        $this->close();
+    }
+
+    public function circle(Vec2 $center, float32 $r) : void
+    {
+        $this->ellipse($center, Vec2($r, $r));
+    }
+
+    public function arc(Vec2 $center, float32 $r, float32 $a0, float32 $a1, Winding $dir) : void
+    {
+        float32 $da = $a1 - $a0;
+
+        if ($dir == Winding::cw) {
+            if (std::math::abs($da) >= std::math::TAU_F32) {
+                $da = std::math::TAU_F32;
+            } else {
+                while ($da < 0.0f) {
+                    $da = $da + std::math::TAU_F32;
+                }
+            }
+        } else {
+            if (std::math::abs($da) >= std::math::TAU_F32) {
+                $da = -std::math::TAU_F32;
+            } else {
+                while ($da > 0.0f) {
+                    $da = $da - std::math::TAU_F32;
+                }
+            }
+        }
+
+        float32 $nd = std::math::abs($da) / (std::math::PI_F32 * 0.5f) + 0.5f;
+        int32 $ndivs = $nd as int32;
+
+        if ($ndivs < 1) {
+            $ndivs = 1;
+        }
+
+        if ($ndivs > 5) {
+            $ndivs = 5;
+        }
+
+        float32 $hda = ($da / ($ndivs as float32)) / 2.0f;
+        float32 $sn = std::math::sin($hda);
+        float32 $kappa = 0.0f;
+
+        if (std::math::abs($sn) > 0.000001f) {
+            $kappa = std::math::abs((4.0f / 3.0f) * (1.0f - std::math::cos($hda)) / $sn);
+        }
+
+        if ($dir == Winding::ccw) {
+            $kappa = -$kappa;
+        }
+
+        float32 $px = 0.0f;
+        float32 $py = 0.0f;
+        float32 $ptanx = 0.0f;
+        float32 $ptany = 0.0f;
+        int32 $i = 0;
+
+        while ($i <= $ndivs) {
+            float32 $a = $a0 + $da * (($i as float32) / ($ndivs as float32));
+            float32 $dx = std::math::cos($a);
+            float32 $dy = std::math::sin($a);
+            float32 $x = $center->x + $dx * $r;
+            float32 $y = $center->y + $dy * $r;
+            float32 $tanx = -$dy * $r * $kappa;
+            float32 $tany = $dx * $r * $kappa;
+
+            if ($i == 0) {
+                if ($this->hasLast) {
+                    $this->lineTo(Vec2($x, $y));
+                } else {
+                    $this->moveTo(Vec2($x, $y));
+                }
+            } else {
+                $this->bezierTo(
+                    Vec2($px + $ptanx, $py + $ptany),
+                    Vec2($x - $tanx, $y - $tany),
+                    Vec2($x, $y)
+                );
+            }
+
+            $px = $x;
+            $py = $y;
+            $ptanx = $tanx;
+            $ptany = $tany;
+            $i = $i + 1;
+        }
+    }
+
+    public const function bounds() : AABB2D
+    {
+        bool $any = false;
+        float32 $minX = 0.0f;
+        float32 $minY = 0.0f;
+        float32 $maxX = 0.0f;
+        float32 $maxY = 0.0f;
+
+        foreach ($this->ops as $op) {
+            if ($op->verb == PathVerb::close || $op->verb == PathVerb::winding) {
+                continue;
+            }
+
+            if (!$any) {
+                $minX = $op->p->x;
+                $minY = $op->p->y;
+                $maxX = $op->p->x;
+                $maxY = $op->p->y;
+                $any = true;
+            }
+
+            growBounds($op->p, $minX, $minY, $maxX, $maxY);
+
+            if ($op->verb == PathVerb::cubic) {
+                growBounds($op->c1, $minX, $minY, $maxX, $maxY);
+                growBounds($op->c2, $minX, $minY, $maxX, $maxY);
+            }
+        }
+
+        if (!$any) {
+            return AABB2D(Vec2(0.0f, 0.0f), Vec2(0.0f, 0.0f));
+        }
+
+        return AABB2D(Vec2($minX, $minY), Vec2($maxX, $maxY));
+    }
+}
+
+internal function clampCorner(float32 $r, float32 $w, float32 $h) : float32
+{
+    float32 $out = $r;
+
+    if ($out < 0.0f) {
+        $out = 0.0f;
+    }
+
+    float32 $m = $w;
+
+    if ($h < $m) {
+        $m = $h;
+    }
+
+    $m = $m * 0.5f;
+
+    if ($out > $m) {
+        $out = $m;
+    }
+
+    return $out;
+}
+
+internal function cornerCubic(Path $path, Vec2 $from, Vec2 $corner, Vec2 $to, float32 $r) : void
+{
+    if ($r <= 0.000001f) {
+        $path->lineTo($to);
+        return;
+    }
+
+    Vec2 $c1 = mixPoint($from, $corner, KAPPA90);
+    Vec2 $c2 = mixPoint($to, $corner, KAPPA90);
+    $path->bezierTo($c1, $c2, $to);
+}
+
+internal function mixPoint(Vec2 $a, Vec2 $b, float32 $t) : Vec2
+{
+    return $a + ($b - $a) * $t;
+}
+
+internal function growBounds(
+    Vec2 $p,
+    float32& $minX,
+    float32& $minY,
+    float32& $maxX,
+    float32& $maxY
+) : void
+{
+    if ($p->x < $minX) {
+        $minX = $p->x;
+    }
+
+    if ($p->y < $minY) {
+        $minY = $p->y;
+    }
+
+    if ($p->x > $maxX) {
+        $maxX = $p->x;
+    }
+
+    if ($p->y > $maxY) {
+        $maxY = $p->y;
+    }
+}

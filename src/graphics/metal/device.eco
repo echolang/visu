@@ -25,7 +25,10 @@ public class Device : DeviceProtocol
     internal int32 $drawableW;
     internal int32 $drawableH;
     internal bool $vsync;
+    internal int32 $presentHz;
+    internal float64 $contentsScale;
     internal bool $encoderOpen;
+    internal mtl::RenderCommandEncoder? $activeEnc;
     internal bool $inFrame;
     internal DeviceLimits $limits;
     internal AdapterInfo $adapterInfo;
@@ -33,7 +36,6 @@ public class Device : DeviceProtocol
     internal map<string, PipelineHandle> $psos;
     internal map<string, SamplerHandle> $samplerHandles;
     internal map<uint32, mtl::DepthStencilState> $depthStates;
-    internal ptr<uint8> $nsWindow;
     internal PixelFormat $bbFormat;
 
     public constructor()
@@ -54,7 +56,10 @@ public class Device : DeviceProtocol
         $this->drawableW = 0;
         $this->drawableH = 0;
         $this->vsync = true;
+        $this->presentHz = 0;
+        $this->contentsScale = 1.0;
         $this->encoderOpen = false;
+        $this->activeEnc = null;
         $this->inFrame = false;
         $this->limits = DeviceLimits();
         $this->limits->uniformAlign = 16;
@@ -65,7 +70,6 @@ public class Device : DeviceProtocol
         $this->psos = map<string, PipelineHandle>();
         $this->samplerHandles = map<string, SamplerHandle>();
         $this->depthStates = map<uint32, mtl::DepthStencilState>();
-        $this->nsWindow:$ = null;
         $this->bbFormat = .bgra8;
     }
 
@@ -117,11 +121,10 @@ public class Device : DeviceProtocol
         mtl::Device $gpu = guard $this->gpu else {
             return .error(.noDevice);
         }
-        mtl::Layer $layer = guard mtlAttachLayer($gpu, $surface->view, $width, $height) else ($e) {
+        mtl::Layer $layer = guard mtlAttachLayer($gpu, $surface->view, $width, $height, $this->contentsScale) else ($e) {
             return .error($e);
         }
         $this->layer = $layer;
-        $this->nsWindow:$ = $surface->view:$;
         $this->drawableW = $width;
         $this->drawableH = $height;
         $this->applyVsync();
@@ -143,7 +146,6 @@ public class Device : DeviceProtocol
         $this->bb = null;
         $this->drawable = null;
         $this->layer = null;
-        $this->nsWindow:$ = null;
     }
 
     public const function lost() : bool
@@ -153,11 +155,7 @@ public class Device : DeviceProtocol
 
     public function waitIdle() : void
     {
-        mtl::CommandBuffer $cmd = guard $this->cmd else {
-            $this->waitSlots();
-            return;
-        }
-        $cmd->waitUntilCompleted();
+        $this->abortFrame();
         $this->waitSlots();
     }
 
@@ -169,6 +167,19 @@ public class Device : DeviceProtocol
     public const function adapter() : AdapterInfo
     {
         return $this->adapterInfo;
+    }
+
+    public const function memory() : MemoryStats
+    {
+        if (!$this->ready) {
+            return MemoryStats();
+        }
+
+        MemoryStats $stats = MemoryStats();
+        $stats->used = visu_mtl_current_allocated();
+        $stats->budget = visu_mtl_working_set();
+        $stats->unified = visu_mtl_has_unified() != 0;
+        return $stats;
     }
 
     public function beginFrame(int32 $width, int32 $height) : result<FrameStatus, DeviceError>
@@ -196,10 +207,7 @@ public class Device : DeviceProtocol
         }
 
         FrameSlot $slot = $this->slots[$this->slot];
-        mtl::CommandBuffer $prev = guard $slot->prev else {
-            return $this->acquireFrame($width, $height);
-        }
-        $prev->waitUntilCompleted();
+        $slot->gpuDone->wait($slot->epoch);
         $slot->prev = null;
         return $this->acquireFrame($width, $height);
     }
@@ -209,22 +217,31 @@ public class Device : DeviceProtocol
         assert($this->inFrame, 'endFrame outside beginFrame');
         assert(!$this->encoderOpen, 'endFrame with an open encoder');
         $this->bb = null;
+        FrameSlot $slot = $this->slots[$this->slot];
         mtl::CommandBuffer $cmd = guard $this->cmd else {
             $this->inFrame = false;
             return .ok;
         }
+        $slot->epoch = $slot->epoch + 1;
+        $cmd->signal($slot->gpuDone, $slot->epoch);
         mtl::Drawable $drawable = guard $this->drawable else {
             $cmd->commit();
-            $this->slots[$this->slot]->prev = $cmd;
+            $slot->prev = $cmd;
             $this->cmd = null;
             $this->inFrame = false;
             $this->frames = $this->frames + 1;
             $this->slot = ($this->slot + 1) % FRAMES_IN_FLIGHT;
             return .ok;
         }
-        $cmd->present($drawable);
+
+        if ($this->vsync) {
+            $cmd->present($drawable);
+        } else {
+            $cmd->present($drawable, after: 0.0);
+        }
+
         $cmd->commit();
-        $this->slots[$this->slot]->prev = $cmd;
+        $slot->prev = $cmd;
         $this->cmd = null;
         $this->drawable = null;
         $this->inFrame = false;
@@ -269,6 +286,43 @@ public class Device : DeviceProtocol
 
         $this->vsync = $on;
         $this->applyVsync();
+    }
+
+    /**
+     * Metadata only. CAMetalLayer paces itself off the panel once
+     * displaySyncEnabled is on, so there is no rate to request.
+     */
+    public function setPresentRate(int32 $hz) : void
+    {
+        $this->presentHz = $hz;
+    }
+
+    public const function presentRate() : int32
+    {
+        return $this->presentHz;
+    }
+
+    /**
+     * Backing scale of the surface, as framebuffer pixels per point.
+     * See mtlLayerScale — the layer is view-hosted, so nobody else
+     * keeps this in step with drawableSize.
+     */
+    public function setContentsScale(float64 $scale) : void
+    {
+        if ($scale <= 0.0 || $this->contentsScale == $scale) {
+            return;
+        }
+
+        $this->contentsScale = $scale;
+        mtl::Layer $layer = guard $this->layer else {
+            return;
+        }
+        mtlLayerScale($layer, $scale);
+    }
+
+    public const function contentsScale() : float64
+    {
+        return $this->contentsScale;
     }
 
     public function beginRender(const RenderPassDesc& $desc) : RenderEncoder
@@ -321,6 +375,8 @@ public class Device : DeviceProtocol
         $pass->depthLoadAction = mtlLoadOp($depth->load);
         $pass->depthStoreAction = mtlStoreOp($depth->store);
         $pass->depthClear = $depth->clearDepth;
+        $formats->depth = $depth->texture->format;
+        $formats->hasDepth = true;
         $depthFmt = mtlPixelFormat($depth->texture->format);
         return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $first->texture->width, $first->texture->height);
     }
@@ -546,6 +602,7 @@ public class Device : DeviceProtocol
     internal function encoderClosed() : void
     {
         $this->encoderOpen = false;
+        $this->activeEnc = null;
     }
 
     public function shutdown() : void
@@ -605,22 +662,21 @@ public class Device : DeviceProtocol
             die('metal: renderCommandEncoder failed');
         }
         $this->encoderOpen = true;
+        $this->activeEnc = $enc;
         return RenderEncoder($this, $formats, $width, $height, $enc, $depthFmt);
     }
 
+    /**
+     * Only on a state change — never per frame. Each write opens an
+     * implicit CATransaction on the main thread, so doing this every
+     * frame dirties the layer and costs us the compositor fast path.
+     */
     private function applyVsync() : void
     {
-        if ($this->nsWindow:$ == null) {
+        mtl::Layer $owned = guard $this->layer else {
             return;
         }
-
-        int32 $on = 0;
-
-        if ($this->vsync) {
-            $on = 1;
-        }
-
-        visu_set_display_sync($this->nsWindow, $on);
+        $owned->setDisplaySync($this->vsync);
     }
 
     private function waitSlots() : void
@@ -640,14 +696,21 @@ public class Device : DeviceProtocol
 
     private function abortFrame() : void
     {
-        if ($this->encoderOpen) {
-            $this->encoderOpen = false;
+        mtl::RenderCommandEncoder? $held = $this->activeEnc;
+
+        if ($held != null) {
+            mtl::RenderCommandEncoder $enc = guard $held;
+            $enc->endEncoding();
         }
+
+        $this->encoderOpen = false;
+        $this->activeEnc = null;
 
         if ($this->inFrame) {
             mtl::CommandBuffer $cmd = guard $this->cmd else {
                 $this->inFrame = false;
                 $this->drawable = null;
+                $this->bb = null;
                 return;
             }
             $cmd->commit();
@@ -657,5 +720,6 @@ public class Device : DeviceProtocol
         }
 
         $this->drawable = null;
+        $this->bb = null;
     }
 }

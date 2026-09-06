@@ -1,0 +1,61 @@
+/**
+ * Graph node: tessellate and sync atlases, then beginRender and
+ * flush. Texture upload is illegal with an encoder open.
+ */
+
+namespace visu::vg;
+
+use visu::graphics::{
+    Context, Frame, IoSink, Pass, Pipeline, PipelineError, RenderEncoder, RenderTarget,
+    TargetRef
+};
+
+public class VgPass : Pass
+{
+    public const TargetRef $target;
+    private Canvas $canvas;
+    private function<void(Canvas)> $draw;
+
+    public constructor(Canvas $canvas, TargetRef $target, function<void(Canvas)> $draw)
+    {
+        $this->canvas = $canvas;
+        $this->target = $target;
+        $this->draw = $draw;
+    }
+
+    public function name() : string
+    {
+        return 'VgPass';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        $io->writes($this->target);
+    }
+
+    public function execute(Context $ctx) : status<PipelineError>
+    {
+        RenderTarget $rt = guard $ctx->pool->getTarget($this->target) else ($e) {
+            return .error(.pool($e));
+        }
+        float32 $scale = $rt->contentScaleX;
+
+        if ($scale < 0.0001f) {
+            $scale = 1.0f;
+        }
+
+        float32 $w = ($rt->width as float32) / $scale;
+        float32 $h = ($rt->height as float32) / $scale;
+        $this->canvas->begin($w, $h, $scale);
+        function<void(Canvas)> $draw = $this->draw;
+        $draw($this->canvas);
+        $this->canvas->sync();
+        RenderEncoder $enc = guard $ctx->beginRender($this->target) else ($e) {
+            $this->canvas->cancel();
+            return .error($e);
+        }
+        $this->canvas->flush($enc);
+        $enc->end();
+        return .ok;
+    }
+}

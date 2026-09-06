@@ -9,7 +9,7 @@
 namespace visu::quickstart;
 
 use std::env;
-use visu::app::{Paths, Services};
+use visu::app::{Paths, Services, info};
 use visu::ecs::{Entities, Systems};
 use visu::graphics::{
     Backbuffer, CallbackPass, ClearPass, ClearPassOptions, Context, Device,
@@ -19,6 +19,7 @@ use visu::graphics::{
 };
 use visu::math::Vec2;
 use visu::os::{ContextMap, Input, Window, WindowError, WindowHints};
+use visu::instrument::{Instruments, Overlay, Sample};
 use visu::runtime::{Delegate, EventLoop};
 use visu::signal::Dispatcher;
 
@@ -36,10 +37,12 @@ public class App : Delegate
     public Services $services;
     public Options $options;
     public EventLoop $events;
+    public Instruments $instruments;
     public int32 $frameIndex;
     public int32 $tickIndex;
     public PipelineError? $fail;
     private FullscreenTextureRenderer $blit;
+    private Overlay? $overlay;
 
     public constructor(Options $options, Services $services)
     {
@@ -61,10 +64,12 @@ public class App : Delegate
         $this->window->setHandler($this->input);
         $this->shaders = ShaderCollection($this->device, $this->shaderDir($services));
         $this->events = EventLoop();
+        $this->instruments = Instruments();
         $this->frameIndex = 0;
         $this->tickIndex = 0;
         $this->fail = null;
         $this->blit = FullscreenTextureRenderer();
+        $this->overlay = null;
     }
 
     public function initialize() : status<WindowError>
@@ -73,13 +78,20 @@ public class App : Delegate
             return .error($e);
         }
 
-        $this->device->setVsync($this->options->windowVsync);
+        int32 $interval = 0;
+
+        if ($this->options->windowVsync) {
+            $interval = 1;
+        }
+
+        $this->window->setSwapInterval($interval);
 
         guard $this->blit->load($this->device) else ($e) {
             $this->fail = .shader($e);
             return .ok;
         }
 
+        $this->bootOverlay();
         return .ok;
     }
 
@@ -141,6 +153,14 @@ public class App : Delegate
         $this->addDraw($pipeline);
         $pipeline->add(ClearPass($back->target, ClearPassOptions()));
         $this->blit->pass($pipeline, $back->target, $color);
+        Sample $sample = $this->instruments->sample();
+        Overlay? $maybeOverlay = $this->overlay;
+
+        if ($maybeOverlay != null) {
+            Overlay $overlay = guard $maybeOverlay;
+            $overlay->pass($pipeline, $back->target, $sample);
+        }
+
         $this->finishFrame($pipeline, $compensation);
     }
 
@@ -164,6 +184,19 @@ public class App : Delegate
     {
         $this->device->waitIdle();
         $this->systems->unregister($this->entities);
+        Overlay? $maybeOverlay = $this->overlay;
+
+        if ($maybeOverlay != null) {
+            Overlay $overlay = guard $maybeOverlay;
+            $overlay->destroy();
+            $this->overlay = null;
+        }
+
+        $this->teardownGpu();
+    }
+
+    private function teardownGpu() : void
+    {
         $this->shaders->destroy();
         $this->blit->destroy();
         $this->pool->destroy();
@@ -209,13 +242,40 @@ public class App : Delegate
 
     private function finishFrame(Pipeline $pipeline, float32 $compensation) : void
     {
-        guard $pipeline->execute($this->frameIndex, $compensation) else ($e) {
-            $this->fail = $e;
+        status<PipelineError> $exec = $pipeline->execute($this->frameIndex, $compensation);
+        bool $presented = $this->present();
+        guard $exec else ($e) {
+            if ($this->fail == null) {
+                $this->fail = $e;
+            }
+
             return;
         }
-        $this->window->swap();
+
+        if (!$presented) {
+            return;
+        }
+
         $this->input->endFrame();
         $this->frameIndex = $this->frameIndex + 1;
+    }
+
+    private function present() : bool
+    {
+        guard $this->window->swap() else ($e) {
+            match ($e) {
+                DeviceError::surfaceLost => {
+                    $this->window->setShouldClose(true);
+                    return false;
+                },
+                else => {
+                    $this->fail = .device($e);
+                    return false;
+                },
+            };
+        }
+
+        return true;
     }
 
     private function runCallback(function<void(App)>? $cb) : void
@@ -249,6 +309,22 @@ public class App : Delegate
         }
 
         return $hints;
+    }
+
+    private function bootOverlay() : void
+    {
+        if (!$this->options->instrumentOverlay || $this->options->windowHeadless) {
+            return;
+        }
+
+        Overlay $overlay = Overlay($this->device);
+        guard $overlay->load() else ($e) {
+            info("instrument overlay: {$e->message()}");
+            $overlay->destroy();
+            return;
+        }
+        $overlay->listen($this->dispatcher);
+        $this->overlay = $overlay;
     }
 
     private function shaderDir(Services $services) : string

@@ -1,0 +1,644 @@
+/**
+ * Immediate 2D canvas. Stores Device; tessellates on fill/stroke,
+ * uploads into the frame ring on flush. y-down, origin top-left,
+ * units in points.
+ */
+
+namespace visu::vg;
+
+use std::io;
+use visu::geo::AABB2D;
+use visu::graphics::{
+    Device, GpuPass, RenderEncoder, Sampler, ShaderProgram, Texture
+};
+use visu::math::{Vec2, Vec4};
+
+public class Canvas
+{
+    public Device $device;
+    private Path $path;
+    internal VgState $state;
+    private array<VgState> $stack;
+    internal TessMesh $mesh;
+    internal array<VgCall> $calls;
+    internal bool $open;
+    internal float32 $width;
+    internal float32 $height;
+    internal float32 $scale;
+    internal ShaderProgram? $program;
+    internal GpuPass? $pass;
+    internal Texture? $white;
+    internal Sampler? $sampler;
+    internal map<string, Font> $fonts;
+    private bool $dead;
+
+    public constructor(Device $device)
+    {
+        $this->device = $device;
+        $this->path = Path();
+        $this->state = defaultState(1.0f);
+        $this->stack = array<VgState>();
+        $this->mesh = TessMesh();
+        $this->calls = array<VgCall>();
+        $this->open = false;
+        $this->width = 1.0f;
+        $this->height = 1.0f;
+        $this->scale = 1.0f;
+        $this->program = null;
+        $this->pass = null;
+        $this->white = null;
+        $this->sampler = null;
+        $this->fonts = map<string, Font>();
+        $this->dead = false;
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->dead = true;
+        array<Font> $faces = $this->fonts->values();
+
+        foreach ($faces as $face) {
+            $face->destroy();
+        }
+
+        $this->fonts->clear();
+        ShaderProgram? $maybe = $this->program;
+
+        if ($maybe != null) {
+            ShaderProgram $prog = guard $maybe;
+            $prog->destroy();
+            $this->program = null;
+            $this->pass = null;
+        }
+
+        Texture? $white = $this->white;
+
+        if ($white != null) {
+            Texture $tex = guard $white;
+            $tex->destroy();
+            $this->white = null;
+        }
+
+        $this->sampler = null;
+    }
+
+    public function load() : status<VgError>
+    {
+        assert(!$this->dead, 'vg load after destroy');
+        return vgEnsureProgram($this);
+    }
+
+    public function begin(float32 $width, float32 $height, float32 $scale = 1.0f) : void
+    {
+        assert(!$this->dead, 'vg begin after destroy');
+        $this->width = $width;
+        $this->height = $height;
+        $this->scale = $scale;
+
+        if ($this->scale < 0.0001f) {
+            $this->scale = 0.0001f;
+        }
+
+        $this->path->clear();
+        $this->state = defaultState($this->scale);
+        $this->stack->clear();
+        $this->mesh->clear();
+        $this->calls->clear();
+        $this->mesh->verts->reserve(65536);
+        $this->mesh->indices->reserve(131072);
+        $this->open = true;
+        array<Font> $faces = $this->fonts->values();
+
+        foreach ($faces as $face) {
+            fontHandleOverflow($face);
+        }
+    }
+
+    public function cancel() : void
+    {
+        $this->mesh->clear();
+        $this->calls->clear();
+        $this->open = false;
+    }
+
+    public function save() : void
+    {
+        $this->stack[] = $this->state;
+    }
+
+    public function restore() : void
+    {
+        assert($this->stack->count() > 0, 'vg restore without save');
+        $this->state = $this->stack->pop();
+    }
+
+    public function reset() : void
+    {
+        $this->state = defaultState($this->scale);
+    }
+
+    public function translate(Vec2 $d) : void
+    {
+        $this->state->xform = Xform(translate: $d)->mul($this->state->xform);
+    }
+
+    public function rotate(float32 $radians) : void
+    {
+        $this->state->xform = Xform(rotate: $radians)->mul($this->state->xform);
+    }
+
+    public function scale(Vec2 $s) : void
+    {
+        $this->state->xform = Xform(scale: $s)->mul($this->state->xform);
+    }
+
+    public function resetTransform() : void
+    {
+        $this->state->xform = Xform();
+    }
+
+    public function transform(const Xform& $x) : void
+    {
+        $this->state->xform = $x->mul($this->state->xform);
+    }
+
+    public const function currentTransform() : Xform
+    {
+        return $this->state->xform;
+    }
+
+    public function fillColor(Color $c) : void
+    {
+        $this->state->fill = Paint($c);
+    }
+
+    public function fillPaint(Paint $p) : void
+    {
+        $this->state->fill = $p;
+    }
+
+    public function strokeColor(Color $c) : void
+    {
+        $this->state->strokePaint = Paint($c);
+    }
+
+    public function strokePaint(Paint $p) : void
+    {
+        $this->state->strokePaint = $p;
+    }
+
+    public function strokeWidth(float32 $w) : void
+    {
+        $this->state->strokeWidth = $w;
+    }
+
+    public function lineCap(LineCap $c) : void
+    {
+        $this->state->cap = $c;
+    }
+
+    public function lineJoin(LineJoin $j) : void
+    {
+        $this->state->join = $j;
+    }
+
+    public function miterLimit(float32 $limit) : void
+    {
+        $this->state->miterLimit = $limit;
+    }
+
+    public function globalAlpha(float32 $a) : void
+    {
+        $this->state->alpha = $a;
+    }
+
+    public function antiAlias(bool $on) : void
+    {
+        $this->state->antiAlias = $on;
+    }
+
+    public function createFont(string $name, string $path) : result<Font, VgError>
+    {
+        string $bytes = guard io::readfile($path) else {
+            return .error(.fontFile($path));
+        }
+
+        return $this->createFont(name: $name, bytes: $bytes);
+    }
+
+    public function createFont(name: string $name, bytes: string $bytes) : result<Font, VgError>
+    {
+        if ($this->fonts->has($name)) {
+            return .ok($this->fonts[$name]);
+        }
+
+        Font $font = guard fontLoad($this->device, $name, $bytes) else ($e) {
+            return .error($e);
+        }
+        $this->fonts[$name] = $font;
+        return .ok($font);
+    }
+
+    public function fontFace(string $name) : status<VgError>
+    {
+        if (!$this->fonts->has($name)) {
+            return .error(.missingFont($name));
+        }
+
+        $this->state->font = $this->fonts[$name];
+        return .ok;
+    }
+
+    public function fontFace(Font $font) : void
+    {
+        $this->state->font = $font;
+    }
+
+    public function fontSize(float32 $size) : void
+    {
+        $this->state->fontSize = $size;
+    }
+
+    public function textAlign(TextAlign $align) : void
+    {
+        $this->state->align = $align;
+    }
+
+    /**
+     * Upload dirty font atlases. Call after drawing, before
+     * `beginRender` — Device refuses texture uploads with an
+     * encoder open.
+     */
+    public function sync() : void
+    {
+        array<Font> $faces = $this->fonts->values();
+
+        foreach ($faces as $face) {
+            fontSync($face);
+        }
+    }
+
+    public function text(Vec2 $pos, const string& $s) : float32
+    {
+        assert($this->open, 'vg text outside begin');
+        return emitText($this, $pos, $s, true);
+    }
+
+    public function textBounds(Vec2 $pos, const string& $s) : AABB2D
+    {
+        TextLayout $layout = layoutText($this, $pos, $s, false);
+        return $layout->bounds;
+    }
+
+    public function scissor(Vec2 $pos, Vec2 $size, radius: float32 $r = 0.0f) : void
+    {
+        $this->state->scissor = makeScissor($pos, $size, $r, $this->state->xform);
+    }
+
+    public function intersectScissor(Vec2 $pos, Vec2 $size, radius: float32 $r = 0.0f) : void
+    {
+        Scissor $next = makeScissor($pos, $size, $r, $this->state->xform);
+
+        if ($this->state->scissor->full) {
+            $this->state->scissor = $next;
+            return;
+        }
+
+        AABB2D? $hit = intersectAabb($this->state->scissor->box, $next->box);
+        AABB2D $box = guard $hit else {
+            $this->state->scissor = $next;
+            $this->state->scissor->box = AABB2D(Vec2(0.0f, 0.0f), Vec2(0.0f, 0.0f));
+            $this->state->scissor->extent = Vec2(0.0f, 0.0f);
+            return;
+        }
+        $next->box = $box;
+        $next->extent = Vec2($box->width() * 0.5f, $box->height() * 0.5f);
+        $next->xform = Xform(translate: $box->center());
+        $this->state->scissor = $next;
+    }
+
+    public function resetScissor() : void
+    {
+        $this->state->scissor = Scissor();
+    }
+
+    public function transformPoint(Vec2 $user) : Vec2
+    {
+        return $this->state->xform->apply($user);
+    }
+
+    public function inversePoint(Vec2 $screen) : Vec2
+    {
+        Xform? $inv = $this->state->xform->invert();
+        assert($inv != null, 'vg inverse of singular xform');
+        Xform $ok = guard $inv;
+        return $ok->apply($screen);
+    }
+
+    public function contains(Vec2 $screen) : bool
+    {
+        return scissorContains($this->state->scissor, $screen);
+    }
+
+    public function scissorIntersects(Vec2 $pos, Vec2 $size) : bool
+    {
+        if ($this->state->scissor->full) {
+            return true;
+        }
+
+        Xform $x = $this->state->xform;
+        Vec2 $p0 = $x->apply($pos);
+        Vec2 $p1 = $x->apply($pos + Vec2($size->x, 0.0f));
+        Vec2 $p2 = $x->apply($pos + $size);
+        Vec2 $p3 = $x->apply($pos + Vec2(0.0f, $size->y));
+        float32 $minX = $p0->x;
+        float32 $minY = $p0->y;
+        float32 $maxX = $p0->x;
+        float32 $maxY = $p0->y;
+        growBounds($p1, $minX, $minY, $maxX, $maxY);
+        growBounds($p2, $minX, $minY, $maxX, $maxY);
+        growBounds($p3, $minX, $minY, $maxX, $maxY);
+        AABB2D $user = AABB2D(Vec2($minX, $minY), Vec2($maxX, $maxY));
+        return $this->state->scissor->box->intersects($user);
+    }
+
+    public function beginPath() : void
+    {
+        $this->path->clear();
+    }
+
+    public function moveTo(Vec2 $p) : void
+    {
+        $this->path->moveTo($p);
+    }
+
+    public function lineTo(Vec2 $p) : void
+    {
+        $this->path->lineTo($p);
+    }
+
+    public function bezierTo(Vec2 $c1, Vec2 $c2, Vec2 $p) : void
+    {
+        $this->path->bezierTo($c1, $c2, $p);
+    }
+
+    public function quadTo(Vec2 $c, Vec2 $p) : void
+    {
+        $this->path->quadTo($c, $p);
+    }
+
+    public function close() : void
+    {
+        $this->path->close();
+    }
+
+    public function winding(Winding $w) : void
+    {
+        $this->path->winding($w);
+    }
+
+    public function rect(Vec2 $pos, Vec2 $size) : void
+    {
+        $this->path->rect($pos, $size);
+    }
+
+    public function roundedRect(Vec2 $pos, Vec2 $size, float32 $r) : void
+    {
+        $this->path->roundedRect($pos, $size, $r);
+    }
+
+    public function ellipse(Vec2 $center, Vec2 $radii) : void
+    {
+        $this->path->ellipse($center, $radii);
+    }
+
+    public function circle(Vec2 $center, float32 $r) : void
+    {
+        $this->path->circle($center, $r);
+    }
+
+    public function arc(Vec2 $center, float32 $r, float32 $a0, float32 $a1, Winding $dir) : void
+    {
+        $this->path->arc($center, $r, $a0, $a1, $dir);
+    }
+
+    public function fill() : void
+    {
+        $this->fill($this->path);
+    }
+
+    public function stroke() : void
+    {
+        $this->stroke($this->path);
+    }
+
+    public function fill(Path $path) : void
+    {
+        assert($this->open, 'vg fill outside begin');
+        array<Contour> $cs = preparedContours($this, $path);
+        int32 $first = $this->mesh->indices->count() as int32;
+        tessFill($cs, pathFringe($this->state), $this->mesh);
+        int32 $count = ($this->mesh->indices->count() as int32) - $first;
+        pushCall($this, $first, $count, $this->state->fill);
+    }
+
+    public function stroke(Path $path) : void
+    {
+        assert($this->open, 'vg stroke outside begin');
+        array<Contour> $cs = preparedContours($this, $path);
+        int32 $first = $this->mesh->indices->count() as int32;
+        tessStroke(
+            $cs,
+            $this->state->strokeWidth * tessScale($this->state->xform),
+            $this->state->cap,
+            $this->state->join,
+            $this->state->miterLimit,
+            pathFringe($this->state),
+            $this->mesh
+        );
+        int32 $count = ($this->mesh->indices->count() as int32) - $first;
+        pushCall($this, $first, $count, $this->state->strokePaint);
+    }
+
+    public function fillRect(Vec2 $pos, Vec2 $size) : void
+    {
+        assert($this->open, 'vg fillRect outside begin');
+        emitSdfBox($this, $pos, $size, 0.0f);
+    }
+
+    public function strokeRect(Vec2 $pos, Vec2 $size) : void
+    {
+        Path $p = Path();
+        $p->rect($pos, $size);
+        $this->stroke($p);
+    }
+
+    public function fillRounded(Vec2 $pos, Vec2 $size, float32 $r) : void
+    {
+        assert($this->open, 'vg fillRounded outside begin');
+        emitSdfBox($this, $pos, $size, $r);
+    }
+
+    public function fillCircle(Vec2 $center, float32 $r) : void
+    {
+        assert($this->open, 'vg fillCircle outside begin');
+        float32 $rr = $r;
+
+        if ($rr < 0.0f) {
+            $rr = 0.0f;
+        }
+
+        Vec2 $ext = Vec2($rr, $rr);
+        emitSdfBox($this, $center - $ext, $ext * 2.0f, $rr);
+    }
+
+    public function strokeCircle(Vec2 $center, float32 $r) : void
+    {
+        Path $p = Path();
+        $p->circle($center, $r);
+        $this->stroke($p);
+    }
+
+    public function linearGradient(Vec2 $s, Vec2 $e, Color $inner, Color $outer) : Paint
+    {
+        Paint $p = Paint();
+        $p->kind = .linear;
+        $p->inner = $inner;
+        $p->outer = $outer;
+        Vec2 $d = $e - $s;
+        float32 $len = visu::math::length($d);
+
+        if ($len < 0.0001f) {
+            $p->kind = .color;
+            return $p;
+        }
+
+        float32 $ang = std::math::atan2($d->y, $d->x);
+        $p->xform = Xform(translate: $s)->mul(Xform(rotate: $ang));
+        $p->extent = Vec2($len, $len);
+        $p->radius = 0.0f;
+        $p->feather = $len;
+        return $p;
+    }
+
+    public function boxGradient(
+        Vec2 $pos,
+        Vec2 $size,
+        float32 $r,
+        float32 $feather,
+        Color $inner,
+        Color $outer
+    ) : Paint
+    {
+        Paint $p = Paint();
+        $p->kind = .box;
+        $p->inner = $inner;
+        $p->outer = $outer;
+        $p->xform = Xform(translate: $pos + $size * 0.5f);
+        $p->extent = $size * 0.5f;
+        $p->radius = $r;
+        $p->feather = $feather;
+        return $p;
+    }
+
+    public function radialGradient(
+        Vec2 $center,
+        float32 $inr,
+        float32 $outr,
+        Color $inner,
+        Color $outer
+    ) : Paint
+    {
+        Paint $p = Paint();
+        $p->kind = .radial;
+        $p->inner = $inner;
+        $p->outer = $outer;
+        $p->xform = Xform(translate: $center);
+        float32 $r = $outr;
+
+        if ($r < $inr) {
+            $r = $inr;
+        }
+
+        $p->extent = Vec2($r, $r);
+        $p->radius = $inr;
+        $p->feather = $outr - $inr;
+
+        if ($p->feather < 0.0001f) {
+            $p->feather = 0.0001f;
+        }
+
+        return $p;
+    }
+
+    public function flush(RenderEncoder $enc) : void
+    {
+        assert($this->open, 'vg flush outside begin');
+        $this->open = false;
+        flushCanvas($this, $enc);
+    }
+}
+
+internal function pathFringe(const VgState& $state) : float32
+{
+    if ($state->antiAlias) {
+        return 0.5f;
+    }
+
+    return 0.0f;
+}
+
+internal function preparedContours(Canvas $vg, Path $path) : array<Contour>
+{
+    array<Contour> $cs = flattenPath($path, tessTol($vg->state->xform));
+    transformContours($cs, $vg->state->xform);
+    return $cs;
+}
+
+internal function emitSdfBox(Canvas $vg, Vec2 $pos, Vec2 $size, float32 $r) : void
+{
+    float32 $w = $size->x;
+    float32 $h = $size->y;
+
+    if ($w <= 0.0f || $h <= 0.0f) {
+        return;
+    }
+
+    float32 $rr = clampCorner($r, $w, $h);
+    float32 $pad = 0.0f;
+
+    if ($vg->state->antiAlias) {
+        $pad = 1.0f / tessScale($vg->state->xform);
+    }
+
+    float32 $x0 = $pos->x - $pad;
+    float32 $y0 = $pos->y - $pad;
+    float32 $x1 = $pos->x + $w + $pad;
+    float32 $y1 = $pos->y + $h + $pad;
+    float32 $cx = $pos->x + $w * 0.5f;
+    float32 $cy = $pos->y + $h * 0.5f;
+    Vec4 $shape = Vec4($w * 0.5f, $h * 0.5f, $rr, 1.0f);
+    Xform $xf = $vg->state->xform;
+    int32 $first = $vg->mesh->indices->count() as int32;
+    uint32 $base = $vg->mesh->verts->count() as uint32;
+    $vg->mesh->verts[] = VgVertex($xf->apply(Vec2($x0, $y0)), Vec2($x0 - $cx, $y0 - $cy), $shape);
+    $vg->mesh->verts[] = VgVertex($xf->apply(Vec2($x1, $y0)), Vec2($x1 - $cx, $y0 - $cy), $shape);
+    $vg->mesh->verts[] = VgVertex($xf->apply(Vec2($x1, $y1)), Vec2($x1 - $cx, $y1 - $cy), $shape);
+    $vg->mesh->verts[] = VgVertex($xf->apply(Vec2($x0, $y1)), Vec2($x0 - $cx, $y1 - $cy), $shape);
+    $vg->mesh->indices[] = $base;
+    $vg->mesh->indices[] = ($base + 1) as uint32;
+    $vg->mesh->indices[] = ($base + 2) as uint32;
+    $vg->mesh->indices[] = $base;
+    $vg->mesh->indices[] = ($base + 2) as uint32;
+    $vg->mesh->indices[] = ($base + 3) as uint32;
+    pushCall($vg, $first, 6, $vg->state->fill);
+}

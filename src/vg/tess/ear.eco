@@ -1,0 +1,422 @@
+/**
+ * Ear clipping and hole linking. Output is a triangle list of
+ * indices into the combined point array.
+ */
+
+namespace visu::vg;
+
+use visu::math::Vec2;
+
+internal function polygonArea(const array<Vec2>& $pts) : float32
+{
+    usize $n = $pts->count();
+    float32 $a = 0.0f;
+    usize $i = 0;
+
+    while ($i < $n) {
+        usize $j = $i + 1;
+
+        if ($j == $n) {
+            $j = 0;
+        }
+
+        $a = $a + $pts[$i]->x * $pts[$j]->y - $pts[$j]->x * $pts[$i]->y;
+        $i = $i + 1;
+    }
+
+    return $a * 0.5f;
+}
+
+internal function isConvexPoly(const array<Vec2>& $pts) : bool
+{
+    usize $n = $pts->count();
+
+    if ($n < 3) {
+        return false;
+    }
+
+    float32 $sign = 0.0f;
+    usize $i = 0;
+
+    while ($i < $n) {
+        Vec2 $p0 = $pts[$i];
+        Vec2 $p1 = $pts[($i + 1) % $n];
+        Vec2 $p2 = $pts[($i + 2) % $n];
+        float32 $c = cross2($p1 - $p0, $p2 - $p1);
+
+        if (std::math::abs($c) > 0.00000001f) {
+            if ($sign == 0.0f) {
+                $sign = $c;
+            } else if ($c * $sign < 0.0f) {
+                return false;
+            }
+        }
+
+        $i = $i + 1;
+    }
+
+    return true;
+}
+
+internal function reversePoints(array<Vec2>& $pts) : void
+{
+    usize $n = $pts->count();
+
+    if ($n < 2) {
+        return;
+    }
+
+    usize $i = 0;
+    usize $j = $n - 1;
+
+    while ($i < $j) {
+        Vec2 $tmp = $pts[$i];
+        $pts[$i] = $pts[$j];
+        $pts[$j] = $tmp;
+        $i = $i + 1;
+        $j = $j - 1;
+    }
+}
+
+internal function ensureCcw(array<Vec2>& $pts) : void
+{
+    if (polygonArea($pts) < 0.0f) {
+        reversePoints($pts);
+    }
+}
+
+internal function ensureCw(array<Vec2>& $pts) : void
+{
+    if (polygonArea($pts) > 0.0f) {
+        reversePoints($pts);
+    }
+}
+
+internal function cross2(Vec2 $a, Vec2 $b) : float32
+{
+    return $a->x * $b->y - $a->y * $b->x;
+}
+
+internal function pointInTri(Vec2 $p, Vec2 $a, Vec2 $b, Vec2 $c) : bool
+{
+    float32 $c1 = cross2($b - $a, $p - $a);
+    float32 $c2 = cross2($c - $b, $p - $b);
+    float32 $c3 = cross2($a - $c, $p - $c);
+    bool $neg = $c1 < 0.0f || $c2 < 0.0f || $c3 < 0.0f;
+    bool $pos = $c1 > 0.0f || $c2 > 0.0f || $c3 > 0.0f;
+    return !($neg && $pos);
+}
+
+internal function pointInPoly(Vec2 $p, const array<Vec2>& $pts) : bool
+{
+    usize $n = $pts->count();
+
+    if ($n < 3) {
+        return false;
+    }
+
+    bool $inside = false;
+    usize $i = 0;
+    usize $j = $n - 1;
+
+    while ($i < $n) {
+        Vec2 $a = $pts[$i];
+        Vec2 $b = $pts[$j];
+        bool $cross = ($a->y > $p->y) != ($b->y > $p->y);
+
+        if ($cross) {
+            float32 $xint = ($b->x - $a->x) * ($p->y - $a->y) / ($b->y - $a->y) + $a->x;
+
+            if ($p->x < $xint) {
+                $inside = !$inside;
+            }
+        }
+
+        $j = $i;
+        $i = $i + 1;
+    }
+
+    return $inside;
+}
+
+internal function contourParent(const array<Contour>& $cs) : array<int32>
+{
+    usize $n = $cs->count();
+    array<int32> $parent = array<int32>();
+    $parent->reserve($n);
+    usize $i = 0;
+
+    while ($i < $n) {
+        $parent[] = -1;
+        $i = $i + 1;
+    }
+
+    $i = 0;
+
+    while ($i < $n) {
+        if ($cs[$i]->pts->count() < 3) {
+            $i = $i + 1;
+            continue;
+        }
+
+        Vec2 $pt = $cs[$i]->pts[0];
+        float32 $self = std::math::abs(polygonArea($cs[$i]->pts));
+        float32 $best = 0.0f;
+        bool $found = false;
+        usize $j = 0;
+
+        while ($j < $n) {
+            if ($j == $i || $cs[$j]->pts->count() < 3) {
+                $j = $j + 1;
+                continue;
+            }
+
+            float32 $a = std::math::abs(polygonArea($cs[$j]->pts));
+
+            if ($a <= $self) {
+                $j = $j + 1;
+                continue;
+            }
+
+            if (pointInPoly($pt, $cs[$j]->pts)) {
+                if (!$found || $a < $best) {
+                    $best = $a;
+                    $parent[$i] = $j as int32;
+                    $found = true;
+                }
+            }
+
+            $j = $j + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    return $parent;
+}
+
+internal function contourDepth(const array<int32>& $parent, usize $i) : int32
+{
+    int32 $depth = 0;
+    int32 $p = $parent[$i];
+    int32 $guard = $parent->count() as int32;
+
+    while ($p >= 0 && $depth < $guard) {
+        $depth = $depth + 1;
+        $p = $parent[$p as usize];
+    }
+
+    return $depth;
+}
+
+internal function copyPoints(const array<Vec2>& $src) : array<Vec2>
+{
+    array<Vec2> $out = array<Vec2>();
+    $out->reserve($src->count());
+    usize $i = 0;
+    usize $n = $src->count();
+
+    while ($i < $n) {
+        $out[] = $src[$i];
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function linkHole(const array<Vec2>& $outer, const array<Vec2>& $hole) : array<Vec2>
+{
+    usize $hn = $hole->count();
+    usize $on = $outer->count();
+
+    if ($hn == 0 || $on == 0) {
+        return copyPoints($outer);
+    }
+
+    usize $hr = 0;
+    float32 $maxX = $hole[0]->x;
+    usize $i = 1;
+
+    while ($i < $hn) {
+        if ($hole[$i]->x > $maxX) {
+            $maxX = $hole[$i]->x;
+            $hr = $i;
+        }
+
+        $i = $i + 1;
+    }
+
+    usize $oi = 0;
+    float32 $best = 1000000000.0f;
+    $i = 0;
+
+    while ($i < $on) {
+        float32 $dx = $outer[$i]->x - $hole[$hr]->x;
+        float32 $dy = $outer[$i]->y - $hole[$hr]->y;
+        float32 $d = $dx * $dx + $dy * $dy;
+
+        if ($d < $best) {
+            $best = $d;
+            $oi = $i;
+        }
+
+        $i = $i + 1;
+    }
+
+    array<Vec2> $out = array<Vec2>();
+    $out->reserve($on + $hn + 2);
+    $i = 0;
+
+    while ($i <= $oi) {
+        $out[] = $outer[$i];
+        $i = $i + 1;
+    }
+
+    usize $k = 0;
+
+    while ($k <= $hn) {
+        $out[] = $hole[($hr + $k) % $hn];
+        $k = $k + 1;
+    }
+
+    $out[] = $outer[$oi];
+    $i = $oi + 1;
+
+    while ($i < $on) {
+        $out[] = $outer[$i];
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function earClip(const array<Vec2>& $pts) : array<uint32>
+{
+    array<uint32> $indices = array<uint32>();
+    usize $n = $pts->count();
+
+    if ($n < 3) {
+        return $indices;
+    }
+
+    if ($n == 3) {
+        $indices[] = 0 as uint32;
+        $indices[] = 1 as uint32;
+        $indices[] = 2 as uint32;
+        return $indices;
+    }
+
+    if (isConvexPoly($pts)) {
+        usize $i = 1;
+
+        while ($i + 1 < $n) {
+            $indices[] = 0 as uint32;
+            $indices[] = $i as uint32;
+            $indices[] = ($i + 1) as uint32;
+            $i = $i + 1;
+        }
+
+        return $indices;
+    }
+
+    array<int32> $rest = array<int32>();
+    $rest->reserve($n);
+    usize $i = 0;
+
+    while ($i < $n) {
+        $rest[] = $i as int32;
+        $i = $i + 1;
+    }
+
+    int32 $guard = ($n as int32) * ($n as int32);
+    int32 $steps = 0;
+
+    while ($rest->count() > 3 && $steps < $guard) {
+        $steps = $steps + 1;
+        usize $m = $rest->count();
+        bool $cut = false;
+        usize $e = 0;
+
+        while ($e < $m) {
+            usize $prev = $e;
+
+            if ($prev == 0) {
+                $prev = $m - 1;
+            } else {
+                $prev = $e - 1;
+            }
+
+            usize $next = $e + 1;
+
+            if ($next == $m) {
+                $next = 0;
+            }
+
+            int32 $ia = $rest[$prev];
+            int32 $ib = $rest[$e];
+            int32 $ic = $rest[$next];
+            Vec2 $a = $pts[$ia as usize];
+            Vec2 $b = $pts[$ib as usize];
+            Vec2 $c = $pts[$ic as usize];
+
+            if (cross2($b - $a, $c - $b) <= 0.0f) {
+                $e = $e + 1;
+                continue;
+            }
+
+            bool $empty = true;
+            usize $t = 0;
+
+            while ($t < $m) {
+                if ($t == $prev || $t == $e || $t == $next) {
+                    $t = $t + 1;
+                    continue;
+                }
+
+                if (pointInTri($pts[$rest[$t] as usize], $a, $b, $c)) {
+                    $empty = false;
+                    break;
+                }
+
+                $t = $t + 1;
+            }
+
+            if (!$empty) {
+                $e = $e + 1;
+                continue;
+            }
+
+            $indices[] = $ia as uint32;
+            $indices[] = $ib as uint32;
+            $indices[] = $ic as uint32;
+            $rest->remove($e);
+            $cut = true;
+            break;
+        }
+
+        if (!$cut) {
+            usize $left = $rest->count();
+
+            if ($left >= 3) {
+                usize $r = 1;
+
+                while ($r + 1 < $left) {
+                    $indices[] = $rest[0] as uint32;
+                    $indices[] = $rest[$r] as uint32;
+                    $indices[] = $rest[$r + 1] as uint32;
+                    $r = $r + 1;
+                }
+            }
+
+            break;
+        }
+    }
+
+    if ($rest->count() == 3) {
+        $indices[] = $rest[0] as uint32;
+        $indices[] = $rest[1] as uint32;
+        $indices[] = $rest[2] as uint32;
+    }
+
+    return $indices;
+}

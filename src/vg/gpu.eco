@@ -1,0 +1,201 @@
+/**
+ * Baked vg program, 1×1 white, mesh upload, and flush.
+ */
+
+namespace visu::vg;
+
+use visu::graphics::{
+    Device, GpuPass, Raster, RenderEncoder, ResourceState, Sampler, SamplerDesc,
+    ScratchSlice, ShaderProgram, Texture, TextureDesc, VertexBuilder, VertexLayout
+};
+use visu::math::{Vec2, Vec4};
+
+internal function vgEnsureProgram(Canvas $vg) : status<VgError>
+{
+    if ($vg->program != null) {
+        return .ok;
+    }
+
+    ShaderProgram $prog = guard ShaderProgram::link(
+        $vg->device,
+        'vg',
+        vgVertexBytes(),
+        vgFragmentBytes()
+    ) else ($e) {
+        return .error(.shader($e->message()));
+    }
+    $vg->program = $prog;
+    Raster $raster = Raster();
+    $raster->blend = .premultiplied;
+    $raster->depthTest = false;
+    $raster->depthWrite = false;
+    $vg->pass = GpuPass($prog, VertexLayout::build(function(VertexBuilder $b) : void {
+        $b->attr<Vec2>(0);
+        $b->attr<Vec2>(1);
+        $b->attr<Vec4>(2);
+    }), $raster);
+    ensureWhite($vg);
+    return .ok;
+}
+
+internal function ensureWhite(Canvas $vg) : void
+{
+    if ($vg->white != null) {
+        return;
+    }
+
+    TextureDesc $desc = TextureDesc($format: .rgba8, $width: 1, $height: 1);
+    Texture $tex = Texture($vg->device, 'vg-white', $desc);
+    array<uint8> $px = array<uint8>();
+    $px[] = 255;
+    $px[] = 255;
+    $px[] = 255;
+    $px[] = 255;
+    $tex->upload(0, $px->data(), 4, 4);
+    $vg->device->transition($tex, ResourceState::shaderRead);
+    $vg->white = $tex;
+    $vg->sampler = $vg->device->sampler(SamplerDesc());
+}
+
+internal function uploadMesh(Device $device, RenderEncoder $enc, TessMesh $mesh) : void
+{
+    usize $nv = $mesh->verts->count();
+    usize $ni = $mesh->indices->count();
+    assert($nv > 0 && $ni > 0, 'vg empty mesh');
+    uint64 $vb = ($nv as uint64) * (mem::size<VgVertex>() as uint64);
+    uint64 $ib = ($ni as uint64) * (mem::size<uint32>() as uint64);
+    ScratchSlice $vs = $device->scratch($vb, 4);
+    ScratchSlice $is = $device->scratch($ib, 4);
+    ptr<VgVertex> $vsrc = $mesh->verts->data();
+    ptr<uint32> $isrc = $mesh->indices->data();
+    mem::copy<VgVertex>(ptr<VgVertex>($vs->data:$), $vsrc, $nv);
+    mem::copy<uint32>(ptr<uint32>($is->data:$), $isrc, $ni);
+    $enc->setVertexScratch(0, $vs);
+    $enc->setIndexScratch($is, .uint32);
+}
+
+internal function makeFrag(const VgCall& $call, float32 $pxW, float32 $pxH) : VgFrag
+{
+    VgFrag $f = VgFrag();
+    $f->view = Vec4($pxW, $pxH, 0.0f, 0.0f);
+    Color $inner = $call->paint->inner;
+    Color $outer = $call->paint->outer;
+    $inner->a = $inner->a * $call->alpha;
+    $outer->a = $outer->a * $call->alpha;
+    $f->inner = $inner->premultiplied();
+    $f->outer = $outer->premultiplied();
+    packScissor($call->scissor, $f);
+    Xform $px = $call->paint->xform;
+    Xform $inv = Xform();
+    Xform? $maybeInv = $px->invert();
+
+    if ($maybeInv != null) {
+        Xform $ok = guard $maybeInv;
+        $inv = $ok;
+    }
+
+    $f->paint0 = Vec4($inv->a, $inv->b, $inv->c, $inv->d);
+    $f->paint1 = Vec4($inv->e, $inv->f, 0.0f, 0.0f);
+    $f->extent = Vec4(
+        $call->paint->extent->x,
+        $call->paint->extent->y,
+        $call->paint->radius,
+        $call->paint->feather
+    );
+    $f->stroke = Vec4(paintType($call->paint->kind), 0.0f, 0.0f, 0.0f);
+    return $f;
+}
+
+internal function paintType(PaintKind $kind) : float32
+{
+    return match ($kind) {
+        PaintKind::color => 0.0f,
+        PaintKind::box => 0.0f,
+        PaintKind::alpha => 2.0f,
+        PaintKind::linear => 3.0f,
+        PaintKind::radial => 4.0f,
+    };
+}
+
+internal function packScissor(const Scissor& $s, VgFrag& $f) : void
+{
+    if ($s->full) {
+        $f->scissorExt = Vec4(0.0f, 0.0f, 0.0f, 0.0f);
+        $f->scissor0 = Vec4(1.0f, 0.0f, 0.0f, 1.0f);
+        $f->scissor1 = Vec4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    Xform? $inv = $s->xform->invert();
+    Xform $ok = guard $inv else {
+        $f->scissorExt = Vec4(0.0f, 0.0f, 0.0f, 0.0f);
+        $f->scissor0 = Vec4(1.0f, 0.0f, 0.0f, 1.0f);
+        $f->scissor1 = Vec4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+    $f->scissor0 = Vec4($ok->a, $ok->b, $ok->c, $ok->d);
+    $f->scissor1 = Vec4($ok->e, $ok->f, 0.0f, 0.0f);
+    $f->scissorExt = Vec4($s->extent->x, $s->extent->y, $s->radius, 1.0f);
+}
+
+internal function applyGpuScissor(RenderEncoder $enc, const Scissor& $s, int32 $fbW, int32 $fbH) : void
+{
+    if ($s->full) {
+        $enc->setScissor(0, 0, $fbW, $fbH);
+        return;
+    }
+
+    $enc->setScissor(
+        $s->box->min->x as int32,
+        $s->box->min->y as int32,
+        $s->box->width() as int32,
+        $s->box->height() as int32
+    );
+}
+
+internal function flushCanvas(Canvas $vg, RenderEncoder $enc) : void
+{
+    if ($vg->calls->count() == 0 || $vg->mesh->indices->count() == 0) {
+        return;
+    }
+
+    guard vgEnsureProgram($vg) else {
+        return;
+    }
+    GpuPass $pass = guard $vg->pass;
+    $pass->bind($enc);
+    Texture $white = guard $vg->white;
+    Sampler $samp = guard $vg->sampler;
+    $enc->bindTexture(0, $white, $samp);
+    Texture $bound = $white;
+    uploadMesh($vg->device, $enc, $vg->mesh);
+    float32 $pxW = $vg->width * $vg->scale;
+    float32 $pxH = $vg->height * $vg->scale;
+
+    foreach ($vg->calls as $call) {
+        if ($call->count <= 0) {
+            continue;
+        }
+
+        Texture $tex = $white;
+        Texture? $maybeTex = $call->texture;
+
+        if ($maybeTex != null) {
+            Texture $callTex = guard $maybeTex;
+            $tex = $callTex;
+        }
+
+        if ($tex != $bound) {
+            $enc->bindTexture(0, $tex, $samp);
+            $bound = $tex;
+        }
+
+        VgFrag $frag = makeFrag($call, $pxW, $pxH);
+        $enc->upload($frag, slot: 0);
+        applyGpuScissor($enc, $call->scissor, $pxW as int32, $pxH as int32);
+        $enc->drawIndexed($call->first, $call->count);
+    }
+
+    $vg->mesh->clear();
+    $vg->calls->clear();
+}

@@ -48,7 +48,16 @@ while (!$window->shouldClose() && !visu::finiteDone($frame)) {
         $desc->colors[] = $color;
         $enc = $device->beginRender($desc);
         $enc->end();
-        $window->swap();
+        guard $window->swap() else ($e) {
+            match ($e) {
+                DeviceError::surfaceLost => {
+                    break;
+                },
+                else => {
+                    die($e->message());
+                },
+            };
+        }
     }
 
     $window->poll();

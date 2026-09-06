@@ -1,0 +1,62 @@
+/**
+ * App gauges and a custom Source merge onto Sample.
+ */
+
+use visu::graphics::MemoryStats;
+use visu::instrument::{Instruments, Sink, Source, Unit};
+
+class WeatherSource : Source
+{
+    public function collect(Sink $sink) : void
+    {
+        $sink->gauge('temp', 21.5, .ratio);
+        MemoryStats $mem = MemoryStats();
+        $mem->used = 4096;
+        $sink->memory($mem);
+    }
+}
+
+test instruments_gauge_and_source_merge
+{
+    Instruments $inst = Instruments();
+    $inst->gauge('entities', 12.0, .count);
+    $inst->add(WeatherSource());
+    $sample = $inst->sample();
+    assert($sample->memory->used == 4096, 'source memory');
+    assert($sample->gauges->count() == 2, 'two gauges');
+    bool $sawEntities = false;
+    bool $sawTemp = false;
+    array<visu::instrument::Gauge> $gauges = $sample->gauges;
+
+    foreach ($gauges as $g) {
+        if ($g->name == 'entities') {
+            $sawEntities = true;
+            assert($g->value == 12.0, 'entities');
+        }
+
+        if ($g->name == 'temp') {
+            $sawTemp = true;
+        }
+    }
+
+    assert($sawEntities, 'entities gauge');
+    assert($sawTemp, 'temp gauge');
+}
+
+test instruments_app_gauge_wins_on_name
+{
+    Instruments $inst = Instruments();
+    $inst->add(WeatherSource());
+    $inst->gauge('temp', 99.0, .ratio);
+    $sample = $inst->sample();
+    array<visu::instrument::Gauge> $gauges = $sample->gauges;
+    float64 $temp = 0.0;
+
+    foreach ($gauges as $g) {
+        if ($g->name == 'temp') {
+            $temp = $g->value;
+        }
+    }
+
+    assert($temp == 99.0, 'app wins');
+}

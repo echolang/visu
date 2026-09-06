@@ -9,7 +9,8 @@ internal function mtlAttachLayer(
     mtl::Device $gpu,
     ptr<uint8> $view,
     int32 $width,
-    int32 $height
+    int32 $height,
+    float64 $scale
 ) : result<mtl::Layer, DeviceError>
 {
     if ($view:$ == null) {
@@ -18,6 +19,8 @@ internal function mtlAttachLayer(
 
     mtl::Layer $layer = mtl::Layer(attachView: $view, $gpu);
     $layer->setFramebufferOnly(true);
+    $layer->setMaximumDrawableCount(3);
+    mtlLayerScale($layer, $scale);
 
     if ($width > 0 && $height > 0) {
         $layer->setDrawableSize(mtl::Size($width as usize, $height as usize));
@@ -33,4 +36,22 @@ internal function mtlResizeLayer(mtl::Layer $layer, int32 $width, int32 $height)
     }
 
     $layer->setDrawableSize(mtl::Size($width as usize, $height as usize));
+}
+
+/**
+ * The layer is view-hosted (setLayer: + setWantsLayer:), so AppKit
+ * does not maintain contentsScale for us and GLFW cannot either —
+ * it never learns about this layer. Leaving it at 1.0 while
+ * drawableSize is the backing size breaks the
+ * `drawableSize == bounds * contentsScale` invariant, and the
+ * WindowServer then resamples every frame instead of scanning the
+ * surface out directly, which pins the window to 60 Hz.
+ */
+internal function mtlLayerScale(mtl::Layer $layer, float64 $scale) : void
+{
+    if ($scale <= 0.0) {
+        return;
+    }
+
+    $layer->setContentsScale($scale);
 }

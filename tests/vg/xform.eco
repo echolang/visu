@@ -1,0 +1,40 @@
+/**
+ * Affine apply, mul, invert.
+ */
+
+use visu::math::{Vec2, equal};
+use visu::vg::Xform;
+
+test xform_translate_apply
+{
+    Xform $t = Xform(translate: Vec2(10.0f, 20.0f));
+    Vec2 $p = $t->apply(Vec2(1.0f, 2.0f));
+    assert(equal($p, Vec2(11.0f, 22.0f)), 'translate');
+}
+
+test xform_invert_translate_roundtrip
+{
+    Xform $t = Xform(translate: Vec2(10.0f, 20.0f));
+    Xform? $maybe = $t->invert();
+    assert($maybe != null, 'invert');
+    Xform $inv = guard $maybe;
+    Vec2 $p = Vec2(3.0f, 4.0f);
+    Vec2 $back = $inv->apply($t->apply($p));
+    assert(equal($back, $p), 'roundtrip');
+}
+
+test xform_mul_scale_then_translate
+{
+    Xform $s = Xform(scale: Vec2(2.0f, 3.0f));
+    Xform $t = Xform(translate: Vec2(1.0f, 1.0f));
+    Xform $st = $t->mul($s);
+    Vec2 $p = $st->apply(Vec2(1.0f, 1.0f));
+    assert(equal($p, Vec2(3.0f, 4.0f)), 's then t');
+}
+
+test xform_identity
+{
+    Xform $i = Xform::identity();
+    Vec2 $p = $i->apply(Vec2(5.0f, 7.0f));
+    assert(equal($p, Vec2(5.0f, 7.0f)), 'id');
+}

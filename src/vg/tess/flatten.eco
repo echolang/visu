@@ -1,0 +1,159 @@
+/**
+ * Path commands → polylines. Adaptive cubic subdivision.
+ */
+
+namespace visu::vg;
+
+use visu::math::{Vec2, length2};
+
+internal function flattenPath(Path $path, float32 $tessTol) : array<Contour>
+{
+    array<Contour> $out = array<Contour>();
+    Contour $cur = Contour();
+    bool $open = false;
+    Vec2 $start = Vec2(0.0f, 0.0f);
+    Vec2 $last = Vec2(0.0f, 0.0f);
+    float32 $tol2 = $tessTol * $tessTol;
+
+    if ($tol2 < 0.000000000001f) {
+        $tol2 = 0.000000000001f;
+    }
+
+    foreach ($path->ops as $op) {
+        match ($op->verb) {
+            PathVerb::move => {
+                if ($open && $cur->pts->count() > 0) {
+                    $out[] = $cur;
+                }
+
+                $cur = Contour();
+                $cur->pts[] = $op->p;
+                $start = $op->p;
+                $last = $op->p;
+                $open = true;
+            }
+            PathVerb::line => {
+                if (!$open) {
+                    $cur = Contour();
+                    $cur->pts[] = $op->p;
+                    $start = $op->p;
+                    $last = $op->p;
+                    $open = true;
+                } else {
+                    pushPoint($cur, $op->p, $tol2, $last);
+                }
+            }
+            PathVerb::cubic => {
+                if (!$open) {
+                    $cur = Contour();
+                    $cur->pts[] = $op->c1;
+                    $start = $op->c1;
+                    $last = $op->c1;
+                    $open = true;
+                }
+
+                flattenCubic($last, $op->c1, $op->c2, $op->p, $tol2, 0, $cur, $last);
+            }
+            PathVerb::close => {
+                if ($open && $cur->pts->count() > 0) {
+                    $cur->closed = true;
+                    $out[] = $cur;
+                }
+
+                $cur = Contour();
+                $open = false;
+            }
+            PathVerb::winding => {
+                if ($open) {
+                    $cur->winding = $op->wind;
+                } else if ($out->count() > 0) {
+                    usize $lastC = $out->count() - 1;
+                    $out[$lastC]->winding = $op->wind;
+                }
+            }
+        }
+    }
+
+    if ($open && $cur->pts->count() > 0) {
+        $out[] = $cur;
+    }
+
+    return $out;
+}
+
+internal function transformContours(array<Contour>& $cs, const Xform& $x) : void
+{
+    usize $n = $cs->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        usize $m = $cs[$i]->pts->count();
+        usize $j = 0;
+
+        while ($j < $m) {
+            $cs[$i]->pts[$j] = $x->apply($cs[$i]->pts[$j]);
+            $j = $j + 1;
+        }
+
+        $i = $i + 1;
+    }
+}
+
+internal function pushPoint(Contour& $cur, Vec2 $p, float32 $tol2, Vec2& $last) : void
+{
+    if (length2($p - $last) < $tol2 && $cur->pts->count() > 0) {
+        return;
+    }
+
+    $cur->pts[] = $p;
+    $last = $p;
+}
+
+internal function flattenCubic(
+    Vec2 $p0,
+    Vec2 $p1,
+    Vec2 $p2,
+    Vec2 $p3,
+    float32 $tol2,
+    int32 $level,
+    Contour& $cur,
+    Vec2& $last
+) : void
+{
+    if ($level < 10 && (distSeg2($p1, $p0, $p3) > $tol2 || distSeg2($p2, $p0, $p3) > $tol2)) {
+        Vec2 $p01 = ($p0 + $p1) * 0.5f;
+        Vec2 $p12 = ($p1 + $p2) * 0.5f;
+        Vec2 $p23 = ($p2 + $p3) * 0.5f;
+        Vec2 $p012 = ($p01 + $p12) * 0.5f;
+        Vec2 $p123 = ($p12 + $p23) * 0.5f;
+        Vec2 $p0123 = ($p012 + $p123) * 0.5f;
+        flattenCubic($p0, $p01, $p012, $p0123, $tol2, $level + 1, $cur, $last);
+        flattenCubic($p0123, $p123, $p23, $p3, $tol2, $level + 1, $cur, $last);
+        return;
+    }
+
+    pushPoint($cur, $p3, $tol2, $last);
+}
+
+internal function distSeg2(Vec2 $p, Vec2 $a, Vec2 $b) : float32
+{
+    Vec2 $d = $b - $a;
+    float32 $len2 = length2($d);
+
+    if ($len2 < 0.00000000000000000001f) {
+        return length2($p - $a);
+    }
+
+    float32 $t = (($p->x - $a->x) * $d->x + ($p->y - $a->y) * $d->y) / $len2;
+
+    if ($t < 0.0f) {
+        $t = 0.0f;
+    }
+
+    if ($t > 1.0f) {
+        $t = 1.0f;
+    }
+
+    Vec2 $q = $a + $d * $t;
+    return length2($p - $q);
+}

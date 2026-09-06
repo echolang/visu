@@ -91,7 +91,8 @@ public struct TargetFormats
 {
     public PixelFormat[4] $colors;
     public uint32 $colorCount;
-    public PixelFormat? $depth;
+    public PixelFormat $depth;
+    public bool $hasDepth;
     public SampleCount $samples;
 
     public constructor()
@@ -106,7 +107,8 @@ public struct TargetFormats
 
         $this->colors = mv $colors;
         $this->colorCount = 0;
-        $this->depth = null;
+        $this->depth = .depth32f;
+        $this->hasDepth = false;
         $this->samples = .one;
     }
 
@@ -120,11 +122,11 @@ public struct TargetFormats
             $i = $i + 1;
         }
 
-        PixelFormat $depth = guard $this->depth else {
+        if (!$this->hasDepth) {
             return "{$out}-|{sampleCode($this->samples)}";
         }
 
-        return "{$out}{pixelCode($depth)}|{sampleCode($this->samples)}";
+        return "{$out}{pixelCode($this->depth)}|{sampleCode($this->samples)}";
     }
 }
 
@@ -183,6 +185,18 @@ public struct AdapterInfo
 
         return "{$head} — {$this->name}";
     }
+}
+
+/**
+ * GPU memory snapshot for instruments. `$budget` is 0 when
+ * unknown. Metal fills driver numbers; Vulkan counts Device-owned
+ * allocations against the device-local heap size.
+ */
+public struct MemoryStats
+{
+    public uint64 $used = 0;
+    public uint64 $budget = 0;
+    public bool $unified = false;
 }
 
 internal function pixelCode(PixelFormat $format) : int32

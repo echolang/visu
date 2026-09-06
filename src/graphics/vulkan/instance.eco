@@ -253,7 +253,26 @@ internal function vkPickDevice(Device $device) : status<DeviceError>
     $device->limits->uniformAlign = $props->limits->minUniformBufferOffsetAlignment;
     $device->limits->maxUniformRange = $props->limits->maxUniformBufferRange as uint64;
     $device->adapterInfo = vkAdapterInfo($props, $major, $minor);
+    $device->heapBudget = vkHeapBudget($device);
     return .ok;
+}
+
+internal function vkHeapBudget(Device $device) : uint64
+{
+    vk::PhysicalDeviceMemoryProperties $props = vk::PhysicalDeviceMemoryProperties();
+    vk::GetPhysicalDeviceMemoryProperties($device->physical, &$props);
+    uint64 $sum = 0;
+    uint32 $i = 0;
+
+    while ($i < $props->memoryHeapCount) {
+        if (($props->memoryHeaps[$i]->flags & vk::MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+            $sum = $sum + $props->memoryHeaps[$i]->size;
+        }
+
+        $i = $i + 1;
+    }
+
+    return $sum;
 }
 
 internal function vkAdapterInfo(

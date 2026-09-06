@@ -1,0 +1,276 @@
+/**
+ * Stroke / fill / align enums and the scissor record the state
+ * stack stores. Clip helpers live here so Canvas and tests share
+ * the same SDF.
+ */
+
+namespace visu::vg;
+
+use visu::geo::AABB2D;
+use visu::math::Vec2;
+
+public enum Winding
+{
+    case ccw;
+    case cw;
+}
+
+public enum LineCap
+{
+    case butt;
+    case round;
+    case square;
+}
+
+public enum LineJoin
+{
+    case miter;
+    case bevel;
+    case round;
+}
+
+public enum HAlign
+{
+    case left;
+    case center;
+    case right;
+}
+
+public enum VAlign
+{
+    case top;
+    case middle;
+    case bottom;
+    case baseline;
+}
+
+public struct TextAlign
+{
+    public HAlign $h = .left;
+    public VAlign $v = .baseline;
+}
+
+/**
+ * Clip in screen space. `full` is the whole frame (no scissor).
+ * `box` is the pixel AABB of the clip. `extent` / `radius` are
+ * clip-local (user units when `xform` includes the canvas scale).
+ * `xform` maps clip-local (origin at the rect centre) to screen.
+ */
+public struct Scissor
+{
+    public bool $full = true;
+    public AABB2D $box;
+    public float32 $radius = 0.0f;
+    public Xform $xform;
+    public Vec2 $extent;
+
+    public constructor()
+    {
+        $this->full = true;
+        $this->box = AABB2D(Vec2(0.0f, 0.0f), Vec2(0.0f, 0.0f));
+        $this->radius = 0.0f;
+        $this->xform = Xform();
+        $this->extent = Vec2(0.0f, 0.0f);
+    }
+}
+
+/**
+ * Signed distance to a rounded box centred at the origin.
+ * `$half` is the half-extent; `$r` is the corner radius.
+ */
+public function roundBoxSdf(Vec2 $p, Vec2 $half, float32 $r) : float32
+{
+    float32 $rr = $r;
+
+    if ($rr < 0.0f) {
+        $rr = 0.0f;
+    }
+
+    float32 $hx = $half->x;
+    float32 $hy = $half->y;
+
+    if ($rr > $hx) {
+        $rr = $hx;
+    }
+
+    if ($rr > $hy) {
+        $rr = $hy;
+    }
+
+    float32 $ax = std::math::abs($p->x);
+    float32 $ay = std::math::abs($p->y);
+    float32 $qx = $ax - $hx + $rr;
+    float32 $qy = $ay - $hy + $rr;
+    float32 $mx = $qx;
+
+    if ($qy > $mx) {
+        $mx = $qy;
+    }
+
+    float32 $inside = $mx;
+
+    if ($inside > 0.0f) {
+        $inside = 0.0f;
+    }
+
+    float32 $ox = $qx;
+
+    if ($ox < 0.0f) {
+        $ox = 0.0f;
+    }
+
+    float32 $oy = $qy;
+
+    if ($oy < 0.0f) {
+        $oy = 0.0f;
+    }
+
+    return $inside + std::math::sqrt($ox * $ox + $oy * $oy) - $rr;
+}
+
+public function roundBoxContains(Vec2 $p, Vec2 $center, Vec2 $half, float32 $r) : bool
+{
+    return roundBoxSdf($p - $center, $half, $r) <= 0.0f;
+}
+
+/**
+ * AABB intersection. Null when the boxes miss.
+ */
+public function intersectAabb(const AABB2D& $a, const AABB2D& $b) : AABB2D?
+{
+    float32 $minX = $a->min->x;
+
+    if ($b->min->x > $minX) {
+        $minX = $b->min->x;
+    }
+
+    float32 $minY = $a->min->y;
+
+    if ($b->min->y > $minY) {
+        $minY = $b->min->y;
+    }
+
+    float32 $maxX = $a->max->x;
+
+    if ($b->max->x < $maxX) {
+        $maxX = $b->max->x;
+    }
+
+    float32 $maxY = $a->max->y;
+
+    if ($b->max->y < $maxY) {
+        $maxY = $b->max->y;
+    }
+
+    if ($minX >= $maxX || $minY >= $maxY) {
+        return null;
+    }
+
+    return AABB2D(Vec2($minX, $minY), Vec2($maxX, $maxY));
+}
+
+public function scissorContains(const Scissor& $s, Vec2 $screen) : bool
+{
+    if ($s->full) {
+        return true;
+    }
+
+    Xform? $inv = $s->xform->invert();
+
+    if ($inv == null) {
+        return $s->box->contains($screen);
+    }
+
+    Xform $ok = guard $inv;
+    Vec2 $local = $ok->apply($screen);
+    return roundBoxSdf($local, $s->extent, $s->radius) <= 0.0f;
+}
+
+internal struct VgState
+{
+    public Xform $xform;
+    public Paint $fill;
+    public Paint $strokePaint;
+    public float32 $strokeWidth;
+    public LineCap $cap;
+    public LineJoin $join;
+    public float32 $miterLimit;
+    public float32 $alpha;
+    public bool $antiAlias;
+    public Scissor $scissor;
+    public Font? $font;
+    public float32 $fontSize;
+    public TextAlign $align;
+
+    public constructor(
+        Xform $xform,
+        Paint $fill,
+        Paint $strokePaint,
+        float32 $strokeWidth,
+        LineCap $cap,
+        LineJoin $join,
+        float32 $miterLimit,
+        float32 $alpha,
+        bool $antiAlias,
+        Scissor $scissor,
+        Font? $font,
+        float32 $fontSize,
+        TextAlign $align
+    )
+    {
+        $this->xform = $xform;
+        $this->fill = $fill;
+        $this->strokePaint = $strokePaint;
+        $this->strokeWidth = $strokeWidth;
+        $this->cap = $cap;
+        $this->join = $join;
+        $this->miterLimit = $miterLimit;
+        $this->alpha = $alpha;
+        $this->antiAlias = $antiAlias;
+        $this->scissor = $scissor;
+        $this->font = $font;
+        $this->fontSize = $fontSize;
+        $this->align = $align;
+    }
+}
+
+internal function defaultState(float32 $scale) : VgState
+{
+    return VgState(
+        Xform(scale: Vec2($scale, $scale)),
+        Paint(Color::white()),
+        Paint(Color::black()),
+        1.0f,
+        .butt,
+        .miter,
+        4.0f,
+        1.0f,
+        true,
+        Scissor(),
+        null,
+        16.0f,
+        TextAlign()
+    );
+}
+
+internal function makeScissor(Vec2 $pos, Vec2 $size, float32 $r, const Xform& $x) : Scissor
+{
+    Vec2 $p0 = $x->apply($pos);
+    Vec2 $p1 = $x->apply($pos + Vec2($size->x, 0.0f));
+    Vec2 $p2 = $x->apply($pos + $size);
+    Vec2 $p3 = $x->apply($pos + Vec2(0.0f, $size->y));
+    float32 $minX = $p0->x;
+    float32 $minY = $p0->y;
+    float32 $maxX = $p0->x;
+    float32 $maxY = $p0->y;
+    growBounds($p1, $minX, $minY, $maxX, $maxY);
+    growBounds($p2, $minX, $minY, $maxX, $maxY);
+    growBounds($p3, $minX, $minY, $maxX, $maxY);
+    Scissor $s = Scissor();
+    $s->full = false;
+    $s->box = AABB2D(Vec2($minX, $minY), Vec2($maxX, $maxY));
+    $s->radius = $r;
+    $s->extent = Vec2($size->x * 0.5f, $size->y * 0.5f);
+    $s->xform = Xform(translate: ($p0 + $p2) * 0.5f)->mul($x);
+    return $s;
+}

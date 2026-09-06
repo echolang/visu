@@ -5,6 +5,48 @@
 
 namespace visu::graphics;
 
+internal function mtlApplyRaster(mtl::RenderPipelineDescriptor& $desc, const Raster& $raster) : void
+{
+    if ($raster->colorWrite) {
+        $desc->writeMask = mtl::COLOR_WRITE_MASK_ALL;
+    } else {
+        $desc->writeMask = 0;
+    }
+
+    match ($raster->blend) {
+        BlendMode::none => {
+            $desc->blendingEnabled = false;
+        }
+        BlendMode::alpha => {
+            $desc->blendingEnabled = true;
+            $desc->sourceRGBBlendFactor = mtl::BlendFactor::sourceAlpha;
+            $desc->destinationRGBBlendFactor = mtl::BlendFactor::oneMinusSourceAlpha;
+            $desc->rgbBlendOperation = mtl::BlendOperation::add;
+            $desc->sourceAlphaBlendFactor = mtl::BlendFactor::one;
+            $desc->destinationAlphaBlendFactor = mtl::BlendFactor::oneMinusSourceAlpha;
+            $desc->alphaBlendOperation = mtl::BlendOperation::add;
+        }
+        BlendMode::premultiplied => {
+            $desc->blendingEnabled = true;
+            $desc->sourceRGBBlendFactor = mtl::BlendFactor::one;
+            $desc->destinationRGBBlendFactor = mtl::BlendFactor::oneMinusSourceAlpha;
+            $desc->rgbBlendOperation = mtl::BlendOperation::add;
+            $desc->sourceAlphaBlendFactor = mtl::BlendFactor::one;
+            $desc->destinationAlphaBlendFactor = mtl::BlendFactor::oneMinusSourceAlpha;
+            $desc->alphaBlendOperation = mtl::BlendOperation::add;
+        }
+        BlendMode::additive => {
+            $desc->blendingEnabled = true;
+            $desc->sourceRGBBlendFactor = mtl::BlendFactor::sourceAlpha;
+            $desc->destinationRGBBlendFactor = mtl::BlendFactor::one;
+            $desc->rgbBlendOperation = mtl::BlendOperation::add;
+            $desc->sourceAlphaBlendFactor = mtl::BlendFactor::one;
+            $desc->destinationAlphaBlendFactor = mtl::BlendFactor::one;
+            $desc->alphaBlendOperation = mtl::BlendOperation::add;
+        }
+    }
+}
+
 internal function mtlPixelFormat(PixelFormat $format) : mtl::PixelFormat
 {
     return match ($format) {
@@ -16,7 +58,7 @@ internal function mtlPixelFormat(PixelFormat $format) : mtl::PixelFormat
         PixelFormat::r8 => mtl::PixelFormat::r8Unorm,
         PixelFormat::r16f => mtl::PixelFormat::r16Float,
         PixelFormat::r32f => mtl::PixelFormat::r32Float,
-        PixelFormat::rg16f => mtl::PixelFormat::rgba8Unorm,
+        PixelFormat::rg16f => mtl::PixelFormat::rg16Float,
         PixelFormat::depth32f => mtl::PixelFormat::depth32Float,
         PixelFormat::depth32fStencil8 => mtl::PixelFormat::depth32Float_stencil8,
     };

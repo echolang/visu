@@ -6,8 +6,35 @@
 
 namespace visu::graphics;
 
-internal const uint64 RING_BYTES = 4194304;
+internal const uint64 RING_BYTES = 16777216;
 internal const uint64 RING_SLACK = 65536;
+
+internal function vkMemoryStats(Device $device) : MemoryStats
+{
+    if (!$device->ready) {
+        return MemoryStats();
+    }
+
+    MemoryStats $stats = MemoryStats();
+    $stats->used = $device->allocated;
+    $stats->budget = $device->heapBudget;
+    return $stats;
+}
+
+internal function vkNoteAlloc(Device $device, uint64 $n) : void
+{
+    $device->allocated = $device->allocated + $n;
+}
+
+internal function vkNoteFree(Device $device, uint64 $n) : void
+{
+    if ($n > $device->allocated) {
+        $device->allocated = 0;
+        return;
+    }
+
+    $device->allocated = $device->allocated - $n;
+}
 
 internal class HostRing
 {
@@ -37,7 +64,10 @@ internal class HostRing
         BufferHandle $h = guard vkCreateBoundBuffer(
             $device,
             $bytes,
-            vk::BUFFER_USAGE_UNIFORM_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+            vk::BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                | vk::BUFFER_USAGE_TRANSFER_SRC_BIT
+                | vk::BUFFER_USAGE_VERTEX_BUFFER_BIT
+                | vk::BUFFER_USAGE_INDEX_BUFFER_BIT,
             vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT
         ) else ($e) {
             return .error($e);
@@ -58,16 +88,21 @@ internal class HostRing
         $this->mapped:$ = $mapped:$;
         $this->bytes = $bytes;
         $this->bump = 0;
+        vkNoteAlloc($device, $bytes);
         return .ok;
     }
 
     public function destroy(Device $device) : void
     {
+        if ($this->bytes > 0) {
+            vkNoteFree($device, $this->bytes);
+            $this->bytes = 0;
+        }
+
         if ($device->logical->handle == 0) {
             $this->mapped:$ = null;
             $this->buffer = vk::Buffer::none();
             $this->memory = vk::DeviceMemory::none();
-            $this->bytes = 0;
             $this->bump = 0;
             return;
         }

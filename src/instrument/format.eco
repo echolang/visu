@@ -1,0 +1,105 @@
+/**
+ * Overlay line helpers. Shared with tests so the HUD string
+ * is checked without a GPU.
+ */
+
+namespace visu::instrument;
+
+public function formatNs(float64 $ns) : string
+{
+    if ($ns < 0.0) {
+        $ns = 0.0;
+    }
+
+    if ($ns < 1000.0) {
+        return "{$ns:.2f} ns";
+    }
+
+    if ($ns < 1000000.0) {
+        float64 $us = $ns / 1000.0;
+        return "{$us:.2f} us";
+    }
+
+    if ($ns < 1000000000.0) {
+        float64 $ms = $ns / 1000000.0;
+        return "{$ms:.2f} ms";
+    }
+
+    float64 $secs = $ns / 1000000000.0;
+    return "{$secs:.2f} s";
+}
+
+public function formatBytes(uint64 $n) : string
+{
+    if ($n < 1024 as uint64) {
+        return "{$n} B";
+    }
+
+    float64 $kib = ($n as float64) / 1024.0;
+
+    if ($n < 1048576 as uint64) {
+        return "{$kib:.1f} KiB";
+    }
+
+    float64 $mib = $kib / 1024.0;
+
+    if ($n < 1073741824 as uint64) {
+        return "{$mib:.1f} MiB";
+    }
+
+    float64 $gib = $mib / 1024.0;
+    return "{$gib:.1f} GiB";
+}
+
+public function formatLine(const Sample& $sample) : string
+{
+    float64 $fpsRaw = $sample->loop->fps;
+
+    if ($fpsRaw < 0.0) {
+        $fpsRaw = 0.0;
+    }
+
+    float64 $fpsRound = $fpsRaw + 0.5;
+    int32 $fps = $fpsRound as int32;
+    float64 $tc = $sample->loop->tickCount;
+    string $ut = formatNs($sample->loop->tickNs);
+    string $ft = formatNs($sample->loop->frameNs);
+    string $vram = formatVram($sample->memory->used, $sample->memory->budget);
+    return "FPS: {$fps} | TC: {$tc:.2f} | UT: {$ut} | FT: {$ft} | VRAM: {$vram}";
+}
+
+public function formatGauge(const Gauge& $g) : string
+{
+    string $value = match ($g->unit) {
+        Unit::fps => formatWhole($g->value),
+        Unit::ns => formatNs($g->value),
+        Unit::bytes => formatBytes(($g->value as uint64)),
+        Unit::count => formatWhole($g->value),
+        Unit::ratio => formatRatio($g->value),
+    };
+    return "{$g->name}: {$value}";
+}
+
+internal function formatVram(uint64 $used, uint64 $budget) : string
+{
+    string $left = formatBytes($used);
+
+    if ($budget == 0) {
+        return $left;
+    }
+
+    string $right = formatBytes($budget);
+    return "{$left} / {$right}";
+}
+
+internal function formatWhole(float64 $n) : string
+{
+    float64 $round = $n + 0.5;
+    int32 $v = $round as int32;
+    return "{$v}";
+}
+
+internal function formatRatio(float64 $n) : string
+{
+    return "{$n:.2f}";
+}

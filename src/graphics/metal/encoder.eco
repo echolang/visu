@@ -19,6 +19,7 @@ public class RenderEncoder : RenderEncoderProtocol
     internal mtl::PixelFormat $depthFmt;
     private Topology $topology;
     private Buffer? $indexBuffer;
+    private mtl::Buffer? $indexScratch;
     private IndexType $indexType;
     private uint64 $indexOffset;
     private Texture? $boundTex;
@@ -48,6 +49,7 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->depthFmt = $depthFmt;
         $this->topology = .triangles;
         $this->indexBuffer = null;
+        $this->indexScratch = null;
         $this->indexType = .uint16;
         $this->indexOffset = 0;
         $this->boundTex = null;
@@ -124,28 +126,13 @@ public class RenderEncoder : RenderEncoderProtocol
     public function setScissor(int32 $x, int32 $y, int32 $w, int32 $h) : void
     {
         assert(!$this->ended, 'setScissor after end');
-        int32 $sx = $x;
-        int32 $sy = $y;
-        int32 $sw = $w;
-        int32 $sh = $h;
-
-        if ($sx < 0) {
-            $sx = 0;
-        }
-
-        if ($sy < 0) {
-            $sy = 0;
-        }
-
-        if ($sw < 0) {
-            $sw = 0;
-        }
-
-        if ($sh < 0) {
-            $sh = 0;
-        }
-
-        $this->enc->setScissorRect(mtl::ScissorRect($sx as uint32, $sy as uint32, $sw as uint32, $sh as uint32));
+        GpuScissor $s = clampScissor($x, $y, $w, $h, $this->width, $this->height);
+        $this->enc->setScissorRect(mtl::ScissorRect(
+            $s->x as uint32,
+            $s->y as uint32,
+            $s->w as uint32,
+            $s->h as uint32
+        ));
         $this->scissorSet = true;
     }
 
@@ -162,8 +149,32 @@ public class RenderEncoder : RenderEncoderProtocol
     {
         assert(!$this->ended, 'setIndexBuffer after end');
         $this->indexBuffer = $buffer;
+        $this->indexScratch = null;
         $this->indexType = $type;
         $this->indexOffset = $offset;
+    }
+
+    public function setVertexScratch(uint32 $binding, ScratchSlice $slice) : void
+    {
+        assert(!$this->ended, 'setVertexScratch after end');
+        assert($slice->frameSlot == $this->device->slot, 'scratch from another frame');
+        mtl::Buffer $buf = guard $this->device->slots[$this->device->slot]->ring->buffer else {
+            die('metal: ring is empty');
+        }
+        $this->enc->setVertexBuffer($buf, $slice->offset as uint32, index: $binding);
+    }
+
+    public function setIndexScratch(ScratchSlice $slice, IndexType $type) : void
+    {
+        assert(!$this->ended, 'setIndexScratch after end');
+        assert($slice->frameSlot == $this->device->slot, 'scratch from another frame');
+        mtl::Buffer $buf = guard $this->device->slots[$this->device->slot]->ring->buffer else {
+            die('metal: ring is empty');
+        }
+        $this->indexBuffer = null;
+        $this->indexScratch = $buf;
+        $this->indexType = $type;
+        $this->indexOffset = $slice->offset;
     }
 
     public function bindUniform(uint32 $slot, ScratchSlice $slice) : void
@@ -214,12 +225,19 @@ public class RenderEncoder : RenderEncoderProtocol
         assert(!$this->ended, 'drawIndexed after end');
         assert($this->pipelineSet, 'drawIndexed before setPipeline');
         assert($vertexOffset == 0, 'metal: base vertex is not implemented');
-        Buffer $idx = guard $this->indexBuffer else {
-            die('drawIndexed without setIndexBuffer');
+        mtl::Buffer? $chosen = $this->indexScratch;
+
+        if ($chosen == null) {
+            Buffer $idx = guard $this->indexBuffer else {
+                die('drawIndexed without setIndexBuffer');
+            }
+            $chosen = $idx->handle->buffer;
         }
-        mtl::Buffer $buf = guard $idx->handle->buffer else {
+
+        guard $chosen else {
             die('metal: index buffer handle is empty');
         }
+        mtl::Buffer $buf = guard $chosen;
         $this->flushBindings();
         uint32 $n = 1;
 

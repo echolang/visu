@@ -6,7 +6,7 @@
 namespace visu::os;
 
 use visu::app::info;
-use visu::graphics::{Device, DeviceOptions, RenderTarget, Surface, Texture};
+use visu::graphics::{Device, DeviceError, DeviceOptions, RenderTarget, Surface, Texture};
 use visu::math::Vec2;
 
 public class Window
@@ -21,6 +21,7 @@ public class Window
     private RenderTarget $target;
     private WindowEventHandler? $handler;
     private Device? $device;
+    private int32 $appliedHz;
 
     public constructor(string $title, int32 $width, int32 $height, WindowHints $hints = WindowHints::defaults())
     {
@@ -34,6 +35,7 @@ public class Window
         $this->target = RenderTarget($width, $height);
         $this->handler = null;
         $this->device = null;
+        $this->appliedHz = 0;
     }
 
     destructor()
@@ -71,6 +73,7 @@ public class Window
         int32 $fbW = 0;
         int32 $fbH = 0;
         glfw::getFramebufferSize($this->handle, &$fbW, &$fbH);
+        $device->setContentsScale($this->backingScale());
         guard $device->attach($surface, $fbW, $fbH) else ($e) {
             $device->lose();
             glfw::destroyWindow($this->handle);
@@ -84,12 +87,16 @@ public class Window
         $this->device = $device;
         windowRegister($this);
         glfw::setFramebufferSizeCallback($this->handle, &onFramebufferSize);
+        glfw::setWindowPosCallback($this->handle, &onWindowPos);
+        applyDisplaySync($this->handle, true);
+        $this->syncPresentRate();
 
         if ($this->handler != null) {
             $this->installCallbacks();
         }
 
-        info("window: '{$this->title}' {$this->width}x{$this->height} (fb {$fbW}x{$fbH})");
+        int32 $hz = $this->appliedHz;
+        info("window: '{$this->title}' {$this->width}x{$this->height} (fb {$fbW}x{$fbH}, {$hz} Hz)");
         return .ok;
     }
 
@@ -125,15 +132,13 @@ public class Window
         return $this->handle;
     }
 
-    public function swap() : void
+    public function swap() : status<DeviceError>
     {
         $this->requireHandle();
         Device $device = guard $this->device else {
-            return;
+            return .ok;
         }
-        guard $device->endFrame() else ($e) {
-            die($e->message());
-        }
+        return $device->endFrame();
     }
 
     public function poll() : void
@@ -408,6 +413,7 @@ public class Window
         Device $device = guard $this->device else {
             return;
         }
+        $device->setContentsScale($this->backingScale());
         $device->resize($width, $height);
         info("backbuffer: {$width}x{$height}");
     }
@@ -492,14 +498,19 @@ public class Window
         Device $device = guard $this->device else {
             return;
         }
-        $device->setVsync($interval != 0);
+        bool $on = $interval != 0;
+        $device->setVsync($on);
+        applyDisplaySync($this->requireHandle(), $on);
     }
 
-    public function setFullscreen(int32 $width, int32 $height, int32 $refreshRate) : void
+    /**
+     * Exclusive fullscreen. `$refreshRate` 0 (the default) picks
+     * the window monitor's highest available Hz.
+     */
+    public function setFullscreen(int32 $width, int32 $height, int32 $refreshRate = 0) : void
     {
-        ptr<glfw::Monitor> $monitor = glfw::getPrimaryMonitor();
-        assert($monitor:$ != null, 'glfw has no primary monitor');
-        glfw::setWindowMonitor($this->requireHandle(), $monitor, 0, 0, $width, $height, $refreshRate);
+        setWindowFullscreen($this->requireHandle(), $width, $height, $refreshRate);
+        $this->syncPresentRate();
     }
 
     public function setWindowed(int32 $width, int32 $height, int32 $x, int32 $y) : void
@@ -507,5 +518,106 @@ public class Window
         glfw::setWindowMonitor($this->requireHandle(), null, $x, $y, $width, $height, glfw::DONT_CARE);
         $this->width = $width;
         $this->height = $height;
+        $this->syncPresentRate();
+    }
+
+    /**
+     * Discrete modes for the monitor this window is on. Darwin
+     * appends NSScreen.maximumFramesPerSecond when GLFW omits it.
+     */
+    public const function videoModes() : array<VideoMode>
+    {
+        ptr<glfw::Window> $handle = $this->requireHandle();
+        array<VideoMode> $modes = windowVideoModes($handle);
+        int32 $cap = cocoaRefresh($handle);
+
+        if ($cap > 0 && !hasRefresh($modes, $cap)) {
+            VideoMode $extra = guard windowCurrentMode($handle) else {
+                VideoMode $fallback = VideoMode();
+                $fallback->width = $this->width;
+                $fallback->height = $this->height;
+                $fallback->refreshRate = $cap;
+                $modes[] = $fallback;
+                return $modes;
+            }
+            $extra->refreshRate = $cap;
+            $modes[] = $extra;
+        }
+
+        return $modes;
+    }
+
+    /**
+     * Windowed present rate. Darwin uses NSScreen.maximumFramesPerSecond
+     * (the live cap — ProMotion off is 60 even if GLFW lists 120).
+     * Elsewhere the highest GLFW video mode.
+     */
+    public const function refreshRate() : int32
+    {
+        int32 $cap = cocoaRefresh($this->requireHandle());
+
+        if ($cap > 0) {
+            return $cap;
+        }
+
+        return maxRefresh(windowVideoModes($this->requireHandle()));
+    }
+
+    public const function currentMode() : VideoMode?
+    {
+        return windowCurrentMode($this->requireHandle());
+    }
+
+    internal function notePos() : void
+    {
+        $this->syncPresentRate();
+        $this->syncContentsScale();
+    }
+
+    private function syncPresentRate() : void
+    {
+        int32 $hz = $this->refreshRate();
+
+        if ($hz == $this->appliedHz) {
+            return;
+        }
+
+        $this->appliedHz = $hz;
+        Device $device = guard $this->device else {
+            return;
+        }
+
+        info("present: {$hz} Hz");
+
+        $device->setPresentRate($hz);
+    }
+
+    /**
+     * Framebuffer pixels per window point. Derived from the two
+     * sizes rather than glfwGetWindowContentScale so it matches the
+     * framebuffer we actually got, whatever the retina hint says.
+     */
+    private const function backingScale() : float64
+    {
+        int32 $w = 0;
+        int32 $h = 0;
+        glfw::getWindowSize($this->requireHandle(), &$w, &$h);
+        int32 $fw = 0;
+        int32 $fh = 0;
+        glfw::getFramebufferSize($this->requireHandle(), &$fw, &$fh);
+
+        if ($w <= 0 || $fw <= 0) {
+            return 1.0;
+        }
+
+        return ($fw as float64) / ($w as float64);
+    }
+
+    private function syncContentsScale() : void
+    {
+        Device $device = guard $this->device else {
+            return;
+        }
+        $device->setContentsScale($this->backingScale());
     }
 }

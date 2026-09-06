@@ -1,0 +1,75 @@
+/**
+ * Pull-based instrument registry. Sources fill a Sample;
+ * gauge() is the app extra. Not on Services — window/app
+ * scoped, like Device.
+ */
+
+namespace visu::instrument;
+
+public class Instruments
+{
+    private array<Source> $sources;
+    private map<string, Gauge> $gauges;
+    private Sample? $last;
+
+    public constructor()
+    {
+        $this->sources = array<Source>();
+        $this->gauges = map<string, Gauge>();
+        $this->last = null;
+    }
+
+    public function add(Source $source) : void
+    {
+        $this->sources[] = $source;
+    }
+
+    public function gauge(string $name, float64 $value, Unit $unit = Unit::count) : void
+    {
+        $this->gauges[$name] = Gauge($name, $value, $unit);
+    }
+
+    public function sample() : Sample
+    {
+        Sink $sink = .empty();
+        array<Source> $sources = $this->sources;
+
+        foreach ($sources as $source) {
+            $source->collect($sink);
+        }
+
+        array<string> $names = $this->gauges->keys();
+
+        foreach ($names as $name) {
+            Gauge $g = $this->gauges[$name];
+            $sink->gauge($g->name, $g->value, $g->unit);
+        }
+
+        array<Gauge> $list = array<Gauge>();
+        array<string> $gaugeNames = $sink->gauges->keys();
+
+        foreach ($gaugeNames as $gaugeName) {
+            $list[] = $sink->gauges[$gaugeName];
+        }
+
+        Sample $snap = Sample($sink->loop, $sink->memory, $sink->adapter, $list);
+        $this->last = $snap;
+        return $snap;
+    }
+
+    public const function fps() : float64
+    {
+        Sample $snap = guard $this->last else {
+            return 0.0;
+        }
+        return $snap->loop->fps;
+    }
+
+    public const function vram() : uint64
+    {
+        Sample $snap = guard $this->last else {
+            return 0 as uint64;
+        }
+        return $snap->memory->used;
+    }
+}

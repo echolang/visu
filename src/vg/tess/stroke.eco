@@ -1,0 +1,385 @@
+/**
+ * Polyline stroke: offset left/right, miter/bevel/round joins,
+ * butt/square/round caps.
+ */
+
+namespace visu::vg;
+
+use visu::math::{Vec2, dot, length, length2};
+
+internal function tessStroke(
+    const array<Contour>& $contours,
+    float32 $width,
+    LineCap $cap,
+    LineJoin $join,
+    float32 $miterLimit,
+    float32 $fringe,
+    TessMesh& $out
+) : void
+{
+    float32 $hw = $width * 0.5f;
+
+    if ($hw < 0.0f) {
+        $hw = 0.0f;
+    }
+
+    float32 $outer = $hw + $fringe;
+
+    foreach ($contours as $c) {
+        if ($c->pts->count() >= 2) {
+            strokeContour($c->pts, $c->closed, $hw, $outer, $cap, $join, $miterLimit, $out);
+        }
+    }
+}
+
+internal function strokePath(
+    Path $path,
+    float32 $tessTol,
+    float32 $width,
+    LineCap $cap,
+    LineJoin $join,
+    float32 $miterLimit,
+    float32 $fringe
+) : TessMesh
+{
+    TessMesh $mesh = TessMesh();
+    array<Contour> $cs = flattenPath($path, $tessTol);
+    tessStroke($cs, $width, $cap, $join, $miterLimit, $fringe, $mesh);
+    return $mesh;
+}
+
+internal function strokeContour(
+    const array<Vec2>& $pts,
+    bool $closed,
+    float32 $hw,
+    float32 $outer,
+    LineCap $cap,
+    LineJoin $join,
+    float32 $miterLimit,
+    TessMesh& $out
+) : void
+{
+    usize $n = $pts->count();
+
+    if ($n < 2) {
+        return;
+    }
+
+    usize $last = $n - 1;
+    usize $i = 0;
+    usize $end = $n - 1;
+
+    if ($closed) {
+        $end = $n;
+    }
+
+    while ($i < $end) {
+        usize $i0 = $i;
+        usize $i1 = $i + 1;
+
+        if ($i1 == $n) {
+            $i1 = 0;
+        }
+
+        Vec2 $a = $pts[$i0];
+        Vec2 $b = $pts[$i1];
+        Vec2 $nrm = edgeNormal($a, $b);
+        addStrokeQuad($a, $b, $nrm, $hw, $outer, $out);
+        $i = $i + 1;
+    }
+
+    if ($closed) {
+        $i = 0;
+
+        while ($i < $n) {
+            usize $prev = $i;
+
+            if ($prev == 0) {
+                $prev = $n - 1;
+            } else {
+                $prev = $i - 1;
+            }
+
+            usize $next = $i + 1;
+
+            if ($next == $n) {
+                $next = 0;
+            }
+
+            strokeJoin($pts[$prev], $pts[$i], $pts[$next], $hw, $outer, $join, $miterLimit, $out);
+            $i = $i + 1;
+        }
+
+        return;
+    }
+
+    $i = 1;
+
+    while ($i < $last) {
+        strokeJoin($pts[$i - 1], $pts[$i], $pts[$i + 1], $hw, $outer, $join, $miterLimit, $out);
+        $i = $i + 1;
+    }
+
+    strokeCap($pts[0], $pts[1], $hw, $outer, $cap, true, $out);
+    strokeCap($pts[$last], $pts[$last - 1], $hw, $outer, $cap, true, $out);
+}
+
+internal function addStrokeQuad(
+    Vec2 $a,
+    Vec2 $b,
+    Vec2 $nrm,
+    float32 $hw,
+    float32 $outer,
+    TessMesh& $out
+) : void
+{
+    Vec2 $l0 = $a + $nrm * $hw;
+    Vec2 $r0 = $a - $nrm * $hw;
+    Vec2 $l1 = $b + $nrm * $hw;
+    Vec2 $r1 = $b - $nrm * $hw;
+    uint32 $base = $out->verts->count() as uint32;
+    $out->verts[] = VgVertex($l0, Vec2(1.0f, 1.0f));
+    $out->verts[] = VgVertex($r0, Vec2(1.0f, 1.0f));
+    $out->verts[] = VgVertex($r1, Vec2(1.0f, 1.0f));
+    $out->verts[] = VgVertex($l1, Vec2(1.0f, 1.0f));
+    $out->indices[] = $base;
+    $out->indices[] = ($base + 1) as uint32;
+    $out->indices[] = ($base + 2) as uint32;
+    $out->indices[] = $base;
+    $out->indices[] = ($base + 2) as uint32;
+    $out->indices[] = ($base + 3) as uint32;
+
+    if ($outer <= $hw + 0.000001f) {
+        return;
+    }
+
+    float32 $extra = $outer - $hw;
+    Vec2 $ol0 = $l0 + $nrm * $extra;
+    Vec2 $ol1 = $l1 + $nrm * $extra;
+    Vec2 $or0 = $r0 - $nrm * $extra;
+    Vec2 $or1 = $r1 - $nrm * $extra;
+    uint32 $fb = $out->verts->count() as uint32;
+    $out->verts[] = VgVertex($l0, Vec2(1.0f, 1.0f));
+    $out->verts[] = VgVertex($l1, Vec2(1.0f, 1.0f));
+    $out->verts[] = VgVertex($ol1, Vec2(0.0f, 1.0f));
+    $out->verts[] = VgVertex($ol0, Vec2(0.0f, 1.0f));
+    $out->indices[] = $fb;
+    $out->indices[] = ($fb + 1) as uint32;
+    $out->indices[] = ($fb + 2) as uint32;
+    $out->indices[] = $fb;
+    $out->indices[] = ($fb + 2) as uint32;
+    $out->indices[] = ($fb + 3) as uint32;
+    uint32 $rb = $out->verts->count() as uint32;
+    $out->verts[] = VgVertex($r0, Vec2(1.0f, 1.0f));
+    $out->verts[] = VgVertex($or0, Vec2(0.0f, 1.0f));
+    $out->verts[] = VgVertex($or1, Vec2(0.0f, 1.0f));
+    $out->verts[] = VgVertex($r1, Vec2(1.0f, 1.0f));
+    $out->indices[] = $rb;
+    $out->indices[] = ($rb + 1) as uint32;
+    $out->indices[] = ($rb + 2) as uint32;
+    $out->indices[] = $rb;
+    $out->indices[] = ($rb + 2) as uint32;
+    $out->indices[] = ($rb + 3) as uint32;
+}
+
+internal function strokeJoin(
+    Vec2 $p0,
+    Vec2 $p1,
+    Vec2 $p2,
+    float32 $hw,
+    float32 $outer,
+    LineJoin $join,
+    float32 $miterLimit,
+    TessMesh& $out
+) : void
+{
+    Vec2 $n0 = edgeNormal($p0, $p1);
+    Vec2 $n1 = edgeNormal($p1, $p2);
+    float32 $cr = cross2($p1 - $p0, $p2 - $p1);
+
+    if (std::math::abs($cr) < 0.00000001f && $join != LineJoin::round) {
+        return;
+    }
+
+    if ($join == LineJoin::round) {
+        roundJoin($p1, $n0, $n1, $hw, $outer, $cr, $out);
+        return;
+    }
+
+    Vec2 $m = $n0 + $n1;
+    float32 $ml2 = length2($m);
+
+    if ($ml2 < 0.000000000001f) {
+        bevelJoin($p1, $n0, $n1, $hw, $outer, $cr, $out);
+        return;
+    }
+
+    float32 $ml = std::math::sqrt($ml2);
+    $m = $m / $ml;
+    float32 $ds = dot($m, $n0);
+
+    if (std::math::abs($ds) < 0.0001f) {
+        bevelJoin($p1, $n0, $n1, $hw, $outer, $cr, $out);
+        return;
+    }
+
+    float32 $scale = 1.0f / $ds;
+
+    if ($join == LineJoin::miter && $scale <= $miterLimit) {
+        Vec2 $left = $p1 + $m * ($hw * $scale);
+        Vec2 $a = $p1 + $n0 * $hw;
+        Vec2 $b = $p1 + $n1 * $hw;
+        addTri($a, $left, $b, 1.0f, $out);
+        return;
+    }
+
+    bevelJoin($p1, $n0, $n1, $hw, $outer, $cr, $out);
+}
+
+internal function bevelJoin(
+    Vec2 $p,
+    Vec2 $n0,
+    Vec2 $n1,
+    float32 $hw,
+    float32 $outer,
+    float32 $cr,
+    TessMesh& $out
+) : void
+{
+    Vec2 $a = $p + $n0 * $hw;
+    Vec2 $b = $p + $n1 * $hw;
+
+    if ($cr < 0.0f) {
+        $a = $p - $n0 * $hw;
+        $b = $p - $n1 * $hw;
+    }
+
+    addTri($a, $p, $b, 1.0f, $out);
+}
+
+internal function roundJoin(
+    Vec2 $p,
+    Vec2 $n0,
+    Vec2 $n1,
+    float32 $hw,
+    float32 $outer,
+    float32 $cr,
+    TessMesh& $out
+) : void
+{
+    Vec2 $s0 = $n0;
+    Vec2 $s1 = $n1;
+
+    if ($cr < 0.0f) {
+        $s0 = -$n0;
+        $s1 = -$n1;
+    }
+
+    float32 $dotn = dot($s0, $s1);
+
+    if ($dotn > 1.0f) {
+        $dotn = 1.0f;
+    }
+
+    if ($dotn < -1.0f) {
+        $dotn = -1.0f;
+    }
+
+    float32 $ang = std::math::acos($dotn);
+    float32 $ratio = $ang / (std::math::PI_F32 / 8.0f);
+    int32 $steps = ($ratio as int32) + 1;
+
+    if ($steps < 1) {
+        $steps = 1;
+    }
+
+    if ($steps > 16) {
+        $steps = 16;
+    }
+
+    Vec2 $prev = $p + $s0 * $hw;
+    int32 $s = 1;
+
+    while ($s <= $steps) {
+        float32 $t = ($s as float32) / ($steps as float32);
+        float32 $a = $ang * $t;
+        float32 $cs = std::math::cos($a);
+        float32 $sn = std::math::sin($a);
+        Vec2 $dir = Vec2(
+            $s0->x * $cs - $s0->y * $sn,
+            $s0->x * $sn + $s0->y * $cs
+        );
+
+        if ($cr < 0.0f) {
+            $dir = Vec2(
+                $s0->x * $cs + $s0->y * $sn,
+                -$s0->x * $sn + $s0->y * $cs
+            );
+        }
+
+        Vec2 $cur = $p + $dir * $hw;
+        addTri($prev, $p, $cur, 1.0f, $out);
+        $prev = $cur;
+        $s = $s + 1;
+    }
+}
+
+internal function strokeCap(
+    Vec2 $p,
+    Vec2 $toward,
+    float32 $hw,
+    float32 $outer,
+    LineCap $cap,
+    bool $start,
+    TessMesh& $out
+) : void
+{
+    if ($cap == LineCap::butt) {
+        return;
+    }
+
+    Vec2 $d = $p - $toward;
+    float32 $len = length($d);
+
+    if ($len < 0.000000000001f) {
+        return;
+    }
+
+    Vec2 $dir = $d / $len;
+    Vec2 $nrm = Vec2(-$dir->y, $dir->x);
+
+    if ($cap == LineCap::square) {
+        Vec2 $ext = $p + $dir * $hw;
+        addStrokeQuad($p, $ext, $nrm, $hw, $outer, $out);
+        return;
+    }
+
+    Vec2 $left = $p + $nrm * $hw;
+    Vec2 $right = $p - $nrm * $hw;
+    int32 $steps = 8;
+    int32 $s = 1;
+    Vec2 $prev = $left;
+
+    while ($s <= $steps) {
+        float32 $t = ($s as float32) / ($steps as float32);
+        float32 $a = std::math::PI_F32 * $t;
+        float32 $cs = std::math::cos($a);
+        float32 $sn = std::math::sin($a);
+        Vec2 $cur = $p + $nrm * ($hw * $cs) + $dir * ($hw * $sn);
+        addTri($prev, $p, $cur, 1.0f, $out);
+        $prev = $cur;
+        $s = $s + 1;
+    }
+}
+
+internal function addTri(Vec2 $a, Vec2 $b, Vec2 $c, float32 $cover, TessMesh& $out) : void
+{
+    uint32 $base = $out->verts->count() as uint32;
+    Vec2 $uv = Vec2($cover, 1.0f);
+    $out->verts[] = VgVertex($a, $uv);
+    $out->verts[] = VgVertex($b, $uv);
+    $out->verts[] = VgVertex($c, $uv);
+    $out->indices[] = $base;
+    $out->indices[] = ($base + 1) as uint32;
+    $out->indices[] = ($base + 2) as uint32;
+}

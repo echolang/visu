@@ -71,13 +71,19 @@ internal function metalPipelineFromPass(
     mtl::VertexDescriptor $vd = metalVertexDescriptor($pass->layout);
     mtl::RenderPipelineDescriptor $desc = mtl::RenderPipelineDescriptor($vs, $vertexDescriptor: $vd);
     $desc->fragmentFunction = $fs;
+    uint32 $ci = 0;
+    uint32 $colorN = $formats->colorCount;
 
-    if ($formats->colorCount > 0) {
-        $desc->colorPixelFormats[] = mtlPixelFormat($formats->colors[0]);
-    } else {
+    if ($colorN == 0) {
         $desc->colorPixelFormats[] = mtl::PixelFormat::bgra8Unorm;
+    } else {
+        while ($ci < $colorN) {
+            $desc->colorPixelFormats[] = mtlPixelFormat($formats->colors[$ci]);
+            $ci = $ci + 1;
+        }
     }
 
+    mtlApplyRaster($desc, $pass->raster);
     $desc->depthPixelFormat = $depthFmt;
     mtl::RenderPipelineState $pso = guard $gpu->newRenderPipelineState($desc) else ($e) {
         string $log = match ($e) {

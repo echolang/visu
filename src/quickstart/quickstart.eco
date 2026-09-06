@@ -9,13 +9,14 @@ use std::env;
 use std::io;
 use visu::app::{Paths, Services, bootstrap};
 use visu::graphics::PipelineError;
+use visu::instrument::{DeviceSource, LoopSource};
 use visu::os::{init, terminate};
 use visu::runtime::{GameLoop, registerMain, unregisterMain};
 
 public class Quickstart
 {
-    private Options $options;
     private App $app;
+    private Options $options;
     private GameLoop $loop;
 
     public constructor(function<void(Options)> $configure)
@@ -28,11 +29,18 @@ public class Quickstart
         });
         $this->app = App($options, $services);
         $this->loop = GameLoop($this->app, $options->tickRate, $options->maxUpdatesPerFrame);
+        $this->app->instruments->add(LoopSource($this->loop));
+        $this->app->instruments->add(DeviceSource($this->app->device));
     }
 
     public function app() : App
     {
         return $this->app;
+    }
+
+    public function loop() : GameLoop
+    {
+        return $this->loop;
     }
 
     /**

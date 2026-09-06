@@ -1,6 +1,6 @@
 /**
- * Graphics pipeline create. Phase 3a is a glfw-group spike:
- * MoltenVK compiles MSL through XPC at CreateGraphicsPipelines.
+ * Vulkan PSO cache. `vkPipelineFromPass` builds a dynamic-rendering
+ * graphics pipeline from GpuPass + TargetFormats.
  */
 
 namespace visu::graphics;
@@ -217,10 +217,31 @@ internal function vkPipelineFromPass(
 
     $depth->depthCompareOp = vkCompare($pass->raster->depthCompare);
 
-    vk::PipelineColorBlendAttachmentState $blendAtt = vkFillBlend($pass->raster);
+    vk::PipelineColorBlendAttachmentState[4] $blendAtts;
+    uint32[4] $colorFormats;
+    uint32 $colorN = $formats->colorCount;
+
+    if ($colorN > 4) {
+        $colorN = 4;
+    }
+
+    if ($colorN == 0) {
+        $colorN = 1;
+        $blendAtts[0] = vkFillBlend($pass->raster);
+        $colorFormats[0] = vkFormat($formats->colors[0]);
+    } else {
+        uint32 $ci = 0;
+
+        while ($ci < $colorN) {
+            $blendAtts[$ci] = vkFillBlend($pass->raster);
+            $colorFormats[$ci] = vkFormat($formats->colors[$ci]);
+            $ci = $ci + 1;
+        }
+    }
+
     vk::PipelineColorBlendStateCreateInfo $blend = vk::PipelineColorBlendStateCreateInfo();
-    $blend->attachmentCount = 1;
-    $blend->pAttachments:$ = &$blendAtt;
+    $blend->attachmentCount = $colorN;
+    $blend->pAttachments:$ = &$blendAtts[0];
 
     uint32[2] $dyn;
     $dyn[0] = vk::DYNAMIC_STATE_VIEWPORT;
@@ -229,14 +250,12 @@ internal function vkPipelineFromPass(
     $dynamic->dynamicStateCount = 2;
     $dynamic->pDynamicStates:$ = &$dyn[0];
 
-    uint32 $colorFormat = vkFormat($formats->colors[0]);
     vk::PipelineRenderingCreateInfo $rendering = vk::PipelineRenderingCreateInfo();
-    $rendering->colorAttachmentCount = $formats->colorCount;
-    $rendering->pColorAttachmentFormats:$ = &$colorFormat;
+    $rendering->colorAttachmentCount = $colorN;
+    $rendering->pColorAttachmentFormats:$ = &$colorFormats[0];
 
-    if ($formats->depth != null) {
-        PixelFormat $depthFmt = guard $formats->depth;
-        $rendering->depthAttachmentFormat = vkFormat($depthFmt);
+    if ($formats->hasDepth) {
+        $rendering->depthAttachmentFormat = vkFormat($formats->depth);
     }
 
     vk::GraphicsPipelineCreateInfo $gpci = vk::GraphicsPipelineCreateInfo();

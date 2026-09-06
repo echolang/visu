@@ -1,0 +1,54 @@
+/**
+ * Overlay line helper without a GPU.
+ */
+
+use visu::graphics::{AdapterInfo, MemoryStats};
+use visu::instrument::{Gauge, LoopStats, Sample, Unit, formatBytes, formatGauge, formatLine, formatNs};
+
+test format_ns_picks_unit
+{
+    assert(formatNs(12.0) == '12.00 ns', 'ns');
+    assert(formatNs(1500.0) == '1.50 us', 'us');
+    assert(formatNs(2500000.0) == '2.50 ms', 'ms');
+}
+
+test format_bytes_picks_unit
+{
+    assert(formatBytes(512) == '512 B', 'b');
+    assert(formatBytes(1536) == '1.5 KiB', 'kib');
+    assert(formatBytes(1572864) == '1.5 MiB', 'mib');
+}
+
+test format_line_includes_fps_and_vram
+{
+    LoopStats $loop = LoopStats();
+    $loop->fps = 59.6;
+    $loop->tickCount = 1.0;
+    $loop->tickNs = 120000.0;
+    $loop->frameNs = 16670000.0;
+    MemoryStats $mem = MemoryStats();
+    $mem->used = 1572864;
+    $mem->budget = 17179869184;
+    Sample $sample = Sample($loop, $mem, AdapterInfo(), array<visu::instrument::Gauge>());
+    string $line = formatLine($sample);
+    assert($line->contains('FPS: 60'), 'fps');
+    assert($line->contains('VRAM: 1.5 MiB / 16.0 GiB'), 'vram');
+}
+
+test format_line_omits_budget_when_unknown
+{
+    LoopStats $loop = LoopStats();
+    MemoryStats $mem = MemoryStats();
+    $mem->used = 512;
+    Sample $sample = Sample($loop, $mem, AdapterInfo(), array<visu::instrument::Gauge>());
+    string $line = formatLine($sample);
+    assert($line->contains('VRAM: 512 B'), 'vram');
+    assert(!$line->contains(' / '), 'no budget');
+}
+
+test format_gauge_picks_unit
+{
+    assert(formatGauge(Gauge('fps', 59.6, Unit::fps)) == 'fps: 60', 'fps');
+    assert(formatGauge(Gauge('ents', 12.2, Unit::count)) == 'ents: 12', 'count');
+    assert(formatGauge(Gauge('fill', 0.5, Unit::ratio)) == 'fill: 0.50', 'ratio');
+}

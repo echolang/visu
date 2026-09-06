@@ -1,0 +1,65 @@
+/**
+ * CPU clamp for encoder setScissor. GPU scissor rects are
+ * unsigned and must sit inside the target.
+ */
+
+namespace visu::graphics;
+
+internal struct GpuScissor
+{
+    public int32 $x;
+    public int32 $y;
+    public int32 $w;
+    public int32 $h;
+}
+
+internal function clampScissor(
+    int32 $x,
+    int32 $y,
+    int32 $w,
+    int32 $h,
+    int32 $fbW,
+    int32 $fbH
+) : GpuScissor
+{
+    int32 $sx = $x;
+    int32 $sy = $y;
+    int32 $sw = $w;
+    int32 $sh = $h;
+
+    if ($sx < 0) {
+        $sw = $sw + $sx;
+        $sx = 0;
+    }
+
+    if ($sy < 0) {
+        $sh = $sh + $sy;
+        $sy = 0;
+    }
+
+    if ($sx > $fbW) {
+        $sx = $fbW;
+    }
+
+    if ($sy > $fbH) {
+        $sy = $fbH;
+    }
+
+    if ($sx + $sw > $fbW) {
+        $sw = $fbW - $sx;
+    }
+
+    if ($sy + $sh > $fbH) {
+        $sh = $fbH - $sy;
+    }
+
+    if ($sw < 0) {
+        $sw = 0;
+    }
+
+    if ($sh < 0) {
+        $sh = 0;
+    }
+
+    return GpuScissor($sx, $sy, $sw, $sh);
+}

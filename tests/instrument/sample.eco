@@ -1,0 +1,54 @@
+/**
+ * LoopSource copies GameLoop averages into a Sample.
+ */
+
+use visu::instrument::{Instruments, LoopSource};
+use visu::runtime::{Delegate, GameLoop};
+
+class InstrumentHits : Delegate
+{
+    public int32 $updates;
+    public int32 $renders;
+
+    public constructor()
+    {
+        $this->updates = 0;
+        $this->renders = 0;
+    }
+
+    public function update() : void
+    {
+        $this->updates = $this->updates + 1;
+    }
+
+    public function render(float32 $compensation) : void
+    {
+        $this->renders = $this->renders + 1;
+    }
+
+    public function shouldStop() : bool
+    {
+        return false;
+    }
+}
+
+test instruments_loop_source_sees_tick_count
+{
+    InstrumentHits $hits = InstrumentHits();
+    GameLoop $loop = GameLoop($hits, 60.0, 10);
+    Instruments $inst = Instruments();
+    $inst->add(LoopSource($loop));
+    $loop->advance(0);
+    $loop->advance($loop->timestepNs);
+    $sample = $inst->sample();
+    assert($hits->renders == 2, 'renders');
+    assert($sample->loop->tickCount > 0.0, 'ticks');
+    assert($inst->fps() == $sample->loop->fps, 'fps cache');
+}
+
+test instruments_sample_before_collect_is_zero
+{
+    Instruments $inst = Instruments();
+    assert($inst->fps() == 0.0, 'fps');
+    assert($inst->vram() == 0, 'vram');
+}

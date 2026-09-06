@@ -1,0 +1,84 @@
+/**
+ * Monitor video modes and the window present rate.
+ */
+
+use visu::os::{Window, WindowHints, VideoMode, init, terminate};
+use visu::graphics::Device;
+
+#[group: "glfw"]
+test window_refresh_rate_is_positive
+{
+    guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('refresh', 320, 240, $hints);
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
+        terminate();
+        die($e->message());
+    }
+
+    array<VideoMode> $modes = $window->videoModes();
+    assert($modes->count() > 0, 'modes');
+    int32 $hz = $window->refreshRate();
+    assert($hz > 0, 'hz');
+    assert($device->presentRate() == $hz, 'device present rate');
+    bool $listed = false;
+
+    foreach ($modes as $mode) {
+        assert($mode->refreshRate > 0, 'mode hz');
+        assert($mode->width > 0, 'mode width');
+        assert($mode->height > 0, 'mode height');
+
+        if ($mode->refreshRate == $hz) {
+            $listed = true;
+        }
+    }
+
+    assert($listed, 'max hz is in the list');
+    VideoMode $current = guard $window->currentMode() else {
+        $window->destroy();
+        $device->shutdown();
+        terminate();
+        die('current mode');
+    }
+    assert($current->refreshRate > 0, 'current hz');
+    $window->destroy();
+    $device->shutdown();
+    terminate();
+}
+
+#[group: "glfw"]
+test window_refresh_rate_covers_cocoa_cap
+{
+    guard init() else ($e) {
+        die($e->message());
+    }
+
+    WindowHints $hints = WindowHints::defaults();
+    $hints->visible = false;
+    Window $window = Window('cocoa-hz', 320, 240, $hints);
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
+        terminate();
+        die($e->message());
+    }
+
+    int32 $hz = $window->refreshRate();
+    int32 $cap = visu::os::cocoaRefresh($window->glfwHandle());
+    assert($hz > 0, 'hz');
+
+    if ($cap > 0) {
+        assert($hz == $cap, 'windowed rate is the live screen cap');
+        assert(visu::os::hasRefresh($window->videoModes(), $cap), 'cocoa listed');
+    }
+
+    $window->destroy();
+    $device->shutdown();
+    terminate();
+}

@@ -5,7 +5,7 @@
 
 namespace visu::graphics;
 
-internal const uint64 RING_BYTES = 4194304;
+internal const uint64 RING_BYTES = 16777216;
 internal const uint64 RING_SLACK = 65536;
 
 internal class HostRing
@@ -71,11 +71,15 @@ internal class FrameSlot
 {
     public mtl::CommandBuffer? $prev;
     public HostRing $ring;
+    public mtl::SharedEvent $gpuDone;
+    public uint64 $epoch;
 
-    public constructor()
+    public constructor(mtl::Device $gpu)
     {
         $this->prev = null;
         $this->ring = HostRing();
+        $this->gpuDone = mtl::SharedEvent($gpu);
+        $this->epoch = 0;
     }
 }
 
@@ -87,7 +91,7 @@ internal function mtlCreateSlots(Device $device) : status<DeviceError>
     uint32 $i = 0;
 
     while ($i < FRAMES_IN_FLIGHT) {
-        FrameSlot $slot = FrameSlot();
+        FrameSlot $slot = FrameSlot($gpu);
         guard $slot->ring->allocate($gpu, RING_BYTES) else ($e) {
             return .error($e);
         }

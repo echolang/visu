@@ -51,9 +51,21 @@ while (!$window->shouldClose() && !visu::finiteDone($n)) {
         Backbuffer $back = $frame->get<Backbuffer>();
         $pipeline->add(ClearPass($back->target, ClearPassOptions(color: Vec4(0.25f, 0.25f, 0.25f, 1.0f))));
         guard $pipeline->execute($tick) else ($e) {
+            guard $window->swap() else ($se) {
+                die($se->message());
+            }
             die($e->message());
         }
-        $window->swap();
+        guard $window->swap() else ($e) {
+            match ($e) {
+                DeviceError::surfaceLost => {
+                    break;
+                },
+                else => {
+                    die($e->message());
+                },
+            };
+        }
     }
 
     $window->poll();

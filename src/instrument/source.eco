@@ -1,0 +1,50 @@
+/**
+ * A producer Instruments.sample() asks. Built-ins are LoopSource
+ * and DeviceSource; apps add their own.
+ */
+
+namespace visu::instrument;
+
+use visu::graphics::{AdapterInfo, MemoryStats};
+
+public interface Source
+{
+    function collect(Sink $sink) : void;
+}
+
+/**
+ * Mailbox one sample() fills. Last writer wins for loop / memory
+ * / adapter; gauges merge by name.
+ */
+public class Sink
+{
+    public LoopStats $loop;
+    public MemoryStats $memory;
+    public AdapterInfo $adapter;
+    public map<string, Gauge> $gauges;
+
+    public static function empty() : Sink
+    {
+        return Sink(LoopStats(), MemoryStats(), AdapterInfo(), map<string, Gauge>());
+    }
+
+    public function loop(LoopStats $stats) : void
+    {
+        $this->loop = $stats;
+    }
+
+    public function memory(MemoryStats $stats) : void
+    {
+        $this->memory = $stats;
+    }
+
+    public function adapter(AdapterInfo $info) : void
+    {
+        $this->adapter = $info;
+    }
+
+    public function gauge(string $name, float64 $value, Unit $unit) : void
+    {
+        $this->gauges[$name] = Gauge($name, $value, $unit);
+    }
+}

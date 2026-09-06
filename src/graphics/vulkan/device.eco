@@ -32,6 +32,8 @@ public class Device : DeviceProtocol
     internal int32 $pendingW;
     internal int32 $pendingH;
     internal bool $vsync;
+    internal int32 $presentHz;
+    internal float64 $contentsScale;
     internal bool $encoderOpen;
     internal bool $inFrame;
     internal DeviceLimits $limits;
@@ -49,6 +51,8 @@ public class Device : DeviceProtocol
     internal uint64 $uniformRange;
     internal TextureHandle $dummyImage;
     internal SamplerHandle $dummySampler;
+    internal uint64 $allocated;
+    internal uint64 $heapBudget;
 
     public constructor()
     {
@@ -75,6 +79,8 @@ public class Device : DeviceProtocol
         $this->pendingW = 0;
         $this->pendingH = 0;
         $this->vsync = true;
+        $this->presentHz = 0;
+        $this->contentsScale = 1.0;
         $this->encoderOpen = false;
         $this->inFrame = false;
         $this->limits = DeviceLimits();
@@ -94,6 +100,8 @@ public class Device : DeviceProtocol
         $this->uniformRange = RING_SLACK;
         $this->dummyImage = TextureHandle::none();
         $this->dummySampler = SamplerHandle::none();
+        $this->allocated = 0;
+        $this->heapBudget = 0;
     }
 
     destructor()
@@ -164,7 +172,7 @@ public class Device : DeviceProtocol
     public function lose() : void
     {
         $this->lostFlag = true;
-        $this->abortFrame();
+        vkAbortFrame($this);
         $this->bb = null;
 
         if ($this->logical->handle != 0) {
@@ -185,6 +193,8 @@ public class Device : DeviceProtocol
 
     public function waitIdle() : void
     {
+        vkAbortFrame($this);
+
         if ($this->logical->handle != 0) {
             vk::DeviceWaitIdle($this->logical);
         }
@@ -198,6 +208,11 @@ public class Device : DeviceProtocol
     public const function adapter() : AdapterInfo
     {
         return $this->adapterInfo;
+    }
+
+    public const function memory() : MemoryStats
+    {
+        return vkMemoryStats($this);
     }
 
     public function beginFrame(int32 $width, int32 $height) : result<FrameStatus, DeviceError>
@@ -292,6 +307,7 @@ public class Device : DeviceProtocol
         vk::CommandBufferBeginInfo $begin = vk::CommandBufferBeginInfo();
         $begin->flags = vk::COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         guard vkCheck(vk::BeginCommandBuffer($slot->cmd, &$begin), 'BeginCommandBuffer') else ($e) {
+            vkRecreateSignaledFence($this, $slot);
             return .error($e);
         }
 
@@ -299,7 +315,8 @@ public class Device : DeviceProtocol
             $this->images[$index],
             $this->views[$index],
             vk::DeviceMemory::none(),
-            true
+            true,
+            0 as uint64
         );
         Texture $bb = Texture(
             imported: $this,
@@ -322,6 +339,10 @@ public class Device : DeviceProtocol
         $this->transition($bb, .present);
         FrameSlot $slot = $this->slots[$this->slot];
         guard vkCheck(vk::EndCommandBuffer($slot->cmd), 'EndCommandBuffer') else ($e) {
+            vkRecreateSignaledFence($this, $slot);
+            $this->lostFlag = true;
+            $this->inFrame = false;
+            $this->bb = null;
             return .error($e);
         }
 
@@ -335,6 +356,8 @@ public class Device : DeviceProtocol
         $si->signalSemaphoreCount = 1;
         $si->pSignalSemaphores:$ = &$this->renderDone[$this->imageIndex];
         guard vkCheck(vk::QueueSubmit($this->queue, 1, &$si, $slot->fence), 'QueueSubmit') else ($e) {
+            vkRecreateSignaledFence($this, $slot);
+            $this->lostFlag = true;
             $this->inFrame = false;
             $this->bb = null;
             return .error($e);
@@ -405,6 +428,34 @@ public class Device : DeviceProtocol
         $this->pendingResize = true;
     }
 
+    public function setPresentRate(int32 $hz) : void
+    {
+        $this->presentHz = $hz;
+    }
+
+    public const function presentRate() : int32
+    {
+        return $this->presentHz;
+    }
+
+    /**
+     * The swapchain owns its extent in pixels already; the surface
+     * layer is the loader's, not ours. Kept for DeviceProtocol.
+     */
+    public function setContentsScale(float64 $scale) : void
+    {
+        if ($scale <= 0.0) {
+            return;
+        }
+
+        $this->contentsScale = $scale;
+    }
+
+    public const function contentsScale() : float64
+    {
+        return $this->contentsScale;
+    }
+
     public function beginRender(const RenderPassDesc& $desc) : RenderEncoder
     {
         assert($this->inFrame, 'beginRender outside beginFrame');
@@ -457,6 +508,8 @@ public class Device : DeviceProtocol
             $this->encoderOpen = true;
             return RenderEncoder($this, $formats, $first->texture->width, $first->texture->height);
         }
+        $formats->depth = $depth->texture->format;
+        $formats->hasDepth = true;
         ResourceState $depthFrom = $depth->texture->state;
 
         if ($depth->load != LoadOp::load) {
@@ -584,12 +637,16 @@ public class Device : DeviceProtocol
     public function createBuffer(const BufferDesc& $desc) : result<BufferHandle, DeviceError>
     {
         assert($this->logical->handle != 0, 'createBuffer before initialize');
-        return vkCreateBoundBuffer(
+        BufferHandle $handle = guard vkCreateBoundBuffer(
             $this,
             $desc->bytes,
             vkBufferUsage($desc->usage),
             vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-        );
+        ) else ($e) {
+            return .error($e);
+        }
+        vkNoteAlloc($this, $handle->bytes);
+        return .ok($handle);
     }
 
     public function destroyBuffer(BufferHandle $handle) : void
@@ -597,6 +654,8 @@ public class Device : DeviceProtocol
         if ($this->logical->handle == 0) {
             return;
         }
+
+        vkNoteFree($this, $handle->bytes);
 
         if ($handle->buffer->handle != 0) {
             vk::DestroyBuffer($this->logical, $handle->buffer, null);
@@ -715,7 +774,8 @@ public class Device : DeviceProtocol
             return .error($e);
         }
 
-        return .ok(TextureHandle($image, $view, $mem, false));
+        vkNoteAlloc($this, $req->size);
+        return .ok(TextureHandle($image, $view, $mem, false, $req->size));
     }
 
     public function destroyTexture(TextureHandle $handle) : void
@@ -723,6 +783,8 @@ public class Device : DeviceProtocol
         if ($this->logical->handle == 0 || $handle->imported) {
             return;
         }
+
+        vkNoteFree($this, $handle->bytes);
 
         if ($handle->view->handle != 0) {
             vk::DestroyImageView($this->logical, $handle->view, null);
@@ -886,24 +948,5 @@ public class Device : DeviceProtocol
         }
 
         $this->ready = false;
-    }
-
-    private function abortFrame() : void
-    {
-        if ($this->slots->count() == 0) {
-            $this->encoderOpen = false;
-            $this->inFrame = false;
-            return;
-        }
-
-        if ($this->encoderOpen) {
-            vk::CmdEndRendering($this->currentCmd());
-            $this->encoderOpen = false;
-        }
-
-        if ($this->inFrame) {
-            vk::EndCommandBuffer($this->currentCmd());
-            $this->inFrame = false;
-        }
     }
 }

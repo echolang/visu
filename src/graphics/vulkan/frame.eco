@@ -91,6 +91,65 @@ internal function vkCreateSlots(Device $device) : status<DeviceError>
     return .ok;
 }
 
+internal function vkAbortFrame(Device $device) : void
+{
+    if ($device->slots->count() == 0) {
+        $device->encoderOpen = false;
+        $device->inFrame = false;
+        $device->bb = null;
+        return;
+    }
+
+    if ($device->encoderOpen) {
+        vk::CmdEndRendering($device->currentCmd());
+        $device->encoderOpen = false;
+    }
+
+    if (!$device->inFrame) {
+        return;
+    }
+
+    FrameSlot $slot = $device->slots[$device->slot];
+    vk::Result $end = vk::EndCommandBuffer($slot->cmd);
+    $device->inFrame = false;
+    $device->bb = null;
+
+    if (!$end->ok()) {
+        vkRecreateSignaledFence($device, $slot);
+        return;
+    }
+
+    uint32 $waitStage = vk::PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    vk::SubmitInfo $si = vk::SubmitInfo();
+    $si->waitSemaphoreCount = 1;
+    $si->pWaitSemaphores:$ = &$slot->acquire;
+    $si->pWaitDstStageMask:$ = &$waitStage;
+    $si->commandBufferCount = 1;
+    $si->pCommandBuffers:$ = &$slot->cmd;
+    vk::Result $sub = vk::QueueSubmit($device->queue, 1, &$si, $slot->fence);
+
+    if (!$sub->ok()) {
+        $device->lostFlag = true;
+        vkRecreateSignaledFence($device, $slot);
+    }
+}
+
+internal function vkRecreateSignaledFence(Device $device, FrameSlot $slot) : void
+{
+    if ($slot->fence->handle != 0) {
+        vk::DestroyFence($device->logical, $slot->fence, null);
+        $slot->fence = vk::Fence::none();
+    }
+
+    vk::FenceCreateInfo $fci = vk::FenceCreateInfo();
+    $fci->flags = vk::FENCE_CREATE_SIGNALED_BIT;
+    vk::Result $r = vk::CreateFence($device->logical, &$fci, null, &$slot->fence);
+
+    if (!$r->ok()) {
+        $device->lostFlag = true;
+    }
+}
+
 internal function vkDestroySlots(Device $device) : void
 {
     if ($device->logical->handle == 0) {

@@ -1,0 +1,172 @@
+/**
+ * Draw-call records and merge. Consecutive calls with the same
+ * paint, scissor, alpha and texture collapse into one draw.
+ */
+
+namespace visu::vg;
+
+use visu::graphics::Texture;
+use visu::math::Vec2;
+
+internal struct VgCall
+{
+    public int32 $first;
+    public int32 $count;
+    public Paint $paint;
+    public Scissor $scissor;
+    public float32 $alpha;
+    public Texture? $texture;
+
+    public constructor(
+        int32 $first,
+        int32 $count,
+        Paint $paint,
+        Scissor $scissor,
+        float32 $alpha,
+        Texture? $texture = null
+    )
+    {
+        $this->first = $first;
+        $this->count = $count;
+        $this->paint = $paint;
+        $this->scissor = $scissor;
+        $this->alpha = $alpha;
+        $this->texture = $texture;
+    }
+}
+
+internal function bakePaint(Canvas $vg, Paint $paint) : Paint
+{
+    Paint $out = $paint;
+    $out->xform = $vg->state->xform->mul($paint->xform);
+    return $out;
+}
+
+internal function pushCall(
+    Canvas $vg,
+    int32 $first,
+    int32 $count,
+    Paint $paint,
+    Texture? $texture = null
+) : void
+{
+    if ($count <= 0) {
+        return;
+    }
+
+    Paint $baked = bakePaint($vg, $paint);
+
+    if (tryMergeCall($vg, $first, $count, $baked, $texture)) {
+        return;
+    }
+
+    $vg->calls[] = VgCall(
+        $first,
+        $count,
+        $baked,
+        $vg->state->scissor,
+        $vg->state->alpha,
+        $texture
+    );
+}
+
+internal function tryMergeCall(
+    Canvas $vg,
+    int32 $first,
+    int32 $count,
+    const Paint& $paint,
+    Texture? $tex
+) : bool
+{
+    usize $n = $vg->calls->count();
+
+    if ($n == 0) {
+        return false;
+    }
+
+    VgCall& $last = $vg->calls->at($n - 1);
+
+    if ($last->first + $last->count != $first) {
+        return false;
+    }
+
+    if ($last->alpha != $vg->state->alpha) {
+        return false;
+    }
+
+    if ($last->texture != $tex) {
+        return false;
+    }
+
+    if (!paintsEqual($last->paint, $paint)) {
+        return false;
+    }
+
+    if (!scissorsMatch($last->scissor, $vg->state->scissor)) {
+        return false;
+    }
+
+    $last->count = $last->count + $count;
+    return true;
+}
+
+internal function scissorsMatch(const Scissor& $a, const Scissor& $b) : bool
+{
+    if ($a->full && $b->full) {
+        return true;
+    }
+
+    if ($a->full != $b->full) {
+        return false;
+    }
+
+    if ($a->radius != $b->radius) {
+        return false;
+    }
+
+    Vec2 $amin = $a->box->min;
+    Vec2 $amax = $a->box->max;
+    Vec2 $bmin = $b->box->min;
+    Vec2 $bmax = $b->box->max;
+    return $amin->x == $bmin->x
+        && $amin->y == $bmin->y
+        && $amax->x == $bmax->x
+        && $amax->y == $bmax->y
+        && xformsEqual($a->xform, $b->xform);
+}
+
+internal function colorsEqual(const Color& $a, const Color& $b) : bool
+{
+    return $a->r == $b->r && $a->g == $b->g && $a->b == $b->b && $a->a == $b->a;
+}
+
+internal function xformsEqual(const Xform& $a, const Xform& $b) : bool
+{
+    return $a->a == $b->a
+        && $a->b == $b->b
+        && $a->c == $b->c
+        && $a->d == $b->d
+        && $a->e == $b->e
+        && $a->f == $b->f;
+}
+
+internal function paintsEqual(const Paint& $a, const Paint& $b) : bool
+{
+    if ($a->kind != $b->kind) {
+        return false;
+    }
+
+    if (!colorsEqual($a->inner, $b->inner) || !colorsEqual($a->outer, $b->outer)) {
+        return false;
+    }
+
+    if (!xformsEqual($a->xform, $b->xform)) {
+        return false;
+    }
+
+    if ($a->extent->x != $b->extent->x || $a->extent->y != $b->extent->y) {
+        return false;
+    }
+
+    return $a->radius == $b->radius && $a->feather == $b->feather;
+}

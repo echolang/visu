@@ -33,6 +33,12 @@ public class GameLoop
      */
     public int32 $tickTimeSampleCount = 60;
 
+    /**
+     * Last interpolant passed to render(). 0 just after a tick,
+     * approaching 1 before the next.
+     */
+    public float32 $compensation = 0.0f;
+
     private Delegate $delegate;
     private time::instant $origin;
     private int64 $lastNs;
@@ -58,6 +64,7 @@ public class GameLoop
         $this->lastNs = 0;
         $this->lag = 0;
         $this->forceStop = false;
+        $this->compensation = 0.0f;
         $this->frameTimes = array<int64>();
         $this->tickCounts = array<int32>();
         $this->tickTimes = array<int64>();
@@ -149,8 +156,15 @@ public class GameLoop
             $compensation = ($this->lag as float32) / ($this->timestepNs as float32);
         }
 
+        $this->compensation = $compensation;
         $this->delegate->render($compensation);
-        $this->push64($this->frameTimes, $this->nowNs() - $nowNs, $this->frameTimeSampleCount);
+
+        // the inter-frame delta, not how long advance() took: a frame
+        // that blocks on present must show up in the fps readout
+        if ($delta > 0) {
+            $this->push64($this->frameTimes, $delta, $this->frameTimeSampleCount);
+        }
+
         $this->push32($this->tickCounts, $ticks, $this->tickCountSampleCount);
     }
 

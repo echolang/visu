@@ -93,9 +93,10 @@ public class RenderEncoder : RenderEncoderProtocol
     public function setScissor(int32 $x, int32 $y, int32 $w, int32 $h) : void
     {
         assert(!$this->ended, 'setScissor after end');
+        GpuScissor $s = clampScissor($x, $y, $w, $h, $this->width, $this->height);
         vk::Rect2D $scissor = vk::Rect2D();
-        $scissor->offset = vk::Offset2D($x, $y);
-        $scissor->extent = vk::Extent2D($w as uint32, $h as uint32);
+        $scissor->offset = vk::Offset2D($s->x, $s->y);
+        $scissor->extent = vk::Extent2D($s->w as uint32, $s->h as uint32);
         vk::CmdSetScissor($this->device->currentCmd(), 0, 1, &$scissor);
         $this->scissorSet = true;
     }
@@ -115,6 +116,27 @@ public class RenderEncoder : RenderEncoderProtocol
             $this->device->currentCmd(),
             $buffer->handle->buffer,
             $offset,
+            vkIndexType($type)
+        );
+    }
+
+    public function setVertexScratch(uint32 $binding, ScratchSlice $slice) : void
+    {
+        assert(!$this->ended, 'setVertexScratch after end');
+        assert($slice->frameSlot == $this->device->slot, 'scratch from another frame');
+        vk::Buffer $buf = $this->device->slots[$this->device->slot]->ring->buffer;
+        uint64 $off = $slice->offset;
+        vk::CmdBindVertexBuffers($this->device->currentCmd(), $binding, 1, &$buf, &$off);
+    }
+
+    public function setIndexScratch(ScratchSlice $slice, IndexType $type) : void
+    {
+        assert(!$this->ended, 'setIndexScratch after end');
+        assert($slice->frameSlot == $this->device->slot, 'scratch from another frame');
+        vk::CmdBindIndexBuffer(
+            $this->device->currentCmd(),
+            $this->device->slots[$this->device->slot]->ring->buffer,
+            $slice->offset,
             vkIndexType($type)
         );
     }

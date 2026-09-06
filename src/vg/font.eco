@@ -1,0 +1,633 @@
+/**
+ * Loaded TTF plus a packed r8 atlas. Raster lives in C
+ * (stb_truetype); packing and the GPU texture stay in Echo.
+ */
+
+namespace visu::vg;
+
+use visu::geo::AABB2D;
+use visu::graphics::{
+    Device, PixelFormat, ResourceState, Texture, TextureDesc
+};
+use visu::math::Vec2;
+
+internal const int32 FONT_ATLAS = 512;
+internal const int32 FONT_ATLAS_MAX = 2048;
+internal const int32 FONT_PAD = 1;
+
+internal struct Glyph
+{
+    public int32 $w = 0;
+    public int32 $h = 0;
+    public int32 $xoff = 0;
+    public int32 $yoff = 0;
+    public float32 $advance = 0.0f;
+    public int32 $atlasX = 0;
+    public int32 $atlasY = 0;
+    public bool $packed = false;
+}
+
+internal struct FontMetrics
+{
+    public float32 $ascent = 0.0f;
+    public float32 $descent = 0.0f;
+    public float32 $lineh = 0.0f;
+}
+
+/**
+ * One face. Canvas owns these by name; the handle is what
+ * `fontFace` stores on the state stack.
+ */
+public class Font
+{
+    public const string $name;
+    public Device $device;
+    internal string $bytes;
+    internal ptr<VgFont> $raw;
+    internal map<uint64, Glyph> $glyphs;
+    internal Texture? $atlas;
+    internal array<uint8> $pixels;
+    internal int32 $atlasW;
+    internal int32 $atlasH;
+    internal int32 $packX;
+    internal int32 $packY;
+    internal int32 $rowH;
+    internal bool $dirty;
+    internal bool $overflow;
+    private bool $dead;
+
+    internal constructor(Device $device, string $name, string $bytes, ptr<VgFont> $raw)
+    {
+        $this->device = $device;
+        $this->name = $name;
+        $this->bytes = $bytes;
+        $this->raw = $raw;
+        $this->glyphs = map<uint64, Glyph>();
+        $this->atlas = null;
+        $this->pixels = array<uint8>();
+        $this->atlasW = FONT_ATLAS;
+        $this->atlasH = FONT_ATLAS;
+        $this->packX = FONT_PAD;
+        $this->packY = FONT_PAD;
+        $this->rowH = 0;
+        $this->dirty = false;
+        $this->overflow = false;
+        $this->dead = false;
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->dead = true;
+
+        if ($this->raw != null) {
+            vg_font_free($this->raw);
+            $this->raw:$ = null;
+        }
+
+        Texture? $atlas = $this->atlas;
+
+        if ($atlas != null) {
+            Texture $tex = guard $atlas;
+            $tex->destroy();
+            $this->atlas = null;
+        }
+    }
+}
+
+internal function fontLoad(Device $device, string $name, string $bytes) : result<Font, VgError>
+{
+    ptr<const uint8> $data = $bytes->data();
+
+    if ($bytes->size() == 0 || $data:$ == null) {
+        return .error(.fontParse);
+    }
+
+    ptr<VgFont> $raw = vg_font_load($data, $bytes->size() as int32);
+
+    if ($raw == null) {
+        return .error(.fontParse);
+    }
+
+    return .ok(Font($device, $name, $bytes, $raw));
+}
+
+internal function fontMetrics(Font $font, float32 $px) : FontMetrics
+{
+    FontMetrics $m = FontMetrics();
+
+    if ($font->raw == null) {
+        return $m;
+    }
+
+    vg_font_metrics($font->raw, $px, &$m->ascent, &$m->descent, &$m->lineh);
+    return $m;
+}
+
+internal function fontGlyph(Font $font, int32 $cp, float32 $px) : Glyph
+{
+    uint64 $key = glyphKey($cp, $px);
+
+    if ($font->glyphs->has($key)) {
+        return $font->glyphs[$key];
+    }
+
+    Glyph $g = Glyph();
+
+    if ($font->raw == null) {
+        return $g;
+    }
+
+    int32 $ok = vg_font_glyph(
+        $font->raw,
+        $cp,
+        $px,
+        &$g->w,
+        &$g->h,
+        &$g->xoff,
+        &$g->yoff,
+        &$g->advance
+    );
+
+    if ($ok == 0) {
+        $font->glyphs[$key] = $g;
+        return $g;
+    }
+
+    $font->glyphs[$key] = $g;
+    return $g;
+}
+
+internal function fontPack(Font $font, int32 $cp, float32 $px) : Glyph
+{
+    Glyph $g = fontGlyph($font, $cp, $px);
+
+    if ($g->packed || $g->w <= 0 || $g->h <= 0) {
+        return $g;
+    }
+
+    fontEnsureAtlas($font);
+
+    if (!fontPlace($font, $g)) {
+        $font->overflow = true;
+        return $g;
+    }
+
+    usize $n = ($g->w * $g->h) as usize;
+    array<uint8> $bitmap = arr::room<uint8>($n);
+    ptr<uint8> $dst = $bitmap->spare();
+
+    if ($dst:$ != null) {
+        vg_font_raster($font->raw, $cp, $px, $dst, $g->w);
+        $bitmap->commit($n);
+        fontBlit($font, $g, $bitmap);
+    }
+
+    $g->packed = true;
+    $font->glyphs[glyphKey($cp, $px)] = $g;
+    $font->dirty = true;
+    return $g;
+}
+
+internal function fontSync(Font $font) : void
+{
+    if (!$font->dirty) {
+        return;
+    }
+
+    Texture? $maybe = $font->atlas;
+    Texture $tex = guard $maybe else {
+        return;
+    }
+    usize $n = $font->pixels->count();
+    ptr<uint8> $pixels = $font->pixels->data();
+
+    if ($n == 0 || $pixels:$ == null) {
+        $font->dirty = false;
+        return;
+    }
+
+    $tex->upload(0, $pixels, $n as uint64, $font->atlasW);
+    $font->device->transition($tex, ResourceState::shaderRead);
+    $font->dirty = false;
+}
+
+internal function fontEnsureAtlas(Font $font) : void
+{
+    if ($font->atlas != null) {
+        return;
+    }
+
+    int32 $w = $font->atlasW;
+    int32 $h = $font->atlasH;
+    usize $n = ($w * $h) as usize;
+    $font->pixels = arr::room<uint8>($n);
+    ptr<uint8> $p = $font->pixels->spare();
+
+    if ($p:$ != null) {
+        mem::zero<uint8>($p, $n);
+        $font->pixels->commit($n);
+    }
+
+    TextureDesc $desc = TextureDesc($format: .r8, $width: $w, $height: $h);
+    Texture $tex = Texture($font->device, "vg-font-{$font->name}", $desc);
+    $font->atlas = $tex;
+    $font->dirty = true;
+}
+
+internal function fontResetAtlas(Font $font) : void
+{
+    $font->glyphs->clear();
+    $font->packX = FONT_PAD;
+    $font->packY = FONT_PAD;
+    $font->rowH = 0;
+    usize $n = $font->pixels->count();
+
+    ptr<uint8> $pixels = $font->pixels->data();
+
+    if ($n > 0 && $pixels:$ != null) {
+        mem::zero<uint8>($pixels, $n);
+    }
+
+    $font->dirty = true;
+}
+
+internal function fontHandleOverflow(Font $font) : void
+{
+    if (!$font->overflow) {
+        return;
+    }
+
+    $font->overflow = false;
+
+    if ($font->atlasW < FONT_ATLAS_MAX) {
+        int32 $next = $font->atlasW * 2;
+
+        if ($next > FONT_ATLAS_MAX) {
+            $next = FONT_ATLAS_MAX;
+        }
+
+        $font->atlasW = $next;
+        $font->atlasH = $next;
+    }
+
+    Texture? $old = $font->atlas;
+
+    if ($old != null) {
+        Texture $tex = guard $old;
+        $tex->destroy();
+        $font->atlas = null;
+    }
+
+    $font->pixels = array<uint8>();
+    fontResetAtlas($font);
+}
+
+internal function fontPlace(Font $font, Glyph& $g) : bool
+{
+    int32 $bw = $g->w + FONT_PAD;
+    int32 $bh = $g->h + FONT_PAD;
+
+    if ($bw > $font->atlasW || $bh > $font->atlasH) {
+        return false;
+    }
+
+    if ($font->packX + $bw > $font->atlasW) {
+        $font->packX = FONT_PAD;
+        $font->packY = $font->packY + $font->rowH + FONT_PAD;
+        $font->rowH = 0;
+    }
+
+    if ($font->packY + $bh > $font->atlasH) {
+        return false;
+    }
+
+    $g->atlasX = $font->packX;
+    $g->atlasY = $font->packY;
+    $font->packX = $font->packX + $bw;
+
+    if ($g->h > $font->rowH) {
+        $font->rowH = $g->h;
+    }
+
+    return true;
+}
+
+internal function fontBlit(Font $font, const Glyph& $g, array<uint8>& $bitmap) : void
+{
+    ptr<uint8> $baseDst = $font->pixels->data();
+    ptr<uint8> $baseSrc = $bitmap->data();
+
+    if ($baseDst:$ == null || $baseSrc:$ == null) {
+        return;
+    }
+
+    int32 $row = 0;
+
+    while ($row < $g->h) {
+        usize $dstOff = (($g->atlasY + $row) * $font->atlasW + $g->atlasX) as usize;
+        usize $srcOff = ($row * $g->w) as usize;
+        ptr<uint8> $dst = $baseDst;
+        ptr<uint8> $src = $baseSrc;
+        $dst:$ = $baseDst:$ + ($dstOff as isize);
+        $src:$ = $baseSrc:$ + ($srcOff as isize);
+        mem::copy<uint8>($dst, $src, $g->w as usize);
+        $row = $row + 1;
+    }
+}
+
+internal function quantizePx(float32 $px) : float32
+{
+    float32 $q = $px * 4.0f + 0.5f;
+    int32 $n = $q as int32;
+
+    if ($n < 1) {
+        $n = 1;
+    }
+
+    float32 $f = $n as float32;
+    return $f * 0.25f;
+}
+
+internal function glyphKey(int32 $cp, float32 $px) : uint64
+{
+    float32 $qpx = $px * 4.0f + 0.5f;
+    int32 $q = $qpx as int32;
+
+    if ($q < 1) {
+        $q = 1;
+    }
+
+    uint64 $hi = $cp as uint64;
+    uint64 $lo = $q as uint64;
+    return ($hi << 32) | $lo;
+}
+
+internal function utf8Next(const string& $s, usize& $i) : int32
+{
+    usize $n = $s->size();
+
+    if ($i >= $n) {
+        return 0;
+    }
+
+    uint8 $b0 = $s->byte($i);
+    $i = $i + 1;
+
+    if ($b0 < 128) {
+        return $b0 as int32;
+    }
+
+    if ($b0 < 194 || $i >= $n) {
+        return $b0 as int32;
+    }
+
+    if ($b0 < 224) {
+        uint8 $b1 = $s->byte($i);
+        $i = $i + 1;
+        return ((($b0 as int32) & 31) << 6) | (($b1 as int32) & 63);
+    }
+
+    if ($b0 < 240 && $i + 1 < $n) {
+        uint8 $b1 = $s->byte($i);
+        uint8 $b2 = $s->byte($i + 1);
+        $i = $i + 2;
+        return ((($b0 as int32) & 15) << 12)
+            | ((($b1 as int32) & 63) << 6)
+            | (($b2 as int32) & 63);
+    }
+
+    if ($i + 2 < $n) {
+        uint8 $b1 = $s->byte($i);
+        uint8 $b2 = $s->byte($i + 1);
+        uint8 $b3 = $s->byte($i + 2);
+        $i = $i + 3;
+        return ((($b0 as int32) & 7) << 18)
+            | ((($b1 as int32) & 63) << 12)
+            | ((($b2 as int32) & 63) << 6)
+            | (($b3 as int32) & 63);
+    }
+
+    return $b0 as int32;
+}
+
+internal function textWidth(Font $font, float32 $px, const string& $s) : float32
+{
+    float32 $pen = 0.0f;
+    int32 $prev = 0;
+    usize $i = 0;
+    usize $n = $s->size();
+
+    while ($i < $n) {
+        int32 $cp = utf8Next($s, $i);
+
+        if ($cp <= 0) {
+            continue;
+        }
+
+        if ($prev != 0) {
+            $pen = $pen + vg_font_kern($font->raw, $prev, $cp, $px);
+        }
+
+        Glyph $g = fontGlyph($font, $cp, $px);
+        $pen = $pen + $g->advance;
+        $prev = $cp;
+    }
+
+    return $pen;
+}
+
+internal struct TextLayout
+{
+    public float32 $advance;
+    public AABB2D $bounds;
+}
+
+internal function emitText(Canvas $vg, Vec2 $pos, const string& $s, bool $draw) : float32
+{
+    TextLayout $layout = layoutText($vg, $pos, $s, $draw);
+    return $layout->advance;
+}
+
+internal function layoutText(Canvas $vg, Vec2 $pos, const string& $s, bool $draw) : TextLayout
+{
+    TextLayout $out = TextLayout(0.0f, AABB2D($pos, $pos));
+    Font? $maybe = $vg->state->font;
+    Font $font = guard $maybe else {
+        return $out;
+    }
+
+    if ($s->size() == 0) {
+        return $out;
+    }
+
+    float32 $scale = tessScale($vg->state->xform);
+    float32 $px = quantizePx($vg->state->fontSize * $scale);
+    float32 $inv = 1.0f / $scale;
+    FontMetrics $m = fontMetrics($font, $px);
+    float32 $widthPx = textWidth($font, $px, $s);
+    float32 $originX = $pos->x;
+    float32 $originY = $pos->y;
+
+    match ($vg->state->align->h) {
+        HAlign::left => {
+        },
+        HAlign::center => {
+            $originX = $originX - $widthPx * $inv * 0.5f;
+        },
+        HAlign::right => {
+            $originX = $originX - $widthPx * $inv;
+        },
+    };
+
+    match ($vg->state->align->v) {
+        VAlign::baseline => {
+        },
+        VAlign::top => {
+            $originY = $originY + $m->ascent * $inv;
+        },
+        VAlign::middle => {
+            $originY = $originY + ($m->ascent + $m->descent) * 0.5f * $inv;
+        },
+        VAlign::bottom => {
+            $originY = $originY + $m->descent * $inv;
+        },
+    };
+
+    $out->advance = $widthPx * $inv;
+    float32 $pen = 0.0f;
+    int32 $prev = 0;
+    usize $i = 0;
+    usize $n = $s->size();
+    bool $any = false;
+    float32 $minX = $originX;
+    float32 $minY = $originY;
+    float32 $maxX = $originX;
+    float32 $maxY = $originY;
+    int32 $first = $vg->mesh->indices->count() as int32;
+    Xform $xf = $vg->state->xform;
+    float32 $aw = $font->atlasW as float32;
+    float32 $ah = $font->atlasH as float32;
+
+    if ($aw < 1.0f) {
+        $aw = 1.0f;
+    }
+
+    if ($ah < 1.0f) {
+        $ah = 1.0f;
+    }
+
+    while ($i < $n) {
+        int32 $cp = utf8Next($s, $i);
+
+        if ($cp <= 0) {
+            continue;
+        }
+
+        if ($prev != 0) {
+            $pen = $pen + vg_font_kern($font->raw, $prev, $cp, $px);
+        }
+
+        Glyph $g = fontGlyph($font, $cp, $px);
+
+        if ($draw) {
+            $g = fontPack($font, $cp, $px);
+        }
+
+        float32 $x0 = $originX + ($pen + ($g->xoff as float32)) * $inv;
+        float32 $y0 = $originY + ($g->yoff as float32) * $inv;
+        float32 $x1 = $x0 + ($g->w as float32) * $inv;
+        float32 $y1 = $y0 + ($g->h as float32) * $inv;
+
+        if ($g->w > 0 && $g->h > 0) {
+            if (!$any) {
+                $minX = $x0;
+                $minY = $y0;
+                $maxX = $x1;
+                $maxY = $y1;
+                $any = true;
+            } else {
+                if ($x0 < $minX) {
+                    $minX = $x0;
+                }
+
+                if ($y0 < $minY) {
+                    $minY = $y0;
+                }
+
+                if ($x1 > $maxX) {
+                    $maxX = $x1;
+                }
+
+                if ($y1 > $maxY) {
+                    $maxY = $y1;
+                }
+            }
+
+            if ($draw && $g->packed) {
+                int32 $gx1 = $g->atlasX + $g->w;
+                int32 $gy1 = $g->atlasY + $g->h;
+                float32 $u0 = $g->atlasX as float32 / $aw;
+                float32 $v0 = $g->atlasY as float32 / $ah;
+                float32 $u1 = $gx1 as float32 / $aw;
+                float32 $v1 = $gy1 as float32 / $ah;
+                emitGlyphQuad($vg->mesh, $xf, $x0, $y0, $x1, $y1, $u0, $v0, $u1, $v1);
+            }
+        }
+
+        $pen = $pen + $g->advance;
+        $prev = $cp;
+    }
+
+    if ($any) {
+        $out->bounds = AABB2D(Vec2($minX, $minY), Vec2($maxX, $maxY));
+    }
+
+    if ($draw) {
+        int32 $count = ($vg->mesh->indices->count() as int32) - $first;
+        Paint $p = Paint($vg->state->fill->inner);
+        $p->kind = .alpha;
+        Texture? $atlas = $font->atlas;
+
+        if ($atlas != null) {
+            Texture $tex = guard $atlas;
+            pushCall($vg, $first, $count, $p, $tex);
+        }
+    }
+
+    return $out;
+}
+
+internal function emitGlyphQuad(
+    TessMesh& $mesh,
+    const Xform& $xf,
+    float32 $x0,
+    float32 $y0,
+    float32 $x1,
+    float32 $y1,
+    float32 $u0,
+    float32 $v0,
+    float32 $u1,
+    float32 $v1
+) : void
+{
+    uint32 $base = $mesh->verts->count() as uint32;
+    $mesh->verts[] = VgVertex($xf->apply(Vec2($x0, $y0)), Vec2($u0, $v0));
+    $mesh->verts[] = VgVertex($xf->apply(Vec2($x1, $y0)), Vec2($u1, $v0));
+    $mesh->verts[] = VgVertex($xf->apply(Vec2($x1, $y1)), Vec2($u1, $v1));
+    $mesh->verts[] = VgVertex($xf->apply(Vec2($x0, $y1)), Vec2($u0, $v1));
+    $mesh->indices[] = $base;
+    $mesh->indices[] = ($base + 1) as uint32;
+    $mesh->indices[] = ($base + 2) as uint32;
+    $mesh->indices[] = $base;
+    $mesh->indices[] = ($base + 2) as uint32;
+    $mesh->indices[] = ($base + 3) as uint32;
+}
