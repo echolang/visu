@@ -1,0 +1,300 @@
+/**
+ * Walk the placed tree into the batch: all boxes, then glyphs,
+ * then overlay (open select). Kind emit lives next to the widget.
+ */
+
+namespace visu::ui;
+
+use visu::graphics::Texture;
+use visu::math::{Vec2, Vec4};
+use visu::vg::{Color, Font, fontHandleOverflow, fontPack, quantizePx, utf8Next};
+
+internal function emitUi(Ui $ui) : void
+{
+    $ui->batch->clear();
+    prepareFonts($ui);
+    Texture? $white = null;
+    UiGpu $g = guard $ui->gpu else {
+        return;
+    }
+    $white = $g->white;
+    int32 $first = $ui->batch->indices->count() as int32;
+    emitBoxes($ui, 0);
+    closeDraw($ui->batch, $first, $white);
+    beginRun($ui->batch);
+    emitGlyphs($ui, 0);
+    endRun($ui->batch);
+    $first = $ui->batch->indices->count() as int32;
+    emitOverlayBoxes($ui);
+    closeDraw($ui->batch, $first, $white);
+    beginRun($ui->batch);
+    emitOverlayGlyphs($ui);
+    endRun($ui->batch);
+}
+
+internal function prepareFonts(Ui $ui) : void
+{
+    Font $regular = guard uiFont($ui, false) else {
+        return;
+    }
+    fontHandleOverflow($regular);
+    Font $semibold = guard uiFont($ui, true) else {
+        return;
+    }
+    fontHandleOverflow($semibold);
+}
+
+internal function aaPad(Ui $ui) : float32
+{
+    return 1.0f / $ui->scale;
+}
+
+internal function noClip() : Vec4
+{
+    return Vec4(0.0f);
+}
+
+internal function clipBox(Vec2 $pos, Vec2 $size) : Vec4
+{
+    return Vec4(
+        $pos->x + $size->x * 0.5f,
+        $pos->y + $size->y * 0.5f,
+        $size->x * 0.5f,
+        $size->y * 0.5f
+    );
+}
+
+internal function fillBox(Ui $ui, Vec2 $pos, Vec2 $size, float32 $r, Color $color, float32 $pad) : void
+{
+    emitBox($ui->batch, $pos, $size, $r, $color, noClip(), $pad);
+}
+
+internal function strokeRing(
+    Ui $ui,
+    Vec2 $pos,
+    Vec2 $size,
+    float32 $r,
+    Color $color,
+    float32 $pad
+) : void
+{
+    emitStrokeBox($ui->batch, $pos, $size, $r, $color, noClip(), $pad);
+}
+
+internal function snapPt(float32 $v, float32 $scale) : float32
+{
+    float32 $px = $v * $scale + 0.5f;
+    int32 $n = $px as int32;
+
+    return ($n as float32) / $scale;
+}
+
+internal function emitBoxes(Ui $ui, int32 $i) : void
+{
+    Node $n = $ui->nodes[$i as usize];
+    float32 $pad = aaPad($ui);
+
+    if ($n->bg->a > 0.0f) {
+        fillBox($ui, $n->pos, $n->size, $n->radius, $n->bg, $pad);
+    }
+
+    match ($n->kind) {
+        Kind::button => {
+            emitButtonBox($ui, $n, $pad);
+        },
+        Kind::checkbox => {
+            emitCheckBox($ui, $n, $pad);
+        },
+        Kind::group => {
+            emitGroupBox($ui, $n, $pad);
+        },
+        Kind::select => {
+            emitSelectBox($ui, $n, $pad);
+        },
+        else => {
+        },
+    };
+
+    int32 $c = $n->firstChild;
+
+    while ($c >= 0) {
+        emitBoxes($ui, $c);
+        $c = $ui->nodes[$c as usize]->next;
+    }
+}
+
+internal function emitGlyphs(Ui $ui, int32 $i) : void
+{
+    Node $n = $ui->nodes[$i as usize];
+    emitNodeGlyphs($ui, $n);
+    int32 $c = $n->firstChild;
+
+    while ($c >= 0) {
+        emitGlyphs($ui, $c);
+        $c = $ui->nodes[$c as usize]->next;
+    }
+}
+
+internal function emitOverlayBoxes(Ui $ui) : void
+{
+    usize $n = $ui->overlays->count();
+    usize $i = 0;
+    float32 $pad = aaPad($ui);
+
+    while ($i < $n) {
+        int32 $idx = $ui->overlays[$i];
+        Node $node = $ui->nodes[$idx as usize];
+        emitSelectOverlayBox($ui, $node, $pad);
+        $i = $i + 1;
+    }
+}
+
+internal function emitOverlayGlyphs(Ui $ui) : void
+{
+    usize $n = $ui->overlays->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        int32 $idx = $ui->overlays[$i];
+        Node $node = $ui->nodes[$idx as usize];
+        emitSelectOverlayGlyphs($ui, $node);
+        $i = $i + 1;
+    }
+}
+
+internal function emitNodeGlyphs(Ui $ui, const Node& $n) : void
+{
+    if ($n->kind == Kind::text || $n->kind == Kind::label) {
+        emitTextRun($ui, $n);
+        return;
+    }
+
+    if ($n->kind == Kind::button) {
+        emitButtonText($ui, $n);
+        return;
+    }
+
+    if ($n->kind == Kind::checkbox) {
+        emitCheckText($ui, $n);
+        return;
+    }
+
+    if ($n->kind == Kind::group) {
+        emitGroupText($ui, $n);
+        return;
+    }
+
+    if ($n->kind == Kind::select) {
+        emitSelectText($ui, $n);
+    }
+}
+
+internal function emitTextRun(Ui $ui, const Node& $n) : Texture?
+{
+    TextRun $run = $ui->texts[$n->payload as usize];
+    return paintText($ui, $n->pos, $run->text, $run->size, $run->color, $run->bold, false);
+}
+
+internal function paintText(
+    Ui $ui,
+    Vec2 $pos,
+    const string& $s,
+    float32 $size,
+    Color $color,
+    bool $bold,
+    bool $center,
+    Vec4 $clip = Vec4(0.0f),
+    bool $middle = false
+) : Texture?
+{
+    Font $font = guard uiFont($ui, $bold) else {
+        return null;
+    }
+
+    if ($s->size() == 0) {
+        return null;
+    }
+
+    float32 $scale = $ui->scale;
+    float32 $px = quantizePx($size * $scale);
+    float32 $inv = 1.0f / $scale;
+    float32 $widthPx = visu::vg::textWidth($font, $px, $s);
+    float32 $originX = $pos->x;
+    float32 $originY = $pos->y;
+
+    if ($center) {
+        $originX = $originX - $widthPx * $inv * 0.5f;
+        visu::vg::FontMetrics $m = visu::vg::fontMetrics($font, $px);
+        $originY = $originY + ($m->ascent + $m->descent) * 0.5f * $inv;
+    } else if ($middle) {
+        visu::vg::FontMetrics $m = visu::vg::fontMetrics($font, $px);
+        $originY = $originY + ($m->ascent + $m->descent) * 0.5f * $inv;
+    } else {
+        visu::vg::FontMetrics $m = visu::vg::fontMetrics($font, $px);
+        $originY = $originY + $m->ascent * $inv;
+    }
+
+    $originX = snapPt($originX, $scale);
+    $originY = snapPt($originY, $scale);
+
+    Vec4 $col = $color->premultiplied();
+    float32 $pen = 0.0f;
+    int32 $prev = 0;
+    usize $i = 0;
+    usize $n = $s->size();
+    float32 $aw = $font->atlasW as float32;
+    float32 $ah = $font->atlasH as float32;
+
+    if ($aw < 1.0f) {
+        $aw = 1.0f;
+    }
+
+    if ($ah < 1.0f) {
+        $ah = 1.0f;
+    }
+
+    while ($i < $n) {
+        int32 $cp = utf8Next($s, $i);
+
+        if ($cp <= 0) {
+            continue;
+        }
+
+        if ($prev != 0) {
+            $pen = $pen + visu::vg::vg_font_kern($font->raw, $prev, $cp, $px);
+        }
+
+        visu::vg::Glyph $g = fontPack($font, $cp, $px);
+        float32 $x0 = $originX + ($pen + ($g->xoff as float32)) * $inv;
+        float32 $y0 = $originY + ($g->yoff as float32) * $inv;
+        float32 $x1 = $x0 + ($g->w as float32) * $inv;
+        float32 $y1 = $y0 + ($g->h as float32) * $inv;
+
+        if (drawGlyph($g) && $g->packed) {
+            bindAtlas($ui->batch, $font->atlas);
+
+            if ($font->atlasW as float32 != $aw) {
+                $aw = $font->atlasW as float32;
+                $ah = $font->atlasH as float32;
+            }
+
+            int32 $gx1 = $g->atlasX + $g->w;
+            int32 $gy1 = $g->atlasY + $g->h;
+            float32 $u0 = ($g->atlasX as float32) / $aw;
+            float32 $v0 = ($g->atlasY as float32) / $ah;
+            float32 $u1 = ($gx1 as float32) / $aw;
+            float32 $v1 = ($gy1 as float32) / $ah;
+            emitGlyph($ui->batch, $x0, $y0, $x1, $y1, $u0, $v0, $u1, $v1, $col, $clip);
+        }
+
+        $pen = $pen + $g->advance;
+        $prev = $cp;
+    }
+
+    return $font->atlas;
+}
+
+internal function drawGlyph(const visu::vg::Glyph& $g) : bool
+{
+    return $g->w > 0 && $g->h > 0;
+}

@@ -1,0 +1,326 @@
+/**
+ * Three linear passes over the packed node table: measure
+ * (bottom-up fit/fixed), allocate (top-down fill), place
+ * (alignment + flow).
+ */
+
+namespace visu::ui;
+
+use visu::math::Vec2;
+
+internal function layoutTree(array<Node>& $nodes, Vec2 $frame) : void
+{
+    if ($nodes->count() == 0) {
+        return;
+    }
+
+    measureNode($nodes, 0);
+    allocateNode($nodes, 0, $frame);
+    $nodes->at(0)->pos = Vec2(0.0f, 0.0f);
+    placeNode($nodes, 0);
+}
+
+internal function measureNode(array<Node>& $nodes, int32 $i) : void
+{
+    int32 $c = $nodes[$i as usize]->firstChild;
+
+    while ($c >= 0) {
+        measureNode($nodes, $c);
+        $c = $nodes[$c as usize]->next;
+    }
+
+    Node $n = $nodes[$i as usize];
+
+    if ($n->kind != Kind::layout) {
+        return;
+    }
+
+    float32 $sumX = 0.0f;
+    float32 $sumY = 0.0f;
+    float32 $maxX = 0.0f;
+    float32 $maxY = 0.0f;
+    int32 $child = $n->firstChild;
+    int32 $count = 0;
+
+    while ($child >= 0) {
+        Node $ch = $nodes[$child as usize];
+        bool $skipFlow = fillsFlow($ch, $n->flow);
+
+        if ($n->flow == Flow::horizontal) {
+            if (!$skipFlow) {
+                $sumX = $sumX + $ch->measured->x;
+            }
+
+            if ($ch->measured->y > $maxY) {
+                $maxY = $ch->measured->y;
+            }
+        } else {
+            if (!$skipFlow) {
+                $sumY = $sumY + $ch->measured->y;
+            }
+
+            if ($ch->measured->x > $maxX) {
+                $maxX = $ch->measured->x;
+            }
+        }
+
+        $count = $count + 1;
+        $child = $ch->next;
+    }
+
+    float32 $gap = 0.0f;
+
+    if ($count > 1) {
+        int32 $gaps = $count - 1;
+        $gap = $n->spacing * ($gaps as float32);
+    }
+
+    float32 $mx = $n->measured->x;
+    float32 $my = $n->measured->y;
+
+    if ($n->h == Sizing::fixed) {
+        $mx = $n->prefW;
+    } else if ($n->h == Sizing::fit) {
+        if ($n->flow == Flow::horizontal) {
+            $mx = $sumX + $gap + $n->pad->width();
+        } else {
+            $mx = $maxX + $n->pad->width();
+        }
+    }
+
+    if ($n->v == Sizing::fixed) {
+        $my = $n->prefH;
+    } else if ($n->v == Sizing::fit) {
+        if ($n->flow == Flow::vertical) {
+            $my = $sumY + $gap + $n->pad->height();
+        } else {
+            $my = $maxY + $n->pad->height();
+        }
+    }
+
+    $nodes->at($i as usize)->measured = Vec2($mx, $my);
+}
+
+internal function fillsFlow(const Node& $n, Flow $flow) : bool
+{
+    if ($flow == Flow::horizontal) {
+        return $n->h == Sizing::fill;
+    }
+
+    return $n->v == Sizing::fill;
+}
+
+internal function allocateNode(array<Node>& $nodes, int32 $i, Vec2 $container) : void
+{
+    Node $n = $nodes[$i as usize];
+    float32 $w = $n->measured->x;
+    float32 $h = $n->measured->y;
+
+    if ($n->h == Sizing::fill) {
+        $w = $container->x;
+    } else if ($n->h == Sizing::fixed) {
+        $w = $n->prefW;
+    }
+
+    if ($n->v == Sizing::fill) {
+        $h = $container->y;
+    } else if ($n->v == Sizing::fixed) {
+        $h = $n->prefH;
+    }
+
+    $nodes->at($i as usize)->size = Vec2($w, $h);
+
+    float32 $innerW = $w - $n->pad->width();
+    float32 $innerH = $h - $n->pad->height();
+
+    if ($innerW < 0.0f) {
+        $innerW = 0.0f;
+    }
+
+    if ($innerH < 0.0f) {
+        $innerH = 0.0f;
+    }
+
+    float32 $nonFill = 0.0f;
+    int32 $fillN = 0;
+    int32 $count = 0;
+    int32 $c = $n->firstChild;
+
+    while ($c >= 0) {
+        Node $ch = $nodes[$c as usize];
+
+        if (fillsFlow($ch, $n->flow)) {
+            $fillN = $fillN + 1;
+        } else if ($n->flow == Flow::horizontal) {
+            $nonFill = $nonFill + $ch->measured->x;
+        } else {
+            $nonFill = $nonFill + $ch->measured->y;
+        }
+
+        $count = $count + 1;
+        $c = $ch->next;
+    }
+
+    float32 $gap = 0.0f;
+
+    if ($count > 1) {
+        int32 $gaps = $count - 1;
+        $gap = $n->spacing * ($gaps as float32);
+    }
+
+    float32 $fillShare = 0.0f;
+
+    if ($fillN > 0) {
+        float32 $inner = $innerW;
+
+        if ($n->flow == Flow::vertical) {
+            $inner = $innerH;
+        }
+
+        float32 $left = $inner - $nonFill - $gap;
+
+        if ($left < 0.0f) {
+            $left = 0.0f;
+        }
+
+        $fillShare = $left / ($fillN as float32);
+    }
+
+    $c = $n->firstChild;
+
+    while ($c >= 0) {
+        Node $ch = $nodes[$c as usize];
+        float32 $cw = $ch->measured->x;
+        float32 $chh = $ch->measured->y;
+
+        if ($n->flow == Flow::horizontal) {
+            if (fillsFlow($ch, $n->flow)) {
+                $cw = $fillShare;
+            }
+
+            if ($ch->v == Sizing::fill) {
+                $chh = $innerH;
+            }
+        } else {
+            if (fillsFlow($ch, $n->flow)) {
+                $chh = $fillShare;
+            }
+
+            if ($ch->h == Sizing::fill) {
+                $cw = $innerW;
+            }
+        }
+
+        allocateNode($nodes, $c, Vec2($cw, $chh));
+        $c = $nodes[$c as usize]->next;
+    }
+}
+
+internal function placeNode(array<Node>& $nodes, int32 $i) : void
+{
+    Node $n = $nodes[$i as usize];
+    float32 $innerW = $n->size->x - $n->pad->width();
+    float32 $innerH = $n->size->y - $n->pad->height();
+    float32 $totalX = 0.0f;
+    float32 $totalY = 0.0f;
+    int32 $count = 0;
+    int32 $c = $n->firstChild;
+
+    while ($c >= 0) {
+        Node $ch = $nodes[$c as usize];
+
+        if ($n->flow == Flow::horizontal) {
+            $totalX = $totalX + $ch->size->x;
+
+            if ($ch->size->y > $totalY) {
+                $totalY = $ch->size->y;
+            }
+        } else {
+            $totalY = $totalY + $ch->size->y;
+
+            if ($ch->size->x > $totalX) {
+                $totalX = $ch->size->x;
+            }
+        }
+
+        $count = $count + 1;
+        $c = $ch->next;
+    }
+
+    float32 $gap = 0.0f;
+
+    if ($count > 1) {
+        int32 $gaps = $count - 1;
+        $gap = $n->spacing * ($gaps as float32);
+    }
+
+    if ($n->flow == Flow::horizontal) {
+        $totalX = $totalX + $gap;
+    } else {
+        $totalY = $totalY + $gap;
+    }
+
+    Vec2 $off = alignOffset($n->align, Vec2($totalX, $totalY), Vec2($innerW, $innerH));
+    float32 $x = $n->pos->x + $n->pad->left + $off->x;
+    float32 $y = $n->pos->y + $n->pad->top + $off->y;
+    $c = $n->firstChild;
+
+    while ($c >= 0) {
+        int32 $next = $nodes[$c as usize]->next;
+        Vec2 $sz = $nodes[$c as usize]->size;
+        $nodes->at($c as usize)->pos = Vec2($x, $y);
+        placeNode($nodes, $c);
+
+        if ($n->flow == Flow::horizontal) {
+            $x = $x + $sz->x + $n->spacing;
+        } else {
+            $y = $y + $sz->y + $n->spacing;
+        }
+
+        $c = $next;
+    }
+}
+
+internal function alignOffset(Align $align, Vec2 $content, Vec2 $inner) : Vec2
+{
+    float32 $x = 0.0f;
+    float32 $y = 0.0f;
+
+    if ($align == Align::topCenter || $align == Align::center || $align == Align::bottomCenter) {
+        $x = ($inner->x - $content->x) * 0.5f;
+    } else if ($align == Align::topRight || $align == Align::centerRight || $align == Align::bottomRight) {
+        $x = $inner->x - $content->x;
+    }
+
+    if ($align == Align::centerLeft || $align == Align::center || $align == Align::centerRight) {
+        $y = ($inner->y - $content->y) * 0.5f;
+    } else if ($align == Align::bottomLeft || $align == Align::bottomCenter || $align == Align::bottomRight) {
+        $y = $inner->y - $content->y;
+    }
+
+    if ($x < 0.0f) {
+        $x = 0.0f;
+    }
+
+    if ($y < 0.0f) {
+        $y = 0.0f;
+    }
+
+    return Vec2($x, $y);
+}
+
+internal function contains(const Node& $n, Vec2 $p) : bool
+{
+    return $p->x >= $n->pos->x
+        && $p->y >= $n->pos->y
+        && $p->x <= $n->pos->x + $n->size->x
+        && $p->y <= $n->pos->y + $n->size->y;
+}
+
+internal function contains(Vec2 $pos, Vec2 $size, Vec2 $p) : bool
+{
+    return $p->x >= $pos->x
+        && $p->y >= $pos->y
+        && $p->x <= $pos->x + $size->x
+        && $p->y <= $pos->y + $size->y;
+}

@@ -1,0 +1,431 @@
+/**
+ * Submit API, ids, last-frame hits.
+ */
+
+use visu::graphics::Device;
+use visu::math::{Vec2, equal};
+use visu::os::key;
+use visu::ui::{Choice, Kind, Node, Ui, mixId, selectData, selectIsOpen};
+
+test ui_column_fit_two_spaces
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(200.0f, 200.0f));
+    $ui->beginColumn(4.0f);
+    $ui->space(10.0f, 8.0f);
+    $ui->space(12.0f, 6.0f);
+    $ui->end();
+    $ui->endFrame();
+    Node $col = $ui->nodes[1];
+    assert(equal($col->size->y, 18.0f), 'h');
+    assert(equal($ui->nodes[3]->pos->y, $col->pos->y + 12.0f), 'c1y');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_button_clicks_on_second_frame
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginColumn();
+    bool $a = $ui->button('Save');
+    $ui->end();
+    $ui->endFrame();
+    assert(!$a, 'first');
+    Node $btn = firstKind($ui, Kind::button);
+    Vec2 $pos = $btn->pos;
+    Vec2 $size = $btn->size;
+    Vec2 $mid = Vec2($pos->x + $size->x * 0.5f, $pos->y + $size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginColumn();
+    $ui->button('Save');
+    $ui->end();
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginColumn();
+    bool $hit = $ui->button('Save');
+    $ui->end();
+    $ui->endFrame();
+    assert($hit, 'clicked');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_checkbox_toggles
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    bool $on = false;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->checkbox('Vsync', &$on);
+    $ui->endFrame();
+    Node $box = firstKind($ui, Kind::checkbox);
+    Vec2 $pos = $box->pos;
+    Vec2 $size = $box->size;
+    Vec2 $mid = Vec2($pos->x + $size->x * 0.5f, $pos->y + $size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->checkbox('Vsync', &$on);
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    bool $changed = $ui->checkbox('Vsync', &$on);
+    $ui->endFrame();
+    assert($changed, 'changed');
+    assert($on, 'on');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_id_override_does_not_collide
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->beginColumn();
+    $ui->button('Same', id: 'a');
+    $ui->button('Same', id: 'b');
+    $ui->end();
+    $ui->endFrame();
+    uint64 $id0 = nthKind($ui, Kind::button, 0)->id;
+    uint64 $id1 = nthKind($ui, Kind::button, 1)->id;
+    assert($id0 != $id1, 'ids');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_select_writes_choice
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('low', 'Low');
+    $opts[] = Choice('high', 'High');
+    string $sel = 'low';
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    assert($sel == 'low', 'keep');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_select_opens_on_click
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('low', 'Low');
+    $opts[] = Choice('high', 'High');
+    string $sel = 'low';
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    uint64 $id = firstKind($ui, Kind::select)->id;
+    $box = $ui->slots[$id];
+    Vec2 $mid = Vec2($box->pos->x + $box->size->x * 0.5f, $box->pos->y + $box->size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    assert(selectIsOpen($ui->slots[$id]), 'open');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_select_picks_option
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('low', 'Low');
+    $opts[] = Choice('high', 'High');
+    string $sel = 'low';
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    uint64 $id = firstKind($ui, Kind::select)->id;
+    $box = $ui->slots[$id];
+    Vec2 $mid = Vec2($box->pos->x + $box->size->x * 0.5f, $box->pos->y + $box->size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    assert(selectIsOpen($ui->slots[$id]), 'open');
+    $box = $ui->slots[$id];
+    $drop = selectData($box);
+    float32 $oh = $ui->theme->select->optionHeight;
+    Vec2 $opt = Vec2(
+        $drop->dropPos->x + $drop->dropSize->x * 0.5f,
+        $drop->dropPos->y + $oh + $oh * 0.5f
+    );
+    $ui->seed($opt, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    $ui->seed($opt, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    bool $changed = $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    assert($changed, 'changed');
+    assert($sel == 'high', 'high');
+    assert(!selectIsOpen($ui->slots[$id]), 'closed');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_select_click_outside_closes
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('low', 'Low');
+    $opts[] = Choice('high', 'High');
+    string $sel = 'low';
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    uint64 $id = firstKind($ui, Kind::select)->id;
+    $box = $ui->slots[$id];
+    Vec2 $mid = Vec2($box->pos->x + $box->size->x * 0.5f, $box->pos->y + $box->size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    assert(selectIsOpen($ui->slots[$id]), 'open');
+    $ui->seed(Vec2(390.0f, 390.0f), true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    assert(!selectIsOpen($ui->slots[$id]), 'closed');
+    assert($sel == 'low', 'keep');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+function firstKind(Ui $ui, Kind $kind) : Node
+{
+    return nthKind($ui, $kind, 0);
+}
+
+function nthKind(Ui $ui, Kind $kind, usize $want) : Node
+{
+    usize $seen = 0;
+    usize $i = 0;
+    usize $n = $ui->nodes->count();
+
+    while ($i < $n) {
+        Node $node = $ui->nodes[$i];
+
+        if ($node->kind == $kind) {
+            if ($seen == $want) {
+                return $node;
+            }
+
+            $seen = $seen + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    die('missing kind');
+}
+
+function openSelect(Ui $ui, string& $sel, const array<Choice>& $opts) : uint64
+{
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, $sel);
+    $ui->endFrame();
+    uint64 $id = firstKind($ui, Kind::select)->id;
+    $box = $ui->slots[$id];
+    Vec2 $mid = Vec2($box->pos->x + $box->size->x * 0.5f, $box->pos->y + $box->size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, $sel);
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, $sel);
+    $ui->endFrame();
+    return $id;
+}
+
+test ui_select_filters_on_type
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('low', 'Low');
+    $opts[] = Choice('high', 'High');
+    string $sel = 'low';
+    uint64 $id = openSelect($ui, &$sel, $opts);
+    assert(selectIsOpen($ui->slots[$id]), 'open');
+    array<int32> $chars = array<int32>();
+    $chars[] = 104;
+    $ui->seedChars($chars);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    assert(selectData($ui->slots[$id])->query == 'h', 'query');
+    assert(selectIsOpen($ui->slots[$id]), 'stays open');
+    assert($sel == 'low', 'keep');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_select_backspace_clears_query
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('low', 'Low');
+    $opts[] = Choice('high', 'High');
+    string $sel = 'low';
+    uint64 $id = openSelect($ui, &$sel, $opts);
+    array<int32> $chars = array<int32>();
+    $chars[] = 104;
+    $ui->seedChars($chars);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    assert(selectData($ui->slots[$id])->query == 'h', 'typed');
+    $ui->seedKey(key::BACKSPACE);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    assert(selectData($ui->slots[$id])->query == '', 'cleared');
+    assert(selectIsOpen($ui->slots[$id]), 'open');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_select_enter_picks_highlight
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('low', 'Low');
+    $opts[] = Choice('high', 'High');
+    string $sel = 'low';
+    uint64 $id = openSelect($ui, &$sel, $opts);
+    array<int32> $chars = array<int32>();
+    $chars[] = 104;
+    $ui->seedChars($chars);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    $ui->seedKey(key::ENTER);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    bool $changed = $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    assert($changed, 'changed');
+    assert($sel == 'high', 'high');
+    assert(!selectIsOpen($ui->slots[$id]), 'closed');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_select_escape_closes
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('low', 'Low');
+    $opts[] = Choice('high', 'High');
+    string $sel = 'low';
+    uint64 $id = openSelect($ui, &$sel, $opts);
+    array<int32> $chars = array<int32>();
+    $chars[] = 104;
+    $ui->seedChars($chars);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    $ui->seedKey(key::ESCAPE);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->endFrame();
+    assert(!selectIsOpen($ui->slots[$id]), 'closed');
+    assert($sel == 'low', 'keep');
+    assert(selectData($ui->slots[$id])->query == '', 'query dropped');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_button_group_clicks
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('a', 'A');
+    $opts[] = Choice('b', 'B');
+    string $sel = 'a';
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->buttonGroup('Size', $opts, &$sel);
+    $ui->endFrame();
+    Node $g = firstKind($ui, Kind::group);
+    uint64 $oid = mixId($g->id, 'b');
+    $opt = $ui->slots[$oid];
+    Vec2 $mid = Vec2($opt->pos->x + $opt->size->x * 0.5f, $opt->pos->y + $opt->size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->buttonGroup('Size', $opts, &$sel);
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    bool $changed = $ui->buttonGroup('Size', $opts, &$sel);
+    $ui->endFrame();
+    assert($changed, 'changed');
+    assert($sel == 'b', 'b');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_select_outside_does_not_click_later_button
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('low', 'Low');
+    $opts[] = Choice('high', 'High');
+    string $sel = 'low';
+    uint64 $id = openSelect($ui, &$sel, $opts);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->space(0.0f, 220.0f);
+    $ui->button('Later');
+    $ui->endFrame();
+    Node $btn = firstKind($ui, Kind::button);
+    Vec2 $mid = Vec2($btn->pos->x + $btn->size->x * 0.5f, $btn->pos->y + $btn->size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->space(0.0f, 220.0f);
+    $ui->button('Later');
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->space(0.0f, 220.0f);
+    bool $hit = $ui->button('Later');
+    $ui->endFrame();
+    assert(!selectIsOpen($ui->slots[$id]), 'closed');
+    assert(!$hit, 'button skipped');
+    $ui->destroy();
+    $device->shutdown();
+}

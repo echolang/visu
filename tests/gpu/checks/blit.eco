@@ -3,7 +3,8 @@
  */
 
 use visu::graphics::{
-    ClearPass, ClearPassOptions, FullscreenTextureRenderer, Pipeline, TargetRef
+    ClearPass, ClearPassOptions, FullscreenTextureRenderer, Pipeline, TargetRef,
+    Texture, TextureDesc, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST
 };
 use visu::math::Vec4;
 
@@ -29,12 +30,79 @@ public function checkBlit(GpuContext $gpu) : void
     assert($pixels[1] < 16, 'blit g');
 }
 
+/**
+ * Top row of a top-left texture must stay at the top of the
+ * destination. readRgba is bottom-left, so that row is last.
+ */
+public function checkBlitY(GpuContext $gpu) : void
+{
+    TextureDesc $desc = TextureDesc($width: 64, $height: 64);
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_DST;
+    Texture $tex = Texture($gpu->device, 'blitY', $desc);
+    array<uint8> $px = array<uint8>();
+    int32 $y = 0;
+
+    while ($y < 64) {
+        int32 $x = 0;
+
+        while ($x < 64) {
+            if ($y == 0) {
+                $px[] = 255;
+                $px[] = 0;
+                $px[] = 0;
+                $px[] = 255;
+            } else {
+                $px[] = 0;
+                $px[] = 255;
+                $px[] = 0;
+                $px[] = 255;
+            }
+
+            $x = $x + 1;
+        }
+
+        $y = $y + 1;
+    }
+
+    $tex->upload(0, $px->data(), 16384 as uint64, 256);
+
+    FullscreenTextureRenderer $blit = FullscreenTextureRenderer();
+    guard $blit->load($gpu->device) else ($e) {
+        $tex->destroy();
+        $blit->destroy();
+        die($e->message());
+    }
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $dst = offscreen64($p, 'blitYDst');
+        $p->add(ClearPass($dst, ClearPassOptions(color: Vec4(0.0f, 0.0f, 1.0f, 1.0f))));
+        $src = $p->importTexture('blitYSrc', $tex);
+        $blit->pass($p, $dst, $src);
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('blitYDst');
+    $blit->destroy();
+    $tex->destroy();
+    assert($pixels[0] < 16, 'bottom r');
+    assert($pixels[1] > 240, 'bottom g');
+    usize $top = ((64 * 63) * 4) as usize;
+    assert($pixels[$top] > 240, 'top r');
+    assert($pixels[$top + 1] < 16, 'top g');
+}
+
 #[if: os != darwin]
 #[group: "glfw"]
 test gpu_blit
 {
     GpuContext $gpu = gpuHidden('blit');
     checkBlit($gpu);
+    $gpu->end();
+}
+
+test gpu_blit_y
+{
+    GpuContext $gpu = gpuHidden('blitY');
+    checkBlitY($gpu);
     $gpu->end();
 }
 #[end]

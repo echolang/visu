@@ -1,0 +1,140 @@
+/**
+ * Packed UI node. Widget calls append these; layout walks by
+ * index. A borrow into the array is invalid after append.
+ */
+
+namespace visu::ui;
+
+use visu::math::Vec2;
+use visu::vg::Color;
+
+public const int32 NODE_NONE = -1;
+
+public enum Kind
+{
+    case layout;
+    case text;
+    case label;
+    case space;
+    case button;
+    case checkbox;
+    case group;
+    case select;
+}
+
+public enum Flow
+{
+    case vertical;
+    case horizontal;
+}
+
+public enum Sizing
+{
+    case fit;
+    case fill;
+    case fixed;
+}
+
+public enum Align
+{
+    case topLeft;
+    case topCenter;
+    case topRight;
+    case centerLeft;
+    case center;
+    case centerRight;
+    case bottomLeft;
+    case bottomCenter;
+    case bottomRight;
+}
+
+public enum ButtonKind
+{
+    case primary;
+    case secondary;
+}
+
+/**
+ * Config for `Ui.begin`. Field defaults; assign what you need.
+ */
+public struct Layout
+{
+    public Flow $flow = .vertical;
+    public Sizing $h = .fill;
+    public Sizing $v = .fit;
+    public Align $align = .topLeft;
+    public Edges $pad = Edges();
+    public float32 $spacing = 0.0f;
+    public float32 $width = 0.0f;
+    public float32 $height = 0.0f;
+    public Color $bg;
+    public float32 $radius = 0.0f;
+
+    init
+    {
+        $this->bg = Color::transparent();
+    }
+}
+
+public struct Node
+{
+    public Kind $kind = .layout;
+    public int32 $parent = NODE_NONE;
+    public int32 $firstChild = NODE_NONE;
+    public int32 $lastChild = NODE_NONE;
+    public int32 $next = NODE_NONE;
+    public int32 $childCount = 0;
+    public Flow $flow = .vertical;
+    public Sizing $h = .fit;
+    public Sizing $v = .fit;
+    public Align $align = .topLeft;
+    public Edges $pad = Edges();
+    public float32 $spacing = 0.0f;
+    public float32 $prefW = 0.0f;
+    public float32 $prefH = 0.0f;
+    public float32 $radius = 0.0f;
+    public Color $bg;
+    public Vec2 $measured = Vec2(0.0f);
+    public Vec2 $size = Vec2(0.0f);
+    public Vec2 $pos = Vec2(0.0f);
+    public uint64 $id = 0 as uint64;
+    public int32 $payload = NODE_NONE;
+
+    init
+    {
+        $this->bg = Color::transparent();
+    }
+}
+
+internal function interactive(Kind $kind) : bool
+{
+    return $kind == Kind::button
+        || $kind == Kind::checkbox
+        || $kind == Kind::group
+        || $kind == Kind::select;
+}
+
+internal function appendNode(array<Node>& $nodes, int32 $parent, Node $n) : int32
+{
+    $n->parent = $parent;
+    int32 $i = $nodes->count() as int32;
+    $nodes[] = $n;
+
+    if ($parent < 0) {
+        return $i;
+    }
+
+    Node& $p = $nodes->at($parent as usize);
+
+    if ($p->firstChild < 0) {
+        $p->firstChild = $i;
+        $p->lastChild = $i;
+    } else {
+        int32 $last = $p->lastChild;
+        $nodes->at($last as usize)->next = $i;
+        $p->lastChild = $i;
+    }
+
+    $p->childCount = $p->childCount + 1;
+    return $i;
+}

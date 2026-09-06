@@ -1,0 +1,44 @@
+/**
+ * Graph node: sync font atlases, then beginRender and flush the
+ * batched mesh. Texture upload is illegal with an encoder open.
+ */
+
+namespace visu::ui;
+
+use visu::graphics::{
+    Context, Frame, IoSink, Pass, Pipeline, PipelineError, RenderEncoder, TargetRef
+};
+
+public class UiPass : Pass
+{
+    public const TargetRef $target;
+    private Ui $ui;
+
+    public constructor(Ui $ui, TargetRef $target)
+    {
+        $this->ui = $ui;
+        $this->target = $target;
+    }
+
+    public function name() : string
+    {
+        return 'UiPass';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        $io->writes($this->target);
+    }
+
+    public function execute(Context $ctx) : status<PipelineError>
+    {
+        $this->ui->tessellate();
+        $this->ui->sync();
+        RenderEncoder $enc = guard $ctx->beginRender($this->target) else ($e) {
+            return .error($e);
+        }
+        $this->ui->flush($enc);
+        $enc->end();
+        return .ok;
+    }
+}

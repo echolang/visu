@@ -138,20 +138,6 @@ internal class HostRing
     }
 }
 
-internal function filledBytes(uint64 $n) : array<uint8>
-{
-    array<uint8> $out = array<uint8>();
-    $out->reserve($n as usize);
-    uint64 $i = 0;
-
-    while ($i < $n) {
-        $out[] = 0;
-        $i = $i + 1;
-    }
-
-    return $out;
-}
-
 internal function alignUp(uint64 $v, uint64 $a) : uint64
 {
     if ($a <= 1) {
@@ -429,6 +415,36 @@ internal function vkOneShotCopyBufferToImage(
         &$region
     );
     vkRecordBarrier($cmd, $texture->handle->image, .transferDst, .shaderRead, vkAspect($texture->format));
+    guard vkCheck(vk::EndCommandBuffer($cmd), 'EndCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    vkSubmitSetup($device);
+}
+
+internal function vkOneShotCopyImage(Device $device, Texture $src, Texture $dst) : void
+{
+    vk::CommandBuffer $cmd = vkBeginSetup($device);
+    vkRecordBarrier($cmd, $src->handle->image, $src->state, .transferSrc, vkAspect($src->format));
+    vkRecordBarrier($cmd, $dst->handle->image, $dst->state, .transferDst, vkAspect($dst->format));
+    vk::ImageCopy $region = vk::ImageCopy();
+    $region->srcSubresource->aspectMask = vkAspect($src->format);
+    $region->srcSubresource->layerCount = 1;
+    $region->dstSubresource->aspectMask = vkAspect($dst->format);
+    $region->dstSubresource->layerCount = 1;
+    $region->extent->width = $src->width as uint32;
+    $region->extent->height = $src->height as uint32;
+    $region->extent->depth = 1;
+    vk::CmdCopyImage(
+        $cmd,
+        $src->handle->image,
+        vk::IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        $dst->handle->image,
+        vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &$region
+    );
+    vkRecordBarrier($cmd, $dst->handle->image, .transferDst, .shaderRead, vkAspect($dst->format));
     guard vkCheck(vk::EndCommandBuffer($cmd), 'EndCommandBuffer') else ($e) {
         die($e->message());
     }

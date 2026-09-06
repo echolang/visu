@@ -1,0 +1,138 @@
+/**
+ * Primary button fill is blue, not the green clear.
+ */
+
+use visu::graphics::{
+    ClearPass, ClearPassOptions, Pipeline, TargetRef, TextureOptions
+};
+use visu::math::{Vec2, Vec4};
+use visu::ui::{Choice, Ui, resolveFontDir};
+
+public function checkFlyUiButton(GpuContext $gpu) : void
+{
+    Ui $ui = Ui($gpu->device);
+    guard $ui->load(resolveFontDir('resources/font')) else ($e) {
+        $ui->destroy();
+        die($e->message());
+    }
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'flyui');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+        $ui->beginFrame(Vec2(64.0f, 64.0f), 1.0f);
+        $ui->button('Save', fill: true);
+        $ui->endFrame();
+        $ui->pass($p, $t);
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('flyui');
+    $ui->destroy();
+    uint8 $maxB = 0;
+    uint8 $minG = 255;
+    usize $i = 0;
+    usize $n = $pixels->count();
+
+    while ($i + 2 < $n) {
+        uint8 $g = $pixels[$i + 1];
+        uint8 $b = $pixels[$i + 2];
+
+        if ($b > $maxB) {
+            $maxB = $b;
+        }
+
+        if ($g < $minG) {
+            $minG = $g;
+        }
+
+        $i = $i + 4;
+    }
+
+    assert($maxB > 80, 'button blue');
+    assert($minG < 200, 'not only clear');
+}
+
+public function checkFlyUiSelect(GpuContext $gpu) : void
+{
+    Ui $ui = Ui($gpu->device);
+    guard $ui->load(resolveFontDir('resources/font')) else ($e) {
+        $ui->destroy();
+        die($e->message());
+    }
+
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('small', 'Small');
+    $opts[] = Choice('medium', 'Medium');
+    $opts[] = Choice('large', 'Large');
+    $opts[] = Choice('xl', 'Extra Large');
+    string $sel = '';
+    flySelectFrame($ui, &$sel, $opts);
+    $sel = 'medium';
+    flySelectFrame($ui, &$sel, $opts);
+    flySelectOpen($ui, &$sel, $opts);
+    flySelectPass($gpu, $ui, 'selOpen');
+    array<uint8> $openPx = $gpu->readOffscreen('selOpen', 320, 240);
+    $ui->destroy();
+    uint8 $maxB = 0;
+    uint8 $maxR = 0;
+    usize $i = 0;
+    usize $n = $openPx->count();
+
+    while ($i + 2 < $n) {
+        uint8 $r = $openPx[$i];
+        uint8 $b = $openPx[$i + 2];
+
+        if ($r > $maxR) {
+            $maxR = $r;
+        }
+
+        if ($b > $maxB) {
+            $maxB = $b;
+        }
+
+        $i = $i + 4;
+    }
+
+    assert($maxR > 200, 'select white');
+    assert($maxB > 80, 'select selected blue');
+}
+
+internal function flySelectFrame(Ui $ui, string& $sel, const array<Choice>& $opts) : void
+{
+    $ui->beginFrame(Vec2(320.0f, 240.0f), 1.0f);
+    $ui->select('Size', $opts, $sel);
+    $ui->endFrame();
+}
+
+internal function flySelectOpen(Ui $ui, string& $sel, const array<Choice>& $opts) : void
+{
+    flySelectFrame($ui, $sel, $opts);
+    Vec2 $mid = Vec2(50.0f, 36.0f);
+    $ui->seed($mid, true, false, true);
+    flySelectFrame($ui, $sel, $opts);
+    $ui->seed($mid, false, true, false);
+    flySelectFrame($ui, $sel, $opts);
+    $ui->seed($mid, false, false, false);
+}
+
+internal function flySelectPass(GpuContext $gpu, Ui $ui, string $name) : void
+{
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = $p->createTarget($name, 320, 240);
+        $p->createColor($t, 'color', TextureOptions());
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.95f, 0.95f, 0.95f, 1.0f))));
+        $ui->pass($p, $t);
+    });
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_flyui_button
+{
+    GpuContext $gpu = gpuHidden('flyui');
+    checkFlyUiButton($gpu);
+    checkFlyUiSelect($gpu);
+    $gpu->end();
+}
+#[end]
+
+

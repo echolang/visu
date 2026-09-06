@@ -8,8 +8,10 @@
  *   php tools/shaders.php examples/shader/shaders
  *   php tools/shaders.php --check
  *   php tools/shaders.php --bake
- *   php tools/shaders.php --include /path/to/resources/shader/include
+ *   php tools/shaders.php --include /path/to/resources/shaders/include
  *
+ * Library GLSL lives in `resources/shaders/` (`blit/`, `vg/`, `ui/`,
+ * `include/visu`). `--bake` writes the Echo byte files in src/.
  * Source is `quad.vert` / `quad.frag` (glslang stage files).
  * Outputs are `quad.vert.spv` + `quad.vert.metal`, plus
  * `name+variant.*` for `#pragma visu variant` and a
@@ -32,6 +34,7 @@ const STAGES = [
 ];
 
 const DEFAULT_TREES = [
+    'resources/shaders',
     'examples/shader/shaders',
     'examples/quickstart/resources/shader',
     'tests/resources/shaders',
@@ -83,7 +86,7 @@ function main(array $argv) : int
         $dirs[] = $arg;
     }
 
-    $defaultInclude = $root . DIRECTORY_SEPARATOR . 'resources' . DIRECTORY_SEPARATOR . 'shader' . DIRECTORY_SEPARATOR . 'include';
+    $defaultInclude = $root . DIRECTORY_SEPARATOR . 'resources' . DIRECTORY_SEPARATOR . 'shaders' . DIRECTORY_SEPARATOR . 'include';
     if (is_dir($defaultInclude)) {
         array_unshift($includes, $defaultInclude);
     }
@@ -118,6 +121,7 @@ function main(array $argv) : int
         foreach ([
             bakeBlit($root, $tools),
             bakeVg($root, $tools),
+            bakeUi($root, $tools),
         ] as $bakeResult) {
             if ($bakeResult === 'error') {
                 return 1;
@@ -173,10 +177,10 @@ Compile Vulkan GLSL to SPIR-V and Metal.
 
   php tools/shaders.php [dir...] [--check] [--bake] [--include dir]
 
-With no dirs, compiles the example and test shader trees.
+With no dirs, compiles the library, example, and test shader trees.
 --check compiles and diffs against the committed outputs.
---bake writes src/graphics/renderer/blitshader.eco from blit/blit.{vert,frag}.
---include adds an extra -I directory (resources/shader/include is default).
+--bake writes blitshader.eco / vgshader.eco / uishader.eco from resources/shaders.
+--include adds an extra -I directory (resources/shaders/include is default).
 
 TXT;
 }
@@ -613,7 +617,7 @@ function checkStale(string $tree, array $expected, array $manifestLines) : strin
 
 function bakeBlit(string $root, array $tools) : string
 {
-    $dir = $root . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'graphics' . DIRECTORY_SEPARATOR . 'renderer' . DIRECTORY_SEPARATOR . 'blit';
+    $dir = $root . DIRECTORY_SEPARATOR . 'resources' . DIRECTORY_SEPARATOR . 'shaders' . DIRECTORY_SEPARATOR . 'blit';
     $vert = $dir . DIRECTORY_SEPARATOR . 'blit.vert';
     $frag = $dir . DIRECTORY_SEPARATOR . 'blit.frag';
     $out = $root . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'graphics' . DIRECTORY_SEPARATOR . 'renderer' . DIRECTORY_SEPARATOR . 'blitshader.eco';
@@ -664,7 +668,7 @@ function bakeBlit(string $root, array $tools) : string
 
 function bakeVg(string $root, array $tools) : string
 {
-    $dir = $root . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'vg' . DIRECTORY_SEPARATOR . 'shader';
+    $dir = $root . DIRECTORY_SEPARATOR . 'resources' . DIRECTORY_SEPARATOR . 'shaders' . DIRECTORY_SEPARATOR . 'vg';
     $vert = $dir . DIRECTORY_SEPARATOR . 'vg.vert';
     $frag = $dir . DIRECTORY_SEPARATOR . 'vg.frag';
     $out = $root . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'vg' . DIRECTORY_SEPARATOR . 'vgshader.eco';
@@ -710,6 +714,57 @@ function bakeVg(string $root, array $tools) : string
     }
 
     fwrite(STDOUT, "shaders: vgshader.eco\n");
+    return $result;
+}
+
+function bakeUi(string $root, array $tools) : string
+{
+    $dir = $root . DIRECTORY_SEPARATOR . 'resources' . DIRECTORY_SEPARATOR . 'shaders' . DIRECTORY_SEPARATOR . 'ui';
+    $vert = $dir . DIRECTORY_SEPARATOR . 'ui.vert';
+    $frag = $dir . DIRECTORY_SEPARATOR . 'ui.frag';
+    $out = $root . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'ui' . DIRECTORY_SEPARATOR . 'uishader.eco';
+
+    if (!is_file($vert) || !is_file($frag)) {
+        fwrite(STDERR, "shaders: ui sources missing under {$dir}\n");
+        return 'error';
+    }
+
+    $tmpCheck = $tools['check'];
+    $tools['check'] = false;
+    $v = compileStage($vert, $dir, $tools, '', []);
+    $f = compileStage($frag, $dir, $tools, '', []);
+    $tools['check'] = $tmpCheck;
+
+    if ($v === 'error' || $f === 'error') {
+        return 'error';
+    }
+
+    $vertSpv = file_get_contents($vert . '.spv');
+    $fragSpv = file_get_contents($frag . '.spv');
+    $vertMsl = file_get_contents($vert . '.metal');
+    $fragMsl = file_get_contents($frag . '.metal');
+
+    $eco = bakeEco(
+        $vertSpv,
+        $fragSpv,
+        $vertMsl,
+        $fragMsl,
+        'visu::ui',
+        'ui',
+        'Baked FlyUI shaders.'
+    );
+    $result = emit($out, $eco, $tmpCheck);
+
+    if ($result === 'error') {
+        return 'error';
+    }
+
+    if ($tmpCheck) {
+        fwrite(STDOUT, "shaders: ok uishader.eco\n");
+        return 'same';
+    }
+
+    fwrite(STDOUT, "shaders: uishader.eco\n");
     return $result;
 }
 

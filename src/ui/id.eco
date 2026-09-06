@@ -1,0 +1,106 @@
+/**
+ * Id stack mix and per-control persistent slots. Rects written
+ * after place are the next frame's hit targets. Widget extras
+ * live in Persist so buttons do not carry a search string.
+ */
+
+namespace visu::ui;
+
+use visu::math::Vec2;
+
+internal struct GroupPersist
+{
+    public bool $hasPill = false;
+    public float32 $pillX = 0.0f;
+    public float32 $pillW = 0.0f;
+}
+
+internal struct SelectPersist
+{
+    public bool $open = false;
+    public string $query = '';
+    public int32 $highlight = 0;
+    public Vec2 $dropPos = Vec2(0.0f);
+    public Vec2 $dropSize = Vec2(0.0f);
+}
+
+internal enum Persist
+{
+    case none;
+    case group(GroupPersist $g);
+    case select(SelectPersist $s);
+}
+
+internal struct Slot
+{
+    public Vec2 $pos = Vec2(0.0f);
+    public Vec2 $size = Vec2(0.0f);
+    public bool $seen = false;
+    public bool $pressed = false;
+    public float64 $pressAt = -99.0;
+    public Persist $data = .none;
+}
+
+internal function mixId(uint64 $parent, const string& $label) : uint64
+{
+    return hash::combine($parent, hash::of($label));
+}
+
+internal function touchSlot(map<uint64, Slot>& $slots, uint64 $id) : void
+{
+    if (!$slots->has($id)) {
+        $slots[$id] = Slot();
+    }
+
+    $slots->at($id)->seen = true;
+}
+
+internal function dropUnseen(map<uint64, Slot>& $slots) : void
+{
+    array<uint64> $keys = $slots->keys();
+
+    foreach ($keys as $k) {
+        if (!$slots[$k]->seen) {
+            $slots->remove($k);
+        }
+    }
+}
+
+internal function groupData(const Slot& $s) : GroupPersist
+{
+    match ($s->data) {
+        Persist::group($g) => {
+            return $g;
+        },
+        else => {
+            return GroupPersist();
+        },
+    };
+}
+
+internal function setGroup(Slot& $s, GroupPersist $g) : void
+{
+    $s->data = .group($g);
+}
+
+internal function selectData(const Slot& $s) : SelectPersist
+{
+    match ($s->data) {
+        Persist::select($p) => {
+            return $p;
+        },
+        else => {
+            return SelectPersist();
+        },
+    };
+}
+
+internal function setSelect(Slot& $s, SelectPersist $p) : void
+{
+    $s->data = .select($p);
+}
+
+internal function selectIsOpen(const Slot& $s) : bool
+{
+    return selectData($s)->open;
+}

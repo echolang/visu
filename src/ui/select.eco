@@ -1,0 +1,643 @@
+/**
+ * Dropdown select: construct, hit rects, emit, overlay.
+ */
+
+namespace visu::ui;
+
+use visu::graphics::Texture;
+use visu::math::{Vec2, Vec4};
+use visu::os::key;
+use visu::vg::Color;
+
+internal const float32 SELECT_ARROW_W = 22.0f;
+
+internal function uiSelect(
+    Ui $ui,
+    const string& $name,
+    const array<Choice>& $choices,
+    string& $selected,
+    const string& $id
+) : bool
+{
+    uint64 $wid = $ui->makeId($id, $name);
+    touchSlot($ui->slots, $wid);
+    Slot $slot = $ui->slots[$wid];
+    SelectPersist $sel = selectData($slot);
+    setSelect($slot, $sel);
+    $ui->slots[$wid] = $slot;
+    bool $changed = false;
+    bool $overBox = contains($slot->pos, $slot->size, $ui->io->mouse);
+
+    if ($ui->click($wid)) {
+        $slot = $ui->slots[$wid];
+        $sel = selectData($slot);
+        $sel->open = !$sel->open;
+        $sel->query = '';
+
+        if ($sel->open) {
+            int32 $hi = findChoice($choices, $selected);
+
+            if ($hi < 0) {
+                $hi = 0;
+            }
+
+            $sel->highlight = $hi;
+        } else {
+            $ui->consume();
+        }
+
+        setSelect($slot, $sel);
+        $ui->slots[$wid] = $slot;
+    }
+
+    $slot = $ui->slots[$wid];
+    $sel = selectData($slot);
+
+    if ($sel->open && $ui->io->leftPressed && !$overBox) {
+        if (!contains($sel->dropPos, $sel->dropSize, $ui->io->mouse)) {
+            $sel = closeSelectPersist($sel);
+            $ui->consume();
+            setSelect($slot, $sel);
+            $ui->slots[$wid] = $slot;
+        }
+    }
+
+    array<int32> $shown = array<int32>();
+
+    if (selectIsOpen($ui->slots[$wid])) {
+        $slot = $ui->slots[$wid];
+        $sel = selectData($slot);
+        $sel = stepSelectKeys($ui, $sel, $choices, $selected, $changed);
+        $shown = shownIndices($choices, $sel->query);
+        int32 $n = $shown->count() as int32;
+
+        if ($sel->highlight < 0) {
+            $sel->highlight = 0;
+        }
+
+        if ($n > 0 && $sel->highlight >= $n) {
+            $sel->highlight = $n - 1;
+        }
+
+        setSelect($slot, $sel);
+        $ui->slots[$wid] = $slot;
+        usize $i = 0;
+        usize $vis = visibleOptionCount($ui->theme->select, $n);
+
+        while ($i < $vis) {
+            int32 $ci = $shown[$i];
+            Choice $ch = $choices[$ci as usize];
+            uint64 $oid = mixId($wid, $ch->id);
+            touchSlot($ui->slots, $oid);
+
+            if (contains($ui->slots[$oid]->pos, $ui->slots[$oid]->size, $ui->io->mouse)) {
+                $sel->highlight = $i as int32;
+                setSelect($slot, $sel);
+                $ui->slots[$wid] = $slot;
+            }
+
+            if ($ui->click($oid)) {
+                $selected = $ch->id;
+                $changed = true;
+                $slot = $ui->slots[$wid];
+                $sel = closeSelectPersist(selectData($slot));
+                setSelect($slot, $sel);
+                $ui->slots[$wid] = $slot;
+                $ui->consume();
+            }
+
+            $i = $i + 1;
+        }
+    }
+
+    if (!selectIsOpen($ui->slots[$wid])) {
+        $shown = array<int32>();
+    } else {
+        $shown = shownIndices($choices, selectData($ui->slots[$wid])->query);
+    }
+
+    int32 $p = $ui->lists->count() as int32;
+    $ui->lists[] = ListRun($name, $choices, $selected, $shown);
+    Node $node = Node();
+    $node->kind = .select;
+    $node->payload = $p;
+    $node->id = $wid;
+    $node->measured = measureSelect($ui, $choices);
+    $ui->push($node);
+    return $changed;
+}
+
+internal function stepSelectKeys(
+    Ui $ui,
+    SelectPersist $sel,
+    const array<Choice>& $choices,
+    string& $selected,
+    bool& $changed
+) : SelectPersist
+{
+    if ($ui->pressedKey(key::ESCAPE)) {
+        return closeSelectPersist($sel);
+    }
+
+    bool $queryChanged = false;
+
+    if ($ui->pressedKey(key::BACKSPACE) && !$sel->query->empty()) {
+        $sel->query = $sel->query->sub(0, $sel->query->size() - 1)->clone();
+        $queryChanged = true;
+    }
+
+    usize $before = $sel->query->size();
+    appendSelectQuery($sel->query, $ui->io->chars);
+
+    if ($sel->query->size() != $before) {
+        $queryChanged = true;
+    }
+
+    array<int32> $shown = shownIndices($choices, $sel->query);
+
+    if ($queryChanged) {
+        int32 $keep = findShown($choices, $shown, $selected);
+
+        if ($keep >= 0) {
+            $sel->highlight = $keep;
+        } else {
+            $sel->highlight = 0;
+        }
+    }
+
+    int32 $n = $shown->count() as int32;
+
+    if ($ui->pressedKey(key::DOWN) && $n > 0) {
+        $sel->highlight = $sel->highlight + 1;
+    }
+
+    if ($ui->pressedKey(key::UP) && $n > 0) {
+        $sel->highlight = $sel->highlight - 1;
+    }
+
+    if ($ui->pressedKey(key::ENTER) && $n > 0) {
+        int32 $hi = $sel->highlight;
+        $selected = $choices[$shown[$hi as usize] as usize]->id;
+        $changed = true;
+        $ui->consume();
+        return closeSelectPersist($sel);
+    }
+
+    return $sel;
+}
+
+internal function shownIndices(const array<Choice>& $choices, const string& $query) : array<int32>
+{
+    array<int32> $out = array<int32>();
+    usize $i = 0;
+    usize $n = $choices->count();
+
+    if ($query->empty()) {
+        while ($i < $n) {
+            $out[] = $i as int32;
+            $i = $i + 1;
+        }
+
+        return $out;
+    }
+
+    string $q = str::lower($query);
+
+    while ($i < $n) {
+        if (str::lower($choices[$i]->label)->contains($q)) {
+            $out[] = $i as int32;
+        }
+
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function findChoice(const array<Choice>& $choices, const string& $id) : int32
+{
+    if ($id->empty()) {
+        return -1;
+    }
+
+    usize $i = 0;
+    usize $n = $choices->count();
+
+    while ($i < $n) {
+        if ($choices[$i]->id == $id) {
+            return $i as int32;
+        }
+
+        $i = $i + 1;
+    }
+
+    return -1;
+}
+
+internal function findShown(const array<Choice>& $choices, const array<int32>& $shown, const string& $id) : int32
+{
+    if ($id->empty()) {
+        return -1;
+    }
+
+    usize $i = 0;
+    usize $n = $shown->count();
+
+    while ($i < $n) {
+        if ($choices[$shown[$i] as usize]->id == $id) {
+            return $i as int32;
+        }
+
+        $i = $i + 1;
+    }
+
+    return -1;
+}
+
+internal function closeSelectPersist(SelectPersist $s) : SelectPersist
+{
+    $s->open = false;
+    $s->query = '';
+    $s->highlight = 0;
+    return $s;
+}
+
+internal function appendSelectQuery(string& $query, const array<int32>& $chars) : void
+{
+    foreach ($chars as $cp) {
+        int32 $code = $cp;
+
+        if ($code >= 32 && $code < 127) {
+            uint8 $b = $code as uint8;
+            $query->push($b);
+        }
+    }
+}
+
+internal function selectBoxHeight(const SelectStyle& $st) : float32
+{
+    return $st->fontSize + $st->pad->height();
+}
+
+internal function visibleOptionCount(const SelectStyle& $st, int32 $n) : usize
+{
+    if ($n <= 0) {
+        return 0;
+    }
+
+    int32 $maxN = ($st->maxDropdownHeight / $st->optionHeight) as int32;
+
+    if ($maxN < 1) {
+        $maxN = 1;
+    }
+
+    if ($maxN > $n) {
+        $maxN = $n;
+    }
+
+    return $maxN as usize;
+}
+
+internal function choiceLabel(const array<Choice>& $choices, const string& $id, const string& $fallback) : string
+{
+    if ($id->empty()) {
+        return $fallback;
+    }
+
+    int32 $i = findChoice($choices, $id);
+
+    if ($i < 0) {
+        return $fallback;
+    }
+
+    return $choices[$i as usize]->label;
+}
+
+internal function selectBoxText(const ListRun& $run, const string& $query, const string& $placeholder) : string
+{
+    if (!$query->empty()) {
+        return $query;
+    }
+
+    return choiceLabel($run->choices, $run->selected, $placeholder);
+}
+
+internal function measureSelect(Ui $ui, const array<Choice>& $choices) : Vec2
+{
+    SelectStyle $st = $ui->theme->select;
+    float32 $maxW = $ui->measureText($st->placeholder, $st->fontSize, true)->x;
+    usize $i = 0;
+    usize $n = $choices->count();
+
+    while ($i < $n) {
+        float32 $w = $ui->measureText($choices[$i]->label, $st->fontSize, true)->x;
+
+        if ($w > $maxW) {
+            $maxW = $w;
+        }
+
+        $i = $i + 1;
+    }
+
+    return Vec2($maxW + $st->pad->width() + SELECT_ARROW_W, $ui->theme->labelHeight + selectBoxHeight($st));
+}
+
+internal function writeSelectRects(Ui $ui, const Node& $node, int32 $index) : void
+{
+    ListRun $run = $ui->lists[$node->payload as usize];
+    SelectStyle $st = $ui->theme->select;
+    float32 $labelH = $ui->theme->labelHeight;
+    float32 $boxH = selectBoxHeight($st);
+    Vec2 $boxPos = Vec2($node->pos->x, $node->pos->y + $labelH);
+    Vec2 $boxSize = Vec2($node->size->x, $boxH);
+    touchSlot($ui->slots, $node->id);
+    Slot $box = $ui->slots[$node->id];
+    SelectPersist $sel = selectData($box);
+    $box->pos = $boxPos;
+    $box->size = $boxSize;
+    $box->seen = true;
+    array<int32> $shown = $run->shown;
+    usize $n = $shown->count();
+    usize $vis = visibleOptionCount($st, $n as int32);
+    float32 $dropH = ($vis as float32) * $st->optionHeight;
+
+    if ($vis == 0) {
+        $dropH = $st->optionHeight;
+    }
+
+    $sel->dropPos = Vec2($boxPos->x, $boxPos->y + $boxH);
+    $sel->dropSize = Vec2($boxSize->x, $dropH);
+    setSelect($box, $sel);
+    $ui->slots[$node->id] = $box;
+
+    if (!$sel->open) {
+        return;
+    }
+
+    $ui->overlays[] = $index;
+    usize $i = 0;
+
+    while ($i < $vis) {
+        Choice $ch = $run->choices[$shown[$i] as usize];
+        uint64 $oid = mixId($node->id, $ch->id);
+        touchSlot($ui->slots, $oid);
+        Slot $s = $ui->slots[$oid];
+        $s->pos = Vec2($sel->dropPos->x, $sel->dropPos->y + ($i as float32) * $st->optionHeight);
+        $s->size = Vec2($sel->dropSize->x, $st->optionHeight);
+        $s->seen = true;
+        $ui->slots[$oid] = $s;
+        $i = $i + 1;
+    }
+}
+
+internal function emitSelectBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    SelectStyle $st = $ui->theme->select;
+    float32 $labelH = $ui->theme->labelHeight;
+    Vec2 $box = Vec2($n->pos->x, $n->pos->y + $labelH);
+    Vec2 $boxSize = Vec2($n->size->x, selectBoxHeight($st));
+    bool $hot = contains($box, $boxSize, $ui->io->mouse);
+    bool $open = false;
+
+    if ($ui->slots->has($n->id)) {
+        $open = selectIsOpen($ui->slots[$n->id]);
+    }
+
+    Color $bg = $st->bg;
+
+    if ($hot || $open) {
+        $bg = $st->hoverBg;
+    }
+
+    fillBox($ui, $box, $boxSize, $st->radius, $bg, $pad);
+    strokeRing($ui, $box, $boxSize, $st->radius, $st->border, $pad);
+    Vec2 $arrow = Vec2($box->x + $boxSize->x - SELECT_ARROW_W * 0.5f, $box->y + $boxSize->y * 0.5f);
+    emitChevron($ui, $arrow, $open, $st->arrow, $pad);
+
+    if ($open) {
+        emitSelectCaret($ui, $n, $box, $boxSize, $st, $pad);
+    }
+}
+
+internal function emitSelectOverlayBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    if (!$ui->slots->has($n->id)) {
+        return;
+    }
+
+    Slot $s = $ui->slots[$n->id];
+    SelectPersist $sel = selectData($s);
+
+    if (!$sel->open) {
+        return;
+    }
+
+    ListRun $run = $ui->lists[$n->payload as usize];
+    SelectStyle $st = $ui->theme->select;
+    array<int32> $shown = $run->shown;
+    usize $vis = visibleOptionCount($st, $shown->count() as int32);
+    fillBox(
+        $ui,
+        Vec2($sel->dropPos->x, $sel->dropPos->y + 2.0f),
+        Vec2($sel->dropSize->x, $sel->dropSize->y),
+        $st->dropdownRadius,
+        Color::black()->withAlpha(0.08f),
+        $pad
+    );
+    fillBox($ui, $sel->dropPos, $sel->dropSize, $st->dropdownRadius, $st->dropdownBg, $pad);
+    strokeRing($ui, $sel->dropPos, $sel->dropSize, $st->dropdownRadius, $st->dropdownBorder, $pad);
+    usize $i = 0;
+    float32 $inset = 4.0f;
+
+    while ($i < $vis) {
+        Choice $ch = $run->choices[$shown[$i] as usize];
+        bool $picked = $ch->id == $run->selected;
+        bool $hi = ($i as int32) == $sel->highlight;
+        Color $bg = Color::transparent();
+
+        if ($picked) {
+            $bg = $st->optionSelectedBg;
+        } else if ($hi) {
+            $bg = $st->optionHoverBg;
+        }
+
+        if ($bg->a > 0.0f) {
+            fillBox(
+                $ui,
+                Vec2($sel->dropPos->x + $inset, $sel->dropPos->y + ($i as float32) * $st->optionHeight + 2.0f),
+                Vec2($sel->dropSize->x - $inset * 2.0f, $st->optionHeight - 4.0f),
+                4.0f,
+                $bg,
+                $pad
+            );
+        }
+
+        $i = $i + 1;
+    }
+}
+
+internal function emitSelectText(Ui $ui, const Node& $n) : Texture?
+{
+    ListRun $run = $ui->lists[$n->payload as usize];
+    SelectStyle $st = $ui->theme->select;
+    Texture? $atlas = paintText(
+        $ui,
+        $n->pos,
+        $run->name,
+        $ui->theme->labelFontSize,
+        $ui->theme->labelTextColor,
+        true,
+        false
+    );
+    string $query = '';
+
+    if ($ui->slots->has($n->id)) {
+        $query = selectData($ui->slots[$n->id])->query;
+    }
+
+    string $shown = selectBoxText($run, $query, $st->placeholder);
+    Color $col = $st->placeholderColor;
+
+    if (!$query->empty() || !$run->selected->empty()) {
+        $col = $st->text;
+    }
+
+    float32 $labelH = $ui->theme->labelHeight;
+    float32 $boxH = selectBoxHeight($st);
+    Vec2 $box = Vec2($n->pos->x, $n->pos->y + $labelH);
+    float32 $textW = $n->size->x - $st->pad->left - SELECT_ARROW_W;
+
+    if ($textW < 8.0f) {
+        $textW = 8.0f;
+    }
+
+    Vec4 $clip = clipBox(Vec2($box->x + $st->pad->left, $box->y), Vec2($textW, $boxH));
+    Vec2 $pos = Vec2($box->x + $st->pad->left, $box->y + $boxH * 0.5f);
+    Texture? $got = paintText($ui, $pos, $shown, $st->fontSize, $col, true, false, $clip, true);
+
+    if ($got != null) {
+        $atlas = $got;
+    }
+
+    return $atlas;
+}
+
+internal function emitSelectOverlayGlyphs(Ui $ui, const Node& $n) : Texture?
+{
+    if (!$ui->slots->has($n->id)) {
+        return null;
+    }
+
+    Slot $s = $ui->slots[$n->id];
+    SelectPersist $sel = selectData($s);
+
+    if (!$sel->open) {
+        return null;
+    }
+
+    ListRun $run = $ui->lists[$n->payload as usize];
+    SelectStyle $st = $ui->theme->select;
+    array<int32> $shown = $run->shown;
+    Vec4 $clip = clipBox($sel->dropPos, $sel->dropSize);
+    Texture? $atlas = null;
+    usize $vis = visibleOptionCount($st, $shown->count() as int32);
+
+    if ($vis == 0) {
+        Vec2 $pos = Vec2(
+            $sel->dropPos->x + $st->pad->left,
+            $sel->dropPos->y + $st->optionHeight * 0.5f
+        );
+        return paintText($ui, $pos, 'No matches', $st->fontSize, $st->placeholderColor, true, false, $clip, true);
+    }
+
+    usize $i = 0;
+
+    while ($i < $vis) {
+        Choice $ch = $run->choices[$shown[$i] as usize];
+        bool $picked = $ch->id == $run->selected;
+        bool $hi = ($i as int32) == $sel->highlight;
+        Color $col = $st->optionText;
+
+        if ($picked) {
+            $col = $st->optionSelectedText;
+        } else if ($hi) {
+            $col = $st->optionHoverText;
+        }
+
+        Vec2 $pos = Vec2(
+            $sel->dropPos->x + $st->pad->left,
+            $sel->dropPos->y + ($i as float32) * $st->optionHeight + $st->optionHeight * 0.5f
+        );
+        Texture? $got = paintText($ui, $pos, $ch->label, $st->fontSize, $col, true, false, $clip, true);
+
+        if ($got != null) {
+            $atlas = $got;
+        }
+
+        $i = $i + 1;
+    }
+
+    return $atlas;
+}
+
+internal function emitChevron(Ui $ui, Vec2 $center, bool $up, Color $color, float32 $pad) : void
+{
+    float32 $w = 8.0f;
+    float32 $h = 5.0f;
+    float32 $x = $center->x - $w * 0.5f;
+    float32 $y = $center->y - $h * 0.5f;
+    float32 $t = 1.5f;
+
+    if ($up) {
+        fillBox($ui, Vec2($x + 3.0f, $y), Vec2(2.0f, $t), 0.6f, $color, $pad);
+        fillBox($ui, Vec2($x + 1.5f, $y + 1.7f), Vec2(5.0f, $t), 0.6f, $color, $pad);
+        fillBox($ui, Vec2($x, $y + 3.4f), Vec2(8.0f, $t), 0.6f, $color, $pad);
+    } else {
+        fillBox($ui, Vec2($x, $y), Vec2(8.0f, $t), 0.6f, $color, $pad);
+        fillBox($ui, Vec2($x + 1.5f, $y + 1.7f), Vec2(5.0f, $t), 0.6f, $color, $pad);
+        fillBox($ui, Vec2($x + 3.0f, $y + 3.4f), Vec2(2.0f, $t), 0.6f, $color, $pad);
+    }
+}
+
+internal function emitSelectCaret(
+    Ui $ui,
+    const Node& $n,
+    Vec2 $box,
+    Vec2 $boxSize,
+    SelectStyle $st,
+    float32 $pad
+) : void
+{
+    ListRun $run = $ui->lists[$n->payload as usize];
+    string $query = '';
+
+    if ($ui->slots->has($n->id)) {
+        $query = selectData($ui->slots[$n->id])->query;
+    }
+
+    string $shown = selectBoxText($run, $query, $st->placeholder);
+    int32 $phase = (visu::runtime::seconds() * 2.0) as int32;
+
+    if ($phase % 2 != 0) {
+        return;
+    }
+
+    Vec2 $tw = $ui->measureText($shown, $st->fontSize, true);
+    float32 $textW = $boxSize->x - $st->pad->left - SELECT_ARROW_W;
+    float32 $caretX = $box->x + $st->pad->left + $tw->x + 1.0f;
+    float32 $maxX = $box->x + $st->pad->left + $textW - 2.0f;
+
+    if ($caretX > $maxX) {
+        $caretX = $maxX;
+    }
+
+    float32 $ch = $st->fontSize * 0.8f;
+    fillBox(
+        $ui,
+        Vec2($caretX, $box->y + $boxSize->y * 0.5f - $ch * 0.5f),
+        Vec2(1.2f, $ch),
+        0.4f,
+        $st->text,
+        $pad
+    );
+}

@@ -1,0 +1,621 @@
+/**
+ * Immediate-mode FlyUI. Widget calls append a packed node table;
+ * endFrame lays out, then last-frame rects feed the next frame's
+ * hits. Window-scoped — the app constructs one, like Input.
+ */
+
+namespace visu::ui;
+
+use visu::graphics::{Device, Pipeline, TargetRef};
+use visu::math::Vec2;
+use visu::os::Input;
+use visu::os::mouse;
+use visu::vg::{Canvas, Color, Font};
+
+public const string UI_CLAIM = 'flyui';
+
+internal struct FrameInput
+{
+    public Vec2 $mouse = Vec2(0.0f);
+    public bool $leftPressed = false;
+    public bool $leftReleased = false;
+    public bool $leftDown = false;
+    public bool $consumed = false;
+    public array<int32> $chars;
+    public int32 $key = 0;
+
+    init
+    {
+        $this->chars = array<int32>();
+    }
+}
+
+public class Ui
+{
+    public Theme $theme;
+    internal Device $device;
+    internal array<Node> $nodes;
+    internal array<TextRun> $texts;
+    internal array<ButtonRun> $buttons;
+    internal array<CheckRun> $checks;
+    internal array<ListRun> $lists;
+    internal array<int32> $parents;
+    internal array<uint64> $ids;
+    internal map<uint64, Slot> $slots;
+    internal FrameInput $io;
+    internal array<int32> $overlays;
+    internal array<int32> $animated;
+    internal bool $open;
+    internal bool $hoverAny;
+    internal bool $holdsClaim;
+    internal Vec2 $frame;
+    internal float32 $scale;
+    internal float64 $tick;
+    internal Input? $input;
+    internal UiBatch $batch;
+    internal UiGpu? $gpu;
+    private bool $dead;
+
+    public constructor(Device $device, Input? $input = null)
+    {
+        $this->device = $device;
+        $this->input = $input;
+        $this->theme = Theme();
+        $this->nodes = array<Node>();
+        $this->texts = array<TextRun>();
+        $this->buttons = array<ButtonRun>();
+        $this->checks = array<CheckRun>();
+        $this->lists = array<ListRun>();
+        $this->parents = array<int32>();
+        $this->ids = array<uint64>();
+        $this->slots = map<uint64, Slot>();
+        $this->io = FrameInput();
+        $this->overlays = array<int32>();
+        $this->animated = array<int32>();
+        $this->open = false;
+        $this->hoverAny = false;
+        $this->holdsClaim = false;
+        $this->frame = Vec2(1.0f);
+        $this->scale = 1.0f;
+        $this->tick = 0.0;
+        $this->dead = false;
+        $this->batch = UiBatch();
+        $this->gpu = null;
+        $this->nodes->reserve(256);
+        $this->batch->verts->reserve(4096);
+        $this->batch->indices->reserve(6144);
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->dead = true;
+        $this->releaseClaim();
+        $this->nodes->clear();
+        $this->slots->clear();
+        UiGpu? $maybe = $this->gpu;
+
+        if ($maybe != null) {
+            UiGpu $g = guard $maybe;
+            $g->destroy();
+            $this->gpu = null;
+        }
+    }
+
+    /**
+     * Test hook: inject mouse before widget calls.
+     */
+    public function seed(Vec2 $mouse, bool $pressed, bool $released, bool $down = false) : void
+    {
+        $this->io->mouse = $mouse;
+        $this->io->leftPressed = $pressed;
+        $this->io->leftReleased = $released;
+        $this->io->leftDown = $down;
+    }
+
+    public function seedChars(array<int32> $chars) : void
+    {
+        $this->io->chars = $chars;
+    }
+
+    public function seedKey(int32 $key) : void
+    {
+        $this->io->key = $key;
+    }
+
+    public function beginFrame(Vec2 $size, float32 $scale = 1.0f) : void
+    {
+        assert(!$this->dead, 'ui beginFrame after destroy');
+        $this->frame = $size;
+        $this->scale = $scale;
+
+        if ($this->scale < 0.0001f) {
+            $this->scale = 0.0001f;
+        }
+
+        Input? $maybe = $this->input;
+
+        if ($maybe != null) {
+            Input $in = guard $maybe;
+            $this->io->mouse = $in->cursor();
+            $this->io->leftPressed = $in->framePressed(button: mouse::LEFT);
+            $this->io->leftReleased = $in->frameReleased(button: mouse::LEFT);
+            $this->io->leftDown = $in->down(button: mouse::LEFT);
+            $this->io->chars = $in->frameChars();
+            $this->io->key = 0;
+        }
+
+        $this->io->consumed = false;
+        $this->nodes->clear();
+        $this->texts->clear();
+        $this->buttons->clear();
+        $this->checks->clear();
+        $this->lists->clear();
+        $this->parents->clear();
+        $this->ids->clear();
+        $this->overlays->clear();
+        $this->animated->clear();
+        array<uint64> $keys = $this->slots->keys();
+
+        foreach ($keys as $k) {
+            $this->slots->at($k)->seen = false;
+        }
+
+        Node $root = Node();
+        $root->kind = .layout;
+        $root->h = .fill;
+        $root->v = .fill;
+        $root->flow = .vertical;
+        appendNode($this->nodes, NODE_NONE, $root);
+        $this->parents[] = 0;
+        $this->ids[] = 0 as uint64;
+        $this->open = true;
+        $this->hoverAny = false;
+    }
+
+    public function endFrame() : void
+    {
+        assert($this->open, 'ui endFrame without beginFrame');
+        assert($this->parents->count() == 1, 'ui endFrame with unclosed begin');
+        layoutTree($this->nodes, $this->frame);
+        writeRects($this);
+        float64 $now = visu::runtime::seconds();
+        float32 $dt = 1.0f / 60.0f;
+
+        if ($this->tick > 0.0) {
+            $dt = ($now - $this->tick) as float32;
+
+            if ($dt < 0.0f) {
+                $dt = 0.0f;
+            }
+
+            if ($dt > 0.1f) {
+                $dt = 0.1f;
+            }
+        }
+
+        $this->tick = $now;
+        animatePills($this, $dt);
+        dropUnseen($this->slots);
+        $this->claimHover();
+        $this->open = false;
+        $this->io->chars = array<int32>();
+        $this->io->key = 0;
+    }
+
+    public function load(string $fontDir) : status<UiError>
+    {
+        assert(!$this->dead, 'ui load after destroy');
+        UiGpu? $prev = $this->gpu;
+
+        if ($prev != null) {
+            UiGpu $old = guard $prev;
+            $old->destroy();
+            $this->gpu = null;
+        }
+
+        Canvas $vg = Canvas($this->device);
+        guard $vg->load() else ($e) {
+            $vg->destroy();
+            return .error(.vg($e));
+        }
+        string $ds = std::env::DS;
+        Theme $t = $this->theme;
+        Font $regular = guard $vg->createFont($t->regularFont, "{$fontDir}{$ds}Inter-Regular.ttf") else ($e) {
+            $vg->destroy();
+            return .error(.vg($e));
+        }
+        Font $semibold = guard $vg->createFont($t->semiBoldFont, "{$fontDir}{$ds}Inter-SemiBold.ttf") else ($e) {
+            $vg->destroy();
+            return .error(.vg($e));
+        }
+        guard $vg->createFont($t->monospaceFont, "{$fontDir}{$ds}Inconsolata-Regular.ttf") else ($e) {
+            $vg->destroy();
+            return .error(.vg($e));
+        }
+        UiGpu $gpu = guard uiMakeGpu($this->device, $vg, $regular, $semibold) else ($e) {
+            $vg->destroy();
+            return .error($e);
+        }
+        $this->gpu = $gpu;
+        return .ok;
+    }
+
+    public function pass(Pipeline $pipeline, TargetRef $target) : void
+    {
+        $pipeline->add(UiPass($this, $target));
+    }
+
+    public function begin(Layout $layout = Layout()) : void
+    {
+        assert($this->open, 'ui begin outside frame');
+        Node $n = Node();
+        $n->kind = .layout;
+        $n->flow = $layout->flow;
+        $n->h = $layout->h;
+        $n->v = $layout->v;
+        $n->align = $layout->align;
+        $n->pad = $layout->pad;
+        $n->spacing = $layout->spacing;
+        $n->prefW = $layout->width;
+        $n->prefH = $layout->height;
+        $n->radius = $layout->radius;
+        $n->bg = $layout->bg;
+
+        if ($layout->width > 0.0f) {
+            $n->h = .fixed;
+        }
+
+        if ($layout->height > 0.0f) {
+            $n->v = .fixed;
+        }
+
+        int32 $parent = $this->peekParent();
+        int32 $i = $this->push($n);
+        int32 $sib = $this->nodes[$parent as usize]->childCount;
+        $this->parents[] = $i;
+        uint64 $pid = $this->peekId();
+        $this->ids[] = mixId($pid, "l{$sib}");
+    }
+
+    public function beginRow(float32? $spacing = null) : void
+    {
+        Layout $l = Layout();
+        $l->flow = .horizontal;
+        $l->h = .fit;
+        $l->v = .fit;
+        $l->spacing = $spacing ?? $this->theme->spacing;
+        $this->begin($l);
+    }
+
+    public function beginColumn(float32? $spacing = null) : void
+    {
+        Layout $l = Layout();
+        $l->flow = .vertical;
+        $l->h = .fill;
+        $l->v = .fit;
+        $l->spacing = $spacing ?? $this->theme->spacing;
+        $this->begin($l);
+    }
+
+    public function beginCard() : void
+    {
+        Theme $t = $this->theme;
+        Layout $l = Layout();
+        $l->flow = .vertical;
+        $l->h = .fit;
+        $l->v = .fit;
+        $l->pad = $t->cardPad;
+        $l->spacing = $t->cardSpacing;
+        $l->bg = $t->cardBg;
+        $l->radius = $t->cardRadius;
+        $this->begin($l);
+    }
+
+    public function beginSection(string $title) : void
+    {
+        Theme $t = $this->theme;
+        Layout $l = Layout();
+        $l->flow = .vertical;
+        $l->h = .fit;
+        $l->v = .fit;
+        $l->spacing = $t->sectionSpacing;
+        $l->pad = Edges(0.0f, 0.0f, 0.0f, $t->sectionBottomSpace);
+        $this->begin($l);
+        $this->text(str::upper($title), size: $t->sectionHeaderFontSize, color: $t->sectionHeaderTextColor, bold: true);
+    }
+
+    public function end() : void
+    {
+        assert($this->open, 'ui end outside frame');
+        assert($this->parents->count() > 1, 'ui end of root');
+        usize $n = $this->parents->count();
+        $this->parents->truncate($n - 1);
+        $this->ids->truncate($this->ids->count() - 1);
+    }
+
+    public function space(float32 $w = 0.0f, float32 $h = 0.0f) : void
+    {
+        Node $n = Node();
+        $n->kind = .space;
+        $n->measured = Vec2($w, $h);
+        $this->push($n);
+    }
+
+    public function text(
+        string $s,
+        size: float32 $size = 0.0f,
+        color: Color? $color = null,
+        bold: bool $bold = false
+    ) : void
+    {
+        Theme $t = $this->theme;
+        float32 $sz = $size;
+
+        if ($sz <= 0.0f) {
+            $sz = $t->fontSize;
+        }
+
+        Color $c = $color ?? $t->textColor;
+
+        int32 $p = $this->texts->count() as int32;
+        $this->texts[] = TextRun($s, $sz, $c, $bold);
+        Node $n = Node();
+        $n->kind = .text;
+        $n->payload = $p;
+        $n->measured = $this->measureText($s, $sz, $bold);
+        $this->push($n);
+    }
+
+    public function label(string $s) : void
+    {
+        Theme $t = $this->theme;
+        int32 $p = $this->texts->count() as int32;
+        $this->texts[] = TextRun($s, $t->labelFontSize, $t->labelTextColor, true);
+        Node $n = Node();
+        $n->kind = .label;
+        $n->payload = $p;
+        Vec2 $ts = $this->measureText($s, $t->labelFontSize, true);
+        $n->measured = Vec2($ts->x, $t->labelHeight);
+        $this->push($n);
+    }
+
+    public function button(
+        string $label,
+        id: string $id = '',
+        fill: bool $fill = false,
+        style: ButtonKind $kind = .primary
+    ) : bool
+    {
+        return uiButton($this, $label, $id, $fill, $kind);
+    }
+
+    public function checkbox(string $label, bool& $on, id: string $id = '') : bool
+    {
+        return uiCheckbox($this, $label, $on, $id);
+    }
+
+    public function buttonGroup(
+        string $name,
+        const array<Choice>& $choices,
+        string& $selected,
+        id: string $id = ''
+    ) : bool
+    {
+        return uiButtonGroup($this, $name, $choices, $selected, $id);
+    }
+
+    public function select(
+        string $name,
+        const array<Choice>& $choices,
+        string& $selected,
+        id: string $id = ''
+    ) : bool
+    {
+        return uiSelect($this, $name, $choices, $selected, $id);
+    }
+
+    internal function tessellate() : void
+    {
+        emitUi($this);
+    }
+
+    internal function flush(visu::graphics::RenderEncoder $enc) : void
+    {
+        flushBatch($this, $enc);
+    }
+
+    internal function sync() : void
+    {
+        UiGpu $g = guard $this->gpu else {
+            return;
+        }
+        $g->canvas->sync();
+    }
+
+    internal function push(Node $n) : int32
+    {
+        return appendNode($this->nodes, $this->peekParent(), $n);
+    }
+
+    internal function peekParent() : int32
+    {
+        usize $n = $this->parents->count();
+        assert($n > 0, 'ui parent stack empty');
+        return $this->parents[$n - 1];
+    }
+
+    internal function peekId() : uint64
+    {
+        usize $n = $this->ids->count();
+        assert($n > 0, 'ui id stack empty');
+        return $this->ids[$n - 1];
+    }
+
+    internal function makeId(const string& $explicit, const string& $fallback) : uint64
+    {
+        string $label = $explicit;
+
+        if ($label->empty()) {
+            $label = $fallback;
+        }
+
+        uint64 $id = mixId($this->peekId(), $label);
+        touchSlot($this->slots, $id);
+        return $id;
+    }
+
+    internal function click(uint64 $id) : bool
+    {
+        if ($this->io->consumed) {
+            return false;
+        }
+
+        touchSlot($this->slots, $id);
+        Slot $s = $this->slots[$id];
+        bool $over = contains($s->pos, $s->size, $this->io->mouse);
+        bool $fire = false;
+
+        if ($over && $this->io->leftDown) {
+            $s->pressed = true;
+            $s->pressAt = visu::runtime::seconds();
+        }
+
+        if ($s->pressed && $over && $this->io->leftReleased) {
+            $fire = true;
+            $s->pressed = false;
+        } else if ($this->io->leftReleased) {
+            $s->pressed = false;
+        }
+
+        $s->seen = true;
+        $this->slots[$id] = $s;
+        return $fire;
+    }
+
+    internal function consume() : void
+    {
+        $this->io->consumed = true;
+    }
+
+    internal function pressedKey(int32 $code) : bool
+    {
+        if ($this->io->key == $code) {
+            return true;
+        }
+
+        Input? $maybe = $this->input;
+
+        if ($maybe == null) {
+            return false;
+        }
+
+        Input $in = guard $maybe;
+        return $in->framePressed($code);
+    }
+
+    internal function measureText(const string& $s, float32 $size, bool $bold) : Vec2
+    {
+        Font $font = guard uiFont($this, $bold) else {
+            float32 $stub = ($s->size() as float32) * $size * 0.5f;
+            return Vec2($stub, $size * 1.2f);
+        }
+        float32 $px = visu::vg::quantizePx($size * $this->scale);
+        float32 $inv = 1.0f / $this->scale;
+        float32 $w = visu::vg::textWidth($font, $px, $s) * $inv;
+        visu::vg::FontMetrics $m = visu::vg::fontMetrics($font, $px);
+        return Vec2($w, $m->lineh * $inv);
+    }
+
+    internal function claimHover() : void
+    {
+        $this->hoverAny = $this->overlays->count() > 0;
+        usize $n = $this->nodes->count();
+        usize $i = 0;
+
+        while (!$this->hoverAny && $i < $n) {
+            Node $node = $this->nodes[$i];
+
+            if (interactive($node->kind) && contains($node, $this->io->mouse)) {
+                $this->hoverAny = true;
+            }
+
+            $i = $i + 1;
+        }
+
+        Input? $maybe = $this->input;
+
+        if ($maybe == null) {
+            return;
+        }
+
+        Input $in = guard $maybe;
+
+        if ($this->hoverAny) {
+            if (!$this->holdsClaim) {
+                guard $in->claim(UI_CLAIM) else {
+                    return;
+                }
+                $this->holdsClaim = true;
+            }
+        } else {
+            $this->releaseClaim();
+        }
+    }
+
+    internal function releaseClaim() : void
+    {
+        if (!$this->holdsClaim) {
+            return;
+        }
+
+        Input? $maybe = $this->input;
+
+        if ($maybe != null) {
+            Input $in = guard $maybe;
+            guard $in->release(UI_CLAIM) else {
+                $this->holdsClaim = false;
+                return;
+            }
+        }
+
+        $this->holdsClaim = false;
+    }
+}
+
+public function resolveFontDir(const string& $preferred) : string
+{
+    if (fontHere($preferred)) {
+        return $preferred;
+    }
+
+    string $ds = std::env::DS;
+
+    if (fontHere("resources{$ds}font")) {
+        return "resources{$ds}font";
+    }
+
+    if (fontHere("..{$ds}resources{$ds}font")) {
+        return "..{$ds}resources{$ds}font";
+    }
+
+    return $preferred;
+}
+
+internal function fontHere(string $dir) : bool
+{
+    string $ds = std::env::DS;
+    bool $ok = guard std::io::exists("{$dir}{$ds}Inter-Regular.ttf") else {
+        return false;
+    }
+
+    return $ok;
+}

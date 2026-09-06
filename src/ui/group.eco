@@ -1,0 +1,282 @@
+/**
+ * Segmented button group: construct, hit rects, emit, pill animation.
+ */
+
+namespace visu::ui;
+
+use visu::graphics::Texture;
+use visu::math::{Vec2, Vec4};
+use visu::vg::Color;
+
+internal function uiButtonGroup(
+    Ui $ui,
+    const string& $name,
+    const array<Choice>& $choices,
+    string& $selected,
+    const string& $id
+) : bool
+{
+    uint64 $wid = $ui->makeId($id, $name);
+    touchSlot($ui->slots, $wid);
+    bool $changed = false;
+    usize $i = 0;
+    usize $n = $choices->count();
+
+    while ($i < $n) {
+        Choice $ch = $choices[$i];
+        uint64 $oid = mixId($wid, $ch->id);
+
+        if ($ui->click($oid)) {
+            $selected = $ch->id;
+            $changed = true;
+        }
+
+        $i = $i + 1;
+    }
+
+    int32 $p = $ui->lists->count() as int32;
+    $ui->lists[] = ListRun($name, $choices, $selected, array<int32>());
+    Node $node = Node();
+    $node->kind = .group;
+    $node->payload = $p;
+    $node->id = $wid;
+    $node->measured = measureGroup($ui, $name, $choices);
+    $ui->push($node);
+    return $changed;
+}
+
+internal function measureGroup(Ui $ui, const string& $name, const array<Choice>& $choices) : Vec2
+{
+    GroupStyle $st = $ui->theme->buttonGroup;
+    float32 $w = $st->buttonSpacing;
+    usize $i = 0;
+    usize $n = $choices->count();
+
+    while ($i < $n) {
+        Vec2 $ts = $ui->measureText($choices[$i]->label, $st->fontSize, true);
+        $w = $w + $ts->x + $st->buttonSpacing * 2.0f;
+        $i = $i + 1;
+    }
+
+    $w = $w - $st->buttonSpacing;
+    float32 $h = $st->fontSize * 1.8f + $st->innerOffset * 2.0f;
+    $h = $h + $ui->theme->labelHeight;
+    return Vec2($w, $h);
+}
+
+internal function groupOptionWidth(float32 $textW, const GroupStyle& $st) : float32
+{
+    return $textW + $st->buttonSpacing * 2.0f - $st->innerOffset * 2.0f;
+}
+
+internal function writeGroupRects(Ui $ui, const Node& $node) : void
+{
+    touchSlot($ui->slots, $node->id);
+    ListRun $run = $ui->lists[$node->payload as usize];
+    GroupStyle $st = $ui->theme->buttonGroup;
+    float32 $labelH = $ui->theme->labelHeight;
+    float32 $x = $node->pos->x + $st->buttonSpacing;
+    float32 $y = $node->pos->y + $labelH + $st->innerOffset;
+    float32 $bh = $node->size->y - $labelH - $st->innerOffset * 2.0f;
+    usize $i = 0;
+    usize $n = $run->choices->count();
+
+    while ($i < $n) {
+        Choice $ch = $run->choices[$i];
+        Vec2 $ts = $ui->measureText($ch->label, $st->fontSize, true);
+        float32 $bw = groupOptionWidth($ts->x, $st);
+        uint64 $oid = mixId($node->id, $ch->id);
+        touchSlot($ui->slots, $oid);
+        Slot $s = $ui->slots[$oid];
+        $s->pos = Vec2($x - $st->buttonSpacing + $st->innerOffset, $y);
+        $s->size = Vec2($bw, $bh);
+        $s->seen = true;
+        $ui->slots[$oid] = $s;
+        $x = $x + $ts->x + $st->buttonSpacing * 2.0f;
+        $i = $i + 1;
+    }
+}
+
+internal function animatePills(Ui $ui, float32 $dt) : void
+{
+    usize $n = $ui->animated->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        int32 $idx = $ui->animated[$i];
+        Node $node = $ui->nodes[$idx as usize];
+        animateGroupPill($ui, $node, $dt);
+        $i = $i + 1;
+    }
+}
+
+internal function animateGroupPill(Ui $ui, const Node& $n, float32 $dt) : void
+{
+    ListRun $run = $ui->lists[$n->payload as usize];
+
+    if ($run->selected->empty() || !$ui->slots->has($n->id)) {
+        return;
+    }
+
+    uint64 $oid = mixId($n->id, $run->selected);
+
+    if (!$ui->slots->has($oid)) {
+        return;
+    }
+
+    Slot $opt = $ui->slots[$oid];
+    Slot $g = $ui->slots[$n->id];
+    GroupPersist $pill = groupData($g);
+    float32 $tx = $opt->pos->x;
+    float32 $tw = $opt->size->x;
+
+    if (!$pill->hasPill) {
+        $pill->pillX = $tx;
+        $pill->pillW = $tw;
+        $pill->hasPill = true;
+    } else {
+        GroupStyle $st = $ui->theme->buttonGroup;
+        float32 $k = 1.0f - std::math::exp(0.0f - $st->animationSpeed * $dt);
+        $pill->pillX = $pill->pillX + ($tx - $pill->pillX) * $k;
+        $pill->pillW = $pill->pillW + ($tw - $pill->pillW) * $k;
+    }
+
+    setGroup($g, $pill);
+    $ui->slots[$n->id] = $g;
+}
+
+internal function emitGroupBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    ListRun $run = $ui->lists[$n->payload as usize];
+    GroupStyle $st = $ui->theme->buttonGroup;
+    float32 $labelH = $ui->theme->labelHeight;
+    Vec2 $box = Vec2($n->pos->x, $n->pos->y + $labelH);
+    Vec2 $boxSize = Vec2($n->size->x, $n->size->y - $labelH);
+    fillBox($ui, $box, $boxSize, $st->radius, $st->bg, $pad);
+
+    if ($st->border->a > 0.0f) {
+        strokeRing($ui, $box, $boxSize, $st->radius, $st->border, $pad);
+    }
+
+    if (!$ui->slots->has($n->id) || $run->choices->count() == 0) {
+        return;
+    }
+
+    Slot $g = $ui->slots[$n->id];
+    GroupPersist $pill = groupData($g);
+
+    if (!$pill->hasPill) {
+        return;
+    }
+
+    uint64 $oid0 = mixId($n->id, $run->choices[0]->id);
+
+    if (!$ui->slots->has($oid0)) {
+        return;
+    }
+
+    Slot $opt = $ui->slots[$oid0];
+    fillBox(
+        $ui,
+        Vec2($pill->pillX, $opt->pos->y),
+        Vec2($pill->pillW, $opt->size->y),
+        $st->buttonRadius,
+        $st->activeBg,
+        $pad
+    );
+}
+
+internal function emitGroupText(Ui $ui, const Node& $n) : Texture?
+{
+    ListRun $run = $ui->lists[$n->payload as usize];
+    GroupStyle $st = $ui->theme->buttonGroup;
+    Texture? $atlas = paintText(
+        $ui,
+        $n->pos,
+        $run->name,
+        $ui->theme->labelFontSize,
+        $ui->theme->labelTextColor,
+        true,
+        false
+    );
+    usize $i = 0;
+    usize $nch = $run->choices->count();
+
+    while ($i < $nch) {
+        Choice $ch = $run->choices[$i];
+        uint64 $oid = mixId($n->id, $ch->id);
+        Slot $s = Slot();
+
+        if ($ui->slots->has($oid)) {
+            $s = $ui->slots[$oid];
+        }
+
+        Color $col = $st->inactiveText;
+
+        if ($ch->id != $run->selected && contains($s->pos, $s->size, $ui->io->mouse)) {
+            $col = $st->hoverText;
+        }
+
+        Vec2 $mid = Vec2($s->pos->x + $s->size->x * 0.5f, $s->pos->y + $s->size->y * 0.5f);
+        Texture? $got = paintText($ui, $mid, $ch->label, $st->fontSize, $col, true, true);
+
+        if ($got != null) {
+            $atlas = $got;
+        }
+
+        $i = $i + 1;
+    }
+
+    if ($nch == 0 || !$ui->slots->has($n->id)) {
+        return $atlas;
+    }
+
+    Slot $g = $ui->slots[$n->id];
+    GroupPersist $pill = groupData($g);
+
+    if (!$pill->hasPill) {
+        return $atlas;
+    }
+
+    uint64 $oid0 = mixId($n->id, $run->choices[0]->id);
+
+    if (!$ui->slots->has($oid0)) {
+        return $atlas;
+    }
+
+    Slot $opt = $ui->slots[$oid0];
+    Vec2 $pillPos = Vec2($pill->pillX, $opt->pos->y);
+    Vec2 $pillSize = Vec2($pill->pillW, $opt->size->y);
+    Vec4 $clip = clipBox($pillPos, $pillSize);
+    $i = 0;
+
+    while ($i < $nch) {
+        Choice $ch = $run->choices[$i];
+        uint64 $oid = mixId($n->id, $ch->id);
+        Slot $s = Slot();
+
+        if ($ui->slots->has($oid)) {
+            $s = $ui->slots[$oid];
+        }
+
+        Vec2 $mid = Vec2($s->pos->x + $s->size->x * 0.5f, $s->pos->y + $s->size->y * 0.5f);
+        Texture? $got = paintText(
+            $ui,
+            $mid,
+            $ch->label,
+            $st->fontSize,
+            $st->activeText,
+            true,
+            true,
+            $clip
+        );
+
+        if ($got != null) {
+            $atlas = $got;
+        }
+
+        $i = $i + 1;
+    }
+
+    return $atlas;
+}

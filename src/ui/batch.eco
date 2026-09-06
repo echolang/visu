@@ -1,0 +1,383 @@
+/**
+ * Packed UI mesh: SDF boxes and atlas glyphs with vertex colour
+ * so mixed-colour chrome is a handful of draws.
+ */
+
+namespace visu::ui;
+
+use visu::graphics::{
+    Device, GpuPass, IndexType, Raster, RenderEncoder, ResourceState,
+    Sampler, SamplerDesc, ScratchSlice, ShaderProgram, Texture, TextureDesc,
+    VertexBuilder, VertexLayout
+};
+use visu::math::{Vec2, Vec4};
+use visu::vg::{Canvas, Color, Font};
+
+internal struct UiVertex
+{
+    public Vec2 $pos;
+    public Vec2 $uv;
+    public Vec4 $shape;
+    public Vec4 $color;
+    public Vec4 $clip;
+}
+
+internal struct UiFrag
+{
+    public Vec4 $view = Vec4(0.0f);
+}
+
+internal struct UiDraw
+{
+    public int32 $first;
+    public int32 $count;
+    public Texture? $texture;
+}
+
+internal class UiBatch
+{
+    public array<UiVertex> $verts;
+    public array<uint32> $indices;
+    public array<UiDraw> $draws;
+    internal int32 $runFirst;
+    internal Texture? $runTex;
+
+    public constructor()
+    {
+        $this->verts = array<UiVertex>();
+        $this->indices = array<uint32>();
+        $this->draws = array<UiDraw>();
+        $this->runFirst = 0;
+        $this->runTex = null;
+    }
+
+    public function clear() : void
+    {
+        $this->verts->clear();
+        $this->indices->clear();
+        $this->draws->clear();
+        $this->runFirst = 0;
+        $this->runTex = null;
+    }
+}
+
+internal function emitBox(
+    UiBatch $b,
+    Vec2 $pos,
+    Vec2 $size,
+    float32 $r,
+    Color $color,
+    Vec4 $clip,
+    float32 $pad
+) : void
+{
+    emitShapedBox($b, $pos, $size, $r, $color, $clip, $pad, 1.0f);
+}
+
+internal function emitStrokeBox(
+    UiBatch $b,
+    Vec2 $pos,
+    Vec2 $size,
+    float32 $r,
+    Color $color,
+    Vec4 $clip,
+    float32 $pad
+) : void
+{
+    emitShapedBox($b, $pos, $size, $r, $color, $clip, $pad + 1.0f, 3.0f);
+}
+
+internal function emitShapedBox(
+    UiBatch $b,
+    Vec2 $pos,
+    Vec2 $size,
+    float32 $r,
+    Color $color,
+    Vec4 $clip,
+    float32 $pad,
+    float32 $kind
+) : void
+{
+    if ($size->x <= 0.0f || $size->y <= 0.0f || $color->a <= 0.0f) {
+        return;
+    }
+
+    float32 $rr = $r;
+    float32 $lim = $size->x;
+
+    if ($size->y < $lim) {
+        $lim = $size->y;
+    }
+
+    $lim = $lim * 0.5f;
+
+    if ($rr > $lim) {
+        $rr = $lim;
+    }
+
+    if ($rr < 0.0f) {
+        $rr = 0.0f;
+    }
+
+    float32 $x0 = $pos->x - $pad;
+    float32 $y0 = $pos->y - $pad;
+    float32 $x1 = $pos->x + $size->x + $pad;
+    float32 $y1 = $pos->y + $size->y + $pad;
+    float32 $cx = $pos->x + $size->x * 0.5f;
+    float32 $cy = $pos->y + $size->y * 0.5f;
+    Vec4 $shape = Vec4($size->x * 0.5f, $size->y * 0.5f, $rr, $kind);
+    Vec4 $col = $color->premultiplied();
+    pushQuad(
+        $b,
+        Vec2($x0, $y0),
+        Vec2($x1, $y0),
+        Vec2($x1, $y1),
+        Vec2($x0, $y1),
+        Vec2($x0 - $cx, $y0 - $cy),
+        Vec2($x1 - $cx, $y0 - $cy),
+        Vec2($x1 - $cx, $y1 - $cy),
+        Vec2($x0 - $cx, $y1 - $cy),
+        $shape,
+        $col,
+        $clip
+    );
+}
+
+internal function emitGlyph(
+    UiBatch $b,
+    float32 $x0,
+    float32 $y0,
+    float32 $x1,
+    float32 $y1,
+    float32 $u0,
+    float32 $v0,
+    float32 $u1,
+    float32 $v1,
+    Vec4 $color,
+    Vec4 $clip
+) : void
+{
+    Vec4 $shape = Vec4(0.0f, 0.0f, 0.0f, 2.0f);
+    pushQuad(
+        $b,
+        Vec2($x0, $y0),
+        Vec2($x1, $y0),
+        Vec2($x1, $y1),
+        Vec2($x0, $y1),
+        Vec2($u0, $v0),
+        Vec2($u1, $v0),
+        Vec2($u1, $v1),
+        Vec2($u0, $v1),
+        $shape,
+        $color,
+        $clip
+    );
+}
+
+internal function pushQuad(
+    UiBatch $b,
+    Vec2 $p0,
+    Vec2 $p1,
+    Vec2 $p2,
+    Vec2 $p3,
+    Vec2 $t0,
+    Vec2 $t1,
+    Vec2 $t2,
+    Vec2 $t3,
+    Vec4 $shape,
+    Vec4 $color,
+    Vec4 $clip
+) : void
+{
+    uint32 $base = $b->verts->count() as uint32;
+    $b->verts[] = UiVertex($p0, $t0, $shape, $color, $clip);
+    $b->verts[] = UiVertex($p1, $t1, $shape, $color, $clip);
+    $b->verts[] = UiVertex($p2, $t2, $shape, $color, $clip);
+    $b->verts[] = UiVertex($p3, $t3, $shape, $color, $clip);
+    $b->indices[] = $base;
+    $b->indices[] = ($base + 1) as uint32;
+    $b->indices[] = ($base + 2) as uint32;
+    $b->indices[] = $base;
+    $b->indices[] = ($base + 2) as uint32;
+    $b->indices[] = ($base + 3) as uint32;
+}
+
+internal function closeDraw(UiBatch $b, int32 $first, Texture? $tex) : void
+{
+    int32 $count = ($b->indices->count() as int32) - $first;
+
+    if ($count <= 0) {
+        return;
+    }
+
+    $b->draws[] = UiDraw($first, $count, $tex);
+}
+
+internal function beginRun(UiBatch $b) : void
+{
+    $b->runFirst = $b->indices->count() as int32;
+    $b->runTex = null;
+}
+
+internal function bindAtlas(UiBatch $b, Texture? $tex) : void
+{
+    if ($tex == null) {
+        return;
+    }
+
+    if ($b->runTex != null && $tex != $b->runTex) {
+        closeDraw($b, $b->runFirst, $b->runTex);
+        $b->runFirst = $b->indices->count() as int32;
+    }
+
+    $b->runTex = $tex;
+}
+
+internal function endRun(UiBatch $b) : void
+{
+    closeDraw($b, $b->runFirst, $b->runTex);
+    $b->runTex = null;
+}
+
+internal class UiGpu
+{
+    public ShaderProgram $program;
+    public GpuPass $pass;
+    public Texture $white;
+    public Sampler $sampler;
+    public Canvas $canvas;
+    public Font $regular;
+    public Font $semibold;
+
+    public constructor(
+        ShaderProgram $program,
+        GpuPass $pass,
+        Texture $white,
+        Sampler $sampler,
+        Canvas $canvas,
+        Font $regular,
+        Font $semibold
+    )
+    {
+        $this->program = $program;
+        $this->pass = $pass;
+        $this->white = $white;
+        $this->sampler = $sampler;
+        $this->canvas = $canvas;
+        $this->regular = $regular;
+        $this->semibold = $semibold;
+    }
+
+    public function destroy() : void
+    {
+        $this->canvas->destroy();
+        $this->program->destroy();
+        $this->white->destroy();
+    }
+}
+
+internal function uiMakeGpu(
+    Device $device,
+    Canvas $canvas,
+    Font $regular,
+    Font $semibold
+) : result<UiGpu, UiError>
+{
+    ShaderProgram $prog = guard ShaderProgram::link(
+        $device,
+        'ui',
+        uiVertexBytes(),
+        uiFragmentBytes()
+    ) else ($e) {
+        return .error(.shader($e));
+    }
+    Raster $raster = Raster();
+    $raster->blend = .premultiplied;
+    $raster->depthTest = false;
+    $raster->depthWrite = false;
+    GpuPass $pass = GpuPass($prog, VertexLayout::of<UiVertex>(function(VertexBuilder $b) : void {
+        ptr<UiVertex> $v = $b->vertex<UiVertex>();
+        $b->attr(0, &$v->pos);
+        $b->attr(1, &$v->uv);
+        $b->attr(2, &$v->shape);
+        $b->attr(3, &$v->color);
+        $b->attr(4, &$v->clip);
+    }), $raster);
+    TextureDesc $desc = TextureDesc($format: .rgba8, $width: 1, $height: 1);
+    Texture $tex = Texture($device, 'ui-white', $desc);
+    array<uint8> $px = array<uint8>();
+    $px[] = 255;
+    $px[] = 255;
+    $px[] = 255;
+    $px[] = 255;
+    $tex->upload(0, $px->data(), 4, 4);
+    $device->transition($tex, ResourceState::shaderRead);
+    return .ok(UiGpu($prog, $pass, $tex, $device->sampler(SamplerDesc()), $canvas, $regular, $semibold));
+}
+
+internal function uiFont(Ui $ui, bool $bold) : Font?
+{
+    UiGpu $g = guard $ui->gpu else {
+        return null;
+    }
+
+    if ($bold) {
+        return $g->semibold;
+    }
+
+    return $g->regular;
+}
+
+internal function flushBatch(Ui $ui, RenderEncoder $enc) : void
+{
+    UiBatch $batch = $ui->batch;
+
+    if ($batch->draws->count() == 0 || $batch->indices->count() == 0) {
+        return;
+    }
+
+    UiGpu $gpu = guard $ui->gpu else {
+        return;
+    }
+    GpuPass $pass = $gpu->pass;
+    $pass->bind($enc);
+    Texture $white = $gpu->white;
+    Sampler $samp = $gpu->sampler;
+    usize $nv = $batch->verts->count();
+    usize $ni = $batch->indices->count();
+    uint64 $vb = ($nv as uint64) * (mem::size<UiVertex>() as uint64);
+    uint64 $ib = ($ni as uint64) * (mem::size<uint32>() as uint64);
+    ScratchSlice $vs = $ui->device->scratch($vb, 16);
+    ScratchSlice $is = $ui->device->scratch($ib, 4);
+    mem::copy<UiVertex>(ptr<UiVertex>($vs->data:$), $batch->verts->data(), $nv);
+    mem::copy<uint32>(ptr<uint32>($is->data:$), $batch->indices->data(), $ni);
+    $enc->setVertexScratch(0, $vs);
+    $enc->setIndexScratch($is, .uint32);
+    $enc->setViewport(0, 0, $enc->width(), $enc->height());
+    UiFrag $frag = UiFrag();
+    $frag->view = Vec4($ui->frame->x, $ui->frame->y, 0.0f, 0.0f);
+    $enc->upload($frag, slot: 0);
+    Texture $bound = $white;
+    $enc->bindTexture(0, $white, $samp);
+
+    foreach ($batch->draws as $draw) {
+        if ($draw->count <= 0) {
+            continue;
+        }
+
+        Texture $tex = $white;
+        Texture? $maybe = $draw->texture;
+
+        if ($maybe != null) {
+            Texture $callTex = guard $maybe;
+            $tex = $callTex;
+        }
+
+        if ($tex != $bound) {
+            $enc->bindTexture(0, $tex, $samp);
+            $bound = $tex;
+        }
+
+        $enc->drawIndexed($draw->first, $draw->count);
+    }
+}

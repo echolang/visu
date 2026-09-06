@@ -82,4 +82,48 @@ public class RenderTarget
         $desc->depth = $d;
         return $desc;
     }
+
+    /**
+     * Color attachment `$color` as rgba8. After endFrame; stalls.
+     */
+    public function capture(int32 $color = 0) : result<Pixels, DumpError>
+    {
+        Texture $tex = guard $this->colorAt($color) else ($e) {
+            return .error($e);
+        }
+        return $tex->capture();
+    }
+
+    /**
+     * Capture color `$color` then write a PNG. After endFrame.
+     */
+    public function dump(const string& $path, int32 $color = 0) : status<DumpError>
+    {
+        Texture $tex = guard $this->colorAt($color) else ($e) {
+            return .error($e);
+        }
+        return $tex->dump($path);
+    }
+
+    /**
+     * Owned rgba8 copy of color `$color`. Caller destroy()s.
+     */
+    public function snapshot(int32 $color = 0) : result<Texture, DumpError>
+    {
+        Texture $tex = guard $this->colorAt($color) else ($e) {
+            return .error($e);
+        }
+        return $tex->snapshot();
+    }
+
+    private const function colorAt(int32 $index) : result<Texture, DumpError>
+    {
+        array<Texture> $colors = $this->colors;
+
+        if ($index < 0 || ($index as usize) >= $colors->count()) {
+            return .error(.noColor);
+        }
+
+        return .ok($colors[$index as usize]);
+    }
 }

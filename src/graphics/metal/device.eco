@@ -409,6 +409,10 @@ public class Device : DeviceProtocol
         assert(!$this->encoderOpen, 'readback with an open encoder');
         assert(!$this->inFrame, 'readback inside a frame');
 
+        if ($texture->imported || ($texture->usage & TEXTURE_TRANSFER_SRC) == 0) {
+            return .error(.missingUsage);
+        }
+
         if ($texture->format->isDepth()) {
             return .error(.unsupportedFormat($texture->format));
         }
@@ -420,7 +424,7 @@ public class Device : DeviceProtocol
         uint32 $bpp = pixelByteCount($texture->format);
         uint64 $row = ($texture->width as uint64) * ($bpp as uint64);
         uint64 $total = $row * ($texture->height as uint64);
-        array<uint8> $pixels = mtlFilledBytes($total);
+        array<uint8> $pixels = pixelsFilled($total);
 
         if ($total == 0) {
             return .ok($pixels);
@@ -432,6 +436,43 @@ public class Device : DeviceProtocol
         );
         $mt->getBytes(ptr<uint8>(&$pixels[0]), $row as usize, $region);
         return .ok($pixels);
+    }
+
+    public function copy(Texture $src, Texture $dst) : status<DeviceError>
+    {
+        assert($this->gpu != null, 'copy before initialize');
+        assert(!$this->encoderOpen, 'copy with an open encoder');
+        assert(!$this->inFrame, 'copy inside a frame');
+        guard textureCopyOk($src, $dst) else ($e) {
+            return .error($e);
+        }
+
+        mtl::CommandQueue $queue = guard $this->queue else {
+            return .error(.metal('copy', 'no command queue'));
+        }
+        mtl::Texture $srcTex = guard $src->handle->texture else {
+            return .error(.metal('copy', 'src handle is empty'));
+        }
+        mtl::Texture $dstTex = guard $dst->handle->texture else {
+            return .error(.metal('copy', 'dst handle is empty'));
+        }
+        $this->waitIdle();
+        mtl::CommandBuffer $cmd = guard $queue->commandBuffer() else {
+            return .error(.metal('copy', 'commandBuffer failed'));
+        }
+        mtl::BlitCommandEncoder $blit = guard $cmd->blitCommandEncoder() else {
+            return .error(.metal('copy', 'blitCommandEncoder failed'));
+        }
+        $blit->copyFromTexture(
+            $srcTex,
+            $dstTex,
+            mtl::Size($src->width as usize, $src->height as usize)
+        );
+        $blit->endEncoding();
+        $cmd->commit();
+        $cmd->waitUntilCompleted();
+        $dst->state = .shaderRead;
+        return .ok;
     }
 
     public function createBuffer(const BufferDesc& $desc) : result<BufferHandle, DeviceError>

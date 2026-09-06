@@ -8,7 +8,6 @@ namespace visu::quickstart;
 use std::env;
 use std::io;
 use visu::app::{Paths, Services, bootstrap};
-use visu::graphics::PipelineError;
 use visu::instrument::{DeviceSource, LoopSource};
 use visu::os::{init, terminate};
 use visu::runtime::{GameLoop, registerMain, unregisterMain};
@@ -45,7 +44,7 @@ public class Quickstart
 
     /**
      * glfwInit, initialize the window, ready(), run the loop, tear
-     * down. Dies on WindowError / PipelineError — this is the process
+     * down. Dies on WindowError / AppError — this is the process
      * edge.
      */
     public function run() : void
@@ -64,14 +63,14 @@ public class Quickstart
         $this->app->ready();
         $this->loop->start();
 
-        PipelineError? $maybeFail = $this->app->fail;
+        AppError $fail = $this->app->fail;
         $this->app->destroy();
         unregisterMain();
         terminate();
-        PipelineError $fail = guard $maybeFail else {
-            return;
+
+        if ($fail->failed()) {
+            die($fail->message());
         }
-        die($fail->message());
     }
 
     private function loadShaders() : void

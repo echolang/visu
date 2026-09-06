@@ -1,4 +1,4 @@
-/* baked from examples/vg/Inconsolata-Regular.ttf — do not edit */
+/* baked from resources/fonts/inconsolata/Inconsolata-Regular.ttf — do not edit */
 #include "debugfont.h"
 
 static const uint8_t visu_debug_font[] = {

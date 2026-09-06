@@ -20,7 +20,7 @@ vertex vs_out vs(vs_in in [[stage_in]])
 {
     vs_out out = {};
     out.gl_Position = float4(in.aPos, 1.0);
-    out.vUv = in.aUv;
+    out.vUv = float2(in.aUv.x, 1.0 - in.aUv.y);
     return out;
 }
 

@@ -1,248 +1,265 @@
 /*
  * Vector canvas bench: 5k rounded cells, a clipped list, FPS.
+ * Quickstart owns the window / loop / graph; this file owns the
+ * canvas and the draw.
  *
  *   echoc run -m examples --target vg
  *   echoc run -m examples --target vg --define VISU_FINITE
  */
 
-use visu::app::{ensureLogger, info};
-use visu::os::{Window, init, terminate};
+use std::io;
+use visu::app::info;
+use visu::graphics::{Context, Device, TargetRef};
 use visu::math::{Vec2, Vec4};
-use visu::graphics::{
-    Device, DeviceError, FrameStatus, RenderPassDesc, ColorTarget
-};
-use visu::vg::{Canvas, Color, TextAlign};
+use visu::quickstart::{App, Options, Quickstart};
+use visu::vg::{Canvas, Color, TextAlign, VgRenderer};
 
-ensureLogger();
-guard init() else ($e) {
-    die($e->message());
-}
+internal class VgDemo
+{
+    public VgRenderer $vg;
+    public float32 $scroll;
+    public int32 $fps;
+    public int32 $cpuMs;
+    public int32 $seen;
+    public int32 $cpuN;
+    public float64 $stamp;
+    public float64 $origin;
+    public float64 $cpuAcc;
+    public float64 $cpuAll;
 
-Window $window = Window('visu vg', 800, 600);
-Device $device = Device();
-guard $window->initialize($device) else ($e) {
-    terminate();
-    die($e->message());
-}
-
-$window->setSwapInterval(0);
-Canvas $vg = Canvas($device);
-guard $vg->load() else ($e) {
-    $device->waitIdle();
-    $vg->destroy();
-    $window->destroy();
-    $device->shutdown();
-    terminate();
-    die($e->message());
-}
-guard $vg->createFont('sans', 'examples/vg/Inconsolata-Regular.ttf') else ($e) {
-    $device->waitIdle();
-    $vg->destroy();
-    $window->destroy();
-    $device->shutdown();
-    terminate();
-    die($e->message());
-}
-
-$vg->begin(1.0f, 1.0f, 1.0f);
-guard $vg->fontFace('sans') else ($e) {
-    die($e->message());
-}
-$vg->fontSize(18.0f);
-$vg->text(Vec2(0.0f, 0.0f), '0123456789. fps');
-$vg->sync();
-$vg->cancel();
-
-float32 $scroll = 0.0f;
-int32 $frame = 0;
-float64 $origin = visu::runtime::seconds();
-float64 $stamp = $origin;
-int32 $seen = 0;
-int32 $fps = 0;
-int32 $cpuMs = 0;
-float64 $cpuAcc = 0.0;
-int32 $cpuN = 0;
-float64 $cpuAll = 0.0;
-
-while (!$window->shouldClose() && !visu::finiteDone($frame)) {
-    int32 $w = $window->framebufferWidth();
-    int32 $h = $window->framebufferHeight();
-    FrameStatus $status = guard $device->beginFrame($w, $h) else ($e) {
-        match ($e) {
-            DeviceError::surfaceLost => {
-                break;
-            },
-            else => {
-                die($e->message());
-            },
-        };
+    public constructor(Device $device)
+    {
+        $this->vg = VgRenderer($device);
+        $this->scroll = 0.0f;
+        $this->fps = 0;
+        $this->cpuMs = 0;
+        $this->seen = 0;
+        $this->cpuN = 0;
+        $this->stamp = 0.0;
+        $this->origin = 0.0;
+        $this->cpuAcc = 0.0;
+        $this->cpuAll = 0.0;
     }
 
-    if ($status == FrameStatus::ready) {
-        float32 $scale = 1.0f;
+    public function destroy() : void
+    {
+        $this->vg->destroy();
+    }
+}
 
-        if ($window->width() > 0) {
-            $scale = ($w as float32) / ($window->width() as float32);
-        }
+Quickstart $qs = Quickstart(function(Options $opt) : void {
+    $opt->windowTitle = 'visu vg';
+    $opt->windowWidth = 800;
+    $opt->windowHeight = 600;
+    $opt->windowVsync = false;
+    $opt->clearColor = Vec4(0.10f, 0.10f, 0.12f, 1.0f);
 
-        float32 $pw = $w as float32 / $scale;
-        float32 $ph = $h as float32 / $scale;
-        float64 $cpu0 = visu::runtime::seconds();
-        $vg->begin($pw, $ph, $scale);
-        guard $vg->fontFace('sans') else ($e) {
+    $opt->ready = function(App $app) : void {
+        VgDemo $demo = $app->services->create<VgDemo>($app->device);
+        guard $demo->vg->load() else ($e) {
             die($e->message());
         }
-        $vg->fontSize(18.0f);
-
-        int32 $cols = 50;
-        int32 $rows = 100;
-        float32 $cw = $pw / ($cols as float32);
-        float32 $ch = $ph / ($rows as float32);
-        int32 $pass = 0;
-
-        while ($pass < 2) {
-            if ($pass == 0) {
-                $vg->fillColor(Color(0.22f, 0.38f, 0.62f, 1.0f));
-            } else {
-                $vg->fillColor(Color(0.16f, 0.17f, 0.20f, 1.0f));
-            }
-
-            int32 $gy = 0;
-
-            while ($gy < $rows) {
-                int32 $gx = 0;
-
-                while ($gx < $cols) {
-                    if ((($gx + $gy) & 1) == $pass) {
-                        $vg->fillRounded(
-                            Vec2(($gx as float32) * $cw + 1.0f, ($gy as float32) * $ch + 1.0f),
-                            Vec2($cw - 2.0f, $ch - 2.0f),
-                            2.0f
-                        );
-                    }
-
-                    $gx = $gx + 1;
-                }
-
-                $gy = $gy + 1;
-            }
-
-            $pass = $pass + 1;
+        guard $demo->vg->canvas->createFont('sans', fontFile()) else ($e) {
+            die($e->message());
         }
-
-        Vec2 $panel = Vec2(24.0f, 48.0f);
-        Vec2 $panelSize = Vec2(220.0f, 280.0f);
-        float32 $rowH = 22.0f;
-        float32 $contentH = 80.0f * $rowH;
-        float32 $maxScroll = $contentH - $panelSize->y;
-
-        if ($maxScroll < 0.0f) {
-            $maxScroll = 0.0f;
+        $demo->vg->canvas->begin(1.0f, 1.0f, 1.0f);
+        guard $demo->vg->canvas->fontFace('sans') else ($e) {
+            die($e->message());
         }
+        $demo->vg->canvas->fontSize(18.0f);
+        $demo->vg->canvas->text(Vec2(0.0f, 0.0f), '0123456789. fps');
+        $demo->vg->canvas->sync();
+        $demo->vg->canvas->cancel();
+        $demo->origin = visu::runtime::seconds();
+        $demo->stamp = $demo->origin;
+    };
 
-        if (visu::finiteFrames() != null) {
-            $scroll = $maxScroll * 0.4f;
+    $opt->render = function(App $app, Context $ctx, TargetRef $target) : void {
+        VgDemo $demo = $app->services->get<VgDemo>();
+        $demo->vg->pass($ctx->pipeline, $target, function(Canvas $vg) : void {
+            paint($app, $demo, $vg);
+        });
+    };
+
+    $opt->teardown = function(App $app) : void {
+        VgDemo? $maybe = $app->services->find<VgDemo>();
+        VgDemo $demo = guard $maybe else {
+            return;
+        }
+        logRun($app, $demo);
+        $demo->destroy();
+    };
+});
+$qs->run();
+
+internal function paint(App $app, VgDemo $demo, Canvas $vg) : void
+{
+    float64 $cpu0 = visu::runtime::seconds();
+    int32 $w = $app->window->framebufferWidth();
+    int32 $h = $app->window->framebufferHeight();
+    float32 $scale = 1.0f;
+
+    if ($app->window->width() > 0) {
+        $scale = ($w as float32) / ($app->window->width() as float32);
+    }
+
+    float32 $pw = $w as float32 / $scale;
+    float32 $ph = $h as float32 / $scale;
+    guard $vg->fontFace('sans') else ($e) {
+        die($e->message());
+    }
+    $vg->fontSize(18.0f);
+
+    int32 $cols = 50;
+    int32 $rows = 100;
+    float32 $cw = $pw / ($cols as float32);
+    float32 $ch = $ph / ($rows as float32);
+    int32 $pass = 0;
+
+    while ($pass < 2) {
+        if ($pass == 0) {
+            $vg->fillColor(Color(0.22f, 0.38f, 0.62f, 1.0f));
         } else {
-            $scroll = $scroll + 0.6f;
-
-            if ($scroll > $maxScroll) {
-                $scroll = 0.0f;
-            }
+            $vg->fillColor(Color(0.16f, 0.17f, 0.20f, 1.0f));
         }
 
-        $vg->fillColor(Color(0.12f, 0.13f, 0.16f, 0.92f));
-        $vg->fillRounded($panel, $panelSize, 10.0f);
-        $vg->save();
-        $vg->scissor($panel, $panelSize, radius: 10.0f);
-        $vg->translate(Vec2(0.0f, -$scroll));
-        int32 $row = 0;
+        int32 $gy = 0;
 
-        while ($row < 80) {
-            float32 $y = $panel->y + ($row as float32) * $rowH;
-            Vec2 $rp = Vec2($panel->x + 8.0f, $y);
-            Vec2 $rs = Vec2($panelSize->x - 16.0f, $rowH - 4.0f);
+        while ($gy < $rows) {
+            int32 $gx = 0;
 
-            if ($vg->scissorIntersects($rp, $rs)) {
-                if ($row % 2 == 0) {
-                    $vg->fillColor(Color(0.32f, 0.48f, 0.72f, 1.0f));
-                } else {
-                    $vg->fillColor(Color(0.20f, 0.22f, 0.26f, 1.0f));
+            while ($gx < $cols) {
+                if ((($gx + $gy) & 1) == $pass) {
+                    $vg->fillRounded(
+                        Vec2(($gx as float32) * $cw + 1.0f, ($gy as float32) * $ch + 1.0f),
+                        Vec2($cw - 2.0f, $ch - 2.0f),
+                        2.0f
+                    );
                 }
 
-                $vg->fillRounded($rp, $rs, 4.0f);
+                $gx = $gx + 1;
             }
 
-            $row = $row + 1;
+            $gy = $gy + 1;
         }
 
-        $vg->restore();
+        $pass = $pass + 1;
+    }
 
-        $vg->fillColor(Color(1.0f, 1.0f, 1.0f, 1.0f));
-        $vg->textAlign(TextAlign(.right, .top));
-        $vg->text(Vec2($pw - 16.0f, 12.0f), "{$fps} fps  {$cpuMs} ms");
-        $vg->sync();
-        float64 $cpuDt = visu::runtime::seconds() - $cpu0;
-        $cpuAcc = $cpuAcc + $cpuDt;
-        $cpuAll = $cpuAll + $cpuDt;
-        $cpuN = $cpuN + 1;
+    Vec2 $panel = Vec2(24.0f, 48.0f);
+    Vec2 $panelSize = Vec2(220.0f, 280.0f);
+    float32 $rowH = 22.0f;
+    float32 $contentH = 80.0f * $rowH;
+    float32 $maxScroll = $contentH - $panelSize->y;
 
-        ColorTarget $color = ColorTarget($device->backbuffer());
-        $color->load = .clear;
-        $color->store = .store;
-        $color->clear = Vec4(0.10f, 0.10f, 0.12f, 1.0f);
-        RenderPassDesc $desc = RenderPassDesc();
-        $desc->colors[] = $color;
-        $enc = $device->beginRender($desc);
-        $vg->flush($enc);
-        $enc->end();
-        guard $window->swap() else ($e) {
-            match ($e) {
-                DeviceError::surfaceLost => {
-                    break;
-                },
-                else => {
-                    die($e->message());
-                },
-            };
+    if ($maxScroll < 0.0f) {
+        $maxScroll = 0.0f;
+    }
+
+    if ($app->options->maxFrames != null) {
+        $demo->scroll = $maxScroll * 0.4f;
+    } else {
+        $demo->scroll = $demo->scroll + 0.6f;
+
+        if ($demo->scroll > $maxScroll) {
+            $demo->scroll = 0.0f;
         }
     }
 
-    $window->poll();
-    $frame = $frame + 1;
-    $seen = $seen + 1;
+    $vg->fillColor(Color(0.12f, 0.13f, 0.16f, 0.92f));
+    $vg->fillRounded($panel, $panelSize, 10.0f);
+    $vg->save();
+    $vg->scissor($panel, $panelSize, radius: 10.0f);
+    $vg->translate(Vec2(0.0f, -$demo->scroll));
+    int32 $row = 0;
+
+    while ($row < 80) {
+        float32 $y = $panel->y + ($row as float32) * $rowH;
+        Vec2 $rp = Vec2($panel->x + 8.0f, $y);
+        Vec2 $rs = Vec2($panelSize->x - 16.0f, $rowH - 4.0f);
+
+        if ($vg->scissorIntersects($rp, $rs)) {
+            if ($row % 2 == 0) {
+                $vg->fillColor(Color(0.32f, 0.48f, 0.72f, 1.0f));
+            } else {
+                $vg->fillColor(Color(0.20f, 0.22f, 0.26f, 1.0f));
+            }
+
+            $vg->fillRounded($rp, $rs, 4.0f);
+        }
+
+        $row = $row + 1;
+    }
+
+    $vg->restore();
+
+    $vg->fillColor(Color(1.0f, 1.0f, 1.0f, 1.0f));
+    $vg->textAlign(TextAlign(.right, .top));
+    int32 $fps = $demo->fps;
+    int32 $cpuMs = $demo->cpuMs;
+    $vg->text(Vec2($pw - 16.0f, 12.0f), "{$fps} fps  {$cpuMs} ms");
+
+    float64 $cpuDt = visu::runtime::seconds() - $cpu0;
+    $demo->cpuAcc = $demo->cpuAcc + $cpuDt;
+    $demo->cpuAll = $demo->cpuAll + $cpuDt;
+    $demo->cpuN = $demo->cpuN + 1;
+    $demo->seen = $demo->seen + 1;
     float64 $now = visu::runtime::seconds();
 
-    if ($now - $stamp >= 0.5) {
-        float64 $rate = ($seen as float64) / ($now - $stamp) + 0.5;
-        $fps = $rate as int32;
-        $seen = 0;
-        $stamp = $now;
+    if ($now - $demo->stamp >= 0.5) {
+        float64 $rate = ($demo->seen as float64) / ($now - $demo->stamp) + 0.5;
+        $demo->fps = $rate as int32;
+        $demo->seen = 0;
+        $demo->stamp = $now;
 
-        if ($cpuN > 0) {
-            float64 $ms = $cpuAcc / ($cpuN as float64) * 1000.0 + 0.5;
-            $cpuMs = $ms as int32;
-            $cpuAcc = 0.0;
-            $cpuN = 0;
+        if ($demo->cpuN > 0) {
+            float64 $ms = $demo->cpuAcc / ($demo->cpuN as float64) * 1000.0 + 0.5;
+            $demo->cpuMs = $ms as int32;
+            $demo->cpuAcc = 0.0;
+            $demo->cpuN = 0;
         }
     }
 }
 
-if ($frame > 0) {
-    float64 $elapsed = visu::runtime::seconds() - $origin;
+internal function logRun(App $app, VgDemo $demo) : void
+{
+    int32 $frame = $app->frameIndex;
 
-    if ($elapsed > 0.0001) {
-        float64 $avg = ($frame as float64) / $elapsed + 0.5;
-        int32 $n = $avg as int32;
-        info("vg: {$n} fps over {$frame} frames");
-        if ($frame > 0) {
-            float64 $cpuAvg = $cpuAll / ($frame as float64) * 1000.0;
-            info("vg: cpu {$cpuAvg:.2f} ms/frame");
-        }
+    if ($frame <= 0) {
+        return;
     }
+
+    float64 $elapsed = visu::runtime::seconds() - $demo->origin;
+
+    if ($elapsed <= 0.0001) {
+        return;
+    }
+
+    float64 $avg = ($frame as float64) / $elapsed + 0.5;
+    int32 $n = $avg as int32;
+    info("vg: {$n} fps over {$frame} frames");
+    float64 $cpuAvg = $demo->cpuAll / ($frame as float64) * 1000.0;
+    info("vg: cpu {$cpuAvg:.2f} ms/frame");
 }
 
-$device->waitIdle();
-$vg->destroy();
-$window->destroy();
-$device->shutdown();
-terminate();
+internal function fontFile() : string
+{
+    if (fileExists('resources/font/Inconsolata-Regular.ttf')) {
+        return 'resources/font/Inconsolata-Regular.ttf';
+    }
+
+    if (fileExists('../resources/font/Inconsolata-Regular.ttf')) {
+        return '../resources/font/Inconsolata-Regular.ttf';
+    }
+
+    return 'resources/font/Inconsolata-Regular.ttf';
+}
+
+internal function fileExists(string $path) : bool
+{
+    bool $here = guard io::exists($path) else {
+        return false;
+    }
+
+    return $here;
+}

@@ -1,0 +1,40 @@
+/**
+ * After place, write this frame's rects into slots so the next
+ * frame's widget calls can hit-test.
+ */
+
+namespace visu::ui;
+
+internal function writeRects(Ui $ui) : void
+{
+    usize $n = $ui->nodes->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        Node $node = $ui->nodes[$i];
+        match ($node->kind) {
+            Kind::group => {
+                if ($node->payload >= 0) {
+                    writeGroupRects($ui, $node);
+                    $ui->animated[] = $i as int32;
+                }
+            },
+            Kind::select => {
+                if ($node->payload >= 0) {
+                    writeSelectRects($ui, $node, $i as int32);
+                }
+            },
+            else => {
+                if ($node->id != (0 as uint64)) {
+                    touchSlot($ui->slots, $node->id);
+                    Slot $s = $ui->slots[$node->id];
+                    $s->pos = $node->pos;
+                    $s->size = $node->size;
+                    $s->seen = true;
+                    $ui->slots[$node->id] = $s;
+                }
+            },
+        };
+        $i = $i + 1;
+    }
+}

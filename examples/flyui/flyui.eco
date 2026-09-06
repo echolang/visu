@@ -1,0 +1,382 @@
+/*
+ * FlyUI gallery: sidebar of demos (layout stacks, buttons, groups,
+ * checkboxes, selects). Quickstart owns the window / loop / graph.
+ *
+ *   echoc run -m examples --target flyui
+ *   echoc run -m examples --target flyui --define VISU_FINITE
+ */
+
+use visu::math::Vec4;
+use visu::quickstart::{App, Options, Quickstart};
+use visu::ui::{Align, Choice, Edges, Flow, Layout, Sizing, Ui};
+use visu::vg::Color;
+
+internal class FlyUiDemo
+{
+    public string $current;
+    public string $stackFlow;
+    public string $vSizing;
+    public string $hSizing;
+    public string $hAlign;
+    public string $vAlign;
+    public string $groupSize;
+    public string $selectSize;
+    public string $selectFruit;
+    public bool $notifications;
+    public bool $darkMode;
+    public bool $autoSave;
+    public bool $showGrid;
+    public bool $sounds;
+
+    public constructor()
+    {
+        $this->current = 'stacks';
+        $this->stackFlow = 'vertical';
+        $this->vSizing = 'fill';
+        $this->hSizing = 'fill';
+        $this->hAlign = 'left';
+        $this->vAlign = 'top';
+        $this->groupSize = 'medium';
+        $this->selectSize = '';
+        $this->selectFruit = '';
+        $this->notifications = true;
+        $this->darkMode = false;
+        $this->autoSave = true;
+        $this->showGrid = false;
+        $this->sounds = true;
+    }
+}
+
+FlyUiDemo $demo = FlyUiDemo();
+
+Quickstart $qs = Quickstart(function(Options $opt) : void {
+    $opt->windowTitle = 'visu flyui';
+    $opt->windowWidth = 1280;
+    $opt->windowHeight = 720;
+    $opt->clearColor = Vec4(1.0f, 1.0f, 1.0f, 1.0f);
+    $opt->instrumentOverlay = false;
+
+    $opt->ui = function(App $app, Ui $ui) : void {
+        paint($demo, $ui);
+    };
+});
+$qs->run();
+
+internal function paint(FlyUiDemo $demo, Ui $ui) : void
+{
+    Layout $root = Layout();
+    $root->flow = .horizontal;
+    $root->h = .fill;
+    $root->v = .fill;
+    $root->pad = Edges::all(25.0f);
+    $root->spacing = 20.0f;
+    $root->bg = Color::white();
+    $ui->begin($root);
+
+    Layout $side = Layout();
+    $side->flow = .vertical;
+    $side->v = .fill;
+    $side->width = 250.0f;
+    $side->pad = Edges::all(10.0f);
+    $side->spacing = 10.0f;
+    $side->bg = Color(0.9f, 0.9f, 0.9f);
+    $side->radius = 5.0f;
+    $ui->begin($side);
+
+    if ($ui->button('Layout - Stacks', fill: true)) {
+        $demo->current = 'stacks';
+    }
+
+    if ($ui->button('Components - Buttons', fill: true)) {
+        $demo->current = 'buttons';
+    }
+
+    if ($ui->button('Components - Button Groups', fill: true)) {
+        $demo->current = 'groups';
+    }
+
+    if ($ui->button('Components - Checkboxes', fill: true)) {
+        $demo->current = 'checks';
+    }
+
+    if ($ui->button('Components - Select Dropdowns', fill: true)) {
+        $demo->current = 'selects';
+    }
+
+    $ui->end();
+
+    Layout $content = Layout();
+    $content->flow = .vertical;
+    $content->h = .fill;
+    $content->v = .fill;
+    $content->pad = Edges::all(10.0f);
+    $content->bg = Color(0.95f, 0.95f, 0.95f);
+    $content->radius = 5.0f;
+    $ui->begin($content);
+
+    if ($demo->current == 'stacks') {
+        demoStacks($demo, $ui);
+    } else if ($demo->current == 'buttons') {
+        demoButtons($ui);
+    } else if ($demo->current == 'groups') {
+        demoGroups($demo, $ui);
+    } else if ($demo->current == 'checks') {
+        demoChecks($demo, $ui);
+    } else {
+        demoSelects($demo, $ui);
+    }
+
+    $ui->end();
+    $ui->end();
+}
+
+internal function demoStacks(FlyUiDemo $demo, Ui $ui) : void
+{
+    Layout $split = Layout();
+    $split->flow = .horizontal;
+    $split->h = .fill;
+    $split->v = .fill;
+    $split->spacing = 10.0f;
+    $ui->begin($split);
+
+    Layout $stack = Layout();
+    $stack->flow = stackFlow($demo->stackFlow);
+    $stack->h = .fill;
+    $stack->v = .fill;
+    $stack->align = stackAlign($demo);
+    $stack->spacing = 5.0f;
+    $ui->begin($stack);
+
+    int32 $i = 0;
+
+    while ($i < 10) {
+        Layout $box = Layout();
+        $box->h = stackSizing($demo->hSizing);
+        $box->v = stackSizing($demo->vSizing);
+        $box->pad = Edges::all(10.0f);
+        $box->bg = Color::white()->darken(($i as float32) / 10.0f);
+        $box->radius = 3.0f;
+        $ui->begin($box);
+        Color $tc = Color::black();
+
+        if ($i >= 5) {
+            $tc = Color::white();
+        }
+
+        int32 $n = $i + 1;
+        $ui->text("#{$n}", size: 12.0f, color: $tc);
+        $ui->end();
+        $i = $i + 1;
+    }
+
+    $ui->end();
+
+    Layout $settings = Layout();
+    $settings->h = .fit;
+    $settings->v = .fit;
+    $settings->spacing = 5.0f;
+    $ui->begin($settings);
+
+    array<Choice> $flows = array<Choice>();
+    $flows[] = Choice('vertical', 'Vertical');
+    $flows[] = Choice('horizontal', 'Horizontal');
+    $ui->buttonGroup('Stack Flow', $flows, &$demo->stackFlow);
+    $ui->space(0.0f, 10.0f);
+
+    $ui->beginSection('Stack Sizing');
+    array<Choice> $sizes = array<Choice>();
+    $sizes[] = Choice('fill', 'Fill');
+    $sizes[] = Choice('fit', 'Fit');
+    $ui->buttonGroup('Vertical', $sizes, &$demo->vSizing);
+    $ui->buttonGroup('Horizontal', $sizes, &$demo->hSizing);
+    $ui->end();
+    $ui->space(0.0f, 10.0f);
+
+    $ui->beginSection('Stack Alignment');
+    array<Choice> $hAligns = array<Choice>();
+    $hAligns[] = Choice('left', 'Left');
+    $hAligns[] = Choice('center', 'Center');
+    $hAligns[] = Choice('right', 'Right');
+    $ui->buttonGroup('Horizontal', $hAligns, &$demo->hAlign, id: 'h-align-btn-group');
+    array<Choice> $vAligns = array<Choice>();
+    $vAligns[] = Choice('top', 'Top');
+    $vAligns[] = Choice('center', 'Center');
+    $vAligns[] = Choice('bottom', 'Bottom');
+    $ui->buttonGroup('Vertical', $vAligns, &$demo->vAlign, id: 'v-align-btn-group');
+    $ui->end();
+
+    $ui->end();
+    $ui->end();
+}
+
+internal function demoButtons(Ui $ui) : void
+{
+    $ui->beginSection('Button Styles');
+    $ui->beginRow();
+    $ui->button('Primary Button');
+    $ui->button('Secondary Button', style: .secondary);
+    $ui->end();
+    $ui->end();
+
+    $ui->beginSection('Fill');
+    $ui->button('Full width', fill: true);
+    $ui->end();
+}
+
+internal function demoGroups(FlyUiDemo $demo, Ui $ui) : void
+{
+    array<Choice> $sizes = array<Choice>();
+    $sizes[] = Choice('small', 'Small');
+    $sizes[] = Choice('medium', 'Medium');
+    $sizes[] = Choice('large', 'Large');
+    $ui->buttonGroup('Size', $sizes, &$demo->groupSize);
+    $ui->space(0.0f, 20.0f);
+    $ui->beginSection('Current Selections');
+    $ui->text("Size: {$demo->groupSize}");
+    $ui->end();
+}
+
+internal function demoChecks(FlyUiDemo $demo, Ui $ui) : void
+{
+    $ui->beginSection('Basic Checkboxes');
+    $ui->beginColumn(5.0f);
+    $ui->checkbox('Enable Notifications', &$demo->notifications);
+    $ui->checkbox('Dark Mode', &$demo->darkMode);
+    $ui->checkbox('Auto Save', &$demo->autoSave);
+    $ui->end();
+    $ui->end();
+    $ui->space(0.0f, 20.0f);
+
+    $ui->beginSection('Settings Panel');
+    $ui->beginColumn(5.0f);
+    $ui->text('Display Options:', size: 14.0f, color: Color(0.3f, 0.3f, 0.3f));
+    $ui->space(0.0f, 5.0f);
+    $ui->checkbox('Show Grid', &$demo->showGrid);
+    $ui->space(0.0f, 10.0f);
+    $ui->text('Audio Options:', size: 14.0f, color: Color(0.3f, 0.3f, 0.3f));
+    $ui->space(0.0f, 5.0f);
+    $ui->checkbox('Enable Sounds', &$demo->sounds);
+    $ui->end();
+    $ui->end();
+    $ui->space(0.0f, 20.0f);
+
+    $ui->beginSection('Current State');
+    $ui->beginColumn(3.0f);
+    string $n0 = onOff($demo->notifications);
+    $ui->text("Notifications: {$n0}");
+    string $n1 = onOff($demo->darkMode);
+    $ui->text("Dark Mode: {$n1}");
+    string $n2 = onOff($demo->autoSave);
+    $ui->text("Auto Save: {$n2}");
+    string $n3 = onOff($demo->showGrid);
+    $ui->text("Show Grid: {$n3}");
+    string $n4 = onOff($demo->sounds);
+    $ui->text("Enable Sounds: {$n4}");
+    $ui->end();
+    $ui->end();
+}
+
+internal function demoSelects(FlyUiDemo $demo, Ui $ui) : void
+{
+    $ui->beginSection('Basic Select Dropdowns');
+    $ui->beginColumn(10.0f);
+    array<Choice> $sizes = array<Choice>();
+    $sizes[] = Choice('small', 'Small');
+    $sizes[] = Choice('medium', 'Medium');
+    $sizes[] = Choice('large', 'Large');
+    $sizes[] = Choice('xl', 'Extra Large');
+    $ui->select('Size', $sizes, &$demo->selectSize);
+    string $picked = $demo->selectSize;
+
+    if ($picked->empty()) {
+        $picked = 'Not selected';
+    }
+
+    $ui->text("Size: {$picked}");
+    $ui->space(0.0f, 16.0f);
+    array<Choice> $fruits = array<Choice>();
+    $fruits[] = Choice('apple', 'Apple');
+    $fruits[] = Choice('banana', 'Banana');
+    $fruits[] = Choice('cherry', 'Cherry');
+    $fruits[] = Choice('grape', 'Grape');
+    $fruits[] = Choice('mango', 'Mango');
+    $fruits[] = Choice('orange', 'Orange');
+    $fruits[] = Choice('peach', 'Peach');
+    $fruits[] = Choice('pear', 'Pear');
+    $fruits[] = Choice('plum', 'Plum');
+    $fruits[] = Choice('strawberry', 'Strawberry');
+    $ui->select('Fruit', $fruits, &$demo->selectFruit);
+    string $fruit = $demo->selectFruit;
+
+    if ($fruit->empty()) {
+        $fruit = 'Not selected';
+    }
+
+    $ui->text("Fruit: {$fruit}");
+    $ui->end();
+    $ui->end();
+}
+
+internal function stackFlow(string $id) : Flow
+{
+    if ($id == 'horizontal') {
+        return Flow::horizontal;
+    }
+
+    return Flow::vertical;
+}
+
+internal function stackSizing(string $id) : Sizing
+{
+    if ($id == 'fill') {
+        return Sizing::fill;
+    }
+
+    return Sizing::fit;
+}
+
+internal function stackAlign(FlyUiDemo $demo) : Align
+{
+    if ($demo->hAlign == 'center') {
+        if ($demo->vAlign == 'center') {
+            return Align::center;
+        }
+
+        if ($demo->vAlign == 'bottom') {
+            return Align::bottomCenter;
+        }
+
+        return Align::topCenter;
+    }
+
+    if ($demo->hAlign == 'right') {
+        if ($demo->vAlign == 'center') {
+            return Align::centerRight;
+        }
+
+        if ($demo->vAlign == 'bottom') {
+            return Align::bottomRight;
+        }
+
+        return Align::topRight;
+    }
+
+    if ($demo->vAlign == 'center') {
+        return Align::centerLeft;
+    }
+
+    if ($demo->vAlign == 'bottom') {
+        return Align::bottomLeft;
+    }
+
+    return Align::topLeft;
+}
+
+internal function onOff(bool $on) : string
+{
+    if ($on) {
+        return 'ON';
+    }
+
+    return 'OFF';
+}

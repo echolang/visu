@@ -13,6 +13,7 @@ public class Texture : GpuObject
     public const PixelFormat $format;
     public const int32 $width;
     public const int32 $height;
+    public const uint32 $usage;
     public const bool $imported;
     private bool $dead;
 
@@ -32,6 +33,7 @@ public class Texture : GpuObject
         $this->format = $desc->format;
         $this->width = $desc->width;
         $this->height = $desc->height;
+        $this->usage = $desc->usage;
         $this->imported = false;
         $this->dead = false;
     }
@@ -44,6 +46,7 @@ public class Texture : GpuObject
         $this->format = $format;
         $this->width = $width;
         $this->height = $height;
+        $this->usage = 0 as uint32;
         $this->imported = true;
         $this->dead = false;
     }
@@ -72,4 +75,92 @@ public class Texture : GpuObject
     {
         $this->device->uploadTexture($this, $mip, $src, $bytes, $bytesPerRow);
     }
+
+    /**
+     * Readback + swizzle to rgba8. After endFrame; stalls.
+     */
+    public function capture() : result<Pixels, DumpError>
+    {
+        if ($this->imported) {
+            return .error(.imported);
+        }
+
+        if (($this->usage & TEXTURE_TRANSFER_SRC) == 0) {
+            return .error(.device(.missingUsage));
+        }
+
+        array<uint8> $raw = guard $this->device->readback($this) else ($e) {
+            return .error(.device($e));
+        }
+        return Pixels::from($this->format, $this->width, $this->height, $raw);
+    }
+
+    /**
+     * Capture then write a PNG. After endFrame; stalls.
+     */
+    public function dump(const string& $path) : status<DumpError>
+    {
+        Pixels $px = guard $this->capture() else ($e) {
+            return .error($e);
+        }
+        return $px->write($path);
+    }
+
+    /**
+     * New owned rgba8 copy. Caller destroy()s. After endFrame.
+     */
+    public function snapshot() : result<Texture, DumpError>
+    {
+        TextureDesc $desc = TextureDesc($format: .rgba8, $width: $this->width, $height: $this->height);
+        $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+        $desc->label = 'snapshot';
+        Texture $dst = Texture($this->device, 'snapshot', $desc);
+
+        if ($this->format == PixelFormat::rgba8) {
+            guard $this->device->copy($this, $dst) else ($e) {
+                $dst->destroy();
+                return .error(.device($e));
+            }
+            return .ok($dst);
+        }
+
+        Pixels $px = guard $this->capture() else ($e) {
+            $dst->destroy();
+            return .error($e);
+        }
+        uint64 $bytes = $px->rgba->count() as uint64;
+
+        if ($bytes == 0) {
+            $dst->destroy();
+            return .error(.empty);
+        }
+
+        $dst->upload(0, ptr<const uint8>(&$px->rgba[0]), $bytes);
+        return .ok($dst);
+    }
+}
+
+internal function textureCopyOk(Texture $src, Texture $dst) : status<DeviceError>
+{
+    if ($src->imported || $dst->imported) {
+        return .error(.missingUsage);
+    }
+
+    if ($src->format->isDepth() || $dst->format->isDepth()) {
+        return .error(.unsupportedFormat($src->format));
+    }
+
+    if ($src->format != $dst->format) {
+        return .error(.unsupportedFormat($src->format));
+    }
+
+    if ($src->width != $dst->width || $src->height != $dst->height) {
+        return .error(.sizeMismatch);
+    }
+
+    if (($src->usage & TEXTURE_TRANSFER_SRC) == 0 || ($dst->usage & TEXTURE_TRANSFER_DST) == 0) {
+        return .error(.missingUsage);
+    }
+
+    return .ok;
 }

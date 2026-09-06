@@ -1,0 +1,121 @@
+/**
+ * Packed layout: fit, fill, alignment, padding, spacing.
+ */
+
+use visu::math::{Vec2, equal};
+use visu::ui::{
+    Align, Edges, Flow, Kind, NODE_NONE, Node, Sizing, appendNode, layoutTree
+};
+
+function leaf(float32 $w, float32 $h) : Node
+{
+    Node $n = Node();
+    $n->kind = .space;
+    $n->measured = Vec2($w, $h);
+    return $n;
+}
+
+function box(Flow $flow, Sizing $h, Sizing $v) : Node
+{
+    Node $n = Node();
+    $n->kind = .layout;
+    $n->flow = $flow;
+    $n->h = $h;
+    $n->v = $v;
+    return $n;
+}
+
+test layout_column_fit_sums_children
+{
+    array<Node> $nodes = array<Node>();
+    Node $root = box(.vertical, .fit, .fit);
+    $root->spacing = 4.0f;
+    $root->pad = Edges::all(2.0f);
+    appendNode($nodes, NODE_NONE, $root);
+    appendNode($nodes, 0, leaf(10.0f, 8.0f));
+    appendNode($nodes, 0, leaf(12.0f, 6.0f));
+    layoutTree($nodes, Vec2(100.0f, 100.0f));
+    Node $r = $nodes[0];
+    assert(equal($r->size->x, 16.0f), 'w');
+    assert(equal($r->size->y, 22.0f), 'h');
+    assert(equal($nodes[1]->pos->x, 2.0f), 'c0x');
+    assert(equal($nodes[1]->pos->y, 2.0f), 'c0y');
+    assert(equal($nodes[2]->pos->y, 14.0f), 'c1y');
+}
+
+test layout_row_fit_sums_width
+{
+    array<Node> $nodes = array<Node>();
+    Node $root = box(.horizontal, .fit, .fit);
+    $root->spacing = 5.0f;
+    appendNode($nodes, NODE_NONE, $root);
+    appendNode($nodes, 0, leaf(10.0f, 8.0f));
+    appendNode($nodes, 0, leaf(20.0f, 4.0f));
+    layoutTree($nodes, Vec2(200.0f, 200.0f));
+    Node $r = $nodes[0];
+    assert(equal($r->size->x, 35.0f), 'w');
+    assert(equal($r->size->y, 8.0f), 'h');
+    assert(equal($nodes[2]->pos->x, 15.0f), 'c1x');
+}
+
+test layout_fill_splits_leftover
+{
+    array<Node> $nodes = array<Node>();
+    Node $root = box(.horizontal, .fill, .fill);
+    $root->spacing = 10.0f;
+    appendNode($nodes, NODE_NONE, $root);
+    appendNode($nodes, 0, leaf(20.0f, 10.0f));
+    Node $a = box(.vertical, .fill, .fit);
+    $a->measured = Vec2(0.0f, 10.0f);
+    appendNode($nodes, 0, $a);
+    Node $b = box(.vertical, .fill, .fit);
+    $b->measured = Vec2(0.0f, 10.0f);
+    appendNode($nodes, 0, $b);
+    layoutTree($nodes, Vec2(100.0f, 40.0f));
+    assert(equal($nodes[0]->size->x, 100.0f), 'root');
+    assert(equal($nodes[1]->size->x, 20.0f), 'fixed');
+    assert(equal($nodes[2]->size->x, 30.0f), 'fill a');
+    assert(equal($nodes[3]->size->x, 30.0f), 'fill b');
+}
+
+test layout_align_center
+{
+    array<Node> $nodes = array<Node>();
+    Node $root = box(.vertical, .fill, .fill);
+    $root->align = .center;
+    appendNode($nodes, NODE_NONE, $root);
+    appendNode($nodes, 0, leaf(20.0f, 10.0f));
+    layoutTree($nodes, Vec2(100.0f, 50.0f));
+    assert(equal($nodes[1]->pos->x, 40.0f), 'x');
+    assert(equal($nodes[1]->pos->y, 20.0f), 'y');
+}
+
+test layout_nested_padding
+{
+    array<Node> $nodes = array<Node>();
+    Node $root = box(.vertical, .fit, .fit);
+    $root->pad = Edges::all(5.0f);
+    appendNode($nodes, NODE_NONE, $root);
+    Node $inner = box(.vertical, .fit, .fit);
+    $inner->pad = Edges::xy(2.0f, 1.0f);
+    appendNode($nodes, 0, $inner);
+    appendNode($nodes, 1, leaf(8.0f, 4.0f));
+    layoutTree($nodes, Vec2(80.0f, 80.0f));
+    assert(equal($nodes[0]->size->x, 22.0f), 'root w');
+    assert(equal($nodes[0]->size->y, 16.0f), 'root h');
+    assert(equal($nodes[2]->pos->x, 7.0f), 'leaf x');
+    assert(equal($nodes[2]->pos->y, 6.0f), 'leaf y');
+}
+
+test layout_fixed_overrides_fit
+{
+    array<Node> $nodes = array<Node>();
+    Node $root = box(.vertical, .fixed, .fixed);
+    $root->prefW = 40.0f;
+    $root->prefH = 30.0f;
+    appendNode($nodes, NODE_NONE, $root);
+    appendNode($nodes, 0, leaf(10.0f, 10.0f));
+    layoutTree($nodes, Vec2(200.0f, 200.0f));
+    assert(equal($nodes[0]->size->x, 40.0f), 'w');
+    assert(equal($nodes[0]->size->y, 30.0f), 'h');
+}

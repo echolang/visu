@@ -1,0 +1,161 @@
+/**
+ * Dump an offscreen color attachment to PNG and read it back.
+ */
+
+use std::env;
+use std::io;
+use visu::graphics::{
+    ClearPass, ClearPassOptions, DeviceError, Pipeline, Pixels, Texture, TextureDesc,
+    TextureOptions, TextureRef, TEXTURE_RENDER_TARGET, TEXTURE_SAMPLED,
+    TEXTURE_TRANSFER_DST, TEXTURE_TRANSFER_SRC
+};
+use visu::math::Vec4;
+
+public function checkDump(GpuContext $gpu) : void
+{
+    $gpu->runFrame(function(Pipeline $p) : void {
+        $t = offscreen64($p, 'dump');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(1.0f, 0.0f, 0.0f, 1.0f))));
+    });
+
+    TextureRef $ref = TextureRef('dump.attachment.color_color', 64, 64, TextureOptions());
+    Texture $tex = guard $gpu->pool->getTexture($ref) else ($e) {
+        die($e->message());
+    }
+    string $dir = dumpTmpDir();
+    $ds = env::DS;
+    string $path = "{$dir}{$ds}scene.png";
+    guard $tex->dump($path) else ($e) {
+        die($e->message());
+    }
+    dumpAssertRed(Pixels::load($path));
+
+    Texture $snap = guard $tex->snapshot() else ($e) {
+        die($e->message());
+    }
+    string $snapPath = "{$dir}{$ds}snap.png";
+    guard $snap->dump($snapPath) else ($e) {
+        $snap->destroy();
+        die($e->message());
+    }
+    dumpAssertRed(Pixels::load($snapPath));
+
+    TextureDesc $desc = TextureDesc($format: .rgba8, $width: 64, $height: 64);
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+    Texture $copied = Texture($gpu->device, 'copyDst', $desc);
+    guard $gpu->device->copy($tex, $copied) else ($e) {
+        $snap->destroy();
+        $copied->destroy();
+        die($e->message());
+    }
+    string $copyPath = "{$dir}{$ds}copy.png";
+    guard $copied->dump($copyPath) else ($e) {
+        $snap->destroy();
+        $copied->destroy();
+        die($e->message());
+    }
+    dumpAssertRed(Pixels::load($copyPath));
+    $snap->destroy();
+    $copied->destroy();
+
+    dumpOrigin($gpu, $dir);
+
+    TextureDesc $smallDesc = TextureDesc($format: .rgba8, $width: 8, $height: 8);
+    $smallDesc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+    Texture $small = Texture($gpu->device, 'copySmall', $smallDesc);
+    status<DeviceError> $bad = $gpu->device->copy($tex, $small);
+    assert($bad->failed(), 'size mismatch');
+    $small->destroy();
+
+    io::remove($path);
+    io::remove($snapPath);
+    io::remove($copyPath);
+}
+
+internal function dumpOrigin(GpuContext $gpu, string $dir) : void
+{
+    TextureDesc $desc = TextureDesc($width: 8, $height: 8);
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+    Texture $tex = Texture($gpu->device, 'dumpY', $desc);
+    array<uint8> $px = array<uint8>();
+    int32 $y = 0;
+
+    while ($y < 8) {
+        int32 $x = 0;
+
+        while ($x < 8) {
+            if ($y == 0) {
+                $px[] = 255;
+                $px[] = 0;
+                $px[] = 0;
+                $px[] = 255;
+            } else {
+                $px[] = 0;
+                $px[] = 255;
+                $px[] = 0;
+                $px[] = 255;
+            }
+
+            $x = $x + 1;
+        }
+
+        $y = $y + 1;
+    }
+
+    $tex->upload(0, $px->data(), 256 as uint64, 32);
+    $ds = env::DS;
+    string $path = "{$dir}{$ds}origin.png";
+    guard $tex->dump($path) else ($e) {
+        $tex->destroy();
+        die($e->message());
+    }
+    Pixels $loaded = guard Pixels::load($path) else ($e) {
+        $tex->destroy();
+        die($e->message());
+    }
+    $tex->destroy();
+    io::remove($path);
+    assert($loaded->width == 8, 'origin w');
+    assert($loaded->rgba[0] > 240, 'origin top r');
+    assert($loaded->rgba[1] < 16, 'origin top g');
+    usize $bottom = ((8 * 7) * 4) as usize;
+    assert($loaded->rgba[$bottom] < 16, 'origin bottom r');
+    assert($loaded->rgba[$bottom + 1] > 240, 'origin bottom g');
+}
+
+internal function dumpAssertRed(result<Pixels, visu::graphics::DumpError> $got) : void
+{
+    Pixels $px = guard $got else ($e) {
+        die($e->message());
+    }
+    assert($px->width == 64, 'w');
+    assert($px->height == 64, 'h');
+    assert($px->rgba[0] > 240, 'r');
+    assert($px->rgba[1] < 16, 'g');
+}
+
+internal function dumpTmpDir() : string
+{
+    $tmp = env::tmp();
+    $ds = env::DS;
+    $pid = env::pid();
+    string $dir = "{$tmp}{$ds}visu-dump-{$pid}";
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return $dir;
+        }
+
+        die($e->message());
+    }
+    return $dir;
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_dump
+{
+    GpuContext $gpu = gpuHidden('dump');
+    checkDump($gpu);
+    $gpu->end();
+}
+#[end]

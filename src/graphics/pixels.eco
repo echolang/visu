@@ -1,0 +1,214 @@
+/**
+ * CPU-side rgba8 image, top-left origin. Swizzle of Device.readback
+ * bytes, then PNG write / load for dump.
+ */
+
+namespace visu::graphics;
+
+use std::io;
+
+public struct Pixels
+{
+    public const int32 $width;
+    public const int32 $height;
+    public array<uint8> $rgba;
+
+    /**
+     * Native readback bytes → packed rgba8. rgba8 / rgba8Srgb
+     * identity, bgra8 swaps R/B, r8 expands to gray.
+     */
+    public static function from(
+        PixelFormat $format,
+        int32 $width,
+        int32 $height,
+        const array<uint8>& $raw
+    ) : result<Pixels, DumpError>
+    {
+        if ($width <= 0 || $height <= 0) {
+            return .error(.empty);
+        }
+
+        uint64 $want = pixelsRawSize($format, $width, $height);
+        if ($want == 0) {
+            return .error(.unsupported($format));
+        }
+
+        if ($raw->count() != $want as usize) {
+            return .error(.sizeMismatch($raw->count() as uint64, $want));
+        }
+
+        array<uint8> $rgba = guard pixelsSwizzle($format, $raw) else ($e) {
+            return .error($e);
+        }
+        return .ok(Pixels($width, $height, $rgba));
+    }
+
+    public static function load(const string& $path) : result<Pixels, DumpError>
+    {
+        int32 $w = 0;
+        int32 $h = 0;
+        ptr<uint8> $data = null;
+        string $cpath = $path->clone();
+        int32 $ok = visu_png_load(pixelsCstr($cpath), &$w, &$h, &$data);
+
+        if ($ok == 0 || $data:$ == null || $w <= 0 || $h <= 0) {
+            return .error(.io($path, 'png load failed'));
+        }
+
+        uint64 $n = (($w as uint64) * ($h as uint64)) * 4;
+        array<uint8> $rgba = pixelsFilled($n);
+        mem::copy<uint8>(ptr<uint8>(&$rgba[0]), $data, $n);
+        visu_png_free($data);
+        return .ok(Pixels($w, $h, $rgba));
+    }
+
+    public const function write(const string& $path) : status<DumpError>
+    {
+        if ($this->width <= 0 || $this->height <= 0 || $this->rgba->empty()) {
+            return .error(.empty);
+        }
+
+        guard pixelsEnsureParent($path) else ($e) {
+            return .error($e);
+        }
+        string $cpath = $path->clone();
+        int32 $ok = visu_png_write(
+            pixelsCstr($cpath),
+            $this->width,
+            $this->height,
+            ptr<const uint8>(&$this->rgba[0])
+        );
+
+        if ($ok == 0) {
+            return .error(.io($path, 'png write failed'));
+        }
+
+        return .ok;
+    }
+}
+
+internal function pixelsRawSize(PixelFormat $format, int32 $width, int32 $height) : uint64
+{
+    uint32 $bpp = match ($format) {
+        PixelFormat::rgba8 => 4,
+        PixelFormat::bgra8 => 4,
+        PixelFormat::rgba8Srgb => 4,
+        PixelFormat::r8 => 1,
+        else => 0,
+    };
+
+    if ($bpp == 0) {
+        return 0;
+    }
+
+    return (($width as uint64) * ($height as uint64)) * ($bpp as uint64);
+}
+
+internal function pixelsSwizzle(
+    PixelFormat $format,
+    const array<uint8>& $raw
+) : result<array<uint8>, DumpError>
+{
+    if ($format == PixelFormat::rgba8 || $format == PixelFormat::rgba8Srgb) {
+        return .ok($raw->clone());
+    }
+
+    if ($format == PixelFormat::bgra8) {
+        return .ok(pixelsSwapRb($raw));
+    }
+
+    if ($format == PixelFormat::r8) {
+        return .ok(pixelsExpandR8($raw));
+    }
+
+    return .error(.unsupported($format));
+}
+
+internal function pixelsSwapRb(const array<uint8>& $raw) : array<uint8>
+{
+    array<uint8> $out = $raw->clone();
+    usize $n = $out->count();
+    usize $i = 0;
+
+    while ($i + 3 < $n) {
+        uint8 $r = $out[$i];
+        $out[$i] = $out[$i + 2];
+        $out[$i + 2] = $r;
+        $i = $i + 4;
+    }
+
+    return $out;
+}
+
+internal function pixelsExpandR8(const array<uint8>& $raw) : array<uint8>
+{
+    usize $n = $raw->count();
+    array<uint8> $out = pixelsFilled(($n * 4) as uint64);
+    usize $i = 0;
+
+    while ($i < $n) {
+        uint8 $v = $raw[$i];
+        usize $o = $i * 4;
+        $out[$o] = $v;
+        $out[$o + 1] = $v;
+        $out[$o + 2] = $v;
+        $out[$o + 3] = 255;
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function pixelsCstr(string& $path) : ptr<const uint8>
+{
+    $path->reserve($path->size() + 1);
+    ptr<uint8> $tail = $path->spare();
+    $tail:$[0] = 0;
+    return ptr<const uint8>($path->data());
+}
+
+internal function pixelsFilled(uint64 $n) : array<uint8>
+{
+    array<uint8> $out = array<uint8>();
+    $out->reserve($n as usize);
+    uint64 $i = 0;
+
+    while ($i < $n) {
+        $out[] = 0;
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function pixelsEnsureParent(const string& $path) : status<DumpError>
+{
+    usize $n = $path->size();
+    usize $i = $n;
+    usize $slash = $n;
+
+    while ($i > 0) {
+        $i = $i - 1;
+        uint8 $b = $path->byte($i);
+
+        if ($b == 47) {
+            $slash = $i;
+            break;
+        }
+    }
+
+    if ($slash == $n || $slash == 0) {
+        return .ok;
+    }
+
+    string $dir = $path->sub(0, $slash)->clone();
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return .ok;
+        }
+
+        return .error(.io($path, $e->message()));
+    }
+
+    return .ok;
+}

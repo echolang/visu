@@ -1,0 +1,114 @@
+/**
+ * Primary / secondary button: construct, emit.
+ */
+
+namespace visu::ui;
+
+use visu::math::Vec2;
+use visu::vg::Color;
+
+internal function uiButton(
+    Ui $ui,
+    const string& $label,
+    const string& $id,
+    bool $fill,
+    ButtonKind $kind
+) : bool
+{
+    uint64 $wid = $ui->makeId($id, $label);
+    bool $hit = $ui->click($wid);
+    ButtonStyle $st = uiButtonStyle($ui, $kind);
+    int32 $p = $ui->buttons->count() as int32;
+    $ui->buttons[] = ButtonRun($label, $fill, $kind);
+    Vec2 $ts = $ui->measureText($label, $st->fontSize, true);
+    Node $n = Node();
+    $n->kind = .button;
+    $n->payload = $p;
+    $n->id = $wid;
+    $n->radius = $st->radius;
+    $n->pad = $st->pad;
+    float32 $bw = $ts->x + $st->pad->width();
+    float32 $bh = $ts->y + $st->pad->height();
+
+    if ($bw < 8.0f) {
+        $bw = 8.0f;
+    }
+
+    if ($bh < 8.0f) {
+        $bh = 8.0f;
+    }
+
+    $n->measured = Vec2($bw, $bh);
+
+    if ($fill) {
+        $n->h = .fill;
+    }
+
+    $ui->push($n);
+    return $hit;
+}
+
+internal function uiButtonStyle(Ui $ui, ButtonKind $kind) : ButtonStyle
+{
+    if ($kind == ButtonKind::secondary) {
+        return $ui->theme->secondaryButton;
+    }
+
+    return $ui->theme->primaryButton;
+}
+
+internal function emitButtonBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    ButtonRun $run = $ui->buttons[$n->payload as usize];
+    ButtonStyle $st = uiButtonStyle($ui, $run->style);
+    bool $hot = contains($n, $ui->io->mouse);
+    Color $bg = $st->bg;
+
+    if ($hot) {
+        $bg = $st->hoverBg;
+    }
+
+    Slot $slot = Slot();
+
+    if ($ui->slots->has($n->id)) {
+        $slot = $ui->slots[$n->id];
+    }
+
+    float64 $now = visu::runtime::seconds();
+    float64 $ringUntil = $slot->pressAt + 0.2;
+
+    if ($ringUntil > $now) {
+        float32 $alpha = (($ringUntil - $now) * 5.0) as float32;
+
+        if ($alpha < 0.0f) {
+            $alpha = 0.0f;
+        }
+
+        float32 $ring = 2.0f + (1.0f - $alpha) * 3.0f;
+        strokeRing(
+            $ui,
+            Vec2($n->pos->x - $ring, $n->pos->y - $ring),
+            Vec2($n->size->x + $ring * 2.0f, $n->size->y + $ring * 2.0f),
+            $st->radius,
+            $st->bg->withAlpha($alpha),
+            $pad
+        );
+    }
+
+    fillBox($ui, $n->pos, $n->size, $st->radius, $bg, $pad);
+}
+
+internal function emitButtonText(Ui $ui, const Node& $n) : visu::graphics::Texture?
+{
+    ButtonRun $run = $ui->buttons[$n->payload as usize];
+    ButtonStyle $st = uiButtonStyle($ui, $run->style);
+    bool $hot = contains($n, $ui->io->mouse);
+    Color $col = $st->text;
+
+    if ($hot) {
+        $col = $st->hoverText;
+    }
+
+    Vec2 $mid = Vec2($n->pos->x + $n->size->x * 0.5f, $n->pos->y + $n->size->y * 0.5f);
+    return paintText($ui, $mid, $run->label, $st->fontSize, $col, true, true);
+}

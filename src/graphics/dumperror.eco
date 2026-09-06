@@ -1,0 +1,29 @@
+/**
+ * Failures dumping a GPU image to CPU pixels or a PNG.
+ */
+
+namespace visu::graphics;
+
+public enum DumpError
+{
+    case device(DeviceError $inner);
+    case io(string $path, string $message);
+    case empty;
+    case noColor;
+    case imported;
+    case sizeMismatch(uint64 $got, uint64 $want);
+    case unsupported(PixelFormat $format);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            DumpError::device($inner) => $inner->message(),
+            DumpError::io($path, $message) => "dump '{$path}': {$message}",
+            DumpError::empty => 'dump: empty image',
+            DumpError::noColor => 'dump: no color attachment',
+            DumpError::imported => 'dump: imported texture',
+            DumpError::sizeMismatch($got, $want) => "dump: size mismatch (got {$got}, want {$want})",
+            DumpError::unsupported($format) => "dump: unsupported format {pixelCode($format)}",
+        };
+    }
+}

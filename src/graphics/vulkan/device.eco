@@ -570,6 +570,10 @@ public class Device : DeviceProtocol
         assert(!$this->encoderOpen, 'readback with an open encoder');
         assert(!$this->inFrame, 'readback inside a frame');
 
+        if ($texture->imported || ($texture->usage & TEXTURE_TRANSFER_SRC) == 0) {
+            return .error(.missingUsage);
+        }
+
         if ($texture->format->isDepth()) {
             return .error(.unsupportedFormat($texture->format));
         }
@@ -610,9 +614,9 @@ public class Device : DeviceProtocol
         }
 
         uint64 $tight = $rowBytes * ($texture->height as uint64);
-        array<uint8> $scratch = filledBytes($total);
+        array<uint8> $scratch = pixelsFilled($total);
         mem::copy<uint8>(ptr<uint8>(&$scratch[0]), $mapped, $total);
-        array<uint8> $pixels = filledBytes($tight);
+        array<uint8> $pixels = pixelsFilled($tight);
         int32 $y = 0;
 
         while ($y < $texture->height) {
@@ -632,6 +636,28 @@ public class Device : DeviceProtocol
         }
 
         return .ok($pixels);
+    }
+
+    public function copy(Texture $src, Texture $dst) : status<DeviceError>
+    {
+        assert($this->logical->handle != 0, 'copy before initialize');
+        assert(!$this->encoderOpen, 'copy with an open encoder');
+        assert(!$this->inFrame, 'copy inside a frame');
+        guard textureCopyOk($src, $dst) else ($e) {
+            return .error($e);
+        }
+        $this->waitIdle();
+        ResourceState $srcPrev = $src->state;
+        vkOneShotCopyImage($this, $src, $dst);
+        $src->state = .transferSrc;
+        $dst->state = .shaderRead;
+
+        if ($srcPrev != ResourceState::undefined && $srcPrev != ResourceState::transferSrc) {
+            vkOneShotImageBarrier($this, $src->handle->image, .transferSrc, $srcPrev, vkAspect($src->format));
+            $src->state = $srcPrev;
+        }
+
+        return .ok;
     }
 
     public function createBuffer(const BufferDesc& $desc) : result<BufferHandle, DeviceError>

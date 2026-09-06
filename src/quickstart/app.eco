@@ -1,9 +1,9 @@
 /**
  * Prototyping app the GameLoop drives. Owns Device (class handle);
  * GPU objects store it. Scene goes to an offscreen target:
- * `$opt->render` adds graph passes, `$opt->draw` (and FlyUI later)
- * runs after beginRender on that target, then a fullscreen blit
- * to the backbuffer.
+ * `$opt->render` adds graph passes, `$opt->draw` runs after
+ * beginRender on that target, `$opt->ui` builds FlyUI during
+ * graph setup, then a fullscreen blit to the backbuffer.
  */
 
 namespace visu::quickstart;
@@ -22,6 +22,7 @@ use visu::os::{ContextMap, Input, Window, WindowError, WindowHints};
 use visu::instrument::{Instruments, Overlay, Sample};
 use visu::runtime::{Delegate, EventLoop};
 use visu::signal::Dispatcher;
+use visu::ui::Ui;
 
 public class App : Delegate
 {
@@ -38,9 +39,10 @@ public class App : Delegate
     public Options $options;
     public EventLoop $events;
     public Instruments $instruments;
+    public Ui? $ui;
     public int32 $frameIndex;
     public int32 $tickIndex;
-    public PipelineError? $fail;
+    public AppError $fail;
     private FullscreenTextureRenderer $blit;
     private Overlay? $overlay;
 
@@ -65,9 +67,10 @@ public class App : Delegate
         $this->shaders = ShaderCollection($this->device, $this->shaderDir($services));
         $this->events = EventLoop();
         $this->instruments = Instruments();
+        $this->ui = null;
         $this->frameIndex = 0;
         $this->tickIndex = 0;
-        $this->fail = null;
+        $this->fail = .none;
         $this->blit = FullscreenTextureRenderer();
         $this->overlay = null;
     }
@@ -87,11 +90,12 @@ public class App : Delegate
         $this->window->setSwapInterval($interval);
 
         guard $this->blit->load($this->device) else ($e) {
-            $this->fail = .shader($e);
+            $this->fail = appPipeline(.shader($e));
             return .ok;
         }
 
         $this->bootOverlay();
+        $this->bootUi();
         return .ok;
     }
 
@@ -127,7 +131,7 @@ public class App : Delegate
                     return;
                 },
                 else => {
-                    $this->fail = .device($e);
+                    $this->fail = appPipeline(.device($e));
                     return;
                 },
             };
@@ -151,6 +155,7 @@ public class App : Delegate
         $this->runRender($ctx, $scene);
         $this->systems->render($this->entities, $ctx);
         $this->addDraw($pipeline);
+        $this->addUi($pipeline, $scene);
         $pipeline->add(ClearPass($back->target, ClearPassOptions()));
         $this->blit->pass($pipeline, $back->target, $color);
         Sample $sample = $this->instruments->sample();
@@ -166,7 +171,7 @@ public class App : Delegate
 
     public function shouldStop() : bool
     {
-        if ($this->fail != null) {
+        if ($this->fail->failed()) {
             return true;
         }
 
@@ -183,6 +188,14 @@ public class App : Delegate
     public function destroy() : void
     {
         $this->device->waitIdle();
+        Ui? $maybeUi = $this->ui;
+
+        if ($maybeUi != null) {
+            Ui $ui = guard $maybeUi;
+            $ui->destroy();
+            $this->ui = null;
+        }
+
         $this->systems->unregister($this->entities);
         Overlay? $maybeOverlay = $this->overlay;
 
@@ -192,6 +205,7 @@ public class App : Delegate
             $this->overlay = null;
         }
 
+        $this->runCallback($this->options->teardown);
         $this->teardownGpu();
     }
 
@@ -245,8 +259,8 @@ public class App : Delegate
         status<PipelineError> $exec = $pipeline->execute($this->frameIndex, $compensation);
         bool $presented = $this->present();
         guard $exec else ($e) {
-            if ($this->fail == null) {
-                $this->fail = $e;
+            if (!$this->fail->failed()) {
+                $this->fail = appPipeline($e);
             }
 
             return;
@@ -269,7 +283,7 @@ public class App : Delegate
                     return false;
                 },
                 else => {
-                    $this->fail = .device($e);
+                    $this->fail = appPipeline(.device($e));
                     return false;
                 },
             };
@@ -309,6 +323,45 @@ public class App : Delegate
         }
 
         return $hints;
+    }
+
+    private function addUi(Pipeline $pipeline, TargetRef $scene) : void
+    {
+        function<void(App, Ui)> $cb = guard $this->options->ui else {
+            return;
+        }
+        Ui $ui = guard $this->ui else {
+            return;
+        }
+        float32 $scale = $scene->contentScaleX;
+
+        if ($scale < 0.0001f) {
+            $scale = 1.0f;
+        }
+
+        float32 $w = ($scene->width as float32) / $scale;
+        float32 $h = ($scene->height as float32) / $scale;
+        $ui->beginFrame(Vec2($w, $h), $scale);
+        $cb($this, $ui);
+        $ui->endFrame();
+        $ui->pass($pipeline, $scene);
+    }
+
+    private function bootUi() : void
+    {
+        if ($this->options->windowHeadless || $this->options->ui == null) {
+            return;
+        }
+
+        Ui $ui = Ui($this->device, $this->input);
+        Paths $paths = $this->services->get<Paths>();
+        string $dir = visu::ui::resolveFontDir($paths->resourcesFont);
+        guard $ui->load($dir) else ($e) {
+            $ui->destroy();
+            $this->fail = appUi($e);
+            return;
+        }
+        $this->ui = $ui;
     }
 
     private function bootOverlay() : void

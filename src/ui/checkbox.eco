@@ -1,0 +1,82 @@
+/**
+ * Toggle checkbox: construct, emit.
+ */
+
+namespace visu::ui;
+
+use visu::math::{Vec2, Vec4};
+use visu::vg::Color;
+
+internal const float32 CHECK_H = 24.0f;
+
+internal function uiCheckbox(Ui $ui, const string& $label, bool& $on, const string& $id) : bool
+{
+    uint64 $wid = $ui->makeId($id, $label);
+    bool $hit = $ui->click($wid);
+
+    if ($hit) {
+        $on = !$on;
+    }
+
+    int32 $p = $ui->checks->count() as int32;
+    $ui->checks[] = CheckRun($label, $on);
+    Node $n = Node();
+    $n->kind = .checkbox;
+    $n->payload = $p;
+    $n->id = $wid;
+    Vec2 $ts = $ui->measureText($label, $ui->theme->fontSize, false);
+    float32 $w = CHECK_H * 2.0f + $ui->theme->padding + $ts->x;
+    $n->measured = Vec2($w, CHECK_H);
+    $ui->push($n);
+    return $hit;
+}
+
+internal function emitCheckBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    CheckRun $run = $ui->checks[$n->payload as usize];
+    Theme $t = $ui->theme;
+    bool $hot = contains($n, $ui->io->mouse);
+    Color $bg = $t->checkboxBg;
+
+    if ($run->on) {
+        $bg = $t->checkboxActiveBg;
+    }
+
+    if ($hot) {
+        $bg = $t->checkboxHoverBg;
+
+        if ($run->on) {
+            $bg = $t->checkboxActiveBg->lighten(0.05f);
+        }
+    }
+
+    float32 $sw = CHECK_H * 2.0f;
+    Vec2 $track = Vec2($n->pos->x, $n->pos->y + 1.0f);
+    Vec2 $trackSize = Vec2($sw, CHECK_H - 2.0f);
+    fillBox($ui, $track, $trackSize, (CHECK_H - 2.0f) * 0.5f, $bg, $pad);
+    float32 $knobX = $n->pos->x;
+
+    if ($run->on) {
+        $knobX = $n->pos->x + $sw - CHECK_H;
+    }
+
+    float32 $kr = CHECK_H * 0.35f * 2.0f;
+    fillBox(
+        $ui,
+        Vec2($knobX + CHECK_H * 0.5f - $kr * 0.5f, $n->pos->y + CHECK_H * 0.5f - $kr * 0.5f),
+        Vec2($kr, $kr),
+        $kr * 0.5f,
+        Color::white(),
+        $pad
+    );
+}
+
+internal function emitCheckText(Ui $ui, const Node& $n) : visu::graphics::Texture?
+{
+    CheckRun $run = $ui->checks[$n->payload as usize];
+    Vec2 $pos = Vec2(
+        $n->pos->x + CHECK_H * 2.0f + $ui->theme->padding,
+        $n->pos->y + CHECK_H * 0.5f
+    );
+    return paintText($ui, $pos, $run->label, $ui->theme->fontSize, $ui->theme->textColor, false, false, Vec4(0.0f), true);
+}
