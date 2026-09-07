@@ -300,8 +300,18 @@ public class Canvas
     public function textAdvance(Vec2 $pos, const string& $s) : float32
     {
         assert($this->open, 'vg textAdvance outside begin');
-        TextLayout $layout = layoutText($this, $pos, $s, false);
-        return $layout->advance;
+        Font? $maybe = $this->state->font;
+        Font $font = guard $maybe else {
+            return 0.0f;
+        }
+
+        if ($s->size() == 0) {
+            return 0.0f;
+        }
+
+        float32 $scale = tessScale($this->state->xform);
+        float32 $px = quantizePx($this->state->fontSize * $scale);
+        return textWidth($font, $px, $s) / $scale;
     }
 
     public function textBounds(Vec2 $pos, const string& $s) : AABB2D

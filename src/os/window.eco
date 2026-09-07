@@ -22,6 +22,7 @@ public class Window
     private WindowEventHandler? $handler;
     private Device? $device;
     private int32 $appliedHz;
+    private bool $vsync = true;
 
     public constructor(string $title, int32 $width, int32 $height, WindowHints $hints = WindowHints::defaults())
     {
@@ -36,6 +37,7 @@ public class Window
         $this->handler = null;
         $this->device = null;
         $this->appliedHz = 0;
+        $this->vsync = true;
     }
 
     destructor()
@@ -51,6 +53,7 @@ public class Window
 
         DeviceOptions $options = DeviceOptions();
         $options->appName = $this->title;
+        $options->vsync = $this->vsync;
         guard $device->initialize($options) else ($e) {
             return .error(.device($e));
         }
@@ -88,7 +91,7 @@ public class Window
         windowRegister($this);
         glfw::setFramebufferSizeCallback($this->handle, &onFramebufferSize);
         glfw::setWindowPosCallback($this->handle, &onWindowPos);
-        applyDisplaySync($this->handle, true);
+        applyDisplaySync($this->handle, $this->vsync);
         $this->syncPresentRate();
 
         if ($this->handler != null) {
@@ -493,14 +496,24 @@ public class Window
         glfw::requestWindowAttention($this->requireHandle());
     }
 
-    public function setSwapInterval(int32 $interval) : void
+    public function setVsync(bool $on) : void
     {
+        $this->vsync = $on;
         Device $device = guard $this->device else {
             return;
         }
-        bool $on = $interval != 0;
         $device->setVsync($on);
-        applyDisplaySync($this->requireHandle(), $on);
+
+        if ($this->handle:$ == null) {
+            return;
+        }
+
+        applyDisplaySync($this->handle, $on);
+    }
+
+    public function setSwapInterval(int32 $interval) : void
+    {
+        $this->setVsync($interval != 0);
     }
 
     /**

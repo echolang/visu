@@ -138,3 +138,56 @@ test font_missing_file
     string $msg = $e->message();
     assert($msg == "vg font file 'no/such/font.ttf'", 'path');
 }
+
+test font_inconsolata_no_kern
+{
+    Canvas $vg = fontCanvas();
+    guard $vg->createFont('sans', inconsolataPath()) else {
+        assert(false, 'load font');
+        return;
+    }
+    guard $vg->fontFace('sans') else {
+        assert(false, 'font face');
+        return;
+    }
+    $vg->fontSize(18.0f);
+    float32 $av = $vg->textAdvance(Vec2(0.0f, 0.0f), 'AV');
+    float32 $a = $vg->textAdvance(Vec2(0.0f, 0.0f), 'A');
+    float32 $v = $vg->textAdvance(Vec2(0.0f, 0.0f), 'V');
+    assert($av == $a + $v, 'mono kern');
+    float32 $again = $vg->textAdvance(Vec2(0.0f, 0.0f), 'AV');
+    assert($again == $av, 'repeat');
+}
+
+function interPath() : string
+{
+    if (fontFileExists('resources/font/Inter-Regular.ttf')) {
+        return 'resources/font/Inter-Regular.ttf';
+    }
+
+    if (fontFileExists('../resources/font/Inter-Regular.ttf')) {
+        return '../resources/font/Inter-Regular.ttf';
+    }
+
+    return 'resources/font/Inter-Regular.ttf';
+}
+
+test font_inter_gpos_pair
+{
+    Canvas $vg = fontCanvas();
+    guard $vg->createFont('sans', interPath()) else {
+        assert(false, 'load inter');
+        return;
+    }
+    guard $vg->fontFace('sans') else {
+        assert(false, 'font face');
+        return;
+    }
+    $vg->fontSize(48.0f);
+    float32 $pair = $vg->textAdvance(Vec2(0.0f, 0.0f), 'y<');
+    float32 $y = $vg->textAdvance(Vec2(0.0f, 0.0f), 'y');
+    float32 $lt = $vg->textAdvance(Vec2(0.0f, 0.0f), '<');
+    assert($pair + 1.0f < $y + $lt, 'y< kerns');
+    float32 $again = $vg->textAdvance(Vec2(0.0f, 0.0f), 'y<');
+    assert($again == $pair, 'repeat');
+}

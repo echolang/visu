@@ -71,7 +71,7 @@ public class Instruments
 
         LoopStats $loop = $sink->loop;
         $loop->renderNs = $this->renderNs;
-        Sample $snap = Sample($loop, $sink->memory, $sink->adapter, $list);
+        Sample $snap = Sample($loop, $sink->memory, $sink->adapter, $list, liveAllocations());
         $this->last = $snap;
         return $snap;
     }
@@ -91,4 +91,17 @@ public class Instruments
         }
         return $snap->memory->used;
     }
+}
+
+/**
+ * Echo heap live count. `--define VISU_TRACK_ALLOCATIONS` plus
+ * `--track-allocations`; without both the overlay omits it.
+ */
+internal function liveAllocations() : usize
+{
+    #[if: VISU_TRACK_ALLOCATIONS]
+    return mem::live_allocations();
+    #[else]
+    return 0;
+    #[end]
 }

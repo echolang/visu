@@ -230,8 +230,9 @@ internal function paintText(
     $originY = snapPt($originY, $scale);
 
     Vec4 $col = $color->premultiplied();
+    float32 $fs = visu::vg::fontScale($font, $px);
     float32 $pen = 0.0f;
-    int32 $prev = 0;
+    int32 $prev = -1;
     usize $i = 0;
     usize $n = $s->size();
     float32 $aw = $font->atlasW as float32;
@@ -252,8 +253,10 @@ internal function paintText(
             continue;
         }
 
-        if ($prev != 0) {
-            $pen = $pen + visu::vg::vg_font_kern($font->raw, $prev, $cp, $px);
+        int32 $gi = visu::vg::fontIndex($font, $cp);
+
+        if ($prev >= 0) {
+            $pen = $pen + (visu::vg::fontKern($font, $prev, $gi) as float32) * $fs;
         }
 
         visu::vg::Glyph $g = fontPack($font, $cp, $px);
@@ -280,7 +283,7 @@ internal function paintText(
         }
 
         $pen = $pen + $g->advance;
-        $prev = $cp;
+        $prev = $gi;
     }
 
     return $font->atlas;

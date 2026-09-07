@@ -112,6 +112,33 @@ test format_rows_are_sections
     assert($rows[4]->text->contains('RT:'), 'rt text');
 }
 
+test format_line_includes_allocations_when_nonzero
+{
+    LoopStats $loop = LoopStats();
+    Sample $sample = Sample($loop, MemoryStats(), AdapterInfo(), array<visu::instrument::Gauge>(), 12);
+    string $line = formatLine($sample);
+    assert($line->contains('ALLOC:     12'), 'alloc');
+}
+
+test format_line_omits_allocations_when_zero
+{
+    Sample $sample = Sample(LoopStats(), MemoryStats(), AdapterInfo(), array<visu::instrument::Gauge>());
+    assert(!formatLine($sample)->contains('ALLOC:'), 'no alloc');
+}
+
+test format_allocations_width_is_stable
+{
+    LoopStats $loop = LoopStats();
+    Sample $a = Sample($loop, MemoryStats(), AdapterInfo(), array<visu::instrument::Gauge>(), 12);
+    Sample $b = Sample($loop, MemoryStats(), AdapterInfo(), array<visu::instrument::Gauge>(), 100000);
+    array<HudRow> $aRows = formatRows($a);
+    array<HudRow> $bRows = formatRows($b);
+    assert($aRows->count() == 7, 'a count');
+    assert($bRows->count() == 7, 'b count');
+    assert($aRows[6]->key == 'alloc', 'key');
+    assert($aRows[6]->text->size() == $bRows[6]->text->size(), 'width');
+}
+
 test format_gauge_picks_unit
 {
     assert(formatGauge(Gauge('fps', 59.6, Unit::fps)) == 'fps:   60', 'fps');

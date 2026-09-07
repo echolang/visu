@@ -14,6 +14,7 @@ use visu::math::Vec2;
 internal const int32 FONT_ATLAS = 512;
 internal const int32 FONT_ATLAS_MAX = 2048;
 internal const int32 FONT_PAD = 1;
+internal const int32 FONT_CMAP = 65536;
 
 internal struct Glyph
 {
@@ -25,6 +26,13 @@ internal struct Glyph
     public int32 $atlasX = 0;
     public int32 $atlasY = 0;
     public bool $packed = false;
+}
+
+internal struct CmapHiRange
+{
+    public int32 $start = 0;
+    public int32 $end = 0;
+    public int32 $startGlyph = 0;
 }
 
 internal struct FontMetrics
@@ -45,6 +53,19 @@ public class Font
     internal string $bytes;
     internal ptr<VgFont> $raw;
     internal map<uint64, Glyph> $glyphs;
+    internal array<int32> $cmap;
+    internal array<int32> $advance;
+    internal map<uint64, int32> $kern;
+    internal array<CmapHiRange> $cmapHi;
+    internal array<int32> $class1;
+    internal array<int32> $class2;
+    internal array<int32> $classMatrix;
+    internal int32 $class2Count;
+    internal int32 $rawAscent;
+    internal int32 $rawDescent;
+    internal int32 $rawLineGap;
+    internal bool $hasKern;
+    internal bool $hasClassKern;
     internal Texture? $atlas;
     internal array<uint8> $pixels;
     internal int32 $atlasW;
@@ -63,6 +84,19 @@ public class Font
         $this->bytes = $bytes;
         $this->raw = $raw;
         $this->glyphs = map<uint64, Glyph>();
+        $this->cmap = array<int32>();
+        $this->advance = array<int32>();
+        $this->kern = map<uint64, int32>();
+        $this->cmapHi = array<CmapHiRange>();
+        $this->class1 = array<int32>();
+        $this->class2 = array<int32>();
+        $this->classMatrix = array<int32>();
+        $this->class2Count = 0;
+        $this->rawAscent = 0;
+        $this->rawDescent = 0;
+        $this->rawLineGap = 0;
+        $this->hasKern = false;
+        $this->hasClassKern = false;
         $this->atlas = null;
         $this->pixels = array<uint8>();
         $this->atlasW = FONT_ATLAS;
@@ -117,18 +151,298 @@ internal function fontLoad(Device $device, string $name, string $bytes) : result
         return .error(.fontParse);
     }
 
-    return .ok(Font($device, $name, $bytes, $raw));
+    Font $font = Font($device, $name, $bytes, $raw);
+    fontTakeLayout($font);
+    return .ok($font);
+}
+
+internal function fontTakeLayout(Font $font) : void
+{
+    if ($font->raw == null) {
+        return;
+    }
+
+    VgFontLayout $info = VgFontLayout();
+    vg_font_layout($font->raw, &$info);
+    $font->rawAscent = $info->ascent;
+    $font->rawDescent = $info->descent;
+    $font->rawLineGap = $info->lineGap;
+    $font->cmap = takeI32($font->raw, FONT_CMAP, true);
+    $font->advance = takeI32($font->raw, $info->glyphCount, false);
+    takeKern($font, $info);
+    takeClassKern($font, $info);
+    takeCmapHi($font, $info);
+    $font->hasKern = $font->kern->count() > 0 || $font->hasClassKern;
+    vg_font_drop_layout($font->raw);
+}
+
+internal function takeI32(ptr<VgFont> $raw, int32 $n, bool $cmap) : array<int32>
+{
+    if ($n <= 0) {
+        return array<int32>();
+    }
+
+    usize $cap = $n as usize;
+    array<int32> $out = arr::room<int32>($cap);
+    ptr<int32> $p = $out->spare();
+
+    if ($p:$ == null) {
+        return array<int32>();
+    }
+
+    int32 $got = 0;
+
+    if ($cmap) {
+        $got = vg_font_copy_cmap($raw, $p, $n);
+    } else {
+        $got = vg_font_copy_advance($raw, $p, $n);
+    }
+
+    if ($got < 0) {
+        $got = 0;
+    }
+
+    $out->commit($got as usize);
+    return $out;
+}
+
+internal function takeClass(ptr<VgFont> $raw, int32 $n, int32 $which) : array<int32>
+{
+    if ($n <= 0) {
+        return array<int32>();
+    }
+
+    usize $cap = $n as usize;
+    array<int32> $out = arr::room<int32>($cap);
+    ptr<int32> $p = $out->spare();
+
+    if ($p:$ == null) {
+        return array<int32>();
+    }
+
+    int32 $got = 0;
+
+    if ($which == 1) {
+        $got = vg_font_copy_class1($raw, $p, $n);
+    } else if ($which == 2) {
+        $got = vg_font_copy_class2($raw, $p, $n);
+    } else {
+        $got = vg_font_copy_class_matrix($raw, $p, $n);
+    }
+
+    if ($got < 0) {
+        $got = 0;
+    }
+
+    $out->commit($got as usize);
+    return $out;
+}
+
+internal function takeKern(Font $font, const VgFontLayout& $info) : void
+{
+    int32 $n = $info->kernPairCount;
+
+    if ($n <= 0 || $font->raw == null) {
+        return;
+    }
+
+    usize $cap = $n as usize;
+    array<uint64> $keys = arr::room<uint64>($cap);
+    array<int32> $vals = arr::room<int32>($cap);
+    ptr<uint64> $pk = $keys->spare();
+    ptr<int32> $pv = $vals->spare();
+
+    if ($pk:$ == null || $pv:$ == null) {
+        return;
+    }
+
+    int32 $got = vg_font_copy_kern($font->raw, $pk, $pv, $n);
+
+    if ($got <= 0) {
+        return;
+    }
+
+    $keys->commit($got as usize);
+    $vals->commit($got as usize);
+    int32 $i = 0;
+
+    while ($i < $got) {
+        uint64 $k = $keys[$i as usize];
+
+        if (!$font->kern->has($k)) {
+            $font->kern[$k] = $vals[$i as usize];
+        }
+
+        $i = $i + 1;
+    }
+}
+
+internal function takeClassKern(Font $font, const VgFontLayout& $info) : void
+{
+    if ($info->hasClassKern == 0 || $info->glyphCount <= 0 || $font->raw == null) {
+        return;
+    }
+
+    int32 $cells = $info->class1Count * $info->class2Count;
+    $font->class1 = takeClass($font->raw, $info->glyphCount, 1);
+    $font->class2 = takeClass($font->raw, $info->glyphCount, 2);
+    $font->classMatrix = takeClass($font->raw, $cells, 0);
+    $font->class2Count = $info->class2Count;
+    $font->hasClassKern = $font->class1->count() > 0
+        && $font->class2->count() > 0
+        && $font->classMatrix->count() > 0
+        && $font->class2Count > 0;
+}
+
+internal function takeCmapHi(Font $font, const VgFontLayout& $info) : void
+{
+    int32 $n = $info->hiCount;
+
+    if ($n <= 0 || $font->raw == null) {
+        return;
+    }
+
+    usize $cap = $n as usize;
+    array<int32> $starts = arr::room<int32>($cap);
+    array<int32> $ends = arr::room<int32>($cap);
+    array<int32> $glyphs = arr::room<int32>($cap);
+    ptr<int32> $ps = $starts->spare();
+    ptr<int32> $pe = $ends->spare();
+    ptr<int32> $pg = $glyphs->spare();
+
+    if ($ps:$ == null || $pe:$ == null || $pg:$ == null) {
+        return;
+    }
+
+    int32 $got = vg_font_copy_cmap_hi($font->raw, $ps, $pe, $pg, $n);
+
+    if ($got <= 0) {
+        return;
+    }
+
+    $starts->commit($got as usize);
+    $ends->commit($got as usize);
+    $glyphs->commit($got as usize);
+    int32 $i = 0;
+
+    while ($i < $got) {
+        usize $u = $i as usize;
+        CmapHiRange $r = CmapHiRange();
+        $r->start = $starts[$u];
+        $r->end = $ends[$u];
+        $r->startGlyph = $glyphs[$u];
+        $font->cmapHi[] = $r;
+        $i = $i + 1;
+    }
+}
+
+internal function fontScale(Font $font, float32 $px) : float32
+{
+    int32 $h = $font->rawAscent - $font->rawDescent;
+
+    if ($h <= 0) {
+        return 0.0f;
+    }
+
+    return $px / ($h as float32);
+}
+
+internal function fontIndex(Font $font, int32 $cp) : int32
+{
+    if ($cp < 0) {
+        return 0;
+    }
+
+    if ($cp < FONT_CMAP) {
+        usize $i = $cp as usize;
+
+        if ($i >= $font->cmap->count()) {
+            return 0;
+        }
+
+        return $font->cmap[$i];
+    }
+
+    int32 $n = $font->cmapHi->count();
+    int32 $i = 0;
+
+    while ($i < $n) {
+        CmapHiRange $r = $font->cmapHi[$i as usize];
+
+        if ($cp >= $r->start && $cp <= $r->end) {
+            return $r->startGlyph + ($cp - $r->start);
+        }
+
+        $i = $i + 1;
+    }
+
+    return 0;
+}
+
+internal function fontKern(Font $font, int32 $g1, int32 $g2) : int32
+{
+    if (!$font->hasKern) {
+        return 0;
+    }
+
+    uint64 $hi = $g1 as uint64;
+    uint64 $lo = $g2 as uint64;
+    uint64 $key = ($hi << 32) | $lo;
+
+    if ($font->kern->has($key)) {
+        return $font->kern[$key];
+    }
+
+    if (!$font->hasClassKern) {
+        return 0;
+    }
+
+    usize $i1 = $g1 as usize;
+    usize $i2 = $g2 as usize;
+
+    if ($i1 >= $font->class1->count() || $i2 >= $font->class2->count()) {
+        return 0;
+    }
+
+    int32 $c1 = $font->class1[$i1];
+
+    if ($c1 < 0) {
+        return 0;
+    }
+
+    int32 $c2 = $font->class2[$i2];
+    int32 $idx = $c1 * $font->class2Count + $c2;
+
+    if ($idx < 0 || ($idx as usize) >= $font->classMatrix->count()) {
+        return 0;
+    }
+
+    return $font->classMatrix[$idx as usize];
+}
+
+internal function fontAdvance(Font $font, int32 $glyph, float32 $scale) : float32
+{
+    if ($glyph < 0) {
+        return 0.0f;
+    }
+
+    usize $i = $glyph as usize;
+
+    if ($i >= $font->advance->count()) {
+        return 0.0f;
+    }
+
+    return ($font->advance[$i] as float32) * $scale;
 }
 
 internal function fontMetrics(Font $font, float32 $px) : FontMetrics
 {
     FontMetrics $m = FontMetrics();
-
-    if ($font->raw == null) {
-        return $m;
-    }
-
-    vg_font_metrics($font->raw, $px, &$m->ascent, &$m->descent, &$m->lineh);
+    float32 $s = fontScale($font, $px);
+    $m->ascent = ($font->rawAscent as float32) * $s;
+    $m->descent = ($font->rawDescent as float32) * $s;
+    int32 $line = $font->rawAscent - $font->rawDescent + $font->rawLineGap;
+    $m->lineh = ($line as float32) * $s;
     return $m;
 }
 
@@ -141,20 +455,23 @@ internal function fontGlyph(Font $font, int32 $cp, float32 $px) : Glyph
     }
 
     Glyph $g = Glyph();
+    int32 $glyph = fontIndex($font, $cp);
+    float32 $scale = fontScale($font, $px);
+    $g->advance = fontAdvance($font, $glyph, $scale);
 
     if ($font->raw == null) {
+        $font->glyphs[$key] = $g;
         return $g;
     }
 
     int32 $ok = vg_font_glyph(
         $font->raw,
-        $cp,
+        $glyph,
         $px,
         &$g->w,
         &$g->h,
         &$g->xoff,
-        &$g->yoff,
-        &$g->advance
+        &$g->yoff
     );
 
     if ($ok == 0) {
@@ -186,7 +503,7 @@ internal function fontPack(Font $font, int32 $cp, float32 $px) : Glyph
     ptr<uint8> $dst = $bitmap->spare();
 
     if ($dst:$ != null) {
-        vg_font_raster($font->raw, $cp, $px, $dst, $g->w);
+        vg_font_raster($font->raw, fontIndex($font, $cp), $px, $dst, $g->w);
         $bitmap->commit($n);
         fontBlit($font, $g, $bitmap);
     }
@@ -426,8 +743,9 @@ internal function utf8Next(const string& $s, usize& $i) : int32
 
 internal function textWidth(Font $font, float32 $px, const string& $s) : float32
 {
+    float32 $scale = fontScale($font, $px);
     float32 $pen = 0.0f;
-    int32 $prev = 0;
+    int32 $prev = -1;
     usize $i = 0;
     usize $n = $s->size();
 
@@ -438,13 +756,14 @@ internal function textWidth(Font $font, float32 $px, const string& $s) : float32
             continue;
         }
 
-        if ($prev != 0) {
-            $pen = $pen + vg_font_kern($font->raw, $prev, $cp, $px);
+        int32 $g = fontIndex($font, $cp);
+
+        if ($prev >= 0) {
+            $pen = $pen + (fontKern($font, $prev, $g) as float32) * $scale;
         }
 
-        Glyph $g = fontGlyph($font, $cp, $px);
-        $pen = $pen + $g->advance;
-        $prev = $cp;
+        $pen = $pen + fontAdvance($font, $g, $scale);
+        $prev = $g;
     }
 
     return $pen;
@@ -476,11 +795,17 @@ internal function layoutText(Canvas $vg, Vec2 $pos, const string& $s, bool $draw
 
     float32 $scale = tessScale($vg->state->xform);
     float32 $px = quantizePx($vg->state->fontSize * $scale);
+    float32 $fs = fontScale($font, $px);
     float32 $inv = 1.0f / $scale;
     FontMetrics $m = fontMetrics($font, $px);
-    float32 $widthPx = textWidth($font, $px, $s);
+    float32 $widthPx = 0.0f;
     float32 $originX = $pos->x;
     float32 $originY = $pos->y;
+    bool $needWidth = $vg->state->align->h != HAlign::left;
+
+    if ($needWidth) {
+        $widthPx = textWidth($font, $px, $s);
+    }
 
     match ($vg->state->align->h) {
         HAlign::left => {
@@ -509,9 +834,8 @@ internal function layoutText(Canvas $vg, Vec2 $pos, const string& $s, bool $draw
 
     $originX = snapPt($originX, $scale);
     $originY = snapPt($originY, $scale);
-    $out->advance = $widthPx * $inv;
     float32 $pen = 0.0f;
-    int32 $prev = 0;
+    int32 $prev = -1;
     usize $i = 0;
     usize $n = $s->size();
     bool $any = false;
@@ -539,8 +863,10 @@ internal function layoutText(Canvas $vg, Vec2 $pos, const string& $s, bool $draw
             continue;
         }
 
-        if ($prev != 0) {
-            $pen = $pen + vg_font_kern($font->raw, $prev, $cp, $px);
+        int32 $gi = fontIndex($font, $cp);
+
+        if ($prev >= 0) {
+            $pen = $pen + (fontKern($font, $prev, $gi) as float32) * $fs;
         }
 
         Glyph $g = fontGlyph($font, $cp, $px);
@@ -591,8 +917,10 @@ internal function layoutText(Canvas $vg, Vec2 $pos, const string& $s, bool $draw
         }
 
         $pen = $pen + $g->advance;
-        $prev = $cp;
+        $prev = $gi;
     }
+
+    $out->advance = $pen * $inv;
 
     if ($any) {
         $out->bounds = AABB2D(Vec2($minX, $minY), Vec2($maxX, $maxY));
