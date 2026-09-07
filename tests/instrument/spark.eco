@@ -1,0 +1,94 @@
+/**
+ * Overlay sparkline raster is a CPU pixel grid: 1 texel per
+ * sample, 1 texel at the mapped y, colour vs the ring average.
+ */
+
+use visu::instrument::{SparkRgba, rasterizeSpark, sparkFilled, sparkStripOrigin, sparkTint};
+
+test spark_empty_is_clear
+{
+    array<uint8> $px = sparkFilled(8, 24);
+    array<float32> $samples = array<float32>();
+    rasterizeSpark($px, $samples, 8, 24);
+    usize $n = $px->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        assert($px[$i] == 0, 'empty');
+        $i = $i + 1;
+    }
+}
+
+test spark_one_texel_per_sample
+{
+    array<uint8> $px = sparkFilled(8, 24);
+    array<float32> $samples = array<float32>();
+    $samples[] = 8.0f;
+    $samples[] = 16.0f;
+    $samples[] = 32.0f;
+    rasterizeSpark($px, $samples, 8, 24);
+    assert(sparkAlpha($px, 8, 0, 18) == 255, 'low mark');
+    assert(sparkAlpha($px, 8, 1, 12) == 255, 'mid mark');
+    assert(sparkAlpha($px, 8, 2, 0) == 255, 'high mark');
+    assert(sparkAlpha($px, 8, 0, 17) == 0, 'below low');
+    assert(sparkAlpha($px, 8, 3, 0) == 0, 'unused col');
+}
+
+test spark_high_is_red
+{
+    array<uint8> $px = sparkFilled(8, 24);
+    array<float32> $samples = array<float32>();
+    $samples[] = 8.0f;
+    $samples[] = 16.0f;
+    $samples[] = 32.0f;
+    rasterizeSpark($px, $samples, 8, 24);
+    SparkRgba $green = sparkTint(8.0f, 18.666666f);
+    SparkRgba $red = sparkTint(32.0f, 18.666666f);
+    assert(sparkRed($px, 8, 0, 18) == $green->r, 'low r');
+    assert(sparkGreen($px, 8, 0, 18) == $green->g, 'low g');
+    assert(sparkRed($px, 8, 2, 0) == $red->r, 'high r');
+    assert(sparkGreen($px, 8, 2, 0) == $red->g, 'high g');
+    assert($red->r > $green->r, 'redder');
+}
+
+test spark_zero_max_stays_clear
+{
+    array<uint8> $px = sparkFilled(4, 8);
+    array<float32> $samples = array<float32>();
+    $samples[] = 0.0f;
+    $samples[] = 0.0f;
+    rasterizeSpark($px, $samples, 4, 8);
+    assert(sparkAlpha($px, 4, 0, 0) == 0, 'zero');
+}
+
+test spark_strip_sits_under_line
+{
+    $p = sparkStripOrigin();
+    assert($p->x == 10.0f, 'x');
+    assert($p->y == 32.0f, 'y');
+}
+
+test spark_fps_low_is_red
+{
+    SparkRgba $low = sparkTint(30.0f, 60.0f, false);
+    SparkRgba $ok = sparkTint(60.0f, 60.0f, false);
+    assert($low->r > $ok->r, 'drop is redder');
+}
+
+internal function sparkAlpha(const array<uint8>& $px, int32 $w, int32 $x, int32 $y) : uint8
+{
+    usize $idx = (($y * $w + $x) * 4) as usize;
+    return $px[$idx + 3];
+}
+
+internal function sparkRed(const array<uint8>& $px, int32 $w, int32 $x, int32 $y) : uint8
+{
+    usize $idx = (($y * $w + $x) * 4) as usize;
+    return $px[$idx];
+}
+
+internal function sparkGreen(const array<uint8>& $px, int32 $w, int32 $x, int32 $y) : uint8
+{
+    usize $idx = (($y * $w + $x) * 4) as usize;
+    return $px[$idx + 1];
+}

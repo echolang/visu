@@ -1,0 +1,234 @@
+/**
+ * CPU sparkline for the overlay HUD. One texel per sample (x),
+ * one texel at the mapped y. Colour is vs the ring average.
+ * GPU upload / blit lives on Overlay, not here.
+ */
+
+namespace visu::instrument;
+
+use visu::math::Vec2;
+
+internal const float32 HUD_X = 10.0f;
+internal const float32 HUD_Y = 10.0f;
+internal const float32 HUD_LH = 18.0f;
+internal const float32 HUD_PAD = 6.0f;
+internal const int32 SPARK_W = 256;
+internal const int32 SPARK_ATLAS_W = 2048;
+internal const int32 SPARK_H = 18;
+internal const float32 SPARK_GAP = 4.0f;
+internal const string HUD_SEP = ' | ';
+
+internal struct SparkRgba
+{
+    public uint8 $r = 0;
+    public uint8 $g = 0;
+    public uint8 $b = 0;
+    public uint8 $a = 0;
+}
+
+internal struct SparkSlot
+{
+    public string $key;
+    public float32 $x = 0.0f;
+    public float32 $w = 0.0f;
+    public float32 $colW = 0.0f;
+    public bool $higherWorse = true;
+}
+
+internal function sparkStripOrigin() : Vec2
+{
+    return Vec2(HUD_X, HUD_Y + HUD_LH + SPARK_GAP);
+}
+
+internal function sparkRound(float32 $v) : int32
+{
+    return std::math::floor($v + 0.5f) as int32;
+}
+
+internal function pushSpark(array<float32>& $samples, float32 $ms, int32 $cap) : void
+{
+    float32 $v = $ms;
+
+    if ($v < 0.0f) {
+        $v = 0.0f;
+    }
+
+    $samples->push($v);
+
+    while (($samples->count() as int32) > $cap) {
+        $samples->remove(0);
+    }
+}
+
+internal function clearSpark(array<uint8>& $rgba) : void
+{
+    usize $n = $rgba->count();
+    ptr<uint8> $base = $rgba->data();
+
+    if ($n > 0 && $base:$ != null) {
+        mem::zero<uint8>($base, $n);
+    }
+}
+
+internal function rasterizeSpark(
+    array<uint8>& $rgba,
+    const array<float32>& $samples,
+    int32 $stride,
+    int32 $height,
+    int32 $y0 = 0,
+    bool $higherWorse = true,
+    bool $clear = true,
+    int32 $x0 = 0,
+    int32 $drawW = 0
+) : void
+{
+    if ($clear) {
+        clearSpark($rgba);
+    }
+
+    int32 $dw = $drawW;
+
+    if ($dw <= 0) {
+        $dw = $stride;
+    }
+
+    if ($x0 < 0) {
+        $dw = $dw + $x0;
+        $x0 = 0;
+    }
+
+    if ($x0 >= $stride) {
+        return;
+    }
+
+    if ($x0 + $dw > $stride) {
+        $dw = $stride - $x0;
+    }
+
+    if ($stride <= 0 || $height <= 0 || $dw <= 0 || $samples->empty()) {
+        return;
+    }
+
+    usize $n = $rgba->count();
+    int32 $needH = $y0 + $height;
+    usize $want = (($stride * $needH) * 4) as usize;
+
+    if ($n < $want) {
+        return;
+    }
+
+    float32 $sum = 0.0f;
+    float32 $max = 0.0f;
+    usize $count = $samples->count();
+
+    foreach ($samples as $ms) {
+        float32 $v = $ms;
+        $sum = $sum + $v;
+
+        if ($v > $max) {
+            $max = $v;
+        }
+    }
+
+    if ($max <= 0.0f) {
+        return;
+    }
+
+    float32 $avg = $sum / ($count as float32);
+    int32 $h1 = $height - 1;
+    usize $skip = 0;
+
+    if (($count as int32) > $dw) {
+        $skip = ($count as int32 - $dw) as usize;
+    }
+
+    usize $i = $skip;
+    int32 $col = 0;
+
+    while ($i < $count && $col < $dw) {
+        float32 $v = $samples[$i];
+        float32 $scaled = ($v / $max) * ($h1 as float32);
+        int32 $yb = $scaled as int32;
+
+        if ($yb < 0) {
+            $yb = 0;
+        }
+
+        if ($yb > $h1) {
+            $yb = $h1;
+        }
+
+        int32 $x = $x0 + $col;
+        int32 $y = $y0 + ($h1 - $yb);
+
+        if ($x < 0 || $x >= $stride || $y < 0 || $y >= $needH) {
+            $i = $i + 1;
+            $col = $col + 1;
+            continue;
+        }
+
+        SparkRgba $c = sparkTint($v, $avg, $higherWorse);
+        usize $idx = (($y * $stride + $x) * 4) as usize;
+
+        if ($idx + 3 >= $n) {
+            break;
+        }
+
+        $rgba[$idx] = $c->r;
+        $rgba[$idx + 1] = $c->g;
+        $rgba[$idx + 2] = $c->b;
+        $rgba[$idx + 3] = $c->a;
+        $i = $i + 1;
+        $col = $col + 1;
+    }
+}
+
+internal function sparkTint(float32 $v, float32 $avg, bool $higherWorse = true) : SparkRgba
+{
+    if ($higherWorse) {
+        if ($v > $avg * 1.5f) {
+            return SparkRgba(242 as uint8, 64 as uint8, 64 as uint8, 255 as uint8);
+        }
+
+        if ($v > $avg) {
+            return SparkRgba(242 as uint8, 140 as uint8, 51 as uint8, 255 as uint8);
+        }
+
+        return SparkRgba(89 as uint8, 217 as uint8, 115 as uint8, 255 as uint8);
+    }
+
+    if ($v < $avg * 0.6666667f) {
+        return SparkRgba(242 as uint8, 64 as uint8, 64 as uint8, 255 as uint8);
+    }
+
+    if ($v < $avg) {
+        return SparkRgba(242 as uint8, 140 as uint8, 51 as uint8, 255 as uint8);
+    }
+
+    return SparkRgba(89 as uint8, 217 as uint8, 115 as uint8, 255 as uint8);
+}
+
+internal function sparkFilled(int32 $width, int32 $height) : array<uint8>
+{
+    int32 $w = $width;
+    int32 $h = $height;
+
+    if ($w < 1) {
+        $w = 1;
+    }
+
+    if ($h < 1) {
+        $h = 1;
+    }
+
+    usize $n = (($w * $h) * 4) as usize;
+    array<uint8> $out = arr::room<uint8>($n);
+    ptr<uint8> $p = $out->spare();
+
+    if ($p:$ != null) {
+        mem::zero<uint8>($p, $n);
+        $out->commit($n);
+    }
+
+    return $out;
+}

@@ -37,6 +37,15 @@ function fontFileExists(string $path) : bool
     return $here;
 }
 
+test font_snap_pt
+{
+    assert(visu::vg::snapPt(10.0f, 1.0f) == 10.0f, 'int');
+    assert(visu::vg::snapPt(10.4f, 1.0f) == 10.0f, 'down');
+    assert(visu::vg::snapPt(10.6f, 1.0f) == 11.0f, 'up');
+    assert(visu::vg::snapPt(10.25f, 2.0f) == 10.5f, 'retina');
+    assert(visu::vg::snapPt(-20.3f, 1.0f) == -20.0f, 'neg');
+}
+
 test font_load_and_bounds
 {
     Canvas $vg = fontCanvas();
@@ -55,6 +64,26 @@ test font_load_and_bounds
     $empty = $vg->textBounds(Vec2(10.0f, 20.0f), '');
     assert($empty->width() == 0.0f, 'empty width');
     assert($empty->height() == 0.0f, 'empty height');
+}
+
+test font_sep_advance_includes_spaces
+{
+    Canvas $vg = fontCanvas();
+    guard $vg->createFont('sans', inconsolataPath()) else {
+        assert(false, 'load font');
+        return;
+    }
+    guard $vg->fontFace('sans') else {
+        assert(false, 'font face');
+        return;
+    }
+    $vg->fontSize(14.0f);
+    $vg->textAlign(TextAlign(.left, .top));
+    float32 $ink = $vg->textBounds(Vec2(0.0f, 0.0f), ' | ')->width();
+    float32 $adv = $vg->textAdvance(Vec2(0.0f, 0.0f), ' | ');
+    assert($adv > $ink, 'spaces add advance');
+    float32 $pipe = $vg->textAdvance(Vec2(0.0f, 0.0f), '|');
+    assert($adv > $pipe, 'spaces around pipe');
 }
 
 test font_align_right

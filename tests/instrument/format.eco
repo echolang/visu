@@ -3,20 +3,47 @@
  */
 
 use visu::graphics::{AdapterInfo, MemoryStats};
-use visu::instrument::{Gauge, LoopStats, Sample, Unit, formatBytes, formatGauge, formatLine, formatNs};
+use visu::instrument::{
+    Gauge, HudRow, LoopStats, Sample, Unit, formatBytes, formatGauge, formatLine, formatNs,
+    formatRows
+};
 
 test format_ns_picks_unit
 {
-    assert(formatNs(12.0) == '12.00 ns', 'ns');
-    assert(formatNs(1500.0) == '1.50 us', 'us');
-    assert(formatNs(2500000.0) == '2.50 ms', 'ms');
+    assert(formatNs(12.0) == ' 12.00 ns', 'ns');
+    assert(formatNs(999.995) == '  1.00 us', 'ns round-up');
+    assert(formatNs(1500.0) == '  1.50 us', 'us');
+    assert(formatNs(999995.0) == '  1.00 ms', 'us round-up');
+    assert(formatNs(2500000.0) == '  2.50 ms', 'ms');
+}
+
+test format_ns_width_is_stable
+{
+    usize $w = formatNs(12.0)->size();
+    assert(formatNs(0.0)->size() == $w, 'zero');
+    assert(formatNs(999.99)->size() == $w, 'ns max');
+    assert(formatNs(999.995)->size() == $w, 'ns round-up');
+    assert(formatNs(1000.0)->size() == $w, 'us');
+    assert(formatNs(999995.0)->size() == $w, 'us round-up');
+    assert(formatNs(1000000.0)->size() == $w, 'ms');
+    assert(formatNs(1000000000.0)->size() == $w, 's');
 }
 
 test format_bytes_picks_unit
 {
-    assert(formatBytes(512) == '512 B', 'b');
-    assert(formatBytes(1536) == '1.5 KiB', 'kib');
-    assert(formatBytes(1572864) == '1.5 MiB', 'mib');
+    assert(formatBytes(512) == '   512 B  ', 'b');
+    assert(formatBytes(1536) == '   1.5 KiB', 'kib');
+    assert(formatBytes(1572864) == '   1.5 MiB', 'mib');
+}
+
+test format_bytes_width_is_stable
+{
+    usize $w = formatBytes(512)->size();
+    assert(formatBytes(0)->size() == $w, 'zero');
+    assert(formatBytes(1023)->size() == $w, 'b max');
+    assert(formatBytes(1024)->size() == $w, 'kib');
+    assert(formatBytes(1048576)->size() == $w, 'mib');
+    assert(formatBytes(1073741824)->size() == $w, 'gib');
 }
 
 test format_line_includes_fps_and_vram
@@ -31,8 +58,9 @@ test format_line_includes_fps_and_vram
     $mem->budget = 17179869184;
     Sample $sample = Sample($loop, $mem, AdapterInfo(), array<visu::instrument::Gauge>());
     string $line = formatLine($sample);
-    assert($line->contains('FPS: 60'), 'fps');
-    assert($line->contains('VRAM: 1.5 MiB / 16.0 GiB'), 'vram');
+    assert($line->contains('FPS:   60'), 'fps');
+    assert($line->contains('RT:'), 'rt');
+    assert($line->contains('VRAM:    1.5 MiB /   16.0 GiB'), 'vram');
 }
 
 test format_line_omits_budget_when_unknown
@@ -42,13 +70,59 @@ test format_line_omits_budget_when_unknown
     $mem->used = 512;
     Sample $sample = Sample($loop, $mem, AdapterInfo(), array<visu::instrument::Gauge>());
     string $line = formatLine($sample);
-    assert($line->contains('VRAM: 512 B'), 'vram');
+    assert($line->contains('VRAM:    512 B  '), 'vram');
     assert(!$line->contains(' / '), 'no budget');
+}
+
+test format_line_width_is_stable
+{
+    LoopStats $aLoop = LoopStats();
+    $aLoop->fps = 9.0;
+    $aLoop->tickCount = 1.0;
+    $aLoop->tickNs = 12.0;
+    $aLoop->frameNs = 1000.0;
+    MemoryStats $aMem = MemoryStats();
+    $aMem->used = 512;
+    $aMem->budget = 1024;
+    Sample $a = Sample($aLoop, $aMem, AdapterInfo(), array<visu::instrument::Gauge>());
+    LoopStats $bLoop = LoopStats();
+    $bLoop->fps = 120.0;
+    $bLoop->tickCount = 10.0;
+    $bLoop->tickNs = 2500000.0;
+    $bLoop->frameNs = 16670000.0;
+    MemoryStats $bMem = MemoryStats();
+    $bMem->used = 1572864;
+    $bMem->budget = 17179869184;
+    Sample $b = Sample($bLoop, $bMem, AdapterInfo(), array<visu::instrument::Gauge>());
+    assert(formatLine($a)->size() == formatLine($b)->size(), 'line');
+}
+
+test format_rows_are_sections
+{
+    LoopStats $loop = LoopStats();
+    $loop->fps = 60.0;
+    $loop->renderNs = 2500000.0;
+    Sample $sample = Sample($loop, MemoryStats(), AdapterInfo(), array<visu::instrument::Gauge>());
+    array<HudRow> $rows = formatRows($sample);
+    assert($rows->count() == 6, 'count');
+    assert($rows[0]->key == 'fps', 'fps');
+    assert($rows[0]->higherWorse == false, 'fps low is bad');
+    assert($rows[4]->key == 'rt', 'rt');
+    assert($rows[4]->higherWorse == true, 'rt high is bad');
+    assert($rows[4]->text->contains('RT:'), 'rt text');
 }
 
 test format_gauge_picks_unit
 {
-    assert(formatGauge(Gauge('fps', 59.6, Unit::fps)) == 'fps: 60', 'fps');
-    assert(formatGauge(Gauge('ents', 12.2, Unit::count)) == 'ents: 12', 'count');
-    assert(formatGauge(Gauge('fill', 0.5, Unit::ratio)) == 'fill: 0.50', 'ratio');
+    assert(formatGauge(Gauge('fps', 59.6, Unit::fps)) == 'fps:   60', 'fps');
+    assert(formatGauge(Gauge('ents', 12.2, Unit::count)) == 'ents:   12', 'count');
+    assert(formatGauge(Gauge('fill', 0.5, Unit::ratio)) == 'fill:  0.50', 'ratio');
+}
+
+test format_gauge_width_is_stable
+{
+    usize $count = formatGauge(Gauge('n', 9.0, Unit::count))->size();
+    assert(formatGauge(Gauge('n', 1000.0, Unit::count))->size() == $count, 'count');
+    usize $ratio = formatGauge(Gauge('r', 0.5, Unit::ratio))->size();
+    assert(formatGauge(Gauge('r', 12.5, Unit::ratio))->size() == $ratio, 'ratio');
 }

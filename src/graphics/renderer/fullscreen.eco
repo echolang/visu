@@ -1,10 +1,13 @@
 /**
  * Blit a texture onto a target as a fullscreen quad. Owns the
  * program (baked SPIR-V / MSL). load() after the device exists;
- * pass() mints FullscreenQuadPass.
+ * pass() mints FullscreenQuadPass. stamp() blits an owned
+ * texture into a point-space dest rect.
  */
 
 namespace visu::graphics;
+
+use visu::math::Vec2;
 
 public class FullscreenTextureRenderer
 {
@@ -44,6 +47,27 @@ public class FullscreenTextureRenderer
         assert($maybe != null, 'fullscreen: load before pass');
         ShaderProgram $program = guard $maybe;
         $pipeline->add(FullscreenQuadPass($program, $target, $texture));
+    }
+
+    /**
+     * Per-frame graph node: writes `$target`, samples `$texture`
+     * into `$pos` / `$size` (points, scaled by contentScale).
+     * `$uv` is the max UV (1,1 is the whole texture).
+     */
+    public function stamp(
+        Pipeline $pipeline,
+        TargetRef $target,
+        Texture $texture,
+        Sampler $sampler,
+        Vec2 $pos,
+        Vec2 $size,
+        Vec2 $uv
+    ) : void
+    {
+        ShaderProgram? $maybe = $this->program;
+        assert($maybe != null, 'fullscreen: load before stamp');
+        ShaderProgram $program = guard $maybe;
+        $pipeline->add(StampPass($program, $target, $texture, $sampler, $pos, $size, $uv));
     }
 
     public function destroy() : void

@@ -1,12 +1,17 @@
 /**
- * VG HUD on the backbuffer. Draws a Sample plus extra row()
- * lines at the top-left. F1 toggles. Extra rows drain even
- * when hidden. Sampling lives on Instruments, not here.
+ * VG HUD on the backbuffer. Metrics stay on one horizontal
+ * line, white on a dark panel, with a sparkline under each
+ * section. F1 toggles. Extra rows drain even when hidden.
+ * Sampling lives on Instruments, not here.
  */
 
 namespace visu::instrument;
 
-use visu::graphics::{Device, Pipeline, TargetRef};
+use visu::geo::AABB2D;
+use visu::graphics::{
+    Device, Filter, FullscreenTextureRenderer, Pipeline, Sampler, SamplerDesc,
+    Texture, TextureDesc, TargetRef
+};
 use visu::math::Vec2;
 use visu::os::key;
 use visu::signal::{Dispatcher, Flow, Key};
@@ -17,6 +22,12 @@ public class Overlay
     public bool $enabled = true;
 
     private VgRenderer $vg;
+    private FullscreenTextureRenderer $blit;
+    private Texture? $spark0;
+    private Texture? $spark1;
+    private Sampler? $nearest;
+    private array<uint8> $pixels;
+    private map<string, array<float32>> $rings;
     private array<string> $rows;
     private bool $loaded;
     private bool $dead;
@@ -24,6 +35,12 @@ public class Overlay
     public constructor(Device $device)
     {
         $this->vg = VgRenderer($device);
+        $this->blit = FullscreenTextureRenderer();
+        $this->spark0 = null;
+        $this->spark1 = null;
+        $this->nearest = null;
+        $this->pixels = array<uint8>();
+        $this->rings = map<string, array<float32>>();
         $this->rows = array<string>();
         $this->loaded = false;
         $this->dead = false;
@@ -36,6 +53,7 @@ public class Overlay
 
     public function load() : status<VgError>
     {
+        Device $device = $this->vg->canvas->device;
         guard $this->vg->load() else ($e) {
             return .error($e);
         }
@@ -43,6 +61,16 @@ public class Overlay
         guard $this->vg->canvas->createFont(name: 'debug', bytes: $bytes) else ($e) {
             return .error($e);
         }
+        guard $this->blit->load($device) else ($e) {
+            return .error(.shader($e->message()));
+        }
+        SamplerDesc $sd = SamplerDesc();
+        $sd->min = Filter::nearest;
+        $sd->mag = Filter::nearest;
+        $this->nearest = $device->createSampler($sd);
+        $this->pixels = sparkFilled(SPARK_ATLAS_W, SPARK_H);
+        $this->spark0 = makeSparkAtlas($device, 'overlay-spark-0');
+        $this->spark1 = makeSparkAtlas($device, 'overlay-spark-1');
         $this->loaded = true;
         return .ok;
     }
@@ -66,41 +94,22 @@ public class Overlay
 
     public function pass(Pipeline $pipeline, TargetRef $target, Sample $sample) : void
     {
+        array<HudRow> $hud = formatRows($sample);
+        array<string> $extra = $this->rows;
+        $this->rows->clear();
+        $this->pushRows($hud);
+
         if (!$this->enabled || !$this->loaded) {
-            $this->rows->clear();
             return;
         }
 
-        array<string> $lines = array<string>();
-        $lines[] = formatLine($sample);
-        array<Gauge> $gauges = $sample->gauges;
-
-        foreach ($gauges as $g) {
-            $lines[] = formatGauge($g);
-        }
-
-        array<string> $extra = $this->rows;
-
-        foreach ($extra as $line) {
-            $lines[] = $line;
-        }
-
-        $this->rows->clear();
+        array<HudRow> $drawn = $hud;
+        array<string> $below = $extra;
+        array<SparkSlot> $slots = $this->measureSlots($target, $drawn);
         $this->vg->pass($pipeline, $target, function(Canvas $vg) : void {
-            guard $vg->fontFace('debug') else {
-                return;
-            }
-            $vg->fontSize(14.0f);
-            $vg->textAlign(TextAlign(.left, .top));
-            $vg->fillColor(Color(1.0f, 1.0f, 1.0f, 1.0f));
-            float32 $y = 10.0f;
-            array<string> $drawn = $lines;
-
-            foreach ($drawn as $line) {
-                $vg->text(Vec2(10.0f, $y), $line);
-                $y = $y + 18.0f;
-            }
+            paintHud($vg, $drawn, $below, $slots);
         });
+        $this->stampSpark($pipeline, $target, $slots);
     }
 
     public function destroy() : void
@@ -111,6 +120,336 @@ public class Overlay
 
         $this->dead = true;
         $this->loaded = false;
+        $this->dropSpark();
+        $this->nearest = null;
+        $this->blit->destroy();
         $this->vg->destroy();
     }
+
+    private function pushRows(const array<HudRow>& $hud) : void
+    {
+        foreach ($hud as $row) {
+            if (!$row->spark) {
+                continue;
+            }
+
+            string $key = $row->key;
+
+            if (!$this->rings->has($key)) {
+                $this->rings[$key] = array<float32>();
+            }
+
+            array<float32>& $ring = $this->rings->at($key);
+            pushSpark($ring, $row->value, SPARK_W);
+        }
+    }
+
+    private function measureSlots(TargetRef $target, const array<HudRow>& $hud) : array<SparkSlot>
+    {
+        array<SparkSlot> $slots = array<SparkSlot>();
+        Canvas $vg = $this->vg->canvas;
+        float32 $scale = $target->contentScaleX;
+
+        if ($scale < 0.0001f) {
+            $scale = 1.0f;
+        }
+
+        float32 $pw = ($target->width as float32) / $scale;
+        float32 $ph = ($target->height as float32) / $scale;
+        $vg->begin($pw, $ph, $scale);
+        guard $vg->fontFace('debug') else {
+            $vg->cancel();
+            return $slots;
+        }
+        $vg->fontSize(14.0f);
+        $vg->textAlign(TextAlign(.left, .top));
+        float32 $sepW = $vg->textAdvance(Vec2(HUD_X, HUD_Y), HUD_SEP);
+        float32 $x = HUD_X;
+        usize $i = 0;
+        usize $n = $hud->count();
+
+        while ($i < $n) {
+            HudRow $row = $hud[$i];
+            float32 $tw = $vg->textAdvance(Vec2(HUD_X, HUD_Y), $row->text);
+
+            if ($row->spark) {
+                $slots[] = SparkSlot($row->key, $x, $tw, $tw, $row->higherWorse);
+            }
+
+            $x = $x + $tw;
+
+            if ($i + 1 < $n) {
+                $x = $x + $sepW;
+            }
+
+            $i = $i + 1;
+        }
+
+        $vg->cancel();
+        return $slots;
+    }
+
+    private function stampSpark(
+        Pipeline $pipeline,
+        TargetRef $target,
+        const array<SparkSlot>& $slots
+    ) : void
+    {
+        if ($slots->empty()) {
+            return;
+        }
+
+        Texture $tex = guard $this->sparkTex() else {
+            return;
+        }
+        Sampler $samp = guard $this->nearest else {
+            return;
+        }
+        clearSpark($this->pixels);
+
+        foreach ($slots as $slot) {
+            if (!$this->rings->has($slot->key)) {
+                continue;
+            }
+
+            int32 $x0 = sparkRound($slot->x - HUD_X);
+            int32 $dw = sparkRound($slot->w);
+
+            if ($dw < 1) {
+                continue;
+            }
+
+            array<float32> $ring = $this->rings[$slot->key];
+            rasterizeSpark(
+                $this->pixels,
+                $ring,
+                SPARK_ATLAS_W,
+                SPARK_H,
+                0,
+                $slot->higherWorse,
+                false,
+                $x0,
+                $dw,
+            );
+        }
+
+        usize $n = $this->pixels->count();
+
+        if ($n == 0) {
+            return;
+        }
+
+        int32 $stripW = sparkStripWidth($slots);
+        int32 $stripH = SPARK_H;
+        float32 $sx = $target->contentScaleX;
+        float32 $sy = $target->contentScaleY;
+
+        if ($sx < 0.0001f) {
+            $sx = 1.0f;
+        }
+
+        if ($sy < 0.0001f) {
+            $sy = 1.0f;
+        }
+
+        Vec2 $origin = sparkStripOrigin();
+        int32 $capW = sparkRound(($target->width as float32) / $sx - $origin->x);
+        int32 $capH = sparkRound(($target->height as float32) / $sy - $origin->y);
+
+        if ($capW < 1 || $capH < 1) {
+            return;
+        }
+
+        if ($stripW > $capW) {
+            $stripW = $capW;
+        }
+
+        if ($stripH > $capH) {
+            $stripH = $capH;
+        }
+
+        if ($stripW > SPARK_ATLAS_W) {
+            $stripW = SPARK_ATLAS_W;
+        }
+
+        if ($stripW < 1 || $stripH < 1) {
+            return;
+        }
+
+        $tex->upload(0, $this->pixels->data(), $n as uint64, SPARK_ATLAS_W * 4);
+        $this->blit->stamp(
+            $pipeline,
+            $target,
+            $tex,
+            $samp,
+            $origin,
+            Vec2($stripW as float32, $stripH as float32),
+            Vec2(
+                ($stripW as float32) / (SPARK_ATLAS_W as float32),
+                ($stripH as float32) / (SPARK_H as float32),
+            ),
+        );
+    }
+
+    private function sparkTex() : Texture?
+    {
+        uint32 $slot = $this->vg->canvas->device->frameSlot() % 2;
+
+        if ($slot == 0) {
+            return $this->spark0;
+        }
+
+        return $this->spark1;
+    }
+
+    private function dropSpark() : void
+    {
+        Texture? $a = $this->spark0;
+
+        if ($a != null) {
+            Texture $tex = guard $a;
+            $tex->destroy();
+            $this->spark0 = null;
+        }
+
+        Texture? $b = $this->spark1;
+
+        if ($b != null) {
+            Texture $tex = guard $b;
+            $tex->destroy();
+            $this->spark1 = null;
+        }
+
+        $this->pixels = array<uint8>();
+    }
+}
+
+internal function makeSparkAtlas(Device $device, string $name) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .rgba8, $width: SPARK_ATLAS_W, $height: SPARK_H);
+    $desc->label = $name;
+    return Texture($device, $name, $desc);
+}
+
+internal function sparkStripWidth(const array<SparkSlot>& $slots) : int32
+{
+    float32 $right = HUD_X;
+
+    foreach ($slots as $slot) {
+        float32 $end = $slot->x + $slot->colW;
+
+        if ($end > $right) {
+            $right = $end;
+        }
+    }
+
+    int32 $w = sparkRound($right - HUD_X);
+
+    if ($w < 1) {
+        return 0;
+    }
+
+    return $w;
+}
+
+internal function paintHud(
+    Canvas $vg,
+    const array<HudRow>& $lines,
+    const array<string>& $extra,
+    const array<SparkSlot>& $slots
+) : void
+{
+    guard $vg->fontFace('debug') else {
+        return;
+    }
+    $vg->fontSize(14.0f);
+    $vg->textAlign(TextAlign(.left, .top));
+    float32 $x = HUD_X;
+    float32 $y = HUD_Y;
+    float32 $lh = HUD_LH;
+    float32 $pad = HUD_PAD;
+    AABB2D $box = AABB2D(Vec2($x, $y), Vec2($x, $y));
+    bool $any = false;
+    string $line = hudJoin($lines);
+    float32 $lineW = $vg->textAdvance(Vec2($x, $y), $line);
+    AABB2D $cell = AABB2D(Vec2($x, $y), Vec2($x + $lineW, $y + $lh));
+    $box = hudExtend($box, $cell, $any);
+    $any = true;
+
+    int32 $atlasW = sparkStripWidth($slots);
+
+    if ($atlasW > 0) {
+        Vec2 $sparkPos = sparkStripOrigin();
+        AABB2D $chart = AABB2D(
+            $sparkPos,
+            $sparkPos + Vec2($atlasW as float32, SPARK_H as float32),
+        );
+        $box = hudExtend($box, $chart, $any);
+        $any = true;
+    }
+
+    float32 $ey = $y + $lh;
+
+    if ($atlasW > 0) {
+        $ey = $ey + SPARK_GAP + (SPARK_H as float32) + SPARK_GAP;
+    }
+
+    foreach ($extra as $more) {
+        $eb = $vg->textBounds(Vec2($x, $ey), $more);
+        $box = hudExtend($box, $eb, $any);
+        $any = true;
+        $ey = $ey + $lh;
+    }
+
+    if ($any && $box->width() > 0.0f && $box->height() > 0.0f) {
+        Vec2 $padV = Vec2($pad, $pad);
+        $vg->fillColor(Color(0.08f, 0.08f, 0.10f, 0.78f));
+        $vg->fillRounded(
+            $box->min - $padV,
+            Vec2($box->width(), $box->height()) + $padV * 2.0f,
+            4.0f,
+        );
+    }
+
+    $vg->fillColor(Color::white());
+    $vg->text(Vec2($x, $y), $line);
+
+    $ey = $y + $lh;
+
+    if ($atlasW > 0) {
+        $ey = $ey + SPARK_GAP + (SPARK_H as float32) + SPARK_GAP;
+    }
+
+    foreach ($extra as $more) {
+        $vg->text(Vec2($x, $ey), $more);
+        $ey = $ey + $lh;
+    }
+}
+
+internal function hudJoin(const array<HudRow>& $rows) : string
+{
+    string $out = '';
+    bool $first = true;
+
+    foreach ($rows as $row) {
+        if ($first) {
+            $out = $row->text;
+            $first = false;
+        } else {
+            $out->append(HUD_SEP);
+            $out->append($row->text);
+        }
+    }
+
+    return $out;
+}
+
+internal function hudExtend(AABB2D $box, const AABB2D& $b, bool $any) : AABB2D
+{
+    if (!$any) {
+        return $b;
+    }
+
+    $box->extend($b);
+    return $box;
 }

@@ -1,0 +1,135 @@
+/**
+ * Dest-rect blit of an owned texture. Graph identity is the
+ * target write; the texture is not a pool TextureRef.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec2;
+
+public class StampPass : Pass
+{
+    private ShaderProgram $program;
+    private TargetRef $target;
+    private Texture $texture;
+    private Sampler $sampler;
+    private Vec2 $pos;
+    private Vec2 $size;
+    private Vec2 $uv;
+
+    public constructor(
+        ShaderProgram $program,
+        TargetRef $target,
+        Texture $texture,
+        Sampler $sampler,
+        Vec2 $pos,
+        Vec2 $size,
+        Vec2 $uv
+    )
+    {
+        $this->program = $program;
+        $this->target = $target;
+        $this->texture = $texture;
+        $this->sampler = $sampler;
+        $this->pos = $pos;
+        $this->size = $size;
+        $this->uv = $uv;
+    }
+
+    public function name() : string
+    {
+        return 'StampPass';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        $io->writes($this->target);
+    }
+
+    public function execute(Context $ctx) : status<PipelineError>
+    {
+        RenderTarget $rt = guard $ctx->pool->getTarget($this->target) else ($e) {
+            return .error(.pool($e));
+        }
+        float32 $sx = $rt->contentScaleX;
+        float32 $sy = $rt->contentScaleY;
+
+        if ($sx < 0.0001f) {
+            $sx = 1.0f;
+        }
+
+        if ($sy < 0.0001f) {
+            $sy = 1.0f;
+        }
+
+        int32 $x = stampPx($this->pos->x * $sx);
+        int32 $y = stampPx($this->pos->y * $sy);
+        int32 $w = stampPx($this->size->x * $sx);
+        int32 $h = stampPx($this->size->y * $sy);
+        GpuScissor $vp = clampScissor($x, $y, $w, $h, $rt->width, $rt->height);
+
+        if ($vp->w < 1 || $vp->h < 1) {
+            return .ok;
+        }
+
+        float32 $u1 = stampUv($this->uv->x);
+        float32 $v1 = stampUv($this->uv->y);
+
+        if ($u1 < 0.0001f || $v1 < 0.0001f) {
+            return .ok;
+        }
+
+        RenderEncoder $enc = guard $ctx->beginRender($this->target) else ($e) {
+            return .error($e);
+        }
+        Raster $raster = Raster();
+        $raster->blend = .alpha;
+        $raster->depthTest = false;
+        $raster->depthWrite = false;
+        GpuPass $pass = GpuPass($this->program, VertexLayout::pos3uv2(), $raster);
+        $pass->bind($enc);
+        $enc->setViewport($vp->x, $vp->y, $vp->w, $vp->h);
+        $enc->setScissor($vp->x, $vp->y, $vp->w, $vp->h);
+        $enc->bindTexture(0, $this->texture, $this->sampler);
+        stampQuad($ctx->device, $enc, $u1, $v1);
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+internal function stampPx(float32 $v) : int32
+{
+    return std::math::floor($v + 0.5f) as int32;
+}
+
+internal function stampUv(float32 $v) : float32
+{
+    if ($v < 0.0f) {
+        return 0.0f;
+    }
+
+    if ($v > 1.0f) {
+        return 1.0f;
+    }
+
+    return $v;
+}
+
+internal function stampQuad(Device $device, RenderEncoder $enc, float32 $u1, float32 $v1) : void
+{
+    float32 $v0 = 1.0f - $v1;
+    array<float32> $verts = [
+        -1.0f, 1.0f, 0.0f, 0.0f, 1.0f,
+        -1.0f, -1.0f, 0.0f, 0.0f, $v0,
+        1.0f, 1.0f, 0.0f, $u1, 1.0f,
+        1.0f, -1.0f, 0.0f, $u1, $v0,
+        1.0f, 1.0f, 0.0f, $u1, 1.0f,
+        -1.0f, -1.0f, 0.0f, 0.0f, $v0
+    ];
+    usize $n = $verts->count();
+    uint64 $bytes = ($n as uint64) * (mem::size<float32>() as uint64);
+    TransientSlice $vs = $device->allocTransient($bytes, 4);
+    mem::copy<float32>(ptr<float32>($vs->data:$), $verts->data(), $n);
+    $enc->setVertexTransient(0, $vs);
+    $enc->draw(0, 6);
+}

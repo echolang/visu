@@ -1,6 +1,7 @@
 /**
- * Overlay line helpers. Shared with tests so the HUD string
- * is checked without a GPU.
+ * Overlay line helpers. Numbers are padded to a fixed width so
+ * the HUD does not jump when FPS, units, or byte sizes change.
+ * Shared with tests so the string is checked without a GPU.
  */
 
 namespace visu::instrument;
@@ -11,47 +12,45 @@ public function formatNs(float64 $ns) : string
         $ns = 0.0;
     }
 
-    if ($ns < 1000.0) {
-        return "{$ns:.2f} ns";
+    // 2-decimal round-up to 1000.00 needs the next unit
+    if ($ns < 999.995) {
+        return formatDuration($ns, 'ns');
     }
 
-    if ($ns < 1000000.0) {
-        float64 $us = $ns / 1000.0;
-        return "{$us:.2f} us";
+    if ($ns < 999995.0) {
+        return formatDuration($ns / 1000.0, 'us');
     }
 
-    if ($ns < 1000000000.0) {
-        float64 $ms = $ns / 1000000.0;
-        return "{$ms:.2f} ms";
+    if ($ns < 999995000.0) {
+        return formatDuration($ns / 1000000.0, 'ms');
     }
 
-    float64 $secs = $ns / 1000000000.0;
-    return "{$secs:.2f} s";
+    return formatDuration($ns / 1000000000.0, 's');
 }
 
 public function formatBytes(uint64 $n) : string
 {
     if ($n < 1024 as uint64) {
-        return "{$n} B";
+        string $unit = 'B';
+        return "{$n:>6} {$unit:<3}";
     }
 
     float64 $kib = ($n as float64) / 1024.0;
 
     if ($n < 1048576 as uint64) {
-        return "{$kib:.1f} KiB";
+        return formatSize($kib, 'KiB');
     }
 
     float64 $mib = $kib / 1024.0;
 
     if ($n < 1073741824 as uint64) {
-        return "{$mib:.1f} MiB";
+        return formatSize($mib, 'MiB');
     }
 
-    float64 $gib = $mib / 1024.0;
-    return "{$gib:.1f} GiB";
+    return formatSize($mib / 1024.0, 'GiB');
 }
 
-public function formatLine(const Sample& $sample) : string
+public function formatRows(const Sample& $sample) : array<HudRow>
 {
     float64 $fpsRaw = $sample->loop->fps;
 
@@ -64,8 +63,47 @@ public function formatLine(const Sample& $sample) : string
     float64 $tc = $sample->loop->tickCount;
     string $ut = formatNs($sample->loop->tickNs);
     string $ft = formatNs($sample->loop->frameNs);
+    string $rt = formatNs($sample->loop->renderNs);
     string $vram = formatVram($sample->memory->used, $sample->memory->budget);
-    return "FPS: {$fps} | TC: {$tc:.2f} | UT: {$ut} | FT: {$ft} | VRAM: {$vram}";
+    array<HudRow> $rows = array<HudRow>();
+    $rows[] = HudRow("FPS: {$fps:>4}", 'fps', $fpsRaw as float32, true, false);
+    $rows[] = HudRow("TC: {$tc:>5.2f}", 'tc', $tc as float32, true, true);
+    $rows[] = HudRow("UT: {$ut}", 'ut', $sample->loop->tickNs as float32, true, true);
+    $rows[] = HudRow("FT: {$ft}", 'ft', $sample->loop->frameNs as float32, true, true);
+    $rows[] = HudRow("RT: {$rt}", 'rt', $sample->loop->renderNs as float32, true, true);
+    $rows[] = HudRow("VRAM: {$vram}", 'vram', $sample->memory->used as float32, true, true);
+    array<Gauge> $gauges = $sample->gauges;
+
+    foreach ($gauges as $g) {
+        $rows[] = HudRow(
+            formatGauge($g),
+            $g->name,
+            $g->value as float32,
+            true,
+            $g->unit != Unit::fps,
+        );
+    }
+
+    return $rows;
+}
+
+public function formatLine(const Sample& $sample) : string
+{
+    array<HudRow> $rows = formatRows($sample);
+    string $out = '';
+    bool $first = true;
+
+    foreach ($rows as $row) {
+        if ($first) {
+            $out = $row->text;
+            $first = false;
+        } else {
+            $out->append(HUD_SEP);
+            $out->append($row->text);
+        }
+    }
+
+    return $out;
 }
 
 public function formatGauge(const Gauge& $g) : string
@@ -96,10 +134,20 @@ internal function formatWhole(float64 $n) : string
 {
     float64 $round = $n + 0.5;
     int32 $v = $round as int32;
-    return "{$v}";
+    return "{$v:>4}";
 }
 
 internal function formatRatio(float64 $n) : string
 {
-    return "{$n:.2f}";
+    return "{$n:>5.2f}";
+}
+
+internal function formatDuration(float64 $v, string $unit) : string
+{
+    return "{$v:>6.2f} {$unit:<2}";
+}
+
+internal function formatSize(float64 $v, string $unit) : string
+{
+    return "{$v:>6.1f} {$unit:<3}";
 }

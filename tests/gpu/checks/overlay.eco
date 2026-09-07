@@ -1,0 +1,105 @@
+/**
+ * Instrument overlay panel is dark on a white clear, so a
+ * light FlyUI scene still shows the HUD.
+ */
+
+use visu::graphics::{
+    AdapterInfo, ClearPass, ClearPassOptions, MemoryStats, Pipeline, TargetRef,
+    Texture, TextureOptions, TextureRef
+};
+use visu::instrument::{Gauge, LoopStats, Overlay, Sample};
+use visu::math::Vec4;
+
+internal const int32 HUD_DUMP_W = 1024;
+internal const int32 HUD_DUMP_H = 96;
+
+public function checkOverlay(GpuContext $gpu) : void
+{
+    Overlay $overlay = Overlay($gpu->device);
+    guard $overlay->load() else ($e) {
+        $overlay->destroy();
+        die($e->message());
+    }
+
+    LoopStats $loop = LoopStats();
+    $loop->fps = 60.0;
+    $loop->tickCount = 1.0;
+    $loop->tickNs = 120000.0;
+    $loop->frameNs = 16670000.0;
+    $loop->renderNs = 2500000.0;
+    MemoryStats $mem = MemoryStats();
+    $mem->used = 1572864;
+    $mem->budget = 17179869184;
+    Sample $sample = Sample($loop, $mem, AdapterInfo(), array<Gauge>());
+    // two frames so the sparkline ring has a dt and stamp runs
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = overlayTarget($p);
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(1.0f, 1.0f, 1.0f, 1.0f))));
+        $overlay->pass($p, $t, $sample);
+    });
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = overlayTarget($p);
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(1.0f, 1.0f, 1.0f, 1.0f))));
+        $overlay->pass($p, $t, $sample);
+    });
+
+    TextureRef $ref = TextureRef(
+        'overlay.attachment.color_color',
+        HUD_DUMP_W,
+        HUD_DUMP_H,
+        TextureOptions(),
+    );
+    Texture $tex = guard $gpu->pool->getTexture($ref) else ($e) {
+        $overlay->destroy();
+        die($e->message());
+    }
+    guard $tex->dump('var/hud.png') else ($e) {
+        $overlay->destroy();
+        die($e->message());
+    }
+    array<uint8> $pixels = $gpu->readOffscreen('overlay', HUD_DUMP_W, HUD_DUMP_H);
+    $overlay->destroy();
+    uint8 $min = 255;
+    usize $i = 0;
+    usize $n = $pixels->count();
+
+    while ($i + 2 < $n) {
+        uint8 $r = $pixels[$i];
+        uint8 $g = $pixels[$i + 1];
+        uint8 $b = $pixels[$i + 2];
+        uint8 $v = $r;
+
+        if ($g < $v) {
+            $v = $g;
+        }
+
+        if ($b < $v) {
+            $v = $b;
+        }
+
+        if ($v < $min) {
+            $min = $v;
+        }
+
+        $i = $i + 4;
+    }
+
+    assert($min < 80, 'overlay panel');
+}
+
+internal function overlayTarget(Pipeline $pipeline) : TargetRef
+{
+    TargetRef $t = $pipeline->createTarget('overlay', HUD_DUMP_W, HUD_DUMP_H);
+    $pipeline->createColor($t, 'color', TextureOptions());
+    return $t;
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_overlay_panel
+{
+    GpuContext $gpu = gpuHidden('overlay');
+    checkOverlay($gpu);
+    $gpu->end();
+}
+#[end]

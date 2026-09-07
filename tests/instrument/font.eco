@@ -1,0 +1,32 @@
+/**
+ * Embedded debug TTF parses without a GPU.
+ */
+
+use visu::graphics::Device;
+use visu::math::Vec2;
+use visu::vg::Canvas;
+
+test debug_font_bytes_load
+{
+    Device $device = Device();
+    Canvas $vg = Canvas($device);
+    $vg->begin(400.0f, 100.0f, 1.0f);
+    string $bytes = visu::instrument::debugFontBytes();
+    assert($bytes->size() > 1000, 'embedded ttf');
+    guard $vg->createFont(name: 'debug', bytes: $bytes) else {
+        assert(false, 'parse');
+        return;
+    }
+    guard $vg->fontFace('debug') else {
+        assert(false, 'face');
+        return;
+    }
+    $vg->fontSize(14.0f);
+    $b = $vg->textBounds(Vec2(0.0f, 0.0f), 'FPS: 60');
+    assert($b->width() > 20.0f, 'width');
+    float32 $ink = $vg->textBounds(Vec2(0.0f, 0.0f), ' | ')->width();
+    float32 $adv = $vg->textAdvance(Vec2(0.0f, 0.0f), ' | ');
+    assert($adv > $ink, 'sep spaces');
+    $vg->destroy();
+    $device->shutdown();
+}
