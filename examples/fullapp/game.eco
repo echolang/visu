@@ -1,0 +1,113 @@
+/**
+ * Class-based app the GameLoop drives. Owns a Host and a Director.
+ * Not Quickstart: scenes take the Host, not this type.
+ */
+
+use visu::app::{Host, HostConfig, HostError, Services};
+use visu::graphics::{Context, TargetRef};
+use visu::instrument::{DeviceSource, LoopSource};
+use visu::math::Vec4;
+use visu::os::{ActionMap, Binding, InputError, key};
+use visu::runtime::{Delegate, GameLoop};
+use visu::scene::Director;
+use visu::ui::Ui;
+
+public class Game : Delegate
+{
+    public Host $host;
+    public Director $director;
+    public GameLoop $loop;
+
+    public constructor(Services $services)
+    {
+        HostConfig $cfg = HostConfig();
+        $cfg->title = 'visu fullapp';
+        $cfg->width = 1280;
+        $cfg->height = 720;
+        $cfg->vsync = true;
+        $cfg->ui = true;
+        $cfg->debugConsole = true;
+        $cfg->clearColor = Vec4(0.08f, 0.09f, 0.12f, 1.0f);
+        $this->host = Host($cfg, $services);
+        $this->loop = GameLoop($this);
+        $this->host->instruments->add(LoopSource($this->loop));
+        $this->host->instruments->add(DeviceSource($this->host->device));
+        guard $this->bindMaps() else ($e) {
+            die($e->message());
+        }
+        $this->director = Director(Menu($this->host));
+    }
+
+    public function initialize() : status<HostError>
+    {
+        return $this->host->initialize();
+    }
+
+    public function start() : void
+    {
+        $this->director->listen($this->host->dispatcher);
+        $this->director->load();
+        $this->loop->start();
+    }
+
+    public function update() : void
+    {
+        $this->host->poll();
+        $this->director->update();
+    }
+
+    public function render(float32 $compensation) : void
+    {
+        Director $director = $this->director;
+        Host $host = $this->host;
+        $host->renderFrame(
+            $compensation,
+            function(Context $ctx, TargetRef $target) : void {
+                $director->render($ctx);
+            },
+            function(Ui $ui) : void {
+                $director->ui($ui);
+            },
+            function() : void {
+                if ($director->pending()) {
+                    $host->device->waitIdle();
+                    $director->apply();
+                }
+            }
+        );
+    }
+
+    public function shouldStop() : bool
+    {
+        return $this->host->shouldStop();
+    }
+
+    public function destroy() : void
+    {
+        $this->host->device->waitIdle();
+        $this->director->unload();
+        $this->host->destroy();
+    }
+
+    private function bindMaps() : status<InputError>
+    {
+        ActionMap $menu = ActionMap();
+        guard $menu->bind('quit', Binding::key(key::ESCAPE)) else ($e) {
+            return .error($e);
+        }
+        ActionMap $play = ActionMap();
+        guard $play->bind('menu', Binding::key(key::ESCAPE)) else ($e) {
+            return .error($e);
+        }
+        guard $play->bind('reload', Binding::key(key::F5)) else ($e) {
+            return .error($e);
+        }
+        guard $this->host->inputContext->register('menu', $menu) else ($e) {
+            return .error($e);
+        }
+        guard $this->host->inputContext->register('play', $play) else ($e) {
+            return .error($e);
+        }
+        return $this->host->inputContext->switch('menu');
+    }
+}

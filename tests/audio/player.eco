@@ -1,0 +1,347 @@
+/**
+ * MusicPlayer playlist, load, play, and EventLoop cross-fade.
+ * Offline engine — no playback device.
+ */
+
+use std::env;
+use visu::audio::{MusicPlayer, PlayerError, Track};
+use visu::runtime::{EventLoop, registerMain, unregisterMain};
+
+internal function offlineEngine() : ma::Engine
+{
+    ma::EngineConfig $cfg = ma::EngineConfig($noDevice: true, $channels: 2, $sampleRate: 48000);
+    ma::Engine $engine = guard ma::Engine::create($cfg) else ($e) {
+        die("{$e}");
+    }
+
+    return $engine;
+}
+
+internal function audioDir() : string
+{
+    string $ds = env::DS;
+    return "tests{$ds}audio{$ds}resources";
+}
+
+internal function sinePath() : string
+{
+    string $ds = env::DS;
+    string $dir = audioDir();
+    return "{$dir}{$ds}sine.wav";
+}
+
+internal function clickPath() : string
+{
+    string $ds = env::DS;
+    string $dir = audioDir();
+    return "{$dir}{$ds}click.wav";
+}
+
+internal class AudioCase
+{
+    public EventLoop $loop;
+    public ma::Engine $engine;
+    public MusicPlayer $player;
+
+    public constructor()
+    {
+        $this->loop = EventLoop();
+        registerMain($this->loop);
+        $this->loop->tickAt(0);
+        $this->engine = offlineEngine();
+        $this->player = MusicPlayer($this->engine);
+    }
+
+    public function done() : void
+    {
+        unregisterMain();
+    }
+}
+
+internal function energyOf(const array<float32>& $frames) : float32
+{
+    float32 $energy = 0.0f;
+    usize $i = 0;
+
+    while ($i < $frames->count()) {
+        float32 $s = $frames[$i];
+        $energy = $energy + ($s * $s);
+        $i = $i + 1;
+    }
+
+    return $energy;
+}
+
+test register_then_has
+{
+    AudioCase $c = AudioCase();
+    guard $c->player->register('theme', Track(sinePath())) else ($e) {
+        die($e->message());
+    }
+    assert($c->player->has('theme'), 'has');
+    array<string> $names = $c->player->names();
+    assert($names->count() == 1, 'one name');
+    $c->done();
+}
+
+test register_missing_file
+{
+    AudioCase $c = AudioCase();
+    status<PlayerError> $r = $c->player->register('gone', Track('tests/audio/resources/no-such.wav'));
+    assert($r->failed(), 'failed');
+    PlayerError $e = $r->failure();
+    match ($e) {
+        PlayerError::missingFile($path) => {
+            assert($path->contains('no-such.wav'), 'path');
+        },
+        else => {
+            assert(false, 'expected missingFile');
+        },
+    }
+    $c->done();
+}
+
+test register_duplicate
+{
+    AudioCase $c = AudioCase();
+    guard $c->player->register('theme', Track(sinePath())) else ($e) {
+        die($e->message());
+    }
+    status<PlayerError> $r = $c->player->register('theme', Track(clickPath()));
+    assert($r->failed(), 'failed');
+    PlayerError $e = $r->failure();
+    match ($e) {
+        PlayerError::duplicate($name) => {
+            assert($name->equals('theme'), 'name');
+        },
+        else => {
+            assert(false, 'expected duplicate');
+        },
+    }
+    $c->done();
+}
+
+test add_names_from_stem
+{
+    AudioCase $c = AudioCase();
+    Track $track = guard $c->player->add(sinePath()) else ($e) {
+        die($e->message());
+    }
+    assert($c->player->has('sine'), 'stem');
+    assert($track->path->ends('sine.wav'), 'path');
+    $c->done();
+}
+
+test add_names_relative_to_base
+{
+    AudioCase $c = AudioCase();
+    string $ds = env::DS;
+    string $base = "tests{$ds}audio";
+    guard $c->player->add(sinePath(), $base) else ($e) {
+        die($e->message());
+    }
+    assert($c->player->has("resources{$ds}sine"), 'relative');
+    $c->done();
+}
+
+test scan_directory_returns_both
+{
+    AudioCase $c = AudioCase();
+    array<Track> $added = guard $c->player->scan(audioDir()) else ($e) {
+        die($e->message());
+    }
+    assert($added->count() == 2, 'two tracks');
+    assert($c->player->has('sine'), 'sine');
+    assert($c->player->has('click'), 'click');
+    $c->done();
+}
+
+test scan_not_directory
+{
+    AudioCase $c = AudioCase();
+    result<array<Track>, PlayerError> $r = $c->player->scan(sinePath());
+    assert($r->failed(), 'failed');
+    PlayerError $e = $r->failure();
+    match ($e) {
+        PlayerError::notDirectory($path) => {
+            assert($path->contains('sine.wav'), 'path');
+        },
+        else => {
+            assert(false, 'expected notDirectory');
+        },
+    }
+    $c->done();
+}
+
+test play_unknown_is_missing
+{
+    AudioCase $c = AudioCase();
+    status<PlayerError> $r = $c->player->play('nope');
+    assert($r->failed(), 'failed');
+    PlayerError $e = $r->failure();
+    match ($e) {
+        PlayerError::missing($name) => {
+            assert($name->equals('nope'), 'name');
+        },
+        else => {
+            assert(false, 'expected missing');
+        },
+    }
+    $c->done();
+}
+
+test play_starts_and_read_has_energy
+{
+    AudioCase $c = AudioCase();
+    guard $c->player->add(sinePath()) else ($e) {
+        die($e->message());
+    }
+    guard $c->player->play('sine') else ($e) {
+        die($e->message());
+    }
+    Track $cur = guard $c->player->current() else {
+        die('current');
+    }
+    ma::Sound $sound = guard $cur->sound else {
+        die('sound');
+    }
+    assert($sound->isPlaying(), 'playing');
+
+    array<float32> $frames = guard $c->engine->read(1024) else ($e) {
+        die("{$e}");
+    }
+    assert($frames->count() == 2048, 'stereo');
+    assert(energyOf($frames) > 0.0f, 'energy');
+    $c->done();
+}
+
+test switch_to_with_no_current_plays
+{
+    AudioCase $c = AudioCase();
+    guard $c->player->add(sinePath()) else ($e) {
+        die($e->message());
+    }
+    guard $c->player->switchTo('sine') else ($e) {
+        die($e->message());
+    }
+    Track $cur = guard $c->player->current() else {
+        die('current');
+    }
+    assert($cur->path->ends('sine.wav'), 'played');
+    $c->done();
+}
+
+test switch_to_crossfade_promotes_after_defer
+{
+    AudioCase $c = AudioCase();
+    $c->player->fadeDuration = 0.5f;
+    guard $c->player->add(sinePath()) else ($e) {
+        die($e->message());
+    }
+    guard $c->player->add(clickPath()) else ($e) {
+        die($e->message());
+    }
+    guard $c->player->play('sine') else ($e) {
+        die($e->message());
+    }
+    guard $c->player->switchTo('click') else ($e) {
+        die($e->message());
+    }
+
+    Track $still = guard $c->player->current() else {
+        die('current');
+    }
+    assert($still->path->ends('sine.wav'), 'not yet');
+    $c->loop->tickAt(499);
+    Track $waiting = guard $c->player->current() else {
+        die('waiting');
+    }
+    assert($waiting->path->ends('sine.wav'), 'still sine');
+    $c->loop->tickAt(500);
+
+    Track $now = guard $c->player->current() else {
+        die('promoted');
+    }
+    assert($now->path->ends('click.wav'), 'click');
+    assert($still->sound == null, 'unloaded');
+    $c->done();
+}
+
+test switch_to_while_switching_is_ignored
+{
+    AudioCase $c = AudioCase();
+    $c->player->fadeDuration = 0.5f;
+    guard $c->player->add(sinePath()) else ($e) {
+        die($e->message());
+    }
+    guard $c->player->add(clickPath()) else ($e) {
+        die($e->message());
+    }
+    guard $c->player->play('sine') else ($e) {
+        die($e->message());
+    }
+    guard $c->player->switchTo('click') else ($e) {
+        die($e->message());
+    }
+    guard $c->player->switchTo('sine') else ($e) {
+        die($e->message());
+    }
+    $c->loop->tickAt(500);
+
+    Track $now = guard $c->player->current() else {
+        die('current');
+    }
+    assert($now->path->ends('click.wav'), 'stayed with first switch');
+    $c->done();
+}
+
+test switch_to_same_track_is_noop
+{
+    AudioCase $c = AudioCase();
+    $c->player->fadeDuration = 0.5f;
+    guard $c->player->add(sinePath()) else ($e) {
+        die($e->message());
+    }
+    guard $c->player->play('sine') else ($e) {
+        die($e->message());
+    }
+    guard $c->player->switchTo('sine') else ($e) {
+        die($e->message());
+    }
+    $c->loop->tickAt(500);
+
+    Track $now = guard $c->player->current() else {
+        die('current');
+    }
+    assert($now->path->ends('sine.wav'), 'still sine');
+    assert($now->sound != null, 'still loaded');
+    $c->done();
+}
+
+test play_during_switch_cancels_and_plays
+{
+    AudioCase $c = AudioCase();
+    $c->player->fadeDuration = 0.5f;
+    guard $c->player->add(sinePath()) else ($e) {
+        die($e->message());
+    }
+    guard $c->player->add(clickPath()) else ($e) {
+        die($e->message());
+    }
+    guard $c->player->play('sine') else ($e) {
+        die($e->message());
+    }
+    guard $c->player->switchTo('click') else ($e) {
+        die($e->message());
+    }
+    guard $c->player->play('sine') else ($e) {
+        die($e->message());
+    }
+    $c->loop->tickAt(500);
+
+    Track $now = guard $c->player->current() else {
+        die('current');
+    }
+    assert($now->path->ends('sine.wav'), 'play won');
+    $c->done();
+}

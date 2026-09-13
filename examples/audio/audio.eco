@@ -1,0 +1,76 @@
+/*
+ * Named playlist with a 0.5s cross-fade. Bundled sine → click.
+ *
+ *   echoc run -m examples --target audio
+ *   echoc run -m examples --target audio --define VISU_FINITE
+ */
+
+use std::env;
+use std::io;
+use visu::app::{Paths, Services, bootstrap};
+use visu::audio::MusicPlayer;
+use visu::math::Vec4;
+use visu::quickstart::{App, Options, Quickstart};
+use visu::runtime::defer;
+
+Quickstart $qs = Quickstart(function(Options $opt) : void
+{
+    $opt->windowTitle = 'visu audio';
+    $opt->windowWidth = 800;
+    $opt->windowHeight = 600;
+    $opt->clearColor = Vec4(0.08f, 0.08f, 0.1f, 1.0f);
+
+    $opt->services = bootstrap(Paths(root: exampleRoot()), function(Services $ctn) : void {
+    });
+
+    $opt->ready = function(App $app) : void {
+        ma::Engine $engine = guard ma::Engine::create() else ($e) {
+            die("{$e}");
+        }
+        MusicPlayer $player = $app->services->create<MusicPlayer, ma::Engine>($engine);
+        $player->fadeDuration = 0.5f;
+
+        Paths $paths = $app->services->get<Paths>();
+        string $ds = env::DS;
+        string $dir = $paths->resources;
+        guard $player->add("{$dir}{$ds}sine.wav") else ($e) {
+            die($e->message());
+        }
+        guard $player->add("{$dir}{$ds}click.wav") else ($e) {
+            die($e->message());
+        }
+        guard $player->play('sine') else ($e) {
+            die($e->message());
+        }
+
+        defer(1000, function() : void {
+            MusicPlayer $p = $app->services->get<MusicPlayer>();
+            guard $p->switchTo('click') else ($e) {
+                die($e->message());
+            }
+        });
+    };
+});
+$qs->run();
+
+internal function exampleRoot() : string
+{
+    if (fileExists('resources/sine.wav')) {
+        return env::cwd();
+    }
+
+    if (fileExists('audio/resources/sine.wav')) {
+        return 'audio';
+    }
+
+    return 'examples/audio';
+}
+
+internal function fileExists(string $path) : bool
+{
+    bool $here = guard io::exists($path) else {
+        return false;
+    }
+
+    return $here;
+}

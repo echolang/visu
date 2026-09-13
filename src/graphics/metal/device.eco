@@ -207,7 +207,15 @@ public class Device : DeviceProtocol
         }
 
         FrameSlot $slot = $this->slots[$this->slot];
-        $slot->gpuDone->wait($slot->epoch);
+        if ($slot->epoch > 0) {
+            bool $ready = $slot->gpuDone->waitUntilSignaledValue(
+                $slot->epoch,
+                timeoutMS: 1000000000
+            );
+            if (!$ready) {
+                return .error(.metal('beginFrame', 'gpu timeline wait timed out'));
+            }
+        }
         $slot->prev = null;
         return $this->acquireFrame($width, $height);
     }
@@ -223,7 +231,7 @@ public class Device : DeviceProtocol
             return .ok;
         }
         $slot->epoch = $slot->epoch + 1;
-        $cmd->signal($slot->gpuDone, $slot->epoch);
+        $cmd->encodeSignalEvent($slot->gpuDone, $slot->epoch);
         mtl::Drawable $drawable = guard $this->drawable else {
             $cmd->commit();
             $slot->prev = $cmd;
@@ -440,7 +448,8 @@ public class Device : DeviceProtocol
             $row as usize,
             $region,
             $mip as uint32,
-            slice: $layer as uint32
+            slice: $layer as uint32,
+            bytesPerImage: ($row as usize) * ($h as usize)
         );
         return .ok($pixels);
     }
@@ -472,8 +481,10 @@ public class Device : DeviceProtocol
         }
         $blit->copyFromTexture(
             $srcTex,
+            mtl::Origin(),
+            mtl::Size($src->desc->width as usize, $src->desc->height as usize),
             $dstTex,
-            mtl::Size($src->desc->width as usize, $src->desc->height as usize)
+            mtl::Origin()
         );
         $blit->endEncoding();
         $cmd->commit();
@@ -584,7 +595,14 @@ public class Device : DeviceProtocol
 
         mtl::Region $region = mtl::Region(mtl::Origin(), mtl::Size($w as usize, $h as usize));
         ptr<uint8> $p = ptr<uint8>($src:$);
-        $mt->replace($region, $p, $row as usize, $mip as uint32, slice: $layer as uint32);
+        $mt->replace(
+            $region,
+            $p,
+            $row as usize,
+            $mip as uint32,
+            slice: $layer as uint32,
+            bytesPerImage: ($row as usize) * ($h as usize)
+        );
         $texture->state = .shaderRead;
     }
 

@@ -1,0 +1,134 @@
+/**
+ * One live scene and an optional pending replacement. switch()
+ * queues; apply() runs after present (caller waitIdle()s first
+ * if the outgoing scene owns GPU objects). Never auto-ticks
+ * bound systems — the scene calls them in the order it wants.
+ */
+
+namespace visu::scene;
+
+use visu::app::info;
+use visu::graphics::Context;
+use visu::signal::{Dispatcher, Flow};
+use visu::ui::Ui;
+
+public class Director
+{
+    private Scene $current;
+    private Scene? $next;
+    private Dispatcher? $dispatcher;
+    private int32? $switchId;
+    private bool $loaded;
+
+    public constructor(Scene $initial)
+    {
+        $this->current = $initial;
+        $this->next = null;
+        $this->dispatcher = null;
+        $this->switchId = null;
+        $this->loaded = false;
+    }
+
+    destructor()
+    {
+        assert(!$this->loaded, 'Director dropped while loaded');
+        $this->silence();
+    }
+
+    public const function current() : Scene
+    {
+        return $this->current;
+    }
+
+    /**
+     * Dispatch of Switch queues a replacement. Safe to call
+     * once; a second call replaces the listener.
+     */
+    public function listen(Dispatcher $dispatcher) : void
+    {
+        $this->silence();
+        Director $director = $this;
+        $this->dispatcher = $dispatcher;
+        $this->switchId = $dispatcher->register<Switch>(function(const Switch& $signal) : Flow {
+            $director->switch($signal->next);
+            return .proceed;
+        });
+    }
+
+    public function switch(Scene $scene) : void
+    {
+        $this->next = $scene;
+    }
+
+    public const function pending() : bool
+    {
+        return $this->next != null;
+    }
+
+    public function load() : void
+    {
+        if ($this->loaded) {
+            return;
+        }
+
+        $this->current->load();
+        $this->loaded = true;
+        string $name = $this->current->name();
+        info("scene: {$name}");
+    }
+
+    public function update() : void
+    {
+        $this->current->update();
+    }
+
+    public function render(const Context& $ctx) : void
+    {
+        $this->current->render($ctx);
+    }
+
+    public function ui(Ui $ui) : void
+    {
+        $this->current->ui($ui);
+    }
+
+    /**
+     * Unload the live scene, adopt the queued one, load it.
+     * No-op when nothing is pending. Caller must not be in a
+     * recorded frame; waitIdle if the old scene holds GPU objects.
+     */
+    public function apply() : void
+    {
+        Scene $incoming = guard $this->next else {
+            return;
+        }
+        $this->next = null;
+        $this->unload();
+        $this->current = $incoming;
+        $this->load();
+    }
+
+    public function unload() : void
+    {
+        if (!$this->loaded) {
+            return;
+        }
+
+        $this->current->unload();
+        $this->loaded = false;
+    }
+
+    private function silence() : void
+    {
+        Dispatcher $dispatcher = guard $this->dispatcher else {
+            return;
+        }
+        int32 $id = guard $this->switchId else {
+            $this->dispatcher = null;
+            return;
+        }
+        $dispatcher->unregister<Switch>($id);
+        $this->switchId = null;
+        $this->dispatcher = null;
+    }
+}

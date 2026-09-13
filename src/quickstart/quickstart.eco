@@ -6,8 +6,7 @@
 namespace visu::quickstart;
 
 use std::env;
-use std::io;
-use visu::app::{Paths, Services, bootstrap};
+use visu::app::{HostError, Paths, Services, bootstrap};
 use visu::instrument::{DeviceSource, LoopSource};
 use visu::os::{init, terminate};
 use visu::runtime::{GameLoop, registerMain, unregisterMain};
@@ -46,8 +45,7 @@ public class Quickstart
 
     /**
      * glfwInit, initialize the window, ready(), run the loop, tear
-     * down. Dies on WindowError / AppError — this is the process
-     * edge.
+     * down. Dies on HostError — this is the process edge.
      */
     public function run() : void
     {
@@ -61,11 +59,10 @@ public class Quickstart
         }
 
         registerMain($this->app->events);
-        $this->loadShaders();
         $this->app->ready();
         $this->loop->start();
 
-        AppError $fail = $this->app->fail;
+        HostError $fail = $this->app->host->fail;
         $this->app->destroy();
         unregisterMain();
         terminate();
@@ -73,30 +70,5 @@ public class Quickstart
         if ($fail->failed()) {
             die($fail->message());
         }
-    }
-
-    private function loadShaders() : void
-    {
-        string $dir = $this->app->shaders->loader->directory;
-        bool $here = guard io::exists($dir) else ($e) {
-            $this->teardown();
-            die($e->message());
-        }
-
-        if (!$here) {
-            return;
-        }
-
-        guard $this->app->shaders->scan() else ($e) {
-            $this->teardown();
-            die($e->message());
-        }
-    }
-
-    private function teardown() : void
-    {
-        $this->app->destroy();
-        unregisterMain();
-        terminate();
     }
 }

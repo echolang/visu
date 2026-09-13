@@ -1,31 +1,29 @@
 /**
- * Prototyping app the GameLoop drives. Owns Device (class handle);
- * GPU objects store it. Scene goes to an offscreen target:
- * `$opt->render` adds graph passes, `$opt->draw` runs after
- * beginRender on that target, `$opt->ui` builds FlyUI during
- * graph setup, then a fullscreen blit to the backbuffer.
+ * Prototyping app the GameLoop drives. Owns a Host (window / GPU
+ * session); GPU objects store the Device. Scene goes to an
+ * offscreen target: `$opt->render` adds graph passes, `$opt->draw`
+ * runs after beginRender on that target, `$opt->ui` builds FlyUI
+ * during graph setup, then the host blits to the backbuffer.
  */
 
 namespace visu::quickstart;
 
-use std::env;
-use visu::app::{Paths, Services, info};
+use visu::app::{Host, HostConfig, HostError, HostPassData, Services};
 use visu::ecs::{Entities, Systems};
 use visu::graphics::{
-    Backbuffer, CallbackPass, ClearPass, ClearPassOptions, Context, Device,
-    DeviceError, Frame, FrameStatus, FullscreenTextureRenderer, IoSink,
-    Pipeline, PipelineError, Pool, RenderEncoder, RenderTarget,
-    SceneTarget, ShaderCollection, TargetRef, TextureOptions, TextureRef
+    CallbackPass, Context, Device, Frame, IoSink, Pipeline, PipelineError,
+    Pool, RenderEncoder, RenderTarget, ShaderCollection, TargetRef
 };
+use visu::instrument::Instruments;
 use visu::math::Vec2;
-use visu::os::{ContextMap, Input, Window, WindowError, WindowHints};
-use visu::instrument::{Instruments, Overlay, Sample};
+use visu::os::{ContextMap, Input, Window};
 use visu::runtime::{Delegate, EventLoop};
 use visu::signal::Dispatcher;
 use visu::ui::Ui;
 
 public class App : Delegate
 {
+    public Host $host;
     public Device $device;
     public Window $window;
     public Pool $pool;
@@ -40,55 +38,36 @@ public class App : Delegate
     public EventLoop $events;
     public Instruments $instruments;
     public Ui? $ui;
-    public int32 $frameIndex;
     public int32 $tickIndex;
-    public AppError $fail;
-    private FullscreenTextureRenderer $blit;
-    private Overlay? $overlay;
 
     public constructor(Options $options, Services $services)
     {
         $this->options = $options;
         $this->services = $services;
-        $this->device = Device();
-        $this->window = Window(
-            $options->windowTitle,
-            $options->windowWidth,
-            $options->windowHeight,
-            $this->hints($options)
-        );
-        $this->pool = Pool($this->device);
+        HostConfig $cfg = hostConfigFromOptions($options);
+        Host $host = Host($cfg, $services);
+        $this->host = $host;
+        $this->device = $host->device;
+        $this->window = $host->window;
+        $this->pool = $host->pool;
+        $this->dispatcher = $host->dispatcher;
+        $this->input = $host->input;
+        $this->inputContext = $host->inputContext;
+        $this->shaders = $host->shaders;
+        $this->events = $host->events;
+        $this->instruments = $host->instruments;
+        $this->ui = $host->ui;
         $this->entities = Entities();
         $this->systems = Systems();
-        $this->dispatcher = Dispatcher();
-        $this->input = Input($this->window, $this->dispatcher);
-        $this->inputContext = ContextMap($this->dispatcher, $this->input);
-        $this->window->setHandler($this->input);
-        $this->shaders = ShaderCollection($this->device, $this->shaderDir($services));
-        $this->events = EventLoop();
-        $this->instruments = Instruments();
-        $this->ui = null;
-        $this->frameIndex = 0;
         $this->tickIndex = 0;
-        $this->fail = .none;
-        $this->blit = FullscreenTextureRenderer();
-        $this->overlay = null;
     }
 
-    public function initialize() : status<WindowError>
+    public function initialize() : status<HostError>
     {
-        $this->window->setVsync($this->options->windowVsync);
-        guard $this->window->initialize($this->device) else ($e) {
+        guard $this->host->initialize() else ($e) {
             return .error($e);
         }
-
-        guard $this->blit->load($this->device) else ($e) {
-            $this->fail = appPipeline(.shader($e));
-            return .ok;
-        }
-
-        $this->bootOverlay();
-        $this->bootUi();
+        $this->ui = $this->host->ui;
         return .ok;
     }
 
@@ -101,9 +80,7 @@ public class App : Delegate
 
     public function update() : void
     {
-        $this->inputContext->reset();
-        $this->window->poll();
-        $this->events->tick();
+        $this->host->poll();
         $this->systems->update($this->entities);
         $this->runCallback($this->options->update);
         $this->tickIndex = $this->tickIndex + 1;
@@ -111,129 +88,45 @@ public class App : Delegate
 
     public function render(float32 $compensation) : void
     {
-        if ($this->window->shouldClose()) {
-            return;
-        }
-
-        int32 $w = $this->window->framebufferWidth();
-        int32 $h = $this->window->framebufferHeight();
-        FrameStatus $status = guard $this->device->beginFrame($w, $h) else ($e) {
-            match ($e) {
-                DeviceError::surfaceLost => {
-                    $this->window->setShouldClose(true);
-                    return;
-                },
-                else => {
-                    $this->fail = appPipeline(.device($e));
-                    return;
-                },
-            };
-        }
-
-        if ($status == FrameStatus::skipped) {
-            return;
-        }
-
-        Frame $frame = Frame();
-        RenderTarget $windowRt = $this->window->renderTarget();
-        Pipeline $pipeline = Pipeline($this->pool, $frame, $windowRt);
-        Context $ctx = Context($this->device, $pipeline, $frame, $this->pool, $compensation);
-        Backbuffer $back = $frame->get<Backbuffer>();
-        TargetRef $scene = $this->sceneTarget($pipeline, $windowRt);
-        $scene->depthStencil = true;
-        TextureRef $color = $pipeline->createColor($scene, 'quickstartColor', TextureOptions());
-        $frame->set(QuickstartPassData($scene, $color));
-        $frame->set(SceneTarget($scene));
-        $pipeline->add(ClearPass($scene, ClearPassOptions(color: $this->options->clearColor)));
-
-        $this->runRender($ctx, $scene);
-        $this->systems->render($this->entities, $ctx);
-        $this->addDraw($pipeline);
-        $this->addUi($pipeline, $scene);
-        $pipeline->add(ClearPass($back->target, ClearPassOptions()));
-        $this->blit->pass($pipeline, $back->target, $color);
-        Sample $sample = $this->instruments->sample();
-        Overlay? $maybeOverlay = $this->overlay;
-
-        if ($maybeOverlay != null) {
-            Overlay $overlay = guard $maybeOverlay;
-            $overlay->pass($pipeline, $back->target, $sample);
-        }
-
-        $this->finishFrame($pipeline, $compensation);
+        App $app = $this;
+        $this->host->renderFrame(
+            $compensation,
+            function(Context $ctx, TargetRef $target) : void {
+                $app->runRender($ctx, $target);
+                $app->systems->render($app->entities, $ctx);
+                $app->addDraw($ctx->pipeline);
+            },
+            $app->uiHook()
+        );
     }
 
     public function shouldStop() : bool
     {
-        if ($this->fail->failed()) {
-            return true;
-        }
-
-        int32 $cap = guard $this->options->maxFrames else {
-            return $this->window->shouldClose();
-        }
-        if ($this->frameIndex >= $cap) {
-            return true;
-        }
-
-        return $this->window->shouldClose();
+        return $this->host->shouldStop();
     }
 
     public function destroy() : void
     {
         $this->device->waitIdle();
-        Ui? $maybeUi = $this->ui;
-
-        if ($maybeUi != null) {
-            Ui $ui = guard $maybeUi;
-            $ui->destroy();
-            $this->ui = null;
-        }
-
         $this->systems->unregister($this->entities);
-        Overlay? $maybeOverlay = $this->overlay;
-
-        if ($maybeOverlay != null) {
-            Overlay $overlay = guard $maybeOverlay;
-            $overlay->destroy();
-            $this->overlay = null;
-        }
-
         $this->runCallback($this->options->teardown);
-        $this->teardownGpu();
+        $this->host->destroy();
+        $this->ui = null;
     }
 
-    private function teardownGpu() : void
-    {
-        $this->shaders->destroy();
-        $this->blit->destroy();
-        $this->pool->destroy();
-        $this->window->destroy();
-        $this->device->shutdown();
-    }
-
-    private function sceneTarget(Pipeline $pipeline, RenderTarget $windowRt) : TargetRef
-    {
-        Vec2 $fixed = guard $this->options->renderResolution else {
-            return $pipeline->createTargetLike('quickstartTarget', $windowRt);
-        }
-
-        return $pipeline->createTarget('quickstartTarget', $fixed->x as int32, $fixed->y as int32);
-    }
-
-    private function addDraw(Pipeline $pipeline) : void
+    internal function addDraw(Pipeline $pipeline) : void
     {
         $pipeline->add(CallbackPass(
             'quickstart.draw',
             setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
-                QuickstartPassData $data = $frame->get<QuickstartPassData>();
+                HostPassData $data = $frame->get<HostPassData>();
                 $io->writes($data->renderTarget);
             },
             execute: function(Context $ctx) : status<PipelineError> {
                 function<void(App, Context, RenderTarget)> $draw = guard $this->options->draw else {
                     return .ok;
                 }
-                QuickstartPassData $data = $ctx->frame->get<QuickstartPassData>();
+                HostPassData $data = $ctx->frame->get<HostPassData>();
                 RenderEncoder $enc = guard $ctx->beginRender($data->renderTarget) else ($e) {
                     return .error($e);
                 }
@@ -248,44 +141,15 @@ public class App : Delegate
         ));
     }
 
-    private function finishFrame(Pipeline $pipeline, float32 $compensation) : void
+    private function uiHook() : function<void(Ui)>?
     {
-        float64 $t0 = visu::runtime::seconds();
-        status<PipelineError> $exec = $pipeline->execute($this->frameIndex, $compensation);
-        $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
-        bool $presented = $this->present();
-        guard $exec else ($e) {
-            if (!$this->fail->failed()) {
-                $this->fail = appPipeline($e);
-            }
-
-            return;
+        function<void(App, Ui)> $cb = guard $this->options->ui else {
+            return null;
         }
-
-        if (!$presented) {
-            return;
-        }
-
-        $this->input->endFrame();
-        $this->frameIndex = $this->frameIndex + 1;
-    }
-
-    private function present() : bool
-    {
-        guard $this->window->swap() else ($e) {
-            match ($e) {
-                DeviceError::surfaceLost => {
-                    $this->window->setShouldClose(true);
-                    return false;
-                },
-                else => {
-                    $this->fail = appPipeline(.device($e));
-                    return false;
-                },
-            };
-        }
-
-        return true;
+        App $app = $this;
+        return function(Ui $ui) : void {
+            $cb($app, $ui);
+        };
     }
 
     private function runCallback(function<void(App)>? $cb) : void
@@ -296,91 +160,34 @@ public class App : Delegate
         $fn($this);
     }
 
-    private function runRender(Context $ctx, TargetRef $target) : void
+    internal function runRender(Context $ctx, TargetRef $target) : void
     {
         function<void(App, Context, TargetRef)> $fn = guard $this->options->render else {
             return;
         }
         $fn($this, $ctx, $target);
     }
+}
 
-    private function hints(Options $options) : WindowHints
-    {
-        WindowHints $hints = WindowHints::defaults();
-        if ($options->windowHeadless) {
-            $hints->visible = false;
-            $hints->resizable = false;
-            $hints->focusOnShow = false;
-            $hints->cocoaRetinaFramebuffer = false;
-            $hints->scaleToMonitor = false;
-        } else {
-            $hints->focusOnShow = true;
-            $hints->resizable = true;
-        }
-
-        return $hints;
+internal function hostConfigFromOptions(Options $options) : HostConfig
+{
+    HostConfig $cfg = HostConfig();
+    $cfg->title = $options->windowTitle;
+    $cfg->width = $options->windowWidth;
+    $cfg->height = $options->windowHeight;
+    $cfg->vsync = $options->windowVsync;
+    $cfg->headless = $options->windowHeadless;
+    $cfg->instrumentOverlay = $options->instrumentOverlay;
+    $cfg->ui = $options->ui != null;
+    $cfg->maxFrames = $options->maxFrames;
+    $cfg->clearColor = $options->clearColor;
+    $cfg->targetName = 'quickstartTarget';
+    $cfg->colorName = 'quickstartColor';
+    if ($options->renderResolution != null) {
+        Vec2 $fixed = guard $options->renderResolution;
+        $cfg->fixedResolution = true;
+        $cfg->renderSize = $fixed;
     }
 
-    private function addUi(Pipeline $pipeline, TargetRef $scene) : void
-    {
-        function<void(App, Ui)> $cb = guard $this->options->ui else {
-            return;
-        }
-        Ui $ui = guard $this->ui else {
-            return;
-        }
-        float32 $scale = $scene->contentScaleX;
-
-        if ($scale < 0.0001f) {
-            $scale = 1.0f;
-        }
-
-        float32 $w = ($scene->width as float32) / $scale;
-        float32 $h = ($scene->height as float32) / $scale;
-        $ui->beginFrame(Vec2($w, $h), $scale);
-        $cb($this, $ui);
-        $ui->endFrame();
-        $ui->pass($pipeline, $scene);
-    }
-
-    private function bootUi() : void
-    {
-        if ($this->options->windowHeadless || $this->options->ui == null) {
-            return;
-        }
-
-        Ui $ui = Ui($this->device, $this->input);
-        Paths $paths = $this->services->get<Paths>();
-        string $dir = visu::ui::resolveFontDir($paths->resourcesFont);
-        guard $ui->load($dir) else ($e) {
-            $ui->destroy();
-            $this->fail = appUi($e);
-            return;
-        }
-        $this->ui = $ui;
-    }
-
-    private function bootOverlay() : void
-    {
-        if (!$this->options->instrumentOverlay || $this->options->windowHeadless) {
-            return;
-        }
-
-        Overlay $overlay = Overlay($this->device);
-        guard $overlay->load() else ($e) {
-            info("instrument overlay: {$e->message()}");
-            $overlay->destroy();
-            return;
-        }
-        $overlay->listen($this->dispatcher);
-        $this->overlay = $overlay;
-    }
-
-    private function shaderDir(Services $services) : string
-    {
-        Paths $paths = guard $services->find<Paths>() else {
-            return env::cwd();
-        }
-        return $paths->resourcesShader;
-    }
+    return $cfg;
 }

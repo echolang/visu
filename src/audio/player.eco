@@ -1,0 +1,325 @@
+/**
+ * Named playlist with cross-fade, driven by the main EventLoop.
+ * Holds a ma::Engine the app constructed — not a Services payload.
+ * Instant play; switchTo fades in seconds via engine sampleRate
+ * frames, then defer()s the unload. miniaudio stop does not rewind;
+ * play seek(0)s.
+ */
+
+namespace visu::audio;
+
+use std::io;
+use visu::app::warn;
+use visu::runtime::{Timer, defer, hasMain};
+
+public class MusicPlayer
+{
+    public const ma::Engine $engine;
+    public float32 $fadeDuration = 2.0f;
+    private map<string, Track> $tracks;
+    private Track? $currentTrack;
+    private Track? $nextTrack;
+    private bool $switching;
+    private Timer? $switchTimer;
+
+    public constructor(ma::Engine $engine)
+    {
+        assert(hasMain(), 'MusicPlayer requires a main event loop');
+        $this->engine = $engine;
+        $this->tracks = map<string, Track>();
+        $this->currentTrack = null;
+        $this->nextTrack = null;
+        $this->switching = false;
+        $this->switchTimer = null;
+    }
+
+    public const function has(string $name) : bool
+    {
+        return $this->tracks->has($name);
+    }
+
+    public const function current() : Track?
+    {
+        return $this->currentTrack;
+    }
+
+    public const function names() : array<string>
+    {
+        return $this->tracks->keys();
+    }
+
+    public function register(string $name, Track $track) : status<PlayerError>
+    {
+        bool $here = guard io::exists($track->path) else ($e) {
+            return .error(.missingFile($track->path));
+        }
+        if (!$here) {
+            return .error(.missingFile($track->path));
+        }
+
+        if ($this->tracks->has($name)) {
+            return .error(.duplicate($name));
+        }
+
+        $this->tracks[$name] = $track;
+        return .ok;
+    }
+
+    public function add(string $path, string? $basePath = null) : result<Track, PlayerError>
+    {
+        Track $track = Track($path);
+        guard $this->register(trackName($path, $basePath), $track) else ($e) {
+            return .error($e);
+        }
+        return .ok($track);
+    }
+
+    public function scan(string $directory, array<string>? $extensions = null) : result<array<Track>, PlayerError>
+    {
+        array<string> $exts = $extensions ?? defaultAudioExts();
+        return $this->collect($directory, $exts);
+    }
+
+    public function play(string $name) : status<PlayerError>
+    {
+        if ($this->switching) {
+            $this->cancelSwitch();
+        }
+
+        Track $track = guard $this->findTrack($name) else ($e) {
+            return .error($e);
+        }
+        guard $track->load($this->engine) else ($e) {
+            return .error($e);
+        }
+        ma::Sound $sound = guard $track->sound else {
+            return .error(.missingFile($track->path));
+        }
+        guard $this->stopCurrent() else ($e) {
+            return .error($e);
+        }
+        guard $sound->start() else ($e) {
+            return .error(.engine($e));
+        }
+        $this->currentTrack = $track;
+        return .ok;
+    }
+
+    public function switchTo(string $name) : status<PlayerError>
+    {
+        Track $next = guard $this->findTrack($name) else ($e) {
+            return .error($e);
+        }
+
+        Track $cur = guard $this->currentTrack else {
+            return $this->play($name);
+        }
+
+        if ($this->switching) {
+            warn("[MusicPlayer] Already switching tracks, ignoring request to switch to '{$name}'");
+            return .ok;
+        }
+
+        if ($cur == $next) {
+            return .ok;
+        }
+
+        guard $next->load($this->engine) else ($e) {
+            return .error($e);
+        }
+        ma::Sound $currentSound = guard $cur->sound else {
+            return $this->play($name);
+        }
+        ma::Sound $nextSound = guard $next->sound else {
+            return .error(.missingFile($next->path));
+        }
+
+        uint64 $frames = $this->fadeFrames();
+        $nextSound->setFade(0.0f, 0.0f, 0);
+        guard $nextSound->start() else ($e) {
+            return .error(.engine($e));
+        }
+        $currentSound->setFade(-1.0f, 0.0f, $frames);
+        $nextSound->setFade(0.0f, 1.0f, $frames);
+
+        $this->switching = true;
+        $this->nextTrack = $next;
+        MusicPlayer $player = $this;
+        int64 $delay = $this->fadeDelayMs();
+        $this->switchTimer = defer($delay, function() : void {
+            $player->finishSwitch();
+        });
+        return .ok;
+    }
+
+    private function findTrack(string $name) : result<Track, PlayerError>
+    {
+        if (!$this->tracks->has($name)) {
+            return .error(.missing($name));
+        }
+
+        return .ok($this->tracks[$name]);
+    }
+
+    private function stopCurrent() : status<PlayerError>
+    {
+        Track $cur = guard $this->currentTrack else {
+            return .ok;
+        }
+        ma::Sound $held = guard $cur->sound else {
+            return .ok;
+        }
+        guard $held->stop() else ($e) {
+            return .error(.engine($e));
+        }
+        guard $held->seek(0) else ($e) {
+            return .error(.engine($e));
+        }
+        return .ok;
+    }
+
+    private function collect(string $directory, const array<string>& $exts) : result<array<Track>, PlayerError>
+    {
+        bool $here = guard io::exists($directory) else ($e) {
+            return .error(.scan($directory, $e->message()));
+        }
+        if (!$here) {
+            return .error(.notDirectory($directory));
+        }
+
+        array<string> $paths = array<string>();
+        guard $this->walk($directory, $exts, $paths) else ($e) {
+            match ($e) {
+                PlayerError::scan($path, $reason) => {
+                    if ($path == $directory) {
+                        return .error(.notDirectory($directory));
+                    }
+
+                    return .error($e);
+                },
+                else => {
+                    return .error($e);
+                },
+            }
+        }
+
+        array<Track> $added = array<Track>();
+        foreach ($paths as $path) {
+            Track $track = guard $this->add($path, $directory) else ($e) {
+                return .error($e);
+            }
+            $added[] = $track;
+        }
+
+        return .ok($added);
+    }
+
+    private function walk(
+        string $dir,
+        const array<string>& $exts,
+        array<string>& $paths,
+    ) : status<PlayerError>
+    {
+        io::dir $d = guard io::opendir($dir) else ($e) {
+            return .error(.scan($dir, $e->message()));
+        }
+        array<string> $subs = array<string>();
+
+        foreach ($d as $entry) {
+            if ($entry->is_directory()) {
+                $subs[] = $entry->path();
+                continue;
+            }
+
+            if (!$entry->is_file()) {
+                continue;
+            }
+
+            string $path = $entry->path();
+            if (matchExt($path, $exts)) {
+                $paths[] = $path;
+            }
+        }
+
+        io::ioerror? $readErr = $d->error();
+        if ($readErr != null) {
+            io::ioerror $e = guard $readErr else {
+                return .error(.scan($dir, 'unknown'));
+            }
+            return .error(.scan($dir, $e->message()));
+        }
+
+        foreach ($subs as $sub) {
+            guard $this->walk($sub, $exts, $paths) else ($e) {
+                return .error($e);
+            }
+        }
+
+        return .ok;
+    }
+
+    private function cancelSwitch() : void
+    {
+        Timer? $heldTimer = $this->switchTimer;
+        $this->switchTimer = null;
+        Timer $timer = guard $heldTimer else {
+            $this->dropNext();
+            return;
+        }
+        $timer->cancel();
+        $this->dropNext();
+    }
+
+    private function dropNext() : void
+    {
+        Track? $held = $this->nextTrack;
+        $this->nextTrack = null;
+        $this->switching = false;
+        Track $next = guard $held else {
+            return;
+        }
+        $next->unload();
+    }
+
+    internal function finishSwitch() : void
+    {
+        $this->switchTimer = null;
+        Track? $held = $this->currentTrack;
+        Track $cur = guard $held else {
+            $this->currentTrack = $this->nextTrack;
+            $this->nextTrack = null;
+            $this->switching = false;
+            return;
+        }
+        $cur->unload();
+        $this->currentTrack = $this->nextTrack;
+        $this->nextTrack = null;
+        $this->switching = false;
+    }
+
+    private function fadeFrames() : uint64
+    {
+        float32 $sec = $this->fadeDuration;
+        if ($sec < 0.0f) {
+            $sec = 0.0f;
+        }
+
+        float32 $rate = $this->engine->sampleRate() as float32;
+        float32 $n = $sec * $rate;
+        if ($n < 0.0f) {
+            return 0;
+        }
+
+        return $n as uint64;
+    }
+
+    private function fadeDelayMs() : int64
+    {
+        float32 $ms = $this->fadeDuration * 1000.0f;
+        if ($ms < 0.0f) {
+            return 0;
+        }
+
+        return $ms as int64;
+    }
+}

@@ -1,0 +1,102 @@
+/**
+ * Playlist naming: stem relative to a scan root, plus extension
+ * matching. slashDir lives in visu::app.
+ */
+
+namespace visu::audio;
+
+use visu::app::slashDir;
+
+internal function defaultAudioExts() : array<string>
+{
+    array<string> $exts = ['wav', 'flac', 'mp3'];
+    return $exts;
+}
+
+internal function fileBase(const string& $path) : string
+{
+    usize $n = $path->size();
+    usize $i = $n;
+
+    while ($i > 0) {
+        $i = $i - 1;
+        uint8 $b = $path->byte($i);
+        if ($b == 47 || $b == 92) {
+            return $path->sub($i + 1, $n - $i - 1);
+        }
+    }
+
+    return $path;
+}
+
+internal function stripExt(const string& $name) : string
+{
+    usize $n = $name->size();
+    usize $i = $n;
+
+    while ($i > 0) {
+        $i = $i - 1;
+        uint8 $b = $name->byte($i);
+        if ($b == 46) {
+            return $name->sub(0, $i);
+        }
+
+        if ($b == 47 || $b == 92) {
+            return $name;
+        }
+    }
+
+    return $name;
+}
+
+internal function trackName(const string& $path, string? $basePath) : string
+{
+    string $base = guard $basePath else {
+        return stripExt(fileBase($path));
+    }
+
+    string $prefix = slashDir($base);
+    if ($path->starts($prefix)) {
+        usize $len = $path->size() - $prefix->size();
+        return stripExt($path->sub($prefix->size(), $len));
+    }
+
+    return stripExt(fileBase($path));
+}
+
+internal function matchExt(const string& $path, const array<string>& $exts) : bool
+{
+    string $ext = fileExt($path);
+    if ($ext->empty()) {
+        return false;
+    }
+
+    string $lower = str::lower($ext);
+    foreach ($exts as $want) {
+        if (str::lower($want) == $lower) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+internal function fileExt(const string& $path) : string
+{
+    usize $n = $path->size();
+    usize $i = $n;
+
+    while ($i > 0) {
+        $i = $i - 1;
+        uint8 $b = $path->byte($i);
+        if ($b == 46) {
+            return $path->sub($i + 1, $n - $i - 1);
+        }
+
+        if ($b == 47 || $b == 92) {
+            return '';
+        }
+    }
+
+    return '';
+}

@@ -1,0 +1,53 @@
+/**
+ * One named playlist entry. Path is identity; the Sound is loaded
+ * on demand and dropped on unload. Defaults differ from PHP:
+ * stream from disk, loop until switchTo, no spatialization.
+ */
+
+namespace visu::audio;
+
+use visu::app::info;
+
+public class Track
+{
+    public const string $path;
+    public bool $looping = true;
+    public ma::Sound? $sound;
+
+    public constructor(string $path)
+    {
+        $this->path = $path;
+        $this->sound = null;
+    }
+
+    public function load(ma::Engine $engine) : status<PlayerError>
+    {
+        if ($this->sound != null) {
+            return .ok;
+        }
+
+        string $base = fileBase($this->path);
+        info("[MusicPlayer] Loading track '{$base}'");
+        ma::SoundOptions $opt = ma::SoundOptions(
+            $stream: true,
+            $looping: $this->looping,
+            $noSpatialization: true
+        );
+        ma::Sound $sound = guard $engine->sound($this->path, $opt) else ($e) {
+            return .error(.engine($e));
+        }
+        $this->sound = $sound;
+        return .ok;
+    }
+
+    public function unload() : void
+    {
+        if ($this->sound == null) {
+            return;
+        }
+
+        string $base = fileBase($this->path);
+        info("[MusicPlayer] Unloading track '{$base}'");
+        $this->sound = null;
+    }
+}

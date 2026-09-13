@@ -1,0 +1,188 @@
+/**
+ * Director: deferred switch, load/unload order, dispatcher listen.
+ */
+
+use visu::graphics::{Context, Device, Frame, Pipeline, Pool, RenderTarget};
+use visu::scene::{Director, Scene, Switch};
+use visu::signal::Dispatcher;
+use visu::ui::Ui;
+
+class SceneHits
+{
+    public string $name;
+    public int32 $loads;
+    public int32 $unloads;
+    public int32 $updates;
+    public int32 $renders;
+    public int32 $uis;
+
+    public constructor(string $name)
+    {
+        $this->name = $name;
+        $this->loads = 0;
+        $this->unloads = 0;
+        $this->updates = 0;
+        $this->renders = 0;
+        $this->uis = 0;
+    }
+}
+
+class Dummy : Scene
+{
+    public SceneHits $hits;
+
+    public constructor(SceneHits $hits)
+    {
+        $this->hits = $hits;
+    }
+
+    public const function name() : string
+    {
+        return $this->hits->name;
+    }
+
+    public function load() : void
+    {
+        $this->hits->loads = $this->hits->loads + 1;
+    }
+
+    public function unload() : void
+    {
+        $this->hits->unloads = $this->hits->unloads + 1;
+    }
+
+    public function update() : void
+    {
+        $this->hits->updates = $this->hits->updates + 1;
+    }
+
+    public function render(const Context& $ctx) : void
+    {
+        $this->hits->renders = $this->hits->renders + 1;
+    }
+
+    public function ui(Ui $ui) : void
+    {
+        $this->hits->uis = $this->hits->uis + 1;
+    }
+}
+
+internal function testContext() : Context
+{
+    Device $device = Device();
+    Pool $pool = Pool($device);
+    Frame $frame = Frame();
+    RenderTarget $rt = RenderTarget(64, 64);
+    Pipeline $pipeline = Pipeline($pool, $frame, $rt);
+    return Context($device, $pipeline, $frame, $pool);
+}
+
+test director_load_then_update_and_render
+{
+    SceneHits $hits = SceneHits('one');
+    Director $director = Director(Dummy($hits));
+    $director->load();
+    $director->update();
+    Context $ctx = testContext();
+    $director->render($ctx);
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $director->ui($ui);
+
+    assert($hits->loads == 1, 'load');
+    assert($hits->updates == 1, 'update');
+    assert($hits->renders == 1, 'render');
+    assert($hits->uis == 1, 'ui');
+    assert($hits->unloads == 0, 'still live');
+    $director->unload();
+}
+
+test switch_is_deferred_until_apply
+{
+    SceneHits $a = SceneHits('a');
+    SceneHits $b = SceneHits('b');
+    Director $director = Director(Dummy($a));
+    $director->load();
+    $director->switch(Dummy($b));
+    $director->update();
+
+    assert($director->pending(), 'queued');
+    assert($a->updates == 1, 'old still ticks');
+    assert($b->updates == 0, 'new waits');
+    assert($b->loads == 0, 'new not loaded');
+    $director->unload();
+}
+
+test apply_unloads_old_then_loads_new
+{
+    SceneHits $a = SceneHits('a');
+    SceneHits $b = SceneHits('b');
+    Director $director = Director(Dummy($a));
+    $director->load();
+    $director->switch(Dummy($b));
+    $director->apply();
+
+    assert(!$director->pending(), 'consumed');
+    assert($director->current()->name() == 'b', 'current');
+    assert($a->unloads == 1, 'old unloaded');
+    assert($b->loads == 1, 'new loaded');
+    assert($a->loads == 1, 'old loaded once');
+    $director->unload();
+}
+
+test last_queued_switch_wins
+{
+    SceneHits $a = SceneHits('a');
+    SceneHits $b = SceneHits('b');
+    SceneHits $c = SceneHits('c');
+    Director $director = Director(Dummy($a));
+    $director->load();
+    $director->switch(Dummy($b));
+    $director->switch(Dummy($c));
+    $director->apply();
+
+    assert($director->current()->name() == 'c', 'last wins');
+    assert($b->loads == 0, 'skipped');
+    assert($c->loads == 1, 'loaded');
+    $director->unload();
+}
+
+test listen_dispatches_switch
+{
+    SceneHits $a = SceneHits('a');
+    SceneHits $b = SceneHits('b');
+    Director $director = Director(Dummy($a));
+    Dispatcher $dispatcher = Dispatcher();
+    $director->listen($dispatcher);
+    $director->load();
+    Scene $queued = Dummy($b);
+    $dispatcher->dispatch(Switch($queued));
+
+    assert($director->pending(), 'queued from signal');
+    $director->apply();
+    assert($director->current()->name() == 'b', 'adopted');
+    $director->unload();
+}
+
+test unload_teardown
+{
+    SceneHits $hits = SceneHits('one');
+    Director $director = Director(Dummy($hits));
+    $director->load();
+    $director->unload();
+    $director->unload();
+
+    assert($hits->unloads == 1, 'idempotent');
+}
+
+test apply_without_pending_is_noop
+{
+    SceneHits $hits = SceneHits('one');
+    Director $director = Director(Dummy($hits));
+    $director->load();
+    $director->apply();
+
+    assert($hits->loads == 1, 'still once');
+    assert($hits->unloads == 0, 'not unloaded');
+    $director->unload();
+}

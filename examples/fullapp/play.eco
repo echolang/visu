@@ -1,0 +1,228 @@
+/**
+ * A small 3D level: flying camera and a ring of spinning cubes.
+ * ESC returns to the menu. F5 reloads this scene.
+ */
+
+use visu::app::Host;
+use visu::ecs::{Entities, Entity, System, Systems};
+use visu::geo::Transform;
+use visu::graphics::{
+    CallbackPass, CameraData, CameraUniforms, Context, Frame, GpuPass, IoSink,
+    Mesh, Pipeline, PipelineError, Raster, RenderEncoder, SceneTarget,
+    ShaderProgram, VertexLayout
+};
+use visu::math::{Mat4, Quat, Vec3, Vec4};
+use visu::scene::{Scene, Switch};
+use visu::system::CameraSystem;
+use visu::ui::Ui;
+
+public struct Cube
+{
+    public Vec4 $color;
+    public float32 $speed;
+    public float32 $angle;
+}
+
+public struct CubeDraw
+{
+    public Mat4 $model;
+    public Vec4 $color;
+}
+
+public class CubeSystem : System
+{
+    public Mesh $mesh;
+    public GpuPass $pass;
+
+    public constructor(Mesh $mesh, GpuPass $pass)
+    {
+        $this->mesh = $mesh;
+        $this->pass = $pass;
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function update(Entities $entities) : void
+    {
+        foreach ($entities->view<Cube>() as $id => &$cube) {
+            Transform& $t = $entities->get<Transform>($id);
+            $t->storePrevious();
+            $cube->angle = $cube->angle + $cube->speed;
+            $t->orientation = Quat(angleAxis: $cube->angle, Vec3(0.0f, 1.0f, 0.0f));
+        }
+    }
+
+    public function render(Entities $entities, const Context& $ctx) : void
+    {
+        CubeSystem $sys = $this;
+        Entities $world = $entities;
+        Context $frameCtx = $ctx;
+        $frameCtx->pipeline->add(CallbackPass(
+            'cubes',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                SceneTarget $scene = $frame->get<SceneTarget>();
+                $io->writes($scene->target);
+            },
+            execute: function(Context $inner) : status<PipelineError> {
+                return $sys->draw($world, $inner);
+            }
+        ));
+    }
+
+    public function draw(Entities $entities, Context $ctx) : status<PipelineError>
+    {
+        SceneTarget $scene = $ctx->frame->get<SceneTarget>();
+        CameraData $camera = guard $ctx->frame->find<CameraData>() else {
+            return .ok;
+        }
+        RenderEncoder $enc = guard $ctx->beginRender($scene->target) else ($e) {
+            return .error($e);
+        }
+        CameraUniforms $cam = $camera->uniforms();
+        $enc->upload($cam, slot: 1);
+        Mesh $mesh = $this->mesh;
+        GpuPass $pass = $this->pass;
+        float32 $alpha = $ctx->compensation;
+
+        foreach ($entities->view<Cube>() as $id => &$cube) {
+            Transform& $t = $entities->get<Transform>($id);
+            CubeDraw $draw = CubeDraw($t->local($alpha), $cube->color);
+            $pass->draw($enc, $mesh, $draw);
+        }
+
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+public class Play : Scene
+{
+    private Host $host;
+    public Entities $entities;
+    public Systems $systems;
+    public CameraSystem $cameras;
+    private Mesh? $mesh;
+
+    public constructor(Host $host)
+    {
+        $this->host = $host;
+        $this->entities = Entities();
+        $this->systems = Systems();
+        $this->cameras = CameraSystem($host->input, $host->dispatcher);
+        $this->systems->bind($this->cameras);
+        $this->mesh = null;
+    }
+
+    public const function name() : string
+    {
+        return 'play';
+    }
+
+    public function load() : void
+    {
+        guard $this->host->inputContext->switch('play') else ($e) {
+            die($e->message());
+        }
+
+        $ref = guard $this->host->shaders->shader('cube') else ($e) {
+            die($e->message());
+        }
+        ShaderProgram $prog = guard $ref->load() else ($e) {
+            die($e->message());
+        }
+        Mesh $mesh = .cube($this->host->device);
+        GpuPass $pass = GpuPass($prog, VertexLayout::pos3(), Raster::opaque());
+        $this->systems->bind(CubeSystem($mesh, $pass));
+        $this->mesh = $mesh;
+        $this->systems->register($this->entities);
+        $this->cameras->spawnDefaultFlyingCamera($this->entities, Vec3(0.0f, 2.5f, 9.0f));
+        $this->spawnCubes();
+    }
+
+    public function unload() : void
+    {
+        $this->systems->unregister($this->entities);
+        $this->teardownGpu();
+    }
+
+    public function update() : void
+    {
+        if ($this->host->inputContext->actions()->pressed('menu')) {
+            Scene $menu = Menu($this->host);
+            $this->host->dispatcher->dispatch(Switch($menu));
+            return;
+        }
+
+        if ($this->host->inputContext->actions()->pressed('reload')) {
+            Scene $again = Play($this->host);
+            $this->host->dispatcher->dispatch(Switch($again));
+            return;
+        }
+
+        $this->systems->update($this->entities);
+    }
+
+    public function render(const Context& $ctx) : void
+    {
+        $this->systems->render($this->entities, $ctx);
+    }
+
+    public function ui(Ui $ui) : void
+    {
+    }
+
+    private function spawnCubes() : void
+    {
+        int32 $count = 8;
+        float64 $step = (std::math::PI * 2.0) / ($count as float64);
+
+        for ($i = 0; $i < $count; $i++) {
+            float64 $a = ($i as float64) * $step;
+            Entity $entity = $this->entities->create();
+            Transform $transform = Transform();
+            float32 $x = std::math::cos($a) as float32;
+            float32 $z = std::math::sin($a) as float32;
+            $transform->position = Vec3($x * 3.2f, 0.0f, $z * 3.2f);
+            $this->entities->attach($entity, $transform);
+            $this->entities->attach($entity, Cube(
+                cubeColor($i),
+                0.015f + ($i as float32) * 0.004f,
+                0.0f
+            ));
+        }
+    }
+
+    private function teardownGpu() : void
+    {
+        Mesh $mesh = guard $this->mesh else {
+            return;
+        }
+        $mesh->destroy();
+        $this->mesh = null;
+    }
+}
+
+internal function cubeColor(int32 $i) : Vec4
+{
+    int32 $n = $i % 4;
+
+    if ($n == 0) {
+        return Vec4(0.91f, 0.38f, 0.32f, 1.0f);
+    }
+
+    if ($n == 1) {
+        return Vec4(0.35f, 0.72f, 0.55f, 1.0f);
+    }
+
+    if ($n == 2) {
+        return Vec4(0.35f, 0.55f, 0.92f, 1.0f);
+    }
+
+    return Vec4(0.95f, 0.78f, 0.32f, 1.0f);
+}

@@ -1,0 +1,371 @@
+/**
+ * Windowed GPU session. The app constructs one; Device stays off
+ * Services. Construct fills the bag; initialize brings the window
+ * up; destroy tears it down. Quickstart and a class-based app
+ * each own a Host and stay Delegate.
+ */
+
+namespace visu::app;
+
+use std::env;
+use std::io;
+use visu::graphics::{
+    Backbuffer, ClearPass, ClearPassOptions, Context, Device, DeviceError,
+    Frame, FrameStatus, FullscreenTextureRenderer, Pipeline, PipelineError,
+    Pool, RenderTarget, SceneTarget, ShaderCollection, TargetRef,
+    TextureOptions, TextureRef
+};
+use visu::instrument::{Instruments, Overlay, Sample};
+use visu::math::Vec2;
+use visu::os::{ContextMap, Input, Window, WindowHints};
+use visu::runtime::{DebugConsole, EventLoop};
+use visu::signal::Dispatcher;
+use visu::ui::Ui;
+
+public class Host
+{
+    public const HostConfig $config;
+    public Device $device;
+    public Window $window;
+    public Pool $pool;
+    public Dispatcher $dispatcher;
+    public Input $input;
+    public ContextMap $inputContext;
+    public ShaderCollection $shaders;
+    public Services $services;
+    public EventLoop $events;
+    public Instruments $instruments;
+    public Ui? $ui;
+    public int32 $frameIndex;
+    public HostError $fail;
+    private FullscreenTextureRenderer $blit;
+    private Overlay? $overlay;
+    private DebugConsole? $console;
+
+    public constructor(HostConfig $config, Services $services)
+    {
+        $this->config = $config;
+        $this->services = $services;
+        $this->device = Device();
+        $this->window = Window(
+            $config->title,
+            $config->width,
+            $config->height,
+            hostHints($config)
+        );
+        $this->pool = Pool($this->device);
+        $this->dispatcher = Dispatcher();
+        $this->input = Input($this->window, $this->dispatcher);
+        $this->inputContext = ContextMap($this->dispatcher, $this->input);
+        $this->window->setHandler($this->input);
+        $this->shaders = ShaderCollection($this->device, hostShaderDir($services));
+        $this->events = EventLoop();
+        $this->instruments = Instruments();
+        $this->ui = null;
+        $this->frameIndex = 0;
+        $this->fail = .none;
+        $this->blit = FullscreenTextureRenderer();
+        $this->overlay = null;
+        $this->console = null;
+    }
+
+    public function initialize() : status<HostError>
+    {
+        if ($this->fail->failed()) {
+            return .error($this->fail);
+        }
+
+        $this->window->setVsync($this->config->vsync);
+        guard $this->window->initialize($this->device) else ($e) {
+            return .error(.window($e));
+        }
+
+        guard $this->blit->load($this->device) else ($e) {
+            return .error(.shader($e));
+        }
+
+        $this->bootOverlay();
+        $this->bootUi();
+        $this->bootConsole();
+        guard $this->scanShaders() else ($e) {
+            return .error($e);
+        }
+
+        if ($this->fail->failed()) {
+            return .error($this->fail);
+        }
+
+        return .ok;
+    }
+
+    public function poll() : void
+    {
+        $this->inputContext->reset();
+        $this->window->poll();
+        $this->events->tick();
+    }
+
+    public function renderFrame(
+        float32 $compensation,
+        function<void(Context, TargetRef)> $scene,
+        function<void(Ui)>? $ui = null,
+        function<void()>? $afterPresent = null,
+    ) : void
+    {
+        if ($this->window->shouldClose()) {
+            return;
+        }
+
+        int32 $w = $this->window->framebufferWidth();
+        int32 $h = $this->window->framebufferHeight();
+        FrameStatus $status = guard $this->device->beginFrame($w, $h) else ($e) {
+            match ($e) {
+                DeviceError::surfaceLost => {
+                    $this->window->setShouldClose(true);
+                    return;
+                },
+                else => {
+                    $this->fail = .pipeline(.device($e));
+                    return;
+                },
+            };
+        }
+
+        if ($status == FrameStatus::skipped) {
+            return;
+        }
+
+        Frame $frame = Frame();
+        RenderTarget $windowRt = $this->window->renderTarget();
+        Pipeline $pipeline = Pipeline($this->pool, $frame, $windowRt);
+        Context $ctx = Context($this->device, $pipeline, $frame, $this->pool, $compensation);
+        Backbuffer $back = $frame->get<Backbuffer>();
+        TargetRef $sceneTarget = $this->sceneTarget($pipeline, $windowRt);
+        $sceneTarget->depthStencil = true;
+        TextureRef $color = $pipeline->createColor($sceneTarget, $this->config->colorName, TextureOptions());
+        $frame->set(HostPassData($sceneTarget, $color));
+        $frame->set(SceneTarget($sceneTarget));
+        $pipeline->add(ClearPass($sceneTarget, ClearPassOptions(color: $this->config->clearColor)));
+        $scene($ctx, $sceneTarget);
+        $this->addUi($pipeline, $sceneTarget, $ui);
+        $pipeline->add(ClearPass($back->target, ClearPassOptions()));
+        $this->blit->pass($pipeline, $back->target, $color);
+        Sample $sample = $this->instruments->sample();
+        Overlay? $maybeOverlay = $this->overlay;
+
+        if ($maybeOverlay != null) {
+            Overlay $overlay = guard $maybeOverlay;
+            $overlay->pass($pipeline, $back->target, $sample);
+        }
+
+        $this->finishFrame($pipeline, $compensation, $afterPresent);
+    }
+
+    public const function shouldStop() : bool
+    {
+        if ($this->fail->failed()) {
+            return true;
+        }
+
+        int32 $cap = guard $this->config->maxFrames else {
+            return $this->window->shouldClose();
+        }
+        if ($this->frameIndex >= $cap) {
+            return true;
+        }
+
+        return $this->window->shouldClose();
+    }
+
+    public function destroy() : void
+    {
+        $this->device->waitIdle();
+        Ui? $maybeUi = $this->ui;
+
+        if ($maybeUi != null) {
+            Ui $ui = guard $maybeUi;
+            $ui->destroy();
+            $this->ui = null;
+        }
+
+        Overlay? $maybeOverlay = $this->overlay;
+
+        if ($maybeOverlay != null) {
+            Overlay $overlay = guard $maybeOverlay;
+            $overlay->destroy();
+            $this->overlay = null;
+        }
+
+        $this->console = null;
+        $this->shaders->destroy();
+        $this->blit->destroy();
+        $this->pool->destroy();
+        $this->window->destroy();
+        $this->device->shutdown();
+    }
+
+    private function sceneTarget(Pipeline $pipeline, RenderTarget $windowRt) : TargetRef
+    {
+        if (!$this->config->fixedResolution) {
+            return $pipeline->createTargetLike($this->config->targetName, $windowRt);
+        }
+
+        Vec2 $fixed = $this->config->renderSize;
+        return $pipeline->createTarget($this->config->targetName, $fixed->x as int32, $fixed->y as int32);
+    }
+
+    private function addUi(Pipeline $pipeline, TargetRef $scene, function<void(Ui)>? $cb) : void
+    {
+        function<void(Ui)> $fn = guard $cb else {
+            return;
+        }
+        Ui $ui = guard $this->ui else {
+            return;
+        }
+        float32 $scale = $scene->contentScaleX;
+
+        if ($scale < 0.0001f) {
+            $scale = 1.0f;
+        }
+
+        float32 $w = ($scene->width as float32) / $scale;
+        float32 $h = ($scene->height as float32) / $scale;
+        $ui->beginFrame(Vec2($w, $h), $scale);
+        $fn($ui);
+        $ui->endFrame();
+        $ui->pass($pipeline, $scene);
+    }
+
+    private function finishFrame(
+        Pipeline $pipeline,
+        float32 $compensation,
+        function<void()>? $afterPresent,
+    ) : void
+    {
+        float64 $t0 = visu::runtime::seconds();
+        status<PipelineError> $exec = $pipeline->execute($this->frameIndex, $compensation);
+        $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
+        bool $presented = $this->present();
+        guard $exec else ($e) {
+            if (!$this->fail->failed()) {
+                $this->fail = .pipeline($e);
+            }
+
+            return;
+        }
+
+        if (!$presented) {
+            return;
+        }
+
+        $this->input->endFrame();
+        $this->frameIndex = $this->frameIndex + 1;
+        function<void()> $after = guard $afterPresent else {
+            return;
+        }
+        $after();
+    }
+
+    private function present() : bool
+    {
+        guard $this->window->swap() else ($e) {
+            match ($e) {
+                DeviceError::surfaceLost => {
+                    $this->window->setShouldClose(true);
+                    return false;
+                },
+                else => {
+                    $this->fail = .pipeline(.device($e));
+                    return false;
+                },
+            };
+        }
+
+        return true;
+    }
+
+    private function bootUi() : void
+    {
+        if ($this->config->headless || !$this->config->ui) {
+            return;
+        }
+
+        Ui $ui = Ui($this->device, $this->input);
+        Paths $paths = $this->services->get<Paths>();
+        string $dir = visu::ui::resolveFontDir($paths->resourcesFont);
+        guard $ui->load($dir) else ($e) {
+            $ui->destroy();
+            $this->fail = .ui($e);
+            return;
+        }
+        $this->ui = $ui;
+    }
+
+    private function bootOverlay() : void
+    {
+        if (!$this->config->instrumentOverlay || $this->config->headless) {
+            return;
+        }
+
+        Overlay $overlay = Overlay($this->device);
+        guard $overlay->load() else ($e) {
+            info("instrument overlay: {$e->message()}");
+            $overlay->destroy();
+            return;
+        }
+        $overlay->listen($this->dispatcher);
+        $this->overlay = $overlay;
+    }
+
+    private function bootConsole() : void
+    {
+        if (!$this->config->debugConsole) {
+            return;
+        }
+
+        $this->console = DebugConsole($this->dispatcher, $this->input);
+    }
+
+    private function scanShaders() : status<HostError>
+    {
+        string $dir = $this->shaders->loader->directory;
+        bool $here = guard io::exists($dir) else ($e) {
+            return .error(.shader(.scan($dir, $e->message())));
+        }
+
+        if (!$here) {
+            return .ok;
+        }
+
+        guard $this->shaders->scan() else ($e) {
+            return .error(.shader($e));
+        }
+
+        return .ok;
+    }
+}
+
+internal function hostHints(HostConfig $config) : WindowHints
+{
+    WindowHints $hints = WindowHints::defaults();
+    if ($config->headless) {
+        $hints->visible = false;
+        $hints->resizable = false;
+        $hints->focusOnShow = false;
+        $hints->cocoaRetinaFramebuffer = false;
+        $hints->scaleToMonitor = false;
+    } else {
+        $hints->focusOnShow = true;
+        $hints->resizable = true;
+    }
+
+    return $hints;
+}
+
+internal function hostShaderDir(Services $services) : string
+{
+    Paths $paths = guard $services->find<Paths>() else {
+        return env::cwd();
+    }
+    return $paths->resourcesShader;
+}

@@ -74,11 +74,11 @@ internal class FrameSlot
     public mtl::SharedEvent $gpuDone;
     public uint64 $epoch;
 
-    public constructor(mtl::Device $gpu)
+    public constructor(mtl::SharedEvent $gpuDone)
     {
         $this->prev = null;
         $this->ring = HostRing();
-        $this->gpuDone = mtl::SharedEvent($gpu);
+        $this->gpuDone = $gpuDone;
         $this->epoch = 0;
     }
 }
@@ -91,7 +91,10 @@ internal function mtlCreateSlots(Device $device) : status<DeviceError>
     uint32 $i = 0;
 
     while ($i < FRAMES_IN_FLIGHT) {
-        FrameSlot $slot = FrameSlot($gpu);
+        mtl::SharedEvent $done = guard $gpu->newSharedEvent() else {
+            return .error(.metal('shared event', 'newSharedEvent failed'));
+        }
+        FrameSlot $slot = FrameSlot($done);
         guard $slot->ring->allocate($gpu, RING_BYTES) else ($e) {
             return .error($e);
         }

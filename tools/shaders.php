@@ -73,6 +73,7 @@ const DEFAULT_TREES = [
     'resources/shaders',
     'examples/shader/shaders',
     'examples/quickstart/resources/shader',
+    'examples/fullapp/resources/shader',
     'tests/resources/shaders',
 ];
 

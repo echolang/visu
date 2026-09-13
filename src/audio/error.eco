@@ -1,0 +1,29 @@
+/**
+ * Failures on the music-player playlist: missing names, bad paths,
+ * or a miniaudio load/start that did not go through. Missing main
+ * EventLoop is a wiring bug (assert), not a case here.
+ */
+
+namespace visu::audio;
+
+public enum PlayerError
+{
+    case missing(string $name);
+    case duplicate(string $name);
+    case missingFile(string $path);
+    case notDirectory(string $path);
+    case scan(string $path, string $reason);
+    case engine(ma::Error $inner);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            .missing($name) => "audio: track '{$name}' does not exist",
+            .duplicate($name) => "audio: track '{$name}' already exists",
+            .missingFile($path) => "audio: file '{$path}' does not exist or is not readable",
+            .notDirectory($path) => "audio: '{$path}' does not exist or is not a directory",
+            .scan($path, $reason) => "audio: could not scan '{$path}': {$reason}",
+            .engine($inner) => "audio: {$inner->message()}",
+        };
+    }
+}
