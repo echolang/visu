@@ -356,7 +356,7 @@ public class Device : DeviceProtocol
             $attachment->level = $color->mip as uint32;
             $attachment->slice = $color->face as uint32;
             $pass->colorAttachments[] = $attachment;
-            $formats->colors[$i] = $color->texture->format;
+            $formats->colors[$i] = $color->texture->desc->format;
             $i = $i + 1;
         }
 
@@ -377,9 +377,9 @@ public class Device : DeviceProtocol
         $pass->depthLoadAction = mtlLoadOp($depth->load);
         $pass->depthStoreAction = mtlStoreOp($depth->store);
         $pass->depthClear = $depth->clearDepth;
-        $formats->depth = $depth->texture->format;
+        $formats->depth = $depth->texture->desc->format;
         $formats->hasDepth = true;
-        $depthFmt = mtlPixelFormat($depth->texture->format);
+        $depthFmt = mtlPixelFormat($depth->texture->desc->format);
         return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $passWidth, $passHeight);
     }
 
@@ -411,21 +411,21 @@ public class Device : DeviceProtocol
         assert(!$this->encoderOpen, 'readbackTexture with an open encoder');
         assert(!$this->inFrame, 'readbackTexture inside a frame');
 
-        if ($texture->imported || ($texture->usage & TEXTURE_TRANSFER_SRC) == 0) {
+        if ($texture->imported || ($texture->desc->usage & TEXTURE_TRANSFER_SRC) == 0) {
             return .error(.missingUsage);
         }
 
-        if ($texture->format->isDepth()) {
-            return .error(.unsupportedFormat($texture->format));
+        if ($texture->desc->format->isDepth()) {
+            return .error(.unsupportedFormat($texture->desc->format));
         }
 
         mtl::Texture $mt = guard $texture->handle->texture else {
             return .error(.metal('readback', 'texture handle is empty'));
         }
         $this->waitIdle();
-        uint32 $bpp = pixelByteCount($texture->format);
-        int32 $w = mipSize($texture->width, $mip);
-        int32 $h = mipSize($texture->height, $mip);
+        uint32 $bpp = pixelByteCount($texture->desc->format);
+        int32 $w = mipSize($texture->desc->width, $mip);
+        int32 $h = mipSize($texture->desc->height, $mip);
         uint64 $row = ($w as uint64) * ($bpp as uint64);
         uint64 $total = $row * ($h as uint64);
         array<uint8> $pixels = pixelsFilled($total);
@@ -473,7 +473,7 @@ public class Device : DeviceProtocol
         $blit->copyFromTexture(
             $srcTex,
             $dstTex,
-            mtl::Size($src->width as usize, $src->height as usize)
+            mtl::Size($src->desc->width as usize, $src->desc->height as usize)
         );
         $blit->endEncoding();
         $cmd->commit();
@@ -573,9 +573,9 @@ public class Device : DeviceProtocol
         mtl::Texture $mt = guard $texture->handle->texture else {
             die('uploadTexture handle is empty');
         }
-        uint32 $bpp = pixelByteCount($texture->format);
-        int32 $w = mipSize($texture->width, $mip);
-        int32 $h = mipSize($texture->height, $mip);
+        uint32 $bpp = pixelByteCount($texture->desc->format);
+        int32 $w = mipSize($texture->desc->width, $mip);
+        int32 $h = mipSize($texture->desc->height, $mip);
         uint64 $row = $bytesPerRow as uint64;
 
         if ($row == 0) {
@@ -592,7 +592,7 @@ public class Device : DeviceProtocol
     {
         assert($this->gpu != null, 'generateMipmaps before initialize');
         assert(!$this->encoderOpen, 'generateMipmaps with an open encoder');
-        assert($texture->mips > 1, 'generateMipmaps needs mips > 1');
+        assert($texture->desc->mips > 1, 'generateMipmaps needs mips > 1');
         mtl::Texture $mt = guard $texture->handle->texture else {
             die('generateMipmaps handle is empty');
         }
@@ -738,7 +738,9 @@ public class Device : DeviceProtocol
         $this->drawable = $next;
         $this->cmd = $cmd;
         TextureHandle $th = TextureHandle($next->texture(), true);
-        Texture $bb = Texture(imported: $this, $th, $this->bbFormat, $width, $height);
+        TextureDesc $bbDesc = TextureDesc($format: $this->bbFormat, $width: $width, $height: $height);
+        $bbDesc->usage = 0 as uint32;
+        Texture $bb = Texture(imported: $this, $th, $bbDesc);
         $bb->state = .undefined;
         $this->bb = $bb;
         $this->inFrame = true;

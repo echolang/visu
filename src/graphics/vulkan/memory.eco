@@ -342,19 +342,19 @@ internal function vkFillBufferImageCopy(
 ) : vk::BufferImageCopy
 {
     vk::BufferImageCopy $region = vk::BufferImageCopy();
-    int32 $w = mipSize($texture->width, $mip);
+    int32 $w = mipSize($texture->desc->width, $mip);
     uint64 $tight = ($w as uint64) * ($bpp as uint64);
 
     if ($rowBytes > $tight) {
         $region->bufferRowLength = ($rowBytes / ($bpp as uint64)) as uint32;
     }
 
-    $region->imageSubresource->aspectMask = vkAspect($texture->format);
+    $region->imageSubresource->aspectMask = vkAspect($texture->desc->format);
     $region->imageSubresource->mipLevel = $mip as uint32;
     $region->imageSubresource->baseArrayLayer = $layer as uint32;
     $region->imageSubresource->layerCount = 1;
     $region->imageExtent->width = $w as uint32;
-    $region->imageExtent->height = mipSize($texture->height, $mip) as uint32;
+    $region->imageExtent->height = mipSize($texture->desc->height, $mip) as uint32;
     $region->imageExtent->depth = 1;
     return $region;
 }
@@ -370,7 +370,7 @@ internal function vkOneShotCopyImageToBuffer(
 ) : void
 {
     vk::CommandBuffer $cmd = vkBeginSetup($device);
-    vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferSrc, vkAspect($texture->format));
+    vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferSrc, vkAspect($texture->desc->format));
     vk::BufferImageCopy $region = vkFillBufferImageCopy($texture, $mip, $layer, $rowBytes, $bpp);
     vk::CmdCopyImageToBuffer(
         $cmd,
@@ -398,7 +398,7 @@ internal function vkOneShotCopyBufferToImage(
 ) : void
 {
     vk::CommandBuffer $cmd = vkBeginSetup($device);
-    vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferDst, vkAspect($texture->format));
+    vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferDst, vkAspect($texture->desc->format));
     vk::BufferImageCopy $region = vkFillBufferImageCopy($texture, $mip, $layer, $rowBytes, $bpp);
     vk::CmdCopyBufferToImage(
         $cmd,
@@ -408,7 +408,7 @@ internal function vkOneShotCopyBufferToImage(
         1,
         &$region
     );
-    vkRecordBarrier($cmd, $texture->handle->image, .transferDst, .shaderRead, vkAspect($texture->format));
+    vkRecordBarrier($cmd, $texture->handle->image, .transferDst, .shaderRead, vkAspect($texture->desc->format));
     guard vkCheck(vk::EndCommandBuffer($cmd), 'EndCommandBuffer') else ($e) {
         die($e->message());
     }
@@ -419,15 +419,15 @@ internal function vkOneShotCopyBufferToImage(
 internal function vkOneShotCopyImage(Device $device, Texture $src, Texture $dst) : void
 {
     vk::CommandBuffer $cmd = vkBeginSetup($device);
-    vkRecordBarrier($cmd, $src->handle->image, $src->state, .transferSrc, vkAspect($src->format));
-    vkRecordBarrier($cmd, $dst->handle->image, $dst->state, .transferDst, vkAspect($dst->format));
+    vkRecordBarrier($cmd, $src->handle->image, $src->state, .transferSrc, vkAspect($src->desc->format));
+    vkRecordBarrier($cmd, $dst->handle->image, $dst->state, .transferDst, vkAspect($dst->desc->format));
     vk::ImageCopy $region = vk::ImageCopy();
-    $region->srcSubresource->aspectMask = vkAspect($src->format);
+    $region->srcSubresource->aspectMask = vkAspect($src->desc->format);
     $region->srcSubresource->layerCount = 1;
-    $region->dstSubresource->aspectMask = vkAspect($dst->format);
+    $region->dstSubresource->aspectMask = vkAspect($dst->desc->format);
     $region->dstSubresource->layerCount = 1;
-    $region->extent->width = $src->width as uint32;
-    $region->extent->height = $src->height as uint32;
+    $region->extent->width = $src->desc->width as uint32;
+    $region->extent->height = $src->desc->height as uint32;
     $region->extent->depth = 1;
     vk::CmdCopyImage(
         $cmd,
@@ -438,7 +438,7 @@ internal function vkOneShotCopyImage(Device $device, Texture $src, Texture $dst)
         1,
         &$region
     );
-    vkRecordBarrier($cmd, $dst->handle->image, .transferDst, .shaderRead, vkAspect($dst->format));
+    vkRecordBarrier($cmd, $dst->handle->image, .transferDst, .shaderRead, vkAspect($dst->desc->format));
     guard vkCheck(vk::EndCommandBuffer($cmd), 'EndCommandBuffer') else ($e) {
         die($e->message());
     }

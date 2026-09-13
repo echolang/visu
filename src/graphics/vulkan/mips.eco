@@ -7,14 +7,14 @@ namespace visu::graphics;
 
 internal function vkRecordMipChain(vk::CommandBuffer $cmd, Texture $texture) : void
 {
-    uint32 $aspect = vkAspect($texture->format);
+    uint32 $aspect = vkAspect($texture->desc->format);
     uint32 $layers = $texture->layers() as uint32;
-    uint32 $levels = $texture->mips as uint32;
+    uint32 $levels = $texture->desc->mips as uint32;
     vk::Image $image = $texture->handle->image;
     vkRecordBarrier($cmd, $image, $texture->state, .transferDst, $aspect);
     int32 $level = 1;
 
-    while ($level < $texture->mips) {
+    while ($level < $texture->desc->mips) {
         int32 $srcLevel = $level - 1;
         vkRecordBarrierRange(
             $cmd,
@@ -33,8 +33,8 @@ internal function vkRecordMipChain(vk::CommandBuffer $cmd, Texture $texture) : v
         $blit->srcSubresource->baseArrayLayer = 0;
         $blit->srcSubresource->layerCount = $layers;
         $blit->srcOffsets[1] = vk::Offset3D(
-            mipSize($texture->width, $srcLevel),
-            mipSize($texture->height, $srcLevel),
+            mipSize($texture->desc->width, $srcLevel),
+            mipSize($texture->desc->height, $srcLevel),
             1
         );
         $blit->dstSubresource->aspectMask = $aspect;
@@ -42,8 +42,8 @@ internal function vkRecordMipChain(vk::CommandBuffer $cmd, Texture $texture) : v
         $blit->dstSubresource->baseArrayLayer = 0;
         $blit->dstSubresource->layerCount = $layers;
         $blit->dstOffsets[1] = vk::Offset3D(
-            mipSize($texture->width, $level),
-            mipSize($texture->height, $level),
+            mipSize($texture->desc->width, $level),
+            mipSize($texture->desc->height, $level),
             1
         );
         vk::CmdBlitImage(

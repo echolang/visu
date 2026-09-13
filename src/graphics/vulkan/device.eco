@@ -319,13 +319,13 @@ public class Device : DeviceProtocol
             true,
             0 as uint64
         );
-        Texture $bb = Texture(
-            imported: $this,
-            $th,
-            $this->bbFormat,
-            $this->extent->width as int32,
-            $this->extent->height as int32
+        TextureDesc $bbDesc = TextureDesc(
+            $format: $this->bbFormat,
+            $width: $this->extent->width as int32,
+            $height: $this->extent->height as int32
         );
+        $bbDesc->usage = 0 as uint32;
+        Texture $bb = Texture(imported: $this, $th, $bbDesc);
         $bb->state = .undefined;
         $this->bb = $bb;
         $this->inFrame = true;
@@ -476,7 +476,7 @@ public class Device : DeviceProtocol
             // clearing one face of a cube must not throw the others away
             if ($color->load != LoadOp::load
                 && $color->texture->layers() == 1
-                && $color->texture->mips == 1) {
+                && $color->texture->desc->mips == 1) {
                 $from = .undefined;
             }
 
@@ -485,7 +485,7 @@ public class Device : DeviceProtocol
                 $color->texture->handle->image,
                 $from,
                 .colorTarget,
-                vkAspect($color->texture->format)
+                vkAspect($color->texture->desc->format)
             );
             $color->texture->state = .colorTarget;
             $atts[$i] = vk::RenderingAttachmentInfo();
@@ -497,7 +497,7 @@ public class Device : DeviceProtocol
             $atts[$i]->clearValue->color->float32[1] = $color->clear->y;
             $atts[$i]->clearValue->color->float32[2] = $color->clear->z;
             $atts[$i]->clearValue->color->float32[3] = $color->clear->w;
-            $formats->colors[$i] = $color->texture->format;
+            $formats->colors[$i] = $color->texture->desc->format;
             $i = $i + 1;
         }
 
@@ -516,7 +516,7 @@ public class Device : DeviceProtocol
             $this->encoderOpen = true;
             return RenderEncoder($this, $formats, $passWidth, $passHeight);
         }
-        $formats->depth = $depth->texture->format;
+        $formats->depth = $depth->texture->desc->format;
         $formats->hasDepth = true;
         ResourceState $depthFrom = $depth->texture->state;
 
@@ -529,7 +529,7 @@ public class Device : DeviceProtocol
             $depth->texture->handle->image,
             $depthFrom,
             .depthTarget,
-            vkAspect($depth->texture->format)
+            vkAspect($depth->texture->desc->format)
         );
         $depth->texture->state = .depthTarget;
         vk::RenderingAttachmentInfo $depthAtt = vk::RenderingAttachmentInfo();
@@ -552,7 +552,7 @@ public class Device : DeviceProtocol
             return;
         }
 
-        vkBarrier($this, $texture->handle->image, $texture->state, $to, vkAspect($texture->format));
+        vkBarrier($this, $texture->handle->image, $texture->state, $to, vkAspect($texture->desc->format));
         $texture->state = $to;
     }
 
@@ -592,7 +592,7 @@ public class Device : DeviceProtocol
         $dst->state = .shaderRead;
 
         if ($srcPrev != ResourceState::undefined && $srcPrev != ResourceState::transferSrc) {
-            vkOneShotImageBarrier($this, $src->handle->image, .transferSrc, $srcPrev, vkAspect($src->format));
+            vkOneShotImageBarrier($this, $src->handle->image, .transferSrc, $srcPrev, vkAspect($src->desc->format));
             $src->state = $srcPrev;
         }
 

@@ -4,7 +4,7 @@
  *
  * A cube is six square slices in the order +X -X +Y -Y +Z -Z:
  * `upload(face:)` writes one, `ColorTarget(tex, face:)` renders into
- * one, and sampling takes a direction.
+ * one, and sampling takes a direction. Identity is `$desc`.
  */
 
 namespace visu::graphics;
@@ -14,12 +14,7 @@ public class Texture : GpuObject
     public Device $device;
     public TextureHandle $handle;
     public ResourceState $state;
-    public const PixelFormat $format;
-    public const int32 $width;
-    public const int32 $height;
-    public const uint32 $usage;
-    public const TextureKind $kind;
-    public const int32 $mips;
+    public const TextureDesc $desc;
     public const bool $imported;
     private bool $dead;
 
@@ -29,18 +24,11 @@ public class Texture : GpuObject
             $desc->label = $name;
         }
 
-        TextureHandle $handle = textureCreate($device, $desc);
         $this->device = $device;
-        $this->handle = $handle;
-        $this->state = .undefined;
-        $this->format = $desc->format;
-        $this->width = $desc->width;
-        $this->height = $desc->height;
-        $this->usage = $desc->usage;
-        $this->kind = $desc->kind;
-        $this->mips = $desc->mips;
+        $this->handle = textureCreate($device, $desc);
+        $this->desc = $desc;
         $this->imported = false;
-        $this->dead = false;
+        $this->state = .undefined;
     }
 
     /** decoded PNG straight to an rgba8 texture, ready to sample */
@@ -50,17 +38,11 @@ public class Texture : GpuObject
         TextureDesc $desc = TextureDesc($format: .rgba8, $width: $pixels->width, $height: $pixels->height);
         $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
         $desc->label = $name;
-        TextureHandle $handle = textureCreate($device, $desc);
         $this->device = $device;
-        $this->handle = $handle;
-        $this->state = .undefined;
-        $this->format = $desc->format;
-        $this->width = $desc->width;
-        $this->height = $desc->height;
-        $this->usage = $desc->usage;
-        $this->kind = $desc->kind;
-        $this->mips = $desc->mips;
+        $this->handle = textureCreate($device, $desc);
+        $this->desc = $desc;
         $this->imported = false;
+        $this->state = .undefined;
         $this->dead = false;
         $this->upload(
             0,
@@ -81,17 +63,11 @@ public class Texture : GpuObject
         TextureDesc $desc = TextureDesc($format: .rgba16f, $width: $pixels->width, $height: $pixels->height);
         $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
         $desc->label = $name;
-        TextureHandle $handle = textureCreate($device, $desc);
         $this->device = $device;
-        $this->handle = $handle;
-        $this->state = .undefined;
-        $this->format = $desc->format;
-        $this->width = $desc->width;
-        $this->height = $desc->height;
-        $this->usage = $desc->usage;
-        $this->kind = $desc->kind;
-        $this->mips = $desc->mips;
+        $this->handle = textureCreate($device, $desc);
+        $this->desc = $desc;
         $this->imported = false;
+        $this->state = .undefined;
         $this->dead = false;
         array<uint16> $halves = pixelsToHalf($pixels->rgba);
         $this->upload(
@@ -102,29 +78,28 @@ public class Texture : GpuObject
         );
     }
 
-    public constructor(imported: Device $device, TextureHandle $handle, PixelFormat $format, int32 $width, int32 $height)
+    public constructor(imported: Device $device, TextureHandle $handle, TextureDesc $desc)
     {
         $this->device = $device;
         $this->handle = $handle;
-        $this->state = .undefined;
-        $this->format = $format;
-        $this->width = $width;
-        $this->height = $height;
-        $this->usage = 0 as uint32;
-        $this->kind = .texture2D;
-        $this->mips = 1;
+        $this->desc = $desc;
         $this->imported = true;
+        $this->state = .undefined;
+    }
+
+    init
+    {
         $this->dead = false;
     }
 
     public const function layers() : int32
     {
-        return $this->kind->layers();
+        return $this->desc->kind->layers();
     }
 
     public const function cube() : bool
     {
-        return $this->kind == TextureKind::cube;
+        return $this->desc->kind == TextureKind::cube;
     }
 
     destructor()
@@ -186,11 +161,11 @@ public class Texture : GpuObject
             return .error(.imported);
         }
 
-        if (($this->usage & TEXTURE_TRANSFER_SRC) == 0) {
+        if (($this->desc->usage & TEXTURE_TRANSFER_SRC) == 0) {
             return .error(.device(.missingUsage));
         }
 
-        if ($face < 0 || $face >= $this->layers() || $mip < 0 || $mip >= $this->mips) {
+        if ($face < 0 || $face >= $this->layers() || $mip < 0 || $mip >= $this->desc->mips) {
             return .error(.empty);
         }
 
@@ -198,9 +173,9 @@ public class Texture : GpuObject
             return .error(.device($e));
         }
         return Pixels::from(
-            $this->format,
-            mipSize($this->width, $mip),
-            mipSize($this->height, $mip),
+            $this->desc->format,
+            mipSize($this->desc->width, $mip),
+            mipSize($this->desc->height, $mip),
             $raw
         );
     }
@@ -226,12 +201,12 @@ public class Texture : GpuObject
      */
     public function snapshot() : result<Texture, DumpError>
     {
-        TextureDesc $desc = TextureDesc($format: .rgba8, $width: $this->width, $height: $this->height);
+        TextureDesc $desc = TextureDesc($format: .rgba8, $width: $this->desc->width, $height: $this->desc->height);
         $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
         $desc->label = 'snapshot';
         Texture $dst = Texture($this->device, 'snapshot', $desc);
 
-        if ($this->format == PixelFormat::rgba8) {
+        if ($this->desc->format == PixelFormat::rgba8) {
             guard $this->device->copyTexture($this, $dst) else ($e) {
                 $dst->destroy();
                 return .error(.device($e));
@@ -270,19 +245,19 @@ internal function textureCopyOk(Texture $src, Texture $dst) : status<DeviceError
         return .error(.missingUsage);
     }
 
-    if ($src->format->isDepth() || $dst->format->isDepth()) {
-        return .error(.unsupportedFormat($src->format));
+    if ($src->desc->format->isDepth() || $dst->desc->format->isDepth()) {
+        return .error(.unsupportedFormat($src->desc->format));
     }
 
-    if ($src->format != $dst->format) {
-        return .error(.unsupportedFormat($src->format));
+    if ($src->desc->format != $dst->desc->format) {
+        return .error(.unsupportedFormat($src->desc->format));
     }
 
-    if ($src->width != $dst->width || $src->height != $dst->height) {
+    if ($src->desc->width != $dst->desc->width || $src->desc->height != $dst->desc->height) {
         return .error(.sizeMismatch);
     }
 
-    if (($src->usage & TEXTURE_TRANSFER_SRC) == 0 || ($dst->usage & TEXTURE_TRANSFER_DST) == 0) {
+    if (($src->desc->usage & TEXTURE_TRANSFER_SRC) == 0 || ($dst->desc->usage & TEXTURE_TRANSFER_DST) == 0) {
         return .error(.missingUsage);
     }
 

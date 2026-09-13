@@ -1,6 +1,6 @@
 /**
- * Graph-side texture create-info. `desc` / `sampler` feed the
- * device types; identity for the pool fingerprint is `key()`.
+ * Graph-side texture create-info. Size and usage are filled when
+ * the pool allocates; identity for the pool fingerprint is `key()`.
  */
 
 namespace visu::graphics;
@@ -9,18 +9,20 @@ public struct TextureOptions
 {
     public PixelFormat $format = .rgba8;
     public TextureKind $kind = .texture2D;
-    public Filter $min = .linear;
-    public Filter $mag = .linear;
-    public Wrap $wrapS = .clampToEdge;
-    public Wrap $wrapT = .clampToEdge;
     public int32 $mips = 1;
 
     /**
-     * Depth attachment defaults: depth32f, nearest, clamp, one mip.
+     * Depth attachment defaults: depth32f, one mip.
      */
     public static function depth() : TextureOptions
     {
-        return TextureOptions($format: .depth32f, $min: .nearest, $mag: .nearest);
+        return TextureOptions($format: .depth32f);
+    }
+
+    /** graph options for an already-created GPU texture */
+    public static function from(const TextureDesc& $desc) : TextureOptions
+    {
+        return TextureOptions($format: $desc->format, $kind: $desc->kind, $mips: $desc->mips);
     }
 
     public const function desc(int32 $width, int32 $height) : TextureDesc
@@ -31,24 +33,10 @@ public struct TextureOptions
         return $d;
     }
 
-    public const function sampler() : SamplerDesc
-    {
-        SamplerDesc $s = SamplerDesc();
-        $s->min = $this->min;
-        $s->mag = $this->mag;
-        $s->wrapS = $this->wrapS;
-        $s->wrapT = $this->wrapT;
-        return $s;
-    }
-
     public const function key() : string
     {
         int32 $fmt = pixelCode($this->format);
-        int32 $min = filterCode($this->min);
-        int32 $mag = filterCode($this->mag);
-        int32 $ws = wrapCode($this->wrapS);
-        int32 $wt = wrapCode($this->wrapT);
         int32 $kind = kindCode($this->kind);
-        return "{$fmt}|{$min}|{$mag}|{$ws}|{$wt}|{$this->mips}|{$kind}";
+        return "{$fmt}|{$this->mips}|{$kind}";
     }
 }

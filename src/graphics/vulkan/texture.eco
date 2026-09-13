@@ -147,8 +147,8 @@ internal function vkUploadTexture(
     assert(!$device->encoderOpen, 'uploadTexture with an open encoder');
     assert($bytes > 0, 'uploadTexture size');
     assert($layer >= 0 && $layer < $texture->layers(), 'uploadTexture layer');
-    uint32 $bpp = pixelByteCount($texture->format);
-    int32 $w = mipSize($texture->width, $mip);
+    uint32 $bpp = pixelByteCount($texture->desc->format);
+    int32 $w = mipSize($texture->desc->width, $mip);
     uint64 $row = $bytesPerRow as uint64;
 
     if ($row == 0) {
@@ -191,15 +191,15 @@ internal function vkReadbackTexture(
     assert(!$device->encoderOpen, 'readbackTexture with an open encoder');
     assert(!$device->inFrame, 'readbackTexture inside a frame');
 
-    if ($texture->imported || ($texture->usage & TEXTURE_TRANSFER_SRC) == 0) {
+    if ($texture->imported || ($texture->desc->usage & TEXTURE_TRANSFER_SRC) == 0) {
         return .error(.missingUsage);
     }
 
-    if ($texture->format->isDepth()) {
-        return .error(.unsupportedFormat($texture->format));
+    if ($texture->desc->format->isDepth()) {
+        return .error(.unsupportedFormat($texture->desc->format));
     }
 
-    uint32 $bpp = pixelByteCount($texture->format);
+    uint32 $bpp = pixelByteCount($texture->desc->format);
     $device->waitIdle();
     vk::PhysicalDeviceProperties $props = vk::PhysicalDeviceProperties();
     vk::GetPhysicalDeviceProperties($device->physical, &$props);
@@ -209,8 +209,8 @@ internal function vkReadbackTexture(
         $align = 4;
     }
 
-    int32 $width = mipSize($texture->width, $mip);
-    int32 $height = mipSize($texture->height, $mip);
+    int32 $width = mipSize($texture->desc->width, $mip);
+    int32 $height = mipSize($texture->desc->height, $mip);
     uint64 $rowBytes = ($width as uint64) * ($bpp as uint64);
     uint64 $pitched = alignUp($rowBytes, $align);
     uint64 $total = $pitched * ($height as uint64);
@@ -254,7 +254,7 @@ internal function vkReadbackTexture(
     vk::FreeMemory($device->logical, $staging->memory, null);
 
     if ($prev != ResourceState::undefined && $prev != ResourceState::transferSrc) {
-        vkOneShotImageBarrier($device, $texture->handle->image, .transferSrc, $prev, vkAspect($texture->format));
+        vkOneShotImageBarrier($device, $texture->handle->image, .transferSrc, $prev, vkAspect($texture->desc->format));
         $texture->state = $prev;
     }
 
@@ -265,9 +265,9 @@ internal function vkGenerateMipmaps(Device $device, Texture $texture) : void
 {
     assert($device->logical->handle != 0, 'generateMipmaps before initialize');
     assert(!$device->encoderOpen, 'generateMipmaps with an open encoder');
-    assert($texture->mips > 1, 'generateMipmaps needs mips > 1');
+    assert($texture->desc->mips > 1, 'generateMipmaps needs mips > 1');
     uint32 $needed = TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
-    assert(($texture->usage & $needed) == $needed, 'generateMipmaps needs transfer usage');
+    assert(($texture->desc->usage & $needed) == $needed, 'generateMipmaps needs transfer usage');
 
     // inside a frame the source mip was written by the frame's own
     // command buffer; the setup buffer would run before it
