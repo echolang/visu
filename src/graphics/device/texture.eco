@@ -1,6 +1,10 @@
 /**
- * A 2D GPU texture. Stores Device; destroy() defers through the
- * handle. Swapchain images use the `imported:` constructor.
+ * A GPU texture, 2D or cube. Stores Device; destroy() defers through
+ * the handle. Swapchain images use the `imported:` constructor.
+ *
+ * A cube is six square slices in the order +X -X +Y -Y +Z -Z:
+ * `upload(face:)` writes one, `ColorTarget(tex, face:)` renders into
+ * one, and sampling takes a direction.
  */
 
 namespace visu::graphics;
@@ -14,6 +18,8 @@ public class Texture : GpuObject
     public const int32 $width;
     public const int32 $height;
     public const uint32 $usage;
+    public const TextureKind $kind;
+    public const int32 $mips;
     public const bool $imported;
     private bool $dead;
 
@@ -23,10 +29,7 @@ public class Texture : GpuObject
             $desc->label = $name;
         }
 
-        result<TextureHandle, DeviceError> $made = $device->createTexture($desc);
-        TextureHandle $handle = guard $made else ($e) {
-            die($e->message());
-        }
+        TextureHandle $handle = textureCreate($device, $desc);
         $this->device = $device;
         $this->handle = $handle;
         $this->state = .undefined;
@@ -34,8 +37,69 @@ public class Texture : GpuObject
         $this->width = $desc->width;
         $this->height = $desc->height;
         $this->usage = $desc->usage;
+        $this->kind = $desc->kind;
+        $this->mips = $desc->mips;
         $this->imported = false;
         $this->dead = false;
+    }
+
+    /** decoded PNG straight to an rgba8 texture, ready to sample */
+    public constructor(Device $device, string $name, const Pixels& $pixels)
+    {
+        assert($pixels->width > 0 && $pixels->height > 0, 'Texture: empty pixels');
+        TextureDesc $desc = TextureDesc($format: .rgba8, $width: $pixels->width, $height: $pixels->height);
+        $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+        $desc->label = $name;
+        TextureHandle $handle = textureCreate($device, $desc);
+        $this->device = $device;
+        $this->handle = $handle;
+        $this->state = .undefined;
+        $this->format = $desc->format;
+        $this->width = $desc->width;
+        $this->height = $desc->height;
+        $this->usage = $desc->usage;
+        $this->kind = $desc->kind;
+        $this->mips = $desc->mips;
+        $this->imported = false;
+        $this->dead = false;
+        $this->upload(
+            0,
+            ptr<const uint8>(&$pixels->rgba[0]),
+            $pixels->rgba->count() as uint64,
+            $pixels->width * 4
+        );
+    }
+
+    /**
+     * Radiance image to an rgba16f texture. Half floats, not full: a
+     * 32-bit float texture is not linearly filterable on every driver
+     * and samples black there, and 65504 is the range an HDRI needs.
+     */
+    public constructor(Device $device, string $name, const HdrPixels& $pixels)
+    {
+        assert($pixels->width > 0 && $pixels->height > 0, 'Texture: empty pixels');
+        TextureDesc $desc = TextureDesc($format: .rgba16f, $width: $pixels->width, $height: $pixels->height);
+        $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+        $desc->label = $name;
+        TextureHandle $handle = textureCreate($device, $desc);
+        $this->device = $device;
+        $this->handle = $handle;
+        $this->state = .undefined;
+        $this->format = $desc->format;
+        $this->width = $desc->width;
+        $this->height = $desc->height;
+        $this->usage = $desc->usage;
+        $this->kind = $desc->kind;
+        $this->mips = $desc->mips;
+        $this->imported = false;
+        $this->dead = false;
+        array<uint16> $halves = pixelsToHalf($pixels->rgba);
+        $this->upload(
+            0,
+            ptr<const uint8>(ptr<const uint8>(&$halves[0])),
+            ($halves->count() as uint64) * 2,
+            $pixels->width * 8
+        );
     }
 
     public constructor(imported: Device $device, TextureHandle $handle, PixelFormat $format, int32 $width, int32 $height)
@@ -47,8 +111,20 @@ public class Texture : GpuObject
         $this->width = $width;
         $this->height = $height;
         $this->usage = 0 as uint32;
+        $this->kind = .texture2D;
+        $this->mips = 1;
         $this->imported = true;
         $this->dead = false;
+    }
+
+    public const function layers() : int32
+    {
+        return $this->kind->layers();
+    }
+
+    public const function cube() : bool
+    {
+        return $this->kind == TextureKind::cube;
     }
 
     destructor()
@@ -73,13 +149,38 @@ public class Texture : GpuObject
 
     public function upload(int32 $mip, ptr<const uint8> $src, uint64 $bytes, int32 $bytesPerRow = 0) : void
     {
-        $this->device->uploadTexture($this, $mip, $src, $bytes, $bytesPerRow);
+        $this->device->uploadTexture($this, $mip, 0, $src, $bytes, $bytesPerRow);
+    }
+
+    /** one cube face, or one slice of an array texture */
+    public function upload(
+        face: int32 $face,
+        int32 $mip,
+        ptr<const uint8> $src,
+        uint64 $bytes,
+        int32 $bytesPerRow = 0
+    ) : void
+    {
+        assert($face >= 0 && $face < $this->layers(), 'Texture.upload: face out of range');
+        $this->device->uploadTexture($this, $mip, $face, $src, $bytes, $bytesPerRow);
+    }
+
+    /** fills mips 1.. from mip 0; leaves the texture readable */
+    public function generateMipmaps() : void
+    {
+        $this->device->generateMipmaps($this);
     }
 
     /**
      * Readback + swizzle to rgba8. After endFrame; stalls.
      */
     public function capture() : result<Pixels, DumpError>
+    {
+        return $this->capture(face: 0, 0);
+    }
+
+    /** one face and mip; float formats clamp to 0..1 */
+    public function capture(face: int32 $face, int32 $mip = 0) : result<Pixels, DumpError>
     {
         if ($this->imported) {
             return .error(.imported);
@@ -89,10 +190,19 @@ public class Texture : GpuObject
             return .error(.device(.missingUsage));
         }
 
-        array<uint8> $raw = guard $this->device->readbackTexture($this) else ($e) {
+        if ($face < 0 || $face >= $this->layers() || $mip < 0 || $mip >= $this->mips) {
+            return .error(.empty);
+        }
+
+        array<uint8> $raw = guard $this->device->readbackTexture($this, $mip, $face) else ($e) {
             return .error(.device($e));
         }
-        return Pixels::from($this->format, $this->width, $this->height, $raw);
+        return Pixels::from(
+            $this->format,
+            mipSize($this->width, $mip),
+            mipSize($this->height, $mip),
+            $raw
+        );
     }
 
     /**
@@ -100,7 +210,12 @@ public class Texture : GpuObject
      */
     public function dump(const string& $path) : status<DumpError>
     {
-        Pixels $px = guard $this->capture() else ($e) {
+        return $this->dump($path, face: 0, 0);
+    }
+
+    public function dump(const string& $path, face: int32 $face, int32 $mip = 0) : status<DumpError>
+    {
+        Pixels $px = guard $this->capture(face: $face, $mip) else ($e) {
             return .error($e);
         }
         return $px->write($path);
@@ -138,6 +253,15 @@ public class Texture : GpuObject
         $dst->upload(0, ptr<const uint8>(&$px->rgba[0]), $bytes);
         return .ok($dst);
     }
+}
+
+internal function textureCreate(Device $device, const TextureDesc& $desc) : TextureHandle
+{
+    TextureHandle $handle = guard $device->createTexture($desc) else ($e) {
+        die($e->message());
+    }
+
+    return $handle;
 }
 
 internal function textureCopyOk(Texture $src, Texture $dst) : status<DeviceError>

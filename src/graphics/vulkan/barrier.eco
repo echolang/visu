@@ -53,12 +53,42 @@ internal function layoutInfo(ResourceState $state) : LayoutInfo
     };
 }
 
+/**
+ * Whole-image transition. `Texture.state` tracks one state per
+ * texture, so every mip and every layer moves together.
+ */
 internal function vkRecordBarrier(
     vk::CommandBuffer $cmd,
     vk::Image $image,
     ResourceState $from,
     ResourceState $to,
     uint32 $aspect
+) : void
+{
+    vkRecordBarrierRange(
+        $cmd,
+        $image,
+        $from,
+        $to,
+        $aspect,
+        0,
+        vk::REMAINING_MIP_LEVELS,
+        0,
+        vk::REMAINING_ARRAY_LAYERS
+    );
+}
+
+/** part of an image; the mip chain walks levels one at a time */
+internal function vkRecordBarrierRange(
+    vk::CommandBuffer $cmd,
+    vk::Image $image,
+    ResourceState $from,
+    ResourceState $to,
+    uint32 $aspect,
+    uint32 $baseMip,
+    uint32 $levelCount,
+    uint32 $baseLayer,
+    uint32 $layerCount
 ) : void
 {
     LayoutInfo $src = layoutInfo($from);
@@ -72,8 +102,10 @@ internal function vkRecordBarrier(
     $b->dstQueueFamilyIndex = vk::QUEUE_FAMILY_IGNORED;
     $b->image = $image;
     $b->subresourceRange->aspectMask = $aspect;
-    $b->subresourceRange->levelCount = 1;
-    $b->subresourceRange->layerCount = 1;
+    $b->subresourceRange->baseMipLevel = $baseMip;
+    $b->subresourceRange->levelCount = $levelCount;
+    $b->subresourceRange->baseArrayLayer = $baseLayer;
+    $b->subresourceRange->layerCount = $layerCount;
     vk::CmdPipelineBarrier(
         $cmd,
         $src->stage,

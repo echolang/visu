@@ -1,0 +1,75 @@
+/**
+ * Draw-call sorting and bounding-sphere maths. No GPU calls; the
+ * assembler itself needs real meshes, so it is covered by the
+ * `drawcalls` pixel check.
+ */
+
+use visu::graphics::{maxAxisScale, sortByKey, sortKey, worldPoint};
+use visu::math::{Mat4, Vec3, scale, translate};
+
+test dca_sort_key_groups_by_mesh_then_depth
+{
+    uint64 $near = sortKey(1, 10);
+    uint64 $far = sortKey(1, 900);
+    uint64 $other = sortKey(2, 0);
+    assert($near < $far, 'near sorts first inside a mesh');
+    assert($far < $other, 'mesh dominates depth');
+}
+
+test dca_sort_is_stable_and_ordered
+{
+    array<uint32> $values = [0, 1, 2, 3, 4, 5];
+    array<uint64> $keys = [30, 10, 20, 10, 5, 20];
+    sortByKey($values, $keys);
+    assert($values[0] == 4, 'smallest key first');
+    assert($values[1] == 1, 'ties keep submit order');
+    assert($values[2] == 3, 'second of the tie');
+    assert($values[3] == 2, 'next key');
+    assert($values[4] == 5, 'second of that tie');
+    assert($values[5] == 0, 'largest key last');
+}
+
+test dca_sort_handles_odd_lengths
+{
+    array<uint32> $values = [0, 1, 2, 3, 4];
+    array<uint64> $keys = [4, 3, 2, 1, 0];
+    sortByKey($values, $keys);
+    assert($values[0] == 4 && $values[4] == 0, 'reversed');
+}
+
+test dca_sort_leaves_short_arrays_alone
+{
+    array<uint32> $one = [7];
+    array<uint64> $keys = [3];
+    sortByKey($one, $keys);
+    assert($one[0] == 7, 'single element');
+}
+
+test dca_world_point_follows_the_model
+{
+    Mat4 $model = translate(Vec3(2.0f, 3.0f, 4.0f));
+    Vec3 $centre = worldPoint($model, Vec3(1.0f, 0.0f, 0.0f));
+    assert($centre->x == 3.0f, 'x');
+    assert($centre->y == 3.0f, 'y');
+    assert($centre->z == 4.0f, 'z');
+}
+
+test dca_max_axis_scale_picks_the_largest_column
+{
+    assert(maxAxisScale(Mat4()) == 1.0f, 'identity');
+    Mat4 $scaled = scale(Vec3(1.0f, 4.0f, 2.0f));
+    assert(maxAxisScale($scaled) == 4.0f, 'largest axis');
+    Mat4 $moved = translate(Vec3(50.0f, 0.0f, 0.0f));
+    assert(maxAxisScale($moved) == 1.0f, 'translation does not scale');
+}
+
+test dca_sort_reads_keys_by_value_not_position
+{
+    // what culling produces: a sparse value set into a dense key table
+    array<uint32> $values = [1, 4, 5];
+    array<uint64> $keys = [99, 30, 99, 99, 10, 20];
+    sortByKey($values, $keys);
+    assert($values[0] == 4, 'smallest key of the visible set');
+    assert($values[1] == 5, 'middle');
+    assert($values[2] == 1, 'largest');
+}

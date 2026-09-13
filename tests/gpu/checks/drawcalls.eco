@@ -1,0 +1,125 @@
+/**
+ * DrawCallAssembler end to end: two meshes, four submissions, two of
+ * them outside the frustum. Two merged commands survive and paint
+ * their halves of the target.
+ */
+
+use visu::geo::{AABB, Frustum};
+use visu::graphics::{
+    CallbackPass, ClearPass, ClearPassOptions, Context, Device, DrawCallAssembler,
+    Frame, GpuPass, IoSink, Mesh, MeshHandle, Pipeline, PipelineError, Raster,
+    RenderEncoder, ShaderCollection, TargetRef, VertexBuilder, VertexLayout,
+    instanceLayout
+};
+use visu::math::{Mat4, Vec3, Vec4, translate};
+
+public struct DcaColor
+{
+    public Vec4 $color;
+}
+
+public struct DcaParams
+{
+    public Mat4 $projectionView;
+}
+
+public function checkDrawCalls(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('dcainst') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    Mesh $mesh = dcaQuad($gpu->device);
+    AABB $bounds = AABB(Vec3(-0.4f, -0.4f, 0.0f), Vec3(0.4f, 0.4f, 0.0f));
+    DrawCallAssembler<DcaColor> $dca = DrawCallAssembler<DcaColor>($gpu->device);
+    MeshHandle $left = $dca->register($mesh, $bounds);
+    MeshHandle $right = $dca->register($mesh, $bounds);
+    assert($dca->meshCount() == 2, 'two meshes');
+
+    // interleave so merging has to reorder, and put two far off to the
+    // side — a culled one first, so a survivor's sort key sits past the
+    // end of the visible set unless keys are read by submission index
+    $dca->submit($left, translate(Vec3(-50.0f, 0.0f, 0.5f)), DcaColor(Vec4(0.0f, 0.0f, 1.0f, 1.0f)));
+    $dca->submit($right, translate(Vec3(0.5f, 0.0f, 0.5f)), DcaColor(Vec4(0.0f, 1.0f, 0.0f, 1.0f)));
+    $dca->submit($right, translate(Vec3(50.0f, 0.0f, 0.5f)), DcaColor(Vec4(0.0f, 0.0f, 1.0f, 1.0f)));
+    $dca->submit($left, translate(Vec3(-0.5f, 0.0f, 0.5f)), DcaColor(Vec4(1.0f, 0.0f, 0.0f, 1.0f)));
+    assert($dca->pendingCount() == 4, 'four submissions');
+
+    Mat4 $identity = Mat4();
+    int32 $commands = $dca->build(Frustum(zeroOne: $identity), Vec3(0.0f, 0.0f, -1.0f));
+    assert($commands == 2, 'two commands survive');
+    assert($dca->commandCount() == 2, 'command count');
+    assert($dca->instanceCount() == 2, 'instance count');
+    assert($dca->culledCount() == 2, 'two culled');
+    assert($dca->command(0)->instanceOffset == 0, 'first offset');
+    assert($dca->command(1)->instanceOffset == 1, 'second offset');
+
+    VertexLayout $layout = VertexLayout::pos3n3()->join(
+        instanceLayout<DcaColor>(2, function(VertexBuilder $b, ptr<const DcaColor> $p) : void {
+            $b->attr(6, &$p->color);
+        })
+    );
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'dca');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'dca-draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(Context $ctx) : status<PipelineError> {
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                GpuPass $pass = GpuPass($ref->program(), $layout, Raster::none());
+                $enc->upload(DcaParams($identity), slot: 0);
+                $dca->execute($enc, $pass);
+                $enc->endRender();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('dca');
+    $shaders->destroy();
+    $mesh->destroy();
+    usize $leftPixel = ((64 * 32 + 16) * 4) as usize;
+    usize $rightPixel = ((64 * 32 + 48) * 4) as usize;
+    assert($pixels[$leftPixel] > 240, 'left instance is red');
+    assert($pixels[$leftPixel + 1] < 16, 'left instance has no green');
+    assert($pixels[$rightPixel] < 16, 'right instance has no red');
+    assert($pixels[$rightPixel + 1] > 240, 'right instance is green');
+}
+
+/** unit quad, position + normal, two triangles */
+internal function dcaQuad(Device $device) : Mesh
+{
+    array<float32> $verts = [
+        -0.4f, -0.4f, 0.0f, 0.0f, 0.0f, 1.0f,
+        0.4f, -0.4f, 0.0f, 0.0f, 0.0f, 1.0f,
+        0.4f, 0.4f, 0.0f, 0.0f, 0.0f, 1.0f,
+        -0.4f, -0.4f, 0.0f, 0.0f, 0.0f, 1.0f,
+        0.4f, 0.4f, 0.0f, 0.0f, 0.0f, 1.0f,
+        -0.4f, 0.4f, 0.0f, 0.0f, 0.0f, 1.0f
+    ];
+    return Mesh($device, $verts, stride: (mem::size<float32>() as int32) * 6);
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_draw_calls
+{
+    GpuContext $gpu = gpuHidden('dca');
+    checkDrawCalls($gpu);
+    $gpu->end();
+}
+#[end]

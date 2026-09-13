@@ -333,26 +333,16 @@ internal function vkBeginSetup(Device $device) : vk::CommandBuffer
     return $cmd;
 }
 
-internal function vkMipSize(int32 $base, int32 $mip) : int32
-{
-    int32 $s = $base >> $mip;
-
-    if ($s < 1) {
-        return 1;
-    }
-
-    return $s;
-}
-
 internal function vkFillBufferImageCopy(
     Texture $texture,
     int32 $mip,
+    int32 $layer,
     uint64 $rowBytes,
     uint32 $bpp
 ) : vk::BufferImageCopy
 {
     vk::BufferImageCopy $region = vk::BufferImageCopy();
-    int32 $w = vkMipSize($texture->width, $mip);
+    int32 $w = mipSize($texture->width, $mip);
     uint64 $tight = ($w as uint64) * ($bpp as uint64);
 
     if ($rowBytes > $tight) {
@@ -361,9 +351,10 @@ internal function vkFillBufferImageCopy(
 
     $region->imageSubresource->aspectMask = vkAspect($texture->format);
     $region->imageSubresource->mipLevel = $mip as uint32;
+    $region->imageSubresource->baseArrayLayer = $layer as uint32;
     $region->imageSubresource->layerCount = 1;
     $region->imageExtent->width = $w as uint32;
-    $region->imageExtent->height = vkMipSize($texture->height, $mip) as uint32;
+    $region->imageExtent->height = mipSize($texture->height, $mip) as uint32;
     $region->imageExtent->depth = 1;
     return $region;
 }
@@ -372,13 +363,15 @@ internal function vkOneShotCopyImageToBuffer(
     Device $device,
     Texture $texture,
     BufferHandle $dst,
+    int32 $mip,
+    int32 $layer,
     uint64 $rowBytes,
     uint32 $bpp
 ) : void
 {
     vk::CommandBuffer $cmd = vkBeginSetup($device);
     vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferSrc, vkAspect($texture->format));
-    vk::BufferImageCopy $region = vkFillBufferImageCopy($texture, 0, $rowBytes, $bpp);
+    vk::BufferImageCopy $region = vkFillBufferImageCopy($texture, $mip, $layer, $rowBytes, $bpp);
     vk::CmdCopyImageToBuffer(
         $cmd,
         $texture->handle->image,
@@ -399,13 +392,14 @@ internal function vkOneShotCopyBufferToImage(
     BufferHandle $src,
     Texture $texture,
     int32 $mip,
+    int32 $layer,
     uint64 $rowBytes,
     uint32 $bpp
 ) : void
 {
     vk::CommandBuffer $cmd = vkBeginSetup($device);
     vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferDst, vkAspect($texture->format));
-    vk::BufferImageCopy $region = vkFillBufferImageCopy($texture, $mip, $rowBytes, $bpp);
+    vk::BufferImageCopy $region = vkFillBufferImageCopy($texture, $mip, $layer, $rowBytes, $bpp);
     vk::CmdCopyBufferToImage(
         $cmd,
         $src->buffer,

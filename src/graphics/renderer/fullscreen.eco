@@ -26,11 +26,13 @@ public class FullscreenTextureRenderer
     public function load(Device $device) : status<ShaderError>
     {
         $this->destroy();
-        ShaderProgram $program = guard ShaderProgram::link(
+        ShaderProgram $program = guard bakedProgram(
             $device,
-            'fullscreen-blit',
-            blitVertexBytes(),
-            blitFragmentBytes()
+            'blit',
+            function(string $name, ShaderKind $kind) : string? {
+                return blitBytes($name, $kind);
+            },
+            label: 'fullscreen-blit'
         ) else ($e) {
             return .error($e);
         }
@@ -78,59 +80,4 @@ public class FullscreenTextureRenderer
         $held->destroy();
         $this->program = null;
     }
-}
-
-#[if: os == darwin && !VISU_BACKEND_VULKAN]
-internal function blitVertexBytes() : string
-{
-    return blitVertexSource();
-}
-
-internal function blitFragmentBytes() : string
-{
-    return blitFragmentSource();
-}
-#[else]
-internal function blitVertexBytes() : string
-{
-    return hexBytes(blitVertexSpvHex());
-}
-
-internal function blitFragmentBytes() : string
-{
-    return hexBytes(blitFragmentSpvHex());
-}
-#[end]
-
-internal function hexBytes(string $hex) : string
-{
-    string $out = '';
-    usize $i = 0;
-    usize $n = $hex->size();
-
-    while ($i + 1 < $n) {
-        uint8 $hi = hexNibble($hex->byte($i));
-        uint8 $lo = hexNibble($hex->byte($i + 1));
-        $out->push(($hi << 4) | $lo);
-        $i = $i + 2;
-    }
-
-    return $out;
-}
-
-internal function hexNibble(uint8 $b) : uint8
-{
-    if ($b >= 48 && $b <= 57) {
-        return $b - 48;
-    }
-
-    if ($b >= 97 && $b <= 102) {
-        return $b - 87;
-    }
-
-    if ($b >= 65 && $b <= 70) {
-        return $b - 55;
-    }
-
-    return 0;
 }

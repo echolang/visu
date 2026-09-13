@@ -314,6 +314,7 @@ public class Device : DeviceProtocol
         TextureHandle $th = TextureHandle(
             $this->images[$index],
             $this->views[$index],
+            array<vk::ImageView>(),
             vk::DeviceMemory::none(),
             true,
             0 as uint64
@@ -468,9 +469,14 @@ public class Device : DeviceProtocol
 
         while ($i < $n) {
             ColorTarget $color = $desc->colors[$i as usize];
+            $color->validate();
             ResourceState $from = $color->texture->state;
 
-            if ($color->load != LoadOp::load) {
+            // discarding is only safe when the pass covers the whole image;
+            // clearing one face of a cube must not throw the others away
+            if ($color->load != LoadOp::load
+                && $color->texture->layers() == 1
+                && $color->texture->mips == 1) {
                 $from = .undefined;
             }
 
@@ -483,7 +489,7 @@ public class Device : DeviceProtocol
             );
             $color->texture->state = .colorTarget;
             $atts[$i] = vk::RenderingAttachmentInfo();
-            $atts[$i]->imageView = $color->texture->handle->view;
+            $atts[$i]->imageView = vkAttachmentView($color->texture, $color->face, $color->mip);
             $atts[$i]->imageLayout = vk::IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             $atts[$i]->loadOp = vkLoadOp($color->load);
             $atts[$i]->storeOp = vkStoreOp($color->store);
@@ -498,15 +504,17 @@ public class Device : DeviceProtocol
         $formats->colorCount = $n;
         $formats->samples = .one;
         ColorTarget $first = $desc->colors[0];
+        int32 $passWidth = $first->width();
+        int32 $passHeight = $first->height();
         vk::RenderingInfo $info = vk::RenderingInfo();
-        $info->renderArea->extent = vk::Extent2D($first->texture->width as uint32, $first->texture->height as uint32);
+        $info->renderArea->extent = vk::Extent2D($passWidth as uint32, $passHeight as uint32);
         $info->layerCount = 1;
         $info->colorAttachmentCount = $n;
         $info->pColorAttachments:$ = &$atts[0];
         DepthTarget $depth = guard $desc->depth else {
             vk::CmdBeginRendering($this->currentCmd(), &$info);
             $this->encoderOpen = true;
-            return RenderEncoder($this, $formats, $first->texture->width, $first->texture->height);
+            return RenderEncoder($this, $formats, $passWidth, $passHeight);
         }
         $formats->depth = $depth->texture->format;
         $formats->hasDepth = true;
@@ -533,7 +541,7 @@ public class Device : DeviceProtocol
         $info->pDepthAttachment:$ = &$depthAtt;
         vk::CmdBeginRendering($this->currentCmd(), &$info);
         $this->encoderOpen = true;
-        return RenderEncoder($this, $formats, $first->texture->width, $first->texture->height);
+        return RenderEncoder($this, $formats, $passWidth, $passHeight);
     }
 
     public function transitionTexture(Texture $texture, ResourceState $to) : void
@@ -564,78 +572,9 @@ public class Device : DeviceProtocol
         return $this->slots[$this->slot]->ring->bump($bytes, $a, $this->slot);
     }
 
-    public function readbackTexture(Texture $texture) : result<array<uint8>, DeviceError>
+    public function readbackTexture(Texture $texture, int32 $mip, int32 $layer) : result<array<uint8>, DeviceError>
     {
-        assert($this->logical->handle != 0, 'readbackTexture before initialize');
-        assert(!$this->encoderOpen, 'readbackTexture with an open encoder');
-        assert(!$this->inFrame, 'readbackTexture inside a frame');
-
-        if ($texture->imported || ($texture->usage & TEXTURE_TRANSFER_SRC) == 0) {
-            return .error(.missingUsage);
-        }
-
-        if ($texture->format->isDepth()) {
-            return .error(.unsupportedFormat($texture->format));
-        }
-
-        uint32 $bpp = pixelByteCount($texture->format);
-        $this->waitIdle();
-        vk::PhysicalDeviceProperties $props = vk::PhysicalDeviceProperties();
-        vk::GetPhysicalDeviceProperties($this->physical, &$props);
-        uint64 $align = $props->limits->optimalBufferCopyRowPitchAlignment;
-
-        if ($align < 4) {
-            $align = 4;
-        }
-
-        uint64 $rowBytes = ($texture->width as uint64) * ($bpp as uint64);
-        uint64 $pitched = alignUp($rowBytes, $align);
-        uint64 $total = $pitched * ($texture->height as uint64);
-        BufferHandle $staging = guard vkCreateBoundBuffer(
-            $this,
-            $total,
-            vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT
-        ) else ($e) {
-            return .error($e);
-        }
-
-        ResourceState $prev = $texture->state;
-        vkOneShotCopyImageToBuffer($this, $texture, $staging, $pitched, $bpp);
-        $texture->state = .transferSrc;
-        ptr<uint8> $mapped = null;
-        guard vkCheck(
-            vk::MapMemory($this->logical, $staging->memory, 0 as uint64, vk::WHOLE_SIZE, 0, &$mapped),
-            'MapMemory'
-        ) else ($e) {
-            vk::DestroyBuffer($this->logical, $staging->buffer, null);
-            vk::FreeMemory($this->logical, $staging->memory, null);
-            return .error($e);
-        }
-
-        uint64 $tight = $rowBytes * ($texture->height as uint64);
-        array<uint8> $scratch = pixelsFilled($total);
-        mem::copy<uint8>(ptr<uint8>(&$scratch[0]), $mapped, $total);
-        array<uint8> $pixels = pixelsFilled($tight);
-        int32 $y = 0;
-
-        while ($y < $texture->height) {
-            usize $srcOff = (($y as uint64) * $pitched) as usize;
-            usize $dstOff = (($y as uint64) * $rowBytes) as usize;
-            mem::copy<uint8>(ptr<uint8>(&$pixels[$dstOff]), ptr<uint8>(&$scratch[$srcOff]), $rowBytes);
-            $y = $y + 1;
-        }
-
-        vk::UnmapMemory($this->logical, $staging->memory);
-        vk::DestroyBuffer($this->logical, $staging->buffer, null);
-        vk::FreeMemory($this->logical, $staging->memory, null);
-
-        if ($prev != ResourceState::undefined && $prev != ResourceState::transferSrc) {
-            vkOneShotImageBarrier($this, $texture->handle->image, .transferSrc, $prev, vkAspect($texture->format));
-            $texture->state = $prev;
-        }
-
-        return .ok($pixels);
+        return vkReadbackTexture($this, $texture, $mip, $layer);
     }
 
     public function copyTexture(Texture $src, Texture $dst) : status<DeviceError>
@@ -722,150 +661,29 @@ public class Device : DeviceProtocol
 
     public function createTexture(const TextureDesc& $desc) : result<TextureHandle, DeviceError>
     {
-        assert($this->logical->handle != 0, 'createTexture before initialize');
-        uint32 $usage = 0;
-
-        if (($desc->usage & TEXTURE_SAMPLED) != 0) {
-            $usage = $usage | vk::IMAGE_USAGE_SAMPLED_BIT;
-        }
-
-        if (($desc->usage & TEXTURE_TRANSFER_SRC) != 0) {
-            $usage = $usage | vk::IMAGE_USAGE_TRANSFER_SRC_BIT;
-        }
-
-        if (($desc->usage & TEXTURE_TRANSFER_DST) != 0) {
-            $usage = $usage | vk::IMAGE_USAGE_TRANSFER_DST_BIT;
-        }
-
-        if (($desc->usage & TEXTURE_RENDER_TARGET) != 0) {
-            if ($desc->isDepth()) {
-                $usage = $usage | vk::IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-            } else {
-                $usage = $usage | vk::IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-            }
-        }
-
-        vk::ImageCreateInfo $ci = vk::ImageCreateInfo();
-        $ci->imageType = vk::IMAGE_TYPE_2D;
-        $ci->format = vkFormat($desc->format);
-        $ci->extent = vk::Extent3D($desc->width as uint32, $desc->height as uint32, 1 as uint32);
-        $ci->mipLevels = $desc->mips as uint32;
-        $ci->arrayLayers = 1;
-        $ci->samples = vkSampleCount($desc->samples);
-        $ci->tiling = vk::IMAGE_TILING_OPTIMAL;
-        $ci->usage = $usage;
-        $ci->sharingMode = vk::SHARING_MODE_EXCLUSIVE;
-        $ci->initialLayout = vk::IMAGE_LAYOUT_UNDEFINED;
-        vk::Image $image = vk::Image::none();
-        guard vkCheck(vk::CreateImage($this->logical, &$ci, null, &$image), 'CreateImage') else ($e) {
-            return .error($e);
-        }
-
-        vk::MemoryRequirements $req = vk::MemoryRequirements();
-        vk::GetImageMemoryRequirements($this->logical, $image, &$req);
-        vk::DeviceMemory $mem = guard vkAllocMemory($this, $req, vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT) else ($e) {
-            vk::DestroyImage($this->logical, $image, null);
-            return .error($e);
-        }
-
-        guard vkCheck(
-            vk::BindImageMemory($this->logical, $image, $mem, 0 as uint64),
-            'BindImageMemory'
-        ) else ($e) {
-            vk::FreeMemory($this->logical, $mem, null);
-            vk::DestroyImage($this->logical, $image, null);
-            return .error($e);
-        }
-
-        uint32 $aspect = vk::IMAGE_ASPECT_COLOR_BIT;
-
-        if ($desc->isDepth()) {
-            $aspect = vk::IMAGE_ASPECT_DEPTH_BIT;
-        }
-
-        vk::ImageViewCreateInfo $vci = vk::ImageViewCreateInfo();
-        $vci->image = $image;
-        $vci->viewType = vk::IMAGE_VIEW_TYPE_2D;
-        $vci->format = $ci->format;
-        $vci->subresourceRange->aspectMask = $aspect;
-        $vci->subresourceRange->levelCount = $desc->mips as uint32;
-        $vci->subresourceRange->layerCount = 1;
-        vk::ImageView $view = vk::ImageView::none();
-        guard vkCheck(
-            vk::CreateImageView($this->logical, &$vci, null, &$view),
-            'CreateImageView'
-        ) else ($e) {
-            vk::FreeMemory($this->logical, $mem, null);
-            vk::DestroyImage($this->logical, $image, null);
-            return .error($e);
-        }
-
-        vkNoteAlloc($this, $req->size);
-        return .ok(TextureHandle($image, $view, $mem, false, $req->size));
+        return vkCreateTexture($this, $desc);
     }
 
     public function destroyTexture(TextureHandle $handle) : void
     {
-        if ($this->logical->handle == 0 || $handle->imported) {
-            return;
-        }
-
-        vkNoteFree($this, $handle->bytes);
-
-        if ($handle->view->handle != 0) {
-            vk::DestroyImageView($this->logical, $handle->view, null);
-        }
-
-        if ($handle->image->handle != 0) {
-            vk::DestroyImage($this->logical, $handle->image, null);
-        }
-
-        if ($handle->memory->handle != 0) {
-            vk::FreeMemory($this->logical, $handle->memory, null);
-        }
+        vkDestroyTexture($this, $handle);
     }
 
-    public function uploadTexture(Texture $texture, int32 $mip, ptr<const uint8> $src, uint64 $bytes, int32 $bytesPerRow) : void
+    public function uploadTexture(
+        Texture $texture,
+        int32 $mip,
+        int32 $layer,
+        ptr<const uint8> $src,
+        uint64 $bytes,
+        int32 $bytesPerRow
+    ) : void
     {
-        assert($this->logical->handle != 0, 'uploadTexture before initialize');
-        assert(!$this->encoderOpen, 'uploadTexture with an open encoder');
-        assert($bytes > 0, 'uploadTexture size');
-        uint32 $bpp = pixelByteCount($texture->format);
-        int32 $w = vkMipSize($texture->width, $mip);
-        uint64 $row = $bytesPerRow as uint64;
-
-        if ($row == 0) {
-            $row = ($w as uint64) * ($bpp as uint64);
-        }
-
-        BufferHandle $staging = guard vkCreateBoundBuffer(
-            $this,
-            $bytes,
-            vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-            vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT
-        ) else ($e) {
-            die($e->message());
-        }
-
-        ptr<uint8> $mapped = null;
-        guard vkCheck(
-            vk::MapMemory($this->logical, $staging->memory, 0 as uint64, vk::WHOLE_SIZE, 0, &$mapped),
-            'MapMemory'
-        ) else ($e) {
-            die($e->message());
-        }
-
-        mem::copy<uint8>($mapped, ptr<uint8>($src:$), $bytes);
-        vk::UnmapMemory($this->logical, $staging->memory);
-        vkOneShotCopyBufferToImage($this, $staging, $texture, $mip, $row, $bpp);
-        $texture->state = .shaderRead;
-        vk::DestroyBuffer($this->logical, $staging->buffer, null);
-        vk::FreeMemory($this->logical, $staging->memory, null);
+        vkUploadTexture($this, $texture, $mip, $layer, $src, $bytes, $bytesPerRow);
     }
 
     public function generateMipmaps(Texture $texture) : void
     {
-        assert(false, 'generateMipmaps is later');
+        vkGenerateMipmaps($this, $texture);
     }
 
     public function createSampler(const SamplerDesc& $desc) : Sampler
@@ -883,7 +701,13 @@ public class Device : DeviceProtocol
         $ci->addressModeU = vkWrap($desc->wrapS);
         $ci->addressModeV = vkWrap($desc->wrapT);
         $ci->addressModeW = vkWrap($desc->wrapT);
-        $ci->maxLod = 1.0f;
+        $ci->maxLod = vk::LOD_CLAMP_NONE;
+
+        if (!$desc->min->mipmapped()) {
+            // the spec idiom for "sample level 0 only"
+            $ci->maxLod = 0.25f;
+        }
+
         vk::Sampler $samp = vk::Sampler::none();
         guard vkCheck(
             vk::CreateSampler($this->logical, &$ci, null, &$samp),

@@ -141,10 +141,10 @@ public interface DeviceProtocol
     function allocTransient(uint64 $bytes, uint64 $align) : TransientSlice;
 
     /**
-     * Copy a texture to CPU bytes. After endFrame; stalls. Needs TEXTURE_TRANSFER_SRC. Depth and
-     * imported textures fail.
+     * Copy one mip of one array slice to CPU bytes. After endFrame; stalls. Needs
+     * TEXTURE_TRANSFER_SRC. Depth and imported textures fail.
      */
-    function readbackTexture(Texture $texture) : result<array<uint8>, DeviceError>;
+    function readbackTexture(Texture $texture, int32 $mip, int32 $layer) : result<array<uint8>, DeviceError>;
 
     /**
      * GPU blit, same size, same format. After endFrame; stalls. Not the window backbuffer.
@@ -167,7 +167,7 @@ public interface DeviceProtocol
     function uploadBuffer(BufferHandle $handle, uint64 $offset, ptr<const uint8> $src, uint64 $bytes) : void;
 
     /**
-     * Allocate a 2D GPU texture. `Texture` wraps this handle.
+     * Allocate a GPU texture, 2D or cube. `Texture` wraps this handle.
      */
     function createTexture(const TextureDesc& $desc) : result<TextureHandle, DeviceError>;
 
@@ -178,12 +178,21 @@ public interface DeviceProtocol
     function destroyTexture(TextureHandle $handle) : void;
 
     /**
-     * CPU write one mip level. Sets state to shaderRead. `$bytesPerRow` 0 means tightly packed.
+     * CPU write one mip of one array slice (a cube face). Sets state to shaderRead.
+     * `$bytesPerRow` 0 means tightly packed.
      */
-    function uploadTexture(Texture $texture, int32 $mip, ptr<const uint8> $src, uint64 $bytes, int32 $bytesPerRow) : void;
+    function uploadTexture(
+        Texture $texture,
+        int32 $mip,
+        int32 $layer,
+        ptr<const uint8> $src,
+        uint64 $bytes,
+        int32 $bytesPerRow
+    ) : void;
 
     /**
-     * Fill mip 1+ from mip 0. Call after uploadTexture.
+     * Fill mip 1+ from mip 0, every slice. Needs TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST and
+     * `mips > 1`; leaves the texture shaderRead. Legal inside a frame.
      */
     function generateMipmaps(Texture $texture) : void;
 

@@ -1,0 +1,100 @@
+/**
+ * Camera projections run 0..1 depth on both backends.
+ *
+ * A quad almost touching the near plane maps to negative Z under the
+ * GL clip range `perspective()` builds, so it would be clipped away
+ * without `clipZeroOne`; a quad far down the frustum covers the rest.
+ * Seeing both means the range is right and the depth test works.
+ */
+
+use visu::geo::Pose;
+use visu::graphics::{
+    Camera, CameraData, CallbackPass, ClearPass, ClearPassOptions, Compare,
+    Context, Device, Frame, GpuPass, IoSink, Mesh, Pipeline, PipelineError,
+    Projection, Raster, RenderEncoder, ShaderCollection, TargetRef,
+    TextureOptions, VertexLayout
+};
+use visu::math::{Mat4, Quat, Vec3, Vec4};
+
+public struct DepthParams
+{
+    public Mat4 $projectionView;
+    public Vec4 $color;
+    /** xy centre, z depth, w half size */
+    public Vec4 $place;
+}
+
+public function checkCameraDepth(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('depthquad') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    Camera $camera = Camera(Projection::perspective);
+    $camera->near = 0.1f;
+    $camera->far = 100.0f;
+    Pose $pose = Pose(Vec3(0.0f, 0.0f, 0.0f), Quat(), Vec3(1.0f, 1.0f, 1.0f));
+    CameraData $data = $camera->data($pose, 64, 64, 1.0f, 1.0f, 0.0f);
+    Mat4 $vp = $data->projectionView;
+
+    Raster $raster = Raster();
+    $raster->depthTest = true;
+    $raster->depthWrite = true;
+    $raster->depthCompare = Compare::less;
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = $p->createTarget('camdepth', 64, 64);
+        $p->createColor($t, 'color', TextureOptions());
+        $p->createDepth($t);
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 0.0f, 1.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'camdepth-draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(Context $ctx) : status<PipelineError> {
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                Device $device = $ctx->device;
+                Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+                    return .quad($device);
+                });
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3uv2(), $raster);
+                // green covers the target from far down the frustum
+                $pass->draw($enc, $mesh, DepthParams($vp, Vec4(0.0f, 1.0f, 0.0f, 1.0f), Vec4(0.0f, 0.0f, -50.0f, 40.0f)));
+                // red sits just past the near plane and covers the middle
+                $pass->draw($enc, $mesh, DepthParams($vp, Vec4(1.0f, 0.0f, 0.0f, 1.0f), Vec4(0.0f, 0.0f, -0.15f, 0.05f)));
+                $enc->endRender();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('camdepth');
+    $shaders->destroy();
+    usize $centre = ((64 * 32 + 32) * 4) as usize;
+    assert($pixels[$centre] > 240, 'the near quad survives the near plane');
+    assert($pixels[$centre + 1] < 16, 'the near quad wins the depth test');
+    assert($pixels[0] < 16, 'the far quad has no red');
+    assert($pixels[1] > 240, 'the far quad drew at the corner');
+    assert($pixels[2] < 16, 'nothing shows the clear colour');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_camera_depth
+{
+    GpuContext $gpu = gpuHidden('camdepth');
+    checkCameraDepth($gpu);
+    $gpu->end();
+}
+#[end]

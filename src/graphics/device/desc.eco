@@ -27,9 +27,29 @@ public const uint32 TEXTURE_RENDER_TARGET = 2;
 public const uint32 TEXTURE_TRANSFER_SRC = 4;
 public const uint32 TEXTURE_TRANSFER_DST = 8;
 
+/**
+ * What the texture is shaped like. A cube is six square array
+ * slices in the order +X -X +Y -Y +Z -Z; sampling takes a direction,
+ * so wrap modes never apply to it.
+ */
+public enum TextureKind
+{
+    case texture2D;
+    case cube;
+
+    public const function layers() : int32
+    {
+        return match ($this) {
+            TextureKind::texture2D => 1,
+            TextureKind::cube => 6,
+        };
+    }
+}
+
 public struct TextureDesc
 {
     public PixelFormat $format = .rgba8;
+    public TextureKind $kind = .texture2D;
     public int32 $width;
     public int32 $height;
     public int32 $mips = 1;
@@ -50,9 +70,14 @@ public struct SamplerDesc
     public Wrap $wrapS = .clampToEdge;
     public Wrap $wrapT = .clampToEdge;
 
+    /** the Device sampler cache key; a call inside a hole is plain text */
     public const function key() : string
     {
-        return "{filterCode($this->min)}|{filterCode($this->mag)}|{wrapCode($this->wrapS)}|{wrapCode($this->wrapT)}";
+        int32 $min = filterCode($this->min);
+        int32 $mag = filterCode($this->mag);
+        int32 $wrapS = wrapCode($this->wrapS);
+        int32 $wrapT = wrapCode($this->wrapT);
+        return "{$min}|{$mag}|{$wrapS}|{$wrapT}";
     }
 }
 
@@ -62,6 +87,9 @@ public struct ColorTarget
     public LoadOp $load = .load;
     public StoreOp $store = .store;
     public Vec4 $clear;
+    /** array slice; a cube face is a slice */
+    public int32 $face = 0;
+    public int32 $mip = 0;
 
     public constructor(Texture $texture)
     {
@@ -69,6 +97,37 @@ public struct ColorTarget
         $this->load = .load;
         $this->store = .store;
         $this->clear = visu::math::Vec4(0.0f);
+        $this->face = 0;
+        $this->mip = 0;
+    }
+
+    /** one face and mip of a cube or mipped texture */
+    public constructor(Texture $texture, face: int32 $face, int32 $mip = 0)
+    {
+        $this->texture = $texture;
+        $this->load = .load;
+        $this->store = .store;
+        $this->clear = visu::math::Vec4(0.0f);
+        $this->face = $face;
+        $this->mip = $mip;
+    }
+
+    /** render area of the mip this target writes, not of mip 0 */
+    public const function width() : int32
+    {
+        return mipSize($this->texture->width, $this->mip);
+    }
+
+    public const function height() : int32
+    {
+        return mipSize($this->texture->height, $this->mip);
+    }
+
+    /** the face and mip have to exist; the fields are public and set late */
+    public const function validate() : void
+    {
+        assert($this->face >= 0 && $this->face < $this->texture->layers(), 'beginRender face');
+        assert($this->mip >= 0 && $this->mip < $this->texture->mips, 'beginRender mip');
     }
 }
 
@@ -197,6 +256,45 @@ public struct MemoryStats
     public uint64 $used = 0;
     public uint64 $budget = 0;
     public bool $unified = false;
+}
+
+/** size of mip `$level` of a `$size`-wide image, never below one */
+public function mipSize(int32 $size, int32 $level) : int32
+{
+    int32 $out = $size >> $level;
+
+    if ($out < 1) {
+        return 1;
+    }
+
+    return $out;
+}
+
+/** how many mips a `$width` by `$height` image can carry */
+public function mipCount(int32 $width, int32 $height) : int32
+{
+    int32 $largest = $width;
+
+    if ($height > $largest) {
+        $largest = $height;
+    }
+
+    int32 $count = 1;
+
+    while ($largest > 1) {
+        $largest = $largest / 2;
+        $count = $count + 1;
+    }
+
+    return $count;
+}
+
+internal function kindCode(TextureKind $kind) : int32
+{
+    return match ($kind) {
+        TextureKind::texture2D => 0,
+        TextureKind::cube => 1,
+    };
 }
 
 internal function pixelCode(PixelFormat $format) : int32

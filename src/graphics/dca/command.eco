@@ -1,0 +1,71 @@
+/**
+ * What `DrawCallAssembler.build` produces: a mesh range plus the
+ * slice of the instance stream that draws it.
+ */
+
+namespace visu::graphics;
+
+use visu::geo::AABB;
+use visu::math::Vec3;
+
+/** index into the assembler's mesh table */
+public struct MeshHandle
+{
+    public const int32 $index;
+
+    public static function none() : MeshHandle
+    {
+        return MeshHandle(-1);
+    }
+
+    public const function valid() : bool
+    {
+        return $this->index >= 0;
+    }
+}
+
+/**
+ * A registered range of one mesh. `$radius` is the bounding-sphere
+ * radius of `$bounds` around its centre, precomputed because culling
+ * reads it once per submission.
+ */
+public class RegisteredMesh
+{
+    public Mesh $mesh;
+    public int32 $first;
+    public int32 $count;
+    public AABB $bounds;
+    public Vec3 $centre;
+    public float32 $radius;
+
+    public constructor(Mesh $mesh, int32 $first, int32 $count, const AABB& $bounds)
+    {
+        $this->mesh = $mesh;
+        $this->first = $first;
+        $this->count = $count;
+        $this->bounds = $bounds;
+        $this->centre = $bounds->center();
+        Vec3 $half = ($bounds->max - $bounds->min) * 0.5f;
+        $this->radius = visu::math::length($half);
+    }
+}
+
+/** one draw: `$instanceCount` copies of a mesh range */
+public struct DrawCommand
+{
+    public int32 $mesh;
+    public int32 $first;
+    public int32 $count;
+    public int32 $instanceOffset;
+    public int32 $instanceCount;
+}
+
+/** one `submit`, before culling and sorting */
+public struct Submission<P>
+{
+    public int32 $mesh;
+    public visu::math::Mat4 $model;
+    public P $payload;
+    public float32 $sortBias;
+    public bool $ignoreCull;
+}

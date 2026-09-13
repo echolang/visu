@@ -336,6 +336,7 @@ public class Device : DeviceProtocol
 
         while ($i < $n) {
             ColorTarget $color = $desc->colors[$i as usize];
+            $color->validate();
             $color->texture->state = .colorTarget;
             mtl::Texture $tex = guard $color->texture->handle->texture else {
                 die('beginRender color texture handle is empty');
@@ -346,12 +347,15 @@ public class Device : DeviceProtocol
                 $color->clear->z as float64,
                 $color->clear->w as float64
             );
-            $pass->colorAttachments[] = mtl::ColorAttachment(
+            mtl::ColorAttachment $attachment = mtl::ColorAttachment(
                 $tex,
                 mtlLoadOp($color->load),
                 mtlStoreOp($color->store),
                 $clear
             );
+            $attachment->level = $color->mip as uint32;
+            $attachment->slice = $color->face as uint32;
+            $pass->colorAttachments[] = $attachment;
             $formats->colors[$i] = $color->texture->format;
             $i = $i + 1;
         }
@@ -359,9 +363,11 @@ public class Device : DeviceProtocol
         $formats->colorCount = $n;
         $formats->samples = .one;
         ColorTarget $first = $desc->colors[0];
+        int32 $passWidth = $first->width();
+        int32 $passHeight = $first->height();
         mtl::PixelFormat $depthFmt = mtl::PixelFormat::invalid;
         DepthTarget $depth = guard $desc->depth else {
-            return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $first->texture->width, $first->texture->height);
+            return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $passWidth, $passHeight);
         }
         $depth->texture->state = .depthTarget;
         mtl::Texture $depthTex = guard $depth->texture->handle->texture else {
@@ -374,7 +380,7 @@ public class Device : DeviceProtocol
         $formats->depth = $depth->texture->format;
         $formats->hasDepth = true;
         $depthFmt = mtlPixelFormat($depth->texture->format);
-        return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $first->texture->width, $first->texture->height);
+        return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $passWidth, $passHeight);
     }
 
     public function transitionTexture(Texture $texture, ResourceState $to) : void
@@ -399,7 +405,7 @@ public class Device : DeviceProtocol
         return $this->slots[$this->slot]->ring->take($bytes, $a, $this->slot);
     }
 
-    public function readbackTexture(Texture $texture) : result<array<uint8>, DeviceError>
+    public function readbackTexture(Texture $texture, int32 $mip, int32 $layer) : result<array<uint8>, DeviceError>
     {
         assert($this->gpu != null, 'readbackTexture before initialize');
         assert(!$this->encoderOpen, 'readbackTexture with an open encoder');
@@ -418,19 +424,24 @@ public class Device : DeviceProtocol
         }
         $this->waitIdle();
         uint32 $bpp = pixelByteCount($texture->format);
-        uint64 $row = ($texture->width as uint64) * ($bpp as uint64);
-        uint64 $total = $row * ($texture->height as uint64);
+        int32 $w = mipSize($texture->width, $mip);
+        int32 $h = mipSize($texture->height, $mip);
+        uint64 $row = ($w as uint64) * ($bpp as uint64);
+        uint64 $total = $row * ($h as uint64);
         array<uint8> $pixels = pixelsFilled($total);
 
         if ($total == 0) {
             return .ok($pixels);
         }
 
-        mtl::Region $region = mtl::Region(
-            mtl::Origin(),
-            mtl::Size($texture->width as usize, $texture->height as usize)
+        mtl::Region $region = mtl::Region(mtl::Origin(), mtl::Size($w as usize, $h as usize));
+        $mt->getBytes(
+            ptr<uint8>(&$pixels[0]),
+            $row as usize,
+            $region,
+            $mip as uint32,
+            slice: $layer as uint32
         );
-        $mt->getBytes(ptr<uint8>(&$pixels[0]), $row as usize, $region);
         return .ok($pixels);
     }
 
@@ -526,6 +537,10 @@ public class Device : DeviceProtocol
             $td->storageMode = .shared;
         }
 
+        if ($desc->kind == TextureKind::cube) {
+            $td->textureType = .typeCube;
+        }
+
         if ($desc->samples == SampleCount::four) {
             $td->sampleCount = 4;
             $td->textureType = .type2DMultisample;
@@ -542,17 +557,25 @@ public class Device : DeviceProtocol
         // rc drop; imported drawable textures are owned by the layer
     }
 
-    public function uploadTexture(Texture $texture, int32 $mip, ptr<const uint8> $src, uint64 $bytes, int32 $bytesPerRow) : void
+    public function uploadTexture(
+        Texture $texture,
+        int32 $mip,
+        int32 $layer,
+        ptr<const uint8> $src,
+        uint64 $bytes,
+        int32 $bytesPerRow
+    ) : void
     {
         assert($this->gpu != null, 'uploadTexture before initialize');
         assert(!$this->encoderOpen, 'uploadTexture with an open encoder');
         assert($bytes > 0, 'uploadTexture size');
+        assert($layer >= 0 && $layer < $texture->layers(), 'uploadTexture layer');
         mtl::Texture $mt = guard $texture->handle->texture else {
             die('uploadTexture handle is empty');
         }
         uint32 $bpp = pixelByteCount($texture->format);
-        int32 $w = mtlMipSize($texture->width, $mip);
-        int32 $h = mtlMipSize($texture->height, $mip);
+        int32 $w = mipSize($texture->width, $mip);
+        int32 $h = mipSize($texture->height, $mip);
         uint64 $row = $bytesPerRow as uint64;
 
         if ($row == 0) {
@@ -561,13 +584,49 @@ public class Device : DeviceProtocol
 
         mtl::Region $region = mtl::Region(mtl::Origin(), mtl::Size($w as usize, $h as usize));
         ptr<uint8> $p = ptr<uint8>($src:$);
-        $mt->replace($region, $p, $row as usize, $mip as uint32);
+        $mt->replace($region, $p, $row as usize, $mip as uint32, slice: $layer as uint32);
         $texture->state = .shaderRead;
     }
 
     public function generateMipmaps(Texture $texture) : void
     {
-        assert(false, 'generateMipmaps is later');
+        assert($this->gpu != null, 'generateMipmaps before initialize');
+        assert(!$this->encoderOpen, 'generateMipmaps with an open encoder');
+        assert($texture->mips > 1, 'generateMipmaps needs mips > 1');
+        mtl::Texture $mt = guard $texture->handle->texture else {
+            die('generateMipmaps handle is empty');
+        }
+
+        // inside a frame the source mip was written by the frame's own
+        // command buffer, so the blit has to ride along with it
+        if ($this->inFrame) {
+            mtl::CommandBuffer $cmd = guard $this->cmd else {
+                die('generateMipmaps without a command buffer');
+            }
+            mtl::BlitCommandEncoder $blit = guard $cmd->blitCommandEncoder() else {
+                die('metal: blitCommandEncoder failed');
+            }
+            $blit->generateMipmaps($mt);
+            $blit->endEncoding();
+            $texture->state = .shaderRead;
+            return;
+        }
+
+        mtl::CommandQueue $queue = guard $this->queue else {
+            die('generateMipmaps before initialize');
+        }
+        $this->waitIdle();
+        mtl::CommandBuffer $once = guard $queue->commandBuffer() else {
+            die('metal: commandBuffer failed');
+        }
+        mtl::BlitCommandEncoder $blit = guard $once->blitCommandEncoder() else {
+            die('metal: blitCommandEncoder failed');
+        }
+        $blit->generateMipmaps($mt);
+        $blit->endEncoding();
+        $once->commit();
+        $once->waitUntilCompleted();
+        $texture->state = .shaderRead;
     }
 
     public function createSampler(const SamplerDesc& $desc) : Sampler

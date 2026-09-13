@@ -198,6 +198,24 @@ public class VertexBuilder
 public struct VertexLayout
 {
     public array<VertexAttr> $attrs;
+    /** derived from $attrs once; every GpuPass key reads it */
+    private string $print;
+
+    public constructor(array<VertexAttr> $attrs)
+    {
+        $this->attrs = $attrs;
+    }
+
+    init
+    {
+        string $out = '';
+
+        foreach ($this->attrs as $attr) {
+            $out = "{$out}{$attr->location}:{$attr->components}:{$attr->offset}:{$attr->stride}:{$attr->divisor};";
+        }
+
+        $this->print = $out;
+    }
 
     /**
      * Packed streams. Sequential offsets, stride is the stream
@@ -255,6 +273,18 @@ public struct VertexLayout
     }
 
     /**
+     * Interleaved position + normal, the primitive builder's
+     * `PrimitiveLayout::pos3n3()` on the GPU side.
+     */
+    public static function pos3n3() : VertexLayout
+    {
+        return VertexLayout::build(function(VertexBuilder $b) : void {
+            $b->attr<Vec3>(0);
+            $b->attr<Vec3>(1);
+        });
+    }
+
+    /**
      * Location 0: packed vec3. Location 1: packed vec3 with
      * divisor 1 (instance offset).
      */
@@ -269,13 +299,7 @@ public struct VertexLayout
 
     public const function fingerprint() : string
     {
-        string $out = '';
-
-        foreach ($this->attrs as $attr) {
-            $out = "{$out}{$attr->location}:{$attr->components}:{$attr->offset}:{$attr->stride}:{$attr->divisor};";
-        }
-
-        return $out;
+        return $this->print;
     }
 }
 

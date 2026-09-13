@@ -1,0 +1,65 @@
+/**
+ * Mip chain by successive blits. Every array layer (every cube face)
+ * is filled in the same pass, and the whole image is left readable.
+ */
+
+namespace visu::graphics;
+
+internal function vkRecordMipChain(vk::CommandBuffer $cmd, Texture $texture) : void
+{
+    uint32 $aspect = vkAspect($texture->format);
+    uint32 $layers = $texture->layers() as uint32;
+    uint32 $levels = $texture->mips as uint32;
+    vk::Image $image = $texture->handle->image;
+    vkRecordBarrier($cmd, $image, $texture->state, .transferDst, $aspect);
+    int32 $level = 1;
+
+    while ($level < $texture->mips) {
+        int32 $srcLevel = $level - 1;
+        vkRecordBarrierRange(
+            $cmd,
+            $image,
+            .transferDst,
+            .transferSrc,
+            $aspect,
+            $srcLevel as uint32,
+            1,
+            0,
+            $layers
+        );
+        vk::ImageBlit $blit = vk::ImageBlit();
+        $blit->srcSubresource->aspectMask = $aspect;
+        $blit->srcSubresource->mipLevel = $srcLevel as uint32;
+        $blit->srcSubresource->baseArrayLayer = 0;
+        $blit->srcSubresource->layerCount = $layers;
+        $blit->srcOffsets[1] = vk::Offset3D(
+            mipSize($texture->width, $srcLevel),
+            mipSize($texture->height, $srcLevel),
+            1
+        );
+        $blit->dstSubresource->aspectMask = $aspect;
+        $blit->dstSubresource->mipLevel = $level as uint32;
+        $blit->dstSubresource->baseArrayLayer = 0;
+        $blit->dstSubresource->layerCount = $layers;
+        $blit->dstOffsets[1] = vk::Offset3D(
+            mipSize($texture->width, $level),
+            mipSize($texture->height, $level),
+            1
+        );
+        vk::CmdBlitImage(
+            $cmd,
+            $image,
+            vk::IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            $image,
+            vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &$blit,
+            vk::FILTER_LINEAR
+        );
+        $level = $level + 1;
+    }
+
+    // every level but the last read as a blit source; the last is still a destination
+    vkRecordBarrierRange($cmd, $image, .transferSrc, .shaderRead, $aspect, 0, $levels - 1, 0, $layers);
+    vkRecordBarrierRange($cmd, $image, .transferDst, .shaderRead, $aspect, $levels - 1, 1, 0, $layers);
+}

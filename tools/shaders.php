@@ -33,6 +33,42 @@ const STAGES = [
     'tesse' => ['glslang' => 'tese', 'spirv' => 'tese', 'entry' => ''],
 ];
 
+/**
+ * Library shader trees baked into the module. Each is compiled like any
+ * other tree (variants included) and emitted as one Echo file exposing
+ * `<prefix>Bytes($program, ShaderKind) : string?`.
+ */
+const BAKES = [
+    [
+        'dir' => 'blit',
+        'out' => 'src/graphics/renderer/blitshader.eco',
+        'ns' => 'visu::graphics',
+        'prefix' => 'blit',
+        'title' => 'Baked fullscreen blit shaders.',
+    ],
+    [
+        'dir' => 'vg',
+        'out' => 'src/vg/vgshader.eco',
+        'ns' => 'visu::vg',
+        'prefix' => 'vg',
+        'title' => 'Baked vector-graphics shaders.',
+    ],
+    [
+        'dir' => 'pbr',
+        'out' => 'src/graphics/deferred/pbrshader.eco',
+        'ns' => 'visu::graphics',
+        'prefix' => 'pbr',
+        'title' => 'Baked deferred PBR shaders.',
+    ],
+    [
+        'dir' => 'ui',
+        'out' => 'src/ui/uishader.eco',
+        'ns' => 'visu::ui',
+        'prefix' => 'ui',
+        'title' => 'Baked FlyUI shaders.',
+    ],
+];
+
 const DEFAULT_TREES = [
     'resources/shaders',
     'examples/shader/shaders',
@@ -117,12 +153,10 @@ function main(array $argv) : int
     $failed = 0;
     $wrote = 0;
 
-    if ($bake) {
-        foreach ([
-            bakeBlit($root, $tools),
-            bakeVg($root, $tools),
-            bakeUi($root, $tools),
-        ] as $bakeResult) {
+    // --check verifies the baked files too, so CI catches a stale bake
+    if ($bake || $check) {
+        foreach (BAKES as $spec) {
+            $bakeResult = bakeTree($root, $spec, $tools);
             if ($bakeResult === 'error') {
                 return 1;
             }
@@ -179,7 +213,7 @@ Compile Vulkan GLSL to SPIR-V and Metal.
 
 With no dirs, compiles the library, example, and test shader trees.
 --check compiles and diffs against the committed outputs.
---bake writes blitshader.eco / vgshader.eco / uishader.eco from resources/shaders.
+--bake writes one Echo file per tree in BAKES (blit, vg, ui) from resources/shaders.
 --include adds an extra -I directory (resources/shaders/include is default).
 
 TXT;
@@ -276,10 +310,29 @@ function compileStage(
     array $defines,
 ) : string
 {
+    // the BAKES dirs sit under resources/shaders, so the default tree walk
+    // reaches every stage the bake already built. Compiling it twice yields
+    // the same bytes; --check still redoes it, because that pass is what
+    // diffs the committed output.
+    static $built = [];
+    $once = $src . '|' . $variant;
+
+    if (!$tools['check'] && isset($built[$once])) {
+        return 'same';
+    }
+
+    $built[$once] = true;
     $ext = pathinfo($src, PATHINFO_EXTENSION);
     $stage = STAGES[$ext];
     $rel = relativeTo($src, $tree);
-    $text = file_get_contents($src);
+    // std140 and friends are declared in includes, so reflect against the
+    // preprocessed text rather than the file on disk
+    $text = preprocess($src, $stage['glslang'], $tools, $defines);
+
+    if ($text === null) {
+        fwrite(STDERR, "shaders: preprocess failed ({$rel})\n");
+        return 'error';
+    }
 
     if ($variant === '') {
         $spvPath = $src . '.spv';
@@ -391,6 +444,37 @@ function compileStage(
     }
 
     return 'same';
+}
+
+/**
+ * The fully expanded source glslang will compile. Includes are
+ * resolved, so a block declared in an include is visible to the
+ * layout checks.
+ */
+function preprocess(string $src, string $stage, array $tools, array $defines) : ?string
+{
+    $cmd = [
+        $tools['glslang'],
+        '-E',
+        '-S', $stage,
+        '-P' . PREAMBLE,
+        '-I' . dirname($src),
+    ];
+    foreach ($tools['includes'] as $inc) {
+        $cmd[] = '-I' . $inc;
+    }
+    foreach ($defines as $name => $value) {
+        $cmd[] = '-D' . $name . '=' . $value;
+    }
+    $cmd[] = $src;
+
+    $r = run($cmd);
+    if (str_contains($r['out'], 'compilation errors') || str_contains($r['err'], 'compilation errors')) {
+        fwrite(STDERR, $r['out'] . $r['err']);
+        return null;
+    }
+
+    return $r['out'];
 }
 
 function validateReflection(string $spvPath, string $label, string $src, string $spirvCross) : ?string
@@ -615,205 +699,133 @@ function checkStale(string $tree, array $expected, array $manifestLines) : strin
     return $ok ? 'same' : 'error';
 }
 
-function bakeBlit(string $root, array $tools) : string
+/**
+ * Compile one library tree and emit its baked Echo file. Every program
+ * in the tree, base and variants, lands in one lookup keyed by the
+ * program name (`stem` or `stem+variant`).
+ */
+function bakeTree(string $root, array $spec, array $tools) : string
 {
-    $dir = $root . DIRECTORY_SEPARATOR . 'resources' . DIRECTORY_SEPARATOR . 'shaders' . DIRECTORY_SEPARATOR . 'blit';
-    $vert = $dir . DIRECTORY_SEPARATOR . 'blit.vert';
-    $frag = $dir . DIRECTORY_SEPARATOR . 'blit.frag';
-    $out = $root . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'graphics' . DIRECTORY_SEPARATOR . 'renderer' . DIRECTORY_SEPARATOR . 'blitshader.eco';
+    $dir = $root . DIRECTORY_SEPARATOR . 'resources' . DIRECTORY_SEPARATOR . 'shaders'
+        . DIRECTORY_SEPARATOR . $spec['dir'];
+    $out = $root . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $spec['out']);
+    $name = basename($spec['out']);
 
-    if (!is_file($vert) || !is_file($frag)) {
-        fwrite(STDERR, "shaders: blit sources missing under {$dir}\n");
+    if (!is_dir($dir)) {
+        fwrite(STDERR, "shaders: bake sources missing under {$dir}\n");
         return 'error';
     }
 
-    $tmpCheck = $tools['check'];
+    $sources = collect($dir);
+    if (empty($sources)) {
+        fwrite(STDERR, "shaders: no stage files in {$dir}\n");
+        return 'error';
+    }
+
+    $wasCheck = $tools['check'];
     $tools['check'] = false;
-    $v = compileStage($vert, $dir, $tools, '', []);
-    $f = compileStage($frag, $dir, $tools, '', []);
-    $tools['check'] = $tmpCheck;
+    $programs = [];
 
-    if ($v === 'error' || $f === 'error') {
-        return 'error';
+    foreach (groupPrograms($sources) as $stem => $stages) {
+        $builds = ['' => []] + unionVariants($stages);
+
+        foreach ($builds as $variant => $defines) {
+            $program = $variant === '' ? $stem : $stem . '+' . $variant;
+
+            foreach ($stages as $src) {
+                $ext = pathinfo($src, PATHINFO_EXTENSION);
+                if (STAGES[$ext]['entry'] === '') {
+                    fwrite(STDERR, "shaders: bake only handles vert/frag ({$src})\n");
+                    return 'error';
+                }
+
+                if (compileStage($src, $dir, $tools, $variant, $defines) === 'error') {
+                    return 'error';
+                }
+
+                if ($variant === '') {
+                    $spvPath = $src . '.spv';
+                    $metalPath = $src . '.metal';
+                } else {
+                    $spvPath = variantPath($src, $variant, $ext . '.spv');
+                    $metalPath = variantPath($src, $variant, $ext . '.metal');
+                }
+
+                $programs[$program][$ext] = [
+                    'spv' => file_get_contents($spvPath),
+                    'metal' => file_get_contents($metalPath),
+                ];
+            }
+        }
     }
 
-    $vertSpv = file_get_contents($vert . '.spv');
-    $fragSpv = file_get_contents($frag . '.spv');
-    $vertMsl = file_get_contents($vert . '.metal');
-    $fragMsl = file_get_contents($frag . '.metal');
-
-    $eco = bakeEco(
-        $vertSpv,
-        $fragSpv,
-        $vertMsl,
-        $fragMsl,
-        'visu::graphics',
-        'blit',
-        'Baked fullscreen blit shaders.'
-    );
-    $result = emit($out, $eco, $tmpCheck);
+    $tools['check'] = $wasCheck;
+    ksort($programs);
+    $eco = bakeEcoTree($programs, $spec['ns'], $spec['prefix'], $spec['title']);
+    $result = emit($out, $eco, $wasCheck);
 
     if ($result === 'error') {
         return 'error';
     }
 
-    if ($tmpCheck) {
-        fwrite(STDOUT, "shaders: ok blitshader.eco\n");
+    if ($wasCheck) {
+        fwrite(STDOUT, "shaders: ok {$name}\n");
         return 'same';
     }
 
-    fwrite(STDOUT, "shaders: blitshader.eco\n");
+    fwrite(STDOUT, "shaders: {$name}\n");
     return $result;
 }
 
-function bakeVg(string $root, array $tools) : string
+function bakeEcoTree(array $programs, string $ns, string $prefix, string $title) : string
 {
-    $dir = $root . DIRECTORY_SEPARATOR . 'resources' . DIRECTORY_SEPARATOR . 'shaders' . DIRECTORY_SEPARATOR . 'vg';
-    $vert = $dir . DIRECTORY_SEPARATOR . 'vg.vert';
-    $frag = $dir . DIRECTORY_SEPARATOR . 'vg.frag';
-    $out = $root . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'vg' . DIRECTORY_SEPARATOR . 'vgshader.eco';
-
-    if (!is_file($vert) || !is_file($frag)) {
-        fwrite(STDERR, "shaders: vg sources missing under {$dir}\n");
-        return 'error';
-    }
-
-    $tmpCheck = $tools['check'];
-    $tools['check'] = false;
-    $v = compileStage($vert, $dir, $tools, '', []);
-    $f = compileStage($frag, $dir, $tools, '', []);
-    $tools['check'] = $tmpCheck;
-
-    if ($v === 'error' || $f === 'error') {
-        return 'error';
-    }
-
-    $vertSpv = file_get_contents($vert . '.spv');
-    $fragSpv = file_get_contents($frag . '.spv');
-    $vertMsl = file_get_contents($vert . '.metal');
-    $fragMsl = file_get_contents($frag . '.metal');
-
-    $eco = bakeEco(
-        $vertSpv,
-        $fragSpv,
-        $vertMsl,
-        $fragMsl,
-        'visu::vg',
-        'vg',
-        'Baked vector-graphics shaders.'
-    );
-    $result = emit($out, $eco, $tmpCheck);
-
-    if ($result === 'error') {
-        return 'error';
-    }
-
-    if ($tmpCheck) {
-        fwrite(STDOUT, "shaders: ok vgshader.eco\n");
-        return 'same';
-    }
-
-    fwrite(STDOUT, "shaders: vgshader.eco\n");
-    return $result;
-}
-
-function bakeUi(string $root, array $tools) : string
-{
-    $dir = $root . DIRECTORY_SEPARATOR . 'resources' . DIRECTORY_SEPARATOR . 'shaders' . DIRECTORY_SEPARATOR . 'ui';
-    $vert = $dir . DIRECTORY_SEPARATOR . 'ui.vert';
-    $frag = $dir . DIRECTORY_SEPARATOR . 'ui.frag';
-    $out = $root . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'ui' . DIRECTORY_SEPARATOR . 'uishader.eco';
-
-    if (!is_file($vert) || !is_file($frag)) {
-        fwrite(STDERR, "shaders: ui sources missing under {$dir}\n");
-        return 'error';
-    }
-
-    $tmpCheck = $tools['check'];
-    $tools['check'] = false;
-    $v = compileStage($vert, $dir, $tools, '', []);
-    $f = compileStage($frag, $dir, $tools, '', []);
-    $tools['check'] = $tmpCheck;
-
-    if ($v === 'error' || $f === 'error') {
-        return 'error';
-    }
-
-    $vertSpv = file_get_contents($vert . '.spv');
-    $fragSpv = file_get_contents($frag . '.spv');
-    $vertMsl = file_get_contents($vert . '.metal');
-    $fragMsl = file_get_contents($frag . '.metal');
-
-    $eco = bakeEco(
-        $vertSpv,
-        $fragSpv,
-        $vertMsl,
-        $fragMsl,
-        'visu::ui',
-        'ui',
-        'Baked FlyUI shaders.'
-    );
-    $result = emit($out, $eco, $tmpCheck);
-
-    if ($result === 'error') {
-        return 'error';
-    }
-
-    if ($tmpCheck) {
-        fwrite(STDOUT, "shaders: ok uishader.eco\n");
-        return 'same';
-    }
-
-    fwrite(STDOUT, "shaders: uishader.eco\n");
-    return $result;
-}
-
-function bakeEco(
-    string $vertSpv,
-    string $fragSpv,
-    string $vertMsl,
-    string $fragMsl,
-    string $ns,
-    string $prefix,
-    string $title
-) : string
-{
-    $vertHex = bin2hex($vertSpv);
-    $fragHex = bin2hex($fragSpv);
-    $vertMetal = echoSingleQuoted($vertMsl);
-    $fragMetal = echoSingleQuoted($fragMsl);
+    $metal = bakeArm($programs, $prefix, true);
+    $spirv = bakeArm($programs, $prefix, false);
+    $names = implode(', ', array_keys($programs));
 
     return <<<ECO
 /**
- * {$title} Generated by
+ * {$title} Programs: {$names}. Generated by
  * `php tools/shaders.php --bake`. Do not edit.
  */
 
 namespace {$ns};
 
 #[if: os == darwin && !VISU_BACKEND_VULKAN]
-internal function {$prefix}VertexSource() : string
-{
-    return {$vertMetal};
-}
-
-internal function {$prefix}FragmentSource() : string
-{
-    return {$fragMetal};
-}
-#[else]
-internal function {$prefix}VertexSpvHex() : string
-{
-    return '{$vertHex}';
-}
-
-internal function {$prefix}FragmentSpvHex() : string
-{
-    return '{$fragHex}';
-}
-#[end]
+{$metal}#[else]
+{$spirv}#[end]
 
 ECO;
+}
+
+/**
+ * One arm of the lookup: MSL source on Darwin, SPIR-V hex elsewhere.
+ */
+function bakeArm(array $programs, string $prefix, bool $isMetal) : string
+{
+    $body = '';
+
+    foreach ($programs as $program => $stages) {
+        foreach ($stages as $ext => $bytes) {
+            $kind = $ext === 'vert' ? 'vertex' : 'fragment';
+
+            if ($isMetal) {
+                $value = echoSingleQuoted($bytes['metal']);
+            } else {
+                $value = 'visu::graphics::hexBytes(\'' . bin2hex($bytes['spv']) . '\')';
+            }
+
+            $body = $body . "    if (\$program == '{$program}' && \$kind == visu::graphics::ShaderKind::{$kind}) {\n"
+                . "        return {$value};\n"
+                . "    }\n\n";
+        }
+    }
+
+    return "internal function {$prefix}Bytes(string \$program, visu::graphics::ShaderKind \$kind) : string?\n"
+        . "{\n"
+        . $body
+        . "    return null;\n"
+        . "}\n";
 }
 
 function echoSingleQuoted(string $s) : string
@@ -890,9 +902,11 @@ function stamp(string $source) : string
 function shiftMetalBuffers(string $msl) : string
 {
     // SPIRV-Cross emits uniform buffers as `constant T& name [[buffer(N)]]`.
-    // Vertex / storage buffers keep their SPIR-V index.
+    // Vertex / storage buffers keep their SPIR-V index. Brackets are excluded
+    // so the match cannot run across neighbouring parameters — with two
+    // uniform blocks a greedy span shifted the wrong one.
     return preg_replace_callback(
-        '/constant\b[^;{]*\[\[buffer\((\d+)\)\]\]/',
+        '/constant\b[^;{\[\]]*\[\[buffer\((\d+)\)\]\]/',
         function (array $m) : string {
             $n = ((int) $m[1]) + MTL_UNIFORM_BASE;
             return preg_replace('/\[\[buffer\(\d+\)\]\]/', "[[buffer({$n})]]", $m[0], 1);

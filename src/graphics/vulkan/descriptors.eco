@@ -6,6 +6,12 @@
 
 namespace visu::graphics;
 
+/**
+ * Set-1 allocations per frame slot. One set is minted per distinct
+ * texture tuple an encoder binds, not per draw.
+ */
+internal const uint32 SET1_MAX_SETS = 1024;
+
 internal function vkCreateDrawStack(Device $device) : status<DeviceError>
 {
     vk::DescriptorSetLayoutBinding[4] $ubo;
@@ -38,7 +44,7 @@ internal function vkCreateDrawStack(Device $device) : status<DeviceError>
         $tex[$i]->binding = $i;
         $tex[$i]->descriptorType = vk::DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         $tex[$i]->descriptorCount = 1;
-        $tex[$i]->stageFlags = vk::SHADER_STAGE_FRAGMENT_BIT;
+        $tex[$i]->stageFlags = vk::SHADER_STAGE_VERTEX_BIT | vk::SHADER_STAGE_FRAGMENT_BIT;
         $i = $i + 1;
     }
 
@@ -129,9 +135,9 @@ internal function vkCreateDrawStack(Device $device) : status<DeviceError>
         vkWriteSet0($device, $slot);
         vk::DescriptorPoolSize $ps1 = vk::DescriptorPoolSize();
         $ps1->type = vk::DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        $ps1->descriptorCount = TEXTURE_SLOTS * 64;
+        $ps1->descriptorCount = TEXTURE_SLOTS * SET1_MAX_SETS;
         vk::DescriptorPoolCreateInfo $pci1 = vk::DescriptorPoolCreateInfo();
-        $pci1->maxSets = 64;
+        $pci1->maxSets = SET1_MAX_SETS;
         $pci1->poolSizeCount = 1;
         $pci1->pPoolSizes:$ = &$ps1;
         guard vkCheck(
@@ -148,6 +154,7 @@ internal function vkCreateDrawStack(Device $device) : status<DeviceError>
         return .error($e);
     }
 
+    $device->limits->vertexTextures = true;
     return .ok;
 }
 
@@ -282,20 +289,12 @@ internal function vkFlushUniforms(Device $device) : void
     $slot->uniformsDirty = false;
 }
 
-internal function vkFlushTextures(
-    Device $device,
-    Texture? $texture,
-    Sampler? $sampler,
-    uint32 $slot
-) : void
+internal function vkFlushTextures(Device $device, RenderEncoder $enc) : void
 {
-    Texture $tex = guard $texture else {
+    if (!$enc->texturesDirty) {
         return;
     }
-    Sampler $samp = guard $sampler else {
-        return;
-    }
-    assert($slot < TEXTURE_SLOTS, 'texture slot');
+
     FrameSlot $fs = $device->slots[$device->slot];
     vk::DescriptorSet $set = vk::DescriptorSet::none();
     vk::DescriptorSetAllocateInfo $ai = vk::DescriptorSetAllocateInfo();
@@ -317,9 +316,9 @@ internal function vkFlushTextures(
         $infos[$i] = vk::DescriptorImageInfo();
         $infos[$i]->imageLayout = vk::IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        if ($i == $slot) {
-            $infos[$i]->sampler = $samp->handle->sampler;
-            $infos[$i]->imageView = $tex->handle->view;
+        if ($enc->texSet[$i]) {
+            $infos[$i]->sampler = $enc->sampHandles[$i]->sampler;
+            $infos[$i]->imageView = $enc->texHandles[$i]->view;
         } else {
             $infos[$i]->sampler = $device->dummySampler->sampler;
             $infos[$i]->imageView = $device->dummyImage->view;
@@ -345,4 +344,5 @@ internal function vkFlushTextures(
         0,
         null
     );
+    $enc->texturesDirty = false;
 }

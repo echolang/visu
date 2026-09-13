@@ -1,0 +1,157 @@
+/**
+ * The environment cube and the three IBL maps baked from it.
+ * `DeferredRenderer.setEnvironment` constructs one and takes
+ * ownership of the source texture.
+ */
+
+namespace visu::graphics;
+
+internal class Environment
+{
+    public Texture $cube;
+    public bool $ready;
+    public Texture $irradiance;
+    public Texture $prefilter;
+    public Texture $brdf;
+    public bool $iblReady;
+    private Texture? $equirect;
+    private uint64 $equirectFrame;
+
+    /**
+     * Equirectangular HDRI: the cube is allocated empty and filled
+     * on the next frame. Takes ownership of `$equirect`.
+     */
+    public constructor(hdri: Device $device, Texture $equirect, int32 $size)
+    {
+        assert($size > 0, 'environment size');
+        IblMaps $maps = iblMaps($device);
+        TextureDesc $desc = TextureDesc($format: .rgba16f, $width: $size, $height: $size);
+        $desc->kind = .cube;
+        $desc->mips = mipCount($size, $size);
+        $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+        $desc->label = 'deferred.environment';
+        $this->cube = Texture($device, 'deferred.environment', $desc);
+        $this->ready = false;
+        $this->irradiance = $maps->irradiance;
+        $this->prefilter = $maps->prefilter;
+        $this->brdf = $maps->brdf;
+        $this->iblReady = false;
+        $this->equirect = $equirect;
+        $this->equirectFrame = 0;
+    }
+
+    /** an already-baked cube; takes ownership */
+    public constructor(Device $device, Texture $cube)
+    {
+        assert($cube->cube(), 'Environment needs a cube texture');
+        IblMaps $maps = iblMaps($device);
+        $this->cube = $cube;
+        $this->ready = true;
+        $this->irradiance = $maps->irradiance;
+        $this->prefilter = $maps->prefilter;
+        $this->brdf = $maps->brdf;
+        $this->iblReady = false;
+        $this->equirect = null;
+        $this->equirectFrame = 0;
+    }
+
+    internal const function lighting() : Lighting
+    {
+        if ($this->iblReady) {
+            return .ibl;
+        }
+
+        if ($this->ready) {
+            return .environment;
+        }
+
+        return .sun;
+    }
+
+    internal function equirect() : Texture
+    {
+        Texture $source = guard $this->equirect;
+        return $source;
+    }
+
+    internal function cubeDone() : void
+    {
+        $this->ready = true;
+        $this->equirectFrame = $this->cube->device->frameIndex();
+    }
+
+    internal function iblDone() : void
+    {
+        $this->iblReady = true;
+    }
+
+    /**
+     * Frees the equirectangular source once every frame that sampled
+     * it is off the GPU. Destroying a texture the current command
+     * buffer still references is a use-after-free on Vulkan.
+     */
+    internal function releaseEquirect() : void
+    {
+        Texture $source = guard $this->equirect else {
+            return;
+        }
+
+        if (!$this->ready) {
+            return;
+        }
+
+        if ($this->cube->device->frameIndex() <= $this->equirectFrame + (FRAMES_IN_FLIGHT as uint64)) {
+            return;
+        }
+
+        $this->equirect = dropTexture($source);
+    }
+
+    internal function destroy() : void
+    {
+        $this->cube->destroy();
+        $this->irradiance->destroy();
+        $this->prefilter->destroy();
+        $this->brdf->destroy();
+        $this->equirect = dropTexture($this->equirect);
+        $this->ready = false;
+        $this->iblReady = false;
+    }
+}
+
+internal struct IblMaps
+{
+    public Texture $irradiance;
+    public Texture $prefilter;
+    public Texture $brdf;
+}
+
+internal function iblMaps(Device $device) : IblMaps
+{
+    uint32 $usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+    TextureDesc $irradiance = TextureDesc(
+        $format: .rgba16f,
+        $width: IBL_IRRADIANCE_SIZE,
+        $height: IBL_IRRADIANCE_SIZE
+    );
+    $irradiance->kind = .cube;
+    $irradiance->usage = $usage;
+    $irradiance->label = 'ibl.irradiance';
+    TextureDesc $prefilter = TextureDesc(
+        $format: .rgba16f,
+        $width: IBL_PREFILTER_SIZE,
+        $height: IBL_PREFILTER_SIZE
+    );
+    $prefilter->kind = .cube;
+    $prefilter->mips = IBL_PREFILTER_MIPS;
+    $prefilter->usage = $usage;
+    $prefilter->label = 'ibl.prefilter';
+    TextureDesc $brdf = TextureDesc($format: .rg16f, $width: IBL_BRDF_SIZE, $height: IBL_BRDF_SIZE);
+    $brdf->usage = $usage;
+    $brdf->label = 'ibl.brdf';
+    return IblMaps(
+        Texture($device, 'ibl.irradiance', $irradiance),
+        Texture($device, 'ibl.prefilter', $prefilter),
+        Texture($device, 'ibl.brdf', $brdf)
+    );
+}

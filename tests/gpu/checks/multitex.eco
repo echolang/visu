@@ -1,0 +1,92 @@
+/**
+ * Two sampler slots bound at once, then slot 1 rebound for a second
+ * draw. The last draw wins, so the readback proves both the
+ * multi-slot flush and the rebind path.
+ */
+
+use visu::graphics::{
+    CallbackPass, ClearPass, ClearPassOptions, Context, Device, Frame, GpuPass,
+    IoSink, Mesh, Pipeline, PipelineError, Raster, RenderEncoder, Sampler,
+    SamplerDesc, ShaderCollection, TargetRef, Texture, TextureDesc,
+    VertexLayout, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST
+};
+use visu::math::Vec4;
+
+public function checkMultiTexture(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('mix2') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    Texture $red = solidTexture($gpu->device, 'mixRed', 255, 0, 0);
+    Texture $blue = solidTexture($gpu->device, 'mixBlue', 0, 0, 255);
+    Texture $green = solidTexture($gpu->device, 'mixGreen', 0, 255, 0);
+    Sampler $samp = $gpu->device->createSampler(SamplerDesc());
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'mix2');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'mix2-draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(Context $ctx) : status<PipelineError> {
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                Device $device = $ctx->device;
+                Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+                    return .quad($device);
+                });
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3uv2(), Raster::none());
+                $pass->bind($enc);
+                $enc->bindTexture(0, $red, $samp);
+                $enc->bindTexture(1, $blue, $samp);
+                $mesh->draw($enc);
+                // same slot 0, new slot 1: the second draw must win
+                $enc->bindTexture(1, $green, $samp);
+                $mesh->draw($enc);
+                $enc->endRender();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('mix2');
+    $shaders->destroy();
+    $red->destroy();
+    $blue->destroy();
+    $green->destroy();
+    assert($pixels[0] > 100 && $pixels[0] < 160, 'slot 0 red half');
+    assert($pixels[1] > 100 && $pixels[1] < 160, 'slot 1 green half');
+    assert($pixels[2] < 16, 'blue is gone');
+}
+
+internal function solidTexture(Device $device, string $name, uint8 $r, uint8 $g, uint8 $b) : Texture
+{
+    TextureDesc $desc = TextureDesc($width: 1, $height: 1);
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_DST;
+    Texture $tex = Texture($device, $name, $desc);
+    array<uint8> $px = [$r, $g, $b, 255];
+    $tex->upload(0, ptr<const uint8>(&$px[0]), 4 as uint64, 4);
+    return $tex;
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_multi_texture
+{
+    GpuContext $gpu = gpuHidden('mix2');
+    checkMultiTexture($gpu);
+    $gpu->end();
+}
+#[end]

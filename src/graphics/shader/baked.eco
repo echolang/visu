@@ -1,0 +1,107 @@
+/**
+ * Shader programs baked into the module by
+ * `php tools/shaders.php --bake`. The generated
+ * `<prefix>Bytes($program, ShaderKind)` lookup is the only backend
+ * `#[if:]`; everything here is arm-agnostic, so a library program
+ * needs no files on disk.
+ */
+
+namespace visu::graphics;
+
+public class BakedShaders
+{
+    public Device $device;
+    private function<string?(string, ShaderKind)> $lookup;
+    private map<string, ShaderProgram> $programs;
+
+    public constructor(Device $device, function<string?(string, ShaderKind)> $lookup)
+    {
+        $this->device = $device;
+        $this->lookup = $lookup;
+        $this->programs = map<string, ShaderProgram>();
+    }
+
+    /** links on first use; a name the bake does not carry is `.missing` */
+    public function program(string $name) : result<ShaderProgram, ShaderError>
+    {
+        if ($this->programs->has($name)) {
+            return .ok($this->programs->get($name));
+        }
+
+        ShaderProgram $program = guard bakedProgram($this->device, $name, $this->lookup, label: $name) else ($e) {
+            return .error($e);
+        }
+        $this->programs[$name] = $program;
+        return .ok($program);
+    }
+
+    public const function has(string $name) : bool
+    {
+        return $this->programs->has($name);
+    }
+
+    public function destroy() : void
+    {
+        foreach ($this->programs as $program) {
+            $program->destroy();
+        }
+
+        $this->programs = map<string, ShaderProgram>();
+    }
+}
+
+/** SPIR-V arrives from the bake as a hex string; decode to raw bytes */
+internal function hexBytes(string $hex) : string
+{
+    string $out = '';
+    usize $i = 0;
+    usize $n = $hex->size();
+
+    while ($i + 1 < $n) {
+        uint8 $hi = hexNibble($hex->byte($i));
+        uint8 $lo = hexNibble($hex->byte($i + 1));
+        $out->push(($hi << 4) | $lo);
+        $i = $i + 2;
+    }
+
+    return $out;
+}
+
+internal function hexNibble(uint8 $b) : uint8
+{
+    if ($b >= 48 && $b <= 57) {
+        return $b - 48;
+    }
+
+    if ($b >= 97 && $b <= 102) {
+        return $b - 87;
+    }
+
+    if ($b >= 65 && $b <= 70) {
+        return $b - 55;
+    }
+
+    return 0;
+}
+
+/**
+ * Both stages of `$name` out of a bake lookup, then `link`. A name the
+ * bake does not carry is `.missing` — a stale generated file, which the
+ * caller surfaces rather than dying on.
+ */
+internal function bakedProgram(
+    Device $device,
+    string $name,
+    function<string?(string, ShaderKind)> $lookup,
+    label: string $label
+) : result<ShaderProgram, ShaderError>
+{
+    $find = $lookup;
+    string $vertex = guard $find($name, ShaderKind::vertex) else {
+        return .error(.missing($name));
+    }
+    string $fragment = guard $find($name, ShaderKind::fragment) else {
+        return .error(.missing($name));
+    }
+    return ShaderProgram::link($device, $label, $vertex, $fragment);
+}

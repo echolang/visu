@@ -1,0 +1,172 @@
+/**
+ * Cube textures: six uploaded faces sample back by direction, and
+ * both backends agree on the face order (+X -X +Y -Y +Z -Z).
+ */
+
+use visu::graphics::{
+    CallbackPass, ClearPass, ClearPassOptions, Context, Device, Frame, GpuPass,
+    IoSink, Mesh, Pipeline, PipelineError, Raster, RenderEncoder, Sampler,
+    SamplerDesc, ShaderCollection, TargetRef, Texture, TextureDesc, TextureKind,
+    VertexLayout, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST, TEXTURE_TRANSFER_SRC
+};
+use visu::math::{Vec3, Vec4};
+
+public struct CubeParams
+{
+    /** xyz sample direction, w mip level */
+    public Vec4 $dir;
+}
+
+public function checkCubemap(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('cubeface') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    Texture $cube = solidCube($gpu->device, 'facecube');
+    Sampler $samp = $gpu->device->createSampler(SamplerDesc());
+    array<Vec3> $dirs = [
+        Vec3(1.0f, 0.0f, 0.0f),
+        Vec3(-1.0f, 0.0f, 0.0f),
+        Vec3(0.0f, 1.0f, 0.0f),
+        Vec3(0.0f, -1.0f, 0.0f),
+        Vec3(0.0f, 0.0f, 1.0f),
+        Vec3(0.0f, 0.0f, -1.0f)
+    ];
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        int32 $face = 0;
+
+        while ($face < 6) {
+            TargetRef $t = offscreen64($p, "cubeface{$face}");
+            $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
+            Vec3 $dir = $dirs[$face as usize];
+            $p->add(CallbackPass(
+                "cubeface-{$face}",
+                setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                    $io->writes($t);
+                },
+                execute: function(Context $ctx) : status<PipelineError> {
+                    RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                        return .error($e);
+                    }
+                    Device $device = $ctx->device;
+                    Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+                        return .quad($device);
+                    });
+                    GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3uv2(), Raster::none());
+                    $pass->bind($enc);
+                    $enc->upload(CubeParams(Vec4($dir->x, $dir->y, $dir->z, 0.0f)), slot: 0);
+                    $enc->bindTexture(0, $cube, $samp);
+                    $mesh->draw($enc);
+                    $enc->endRender();
+                    return .ok;
+                }
+            ));
+            $face = $face + 1;
+        }
+    });
+
+    // +X red, -X green, +Y blue, -Y yellow, +Z cyan, -Z magenta
+    assertFace($gpu, 0, 255, 0, 0);
+    assertFace($gpu, 1, 0, 255, 0);
+    assertFace($gpu, 2, 0, 0, 255);
+    assertFace($gpu, 3, 255, 255, 0);
+    assertFace($gpu, 4, 0, 255, 255);
+    assertFace($gpu, 5, 255, 0, 255);
+
+    // the same six faces read back through capture(face:)
+    int32 $face = 0;
+
+    while ($face < 6) {
+        $px = guard $cube->capture(face: $face) else ($e) {
+            die($e->message());
+        }
+        assert($px->width == 2 && $px->height == 2, 'face size');
+        assert($px->rgba[0] == faceByte($face, 0), 'captured face red');
+        assert($px->rgba[1] == faceByte($face, 1), 'captured face green');
+        assert($px->rgba[2] == faceByte($face, 2), 'captured face blue');
+        $face = $face + 1;
+    }
+
+    $shaders->destroy();
+    $cube->destroy();
+}
+
+internal function assertFace(GpuContext $gpu, int32 $face, int32 $r, int32 $g, int32 $b) : void
+{
+    array<uint8> $pixels = $gpu->readOffscreen("cubeface{$face}");
+    assert(near($pixels[0] as int32, $r), 'face red');
+    assert(near($pixels[1] as int32, $g), 'face green');
+    assert(near($pixels[2] as int32, $b), 'face blue');
+}
+
+internal function near(int32 $got, int32 $want) : bool
+{
+    int32 $delta = $got - $want;
+
+    if ($delta < 0) {
+        $delta = -$delta;
+    }
+
+    return $delta < 8;
+}
+
+/** 2x2 cube, one flat colour per face */
+internal function solidCube(Device $device, string $name) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .rgba8, $width: 2, $height: 2);
+    $desc->kind = .cube;
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+    Texture $cube = Texture($device, $name, $desc);
+    int32 $face = 0;
+
+    while ($face < 6) {
+        array<uint8> $px = array<uint8>();
+        int32 $texel = 0;
+
+        while ($texel < 4) {
+            $px[] = faceByte($face, 0);
+            $px[] = faceByte($face, 1);
+            $px[] = faceByte($face, 2);
+            $px[] = 255;
+            $texel = $texel + 1;
+        }
+
+        $cube->upload(face: $face, 0, ptr<const uint8>(&$px[0]), 16 as uint64, 8);
+        $face = $face + 1;
+    }
+
+    return $cube;
+}
+
+internal function faceByte(int32 $face, int32 $channel) : uint8
+{
+    array<uint8> $table = [
+        255, 0, 0,
+        0, 255, 0,
+        0, 0, 255,
+        255, 255, 0,
+        0, 255, 255,
+        255, 0, 255
+    ];
+    return $table[(($face * 3) + $channel) as usize];
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_cubemap
+{
+    GpuContext $gpu = gpuHidden('cube');
+    checkCubemap($gpu);
+    $gpu->end();
+}
+#[end]

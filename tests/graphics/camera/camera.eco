@@ -1,0 +1,118 @@
+/**
+ * Projection depth range, screen rays, and the CameraData fact.
+ * No GPU calls.
+ */
+
+use visu::geo::{Pose, Ray};
+use visu::graphics::{Camera, CameraData, CameraUniforms, Projection};
+use visu::math::{Mat4, Quat, Vec2, Vec3, Vec4, length};
+
+internal function identityPose() : Pose
+{
+    return Pose(Vec3(0.0f, 0.0f, 0.0f), Quat(), Vec3(1.0f, 1.0f, 1.0f));
+}
+
+test camera_perspective_depth_is_zero_to_one
+{
+    Camera $camera = Camera(Projection::perspective);
+    $camera->near = 0.5f;
+    $camera->far = 100.0f;
+    Mat4 $p = $camera->projection(128, 64, 1.0f, 1.0f);
+    Vec4 $near = $p * Vec4(0.0f, 0.0f, -0.5f, 1.0f);
+    Vec4 $far = $p * Vec4(0.0f, 0.0f, -100.0f, 1.0f);
+    float32 $nz = $near->z / $near->w;
+    float32 $fz = $far->z / $far->w;
+    assert($nz > -0.001f && $nz < 0.001f, 'near maps to 0');
+    assert($fz > 0.999f && $fz < 1.001f, 'far maps to 1');
+}
+
+test camera_perspective_keeps_half_depth_in_range
+{
+    Camera $camera = Camera(Projection::perspective);
+    Mat4 $p = $camera->projection(64, 64, 1.0f, 1.0f);
+    Vec4 $mid = $p * Vec4(0.0f, 0.0f, -32768.0f, 1.0f);
+    float32 $z = $mid->z / $mid->w;
+    assert($z > 0.0f && $z < 1.0f, 'mid depth is inside the range');
+}
+
+test camera_legacy_fov_is_wider_than_degrees
+{
+    Camera $legacy = Camera(Projection::perspective);
+    $legacy->legacyFov = true;
+    Camera $degrees = Camera(Projection::perspective);
+    Mat4 $a = $legacy->projection(64, 64, 1.0f, 1.0f);
+    Mat4 $b = $degrees->projection(64, 64, 1.0f, 1.0f);
+    // a wider vertical fov means a smaller y scale
+    assert($a->c1->y < $b->c1->y, 'legacy 45 reads as radians');
+}
+
+test camera_ray_through_the_centre_looks_forward
+{
+    Camera $camera = Camera(Projection::perspective);
+    CameraData $data = $camera->data(identityPose(), 64, 64, 1.0f, 1.0f, 0.0f);
+    Ray $ray = $data->ray(Vec2(0.0f, 0.0f));
+    assert($ray->direction->z < -0.99f, 'looks down -Z');
+    assert($ray->direction->x > -0.01f && $ray->direction->x < 0.01f, 'no x drift');
+    assert($ray->direction->y > -0.01f && $ray->direction->y < 0.01f, 'no y drift');
+}
+
+test camera_view_is_the_inverse_of_the_pose
+{
+    Camera $camera = Camera(Projection::perspective);
+    Pose $pose = identityPose();
+    $pose->position = Vec3(3.0f, 4.0f, 5.0f);
+    Mat4 $view = $camera->view($pose);
+    Vec4 $origin = $view * Vec4(3.0f, 4.0f, 5.0f, 1.0f);
+    assert(length(Vec3($origin->x, $origin->y, $origin->z)) < 0.001f, 'camera sits at the view origin');
+}
+
+test camera_orthographic_screen_viewport_is_top_left
+{
+    Camera $camera = Camera(Projection::orthographicScreen);
+    assert($camera->orthographic(), 'ortho');
+    $vp = $camera->viewport(200, 100, 2.0f, 2.0f);
+    assert($vp->left == 0.0f, 'left');
+    assert($vp->right == 100.0f, 'right is logical points');
+    assert($vp->top == 0.0f, 'top');
+    assert($vp->bottom == 50.0f, 'bottom is logical points');
+}
+
+test camera_perspective_has_no_viewport
+{
+    Camera $camera = Camera(Projection::perspective);
+    assert(!$camera->orthographic(), 'perspective');
+    CameraData $data = $camera->data(identityPose(), 64, 64, 1.0f, 1.0f, 0.0f);
+    assert(!$data->hasViewport, 'no viewport');
+}
+
+test camera_data_resolution_helpers
+{
+    Camera $camera = Camera(Projection::perspective);
+    CameraData $data = $camera->data(identityPose(), 200, 100, 2.0f, 2.0f, 0.25f);
+    Vec2 $device = $data->resolution();
+    Vec2 $points = $data->scaledResolution();
+    assert($device->x == 200.0f && $device->y == 100.0f, 'device pixels');
+    assert($points->x == 100.0f && $points->y == 50.0f, 'logical points');
+    assert($data->compensation == 0.25f, 'compensation rides along');
+}
+
+test camera_uniforms_carry_position_and_resolution
+{
+    Camera $camera = Camera(Projection::perspective);
+    Pose $pose = identityPose();
+    $pose->position = Vec3(1.0f, 2.0f, 3.0f);
+    CameraData $data = $camera->data($pose, 64, 32, 1.0f, 1.0f, 0.0f);
+    CameraUniforms $u = $data->uniforms();
+    assert($u->position->x == 1.0f && $u->position->z == 3.0f, 'position');
+    assert($u->resolution->x == 64.0f && $u->resolution->y == 32.0f, 'size');
+    assert($u->resolution->z > 0.015f && $u->resolution->z < 0.016f, '1/width');
+}
+
+test camera_frustum_contains_what_is_in_front
+{
+    Camera $camera = Camera(Projection::perspective);
+    CameraData $data = $camera->data(identityPose(), 64, 64, 1.0f, 1.0f, 0.0f);
+    assert($data->frustum->contains(Vec3(0.0f, 0.0f, -10.0f), 1.0f), 'ahead');
+    assert(!$data->frustum->contains(Vec3(0.0f, 0.0f, 10.0f), 1.0f), 'behind');
+    assert(!$data->frustum->contains(Vec3(500.0f, 0.0f, -10.0f), 1.0f), 'far off to the side');
+}

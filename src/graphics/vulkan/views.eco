@@ -1,0 +1,84 @@
+/**
+ * Per-(face, mip) image views. A render pass attachment is always a
+ * single 2D subresource, so a cube or a mipped render target needs
+ * one view per face and level beside its sampling view.
+ */
+
+namespace visu::graphics;
+
+internal function vkCreateAttachmentViews(
+    Device $device,
+    TextureHandle& $handle,
+    const TextureDesc& $desc,
+    uint32 $aspect
+) : status<DeviceError>
+{
+    if (($desc->usage & TEXTURE_RENDER_TARGET) == 0) {
+        return .ok;
+    }
+
+    int32 $layers = $desc->kind->layers();
+
+    if ($layers == 1 && $desc->mips == 1) {
+        // the sampling view already is the single subresource
+        return .ok;
+    }
+
+    int32 $face = 0;
+
+    while ($face < $layers) {
+        int32 $mip = 0;
+
+        while ($mip < $desc->mips) {
+            vk::ImageViewCreateInfo $vci = vk::ImageViewCreateInfo();
+            $vci->image = $handle->image;
+            $vci->viewType = vk::IMAGE_VIEW_TYPE_2D;
+            $vci->format = vkFormat($desc->format);
+            $vci->subresourceRange->aspectMask = $aspect;
+            $vci->subresourceRange->baseMipLevel = $mip as uint32;
+            $vci->subresourceRange->levelCount = 1;
+            $vci->subresourceRange->baseArrayLayer = $face as uint32;
+            $vci->subresourceRange->layerCount = 1;
+            vk::ImageView $view = vk::ImageView::none();
+            guard vkCheck(
+                vk::CreateImageView($device->logical, &$vci, null, &$view),
+                'CreateImageView'
+            ) else ($e) {
+                return .error($e);
+            }
+
+            $handle->levelViews[] = $view;
+            $mip = $mip + 1;
+        }
+
+        $face = $face + 1;
+    }
+
+    return .ok;
+}
+
+internal function vkDestroyViews(Device $device, TextureHandle& $handle) : void
+{
+    foreach ($handle->levelViews as $view) {
+        if ($view->handle != 0) {
+            vk::DestroyImageView($device->logical, $view, null);
+        }
+    }
+
+    $handle->levelViews = array<vk::ImageView>();
+}
+
+/** the view a render pass binds for one face and mip */
+internal function vkAttachmentView(Texture $texture, int32 $face, int32 $mip) : vk::ImageView
+{
+    if ($texture->layers() == 1 && $texture->mips == 1) {
+        return $texture->handle->view;
+    }
+
+    usize $index = (($face * $texture->mips) + $mip) as usize;
+    assert(
+        $index < $texture->handle->levelViews->count(),
+        'render into a face or mip needs TEXTURE_RENDER_TARGET'
+    );
+    return $texture->handle->levelViews[$index];
+}

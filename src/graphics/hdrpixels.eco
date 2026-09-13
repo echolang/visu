@@ -1,0 +1,85 @@
+/**
+ * CPU-side linear rgba32f image, top-left origin. Radiance (.hdr)
+ * files in and out through stb; `Texture($device, $name, $pixels)`
+ * uploads one. Values are scene referred and routinely exceed 1.
+ */
+
+namespace visu::graphics;
+
+public struct HdrPixels
+{
+    public const int32 $width;
+    public const int32 $height;
+    /** four floats per pixel, row major from the top */
+    public array<float32> $rgba;
+
+    public static function load(const string& $path) : result<HdrPixels, DumpError>
+    {
+        int32 $w = 0;
+        int32 $h = 0;
+        ptr<float32> $data = null;
+        string $cpath = $path->clone();
+        int32 $ok = visu_hdr_load(pixelsCstr($cpath), &$w, &$h, &$data);
+
+        if ($ok == 0 || $data:$ == null || $w <= 0 || $h <= 0) {
+            return .error(.io($path, 'hdr load failed'));
+        }
+
+        usize $count = (($w as usize) * ($h as usize)) * 4;
+        // room + commit, then copy over every element; no zero-fill to overwrite
+        array<float32> $rgba = arr::room<float32>($count);
+        $rgba->commit($count);
+        mem::copy<uint8>(
+            ptr<uint8>(&$rgba[0]),
+            ptr<uint8>($data:$ as ptr<uint8>),
+            ($count as uint64) * (mem::size<float32>() as uint64)
+        );
+        visu_hdr_free($data);
+        return .ok(HdrPixels($w, $h, $rgba));
+    }
+
+    public const function write(const string& $path) : status<DumpError>
+    {
+        if ($this->width <= 0 || $this->height <= 0 || $this->rgba->empty()) {
+            return .error(.empty);
+        }
+
+        guard pixelsEnsureParent($path) else ($e) {
+            return .error($e);
+        }
+        string $cpath = $path->clone();
+        int32 $ok = visu_hdr_write(
+            pixelsCstr($cpath),
+            $this->width,
+            $this->height,
+            ptr<const float32>(&$this->rgba[0])
+        );
+
+        if ($ok == 0) {
+            return .error(.io($path, 'hdr write failed'));
+        }
+
+        return .ok;
+    }
+
+    public const function bytes() : uint64
+    {
+        return ($this->rgba->count() as uint64) * (mem::size<float32>() as uint64);
+    }
+}
+
+/** the half-float copy a GPU texture wants */
+internal function pixelsToHalf(const array<float32>& $values) : array<uint16>
+{
+    usize $n = $values->count();
+    array<uint16> $out = array<uint16>();
+    $out->reserve($n);
+    usize $i = 0;
+
+    while ($i < $n) {
+        $out[] = pixelsFloatToHalf($values[$i]);
+        $i = $i + 1;
+    }
+
+    return $out;
+}

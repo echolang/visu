@@ -22,9 +22,9 @@ public class RenderEncoder : RenderEncoderProtocol
     private mtl::Buffer? $indexTransient;
     private IndexType $indexType;
     private uint64 $indexOffset;
-    private Texture? $boundTex;
-    private Sampler? $boundSamp;
-    private uint32 $boundSlot;
+    private TextureHandle[8] $texHandles;
+    private SamplerHandle[8] $sampHandles;
+    private bool $texturesDirty;
     private uint64[4] $uniformOff;
     private bool[4] $uniformSet;
 
@@ -52,9 +52,7 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->indexTransient = null;
         $this->indexType = .uint16;
         $this->indexOffset = 0;
-        $this->boundTex = null;
-        $this->boundSamp = null;
-        $this->boundSlot = 0;
+        $this->texturesDirty = false;
         uint64[4] $off;
         bool[4] $set;
         uint32 $i = 0;
@@ -67,6 +65,18 @@ public class RenderEncoder : RenderEncoderProtocol
 
         $this->uniformOff = mv $off;
         $this->uniformSet = mv $set;
+        TextureHandle[8] $texes;
+        SamplerHandle[8] $samps;
+        $i = 0;
+
+        while ($i < TEXTURE_SLOTS) {
+            $texes[$i] = TextureHandle::none();
+            $samps[$i] = SamplerHandle::none();
+            $i = $i + 1;
+        }
+
+        $this->texHandles = mv $texes;
+        $this->sampHandles = mv $samps;
     }
 
     destructor()
@@ -201,9 +211,9 @@ public class RenderEncoder : RenderEncoderProtocol
         assert(!$this->ended, 'bindTexture after endRender');
         assert($slot < TEXTURE_SLOTS, 'texture slot');
         assert($texture->state == ResourceState::shaderRead, 'bindTexture: texture is not shaderRead');
-        $this->boundTex = $texture;
-        $this->boundSamp = $sampler;
-        $this->boundSlot = $slot;
+        $this->texHandles[$slot] = $texture->handle;
+        $this->sampHandles[$slot] = $sampler->handle;
+        $this->texturesDirty = true;
     }
 
     public function draw(int32 $first, int32 $count, int32 $instances = 1) : void
@@ -300,19 +310,32 @@ public class RenderEncoder : RenderEncoderProtocol
             $i = $i + 1;
         }
 
-        Texture $tex = guard $this->boundTex else {
+        if (!$this->texturesDirty) {
             return;
         }
-        Sampler $samp = guard $this->boundSamp else {
+
+        $i = 0;
+
+        while ($i < TEXTURE_SLOTS) {
+            // bindSlot skips a slot nothing was bound into
+            $this->bindSlot($i);
+            $i = $i + 1;
+        }
+
+        $this->texturesDirty = false;
+    }
+
+    // one combined image sampler; an empty handle is a wiring bug the
+    // shared Texture class already asserts against
+    private function bindSlot(uint32 $slot) : void
+    {
+        mtl::Texture $mt = guard $this->texHandles[$slot]->texture else {
             return;
         }
-        mtl::Texture $mt = guard $tex->handle->texture else {
+        mtl::SamplerState $ss = guard $this->sampHandles[$slot]->sampler else {
             return;
         }
-        mtl::SamplerState $ss = guard $samp->handle->sampler else {
-            return;
-        }
-        $this->enc->setFragmentTexture($mt, index: $this->boundSlot);
-        $this->enc->setFragmentSamplerState($ss, index: $this->boundSlot);
+        $this->enc->setFragmentTexture($mt, index: $slot);
+        $this->enc->setFragmentSamplerState($ss, index: $slot);
     }
 }

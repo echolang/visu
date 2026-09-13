@@ -15,9 +15,10 @@ public class RenderEncoder : RenderEncoderProtocol
     private bool $viewportSet;
     private bool $scissorSet;
     private bool $pipelineSet;
-    private Texture? $boundTex;
-    private Sampler? $boundSamp;
-    private uint32 $boundSlot;
+    internal TextureHandle[8] $texHandles;
+    internal SamplerHandle[8] $sampHandles;
+    internal bool[8] $texSet;
+    internal bool $texturesDirty;
 
     public constructor(Device $device, TargetFormats $formats, int32 $width, int32 $height)
     {
@@ -29,9 +30,22 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->viewportSet = false;
         $this->scissorSet = false;
         $this->pipelineSet = false;
-        $this->boundTex = null;
-        $this->boundSamp = null;
-        $this->boundSlot = 0;
+        $this->texturesDirty = false;
+        TextureHandle[8] $texes;
+        SamplerHandle[8] $samps;
+        bool[8] $bound;
+        uint32 $i = 0;
+
+        while ($i < TEXTURE_SLOTS) {
+            $texes[$i] = TextureHandle::none();
+            $samps[$i] = SamplerHandle::none();
+            $bound[$i] = false;
+            $i = $i + 1;
+        }
+
+        $this->texHandles = mv $texes;
+        $this->sampHandles = mv $samps;
+        $this->texSet = mv $bound;
     }
 
     destructor()
@@ -166,9 +180,17 @@ public class RenderEncoder : RenderEncoderProtocol
         assert(!$this->ended, 'bindTexture after endRender');
         assert($slot < TEXTURE_SLOTS, 'texture slot');
         assert($texture->state == ResourceState::shaderRead, 'bindTexture: texture is not shaderRead');
-        $this->boundTex = $texture;
-        $this->boundSamp = $sampler;
-        $this->boundSlot = $slot;
+        // a repeat bind of the same pair must not mint another set 1
+        if ($this->texSet[$slot]
+            && $this->texHandles[$slot]->view->handle == $texture->handle->view->handle
+            && $this->sampHandles[$slot]->sampler->handle == $sampler->handle->sampler->handle) {
+            return;
+        }
+
+        $this->texHandles[$slot] = $texture->handle;
+        $this->sampHandles[$slot] = $sampler->handle;
+        $this->texSet[$slot] = true;
+        $this->texturesDirty = true;
     }
 
     public function draw(int32 $first, int32 $count, int32 $instances = 1) : void
@@ -176,7 +198,7 @@ public class RenderEncoder : RenderEncoderProtocol
         assert(!$this->ended, 'draw after endRender');
         assert($this->pipelineSet, 'draw before setGpuPass');
         vkFlushUniforms($this->device);
-        vkFlushTextures($this->device, $this->boundTex, $this->boundSamp, $this->boundSlot);
+        vkFlushTextures($this->device, $this);
         vk::CmdDraw($this->device->currentCmd(), $count as uint32, $instances as uint32, $first as uint32, 0);
     }
 
@@ -185,7 +207,7 @@ public class RenderEncoder : RenderEncoderProtocol
         assert(!$this->ended, 'drawIndexed after endRender');
         assert($this->pipelineSet, 'drawIndexed before setGpuPass');
         vkFlushUniforms($this->device);
-        vkFlushTextures($this->device, $this->boundTex, $this->boundSamp, $this->boundSlot);
+        vkFlushTextures($this->device, $this);
         vk::CmdDrawIndexed(
             $this->device->currentCmd(),
             $count as uint32,

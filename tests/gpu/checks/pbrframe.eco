@@ -1,0 +1,81 @@
+/**
+ * The whole deferred pipeline in one frame: GBuffer fill, ambient
+ * occlusion, shading, blit. One white sphere lit by a sun from the
+ * front must come out brighter than the background it sits on.
+ */
+
+use visu::geo::{AABB, Pose, PrimitiveBuilder, PrimitiveLayout, sphere};
+use visu::graphics::{
+    Camera, Context, DeferredRenderer, DirectionalLight, DrawCallAssembler,
+    GBufferData, Mesh, MeshHandle, Pipeline, Projection, TargetRef,
+    VertexBuilder, VertexLayout, instanceLayout
+};
+use visu::math::{Mat4, Quat, Vec3, Vec4, translate};
+
+public struct PbrCheckMaterial
+{
+    public Vec4 $albedoMetallic;
+    public Vec4 $emissiveRoughness;
+}
+
+public function checkPbrFrame(GpuContext $gpu) : void
+{
+    DeferredRenderer $renderer = DeferredRenderer($gpu->device);
+    guard $renderer->load() else ($e) {
+        die($e->message());
+    }
+
+    // a sun straight at the camera, so the sphere is unmistakably lit
+    $renderer->sun = DirectionalLight(Vec3(0.0f, 0.0f, -1.0f), Vec3(1.0f, 1.0f, 1.0f), 1.0f);
+    $renderer->renderSkybox = false;
+
+    PrimitiveBuilder $builder = PrimitiveBuilder(PrimitiveLayout::pos3n3());
+    sphere($builder, 0.8f, 24, 12);
+    Mesh $mesh = Mesh($gpu->device, $builder->data, stride: $builder->layout->bytes());
+
+    DrawCallAssembler<PbrCheckMaterial> $dca = DrawCallAssembler<PbrCheckMaterial>($gpu->device);
+    MeshHandle $handle = $dca->register($mesh, AABB(Vec3(-0.8f, -0.8f, -0.8f), Vec3(0.8f, 0.8f, 0.8f)));
+    VertexLayout $layout = VertexLayout::pos3n3()->join(
+        instanceLayout<PbrCheckMaterial>(2, function(VertexBuilder $b, ptr<const PbrCheckMaterial> $p) : void {
+            $b->attr(6, &$p->albedoMetallic);
+            $b->attr(7, &$p->emissiveRoughness);
+        })
+    );
+
+    Camera $camera = Camera(Projection::perspective);
+    Pose $pose = Pose(Vec3(0.0f, 0.0f, 3.0f), Quat(), Vec3(1.0f, 1.0f, 1.0f));
+
+    $gpu->runFrame(function(Pipeline $p, Context $build) : void {
+        TargetRef $out = offscreen64($p, 'pbrframe');
+        $build->frame->set($camera->data($pose, 64, 64, 1.0f, 1.0f, 0.0f));
+        $renderer->render($build, $out, function(Context $inner, GBufferData $gbuffer) : void {
+            $dca->clearInstances();
+            $dca->submit($handle, translate(Vec3(0.0f, 0.0f, 0.0f)), PbrCheckMaterial(
+                Vec4(1.0f, 1.0f, 1.0f, 0.0f),
+                Vec4(0.0f, 0.0f, 0.0f, 0.4f)
+            ));
+            assert($dca->pendingCount() == 1, 'one instance');
+            $renderer->draw($inner, $gbuffer, $dca, $layout);
+        });
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('pbrframe');
+    $renderer->destroy();
+    $mesh->destroy();
+    usize $centre = ((64 * 32 + 32) * 4) as usize;
+    int32 $lit = $pixels[$centre] as int32;
+    int32 $background = $pixels[0] as int32;
+    assert($lit > 120, 'the sphere is lit');
+    assert($lit > $background + 40, 'the sphere stands out from the background');
+    assert($pixels[$centre + 1] as int32 > 120, 'white albedo stays neutral');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_pbr_frame
+{
+    GpuContext $gpu = gpuHidden('pbrframe');
+    checkPbrFrame($gpu);
+    $gpu->end();
+}
+#[end]

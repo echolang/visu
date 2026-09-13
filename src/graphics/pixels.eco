@@ -15,7 +15,9 @@ public struct Pixels
 
     /**
      * Native readback bytes → packed rgba8. rgba8 / rgba8Srgb
-     * identity, bgra8 swaps R/B, r8 expands to gray.
+     * identity, bgra8 swaps R/B, r8 expands to gray. Float formats
+     * clamp to 0..1 — enough to eyeball a GBuffer or an IBL bake,
+     * not a tone mapper.
      */
     public static function from(
         PixelFormat $format,
@@ -89,13 +91,11 @@ public struct Pixels
 
 internal function pixelsRawSize(PixelFormat $format, int32 $width, int32 $height) : uint64
 {
-    uint32 $bpp = match ($format) {
-        PixelFormat::rgba8 => 4,
-        PixelFormat::bgra8 => 4,
-        PixelFormat::rgba8Srgb => 4,
-        PixelFormat::r8 => 1,
-        else => 0,
-    };
+    if ($format->isDepth()) {
+        return 0;
+    }
+
+    uint32 $bpp = pixelByteCount($format);
 
     if ($bpp == 0) {
         return 0;
@@ -109,19 +109,165 @@ internal function pixelsSwizzle(
     const array<uint8>& $raw
 ) : result<array<uint8>, DumpError>
 {
-    if ($format == PixelFormat::rgba8 || $format == PixelFormat::rgba8Srgb) {
-        return .ok($raw->clone());
-    }
-
+    // channel order is the one thing the format accessors do not carry
     if ($format == PixelFormat::bgra8) {
         return .ok(pixelsSwapRb($raw));
     }
 
-    if ($format == PixelFormat::r8) {
+    usize $channels = $format->channels() as usize;
+
+    if ($format->component() == Component::unorm8) {
+        if ($channels == 4) {
+            return .ok($raw->clone());
+        }
+
         return .ok(pixelsExpandR8($raw));
     }
 
+    if ($format->component() == Component::float32) {
+        return .ok(pixelsFromFloat32($raw, $channels));
+    }
+
+    if ($format->component() == Component::half) {
+        return .ok(pixelsFromFloat16($raw, $channels));
+    }
+
     return .error(.unsupported($format));
+}
+
+/** 0..1 clamp then 8-bit quantize; missing channels read black, alpha opaque */
+internal function pixelsChannelByte(float32 $value) : uint8
+{
+    if ($value <= 0.0f) {
+        return 0;
+    }
+
+    if ($value >= 1.0f) {
+        return 255;
+    }
+
+    return ($value * 255.0f) as uint8;
+}
+
+internal function pixelsFromFloat32(const array<uint8>& $raw, usize $channels) : array<uint8>
+{
+    usize $texels = $raw->count() / ($channels * 4);
+    array<uint8> $out = pixelsFilled(($texels * 4) as uint64);
+    ptr<const float32> $src = ptr<const float32>(&$raw[0]);
+    usize $i = 0;
+
+    while ($i < $texels) {
+        usize $o = $i * 4;
+        usize $s = $i * $channels;
+        usize $c = 0;
+
+        while ($c < $channels && $c < 4) {
+            $out[$o + $c] = pixelsChannelByte($src:$[$s + $c]);
+            $c = $c + 1;
+        }
+
+        if ($channels < 4) {
+            $out[$o + 3] = 255;
+        }
+
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function pixelsFromFloat16(const array<uint8>& $raw, usize $channels) : array<uint8>
+{
+    usize $texels = $raw->count() / ($channels * 2);
+    array<uint8> $out = pixelsFilled(($texels * 4) as uint64);
+    ptr<const uint16> $src = ptr<const uint16>(&$raw[0]);
+    usize $i = 0;
+
+    while ($i < $texels) {
+        usize $o = $i * 4;
+        usize $s = $i * $channels;
+        usize $c = 0;
+
+        while ($c < $channels && $c < 4) {
+            $out[$o + $c] = pixelsChannelByte(pixelsHalfToFloat($src:$[$s + $c]));
+            $c = $c + 1;
+        }
+
+        if ($channels < 4) {
+            $out[$o + 3] = 255;
+        }
+
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+/**
+ * IEEE float to half, truncating the mantissa. Subnormals flush to
+ * zero and anything above the half range saturates at 65504, which is
+ * what radiance data wants anyway.
+ */
+internal function pixelsFloatToHalf(float32 $value) : uint16
+{
+    float32 $local = $value;
+    ptr<const uint32> $word = ptr<const uint32>(&$local);
+    uint32 $bits = $word:$[0];
+    uint32 $sign = ($bits >> 16) & 32768;
+    uint32 $rest = $bits & 2147483647;
+
+    // >= 2^16 in float32 exponent terms: saturate rather than make an inf
+    if ($rest >= 1199570944) {
+        return ($sign | 31743) as uint16;
+    }
+
+    // below the smallest half normal
+    if ($rest < 947912704) {
+        return $sign as uint16;
+    }
+
+    uint32 $exponent = (($rest >> 23) - 112) << 10;
+    uint32 $mantissa = ($rest >> 13) & 1023;
+    return ($sign | $exponent | $mantissa) as uint16;
+}
+
+/** IEEE half to float; denormals and NaN land on 0, which is fine for a dump */
+internal function pixelsHalfToFloat(uint16 $half) : float32
+{
+    uint32 $exponent = (($half as uint32) >> 10) & 31;
+    uint32 $mantissa = ($half as uint32) & 1023;
+    bool $negative = (($half as uint32) & 32768) != 0;
+
+    if ($exponent == 0) {
+        return 0.0f;
+    }
+
+    if ($exponent == 31) {
+        if ($negative) {
+            return 0.0f;
+        }
+
+        return 65504.0f;
+    }
+
+    float32 $value = 1.0f + ($mantissa as float32) / 1024.0f;
+    int32 $power = ($exponent as int32) - 15;
+
+    while ($power > 0) {
+        $value = $value * 2.0f;
+        $power = $power - 1;
+    }
+
+    while ($power < 0) {
+        $value = $value * 0.5f;
+        $power = $power + 1;
+    }
+
+    if ($negative) {
+        return -$value;
+    }
+
+    return $value;
 }
 
 internal function pixelsSwapRb(const array<uint8>& $raw) : array<uint8>

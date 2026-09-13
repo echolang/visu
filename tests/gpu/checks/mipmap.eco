@@ -1,0 +1,96 @@
+/**
+ * generateMipmaps fills level 1 from level 0: a red/blue checker
+ * averages to purple one level down.
+ */
+
+use visu::graphics::{
+    CallbackPass, ClearPass, ClearPassOptions, Context, Device, Filter, Frame,
+    GpuPass, IoSink, Mesh, Pipeline, PipelineError, Raster, RenderEncoder,
+    Sampler, SamplerDesc, ShaderCollection, TargetRef, Texture, TextureDesc,
+    VertexLayout, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST, TEXTURE_TRANSFER_SRC
+};
+use visu::math::Vec4;
+
+public struct LodParams
+{
+    /** x is the mip level to sample */
+    public Vec4 $level;
+}
+
+public function checkMipmaps(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('lod') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    TextureDesc $desc = TextureDesc($format: .rgba8, $width: 2, $height: 2);
+    $desc->mips = 2;
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+    Texture $tex = Texture($gpu->device, 'checker', $desc);
+    array<uint8> $px = [
+        255, 0, 0, 255,
+        0, 0, 255, 255,
+        0, 0, 255, 255,
+        255, 0, 0, 255
+    ];
+    $tex->upload(0, ptr<const uint8>(&$px[0]), 16 as uint64, 8);
+    $tex->generateMipmaps();
+
+    SamplerDesc $sd = SamplerDesc();
+    $sd->min = Filter::linearMipmapLinear;
+    Sampler $samp = $gpu->device->createSampler($sd);
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'mip');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'mip-draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(Context $ctx) : status<PipelineError> {
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                Device $device = $ctx->device;
+                Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+                    return .quad($device);
+                });
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3uv2(), Raster::none());
+                $pass->bind($enc);
+                $enc->upload(LodParams(Vec4(1.0f, 0.0f, 0.0f, 0.0f)), slot: 0);
+                $enc->bindTexture(0, $tex, $samp);
+                $mesh->draw($enc);
+                $enc->endRender();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('mip');
+    $shaders->destroy();
+    $tex->destroy();
+    // half red half blue averaged, with nothing green in between
+    // half red half blue averaged, with nothing green in between
+    assert($pixels[0] > 100 && $pixels[0] < 160, 'mip 1 red is halved');
+    assert($pixels[1] < 16, 'mip 1 has no green');
+    assert($pixels[2] > 100 && $pixels[2] < 160, 'mip 1 blue is halved');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_mipmaps
+{
+    GpuContext $gpu = gpuHidden('mip');
+    checkMipmaps($gpu);
+    $gpu->end();
+}
+#[end]

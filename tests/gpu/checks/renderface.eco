@@ -1,0 +1,133 @@
+/**
+ * Rendering into one cube face and mip. Clearing face 3 mip 1 must
+ * leave the other faces alone, and the result must sample back both
+ * through the cube view and through capture(face:, mip:).
+ */
+
+use visu::graphics::{
+    CallbackPass, ClearPass, ClearPassOptions, ColorTarget, Context, Device,
+    Filter, Frame, GpuPass, IoSink, LoadOp, Mesh, Pipeline, PipelineError,
+    Raster, RenderEncoder, RenderPassDesc, ResourceState, Sampler, SamplerDesc,
+    ShaderCollection, StoreOp, TargetRef, Texture, TextureDesc, VertexLayout,
+    TEXTURE_RENDER_TARGET, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST,
+    TEXTURE_TRANSFER_SRC
+};
+use visu::math::{Vec3, Vec4};
+
+public function checkRenderToFace(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('cubeface') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    TextureDesc $desc = TextureDesc($format: .rgba8, $width: 4, $height: 4);
+    $desc->kind = .cube;
+    $desc->mips = 2;
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+    Texture $cube = Texture($gpu->device, 'facetarget', $desc);
+
+    SamplerDesc $sd = SamplerDesc();
+    $sd->min = Filter::linearMipmapLinear;
+    Sampler $samp = $gpu->device->createSampler($sd);
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'renderface');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'renderface-bake',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(Context $ctx) : status<PipelineError> {
+                Device $device = $ctx->device;
+                // every face and mip cleared to blue, then -Y mip 1 to orange
+                int32 $face = 0;
+
+                while ($face < 6) {
+                    int32 $mip = 0;
+
+                    while ($mip < 2) {
+                        Vec4 $colour = Vec4(0.0f, 0.0f, 1.0f, 1.0f);
+
+                        if ($face == 3 && $mip == 1) {
+                            $colour = Vec4(1.0f, 0.5f, 0.0f, 1.0f);
+                        }
+
+                        clearFace($device, $cube, $face, $mip, $colour);
+                        $mip = $mip + 1;
+                    }
+
+                    $face = $face + 1;
+                }
+
+                $device->transitionTexture($cube, ResourceState::shaderRead);
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+                    return .quad($device);
+                });
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3uv2(), Raster::none());
+                $pass->bind($enc);
+                $enc->upload(CubeParams(Vec4(0.0f, -1.0f, 0.0f, 1.0f)), slot: 0);
+                $enc->bindTexture(0, $cube, $samp);
+                $mesh->draw($enc);
+                $enc->endRender();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('renderface');
+    assert($pixels[0] > 240, '-Y mip 1 is orange');
+    assert($pixels[1] > 110 && $pixels[1] < 145, '-Y mip 1 green is half');
+    assert($pixels[2] < 16, '-Y mip 1 has no blue');
+
+    $orange = guard $cube->capture(face: 3, 1) else ($e) {
+        die($e->message());
+    }
+    assert($orange->width == 2 && $orange->height == 2, 'mip 1 is half size');
+    assert($orange->rgba[0] > 240, 'captured orange');
+    assert($orange->rgba[2] < 16, 'captured has no blue');
+
+    $blue = guard $cube->capture(face: 0, 0) else ($e) {
+        die($e->message());
+    }
+    assert($blue->width == 4, 'mip 0 is full size');
+    assert($blue->rgba[2] > 240, '+X was not discarded');
+    assert($blue->rgba[0] < 16, '+X has no red');
+
+    $shaders->destroy();
+    $cube->destroy();
+}
+
+/** a render pass with no draws: the clear is the whole point */
+internal function clearFace(Device $device, Texture $cube, int32 $face, int32 $mip, Vec4 $colour) : void
+{
+    ColorTarget $target = ColorTarget($cube, face: $face, $mip);
+    $target->load = LoadOp::clear;
+    $target->store = StoreOp::store;
+    $target->clear = $colour;
+    RenderPassDesc $desc = RenderPassDesc();
+    $desc->colors[] = $target;
+    RenderEncoder $enc = $device->beginRender($desc);
+    $enc->endRender();
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_render_to_face
+{
+    GpuContext $gpu = gpuHidden('face');
+    checkRenderToFace($gpu);
+    $gpu->end();
+}
+#[end]

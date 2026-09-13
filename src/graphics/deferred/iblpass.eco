@@ -1,0 +1,173 @@
+/**
+ * Bakes the three image-based-lighting maps from the environment
+ * cube, once: a diffuse irradiance cube, a specular cube prefiltered
+ * per roughness across its mips, and the split-sum BRDF lookup.
+ *
+ * Like the environment bake this runs inside a frame, because a
+ * render pass needs one, and then only imports what it made.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Mat4, Vec4};
+
+/** irradiance cube edge; PHP VISU used the same 32 */
+public const int32 IBL_IRRADIANCE_SIZE = 32;
+/** prefiltered specular base; PHP used 128, six mips here floor at 8 */
+public const int32 IBL_PREFILTER_SIZE = 256;
+public const int32 IBL_PREFILTER_MIPS = 6;
+/** split-sum LUT; PHP used 512 */
+public const int32 IBL_BRDF_SIZE = 128;
+
+public class IblPass : Pass
+{
+    private DeferredGpu $gpu;
+    private Environment $environment;
+
+    public constructor(DeferredGpu $gpu, Environment $environment)
+    {
+        $this->gpu = $gpu;
+        $this->environment = $environment;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.ibl';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        TextureRef $irradiance = $pipeline->importTexture('ibl.irradiance', $this->environment->irradiance);
+        TextureRef $prefilter = $pipeline->importTexture('ibl.prefilter', $this->environment->prefilter);
+        TextureRef $brdf = $pipeline->importTexture('ibl.brdf', $this->environment->brdf);
+        $frame->set(IblData($irradiance, $prefilter, $brdf, IBL_PREFILTER_MIPS));
+
+        if (!$this->environment->iblReady) {
+            EnvironmentData $environment = $frame->get<EnvironmentData>();
+            $io->reads($environment->cubemap);
+            $io->writes($irradiance);
+            $io->writes($prefilter);
+            $io->writes($brdf);
+        }
+    }
+
+    public function execute(Context $ctx) : status<PipelineError>
+    {
+        if ($this->environment->iblReady) {
+            return .ok;
+        }
+
+        Device $device = $ctx->device;
+        Texture $environment = $this->environment->cube;
+
+        if ($environment->state != ResourceState::shaderRead) {
+            // the environment bake has not run yet; try again next frame
+            return .ok;
+        }
+
+        Mesh $cube = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
+            return .cube($device);
+        });
+        Mesh $quad = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($device);
+        });
+        Sampler $sampler = $this->gpu->cube;
+        Mat4 $projection = captureProjection();
+
+        guard $this->bakeIrradiance($ctx, $cube, $environment, $sampler, $projection) else ($e) {
+            return .error($e);
+        }
+        guard $this->bakePrefilter($ctx, $cube, $environment, $sampler, $projection) else ($e) {
+            return .error($e);
+        }
+        guard $this->bakeBrdf($ctx, $quad) else ($e) {
+            return .error($e);
+        }
+
+        $device->transitionTexture($this->environment->irradiance, ResourceState::shaderRead);
+        $device->transitionTexture($this->environment->prefilter, ResourceState::shaderRead);
+        $device->transitionTexture($this->environment->brdf, ResourceState::shaderRead);
+        $this->environment->iblDone();
+        return .ok;
+    }
+
+    private function bakeIrradiance(
+        Context $ctx,
+        Mesh $cube,
+        Texture $environment,
+        Sampler $sampler,
+        const Mat4& $projection
+    ) : status<PipelineError>
+    {
+        ShaderProgram $program = guard $this->gpu->shaders->program('bake_irradiance') else ($e) {
+            return .error(.shader($e));
+        }
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3(), captureRaster());
+        bakeCubeFaces(
+            $ctx->device,
+            $pass,
+            $cube,
+            $environment,
+            $sampler,
+            $this->environment->irradiance,
+            0,
+            CaptureUniforms($projection, Mat4(), Vec4(0.0f, 0.0f, 0.0f, 0.0f))
+        );
+        return .ok;
+    }
+
+    private function bakePrefilter(
+        Context $ctx,
+        Mesh $cube,
+        Texture $environment,
+        Sampler $sampler,
+        const Mat4& $projection
+    ) : status<PipelineError>
+    {
+        ShaderProgram $program = guard $this->gpu->shaders->program('bake_prefilter') else ($e) {
+            return .error(.shader($e));
+        }
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3(), captureRaster());
+        Texture $target = $this->environment->prefilter;
+        float32 $steps = (IBL_PREFILTER_MIPS - 1) as float32;
+        float32 $source = $environment->width as float32;
+        int32 $mip = 0;
+
+        while ($mip < IBL_PREFILTER_MIPS) {
+            float32 $roughness = ($mip as float32) / $steps;
+            bakeCubeFaces(
+                $ctx->device,
+                $pass,
+                $cube,
+                $environment,
+                $sampler,
+                $target,
+                $mip,
+                CaptureUniforms($projection, Mat4(), Vec4($roughness, $source, 0.0f, 0.0f))
+            );
+            $mip = $mip + 1;
+        }
+
+        return .ok;
+    }
+
+    private function bakeBrdf(Context $ctx, Mesh $quad) : status<PipelineError>
+    {
+        ShaderProgram $program = guard $this->gpu->shaders->program('bake_brdf_lut') else ($e) {
+            return .error(.shader($e));
+        }
+        Texture $target = $this->environment->brdf;
+        ColorTarget $color = ColorTarget($target);
+        $color->load = .clear;
+        $color->store = .store;
+        $color->clear = Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        RenderPassDesc $desc = RenderPassDesc();
+        $desc->colors[] = $color;
+        RenderEncoder $enc = $ctx->device->beginRender($desc);
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        $pass->bind($enc);
+        $quad->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+}

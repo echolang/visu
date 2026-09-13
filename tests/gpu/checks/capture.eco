@@ -1,0 +1,171 @@
+/**
+ * Cube capture orientation. A synthetic equirectangular image with a
+ * red top, a blue bottom and a green +Z stripe must land on the
+ * matching faces. A Y flip here would turn every IBL bake upside
+ * down, so this gates the environment work on both backends.
+ */
+
+use visu::graphics::{
+    CUBE_FACES, CaptureUniforms, ColorTarget, Context, DeferredRenderer, Device,
+    Frame, GpuPass, HdrPixels, LoadOp, Mesh, Pipeline, PipelineError,
+    RenderEncoder, RenderPassDesc, ResourceState, Sampler, SamplerDesc,
+    ShaderProgram, StoreOp, Texture, TextureDesc, VertexLayout, captureProjection,
+    captureRaster, captureView, TEXTURE_RENDER_TARGET, TEXTURE_SAMPLED,
+    TEXTURE_TRANSFER_DST, TEXTURE_TRANSFER_SRC
+};
+use visu::math::{Mat4, Vec4};
+
+public function checkCaptureOrientation(GpuContext $gpu) : void
+{
+    DeferredRenderer $renderer = DeferredRenderer($gpu->device);
+    guard $renderer->load() else ($e) {
+        die($e->message());
+    }
+
+    Texture $equirect = Texture($gpu->device, 'captureSrc', syntheticSky());
+    TextureDesc $desc = TextureDesc($format: .rgba16f, $width: 8, $height: 8);
+    $desc->kind = .cube;
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+    Texture $cube = Texture($gpu->device, 'captureCube', $desc);
+
+    ShaderProgram $program = guard $renderer->program('hdri_to_cubemap') else ($e) {
+        die($e->message());
+    }
+    Sampler $sampler = $gpu->device->createSampler(SamplerDesc());
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        $p->add(visu::graphics::CallbackPass(
+            'capture-bake',
+            setup: function(Pipeline $pipe, Frame $frame, visu::graphics::IoSink $io) : void {
+            },
+            execute: function(Context $ctx) : status<PipelineError> {
+                Device $device = $ctx->device;
+                Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
+                    return .cube($device);
+                });
+                GpuPass $pass = GpuPass($program, VertexLayout::pos3(), captureRaster());
+                Mat4 $projection = captureProjection();
+                int32 $face = 0;
+
+                while ($face < CUBE_FACES) {
+                    ColorTarget $target = ColorTarget($cube, face: $face, 0);
+                    $target->load = LoadOp::clear;
+                    $target->store = StoreOp::store;
+                    $target->clear = Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+                    RenderPassDesc $pass1 = RenderPassDesc();
+                    $pass1->colors[] = $target;
+                    RenderEncoder $enc = $device->beginRender($pass1);
+                    $pass->bind($enc);
+                    $enc->upload(
+                        CaptureUniforms($projection, captureView($face), Vec4(0.0f, 0.0f, 0.0f, 0.0f)),
+                        slot: 0
+                    );
+                    $enc->bindTexture(0, $equirect, $sampler);
+                    $mesh->draw($enc);
+                    $enc->endRender();
+                    $face = $face + 1;
+                }
+
+                $device->transitionTexture($cube, ResourceState::shaderRead);
+                return .ok;
+            }
+        ));
+    });
+
+    // +Y is the sky, -Y is the ground; a vertical flip swaps them
+    assertFaceIs($cube, 2, 'red up', 216, 25, 25);
+    assertFaceIs($cube, 3, 'blue down', 25, 25, 216);
+    // +Z carries the green stripe, -Z does not
+    assertFaceIs($cube, 4, 'green forward', 25, 216, 25);
+    assertFaceIs($cube, 5, 'grey back', 102, 102, 102);
+
+    $renderer->destroy();
+    $cube->destroy();
+    $equirect->destroy();
+}
+
+internal function assertFaceIs(Texture $cube, int32 $face, string $what, int32 $r, int32 $g, int32 $b) : void
+{
+    $px = guard $cube->capture(face: $face) else ($e) {
+        die($e->message());
+    }
+    usize $middle = (((($px->height / 2) * $px->width) + ($px->width / 2)) * 4) as usize;
+    int32 $gotR = $px->rgba[$middle] as int32;
+    int32 $gotG = $px->rgba[$middle + 1] as int32;
+    int32 $gotB = $px->rgba[$middle + 2] as int32;
+
+    if (closeTo($gotR, $r) && closeTo($gotG, $g) && closeTo($gotB, $b)) {
+        return;
+    }
+
+    die("capture face {$face}: expected {$what}, got {$gotR} {$gotG} {$gotB}");
+}
+
+internal function closeTo(int32 $got, int32 $want) : bool
+{
+    int32 $delta = $got - $want;
+
+    if ($delta < 0) {
+        $delta = -$delta;
+    }
+
+    return $delta < 60;
+}
+
+/**
+ * 16x8 equirectangular: top row band red, bottom band blue, and the
+ * middle band green only where the direction points at +Z, grey
+ * elsewhere. Row 0 is the image top, which is +Y.
+ */
+internal function syntheticSky() : HdrPixels
+{
+    int32 $w = 16;
+    int32 $h = 8;
+    array<float32> $rgba = array<float32>();
+    int32 $y = 0;
+
+    while ($y < $h) {
+        int32 $x = 0;
+
+        while ($x < $w) {
+            float32 $r = 0.4f;
+            float32 $g = 0.4f;
+            float32 $b = 0.4f;
+
+            if ($y < 2) {
+                $r = 0.85f;
+                $g = 0.1f;
+                $b = 0.1f;
+            } else if ($y >= $h - 2) {
+                $r = 0.1f;
+                $g = 0.1f;
+                $b = 0.85f;
+            } else if ($x >= 11 && $x <= 13) {
+                // u = 0.75 is atan(z, x) = +pi/2, which is +Z
+                $r = 0.1f;
+                $g = 0.85f;
+                $b = 0.1f;
+            }
+
+            $rgba[] = $r;
+            $rgba[] = $g;
+            $rgba[] = $b;
+            $rgba[] = 1.0f;
+            $x = $x + 1;
+        }
+
+        $y = $y + 1;
+    }
+
+    return HdrPixels($w, $h, $rgba);
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_capture_orientation
+{
+    GpuContext $gpu = gpuHidden('capture');
+    checkCaptureOrientation($gpu);
+    $gpu->end();
+}
+#[end]

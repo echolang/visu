@@ -1,0 +1,71 @@
+/**
+ * Turns an equirectangular HDRI into a cubemap, once. The bake runs
+ * on the first frame that has one — `Device.beginRender` needs an
+ * open frame, so this cannot happen at load time — then the pass
+ * only imports the finished cube.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Mat4, Vec4};
+
+public class EnvironmentPass : Pass
+{
+    private DeferredGpu $gpu;
+    private Environment $environment;
+
+    public constructor(DeferredGpu $gpu, Environment $environment)
+    {
+        $this->gpu = $gpu;
+        $this->environment = $environment;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.environment';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        Texture $cube = $this->environment->cube;
+        TextureRef $ref = $pipeline->importTexture('environment', $cube);
+        $frame->set(EnvironmentData($ref, $cube->mips));
+
+        // the bake writes the cube; later passes read it, which orders them
+        if (!$this->environment->ready) {
+            $io->writes($ref);
+        }
+    }
+
+    public function execute(Context $ctx) : status<PipelineError>
+    {
+        if ($this->environment->ready) {
+            return .ok;
+        }
+
+        Texture $cube = $this->environment->cube;
+        Texture $source = $this->environment->equirect();
+        ShaderProgram $program = guard $this->gpu->shaders->program('hdri_to_cubemap') else ($e) {
+            return .error(.shader($e));
+        }
+
+        Device $device = $ctx->device;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
+            return .cube($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3(), captureRaster());
+        bakeCubeFaces(
+            $device,
+            $pass,
+            $mesh,
+            $source,
+            $this->gpu->linear,
+            $cube,
+            0,
+            CaptureUniforms(captureProjection(), Mat4(), Vec4(0.0f, 0.0f, 0.0f, 0.0f))
+        );
+        $device->generateMipmaps($cube);
+        $this->environment->cubeDone();
+        return .ok;
+    }
+}

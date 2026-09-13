@@ -1,0 +1,119 @@
+/**
+ * Radiance image round trip. GPU-free, so it runs on every arm
+ * including Darwin under the test fork.
+ */
+
+use visu::graphics::{DumpError, HdrPixels, Pixels, PixelFormat, pixelsFloatToHalf, pixelsHalfToFloat};
+
+internal function tinyHdr() : HdrPixels
+{
+    array<float32> $rgba = [
+        1.0f, 0.0f, 0.0f, 1.0f,
+        0.0f, 2.0f, 0.0f, 1.0f,
+        0.0f, 0.0f, 0.5f, 1.0f,
+        1.0f, 1.0f, 1.0f, 1.0f
+    ];
+    return HdrPixels(2, 2, $rgba);
+}
+
+test hdr_pixels_report_their_byte_size
+{
+    HdrPixels $px = tinyHdr();
+    assert($px->bytes() == 64, '16 floats');
+}
+
+test hdr_round_trip_keeps_values
+{
+    HdrPixels $px = tinyHdr();
+    guard $px->write('var/test/tiny.hdr') else ($e) {
+        die($e->message());
+    }
+    HdrPixels $back = guard HdrPixels::load('var/test/tiny.hdr') else ($e) {
+        die($e->message());
+    }
+    assert($back->width == 2 && $back->height == 2, 'size');
+    assert($back->rgba->count() == 16, 'channels');
+    // radiance is a shared-exponent format, so compare loosely
+    assert($back->rgba[0] > 0.98f && $back->rgba[0] < 1.02f, 'red stays 1');
+    assert($back->rgba[5] > 1.95f && $back->rgba[5] < 2.05f, 'green stays above 1');
+    assert($back->rgba[10] > 0.48f && $back->rgba[10] < 0.52f, 'blue stays 0.5');
+}
+
+test hdr_load_missing_file_is_an_error
+{
+    guard HdrPixels::load('var/test/definitely-missing.hdr') else ($e) {
+        return;
+    }
+    assert(false, 'missing file should fail');
+}
+
+test pixels_from_float32_clamps_to_a_visible_range
+{
+    array<uint8> $raw = floatBytes([2.0f, 0.5f, -1.0f, 1.0f]);
+    Pixels $px = guard Pixels::from(PixelFormat::rgba32f, 1, 1, $raw) else ($e) {
+        die($e->message());
+    }
+    assert($px->rgba[0] == 255, 'over one clamps');
+    assert($px->rgba[1] > 120 && $px->rgba[1] < 135, 'half stays mid');
+    assert($px->rgba[2] == 0, 'negative clamps');
+}
+
+test pixels_from_r32f_expands_to_gray
+{
+    array<uint8> $raw = floatBytes([0.5f]);
+    Pixels $px = guard Pixels::from(PixelFormat::r32f, 1, 1, $raw) else ($e) {
+        die($e->message());
+    }
+    assert($px->rgba[0] > 120 && $px->rgba[0] < 135, 'red');
+    assert($px->rgba[1] == 0, 'green is black');
+    assert($px->rgba[3] == 255, 'alpha is opaque');
+}
+
+test pixels_reject_depth_formats
+{
+    array<uint8> $raw = floatBytes([0.5f]);
+    guard Pixels::from(PixelFormat::depth32f, 1, 1, $raw) else ($e) {
+        return;
+    }
+    assert(false, 'depth is not dumpable');
+}
+
+internal function floatBytes(const array<float32>& $values) : array<uint8>
+{
+    usize $n = $values->count() * 4;
+    array<uint8> $out = arr::room<uint8>($n);
+    $out->commit($n);
+    ptr<const uint8> $src = ptr<const uint8>(&$values[0]);
+    mem::copy<uint8>(ptr<uint8>(&$out[0]), ptr<uint8>($src:$), $n as uint64);
+    return $out;
+}
+
+test half_round_trip_keeps_the_value
+{
+    array<float32> $values = [0.0f, 0.13f, 0.5f, 1.0f, 2.0f, 17.5f, 1000.0f];
+
+    foreach ($values as $value) {
+        float32 $back = pixelsHalfToFloat(pixelsFloatToHalf($value));
+        float32 $delta = $back - $value;
+
+        if ($delta < 0.0f) {
+            $delta = -$delta;
+        }
+
+        float32 $tolerance = $value * 0.01f;
+
+        if ($tolerance < 0.001f) {
+            $tolerance = 0.001f;
+        }
+
+        assert($delta <= $tolerance, 'half round trip');
+    }
+}
+
+test half_encodes_known_bit_patterns
+{
+    assert(pixelsFloatToHalf(1.0f) == 15360, 'one is 0x3c00');
+    assert(pixelsFloatToHalf(0.5f) == 14336, 'half is 0x3800');
+    assert(pixelsFloatToHalf(2.0f) == 16384, 'two is 0x4000');
+    assert(pixelsFloatToHalf(0.0f) == 0, 'zero');
+}

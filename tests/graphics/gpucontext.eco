@@ -7,7 +7,7 @@
 use std::io;
 use visu::os::{Window, WindowHints, init, terminate};
 use visu::graphics::{
-    Device, Frame, FrameStatus, Pipeline, Pool, TargetRef, Texture,
+    Context, Device, Frame, FrameStatus, Pipeline, Pool, TargetRef, Texture,
     TextureOptions, TextureRef
 };
 use visu::math::Vec4;
@@ -45,7 +45,22 @@ public class GpuContext
         terminate();
     }
 
+    /** the Pipeline plus a Context, for passes that need one at build time */
+    public function runFrame(function<void(Pipeline, Context)> $build) : void
+    {
+        $this->frame(function(Pipeline $pipeline, Context $ctx) : void {
+            $build($pipeline, $ctx);
+        });
+    }
+
     public function runFrame(function<void(Pipeline)> $build) : void
+    {
+        $this->frame(function(Pipeline $pipeline, Context $ctx) : void {
+            $build($pipeline);
+        });
+    }
+
+    private function frame(function<void(Pipeline, Context)> $build) : void
     {
         int32 $w = $this->window->framebufferWidth();
         int32 $h = $this->window->framebufferHeight();
@@ -59,7 +74,8 @@ public class GpuContext
 
         Frame $frame = Frame();
         Pipeline $pipeline = Pipeline($this->pool, $frame, $this->window->renderTarget());
-        $build($pipeline);
+        Context $ctx = Context($this->device, $pipeline, $frame, $this->pool, 0.0f);
+        $build($pipeline, $ctx);
         int32 $tick = $this->tick;
         $this->tick = $this->tick + 1;
         guard $pipeline->execute($tick) else ($e) {
@@ -101,7 +117,7 @@ public function gpuHidden(string $title, int32 $width = 64, int32 $height = 64) 
  */
 public function readRgba(Device $device, Texture $texture) : array<uint8>
 {
-    array<uint8> $raw = guard $device->readbackTexture($texture) else ($e) {
+    array<uint8> $raw = guard $device->readbackTexture($texture, 0, 0) else ($e) {
         die($e->message());
     }
 

@@ -1,0 +1,229 @@
+/**
+ * Deferred PBR: fill a packed GBuffer, shade it once, blit the
+ * result. Not an ECS system — the app owns one and calls `render`
+ * with the geometry it wants in the buffer, so the same renderer
+ * serves an ECS scene and a hand-rolled one.
+ *
+ * Programs come from the module bake (`tools/shaders.php --bake`),
+ * so nothing has to ship shader files.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+public class DeferredRenderer
+{
+    public DirectionalLight $sun;
+    /** shows wherever no geometry drew, until a skybox covers it */
+    public Vec4 $background;
+    /** draw the environment cube behind the scene */
+    public bool $renderSkybox;
+    /** null quality means off */
+    public SsaoQuality? $ssao;
+    public Device $device;
+    private DeferredGpu? $gpu;
+    private Environment? $environment;
+
+    public constructor(Device $device)
+    {
+        $this->sun = DirectionalLight();
+        $this->background = Vec4(0.05f, 0.05f, 0.06f, 1.0f);
+        $this->renderSkybox = true;
+        $this->ssao = SsaoQuality::ultra();
+        $this->device = $device;
+        $this->gpu = null;
+        $this->environment = null;
+    }
+
+    /** links the programs and builds the fallback textures */
+    public function load() : status<ShaderError>
+    {
+        DeferredGpu $gpu = guard DeferredGpu::load($this->device) else ($e) {
+            return .error($e);
+        }
+        $this->gpu = $gpu;
+        return .ok;
+    }
+
+    /**
+     * Takes an equirectangular HDRI and bakes it into a cubemap on
+     * the next frame. Takes ownership of `$equirect`; it is released
+     * once the bake has retired from the GPU.
+     */
+    public function setEnvironment(hdri: Texture $equirect, int32 $size = 1024) : void
+    {
+        assert($this->gpu != null, 'setEnvironment before load');
+        $this->dropEnvironment();
+        $this->environment = Environment(hdri: $this->device, $equirect, $size);
+    }
+
+    /**
+     * An already-baked cube. Takes ownership of `$cube`; the renderer
+     * will destroy it.
+     */
+    public function setEnvironment(Texture $cube) : void
+    {
+        assert($this->gpu != null, 'setEnvironment before load');
+        $this->dropEnvironment();
+        $this->environment = Environment($this->device, $cube);
+    }
+
+    /** re-bake the lighting maps on the next frame */
+    public function invalidateIbl() : void
+    {
+        Environment $env = guard $this->environment else {
+            return;
+        }
+        $env->iblReady = false;
+    }
+
+    public const function hasEnvironment() : bool
+    {
+        return $this->environment != null;
+    }
+
+    /**
+     * Adds the deferred passes for this frame. `$fill` runs between
+     * the GBuffer allocation and the shading pass; add the geometry
+     * passes there, writing `$gbuffer->target`.
+     */
+    public function render(
+        Context $ctx,
+        TargetRef $output,
+        function<void(Context, GBufferData)> $fill
+    ) : void
+    {
+        assert($this->gpu != null, 'DeferredRenderer.render before load');
+        DeferredGpu $gpu = guard $this->gpu;
+        Environment? $env = $this->environment;
+        Environment $held = guard $env else {
+            $this->addScene($ctx, $output, $fill, $gpu, null);
+            return;
+        }
+        $held->releaseEquirect();
+        $this->addScene($ctx, $output, $fill, $gpu, $held);
+    }
+
+    private function addScene(
+        Context $ctx,
+        TargetRef $output,
+        function<void(Context, GBufferData)> $fill,
+        DeferredGpu $gpu,
+        Environment? $env
+    ) : void
+    {
+        Pipeline $pipeline = $ctx->pipeline;
+        $pipeline->add(GBufferPass($gpu->camera, $output->width, $output->height));
+        GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
+        $fill($ctx, $gbuffer);
+
+        SsaoQuality? $ssao = $this->ssao;
+
+        if ($ssao != null) {
+            SsaoQuality $quality = guard $ssao;
+            $pipeline->add(SsaoPass($gpu, $quality));
+            $pipeline->add(SsaoBlurPass($gpu));
+        }
+
+        if ($env != null) {
+            Environment $environment = guard $env;
+            $pipeline->add(EnvironmentPass($gpu, $environment));
+            $pipeline->add(IblPass($gpu, $environment));
+        }
+
+        $pipeline->add(LightPass($gpu, $env, $this->sun, $this->background));
+
+        if ($this->renderSkybox && $env != null) {
+            Environment $environment = guard $env;
+            $pipeline->add(SkyboxPass($gpu, $environment));
+        }
+
+        LightPassData $light = $ctx->frame->get<LightPassData>();
+        $gpu->blit->pass($pipeline, $output, $light->output);
+    }
+
+    /**
+     * The common fill: cull/sort the assembler and draw it into the
+     * GBuffer with the instanced geometry program.
+     */
+    public function draw<P>(
+        Context $ctx,
+        GBufferData $gbuffer,
+        DrawCallAssembler<P> $dca,
+        const VertexLayout& $layout
+    ) : void
+    {
+        assert($this->gpu != null, 'DeferredRenderer.draw before load');
+        VertexLayout $joined = $layout;
+        DrawCallAssembler<P> $assembler = $dca;
+        DeferredRenderer $renderer = $this;
+        $ctx->pipeline->add(CallbackPass(
+            'deferred.geometry',
+            setup: function(Pipeline $pipeline, Frame $frame, IoSink $io) : void {
+                $io->writes($gbuffer->target);
+            },
+            execute: function(Context $pass) : status<PipelineError> {
+                CameraData $camera = $pass->frame->get<CameraData>();
+                $assembler->build($camera->frustum, $camera->position);
+
+                if ($assembler->commandCount() == 0) {
+                    return .ok;
+                }
+
+                RenderEncoder $enc = guard $pass->beginRender($gbuffer->target) else ($e) {
+                    return .error($e);
+                }
+                GpuPass $gpuPass = $renderer->geometryPass($joined);
+                $gpuPass->bind($enc);
+                $renderer->bindCamera($enc);
+                $assembler->execute($enc, $gpuPass);
+                $enc->endRender();
+                return .ok;
+            }
+        ));
+    }
+
+    /** a linked program by its baked name, e.g. 'skybox' or 'hdri_to_cubemap' */
+    public function program(string $name) : result<ShaderProgram, ShaderError>
+    {
+        assert($this->gpu != null, 'DeferredRenderer.program before load');
+        DeferredGpu $gpu = guard $this->gpu;
+        return $gpu->shaders->program($name);
+    }
+
+    /** the pass a geometry filler draws with, joined to its own layout */
+    public function geometryPass(const VertexLayout& $layout) : GpuPass
+    {
+        assert($this->gpu != null, 'DeferredRenderer.geometryPass before load');
+        DeferredGpu $gpu = guard $this->gpu;
+        ShaderProgram $program = guard $gpu->shaders->program('gbuffer_instanced');
+        return GpuPass($program, $layout, Raster::opaque());
+    }
+
+    public function bindCamera(RenderEncoder $enc) : void
+    {
+        assert($this->gpu != null, 'DeferredRenderer.bindCamera before load');
+        DeferredGpu $gpu = guard $this->gpu;
+        $gpu->camera->bind($enc);
+    }
+
+    private function dropEnvironment() : void
+    {
+        Environment $env = guard $this->environment else {
+            return;
+        }
+        $env->destroy();
+        $this->environment = null;
+    }
+
+    public function destroy() : void
+    {
+        $this->dropEnvironment();
+        DeferredGpu $gpu = guard $this->gpu else {
+            return;
+        }
+        $gpu->destroy();
+        $this->gpu = null;
+    }
+}

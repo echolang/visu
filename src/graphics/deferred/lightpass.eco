@@ -1,0 +1,184 @@
+/**
+ * Shades the GBuffer into an offscreen colour target. Which shader
+ * variant runs depends on what is baked this frame: image-based
+ * lighting, a plain environment cubemap, or the sun alone.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+public class LightPass : Pass
+{
+    private DeferredGpu $gpu;
+    private Environment? $environment;
+    private DirectionalLight $sun;
+    private Vec4 $background;
+
+    public constructor(
+        DeferredGpu $gpu,
+        Environment? $environment,
+        DirectionalLight $sun,
+        Vec4 $background
+    )
+    {
+        $this->gpu = $gpu;
+        $this->environment = $environment;
+        $this->sun = $sun;
+        $this->background = $background;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.light';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        GBufferData $gbuffer = $frame->get<GBufferData>();
+        $io->reads($gbuffer->position);
+        $io->reads($gbuffer->normal);
+        $io->reads($gbuffer->albedo);
+        $io->reads($gbuffer->emissive);
+        SsaoData? $ssao = $frame->find<SsaoData>();
+
+        if ($ssao != null) {
+            SsaoData $found = guard $ssao;
+            $io->reads($found->blurred);
+        }
+
+        EnvironmentData? $environment = $frame->find<EnvironmentData>();
+
+        if ($environment != null) {
+            EnvironmentData $found = guard $environment;
+            $io->reads($found->cubemap);
+        }
+
+        IblData? $ibl = $frame->find<IblData>();
+
+        if ($ibl != null) {
+            IblData $found = guard $ibl;
+            $io->reads($found->irradiance);
+            $io->reads($found->prefilter);
+            $io->reads($found->brdfLut);
+        }
+
+        TargetRef $target = $pipeline->createTarget(
+            'lightpass',
+            $gbuffer->target->width,
+            $gbuffer->target->height
+        );
+        TextureRef $output = $pipeline->createColor($target, 'output', TextureOptions());
+        $frame->set(LightPassData($target, $output));
+        $io->writes($target);
+    }
+
+    public function execute(Context $ctx) : status<PipelineError>
+    {
+        LightPassData $data = $ctx->frame->get<LightPassData>();
+        GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
+        $ctx->pipeline->requestClear($data->target, ClearPassOptions(color: $this->background));
+        Lighting $mode = lightingOf($this->environment);
+        ShaderProgram $program = guard lightProgram($this->gpu, $mode) else ($e) {
+            return .error(.shader($e));
+        }
+
+        RenderEncoder $enc = guard $ctx->beginRender($data->target) else ($e) {
+            return .error($e);
+        }
+        Device $device = $ctx->device;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        $pass->bind($enc);
+        $this->gpu->camera->bind($enc);
+        $enc->upload(lightUniforms($this->sun, $this->environment), slot: 2);
+        Sampler $point = $this->gpu->point;
+
+        // slots 0..3 in gbuffer_layout order
+        array<TextureRef> $inputs = [
+            $gbuffer->position,
+            $gbuffer->normal,
+            $gbuffer->albedo,
+            $gbuffer->emissive,
+        ];
+        uint32 $slot = 0;
+
+        while ($slot < 4) {
+            guard bindPooled($ctx, $enc, $slot, $inputs[$slot as usize], $point) else ($e) {
+                $enc->endRender();
+                return .error($e);
+            }
+            $slot = $slot + 1;
+        }
+
+        guard $this->bindAmbient($ctx, $enc, $point) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        guard $this->bindEnvironment($ctx, $enc, $mode) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+
+        $mesh->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+
+    /**
+     * Slots 5..7. Image-based lighting binds irradiance, prefiltered
+     * specular and the BRDF lookup; the environment variant binds the
+     * raw cube at slot 5.
+     */
+    private function bindEnvironment(Context $ctx, RenderEncoder $enc, Lighting $mode) : status<PipelineError>
+    {
+        if ($mode == Lighting::sun) {
+            return .ok;
+        }
+
+        if ($mode == Lighting::ibl) {
+            return $this->bindIbl($ctx, $enc);
+        }
+
+        return $this->bindCube($ctx, $enc);
+    }
+
+    private function bindIbl(Context $ctx, RenderEncoder $enc) : status<PipelineError>
+    {
+        IblData $maps = $ctx->frame->get<IblData>();
+        Sampler $cubeSampler = $this->gpu->cube;
+        guard bindPooled($ctx, $enc, 5, $maps->irradiance, $cubeSampler) else ($e) {
+            return .error($e);
+        }
+        guard bindPooled($ctx, $enc, 6, $maps->prefilter, $cubeSampler) else ($e) {
+            return .error($e);
+        }
+        return bindPooled($ctx, $enc, 7, $maps->brdfLut, $this->gpu->linear);
+    }
+
+    private function bindCube(Context $ctx, RenderEncoder $enc) : status<PipelineError>
+    {
+        EnvironmentData $environment = $ctx->frame->get<EnvironmentData>();
+        Texture $cube = guard $ctx->pool->getTexture($environment->cubemap) else ($e) {
+            return .error(.pool($e));
+        }
+        $enc->bindTexture(5, $cube, $this->gpu->cube);
+        return .ok;
+    }
+
+    /** the SSAO blur when there is one, otherwise a white 1x1 */
+    private function bindAmbient(Context $ctx, RenderEncoder $enc, Sampler $sampler) : status<PipelineError>
+    {
+        SsaoData? $ssao = $ctx->frame->find<SsaoData>();
+
+        if ($ssao != null) {
+            SsaoData $found = guard $ssao;
+            return bindPooled($ctx, $enc, 4, $found->blurred, $sampler);
+        }
+
+        $enc->bindTexture(4, $this->gpu->white, $sampler);
+        return .ok;
+    }
+}

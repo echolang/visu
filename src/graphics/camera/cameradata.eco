@@ -1,0 +1,118 @@
+/**
+ * Everything a pass needs from the camera this frame. Written once
+ * by `CameraSystem.render`, read by every later pass through
+ * `Frame.get<CameraData>()`; immutable so readers cannot disagree.
+ */
+
+namespace visu::graphics;
+
+use visu::geo::{Frustum, Ray};
+use visu::math::{Mat4, Vec2, Vec3, Vec4, normalize};
+
+public class CameraData
+{
+    public const Mat4 $projection;
+    public const Mat4 $view;
+    public const Mat4 $projectionView;
+    public const Mat4 $inverseProjection;
+    public const Mat4 $inverseProjectionView;
+    public const Frustum $frustum;
+    /** interpolated world position of the camera */
+    public const Vec3 $position;
+    /** lag between ticks, 0 just after an update, approaching 1 before the next */
+    public const float32 $compensation;
+    public const int32 $resolutionX;
+    public const int32 $resolutionY;
+    public const float32 $contentScaleX;
+    public const float32 $contentScaleY;
+    /** orthographic world rectangle; meaningless unless `hasViewport` */
+    public const Viewport $viewport;
+    public const bool $hasViewport;
+
+    public constructor(
+        Mat4 $projection,
+        Mat4 $view,
+        Mat4 $projectionView,
+        Mat4 $inverseProjection,
+        Mat4 $inverseProjectionView,
+        Frustum $frustum,
+        Vec3 $position,
+        float32 $compensation,
+        int32 $resolutionX,
+        int32 $resolutionY,
+        float32 $contentScaleX,
+        float32 $contentScaleY,
+        Viewport $viewport,
+        bool $hasViewport
+    )
+    {
+        $this->projection = $projection;
+        $this->view = $view;
+        $this->projectionView = $projectionView;
+        $this->inverseProjection = $inverseProjection;
+        $this->inverseProjectionView = $inverseProjectionView;
+        $this->frustum = $frustum;
+        $this->position = $position;
+        $this->compensation = $compensation;
+        $this->resolutionX = $resolutionX;
+        $this->resolutionY = $resolutionY;
+        $this->contentScaleX = $contentScaleX;
+        $this->contentScaleY = $contentScaleY;
+        $this->viewport = $viewport;
+        $this->hasViewport = $hasViewport;
+    }
+
+    /** device pixels */
+    public const function resolution() : Vec2
+    {
+        return Vec2($this->resolutionX as float32, $this->resolutionY as float32);
+    }
+
+    /** logical points */
+    public const function scaledResolution() : Vec2
+    {
+        return Vec2(
+            ($this->resolutionX as float32) / $this->contentScaleX,
+            ($this->resolutionY as float32) / $this->contentScaleY
+        );
+    }
+
+    /** picking ray through a normalized device point (-1..1, y up) */
+    public const function ray(Vec2 $ndc) : Ray
+    {
+        Vec4 $far = $this->inverseProjectionView * Vec4($ndc->x, $ndc->y, 1.0f, 1.0f);
+        Vec3 $point = Vec3($far->x / $far->w, $far->y / $far->w, $far->z / $far->w);
+        return Ray($this->position, normalize($point - $this->position));
+    }
+
+    /** slot 1 payload; std140 needs mat4 and vec4 only */
+    public const function uniforms() : CameraUniforms
+    {
+        float32 $w = $this->resolutionX as float32;
+        float32 $h = $this->resolutionY as float32;
+        return CameraUniforms(
+            $this->projection,
+            $this->view,
+            $this->projectionView,
+            $this->inverseProjection,
+            $this->inverseProjectionView,
+            Vec4($this->position->x, $this->position->y, $this->position->z, 1.0f),
+            Vec4($w, $h, 1.0f / $w, 1.0f / $h)
+        );
+    }
+}
+
+/**
+ * Mirrors `CameraUniforms` in resources/shaders/include/visu/camera.glsl
+ * at uniform slot 1.
+ */
+public struct CameraUniforms
+{
+    public Mat4 $projection;
+    public Mat4 $view;
+    public Mat4 $projectionView;
+    public Mat4 $inverseProjection;
+    public Mat4 $inverseProjectionView;
+    public Vec4 $position;
+    public Vec4 $resolution;
+}

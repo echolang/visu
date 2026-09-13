@@ -42,8 +42,9 @@ vec3 importance_sample_ggx(vec2 Xi, vec3 N, float roughness)
 	vec3 tangent   = normalize(cross(up, N));
 	vec3 bitangent = cross(N, tangent);
 
-	vec3 sample = tangent * H.x + bitangent * H.y + N * H.z;
-	return normalize(sample);
+	// `sample` is reserved in GLSL 450
+	vec3 dir = tangent * H.x + bitangent * H.y + N * H.z;
+	return normalize(dir);
 }
 
 #endif

@@ -1,0 +1,86 @@
+/**
+ * Draws the environment cube behind the shaded scene. It borrows the
+ * GBuffer depth so geometry still occludes it, which means its own
+ * render pass description rather than the light target's — the pool
+ * has no way to share one depth texture between two targets.
+ */
+
+namespace visu::graphics;
+
+public class SkyboxPass : Pass
+{
+    private DeferredGpu $gpu;
+    private Environment $environment;
+
+    public constructor(DeferredGpu $gpu, Environment $environment)
+    {
+        $this->gpu = $gpu;
+        $this->environment = $environment;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.skybox';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        LightPassData $light = $frame->get<LightPassData>();
+        GBufferData $gbuffer = $frame->get<GBufferData>();
+        EnvironmentData $environment = $frame->get<EnvironmentData>();
+        $io->reads($environment->cubemap);
+        // ordering only: the depth is an attachment here, not a sampler
+        $io->reads($gbuffer->depth);
+        $io->writes($light->target);
+    }
+
+    public function execute(Context $ctx) : status<PipelineError>
+    {
+        LightPassData $light = $ctx->frame->get<LightPassData>();
+        GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
+        EnvironmentData $environment = $ctx->frame->get<EnvironmentData>();
+        ShaderProgram $program = guard $this->gpu->shaders->program('skybox') else ($e) {
+            return .error(.shader($e));
+        }
+
+        Texture $color = guard $ctx->pool->getTexture($light->output) else ($e) {
+            return .error(.pool($e));
+        }
+        Texture $depth = guard $ctx->pool->getTexture($gbuffer->depth) else ($e) {
+            return .error(.pool($e));
+        }
+        Texture $cube = guard $ctx->pool->getTexture($environment->cubemap) else ($e) {
+            return .error(.pool($e));
+        }
+
+        Device $device = $ctx->device;
+        ColorTarget $target = ColorTarget($color);
+        $target->load = .load;
+        $target->store = .store;
+        DepthTarget $depthTarget = DepthTarget($depth);
+        $depthTarget->load = .load;
+        $depthTarget->store = .dontCare;
+        RenderPassDesc $desc = RenderPassDesc();
+        $desc->colors[] = $target;
+        $desc->depth = $depthTarget;
+
+        Raster $raster = Raster();
+        $raster->depthTest = true;
+        $raster->depthWrite = false;
+        // the sky sits exactly on the far plane, so equal has to pass
+        $raster->depthCompare = .lessEqual;
+        $raster->cull = .none;
+
+        RenderEncoder $enc = $device->beginRender($desc);
+        Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
+            return .cube($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3(), $raster);
+        $pass->bind($enc);
+        $this->gpu->camera->bind($enc);
+        $enc->bindTexture(0, $cube, $this->gpu->cube);
+        $mesh->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+}

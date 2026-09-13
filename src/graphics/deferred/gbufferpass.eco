@@ -1,0 +1,57 @@
+/**
+ * Allocates the packed GBuffer, clears it, and publishes the camera
+ * uniform for every later pass. Geometry is filled by whoever the
+ * renderer's `render` callback adds after this pass.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+public class GBufferPass : Pass
+{
+    private UniformBuffer $camera;
+    private int32 $width;
+    private int32 $height;
+
+    public constructor(UniformBuffer $camera, int32 $width, int32 $height)
+    {
+        $this->camera = $camera;
+        $this->width = $width;
+        $this->height = $height;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.gbuffer';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        TargetRef $target = $pipeline->createTarget('gbuffer', $this->width, $this->height);
+        TextureRef $position = $pipeline->createColor($target, 'position', gbufferOptions(.rgba32f));
+        TextureRef $normal = $pipeline->createColor($target, 'normal', gbufferOptions(.rgba16f));
+        TextureRef $albedo = $pipeline->createColor($target, 'albedo', gbufferOptions(.rgba8));
+        TextureRef $emissive = $pipeline->createColor($target, 'emissive', gbufferOptions(.rgba16f));
+        TextureRef $depth = $pipeline->createDepth($target, TextureOptions::depth());
+        $frame->set(GBufferData($target, $position, $normal, $albedo, $emissive, $depth));
+        $io->writes($target);
+    }
+
+    public function execute(Context $ctx) : status<PipelineError>
+    {
+        GBufferData $data = $ctx->frame->get<GBufferData>();
+        // alpha 0 everywhere is "nothing drew here"; the light pass
+        // discards those pixels so the skybox shows through
+        $ctx->pipeline->requestClear($data->target, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 0.0f)));
+        CameraData $camera = $ctx->frame->get<CameraData>();
+        $this->camera->push($camera->uniforms());
+        return .ok;
+    }
+}
+
+/** point sampling: a GBuffer texel is one pixel, never blended */
+internal function gbufferOptions(PixelFormat $format) : TextureOptions
+{
+    return TextureOptions($format: $format, $min: .nearest, $mag: .nearest);
+}

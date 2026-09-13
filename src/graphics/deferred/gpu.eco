@@ -1,0 +1,125 @@
+/**
+ * Linked programs, fallback textures, and the four samplers the
+ * deferred passes share. Constructed wholly by `load`; nothing on
+ * it is nullable.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+internal class DeferredGpu
+{
+    public Device $device;
+    public BakedShaders $shaders;
+    public UniformBuffer $camera;
+    public FullscreenTextureRenderer $blit;
+    public Texture $white;
+    public Texture $noise;
+    public Sampler $point;
+    public Sampler $linear;
+    public Sampler $noiseRepeat;
+    public Sampler $cube;
+    public array<Vec4> $kernel;
+
+    public static function load(Device $device) : result<DeferredGpu, ShaderError>
+    {
+        BakedShaders $shaders = BakedShaders($device, function(string $name, ShaderKind $kind) : string? {
+            return pbrBytes($name, $kind);
+        });
+        guard $shaders->program('gbuffer_instanced') else ($e) {
+            $shaders->destroy();
+            return .error($e);
+        }
+        guard $shaders->program('lightpass') else ($e) {
+            $shaders->destroy();
+            return .error($e);
+        }
+        FullscreenTextureRenderer $blit = FullscreenTextureRenderer();
+        guard $blit->load($device) else ($e) {
+            $shaders->destroy();
+            $blit->destroy();
+            return .error($e);
+        }
+
+        SamplerDesc $cubeDesc = SamplerDesc();
+        $cubeDesc->min = .linearMipmapLinear;
+        $cubeDesc->mag = .linear;
+        return .ok(DeferredGpu(
+            $device,
+            $shaders,
+            UniformBuffer($device, 1),
+            $blit,
+            whitePixel($device),
+            Texture($device, 'deferred.ssaoNoise', ssaoNoise()),
+            $device->createSampler(SamplerDesc($min: .nearest, $mag: .nearest)),
+            $device->createSampler(SamplerDesc()),
+            $device->createSampler(SamplerDesc(
+                $min: .nearest,
+                $mag: .nearest,
+                $wrapS: .repeat,
+                $wrapT: .repeat
+            )),
+            $device->createSampler($cubeDesc),
+            ssaoKernel(SSAO_MAX_SAMPLES)
+        ));
+    }
+
+    /** the kernel is built once; only the screen size changes */
+    public const function ssaoUniforms(const SsaoQuality& $quality, int32 $width, int32 $height) : SsaoUniforms
+    {
+        SsaoUniforms $uniforms = SsaoUniforms();
+        int32 $count = $quality->samples;
+
+        if ($count > SSAO_MAX_SAMPLES) {
+            $count = SSAO_MAX_SAMPLES;
+        }
+
+        $uniforms->params = Vec4(
+            $quality->radius,
+            $quality->bias,
+            $quality->strength,
+            $count as float32
+        );
+        $uniforms->screen = Vec4(
+            $width as float32,
+            $height as float32,
+            ($width as float32) / (SSAO_NOISE_SIZE as float32),
+            ($height as float32) / (SSAO_NOISE_SIZE as float32)
+        );
+        int32 $i = 0;
+
+        while ($i < SSAO_MAX_SAMPLES) {
+            $uniforms->samples[$i] = $this->kernel[$i as usize];
+            $i = $i + 1;
+        }
+
+        return $uniforms;
+    }
+
+    public function destroy() : void
+    {
+        $this->white->destroy();
+        $this->noise->destroy();
+        $this->blit->destroy();
+        $this->shaders->destroy();
+    }
+}
+
+/** destroys an owned texture if there is one; always returns null */
+internal function dropTexture(Texture? $texture) : Texture?
+{
+    Texture $held = guard $texture else {
+        return null;
+    }
+
+    $held->destroy();
+    return null;
+}
+
+/** opaque white, the stand-in for an absent ambient-occlusion map */
+internal function whitePixel(Device $device) : Texture
+{
+    array<uint8> $rgba = [255, 255, 255, 255];
+    return Texture($device, 'deferred.white', Pixels(1, 1, $rgba));
+}

@@ -1,0 +1,393 @@
+/**
+ * Turns per-frame submissions into merged instanced draw calls.
+ * `register` names a mesh range once, `submit` adds a transform plus
+ * payload, `build` culls / sorts / merges, `execute` records the
+ * draws. The instance stream goes through this frame's ring, so
+ * nothing is uploaded twice.
+ *
+ * The PHP predecessor was php-glfw's C `DrawCallAssembler`. Dropped
+ * on the way over: the octree culler (linear only here), LOD tables,
+ * material and program ids in the sort key, the transparent
+ * back-to-front pass, and the per-command callback — the caller sets
+ * its own uniforms before `execute`.
+ */
+
+namespace visu::graphics;
+
+use visu::geo::{AABB, Frustum};
+use visu::math::{Mat4, Vec3, Vec4, length};
+
+/** distance quantization; 20 bits of the sort key */
+internal const uint64 DCA_DEPTH_MAX = 1048575;
+
+public class DrawCallAssembler<P>
+{
+    /** frustum-cull submissions against their mesh bounds */
+    public bool $cull;
+    /** group by mesh, then near to far inside a group */
+    public bool $sortFrontToBack;
+    public Device $device;
+    private array<RegisteredMesh> $meshes;
+    private array<Submission<P>> $pending;
+    private array<Instance<P>> $stream;
+    private array<DrawCommand> $commands;
+    /** per-frame scratch, kept so the capacity survives across builds */
+    private array<uint32> $visible;
+    private array<uint64> $keys;
+    private int32 $culled;
+
+    public constructor(Device $device)
+    {
+        $this->cull = true;
+        $this->sortFrontToBack = true;
+        $this->device = $device;
+        $this->meshes = array<RegisteredMesh>();
+        $this->pending = array<Submission<P>>();
+        $this->stream = array<Instance<P>>();
+        $this->commands = array<DrawCommand>();
+        $this->visible = array<uint32>();
+        $this->keys = array<uint64>();
+        $this->culled = 0;
+    }
+
+    /** the whole mesh; bounds come from the mesh's own extents */
+    public function register(Mesh $mesh, const AABB& $bounds) : MeshHandle
+    {
+        return $this->register($mesh, 0, $mesh->vertexCount, $bounds);
+    }
+
+    public function register(Mesh $mesh, int32 $first, int32 $count, const AABB& $bounds) : MeshHandle
+    {
+        assert($first >= 0 && $count > 0, 'dca: mesh range');
+        int32 $index = $this->meshes->count() as int32;
+        $this->meshes[] = RegisteredMesh($mesh, $first, $count, $bounds);
+        return MeshHandle($index);
+    }
+
+    public function submit(
+        MeshHandle $mesh,
+        const Mat4& $model,
+        P $payload,
+        float32 $sortBias = 0.0f,
+        bool $ignoreCull = false
+    ) : void
+    {
+        assert($mesh->valid(), 'dca: submit needs a registered mesh');
+        assert(($mesh->index as usize) < $this->meshes->count(), 'dca: mesh handle');
+        $this->pending[] = Submission<P>($mesh->index, $model, $payload, $sortBias, $ignoreCull);
+    }
+
+    /** drop the submissions; the mesh table stays */
+    public function clearInstances() : void
+    {
+        $this->pending->clear();
+        $this->stream->clear();
+        $this->commands->clear();
+        $this->culled = 0;
+    }
+
+    public function clearMeshes() : void
+    {
+        $this->clearInstances();
+        $this->meshes->clear();
+    }
+
+    /**
+     * Cull, sort, and merge into draw commands. Returns the command
+     * count. Call once per frame after the last `submit`.
+     */
+    public function build(const Frustum& $frustum, Vec3 $cameraPosition) : int32
+    {
+        $this->stream->clear();
+        $this->commands->clear();
+        $this->culled = 0;
+        usize $n = $this->pending->count();
+
+        if ($n == 0) {
+            return 0;
+        }
+
+        $this->visible->clear();
+        $this->keys->clear();
+        $this->visible->reserve($n);
+        $this->keys->reserve($n);
+        usize $i = 0;
+
+        while ($i < $n) {
+            Submission<P> $sub = $this->pending[$i];
+            RegisteredMesh $mesh = $this->meshes[$sub->mesh as usize];
+            Vec3 $centre = worldPoint($sub->model, $mesh->centre);
+            // one key per submission, culled included: sortByKey looks
+            // them up by submission index, not by position in $visible
+            $this->keys[] = sortKey($sub->mesh, $this->depthBucket($centre, $cameraPosition, $sub->sortBias));
+
+            if ($this->cull && !$sub->ignoreCull) {
+                float32 $radius = $mesh->radius * maxAxisScale($sub->model);
+
+                if (!$frustum->contains($centre, $radius)) {
+                    $this->culled = $this->culled + 1;
+                    $i = $i + 1;
+                    continue;
+                }
+            }
+
+            $this->visible[] = $i as uint32;
+            $i = $i + 1;
+        }
+
+        if ($this->visible->count() == 0) {
+            return 0;
+        }
+
+        sortByKey($this->visible, $this->keys);
+        $this->merge();
+        return $this->commands->count() as int32;
+    }
+
+    /**
+     * Binds the pass, uploads the instance stream once, then one draw
+     * per command. `build` must have run this frame. Shared uniforms
+     * go on the encoder before this call.
+     */
+    public function execute(RenderEncoder $enc, GpuPass $pass) : void
+    {
+        if ($this->commands->count() == 0) {
+            return;
+        }
+
+        $pass->bind($enc);
+        uint64 $stride = mem::size<Instance<P>>() as uint64;
+        uint64 $bytes = ($this->stream->count() as uint64) * $stride;
+        TransientSlice $slice = $this->device->allocTransient($bytes, 16);
+        ptr<const uint8> $src = ptr<const uint8>(&$this->stream[0]);
+        mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $bytes);
+
+        foreach ($this->commands as $command) {
+            RegisteredMesh $mesh = $this->meshes[$command->mesh as usize];
+            uint64 $offset = ($command->instanceOffset as uint64) * $stride;
+            TransientSlice $sub = $slice;
+            $sub->data:$ = $slice->data:$ + $offset;
+            $sub->offset = $slice->offset + $offset;
+            $sub->bytes = ($command->instanceCount as uint64) * $stride;
+            $enc->setVertexBuffer(VERTEX_BINDING, $mesh->mesh->vertices);
+            $enc->setVertexTransient(INSTANCE_BINDING, $sub);
+            $enc->draw($command->first, $command->count, $command->instanceCount);
+        }
+    }
+
+    public const function commandCount() : int32
+    {
+        return $this->commands->count() as int32;
+    }
+
+    public const function instanceCount() : int32
+    {
+        return $this->stream->count() as int32;
+    }
+
+    public const function culledCount() : int32
+    {
+        return $this->culled;
+    }
+
+    public const function meshCount() : int32
+    {
+        return $this->meshes->count() as int32;
+    }
+
+    public const function pendingCount() : int32
+    {
+        return $this->pending->count() as int32;
+    }
+
+    /** command `$i`, for tests and metrics */
+    public const function command(int32 $i) : DrawCommand
+    {
+        assert($i >= 0 && ($i as usize) < $this->commands->count(), 'dca: command index');
+        return $this->commands[$i as usize];
+    }
+
+    /** over $this->visible, which sortByKey has just ordered */
+    private function merge() : void
+    {
+        usize $n = $this->visible->count();
+        $this->stream->reserve($n);
+        usize $i = 0;
+
+        while ($i < $n) {
+            Submission<P> $base = $this->pending[$this->visible[$i] as usize];
+            usize $start = $i;
+
+            while ($i < $n) {
+                Submission<P> $next = $this->pending[$this->visible[$i] as usize];
+
+                if ($next->mesh != $base->mesh) {
+                    break;
+                }
+
+                $this->stream[] = Instance<P>($next->model, $next->payload);
+                $i = $i + 1;
+            }
+
+            RegisteredMesh $mesh = $this->meshes[$base->mesh as usize];
+            $this->commands[] = DrawCommand(
+                $base->mesh,
+                $mesh->first,
+                $mesh->count,
+                $start as int32,
+                ($i - $start) as int32
+            );
+        }
+    }
+
+    private const function depthBucket(Vec3 $centre, Vec3 $camera, float32 $bias) : uint64
+    {
+        if (!$this->sortFrontToBack) {
+            return 0;
+        }
+
+        float32 $distance = length($centre - $camera) + $bias;
+
+        if ($distance <= 0.0f) {
+            return 0;
+        }
+
+        uint64 $bucket = ($distance * 16.0f) as uint64;
+
+        if ($bucket > DCA_DEPTH_MAX) {
+            return DCA_DEPTH_MAX;
+        }
+
+        return $bucket;
+    }
+}
+
+/** mesh in the high bits so instances of one mesh stay adjacent */
+internal function sortKey(int32 $mesh, uint64 $depth) : uint64
+{
+    return (($mesh as uint64) << 32) | $depth;
+}
+
+internal function worldPoint(const Mat4& $model, Vec3 $point) : Vec3
+{
+    Vec4 $world = $model * Vec4($point->x, $point->y, $point->z, 1.0f);
+    return Vec3($world->x, $world->y, $world->z);
+}
+
+/** the largest column length: a sphere scaled by this still contains the mesh */
+internal function maxAxisScale(const Mat4& $model) : float32
+{
+    float32 $x = length(Vec3($model->c0->x, $model->c0->y, $model->c0->z));
+    float32 $y = length(Vec3($model->c1->x, $model->c1->y, $model->c1->z));
+    float32 $z = length(Vec3($model->c2->x, $model->c2->y, $model->c2->z));
+    float32 $max = $x;
+
+    if ($y > $max) {
+        $max = $y;
+    }
+
+    if ($z > $max) {
+        $max = $z;
+    }
+
+    return $max;
+}
+
+/**
+ * Bottom-up merge sort; stable, so equal keys keep submit order.
+ * `$keys` is indexed by the *value*, not by its position: a sparse
+ * `$values` still reads `$keys[$values[$i]]`.
+ */
+internal function sortByKey(array<uint32>& $values, const array<uint64>& $keys) : void
+{
+    usize $n = $values->count();
+
+    if ($n < 2) {
+        return;
+    }
+
+    array<uint32> $scratch = arr::room<uint32>($n);
+    $scratch->commit($n);
+    usize $i = 0;
+
+    while ($i < $n) {
+        assert(($values[$i] as usize) < $keys->count(), 'sortByKey: keys are indexed by value');
+        $i = $i + 1;
+    }
+
+    usize $width = 1;
+    // ping-pong: each pass merges into the other buffer instead of
+    // merging and then copying the whole array back
+    bool $sorted = false;
+
+    while ($width < $n) {
+        usize $left = 0;
+
+        while ($left < $n) {
+            usize $mid = $left + $width;
+            usize $right = $mid + $width;
+
+            if ($mid > $n) {
+                $mid = $n;
+            }
+
+            if ($right > $n) {
+                $right = $n;
+            }
+
+            if ($sorted) {
+                mergeRun($scratch, $values, $keys, $left, $mid, $right);
+            } else {
+                mergeRun($values, $scratch, $keys, $left, $mid, $right);
+            }
+
+            $left = $left + $width * 2;
+        }
+
+        $sorted = !$sorted;
+        $width = $width * 2;
+    }
+
+    if (!$sorted) {
+        return;
+    }
+
+    $i = 0;
+
+    while ($i < $n) {
+        $values[$i] = $scratch[$i];
+        $i = $i + 1;
+    }
+}
+
+internal function mergeRun(
+    array<uint32>& $values,
+    array<uint32>& $scratch,
+    const array<uint64>& $keys,
+    usize $left,
+    usize $mid,
+    usize $right
+) : void
+{
+    usize $a = $left;
+    usize $b = $mid;
+    usize $out = $left;
+
+    while ($out < $right) {
+        bool $takeLeft = $a < $mid;
+
+        if ($takeLeft && $b < $right) {
+            $takeLeft = $keys[$values[$a] as usize] <= $keys[$values[$b] as usize];
+        }
+
+        if ($takeLeft) {
+            $scratch[$out] = $values[$a];
+            $a = $a + 1;
+        } else {
+            $scratch[$out] = $values[$b];
+            $b = $b + 1;
+        }
+
+        $out = $out + 1;
+    }
+}

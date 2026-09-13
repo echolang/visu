@@ -1,0 +1,142 @@
+/**
+ * The two SSAO passes: sample the hemisphere into a single-channel
+ * buffer, then blur the noise out of it. The light pass multiplies
+ * its ambient term by the result.
+ */
+
+namespace visu::graphics;
+
+public class SsaoPass : Pass
+{
+    private DeferredGpu $gpu;
+    private SsaoQuality $quality;
+
+    public constructor(DeferredGpu $gpu, SsaoQuality $quality)
+    {
+        $this->gpu = $gpu;
+        $this->quality = $quality;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.ssao';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        GBufferData $gbuffer = $frame->get<GBufferData>();
+        $io->reads($gbuffer->position);
+        $io->reads($gbuffer->normal);
+        int32 $width = ($gbuffer->target->width as float32 * $this->quality->scale) as int32;
+        int32 $height = ($gbuffer->target->height as float32 * $this->quality->scale) as int32;
+
+        if ($width < 1) {
+            $width = 1;
+        }
+
+        if ($height < 1) {
+            $height = 1;
+        }
+
+        TargetRef $target = $pipeline->createTarget('ssao', $width, $height);
+        TextureRef $output = $pipeline->createColor($target, 'output', occlusionOptions());
+        $frame->set(SsaoRawData($target, $output));
+        $io->writes($target);
+    }
+
+    public function execute(Context $ctx) : status<PipelineError>
+    {
+        SsaoRawData $data = $ctx->frame->get<SsaoRawData>();
+        GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
+        ShaderProgram $program = guard $this->gpu->shaders->program('ssao') else ($e) {
+            return .error(.shader($e));
+        }
+
+        RenderEncoder $enc = guard $ctx->beginRender($data->target) else ($e) {
+            return .error($e);
+        }
+        Device $device = $ctx->device;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        $pass->bind($enc);
+        $this->gpu->camera->bind($enc);
+        $enc->upload($this->gpu->ssaoUniforms($this->quality, $data->target->width, $data->target->height), slot: 0);
+
+        guard bindPooled($ctx, $enc, 0, $gbuffer->position, $this->gpu->point) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        guard bindPooled($ctx, $enc, 1, $gbuffer->normal, $this->gpu->point) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        $enc->bindTexture(2, $this->gpu->noise, $this->gpu->noiseRepeat);
+        $mesh->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+public class SsaoBlurPass : Pass
+{
+    private DeferredGpu $gpu;
+
+    public constructor(DeferredGpu $gpu)
+    {
+        $this->gpu = $gpu;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.ssao.blur';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        SsaoRawData $raw = $frame->get<SsaoRawData>();
+        $io->reads($raw->output);
+        TargetRef $target = $pipeline->createTarget(
+            'ssaoBlur',
+            $raw->target->width,
+            $raw->target->height
+        );
+        TextureRef $output = $pipeline->createColor($target, 'output', occlusionOptions());
+        $frame->set(SsaoData($target, $output));
+        $io->writes($target);
+    }
+
+    public function execute(Context $ctx) : status<PipelineError>
+    {
+        SsaoRawData $raw = $ctx->frame->get<SsaoRawData>();
+        SsaoData $data = $ctx->frame->get<SsaoData>();
+        ShaderProgram $program = guard $this->gpu->shaders->program('ssao_blur') else ($e) {
+            return .error(.shader($e));
+        }
+
+        RenderEncoder $enc = guard $ctx->beginRender($data->target) else ($e) {
+            return .error($e);
+        }
+        Device $device = $ctx->device;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        $pass->bind($enc);
+
+        guard bindPooled($ctx, $enc, 0, $raw->output, $this->gpu->linear) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        $mesh->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+/** single channel, linear so the blur reads between texels */
+internal function occlusionOptions() : TextureOptions
+{
+    return TextureOptions($format: .r16f, $min: .linear, $mag: .linear);
+}

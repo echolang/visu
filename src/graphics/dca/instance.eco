@@ -1,0 +1,39 @@
+/**
+ * What the GPU reads per instance: the model matrix the assembler
+ * writes, followed by the caller's payload struct. `P` decides the
+ * vertex attributes past the matrix, so the layout and the stream
+ * cannot drift apart.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Mat4, Vec4};
+
+public struct Instance<P>
+{
+    public Mat4 $model;
+    public P $payload;
+}
+
+/**
+ * Attribute layout of `Instance<P>` as the instance stream. `$first`
+ * is the location of the model matrix; it takes four (one per
+ * column), then `$payload` names the rest.
+ *
+ * Metal caps a pipeline at 8 vertex attributes, so a mesh layout of
+ * pos + normal leaves exactly two payload slots.
+ */
+public function instanceLayout<P>(
+    uint32 $first,
+    function<void(VertexBuilder, ptr<const P>)> $payload
+) : VertexLayout
+{
+    return VertexLayout::of<Instance<P>>(function(VertexBuilder $b) : void {
+        ptr<Instance<P>> $v = $b->vertex<Instance<P>>();
+        $b->attr($first, &$v->model->c0);
+        $b->attr($first + 1, &$v->model->c1);
+        $b->attr($first + 2, &$v->model->c2);
+        $b->attr($first + 3, &$v->model->c3);
+        $payload($b, &$v->payload);
+    }, divisor: 1);
+}
