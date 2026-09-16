@@ -1,35 +1,40 @@
 /*
- * Deferred PBR: a 10x5 grid of spheres, roughness left to right and
- * metallic bottom to top, lit by a directional sun and (when an HDRI
- * is present) the environment around them.
+ * Deferred PBR: a 10x5 grid of spheres, roughness left to right and metallic bottom to top.
+ * Lit by a directional sun and (when an HDRI is present) the environment around them.
  *
  *   echoc run -m examples --target pbr
  *   echoc run -m examples --target pbr --define VISU_FINITE
  *
- * Hold left mouse to look, WASD to fly.
+ * Hold left to orbit, scroll to zoom. On iOS, drag and pinch.
  */
 
 use std::io;
 use visu::app::info;
+use visu::os::{resourceRoot, writableRoot};
 use visu::ecs::{Entities, Entity, System};
 use visu::geo::{AABB, Transform, PrimitiveBuilder, PrimitiveLayout, sphere};
 use visu::graphics::{
-    Context, DeferredRenderer, DrawCallAssembler, GBufferData, Mesh, MeshHandle,
+    Camera, Context, DeferredRenderer, DrawCallAssembler, GBufferData, IblQuality, Mesh, MeshHandle,
     HdrPixels, SceneTarget, Texture, TextureOptions, TextureRef, VertexBuilder,
     VertexLayout, instanceLayout
 };
 use visu::math::{Vec3, Vec4};
 use visu::quickstart::{App, Options, Quickstart};
+use visu::components::OrbitCamera;
 use visu::system::CameraSystem;
 
-/** any equirectangular radiance map; missing means sun-only lighting */
+/**
+ * Any equirectangular radiance map. Missing means sun-only lighting.
+ */
 const HDRI_PATH = 'resources/hdri/cowboy_town_saloon_2k.hdr';
 const int32 ENVIRONMENT_SIZE = 1024;
 const int32 ROUGHNESS_STEPS = 10;
 const int32 METALLIC_STEPS = 5;
 const float32 SPHERE_SPACING = 1.2f;
 
-/** per-entity material; the sphere mesh itself is shared */
+/**
+ * Per-entity material. The sphere mesh itself is shared.
+ */
 public struct PbrMaterial
 {
     public Vec3 $albedo;
@@ -38,7 +43,9 @@ public struct PbrMaterial
     public Vec3 $emissive;
 }
 
-/** the two payload vec4s that ride the instance stream */
+/**
+ * The two payload vec4s that ride the instance stream.
+ */
 public struct SphereInstance
 {
     public Vec4 $albedoMetallic;
@@ -46,8 +53,8 @@ public struct SphereInstance
 }
 
 /**
- * Submits every sphere into the assembler, then hands the deferred
- * renderer a closure that records the merged draw calls.
+ * Submits every sphere into the assembler,
+ * then hands the deferred renderer a closure that records the merged draw calls.
  */
 public class SphereSystem : System
 {
@@ -104,8 +111,8 @@ public class SphereSystem : System
 }
 
 /**
- * Everything `ready` builds. Closures capture by value, so the scene
- * lives on Services and every callback reads it back through `$app`.
+ * Everything `ready` builds.
+ * Closures capture by value, so the scene lives on Services and every callback reads it back through `$app`.
  */
 public class PbrScene
 {
@@ -136,6 +143,9 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
 
     $opt->ready = function(App $app) : void {
         DeferredRenderer $renderer = DeferredRenderer($app->device);
+        #[if: os == ios]
+        $renderer->ibl = IblQuality::mobile();
+        #[end]
         guard $renderer->load() else ($e) {
             die($e->message());
         }
@@ -149,9 +159,10 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
         SphereSystem $spheres = SphereSystem($dca, $renderer);
         $spheres->sphere = $dca->register($mesh, AABB(Vec3(-0.5f, -0.5f, -0.5f), Vec3(0.5f, 0.5f, 0.5f)));
 
-        CameraSystem $camera = CameraSystem($app->input, $app->dispatcher);
+        CameraSystem $camera = CameraSystem();
         // the camera has to publish CameraData before anything reads it
         $app->systems->bind($camera);
+        $app->systems->bind(OrbitCameraSystem($app->input, $camera));
         $app->systems->bind($spheres);
 
         $app->services->set(PbrScene($renderer, $mesh, $dca, $camera));
@@ -168,11 +179,16 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
             $distance = $gridHeight;
         }
 
-        $camera->spawnDefaultFlyingCamera($app->entities, Vec3(
+        Vec3 $center = Vec3(
             $gridWidth * 0.5f - SPHERE_SPACING * 0.5f,
             $gridHeight * 0.5f - SPHERE_SPACING * 0.5f,
-            $distance * 1.2f
-        ));
+            0.0f
+        );
+        Entity $cam = Camera::spawn($app->entities, Vec3(0.0f, 0.0f, 0.0f));
+        OrbitCamera $orbit = OrbitCamera($center, $distance * 1.2f);
+        $orbit->place($app->entities->get<Transform>($cam));
+        $app->entities->attach($cam, $orbit);
+        $camera->activeCamera = $cam;
 
         int32 $metallicLast = METALLIC_STEPS - 1;
         float32 $metallicSteps = $metallicLast as float32;
@@ -202,16 +218,38 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
         info("pbr: {$count} spheres, roughness across x, metallic up y");
     };
 
+    #[if: VISU_PBR_DUMP]
+    $opt->afterFrame = function(App $app) : void {
+        if (PbrDump::$done) {
+            return;
+        }
+
+        PbrScene $scene = $app->services->get<PbrScene>();
+        if ($scene->renderer->hasEnvironment() && !$scene->renderer->iblReady()) {
+            return;
+        }
+
+        if ($app->device->frameIndex() < 4) {
+            return;
+        }
+
+        dumpFrame($app);
+        PbrDump::$done = true;
+    };
+    #[end]
+
     $opt->teardown = function(App $app) : void {
         PbrScene $scene = $app->services->get<PbrScene>();
-        dumpFrame($app);
         $scene->renderer->destroy();
         $scene->mesh->destroy();
     };
 });
 $qs->run();
 
-/** never fully smooth: a zero-roughness highlight is a single pixel */
+/**
+ * Maps a grid step to roughness, never fully smooth.
+ * A zero-roughness highlight is a single pixel.
+ */
 internal function gridRoughness(int32 $step) : float32
 {
     int32 $last = ROUGHNESS_STEPS - 1;
@@ -227,8 +265,8 @@ internal function gridRoughness(int32 $step) : float32
 }
 
 /**
- * Finds the HDRI whether the example runs from the repo root or from
- * its own directory, and hands it to the renderer to bake.
+ * Finds the HDRI whether the example runs from the repo root or from its own directory,
+ * and hands it to the renderer to bake.
  */
 internal function loadEnvironment(App $app, DeferredRenderer $renderer) : void
 {
@@ -248,14 +286,20 @@ internal function loadEnvironment(App $app, DeferredRenderer $renderer) : void
 internal function findHdri() : string?
 {
     array<string> $roots = ['', 'examples/pbr/', 'pbr/', '../examples/pbr/'];
+    string $bundle = resourceRoot();
+    if (!$bundle->empty()) {
+        $roots[] = "{$bundle}/";
+    }
 
-    string $relative = HDRI_PATH;
+    array<string> $files = [HDRI_PATH, 'hdri/cowboy_town_saloon_2k.hdr'];
 
-    foreach ($roots as $root) {
-        string $candidate = "{$root}{$relative}";
+    foreach ($files as $relative) {
+        foreach ($roots as $root) {
+            string $candidate = "{$root}{$relative}";
 
-        if (pathExists($candidate)) {
-            return $candidate;
+            if (pathExists($candidate)) {
+                return $candidate;
+            }
         }
     }
 
@@ -271,21 +315,33 @@ internal function pathExists(const string& $path) : bool
 }
 
 /**
- * --define VISU_PBR_DUMP writes the last frame to var/ so the scene
- * can be eyeballed (and diffed) without a window.
+ * --define VISU_PBR_DUMP writes the last frame to var/ so the scene can be eyeballed (and diffed) without a window.
  */
 #[if: VISU_PBR_DUMP]
+internal class PbrDump
+{
+    public static bool $done = false;
+}
+
+internal function dumpDir() : string
+{
+    return writableRoot();
+}
+
 internal function dumpFrame(App $app) : void
 {
-    dumpPoolTexture($app, 'quickstartTarget.attachment.color_quickstartColor', 'var/pbr.png');
-    dumpPoolTexture($app, 'gbuffer.attachment.color_albedo', 'var/pbr_albedo.png');
-    dumpPoolTexture($app, 'gbuffer.attachment.color_normal', 'var/pbr_normal.png');
-    dumpPoolTexture($app, 'lightpass.attachment.color_output', 'var/pbr_light.png');
-    dumpPoolTexture($app, 'ssaoBlur.attachment.color_output', 'var/pbr_ssao.png');
+    string $dir = dumpDir();
+    dumpPoolTexture($app, 'quickstartTarget.attachment.color_quickstartColor', "{$dir}/pbr.png");
+    dumpPoolTexture($app, 'gbuffer.attachment.color_albedo', "{$dir}/pbr_albedo.png");
+    dumpPoolTexture($app, 'gbuffer.attachment.color_normal', "{$dir}/pbr_normal.png");
+    dumpPoolTexture($app, 'lightpass.attachment.color_output', "{$dir}/pbr_light.png");
+    dumpPoolTexture($app, 'ssao.attachment.color_output', "{$dir}/pbr_ssao_raw.png");
+    dumpPoolTexture($app, 'ssaoBlur.attachment.color_output', "{$dir}/pbr_ssao.png");
     // cube dumps write face 0, +X
-    dumpPoolTexture($app, 'environment', 'var/pbr_env.png');
-    dumpPoolTexture($app, 'ibl.irradiance', 'var/pbr_irradiance.png');
-    dumpPoolTexture($app, 'ibl.brdf', 'var/pbr_brdf.png');
+    dumpPoolTexture($app, 'environment', "{$dir}/pbr_env.png");
+    dumpPoolTexture($app, 'ibl.irradiance', "{$dir}/pbr_irradiance.png");
+    dumpPoolTexture($app, 'ibl.prefilter', "{$dir}/pbr_prefilter.png");
+    dumpPoolTexture($app, 'ibl.brdf', "{$dir}/pbr_brdf.png");
 }
 
 internal function dumpPoolTexture(App $app, string $name, string $path) : void
@@ -300,9 +356,5 @@ internal function dumpPoolTexture(App $app, string $name, string $path) : void
         return;
     }
     info("pbr: wrote {$path}");
-}
-#[else]
-internal function dumpFrame(App $app) : void
-{
 }
 #[end]

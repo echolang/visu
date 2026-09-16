@@ -62,8 +62,9 @@ void main()
 
         vec3 diffuseIBL = vec3(0.0);
 #ifdef USE_IBL
-        // the irradiance bake already multiplied by PI
-        vec3 irradiance = texture(ibl_irradiance_map, s.N).rgb;
+        // lod 0: screen-space derivatives of N across a sphere are
+        // meaningless, and a 1-mip cube reads black on iOS at high lod
+        vec3 irradiance = textureLod(ibl_irradiance_map, s.N, 0.0).rgb;
         diffuseIBL = irradiance * s.albedo / PI;
 #else
         diffuseIBL = vec3(0.03) * s.albedo;
@@ -76,7 +77,8 @@ void main()
         vec2 brdf = texture(ibl_brdf_lut, vec2(NdotV, s.roughness)).rg;
         specIBL = prefiltered * (s.F0 * brdf.x + brdf.y);
 #elif defined(USE_ENV_CUBEMAP)
-        float maxLod = max(u_ibl.y - 1.0, 0.0);
+        // y is the env cube mip count; skip the 1x1 lod
+        float maxLod = max(u_ibl.y - 2.0, 0.0);
         vec3 env = textureLod(environment_cubemap, R, s.roughness * maxLod).rgb;
         // no split-sum LUT on this path, so Fresnel alone
         specIBL = env * F;

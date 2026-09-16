@@ -1,13 +1,15 @@
 /**
- * Scene lighting the deferred renderer owns. One directional sun for
- * now; point and spot lights land with a light-volume pass.
+ * Scene lighting the deferred renderer owns. One directional sun for now;
+ * point and spot lights land with a light-volume pass.
  */
 
 namespace visu::graphics;
 
 use visu::math::{Mat4, Vec3, Vec4, normalize};
 
-/** which lightpass variant runs; computed at execute after the bakes */
+/**
+ * Which lightpass variant runs; computed at execute after the bakes.
+ */
 internal enum Lighting
 {
     case sun;
@@ -37,23 +39,28 @@ internal function lightUniforms(const DirectionalLight& $sun, Environment? $env)
 {
     Vec3 $direction = normalize($sun->direction);
     Environment $held = guard $env else {
+        IblQuality $fallback = IblQuality();
         return LightUniforms(
             Vec4($direction->x, $direction->y, $direction->z, $sun->intensity),
             Vec4($sun->color->x, $sun->color->y, $sun->color->z, 1.0f),
-            Vec4(IBL_PREFILTER_MIPS as float32, 1.0f, 0.0f, 0.0f)
+            Vec4($fallback->prefilterMips as float32, 1.0f, 0.0f, 0.0f)
         );
     }
     float32 $environmentMips = $held->cube->desc->mips as float32;
+    // never lod into 1x1 env mips: that paints cube faces on the spheres
     return LightUniforms(
         Vec4($direction->x, $direction->y, $direction->z, $sun->intensity),
         Vec4($sun->color->x, $sun->color->y, $sun->color->z, 1.0f),
-        Vec4(IBL_PREFILTER_MIPS as float32, $environmentMips, 0.0f, 0.0f)
+        Vec4($held->ibl->prefilterMips as float32, $environmentMips, 0.0f, 0.0f)
     );
 }
 
 public struct DirectionalLight
 {
-    /** the direction light travels, so straight down is (0, -1, 0) */
+
+    /**
+     * The direction light travels, so straight down is (0, -1, 0).
+     */
     public Vec3 $direction;
     public Vec3 $color;
     public float32 $intensity;
@@ -74,26 +81,33 @@ public struct DirectionalLight
 }
 
 /**
- * Mirrors LightUniforms in resources/shaders/pbr/lightpass.frag at
- * uniform slot 2. std140 with vec4 members only.
+ * Mirrors LightUniforms in resources/shaders/pbr/lightpass.frag at uniform slot 2; std140 with vec4 members only.
  */
 public struct LightUniforms
 {
-    /** xyz sun direction, w intensity */
+
+    /**
+     * Sun direction in xyz, intensity in w.
+     */
     public Vec4 $sunDirection;
     public Vec4 $sunColor;
-    /** x prefiltered mip count, y environment mip count */
+
+    /**
+     * Prefiltered mip count in x, environment mip count in y.
+     */
     public Vec4 $ibl;
 }
 
 /**
- * Mirrors CaptureUniforms in resources/shaders/include/visu/capture.glsl
- * at uniform slot 0, used by every cube bake.
+ * Mirrors CaptureUniforms in resources/shaders/include/visu/capture.glsl at uniform slot 0, used by every cube bake.
  */
 public struct CaptureUniforms
 {
     public Mat4 $projection;
     public Mat4 $view;
-    /** x roughness, y source face resolution */
+
+    /**
+     * Roughness in x, source face resolution in y, convolution samples in z.
+     */
     public Vec4 $params;
 }

@@ -1,0 +1,35 @@
+/**
+ * Failures at the input-claim / action-map boundary.
+ * No exceptions; match the case.
+ */
+
+namespace visu::os::input;
+
+public enum InputError
+{
+    case claimed(string $by);
+    case notHeld(string $wanted, string? $actual);
+    case taken(Binding $binding, string $action);
+    case duplicate(string $name);
+    case missing(string $name);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            .claimed($by) => "input context already claimed by '{$by}'",
+            .notHeld($wanted, $actual) => inputNotHeld($wanted, $actual),
+            .taken($binding, $action) => "{$binding->label()} is already bound to '{$action}'",
+            .duplicate($name) => "input context '{$name}' is already registered",
+            .missing($name) => "input context '{$name}' is not registered",
+        };
+    }
+}
+
+internal function inputNotHeld(string $wanted, string? $actual) : string
+{
+    string $held = guard $actual else {
+        return "input context '{$wanted}' is not claimed";
+    }
+
+    return "input context '{$wanted}' is not claimed (held by '{$held}')";
+}

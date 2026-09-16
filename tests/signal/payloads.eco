@@ -1,14 +1,15 @@
 /**
- * Signal payload fields. No window — the producer holds that.
+ * Signal payload fields. No window; the producer holds that.
  */
 
 use visu::ecs::Entity;
 use visu::math::Vec2;
-use visu::os::key;
-use visu::os::mouse;
+use visu::os::input;
+use visu::os::input::{KeyPhase, MOD_CONTROL, MOD_SHIFT};
 use visu::signal::{
     Char, CharMod, Click, ConsoleCommand, Cursor, CursorEnter, Drop,
-    EntitySelected, Key, MouseButton, Pick, Scroll
+    EntitySelected, Focus, Key, MouseButton, Pause, Pick,
+    Resume, Scroll, Touch
 };
 
 test console_command_parts
@@ -33,10 +34,10 @@ test entity_selected
 
 test key_fields
 {
-    int32 $mods = key::MOD_SHIFT | key::MOD_CONTROL;
-    Key $k = Key(key::A, 0, key::PRESS, $mods);
-    assert($k->key == key::A, 'key');
-    assert($k->action == key::PRESS, 'press');
+    int32 $mods = MOD_SHIFT | MOD_CONTROL;
+    Key $k = Key(.a, 0, .press, $mods);
+    assert($k->key == input::Key::a, 'key');
+    assert($k->phase == KeyPhase::press, 'press');
     assert($k->isShift(), 'shift');
     assert($k->isControl(), 'control');
     assert(!$k->isAlt(), 'alt');
@@ -66,17 +67,30 @@ test char_text_utf8
     assert($bt == 'B', 'B');
 }
 
+test touch_and_lifecycle_fields
+{
+    Touch $t = Touch(3, .began, Vec2(1.0f, 2.0f), 0.5f);
+    assert($t->id == 3, 'id');
+    assert($t->position->x == 1.0f, 'x');
+    assert($t->force == 0.5f, 'force');
+    Pause $p = Pause();
+    Resume $r = Resume();
+    Focus $f = Focus(true);
+    assert($f->gained, 'gained');
+
+}
+
 test mouse_button_fields
 {
-    MouseButton $left = MouseButton(mouse::LEFT, key::PRESS, 0);
+    MouseButton $left = MouseButton(.left, .press, 0);
     assert($left->isLeft(), 'left');
     assert($left->isLeftDown(), 'down');
     assert(!$left->isLeftUp(), 'not up');
-    MouseButton $right = MouseButton(mouse::RIGHT, key::RELEASE, 0);
+    MouseButton $right = MouseButton(.right, .release, 0);
     assert($right->isRight(), 'right');
     assert($right->isRightUp(), 'up');
     assert(!$right->isRightDown(), 'not down');
-    MouseButton $mid = MouseButton(mouse::MIDDLE, key::PRESS, 0);
+    MouseButton $mid = MouseButton(.middle, .press, 0);
     assert($mid->isMiddle(), 'middle');
     assert($mid->isMiddleDown(), 'mid down');
     assert(!$mid->isMiddleUp(), 'mid not up');

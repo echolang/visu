@@ -1,0 +1,85 @@
+/**
+ * Drives the active entity when it has a `FlyingCamera`.
+ * Bind alongside `CameraSystem`; only the active camera consumes input.
+ */
+
+namespace visu::system;
+
+use visu::components::FlyingCamera;
+use visu::ecs::{Entities, Entity, System};
+use visu::geo::Transform;
+use visu::graphics::Context;
+use visu::os::input::InputHub;
+use visu::signal::{Cursor, Dispatcher, Queue};
+
+public class FlyingCameraSystem : System
+{
+    public CameraSystem $cameras;
+    private InputHub $input;
+    private Dispatcher $dispatcher;
+    private Queue<Cursor>? $cursors;
+
+    public constructor(InputHub $input, Dispatcher $dispatcher, CameraSystem $cameras)
+    {
+        $this->cameras = $cameras;
+        $this->input = $input;
+        $this->dispatcher = $dispatcher;
+        $this->cursors = null;
+    }
+
+    public function register(Entities $entities) : void
+    {
+        $this->cursors = $this->dispatcher->queue<Cursor>();
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+        Queue<Cursor> $cursors = guard $this->cursors else {
+            return;
+        }
+        $this->dispatcher->unqueue<Cursor>($cursors);
+        $this->cursors = null;
+    }
+
+    public function update(Entities $entities) : void
+    {
+        Entity $active = $this->cameras->activeCamera;
+
+        if (!$this->cameras->valid($entities, $active)) {
+            return;
+        }
+
+        if (!$entities->has<FlyingCamera>($active)) {
+            return;
+        }
+
+        $this->drain($entities, $active);
+
+        if (!$this->input->unclaimed()) {
+            return;
+        }
+
+        FlyingCamera& $fly = $entities->get<FlyingCamera>($active);
+        Transform& $transform = $entities->get<Transform>($active);
+        $fly->fly($this->input, $transform);
+    }
+
+    public function render(Entities $entities, const Context& $ctx) : void
+    {
+    }
+
+    private function drain(Entities $entities, Entity $active) : void
+    {
+        Queue<Cursor> $cursors = guard $this->cursors else {
+            return;
+        }
+
+        while (true) {
+            Cursor $signal = guard $cursors->shift() else {
+                break;
+            }
+            FlyingCamera& $fly = $entities->get<FlyingCamera>($active);
+            $fly->look($this->input, $signal);
+        }
+    }
+}

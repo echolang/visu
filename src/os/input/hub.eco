@@ -1,0 +1,675 @@
+/**
+ * Pollable input hub.
+ * The window's event handler: records press / release edges (per poll and per frame), dispatches typed facts, and turns a pointer down+up that did not travel far into Click.
+ * Pointer is its own record (cursor or first finger); buttons stay physical.
+ * Systems claim a mutex string so they do not steal each other's pointer.
+ */
+
+namespace visu::os::input;
+
+use visu::math::{Vec2, distance};
+use visu::os::{
+    CursorMode, Window, WindowEventHandler, liveCursor, liveCursorMode,
+    warpCursor, warpCursorMode
+};
+use visu::signal::{
+    Char, CharMod, Click, Cursor, CursorEnter, Dispatcher, Drop, Focus,
+    Pause, Resume, Scroll, Touch
+};
+
+public class InputHub : WindowEventHandler
+{
+
+    /**
+     * Max pointer travel between down and up for a Click.
+     */
+    public float32 $clickSlop = 10.0f;
+
+    private Window $window;
+    private Dispatcher $dispatcher;
+    private string? $context;
+    private Vec2 $pointerPos;
+    private bool $pointerSeeded;
+    private Vec2 $pointerDownAt;
+    private Vec2 $pointerUpAt;
+    private PointerSource $pointerOrigin;
+    private bool $pointerHeld;
+    private bool $pointerPress;
+    private bool $pointerRelease;
+    private bool $pointerPressFrame;
+    private bool $pointerReleaseFrame;
+    private int32 $pointerMods;
+    private map<int32, bool> $keyHeld;
+    private map<int32, bool> $keyPress;
+    private map<int32, bool> $keyRelease;
+    private map<int32, bool> $keyPressFrame;
+    private map<int32, bool> $keyReleaseFrame;
+    private map<int32, bool> $buttonHeld;
+    private map<int32, bool> $buttonPress;
+    private map<int32, bool> $buttonRelease;
+    private map<int32, bool> $buttonPressFrame;
+    private map<int32, bool> $buttonReleaseFrame;
+    private array<int32> $charFrame;
+    private map<int32, TouchState> $touchHeld;
+    private int32 $primaryTouch;
+    private bool $mousePresent;
+    private Vec2 $mouseDelta;
+    private Vec2 $mouseWheel;
+    private int32 $pinchA;
+    private int32 $pinchB;
+    private float32 $pinchPrev;
+
+    public constructor(Window $window, Dispatcher $dispatcher)
+    {
+        $this->window = $window;
+        $this->dispatcher = $dispatcher;
+        $this->context = null;
+        $this->pointerPos = Vec2(0.0f);
+        $this->pointerSeeded = false;
+        $this->pointerDownAt = Vec2(0.0f);
+        $this->pointerUpAt = Vec2(0.0f);
+        $this->pointerOrigin = .none;
+        $this->pointerHeld = false;
+        $this->pointerPress = false;
+        $this->pointerRelease = false;
+        $this->pointerPressFrame = false;
+        $this->pointerReleaseFrame = false;
+        $this->pointerMods = 0;
+        $this->keyHeld = map<int32, bool>();
+        $this->keyPress = map<int32, bool>();
+        $this->keyRelease = map<int32, bool>();
+        $this->keyPressFrame = map<int32, bool>();
+        $this->keyReleaseFrame = map<int32, bool>();
+        $this->buttonHeld = map<int32, bool>();
+        $this->buttonPress = map<int32, bool>();
+        $this->buttonRelease = map<int32, bool>();
+        $this->buttonPressFrame = map<int32, bool>();
+        $this->buttonReleaseFrame = map<int32, bool>();
+        $this->charFrame = array<int32>();
+        $this->touchHeld = map<int32, TouchState>();
+        $this->primaryTouch = -1;
+        $this->mousePresent = false;
+        $this->mouseDelta = Vec2(0.0f);
+        $this->mouseWheel = Vec2(0.0f);
+        $this->pinchA = -1;
+        $this->pinchB = -1;
+        $this->pinchPrev = 0.0f;
+    }
+
+    public const function down(Key $key) : bool
+    {
+        return $this->keyHeld->has($key->value());
+    }
+
+    /**
+     * Physical mouse button.
+     * Fingers do not set this.
+     */
+    public const function down(button: MouseButton $button) : bool
+    {
+        return $this->buttonHeld->has($button->value());
+    }
+
+    public const function up(Key $key) : bool
+    {
+        return !$this->down($key);
+    }
+
+    public const function up(button: MouseButton $button) : bool
+    {
+        return !$this->down(button: $button);
+    }
+
+    public const function pressed(Key $key) : bool
+    {
+        return $this->keyPress->has($key->value());
+    }
+
+    public const function pressed(button: MouseButton $button) : bool
+    {
+        return $this->buttonPress->has($button->value());
+    }
+
+    public const function released(Key $key) : bool
+    {
+        return $this->keyRelease->has($key->value());
+    }
+
+    public const function released(button: MouseButton $button) : bool
+    {
+        return $this->buttonRelease->has($button->value());
+    }
+
+    public const function framePressed(Key $key) : bool
+    {
+        return $this->keyPressFrame->has($key->value());
+    }
+
+    public const function framePressed(button: MouseButton $button) : bool
+    {
+        return $this->buttonPressFrame->has($button->value());
+    }
+
+    public const function frameReleased(Key $key) : bool
+    {
+        return $this->keyReleaseFrame->has($key->value());
+    }
+
+    public const function frameReleased(button: MouseButton $button) : bool
+    {
+        return $this->buttonReleaseFrame->has($button->value());
+    }
+
+    public const function presses() : array<Key>
+    {
+        return keyCodes($this->keyPress->keys());
+    }
+
+    public const function framePresses() : array<Key>
+    {
+        return keyCodes($this->keyPressFrame->keys());
+    }
+
+    /**
+     * Codepoints from char events this displayed frame.
+     */
+    public const function frameChars() : array<int32>
+    {
+        return $this->charFrame;
+    }
+
+    /**
+     * Primary pointer.
+     * Desktop: mouse.
+     * Mobile: first active finger, or the last tap when none.
+     */
+    public const function pointer() : Vec2
+    {
+        return $this->pointerPos;
+    }
+
+    public const function pointerDown() : bool
+    {
+        return $this->pointerHeld;
+    }
+
+    public const function pointerPressed() : bool
+    {
+        return $this->pointerPressFrame;
+    }
+
+    public const function pointerReleased() : bool
+    {
+        return $this->pointerReleaseFrame;
+    }
+
+    public const function pointerSource() : PointerSource
+    {
+        return $this->pointerOrigin;
+    }
+
+    /**
+     * Cursor delta this poll.
+     * Fingers do not contribute.
+     */
+    public const function mouseDelta() : Vec2
+    {
+        return $this->mouseDelta;
+    }
+
+    /**
+     * Scroll this poll.
+     */
+    public const function mouseScroll() : Vec2
+    {
+        return $this->mouseWheel;
+    }
+
+    /**
+     * A hovering cursor exists (mouse moved).
+     * Fingers do not hover.
+     */
+    public const function hovering() : bool
+    {
+        return $this->mousePresent;
+    }
+
+    public const function touches() : array<TouchState>
+    {
+        return $this->touchHeld->values();
+    }
+
+    /**
+     * Two-finger span this poll.
+     * Null unless two fingers are down.
+     */
+    public const function pinch() : Pinch?
+    {
+        float32 $span = $this->pinchSpan();
+        if ($span <= 0.0f) {
+            return null;
+        }
+
+        float32 $scale = 1.0f;
+        if ($this->pinchPrev > 0.0f) {
+            $scale = $span / $this->pinchPrev;
+        }
+
+        return Pinch($span, $scale);
+    }
+
+    /**
+     * Pointer in [-1, 1] from the window's size.
+     */
+    public const function normalizedPointer() : Vec2
+    {
+        Vec2 $pos = $this->pointerPos;
+        float32 $w = $this->window->width() as float32;
+        float32 $h = $this->window->height() as float32;
+        if ($w == 0.0f || $h == 0.0f) {
+            return Vec2(0.0f);
+        }
+        return Vec2(
+            $pos->x / ($w * 0.5f) - 1.0f,
+            $pos->y / ($h * 0.5f) - 1.0f
+        );
+    }
+
+    public const function lastPointerDown() : Vec2
+    {
+        return $this->pointerDownAt;
+    }
+
+    public const function lastPointerUp() : Vec2
+    {
+        return $this->pointerUpAt;
+    }
+
+    public function setCursor(Vec2 $position) : void
+    {
+        $this->pointerPos = $position;
+        $this->pointerSeeded = true;
+        $this->pointerOrigin = .cursor;
+        warpCursor($this->window, $position);
+    }
+
+    public const function cursorMode() : CursorMode
+    {
+        return liveCursorMode($this->window);
+    }
+
+    public function setCursorMode(CursorMode $mode) : void
+    {
+        warpCursorMode($this->window, $mode);
+    }
+
+    public function endFrame() : void
+    {
+        $this->keyPressFrame->clear();
+        $this->keyReleaseFrame->clear();
+        $this->buttonPressFrame->clear();
+        $this->buttonReleaseFrame->clear();
+        $this->pointerPressFrame = false;
+        $this->pointerReleaseFrame = false;
+        $this->charFrame->clear();
+    }
+
+    public const function unclaimed() : bool
+    {
+        return $this->context == null;
+    }
+
+    public const function holds(string $name) : bool
+    {
+        string $held = guard $this->context else {
+            return false;
+        }
+
+        return $held == $name;
+    }
+
+    public const function claimed() : string?
+    {
+        return $this->context;
+    }
+
+    public function claim(string $name) : status<InputError>
+    {
+        string $by = guard $this->context else {
+            $this->context = $name;
+            return .ok;
+        }
+
+        return .error(.claimed($by));
+    }
+
+    public function release(string $name) : status<InputError>
+    {
+        string $held = guard $this->context else {
+            return .error(.notHeld($name, null));
+        }
+
+        if ($held != $name) {
+            return .error(.notHeld($name, $held));
+        }
+
+        $this->context = null;
+        return .ok;
+    }
+
+    public function handleKey(Window $window, Key $key, int32 $scancode, KeyPhase $phase, int32 $mods) : void
+    {
+        int32 $id = $key->value();
+        if ($phase->down()) {
+            $this->keyHeld[$id] = true;
+        }
+
+        if ($phase == KeyPhase::press) {
+            $this->keyPress[$id] = true;
+            $this->keyPressFrame[$id] = true;
+        } else if ($phase == KeyPhase::release) {
+            if ($this->keyHeld->has($id)) {
+                $this->keyHeld->remove($id);
+            }
+
+            $this->keyRelease[$id] = true;
+            $this->keyReleaseFrame[$id] = true;
+        }
+
+        $this->dispatcher->dispatch(visu::signal::Key($key, $scancode, $phase, $mods));
+    }
+
+    public function handleChar(Window $window, int32 $codepoint) : void
+    {
+        $this->charFrame[] = $codepoint;
+        $this->dispatcher->dispatch(Char($codepoint));
+    }
+
+    public function handleCharMods(Window $window, int32 $codepoint, int32 $mods) : void
+    {
+        $this->dispatcher->dispatch(CharMod($codepoint, $mods));
+    }
+
+    public function handleMouseButton(Window $window, MouseButton $button, KeyPhase $phase, int32 $mods) : void
+    {
+        int32 $id = $button->value();
+        if ($phase == KeyPhase::press) {
+            $this->buttonHeld[$id] = true;
+            $this->buttonPress[$id] = true;
+            $this->buttonPressFrame[$id] = true;
+        } else if ($phase == KeyPhase::release) {
+            if ($this->buttonHeld->has($id)) {
+                $this->buttonHeld->remove($id);
+            }
+
+            $this->buttonRelease[$id] = true;
+            $this->buttonReleaseFrame[$id] = true;
+        }
+
+        $this->dispatcher->dispatch(visu::signal::MouseButton($button, $phase, $mods));
+
+        if ($button != MouseButton::left) {
+            return;
+        }
+
+        if ($phase == KeyPhase::press) {
+            $this->pressPointer(.cursor, $mods);
+            return;
+        }
+
+        if ($phase == KeyPhase::release) {
+            $this->releasePointer(true);
+        }
+    }
+
+    public function handleCursorPos(Window $window, float64 $x, float64 $y) : void
+    {
+        $this->mousePresent = true;
+        $this->movePointer($x, $y, .cursor);
+    }
+
+    public function handleCursorEnter(Window $window, bool $entered) : void
+    {
+        $this->dispatcher->dispatch(CursorEnter($entered));
+    }
+
+    public function handleScroll(Window $window, float64 $x, float64 $y) : void
+    {
+        $this->mouseWheel = $this->mouseWheel + Vec2($x as float32, $y as float32);
+        $this->dispatcher->dispatch(Scroll($x, $y));
+    }
+
+    public function handleDrop(Window $window, array<string> $paths) : void
+    {
+        $this->dispatcher->dispatch(Drop($paths));
+    }
+
+    public function handleTouch(
+        Window $window,
+        int32 $id,
+        TouchPhase $phase,
+        float32 $x,
+        float32 $y,
+        float32 $force
+    ) : void
+    {
+        Vec2 $pos = Vec2($x, $y);
+        $this->dispatcher->dispatch(Touch($id, $phase, $pos, $force));
+
+        if ($phase == TouchPhase::began) {
+            $this->touchHeld[$id] = TouchState($id, $pos, $force);
+            $this->pinFingers();
+
+            if ($this->primaryTouch < 0) {
+                $this->primaryTouch = $id;
+                $this->movePointer($x as float64, $y as float64, .finger($id));
+                $this->pressPointer(.finger($id), 0);
+            }
+
+            return;
+        }
+
+        if ($phase == TouchPhase::moved) {
+            if ($this->touchHeld->has($id)) {
+                $this->touchHeld[$id] = TouchState($id, $pos, $force);
+            }
+
+            if ($id == $this->primaryTouch) {
+                $this->movePointer($x as float64, $y as float64, .finger($id));
+            }
+
+            return;
+        }
+
+        if ($this->touchHeld->has($id)) {
+            $this->touchHeld->remove($id);
+        }
+
+        $this->pinFingers();
+
+        if ($id != $this->primaryTouch) {
+            return;
+        }
+
+        $this->movePointer($x as float64, $y as float64, .finger($id));
+
+        if ($this->touchHeld->count() > 0) {
+            $this->promotePrimary();
+            return;
+        }
+
+        $this->primaryTouch = -1;
+        $this->releasePointer($phase == TouchPhase::ended);
+    }
+
+    public function handleFocus(Window $window, bool $gained) : void
+    {
+        $this->dispatcher->dispatch(Focus($gained));
+    }
+
+    public function handlePause(Window $window) : void
+    {
+        $this->dispatcher->dispatch(Pause());
+    }
+
+    public function handleResume(Window $window) : void
+    {
+        $this->dispatcher->dispatch(Resume());
+    }
+
+    public function handleWillPoll(Window $window) : void
+    {
+        $this->pinchPrev = $this->pinchSpan();
+        $this->keyPress->clear();
+        $this->keyRelease->clear();
+        $this->buttonPress->clear();
+        $this->buttonRelease->clear();
+        $this->pointerPress = false;
+        $this->pointerRelease = false;
+        $this->mouseDelta = Vec2(0.0f);
+        $this->mouseWheel = Vec2(0.0f);
+        if ($this->pointerSeeded) {
+            return;
+        }
+
+        Vec2 $seed = guard liveCursor($window) else {
+            return;
+        }
+        $this->pointerPos = $seed;
+        $this->pointerSeeded = true;
+        $this->pointerOrigin = .cursor;
+    }
+
+    public function handleDidPoll(Window $window) : void
+    {
+    }
+
+    private function pressPointer(PointerSource $source, int32 $mods) : void
+    {
+        $this->pointerHeld = true;
+        $this->pointerPress = true;
+        $this->pointerPressFrame = true;
+        $this->pointerDownAt = $this->pointerPos;
+        $this->pointerOrigin = $source;
+        $this->pointerMods = $mods;
+    }
+
+    private function releasePointer(bool $click) : void
+    {
+        $this->pointerHeld = false;
+        $this->pointerRelease = true;
+        $this->pointerReleaseFrame = true;
+        $this->pointerUpAt = $this->pointerPos;
+        $this->pointerOrigin = .none;
+        if (!$click) {
+            return;
+        }
+
+        float32 $travel = distance($this->pointerPos, $this->pointerDownAt);
+        if ($travel < $this->clickSlop) {
+            $this->dispatcher->dispatch(Click(
+                $this->pointerMods,
+                $this->pointerPos,
+                $this->pointerDownAt,
+                $travel
+            ));
+        }
+    }
+
+    private function movePointer(float64 $x, float64 $y, PointerSource $source) : void
+    {
+        float64 $offsetX = $x - ($this->pointerPos->x as float64);
+        float64 $offsetY = $y - ($this->pointerPos->y as float64);
+        $this->dispatcher->dispatch(Cursor($x, $y, $offsetX, $offsetY));
+        $this->pointerPos = Vec2($x as float32, $y as float32);
+        $this->pointerSeeded = true;
+        $this->pointerOrigin = $source;
+        if ($source->isMouse()) {
+            $this->mouseDelta = $this->mouseDelta + Vec2($offsetX as float32, $offsetY as float32);
+        }
+    }
+
+    private function promotePrimary() : void
+    {
+        array<TouchState> $fingers = $this->touchHeld->values();
+        if ($fingers->empty()) {
+            $this->primaryTouch = -1;
+            return;
+        }
+
+        TouchState $next = $fingers[0];
+        $this->primaryTouch = $next->id;
+        $this->pointerPos = $next->position;
+        $this->pointerSeeded = true;
+        $this->pointerOrigin = .finger($next->id);
+    }
+
+    private function pinFingers() : void
+    {
+        array<TouchState> $fingers = $this->touchHeld->values();
+        if ($fingers->count() < 2) {
+            $this->pinchA = -1;
+            $this->pinchB = -1;
+            return;
+        }
+
+        if ($this->pinchA >= 0 && $this->pinchB >= 0) {
+            bool $haveA = $this->touchHeld->has($this->pinchA);
+            bool $haveB = $this->touchHeld->has($this->pinchB);
+            if ($haveA && $haveB) {
+                return;
+            }
+        }
+
+        $this->pinchA = $fingers[0]->id;
+        $this->pinchB = $fingers[1]->id;
+    }
+
+    private const function pinchSpan() : float32
+    {
+        array<TouchState> $fingers = $this->touchHeld->values();
+        if ($fingers->count() < 2) {
+            return 0.0f;
+        }
+
+        Vec2 $posA = Vec2(0.0f);
+        Vec2 $posB = Vec2(0.0f);
+        bool $haveA = false;
+        bool $haveB = false;
+        if ($this->pinchA >= 0 && $this->pinchB >= 0) {
+            usize $n = $fingers->count();
+            usize $i = 0;
+            while ($i < $n) {
+                TouchState $finger = $fingers[$i];
+                if ($finger->id == $this->pinchA) {
+                    $posA = $finger->position;
+                    $haveA = true;
+                }
+
+                if ($finger->id == $this->pinchB) {
+                    $posB = $finger->position;
+                    $haveB = true;
+                }
+
+                $i = $i + 1;
+            }
+        }
+
+        if (!$haveA || !$haveB) {
+            return distance($fingers[0]->position, $fingers[1]->position);
+        }
+
+        return distance($posA, $posB);
+    }
+}
+
+internal function keyCodes(const array<int32>& $ids) : array<Key>
+{
+    array<Key> $out = array<Key>();
+    foreach ($ids as $id) {
+        Key $code = Key::from($id) ?? .unknown;
+        $out[] = $code;
+    }
+
+    return $out;
+}

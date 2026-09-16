@@ -7,7 +7,8 @@ use visu::app::{Host, HostConfig, HostError, Services};
 use visu::graphics::{Context, TargetRef};
 use visu::instrument::{DeviceSource, LoopSource};
 use visu::math::Vec4;
-use visu::os::{ActionMap, Binding, InputError, key};
+use visu::os::requestStop;
+use visu::os::input::{ActionMap, Binding, InputError};
 use visu::runtime::{Delegate, GameLoop};
 use visu::scene::Director;
 use visu::ui::Ui;
@@ -43,11 +44,21 @@ public class Game : Delegate
         return $this->host->initialize();
     }
 
-    public function start() : void
+    public function prepare() : void
     {
         $this->director->listen($this->host->dispatcher);
         $this->director->load();
-        $this->loop->start();
+        $this->loop->prepare();
+    }
+
+    public function tick() : void
+    {
+        if ($this->shouldStop()) {
+            requestStop();
+            return;
+        }
+
+        $this->loop->pulse();
     }
 
     public function update() : void
@@ -92,14 +103,14 @@ public class Game : Delegate
     private function bindMaps() : status<InputError>
     {
         ActionMap $menu = ActionMap();
-        guard $menu->bind('quit', Binding::key(key::ESCAPE)) else ($e) {
+        guard $menu->bind('quit', .key(.escape)) else ($e) {
             return .error($e);
         }
         ActionMap $play = ActionMap();
-        guard $play->bind('menu', Binding::key(key::ESCAPE)) else ($e) {
+        guard $play->bind('menu', .key(.escape)) else ($e) {
             return .error($e);
         }
-        guard $play->bind('reload', Binding::key(key::F5)) else ($e) {
+        guard $play->bind('reload', .key(.f5)) else ($e) {
             return .error($e);
         }
         guard $this->host->inputContext->register('menu', $menu) else ($e) {

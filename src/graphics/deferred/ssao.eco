@@ -1,7 +1,5 @@
 /**
- * Screen-space ambient occlusion: sample a hemisphere around every
- * shaded point, count how many samples land behind geometry, then
- * blur out the sampling noise.
+ * Screen-space ambient occlusion: sample a hemisphere around every shaded point, count how many samples land behind geometry, then blur out the sampling noise.
  */
 
 namespace visu::graphics;
@@ -11,24 +9,38 @@ use visu::math::{Vec3, Vec4, normalize};
 public const int32 SSAO_MAX_SAMPLES = 64;
 public const int32 SSAO_NOISE_SIZE = 4;
 
-/** class so `SsaoQuality?` can be a renderer field; Echo crashes on optional structs */
+/**
+ * Class so `SsaoQuality?` can be a renderer field; Echo crashes on optional structs.
+ */
 public class SsaoQuality
 {
-    /** hemisphere radius in world units */
+
+    /**
+     * Hemisphere radius in world units.
+     */
     public float32 $radius;
-    /** view-space slack before a sample counts as occluded */
+
+    /**
+     * View-space slack before a sample counts as occluded.
+     */
     public float32 $bias;
-    /** exponent on the result; higher darkens contact points */
+
+    /**
+     * Exponent on the result; higher darkens contact points.
+     */
     public float32 $strength;
-    /** occlusion buffer size relative to the scene */
+
+    /**
+     * Occlusion buffer size relative to the scene.
+     */
     public float32 $scale;
     public int32 $samples;
 
     public constructor()
     {
-        $this->radius = 0.8f;
+        $this->radius = 0.25f;
         $this->bias = 0.02f;
-        $this->strength = 5.0f;
+        $this->strength = 2.0f;
         $this->scale = 1.0f;
         $this->samples = 64;
     }
@@ -36,9 +48,9 @@ public class SsaoQuality
     public static function low() : SsaoQuality
     {
         SsaoQuality $q = SsaoQuality();
-        $q->radius = 0.35f;
+        $q->radius = 0.12f;
         $q->bias = 0.035f;
-        $q->strength = 3.5f;
+        $q->strength = 1.4f;
         $q->scale = 0.5f;
         $q->samples = 16;
         return $q;
@@ -47,9 +59,9 @@ public class SsaoQuality
     public static function medium() : SsaoQuality
     {
         SsaoQuality $q = SsaoQuality();
-        $q->radius = 0.5f;
+        $q->radius = 0.16f;
         $q->bias = 0.03f;
-        $q->strength = 4.0f;
+        $q->strength = 1.6f;
         $q->scale = 0.75f;
         $q->samples = 24;
         return $q;
@@ -58,9 +70,9 @@ public class SsaoQuality
     public static function high() : SsaoQuality
     {
         SsaoQuality $q = SsaoQuality();
-        $q->radius = 0.65f;
+        $q->radius = 0.20f;
         $q->bias = 0.025f;
-        $q->strength = 4.5f;
+        $q->strength = 1.8f;
         $q->samples = 48;
         return $q;
     }
@@ -77,9 +89,15 @@ public class SsaoQuality
  */
 public struct SsaoUniforms
 {
-    /** radius, bias, strength, sample count */
+
+    /**
+     * Radius, bias, strength, sample count.
+     */
     public Vec4 $params;
-    /** width, height, noise scale x, noise scale y */
+
+    /**
+     * Width, height, noise scale x, noise scale y.
+     */
     public Vec4 $screen;
     public Vec4[64] $samples;
 
@@ -100,8 +118,7 @@ public struct SsaoUniforms
 }
 
 /**
- * Hemisphere kernel, packed towards the origin so nearby geometry
- * carries more weight than the far edge of the radius.
+ * Hemisphere kernel, packed towards the origin so nearby geometry carries more weight than the far edge of the radius.
  */
 public function ssaoKernel(int32 $count) : array<Vec4>
 {
@@ -127,7 +144,9 @@ public function ssaoKernel(int32 $count) : array<Vec4>
     return $out;
 }
 
-/** rgba8 noise that rotates the kernel per pixel; sampled nearest and repeated */
+/**
+ * Builds rgba8 noise that rotates the kernel per pixel; sampled nearest and repeated.
+ */
 public function ssaoNoise() : Pixels
 {
     array<uint8> $rgba = array<uint8>();
@@ -147,7 +166,9 @@ public function ssaoNoise() : Pixels
     return Pixels(SSAO_NOISE_SIZE, SSAO_NOISE_SIZE, $rgba);
 }
 
-/** xorshift so the kernel is the same on every run and every backend */
+/**
+ * Xorshift so the kernel is the same on every run and every backend.
+ */
 internal function ssaoRandom(ptr<uint32> $seed) : float32
 {
     uint32 $x = $seed:$[0];

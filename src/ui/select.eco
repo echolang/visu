@@ -6,7 +6,6 @@ namespace visu::ui;
 
 use visu::graphics::Texture;
 use visu::math::{Vec2, Vec4};
-use visu::os::key;
 use visu::vg::Color;
 
 internal const float32 SELECT_ARROW_W = 22.0f;
@@ -26,7 +25,7 @@ internal function uiSelect(
     setSelect($slot, $sel);
     $ui->slots[$wid] = $slot;
     bool $changed = false;
-    bool $overBox = contains($slot->pos, $slot->size, $ui->io->mouse);
+    bool $overBox = contains($slot->pos, $slot->size, $ui->io->pointer);
 
     if ($ui->click($wid)) {
         $slot = $ui->slots[$wid];
@@ -54,7 +53,7 @@ internal function uiSelect(
     $sel = selectData($slot);
 
     if ($sel->open && $ui->io->leftPressed && !$overBox) {
-        if (!contains($sel->dropPos, $sel->dropSize, $ui->io->mouse)) {
+        if (!contains($sel->dropPos, $sel->dropSize, $ui->io->pointer)) {
             $sel = closeSelectPersist($sel);
             $ui->consume();
             setSelect($slot, $sel);
@@ -90,7 +89,7 @@ internal function uiSelect(
             uint64 $oid = mixId($wid, $ch->id);
             touchSlot($ui->slots, $oid);
 
-            if (contains($ui->slots[$oid]->pos, $ui->slots[$oid]->size, $ui->io->mouse)) {
+            if (contains($ui->slots[$oid]->pos, $ui->slots[$oid]->size, $ui->io->pointer)) {
                 $sel->highlight = $i as int32;
                 setSelect($slot, $sel);
                 $ui->slots[$wid] = $slot;
@@ -135,13 +134,13 @@ internal function stepSelectKeys(
     bool& $changed
 ) : SelectPersist
 {
-    if ($ui->pressedKey(key::ESCAPE)) {
+    if ($ui->pressedKey(.escape)) {
         return closeSelectPersist($sel);
     }
 
     bool $queryChanged = false;
 
-    if ($ui->pressedKey(key::BACKSPACE) && !$sel->query->empty()) {
+    if ($ui->pressedKey(.backspace) && !$sel->query->empty()) {
         $sel->query = $sel->query->sub(0, $sel->query->size() - 1)->clone();
         $queryChanged = true;
     }
@@ -167,15 +166,15 @@ internal function stepSelectKeys(
 
     int32 $n = $shown->count() as int32;
 
-    if ($ui->pressedKey(key::DOWN) && $n > 0) {
+    if ($ui->pressedKey(.down) && $n > 0) {
         $sel->highlight = $sel->highlight + 1;
     }
 
-    if ($ui->pressedKey(key::UP) && $n > 0) {
+    if ($ui->pressedKey(.up) && $n > 0) {
         $sel->highlight = $sel->highlight - 1;
     }
 
-    if ($ui->pressedKey(key::ENTER) && $n > 0) {
+    if ($ui->pressedKey(.enter) && $n > 0) {
         int32 $hi = $sel->highlight;
         $selected = $choices[$shown[$hi as usize] as usize]->id;
         $changed = true;
@@ -396,7 +395,7 @@ internal function emitSelectBox(Ui $ui, const Node& $n, float32 $pad) : void
     float32 $labelH = $ui->theme->labelHeight;
     Vec2 $box = Vec2($n->pos->x, $n->pos->y + $labelH);
     Vec2 $boxSize = Vec2($n->size->x, selectBoxHeight($st));
-    bool $hot = contains($box, $boxSize, $ui->io->mouse);
+    bool $hot = contains($box, $boxSize, $ui->io->pointer);
     bool $open = false;
 
     if ($ui->slots->has($n->id)) {

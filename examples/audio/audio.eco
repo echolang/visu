@@ -3,6 +3,9 @@
  *
  *   echoc run -m examples --target audio
  *   echoc run -m examples --target audio --define VISU_FINITE
+ *
+ *   echoc build -m examples --target audio --target-os ios
+ *   ./examples/ios/pack.sh examples/ecobuild/audio --resources examples/audio/resources
  */
 
 use std::env;
@@ -10,8 +13,10 @@ use std::io;
 use visu::app::{Paths, Services, bootstrap};
 use visu::audio::MusicPlayer;
 use visu::math::Vec4;
+use visu::os::resourceRoot;
 use visu::quickstart::{App, Options, Quickstart};
 use visu::runtime::defer;
+use visu::signal::{Flow, Pause, Resume};
 
 Quickstart $qs = Quickstart(function(Options $opt) : void
 {
@@ -30,18 +35,34 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
         MusicPlayer $player = $app->services->create<MusicPlayer, ma::Engine>($engine);
         $player->fadeDuration = 0.5f;
 
-        Paths $paths = $app->services->get<Paths>();
-        string $ds = env::DS;
-        string $dir = $paths->resources;
-        guard $player->add("{$dir}{$ds}sine.wav") else ($e) {
+        string $sine = guard findWav('sine.wav') else {
+            die('audio: sine.wav not found');
+        }
+        string $click = guard findWav('click.wav') else {
+            die('audio: click.wav not found');
+        }
+        guard $player->add($sine) else ($e) {
             die($e->message());
         }
-        guard $player->add("{$dir}{$ds}click.wav") else ($e) {
+        guard $player->add($click) else ($e) {
             die($e->message());
         }
         guard $player->play('sine') else ($e) {
             die($e->message());
         }
+
+        $app->dispatcher->register<Pause>(function(const Pause& $signal) : Flow {
+            guard $engine->stop() else {
+                return .proceed;
+            }
+            return .proceed;
+        });
+        $app->dispatcher->register<Resume>(function(const Resume& $signal) : Flow {
+            guard $engine->start() else {
+                return .proceed;
+            }
+            return .proceed;
+        });
 
         defer(1000, function() : void {
             MusicPlayer $p = $app->services->get<MusicPlayer>();
@@ -55,6 +76,9 @@ $qs->run();
 
 internal function exampleRoot() : string
 {
+    #[if: os == ios]
+    return resourceRoot();
+    #[else]
     if (fileExists('resources/sine.wav')) {
         return env::cwd();
     }
@@ -64,6 +88,32 @@ internal function exampleRoot() : string
     }
 
     return 'examples/audio';
+    #[end]
+}
+
+// pack copies wavs to the .app root; desktop keeps them under resources/
+internal function findWav(string $name) : string?
+{
+    array<string> $dirs = [
+        'resources/',
+        'examples/audio/resources/',
+        'audio/resources/',
+        '../examples/audio/resources/',
+    ];
+    string $bundle = resourceRoot();
+    if (!$bundle->empty()) {
+        $dirs[] = "{$bundle}/";
+        $dirs[] = "{$bundle}/resources/";
+    }
+
+    foreach ($dirs as $dir) {
+        string $candidate = "{$dir}{$name}";
+        if (fileExists($candidate)) {
+            return $candidate;
+        }
+    }
+
+    return null;
 }
 
 internal function fileExists(string $path) : bool

@@ -1,9 +1,7 @@
 /**
- * Prototyping app the GameLoop drives. Owns a Host (window / GPU
- * session); GPU objects store the Device. Scene goes to an
- * offscreen target: `$opt->render` adds graph passes, `$opt->draw`
- * runs after beginRender on that target, `$opt->ui` builds FlyUI
- * during graph setup, then the host blits to the backbuffer.
+ * Prototyping app the GameLoop drives.
+ * Owns a Host (window / GPU session); GPU objects store the Device.
+ * Scene goes to an offscreen target: `$opt->render` adds graph passes, `$opt->draw` runs after beginRender on that target, `$opt->ui` builds FlyUI during graph setup, then the host blits to the backbuffer.
  */
 
 namespace visu::quickstart;
@@ -16,7 +14,8 @@ use visu::graphics::{
 };
 use visu::instrument::Instruments;
 use visu::math::Vec2;
-use visu::os::{ContextMap, Input, Window};
+use visu::os::Window;
+use visu::os::input::{ContextMap, InputHub};
 use visu::runtime::{Delegate, EventLoop};
 use visu::signal::Dispatcher;
 use visu::ui::Ui;
@@ -30,7 +29,7 @@ public class App : Delegate
     public Entities $entities;
     public Systems $systems;
     public Dispatcher $dispatcher;
-    public Input $input;
+    public InputHub $input;
     public ContextMap $inputContext;
     public ShaderCollection $shaders;
     public Services $services;
@@ -96,7 +95,10 @@ public class App : Delegate
                 $app->systems->render($app->entities, $ctx);
                 $app->addDraw($ctx->pipeline);
             },
-            $app->uiHook()
+            $app->uiHook(),
+            function() : void {
+                $app->runAfterFrame();
+            }
         );
     }
 
@@ -150,6 +152,11 @@ public class App : Delegate
         return function(Ui $ui) : void {
             $cb($app, $ui);
         };
+    }
+
+    internal function runAfterFrame() : void
+    {
+        $this->runCallback($this->options->afterFrame);
     }
 
     private function runCallback(function<void(App)>? $cb) : void

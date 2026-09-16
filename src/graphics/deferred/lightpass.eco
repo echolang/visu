@@ -1,7 +1,6 @@
 /**
- * Shades the GBuffer into an offscreen colour target. Which shader
- * variant runs depends on what is baked this frame: image-based
- * lighting, a plain environment cubemap, or the sun alone.
+ * Shades the GBuffer into an offscreen colour target.
+ * Which shader variant runs depends on what is baked this frame: image-based lighting, a plain environment cubemap, or the sun alone.
  */
 
 namespace visu::graphics;
@@ -128,9 +127,8 @@ public class LightPass : Pass
     }
 
     /**
-     * Slots 5..7. Image-based lighting binds irradiance, prefiltered
-     * specular and the BRDF lookup; the environment variant binds the
-     * raw cube at slot 5.
+     * Binds slots 5..7. Image-based lighting binds irradiance, prefiltered specular and the BRDF lookup;
+     * the environment variant binds the raw cube at slot 5.
      */
     private function bindEnvironment(Context $ctx, RenderEncoder $enc, Lighting $mode) : status<PipelineError>
     {
@@ -148,11 +146,12 @@ public class LightPass : Pass
     private function bindIbl(Context $ctx, RenderEncoder $enc) : status<PipelineError>
     {
         IblData $maps = $ctx->frame->get<IblData>();
-        Sampler $cubeSampler = $this->gpu->cube;
-        guard bindPooled($ctx, $enc, 5, $maps->irradiance, $cubeSampler) else ($e) {
+        // irradiance is a single mip; a mip-linear cube sampler reads
+        // garbage on iOS when lod > 0
+        guard bindPooled($ctx, $enc, 5, $maps->irradiance, $this->gpu->linear) else ($e) {
             return .error($e);
         }
-        guard bindPooled($ctx, $enc, 6, $maps->prefilter, $cubeSampler) else ($e) {
+        guard bindPooled($ctx, $enc, 6, $maps->prefilter, $this->gpu->cube) else ($e) {
             return .error($e);
         }
         return bindPooled($ctx, $enc, 7, $maps->brdfLut, $this->gpu->linear);
@@ -168,7 +167,9 @@ public class LightPass : Pass
         return .ok;
     }
 
-    /** the SSAO blur when there is one, otherwise a white 1x1 */
+    /**
+     * Binds the SSAO blur when there is one, otherwise a white 1x1.
+     */
     private function bindAmbient(Context $ctx, RenderEncoder $enc, Sampler $sampler) : status<PipelineError>
     {
         SsaoData? $ssao = $ctx->frame->find<SsaoData>();

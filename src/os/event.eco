@@ -1,0 +1,145 @@
+/**
+ * One host event.
+ * Callbacks enqueue; poll() / flush() drain onto the handler.
+ * Framebuffer is applied on the window itself.
+ */
+
+namespace visu::os;
+
+use visu::os::input::{Key, KeyPhase, MouseButton, TouchPhase};
+
+#[if: os == ios]
+public enum HostEvent
+{
+    case key(Key $key, int32 $scancode, KeyPhase $phase, int32 $mods);
+    case char(int32 $codepoint);
+    case charMods(int32 $codepoint, int32 $mods);
+    case button(MouseButton $button, KeyPhase $phase, int32 $mods);
+    case cursor(float64 $x, float64 $y);
+    case cursorEnter(bool $entered);
+    case scroll(float64 $x, float64 $y);
+    case drop(array<string> $paths);
+    case touch(int32 $id, TouchPhase $phase, float32 $x, float32 $y, float32 $force);
+    case focus(bool $gained);
+    case pause;
+    case resume;
+    case framebuffer(int32 $width, int32 $height);
+}
+
+internal function applyHostEvent(
+    Window $window,
+    WindowEventHandler? $handler,
+    const HostEvent& $event
+) : void
+{
+    match ($event) {
+        .framebuffer($width, $height) => {
+            $window->noteFramebuffer($width, $height);
+        },
+        .pause => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handlePause($window);
+        },
+        .resume => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handleResume($window);
+        },
+        .focus($gained) => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handleFocus($window, $gained);
+        },
+        .key($key, $scancode, $phase, $mods) => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handleKey($window, $key, $scancode, $phase, $mods);
+        },
+        .char($codepoint) => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handleChar($window, $codepoint);
+        },
+        .charMods($codepoint, $mods) => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handleCharMods($window, $codepoint, $mods);
+        },
+        .button($button, $phase, $mods) => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handleMouseButton($window, $button, $phase, $mods);
+        },
+        .cursor($x, $y) => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handleCursorPos($window, $x, $y);
+        },
+        .cursorEnter($entered) => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handleCursorEnter($window, $entered);
+        },
+        .scroll($x, $y) => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handleScroll($window, $x, $y);
+        },
+        .drop($paths) => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handleDrop($window, $paths);
+        },
+        .touch($id, $phase, $x, $y, $force) => {
+            WindowEventHandler $to = guard $handler else {
+                return;
+            }
+            $to->handleTouch($window, $id, $phase, $x, $y, $force);
+        },
+    }
+}
+
+internal class EventQueue
+{
+    private array<HostEvent> $items;
+
+    public constructor()
+    {
+        $this->items = array<HostEvent>();
+    }
+
+    public function post(HostEvent $event) : void
+    {
+        $this->items[] = $event;
+    }
+
+    public function take() : array<HostEvent>
+    {
+        array<HostEvent> $batch = $this->items;
+        $this->items = array<HostEvent>();
+        return $batch;
+    }
+
+    public const function empty() : bool
+    {
+        return $this->items->empty();
+    }
+
+    public function clear() : void
+    {
+        $this->items = array<HostEvent>();
+    }
+}
+#[end]

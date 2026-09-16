@@ -1,0 +1,37 @@
+/**
+ * Desktop process pump. iOS run() is UIApplicationMain.
+ */
+
+use visu::os::{requestStop, run};
+
+class PumpHits
+{
+    public int32 $n;
+
+    public constructor()
+    {
+        $this->n = 0;
+    }
+}
+
+#[if: os != ios]
+test os_run_ticks_until_request_stop
+{
+    PumpHits $hits = PumpHits();
+    run(
+        function() : void {
+            $hits->n = $hits->n + 1;
+        },
+        function() : void {
+            $hits->n = $hits->n + 1;
+            if ($hits->n >= 3) {
+                requestStop();
+            }
+        },
+        function() : void {
+            $hits->n = $hits->n + 10;
+        }
+    );
+    assert($hits->n == 13, 'start + two ticks + stop');
+}
+#[end]

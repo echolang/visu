@@ -792,7 +792,7 @@ function bakeEcoTree(array $programs, string $ns, string $prefix, string $title)
 
 namespace {$ns};
 
-#[if: os == darwin && !VISU_BACKEND_VULKAN]
+#[if: (os == darwin || os == ios) && !VISU_BACKEND_VULKAN]
 {$metal}#[else]
 {$spirv}#[end]
 
@@ -800,7 +800,7 @@ ECO;
 }
 
 /**
- * One arm of the lookup: MSL source on Darwin, SPIR-V hex elsewhere.
+ * One arm of the lookup: MSL source on Darwin/iOS, SPIR-V hex elsewhere.
  */
 function bakeArm(array $programs, string $prefix, bool $isMetal) : string
 {

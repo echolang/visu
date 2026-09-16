@@ -6,65 +6,103 @@
  */
 
 use visu::app::ensureLogger;
-use visu::os::{Window, init, terminate};
+use visu::os::{Window, WindowHints, init, requestStop, run, terminate};
 use visu::graphics::{Device, DeviceError, FrameStatus, RenderPassDesc, ColorTarget};
 use visu::math::Vec4;
 
-ensureLogger();
-guard init() else ($e) {
-    die($e->message());
-}
+internal class ClearExample
+{
+    public Window $window;
+    public Device $device;
+    public int32 $frame;
 
-Window $window = Window('visu', 800, 600);
-Device $device = Device();
-guard $window->initialize($device) else ($e) {
-    terminate();
-    die($e->message());
-}
-
-$window->setSwapInterval(1);
-
-int32 $frame = 0;
-while (!$window->shouldClose() && !visu::finiteDone($frame)) {
-    int32 $w = $window->framebufferWidth();
-    int32 $h = $window->framebufferHeight();
-    FrameStatus $status = guard $device->beginFrame($w, $h) else ($e) {
-        match ($e) {
-            DeviceError::surfaceLost => {
-                break;
-            },
-            else => {
-                die($e->message());
-            },
-        };
+    public constructor()
+    {
+        $this->window = Window('visu', 800, 600, WindowHints());
+        $this->device = Device();
+        $this->frame = 0;
     }
 
-    if ($status == FrameStatus::ready) {
-        ColorTarget $color = ColorTarget($device->backbuffer());
-        $color->load = .clear;
-        $color->store = .store;
-        $color->clear = Vec4(0.25f, 0.25f, 0.25f, 1.0f);
-        RenderPassDesc $desc = RenderPassDesc();
-        $desc->colors[] = $color;
-        $enc = $device->beginRender($desc);
-        $enc->endRender();
-        guard $window->swap() else ($e) {
+    public function start() : void
+    {
+        guard init() else ($e) {
+            die($e->message());
+        }
+
+        guard $this->window->initialize($this->device) else ($e) {
+            terminate();
+            die($e->message());
+        }
+
+        $this->window->setVsync(true);
+    }
+
+    public function tick() : void
+    {
+        if ($this->window->shouldClose() || visu::finiteDone($this->frame)) {
+            requestStop();
+            return;
+        }
+
+        int32 $w = $this->window->framebufferWidth();
+        int32 $h = $this->window->framebufferHeight();
+        FrameStatus $status = guard $this->device->beginFrame($w, $h) else ($e) {
             match ($e) {
                 DeviceError::surfaceLost => {
-                    break;
+                    requestStop();
+                    return;
                 },
                 else => {
                     die($e->message());
                 },
             };
         }
+
+        if ($status == FrameStatus::ready) {
+            ColorTarget $color = ColorTarget($this->device->backbuffer());
+            $color->load = .clear;
+            $color->store = .store;
+            $color->clear = Vec4(0.25f, 0.25f, 0.25f, 1.0f);
+            RenderPassDesc $desc = RenderPassDesc();
+            $desc->colors[] = $color;
+            $enc = $this->device->beginRender($desc);
+            $enc->endRender();
+            guard $this->window->swap() else ($e) {
+                match ($e) {
+                    DeviceError::surfaceLost => {
+                        requestStop();
+                        return;
+                    },
+                    else => {
+                        die($e->message());
+                    },
+                };
+            }
+        }
+
+        $this->window->poll();
+        $this->frame = $this->frame + 1;
     }
 
-    $window->poll();
-    $frame = $frame + 1;
+    public function stop() : void
+    {
+        $this->device->waitIdle();
+        $this->window->destroy();
+        $this->device->shutdown();
+        terminate();
+    }
 }
 
-$device->waitIdle();
-$window->destroy();
-$device->shutdown();
-terminate();
+ensureLogger();
+ClearExample $app = ClearExample();
+run(
+    function() : void {
+        $app->start();
+    },
+    function() : void {
+        $app->tick();
+    },
+    function() : void {
+        $app->stop();
+    }
+);

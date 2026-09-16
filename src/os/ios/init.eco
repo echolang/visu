@@ -1,0 +1,127 @@
+/**
+ * iOS process lifetime.
+ * UIKit owns the run loop; init/terminate are no-ops besides the bundle resource root and UIApplicationMain.
+ */
+
+namespace visu::os;
+
+internal extern {
+    function visu_ios_resource_root as cResourceRoot(ptr<uint8> $buf, int32 $cap) : int32;
+    function visu_ios_documents_dir as cDocumentsDir(ptr<uint8> $buf, int32 $cap) : int32;
+    function visu_ios_boot as cBoot(
+        extern function<void()> $start,
+        extern function<void()> $tick,
+        extern function<void()> $stop
+    ) : int32;
+    function visu_ios_request_stop as cRequestStop() : void;
+}
+
+internal class Pump
+{
+    public static function<void()>? $start = null;
+    public static function<void()>? $tick = null;
+    public static function<void()>? $stop = null;
+    public static bool $halt = false;
+    public static bool $stopped = false;
+}
+
+public function init() : status<OsError>
+{
+    return .ok;
+}
+
+public function terminate() : void
+{
+}
+
+public function surfaceInstanceExtensions() : array<string>
+{
+    return array<string>();
+}
+
+public function resourceRoot() : string
+{
+    uint8[1024] $buf;
+    int32 $n = cResourceRoot(&$buf[0], 1024);
+
+    if ($n <= 0) {
+        return '.';
+    }
+
+    return str::from(&$buf[0]);
+}
+
+/**
+ * Documents directory the app can write.
+ * The bundle resource root is not writable.
+ */
+public function writableRoot() : string
+{
+    uint8[1024] $buf;
+    int32 $n = cDocumentsDir(&$buf[0], 1024);
+
+    if ($n <= 0) {
+        return '.';
+    }
+
+    return str::from(&$buf[0]);
+}
+
+/**
+ * Process edge.
+ * UIApplicationMain: start after the key window exists, tick from the display link, stop on terminate or requestStop.
+ */
+public function run(function<void()> $start, function<void()> $tick, function<void()> $stop) : void
+{
+    Pump::$start = $start;
+    Pump::$tick = $tick;
+    Pump::$stop = $stop;
+    Pump::$halt = false;
+    Pump::$stopped = false;
+    cBoot(&pumpStart, &pumpTick, &pumpStop);
+}
+
+public function requestStop() : void
+{
+    if (Pump::$halt) {
+        return;
+    }
+
+    Pump::$halt = true;
+    cRequestStop();
+    pumpStop();
+}
+
+internal function pumpStart() : void
+{
+    function<void()> $fn = guard Pump::$start else {
+        return;
+    }
+    $fn();
+}
+
+internal function pumpTick() : void
+{
+    if (Pump::$halt) {
+        return;
+    }
+
+    function<void()> $fn = guard Pump::$tick else {
+        return;
+    }
+    $fn();
+}
+
+internal function pumpStop() : void
+{
+    if (Pump::$stopped) {
+        return;
+    }
+
+    Pump::$stopped = true;
+    Pump::$halt = true;
+    function<void()> $fn = guard Pump::$stop else {
+        return;
+    }
+    $fn();
+}

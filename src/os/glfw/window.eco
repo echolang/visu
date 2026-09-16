@@ -1,15 +1,18 @@
 /**
- * An OS window. Construct does not create the GLFW resource; initialize
- * does. GLFW stays in this file — typical code never writes glfw::.
+ * Desktop window.
+ * Construct does not create the GLFW resource; initialize does.
+ * GLFW stays under src/os/glfw; typical code never writes glfw::.
+ * Desktop-only methods (cursor, title, decorations, keyState) live here, not on WindowProtocol.
  */
 
 namespace visu::os;
 
 use visu::app::info;
-use visu::graphics::{Device, DeviceError, DeviceOptions, RenderTarget, Surface, Texture};
+use visu::graphics::{Device, DeviceError, DeviceOptions, RenderTarget, Surface};
 use visu::math::Vec2;
+use visu::os::input::{Key, KeyPhase, MouseButton};
 
-public class Window
+public class Window : WindowProtocol
 {
     private string $title;
     private int32 $width;
@@ -24,7 +27,7 @@ public class Window
     private int32 $appliedHz;
     private bool $vsync = true;
 
-    public constructor(string $title, int32 $width, int32 $height, WindowHints $hints = WindowHints::defaults())
+    public constructor(string $title, int32 $width, int32 $height, WindowHints $hints)
     {
         $this->title = $title;
         $this->width = $width;
@@ -58,7 +61,7 @@ public class Window
             return .error(.device($e));
         }
 
-        $this->hints->apply();
+        applyWindowHints($this->hints);
 
         ptr<glfw::Window> $created = glfw::createWindow($this->width, $this->height, $this->title, null, null);
 
@@ -101,6 +104,11 @@ public class Window
         int32 $hz = $this->appliedHz;
         info("window: '{$this->title}' {$this->width}x{$this->height} (fb {$fbW}x{$fbH}, {$hz} Hz)");
         return .ok;
+    }
+
+    public const function initialized() : bool
+    {
+        return $this->handle:$ != null;
     }
 
     public function destroy() : void
@@ -252,14 +260,14 @@ public class Window
         glfw::setInputMode($this->requireHandle(), glfw::CURSOR, glfwCursorMode($mode));
     }
 
-    public const function keyState(int32 $key) : int32
+    public const function keyState(Key $key) : KeyPhase
     {
-        return glfw::getKey($this->requireHandle(), $key);
+        return KeyPhase::from(glfw: glfw::getKey($this->requireHandle(), $key->glfw())) ?? .release;
     }
 
-    public const function buttonState(int32 $button) : int32
+    public const function buttonState(MouseButton $button) : KeyPhase
     {
-        return glfw::getMouseButton($this->requireHandle(), $button);
+        return KeyPhase::from(glfw: glfw::getMouseButton($this->requireHandle(), $button->glfw())) ?? .release;
     }
 
     public const function framebufferSize() : Vec2
@@ -280,22 +288,15 @@ public class Window
         return $this->framebufferSize()->y as int32;
     }
 
+    public const function safeArea() : Insets
+    {
+        return Insets();
+    }
+
     public function renderTarget() : RenderTarget
     {
         $this->syncTarget();
-        Device $device = guard $this->device else {
-            return $this->target;
-        }
-
-        if ($device->inFrame()) {
-            Texture $bb = $device->backbuffer();
-
-            if ($this->target->colors->empty()) {
-                $this->target->colors[] = $bb;
-            } else {
-                $this->target->colors[0] = $bb;
-            }
-        }
+        presentBackbuffer($this->target, $this->device);
 
         return $this->target;
     }
@@ -332,15 +333,16 @@ public class Window
         glfw::setCursorEnterCallback($glfwWindow, &onCursorEnter);
         glfw::setScrollCallback($glfwWindow, &onScroll);
         glfw::setDropCallback($glfwWindow, &onDrop);
+        glfw::setWindowFocusCallback($glfwWindow, &onFocus);
         glfw::setWindowSizeCallback($glfwWindow, &onSize);
     }
 
-    internal function triggerKey(int32 $key, int32 $scancode, int32 $action, int32 $mods) : void
+    internal function triggerKey(Key $key, int32 $scancode, KeyPhase $phase, int32 $mods) : void
     {
         WindowEventHandler $handler = guard $this->handler else {
             return;
         }
-        $handler->handleKey($this, $key, $scancode, $action, $mods);
+        $handler->handleKey($this, $key, $scancode, $phase, $mods);
     }
 
     internal function triggerChar(int32 $codepoint) : void
@@ -359,12 +361,12 @@ public class Window
         $handler->handleCharMods($this, $codepoint, $mods);
     }
 
-    internal function triggerMouseButton(int32 $button, int32 $action, int32 $mods) : void
+    internal function triggerMouseButton(MouseButton $button, KeyPhase $phase, int32 $mods) : void
     {
         WindowEventHandler $handler = guard $this->handler else {
             return;
         }
-        $handler->handleMouseButton($this, $button, $action, $mods);
+        $handler->handleMouseButton($this, $button, $phase, $mods);
     }
 
     internal function triggerCursorPos(float64 $x, float64 $y) : void
@@ -397,6 +399,14 @@ public class Window
             return;
         }
         $handler->handleDrop($this, $paths);
+    }
+
+    internal function triggerFocus(bool $gained) : void
+    {
+        WindowEventHandler $handler = guard $this->handler else {
+            return;
+        }
+        $handler->handleFocus($this, $gained);
     }
 
     internal function noteSize(int32 $width, int32 $height) : void
@@ -517,8 +527,8 @@ public class Window
     }
 
     /**
-     * Exclusive fullscreen. `$refreshRate` 0 (the default) picks
-     * the window monitor's highest available Hz.
+     * Exclusive fullscreen.
+     * `$refreshRate` 0 (the default) picks the window monitor's highest available Hz.
      */
     public function setFullscreen(int32 $width, int32 $height, int32 $refreshRate = 0) : void
     {
@@ -535,8 +545,8 @@ public class Window
     }
 
     /**
-     * Discrete modes for the monitor this window is on. Darwin
-     * appends NSScreen.maximumFramesPerSecond when GLFW omits it.
+     * Discrete modes for the monitor this window is on.
+     * Darwin appends NSScreen.maximumFramesPerSecond when GLFW omits it.
      */
     public const function videoModes() : array<VideoMode>
     {
@@ -561,8 +571,8 @@ public class Window
     }
 
     /**
-     * Windowed present rate. Darwin uses NSScreen.maximumFramesPerSecond
-     * (the live cap — ProMotion off is 60 even if GLFW lists 120).
+     * Windowed present rate.
+     * Darwin uses NSScreen.maximumFramesPerSecond (the live cap; ProMotion off is 60 even if GLFW lists 120).
      * Elsewhere the highest GLFW video mode.
      */
     public const function refreshRate() : int32
@@ -606,9 +616,8 @@ public class Window
     }
 
     /**
-     * Framebuffer pixels per window point. Derived from the two
-     * sizes rather than glfwGetWindowContentScale so it matches the
-     * framebuffer we actually got, whatever the retina hint says.
+     * Framebuffer pixels per window point.
+     * Derived from the two sizes rather than glfwGetWindowContentScale so it matches the framebuffer we actually got, whatever the retina hint says.
      */
     private const function backingScale() : float64
     {

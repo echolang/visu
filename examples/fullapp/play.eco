@@ -7,13 +7,14 @@ use visu::app::Host;
 use visu::ecs::{Entities, Entity, System, Systems};
 use visu::geo::Transform;
 use visu::graphics::{
-    CallbackPass, CameraData, CameraUniforms, Context, Frame, GpuPass, IoSink,
+    CallbackPass, Camera, CameraData, CameraUniforms, Context, Frame, GpuPass, IoSink,
     Mesh, Pipeline, PipelineError, Raster, RenderEncoder, SceneTarget,
     ShaderProgram, VertexLayout
 };
 use visu::math::{Mat4, Quat, Vec3, Vec4};
 use visu::scene::{Scene, Switch};
-use visu::system::CameraSystem;
+use visu::components::FlyingCamera;
+use visu::system::{CameraSystem, FlyingCameraSystem};
 use visu::ui::Ui;
 
 public struct Cube
@@ -114,8 +115,9 @@ public class Play : Scene
         $this->host = $host;
         $this->entities = Entities();
         $this->systems = Systems();
-        $this->cameras = CameraSystem($host->input, $host->dispatcher);
+        $this->cameras = CameraSystem();
         $this->systems->bind($this->cameras);
+        $this->systems->bind(FlyingCameraSystem($host->input, $host->dispatcher, $this->cameras));
         $this->mesh = null;
     }
 
@@ -141,7 +143,9 @@ public class Play : Scene
         $this->systems->bind(CubeSystem($mesh, $pass));
         $this->mesh = $mesh;
         $this->systems->register($this->entities);
-        $this->cameras->spawnDefaultFlyingCamera($this->entities, Vec3(0.0f, 2.5f, 9.0f));
+        Entity $cam = Camera::spawn($this->entities, Vec3(0.0f, 2.5f, 9.0f));
+        $this->entities->attach($cam, FlyingCamera());
+        $this->cameras->activeCamera = $cam;
         $this->spawnCubes();
     }
 

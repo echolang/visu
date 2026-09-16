@@ -18,14 +18,13 @@ void main()
     float roughness = u_capture_params.x;
     float rough = max(roughness, 1e-4);
     float source_resolution = u_capture_params.y;
-
-    const uint SAMPLE_COUNT = 4096u;
+    uint sample_count = uint(max(u_capture_params.z, 64.0));
     vec3 prefiltered = vec3(0.0);
     float weight = 0.0;
 
-    for (uint i = 0u; i < SAMPLE_COUNT; ++i)
+    for (uint i = 0u; i < sample_count; ++i)
     {
-        vec2 Xi = hammersley(i, SAMPLE_COUNT);
+        vec2 Xi = hammersley(i, sample_count);
         vec3 H = importance_sample_ggx(Xi, N, rough);
         vec3 L = normalize(2.0 * dot(V, H) * H - V);
 
@@ -39,7 +38,7 @@ void main()
             float pdf = D * NdotH / max(4.0 * HdotV, 1e-6) + 1e-4;
 
             float sa_texel = 4.0 * PI / (6.0 * source_resolution * source_resolution);
-            float sa_sample = 1.0 / (float(SAMPLE_COUNT) * pdf + 1e-4);
+            float sa_sample = 1.0 / (float(sample_count) * pdf + 1e-4);
 
             float mip = 0.0;
 
@@ -47,7 +46,8 @@ void main()
                 mip = 0.5 * log2(sa_sample / sa_texel);
             }
 
-            prefiltered += textureLod(u_env_cubemap, L, mip).rgb * NdotL;
+            vec3 env = min(textureLod(u_env_cubemap, L, mip).rgb, vec3(8.0));
+            prefiltered += env * NdotL;
             weight += NdotL;
         }
     }

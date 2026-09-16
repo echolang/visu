@@ -78,12 +78,13 @@ fragment fs_out fs(fs_in in [[stage_in]], constant CaptureUniforms& _219 [[buffe
     float roughness = _219.u_capture_params.x;
     float rough = fast::max(roughness, 9.9999997473787516355514526367188e-05);
     float source_resolution = _219.u_capture_params.y;
+    uint sample_count = uint(fast::max(_219.u_capture_params.z, 64.0));
     float3 prefiltered = float3(0.0);
     float weight = 0.0;
-    for (uint i = 0u; i < 4096u; i++)
+    for (uint i = 0u; i < sample_count; i++)
     {
         uint param = i;
-        uint param_1 = 4096u;
+        uint param_1 = sample_count;
         float2 Xi = hammersley(param, param_1);
         float2 param_2 = Xi;
         float3 param_3 = N;
@@ -100,13 +101,14 @@ fragment fs_out fs(fs_in in [[stage_in]], constant CaptureUniforms& _219 [[buffe
             float HdotV = fast::max(dot(H, V), 0.0);
             float pdf = ((D * NdotH) / fast::max(4.0 * HdotV, 9.9999999747524270787835121154785e-07)) + 9.9999997473787516355514526367188e-05;
             float sa_texel = 12.56637096405029296875 / ((6.0 * source_resolution) * source_resolution);
-            float sa_sample = 1.0 / ((4096.0 * pdf) + 9.9999997473787516355514526367188e-05);
+            float sa_sample = 1.0 / ((float(sample_count) * pdf) + 9.9999997473787516355514526367188e-05);
             float mip = 0.0;
             if (roughness >= 9.9999997473787516355514526367188e-05)
             {
                 mip = 0.5 * log2(sa_sample / sa_texel);
             }
-            prefiltered += (u_env_cubemap.sample(u_env_cubemapSmplr, L, level(mip)).xyz * NdotL);
+            float3 env = fast::min(u_env_cubemap.sample(u_env_cubemapSmplr, L, level(mip)).xyz, float3(8.0));
+            prefiltered += (env * NdotL);
             weight += NdotL;
         }
     }

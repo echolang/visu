@@ -1,23 +1,21 @@
 /**
- * CameraSystem entity handling and the CameraData handoff. Movement
- * needs a real window (Input.down is glfwGetKey), so it lives in the
- * glfw group; everything here is GPU-free.
+ * CameraSystem publishes CameraData from the active Camera+Transform.
+ * GPU-free.
  */
 
+use visu::components::FlyingCamera;
 use visu::ecs::{Entities, Entity};
 use visu::geo::Transform;
 use visu::graphics::{
     Backbuffer, Camera, CameraData, Context, Device, Frame, Pipeline, Pool,
-    Projection, RenderTarget, SceneTarget, TargetRef, TextureOptions
+    Projection, RenderTarget, SceneTarget, TargetRef
 };
-use visu::math::{Vec2, Vec3};
-use visu::os::{Input, Window};
-use visu::signal::Dispatcher;
-use visu::system::{CameraMode, CameraSystem};
+use visu::math::Vec3;
+use visu::system::CameraSystem;
 
 internal function headlessCamera() : CameraSystem
 {
-    return CameraSystem(Input(Window('camera', 64, 64), Dispatcher()), Dispatcher());
+    return CameraSystem();
 }
 
 test camera_system_starts_without_a_camera
@@ -27,14 +25,14 @@ test camera_system_starts_without_a_camera
     assert(!$system->valid($world, $system->activeCamera), 'no active camera');
 }
 
-test camera_system_spawns_a_flying_camera
+test camera_system_publishes_a_flying_camera
 {
     Entities $world = Entities();
     CameraSystem $system = headlessCamera();
-    Entity $entity = $system->spawnDefaultFlyingCamera($world, Vec3(5.4f, 2.4f, 14.4f));
-    assert($system->activeCamera == $entity, 'active');
+    Entity $entity = Camera::spawn($world, Vec3(5.4f, 2.4f, 14.4f));
+    $world->attach($entity, FlyingCamera());
+    $system->activeCamera = $entity;
     assert($system->valid($world, $entity), 'camera and transform');
-    assert($system->mode == CameraMode::flying, 'flying');
     Transform& $transform = $world->get<Transform>($entity);
     assert($transform->position->x == 5.4f, 'position x');
     assert($transform->position->z == 14.4f, 'position z');
@@ -46,7 +44,8 @@ test camera_system_publishes_camera_data_for_the_scene_target
 {
     Entities $world = Entities();
     CameraSystem $system = headlessCamera();
-    $system->spawnDefaultFlyingCamera($world, Vec3(0.0f, 0.0f, 4.0f));
+    $system->activeCamera = Camera::spawn($world, Vec3(0.0f, 0.0f, 4.0f));
+    $world->attach($system->activeCamera, FlyingCamera());
     Device $device = Device();
     Pool $pool = Pool($device);
     Frame $frame = Frame();
@@ -68,7 +67,8 @@ test camera_system_falls_back_to_the_backbuffer
 {
     Entities $world = Entities();
     CameraSystem $system = headlessCamera();
-    $system->spawnDefaultFlyingCamera($world, Vec3(0.0f, 0.0f, 0.0f));
+    $system->activeCamera = Camera::spawn($world, Vec3(0.0f, 0.0f, 0.0f));
+    $world->attach($system->activeCamera, FlyingCamera());
     Device $device = Device();
     Pool $pool = Pool($device);
     Frame $frame = Frame();

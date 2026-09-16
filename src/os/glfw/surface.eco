@@ -1,18 +1,49 @@
 /**
  * The one site that names glfw and a backend together.
+ * Graphics never writes glfw::; instance extensions come from here too.
  */
 
 namespace visu::os;
 
 use visu::graphics::{Device, DeviceError, Surface};
 
+/**
+ * WSI instance extensions GLFW needs for a window surface.
+ * Call after os::init.
+ * Empty when GLFW was built without Vulkan.
+ */
+public function surfaceInstanceExtensions() : array<string>
+{
+    array<string> $out = array<string>();
+    uint32 $count = 0;
+    ptr<ptr<const uint8>> $exts = glfw::getRequiredInstanceExtensions(&$count);
+
+    if ($exts:$ == null || $count == 0) {
+        return $out;
+    }
+
+    uint32 $i = 0;
+
+    while ($i < $count) {
+        ptr<const uint8> $p = $exts:$[$i];
+
+        if ($p:$ != null) {
+            $out[] = str::from($p:$);
+        }
+
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
 #[if: os == darwin && !VISU_BACKEND_VULKAN]
 internal function createSurface(Window $window, Device $device) : result<Surface, DeviceError>
 {
-    ptr<uint8> $view = glfw::getCocoaWindow($window->glfwHandle());
+    ptr<uint8> $view = glfw::getCocoaView($window->glfwHandle());
 
     if ($view:$ == null) {
-        return .error(.metal('createSurface', 'no cocoa window'));
+        return .error(.metal('createSurface', 'no cocoa view'));
     }
 
     return .ok(Surface($view));

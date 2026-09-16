@@ -1,6 +1,5 @@
 /**
- * Per-frame uniform push into the host-visible ring. Not a
- * GpuObject; slot 1+ is shared data (camera, lights).
+ * Per-frame uniform push into the host-visible ring. Not a GpuObject; slot 1+ is shared data (camera, lights).
  */
 
 namespace visu::graphics;
@@ -10,13 +9,15 @@ public class UniformBuffer
     public Device $device;
     public const uint32 $slot;
     private uint64 $pushedFrame;
+    private bool $havePush;
     private TransientSlice $slice;
 
     public constructor(Device $device, uint32 $slot = 1)
     {
         $this->device = $device;
         $this->slot = $slot;
-        $this->pushedFrame = vk::WHOLE_SIZE;
+        $this->pushedFrame = 0;
+        $this->havePush = false;
         $this->slice = TransientSlice(null, 0 as uint64, 0 as uint64, 0);
     }
 
@@ -29,11 +30,12 @@ public class UniformBuffer
         mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $n);
         $this->slice = $slice;
         $this->pushedFrame = $this->device->frameIndex();
+        $this->havePush = true;
     }
 
     public function bind(RenderEncoder $enc) : void
     {
-        assert($this->pushedFrame == $this->device->frameIndex(), 'UniformBuffer.bind without push this frame');
+        assert($this->havePush && $this->pushedFrame == $this->device->frameIndex(), 'UniformBuffer.bind without push this frame');
         $enc->bindUniform($this->slot, $this->slice);
     }
 }

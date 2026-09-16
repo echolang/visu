@@ -1,23 +1,40 @@
 /**
- * Bakes the three image-based-lighting maps from the environment
- * cube, once: a diffuse irradiance cube, a specular cube prefiltered
- * per roughness across its mips, and the split-sum BRDF lookup.
+ * Bakes the three image-based-lighting maps from the environment cube, once:
+ * a diffuse irradiance cube, a specular cube prefiltered per roughness across its mips, and the split-sum BRDF lookup.
  *
- * Like the environment bake this runs inside a frame, because a
- * render pass needs one, and then only imports what it made.
+ * Like the environment bake this runs inside a frame, because a render pass needs one, and then only imports what it made.
  */
 
 namespace visu::graphics;
 
 use visu::math::{Mat4, Vec4};
 
-/** irradiance cube edge; PHP VISU used the same 32 */
-public const int32 IBL_IRRADIANCE_SIZE = 32;
-/** prefiltered specular base; PHP used 128, six mips here floor at 8 */
-public const int32 IBL_PREFILTER_SIZE = 256;
-public const int32 IBL_PREFILTER_MIPS = 6;
-/** split-sum LUT; PHP used 512 */
-public const int32 IBL_BRDF_SIZE = 128;
+/**
+ * Convolution budget for the three IBL maps. Snapshotted when the environment is constructed.
+ * `mobile()` is the phone-safe preset.
+ */
+public struct IblQuality
+{
+    public int32 $irradianceSize = 64;
+    public int32 $prefilterSize = 256;
+    public int32 $prefilterMips = 6;
+    public int32 $brdfSize = 128;
+
+    /**
+     * Prefiltered specular samples per texel.
+     */
+    public float32 $sampleCount = 4096.0f;
+    public float32 $irradianceSamples = 2048.0f;
+
+    public static function mobile() : IblQuality
+    {
+        IblQuality $q = IblQuality();
+        $q->prefilterSize = 128;
+        $q->sampleCount = 512.0f;
+        $q->irradianceSamples = 1024.0f;
+        return $q;
+    }
+}
 
 public class IblPass : Pass
 {
@@ -40,7 +57,7 @@ public class IblPass : Pass
         TextureRef $irradiance = $pipeline->importTexture('ibl.irradiance', $this->environment->irradiance);
         TextureRef $prefilter = $pipeline->importTexture('ibl.prefilter', $this->environment->prefilter);
         TextureRef $brdf = $pipeline->importTexture('ibl.brdf', $this->environment->brdf);
-        $frame->set(IblData($irradiance, $prefilter, $brdf, IBL_PREFILTER_MIPS));
+        $frame->set(IblData($irradiance, $prefilter, $brdf, $this->environment->ibl->prefilterMips));
 
         if (!$this->environment->iblReady) {
             EnvironmentData $environment = $frame->get<EnvironmentData>();
@@ -65,6 +82,10 @@ public class IblPass : Pass
             return .ok;
         }
 
+        if ($this->environment->cubeJustBaked($device->frameIndex())) {
+            return .ok;
+        }
+
         Mesh $cube = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
             return .cube($device);
         });
@@ -73,17 +94,35 @@ public class IblPass : Pass
         });
         Sampler $sampler = $this->gpu->cube;
         Mat4 $projection = captureProjection();
+        int32 $step = $this->environment->iblStep;
+        int32 $mips = $this->environment->ibl->prefilterMips;
 
-        guard $this->bakeIrradiance($ctx, $cube, $environment, $sampler, $projection) else ($e) {
-            return .error($e);
+        if ($step == 0) {
+            guard $this->bakeIrradiance($ctx, $cube, $environment, $sampler, $projection) else ($e) {
+                return .error($e);
+            }
+            $this->environment->iblStep = 1;
+            return .ok;
         }
-        guard $this->bakePrefilter($ctx, $cube, $environment, $sampler, $projection) else ($e) {
-            return .error($e);
+
+        if ($step >= 1 && $step <= $mips) {
+            guard $this->bakePrefilter(
+                $ctx,
+                $cube,
+                $environment,
+                $sampler,
+                $projection,
+                $step - 1
+            ) else ($e) {
+                return .error($e);
+            }
+            $this->environment->iblStep = $step + 1;
+            return .ok;
         }
+
         guard $this->bakeBrdf($ctx, $quad) else ($e) {
             return .error($e);
         }
-
         $device->transitionTexture($this->environment->irradiance, ResourceState::shaderRead);
         $device->transitionTexture($this->environment->prefilter, ResourceState::shaderRead);
         $device->transitionTexture($this->environment->brdf, ResourceState::shaderRead);
@@ -103,6 +142,7 @@ public class IblPass : Pass
             return .error(.shader($e));
         }
         GpuPass $pass = GpuPass($program, VertexLayout::pos3(), captureRaster());
+        float32 $samples = $this->environment->ibl->irradianceSamples;
         bakeCubeFaces(
             $ctx->device,
             $pass,
@@ -111,7 +151,7 @@ public class IblPass : Pass
             $sampler,
             $this->environment->irradiance,
             0,
-            CaptureUniforms($projection, Mat4(), Vec4(0.0f, 0.0f, 0.0f, 0.0f))
+            CaptureUniforms($projection, Mat4(), Vec4(0.0f, 0.0f, $samples, 0.0f))
         );
         return .ok;
     }
@@ -121,33 +161,28 @@ public class IblPass : Pass
         Mesh $cube,
         Texture $environment,
         Sampler $sampler,
-        const Mat4& $projection
+        const Mat4& $projection,
+        int32 $mip
     ) : status<PipelineError>
     {
         ShaderProgram $program = guard $this->gpu->shaders->program('bake_prefilter') else ($e) {
             return .error(.shader($e));
         }
         GpuPass $pass = GpuPass($program, VertexLayout::pos3(), captureRaster());
-        Texture $target = $this->environment->prefilter;
-        float32 $steps = (IBL_PREFILTER_MIPS - 1) as float32;
+        IblQuality $ibl = $this->environment->ibl;
+        float32 $steps = ($ibl->prefilterMips - 1) as float32;
+        float32 $roughness = ($mip as float32) / $steps;
         float32 $source = $environment->desc->width as float32;
-        int32 $mip = 0;
-
-        while ($mip < IBL_PREFILTER_MIPS) {
-            float32 $roughness = ($mip as float32) / $steps;
-            bakeCubeFaces(
-                $ctx->device,
-                $pass,
-                $cube,
-                $environment,
-                $sampler,
-                $target,
-                $mip,
-                CaptureUniforms($projection, Mat4(), Vec4($roughness, $source, 0.0f, 0.0f))
-            );
-            $mip = $mip + 1;
-        }
-
+        bakeCubeFaces(
+            $ctx->device,
+            $pass,
+            $cube,
+            $environment,
+            $sampler,
+            $this->environment->prefilter,
+            $mip,
+            CaptureUniforms($projection, Mat4(), Vec4($roughness, $source, $ibl->sampleCount, 0.0f))
+        );
         return .ok;
     }
 

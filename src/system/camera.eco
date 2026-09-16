@@ -1,8 +1,7 @@
 /**
- * Picks the active camera entity, drives it, and publishes
- * `CameraData` for the frame. Flying mode is WASD plus hold-left to
- * look; game mode hands `update` / cursor / scroll to the app's
- * closures — Echo has no subclassing, so the hooks are fields.
+ * Picks the active camera entity and publishes `CameraData` for the frame.
+ * Controllers (`FlyingCamera`, `OrbitCamera`) live on the entity and are driven by their own systems.
+ * An entity with only `Camera` + `Transform` is static or scripted; this system still publishes it, and does not move it.
  *
  * Bind this before any system that reads `CameraData`.
  */
@@ -11,83 +10,25 @@ namespace visu::system;
 
 use visu::ecs::{Entities, Entity, System};
 use visu::geo::{Pose, Transform};
-use visu::graphics::{Backbuffer, Camera, CameraData, Context, Projection, SceneTarget, TargetRef};
-use visu::math::{Quat, Vec2, Vec3, radians};
-use visu::os::{CursorMode, Input, mouse, key};
-use visu::signal::{Cursor, Dispatcher, Queue, Scroll};
-
-public enum CameraMode
-{
-    case flying;
-    case game;
-}
+use visu::graphics::{
+    Backbuffer, Camera, CameraData, Context, SceneTarget, TargetRef
+};
 
 public class CameraSystem : System
 {
     public Entity $activeCamera;
-    public CameraMode $mode;
-    /** world units per fixed update tick */
-    public float32 $flySpeed;
-    /** degrees of yaw / pitch per cursor pixel */
-    public float32 $lookSpeed;
-    public function<void(Entities, Camera&, Transform&)>? $updateGame;
-    public function<void(Entities, const Cursor&)>? $cursorGame;
-    public function<void(Entities, const Scroll&)>? $scrollGame;
-    private Input $input;
-    private Dispatcher $dispatcher;
-    private Queue<Cursor>? $cursors;
-    private Queue<Scroll>? $scrolls;
-    /** degrees; x is yaw about world up, y is pitch */
-    private Vec2 $euler;
 
-    public constructor(Input $input, Dispatcher $dispatcher)
+    public constructor()
     {
         $this->activeCamera = Entity::none();
-        $this->mode = .flying;
-        $this->flySpeed = 0.5f;
-        $this->lookSpeed = 0.1f;
-        $this->updateGame = null;
-        $this->cursorGame = null;
-        $this->scrollGame = null;
-        $this->input = $input;
-        $this->dispatcher = $dispatcher;
-        $this->cursors = null;
-        $this->scrolls = null;
-        $this->euler = Vec2(0.0f, 0.0f);
     }
 
     public function register(Entities $entities) : void
     {
-        $this->cursors = $this->dispatcher->queue<Cursor>();
-        $this->scrolls = $this->dispatcher->queue<Scroll>();
     }
 
     public function unregister(Entities $entities) : void
     {
-        Queue<Cursor> $cursors = guard $this->cursors else {
-            return;
-        }
-        Queue<Scroll> $scrolls = guard $this->scrolls else {
-            return;
-        }
-        $this->dispatcher->unqueue<Cursor>($cursors);
-        $this->dispatcher->unqueue<Scroll>($scrolls);
-        $this->cursors = null;
-        $this->scrolls = null;
-    }
-
-    /** a perspective camera at `$position`, looking down -Z */
-    public function spawnDefaultFlyingCamera(Entities $entities, Vec3 $position) : Entity
-    {
-        Entity $entity = $entities->create();
-        Transform $transform = Transform();
-        $transform->position = $position;
-        $entities->attach($entity, $transform);
-        $entities->attach($entity, Camera(Projection::perspective));
-        $this->activeCamera = $entity;
-        $this->mode = .flying;
-        $this->euler = Vec2(0.0f, 0.0f);
-        return $entity;
     }
 
     public function update(Entities $entities) : void
@@ -98,27 +39,9 @@ public class CameraSystem : System
             return;
         }
 
-        // snapshot before this tick moves anything, so render interpolates
-        // from where the camera actually was
+        // snapshot before this tick moves anything, so render interpolates from where the camera actually was
         Transform& $transform = $entities->get<Transform>($active);
         $transform->storePrevious();
-        $this->drain($entities);
-
-        if (!$this->input->unclaimed()) {
-            return;
-        }
-
-        if ($this->mode == CameraMode::game) {
-            $hook = guard $this->updateGame else {
-                return;
-            }
-            Camera& $camera = $entities->get<Camera>($active);
-            Transform& $moved = $entities->get<Transform>($active);
-            $hook($entities, $camera, $moved);
-            return;
-        }
-
-        $this->fly($entities, $active);
     }
 
     public function render(Entities $entities, const Context& $ctx) : void
@@ -160,103 +83,5 @@ public class CameraSystem : System
             return $ctx->frame->get<Backbuffer>()->target;
         }
         return $scene->target;
-    }
-
-    private function drain(Entities $entities) : void
-    {
-        Queue<Cursor> $cursors = guard $this->cursors else {
-            return;
-        }
-        Queue<Scroll> $scrolls = guard $this->scrolls else {
-            return;
-        }
-
-        while (true) {
-            Cursor $signal = guard $cursors->shift() else {
-                break;
-            }
-            $this->look($entities, $signal);
-        }
-
-        while (true) {
-            Scroll $signal = guard $scrolls->shift() else {
-                break;
-            }
-            $this->zoom($entities, $signal);
-        }
-    }
-
-    private function look(Entities $entities, const Cursor& $signal) : void
-    {
-        if (!$this->input->unclaimed()) {
-            return;
-        }
-
-        if ($this->mode == CameraMode::game) {
-            $hook = guard $this->cursorGame else {
-                return;
-            }
-            $hook($entities, $signal);
-            return;
-        }
-
-        // the press frame carries the jump from wherever the cursor was
-        if ($this->input->pressed(button: mouse::LEFT)) {
-            return;
-        }
-
-        if (!$this->input->down(button: mouse::LEFT)) {
-            $this->input->setCursorMode(CursorMode::normal);
-            return;
-        }
-
-        $this->euler->x = $this->euler->x - ($signal->offsetX as float32) * $this->lookSpeed;
-        $this->euler->y = $this->euler->y - ($signal->offsetY as float32) * $this->lookSpeed;
-    }
-
-    private function zoom(Entities $entities, const Scroll& $signal) : void
-    {
-        if (!$this->input->unclaimed()) {
-            return;
-        }
-
-        if ($this->mode != CameraMode::game) {
-            return;
-        }
-
-        $hook = guard $this->scrollGame else {
-            return;
-        }
-        $hook($entities, $signal);
-    }
-
-    private function fly(Entities $entities, Entity $active) : void
-    {
-        if ($this->input->pressed(button: mouse::LEFT)) {
-            $this->input->setCursorMode(CursorMode::disabled);
-        }
-
-        Transform& $transform = $entities->get<Transform>($active);
-
-        if ($this->input->down(key::W)) {
-            $transform->moveForward($this->flySpeed);
-        }
-
-        if ($this->input->down(key::S)) {
-            $transform->moveBackward($this->flySpeed);
-        }
-
-        if ($this->input->down(key::A)) {
-            $transform->moveLeft($this->flySpeed);
-        }
-
-        if ($this->input->down(key::D)) {
-            $transform->moveRight($this->flySpeed);
-        }
-
-        // yaw about world up then pitch about local right; no roll, no clamp
-        Quat $yaw = Quat(angleAxis: radians($this->euler->x), Vec3(0.0f, 1.0f, 0.0f));
-        Quat $pitch = Quat(angleAxis: radians($this->euler->y), Vec3(1.0f, 0.0f, 0.0f));
-        $transform->orientation = $yaw * $pitch;
     }
 }

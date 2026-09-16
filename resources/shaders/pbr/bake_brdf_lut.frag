@@ -1,7 +1,7 @@
 #version 450
 
 layout(location = 0) in vec2 v_uv;
-layout(location = 0) out vec2 frag_color;
+layout(location = 0) out vec4 frag_color;
 
 #include "visu/constants.glsl"
 #include "visu/functions/importance_sampling.glsl"
@@ -29,11 +29,11 @@ vec2 integrate_brdf(float NdotV, float roughness)
     float A = 0.0;
     float B = 0.0;
 
-    const uint SAMPLE_COUNT = 4096u;
+    const uint sample_count = 256u;
 
-    for (uint i = 0u; i < SAMPLE_COUNT; ++i)
+    for (uint i = 0u; i < sample_count; ++i)
     {
-        vec2 Xi = hammersley(i, SAMPLE_COUNT);
+        vec2 Xi = hammersley(i, sample_count);
         vec3 H = importance_sample_ggx(Xi, N, roughness);
         vec3 L = normalize(2.0 * dot(V, H) * H - V);
 
@@ -52,10 +52,11 @@ vec2 integrate_brdf(float NdotV, float roughness)
         }
     }
 
-    return vec2(A, B) / float(SAMPLE_COUNT);
+    return vec2(A, B) / float(sample_count);
 }
 
 void main()
 {
-    frag_color = integrate_brdf(v_uv.x, v_uv.y);
+    vec2 lut = integrate_brdf(v_uv.x, v_uv.y);
+    frag_color = vec4(lut, 0.0, 1.0);
 }

@@ -1,6 +1,6 @@
 /**
- * CAMetalLayer attach / resize / next drawable. Device owns
- * the layer; this file is the glfw-view glue.
+ * CAMetalLayer attach / resize / next drawable. Device owns the layer.
+ * The host passes the view (NSView or UIView), not an NSWindow.
  */
 
 namespace visu::graphics;
@@ -14,7 +14,7 @@ internal function mtlAttachLayer(
 ) : result<mtl::Layer, DeviceError>
 {
     if ($view:$ == null) {
-        return .error(.metal('attach', 'no cocoa window'));
+        return .error(.metal('attach', 'no view'));
     }
 
     mtl::Layer $layer = mtl::Layer(attachView: $view, $gpu);
@@ -39,13 +39,9 @@ internal function mtlResizeLayer(mtl::Layer $layer, int32 $width, int32 $height)
 }
 
 /**
- * The layer is view-hosted (setLayer: + setWantsLayer:), so AppKit
- * does not maintain contentsScale for us and GLFW cannot either —
- * it never learns about this layer. Leaving it at 1.0 while
- * drawableSize is the backing size breaks the
- * `drawableSize == bounds * contentsScale` invariant, and the
- * WindowServer then resamples every frame instead of scanning the
- * surface out directly, which pins the window to 60 Hz.
+ * The layer is view-hosted (setLayer: + setWantsLayer:), so AppKit does not maintain contentsScale for us and GLFW cannot either; it never learns about this layer.
+ * Leaving it at 1.0 while drawableSize is the backing size breaks the `drawableSize == bounds * contentsScale` invariant.
+ * The WindowServer then resamples every frame instead of scanning the surface out directly, which pins the window to 60 Hz.
  */
 internal function mtlLayerScale(mtl::Layer $layer, float64 $scale) : void
 {

@@ -1,20 +1,21 @@
 /**
- * Named ActionMap sets. Switch when the UI or a vehicle takes over.
- * Forwards Key / MouseButton / Click to the active map. Inactive maps
- * still update held state so down() cannot stick across a switch.
- * When constructed with Input, handle is skipped while claimed
- * (track still runs). Dispatcher closures capture a slot, not this.
+ * Named ActionMap sets.
+ * Switch when the UI or a vehicle takes over.
+ * Forwards Key / MouseButton / Click to the active map.
+ * Inactive maps still update held state so down() cannot stick across a switch.
+ * When constructed with InputHub, handle is skipped while claimed (track still runs).
+ * Dispatcher closures capture a slot, not this.
  */
 
-namespace visu::os;
+namespace visu::os::input;
 
-use visu::signal::{Click, Dispatcher, Flow, Key, MouseButton};
+use visu::signal::{Click, Dispatcher, Flow};
 
 internal class ActionSlot
 {
     public ActionMap $current;
     public map<string, ActionMap> $maps;
-    public Input? $input;
+    public InputHub? $input;
 
     public constructor()
     {
@@ -25,16 +26,16 @@ internal class ActionSlot
 
     public const function claimed() : bool
     {
-        Input? $held = $this->input;
+        InputHub? $held = $this->input;
         if ($held == null) {
             return false;
         }
 
-        Input $input = guard $held;
+        InputHub $input = guard $held;
         return !$input->unclaimed();
     }
 
-    public function handle(const Key& $signal) : Flow
+    public function handle(const visu::signal::Key& $signal) : Flow
     {
         foreach ($this->maps as $map) {
             $map->track($signal);
@@ -47,7 +48,7 @@ internal class ActionSlot
         return $this->current->handle($signal);
     }
 
-    public function handle(const MouseButton& $signal) : Flow
+    public function handle(const visu::signal::MouseButton& $signal) : Flow
     {
         foreach ($this->maps as $map) {
             $map->track($signal);
@@ -80,7 +81,7 @@ public class ContextMap
     private int32 $buttonId;
     private int32 $clickId;
 
-    public constructor(Dispatcher $dispatcher, Input? $input = null)
+    public constructor(Dispatcher $dispatcher, InputHub? $input = null)
     {
         $this->dispatcher = $dispatcher;
         $this->slot = ActionSlot();
@@ -89,10 +90,10 @@ public class ContextMap
         $this->pending = null;
 
         ActionSlot $slot = $this->slot;
-        $this->keyId = $dispatcher->register<Key>(function(const Key& $signal) : Flow {
+        $this->keyId = $dispatcher->register<visu::signal::Key>(function(const visu::signal::Key& $signal) : Flow {
             return $slot->handle($signal);
         });
-        $this->buttonId = $dispatcher->register<MouseButton>(function(const MouseButton& $signal) : Flow {
+        $this->buttonId = $dispatcher->register<visu::signal::MouseButton>(function(const visu::signal::MouseButton& $signal) : Flow {
             return $slot->handle($signal);
         });
         $this->clickId = $dispatcher->register<Click>(function(const Click& $signal) : Flow {
@@ -102,8 +103,8 @@ public class ContextMap
 
     destructor()
     {
-        $this->dispatcher->unregister<Key>($this->keyId);
-        $this->dispatcher->unregister<MouseButton>($this->buttonId);
+        $this->dispatcher->unregister<visu::signal::Key>($this->keyId);
+        $this->dispatcher->unregister<visu::signal::MouseButton>($this->buttonId);
         $this->dispatcher->unregister<Click>($this->clickId);
     }
 
@@ -164,8 +165,8 @@ public class ContextMap
     }
 
     /**
-     * Apply a pending switch, then clear action edges on every
-     * map. Held state stays.
+     * Apply a pending switch, then clear action edges on every map.
+     * Held state stays.
      */
     public function reset() : void
     {

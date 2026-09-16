@@ -1,6 +1,6 @@
 /**
- * Compile-time GPU device checklist. Both backends write
- * `: DeviceProtocol` so a missing method fails at the class.
+ * Compile-time GPU device checklist.
+ * Both backends write `: DeviceProtocol` so a missing method fails at the class.
  * Not a runtime switch: call sites still hold Device.
  */
 
@@ -8,27 +8,29 @@ namespace visu::graphics;
 
 public interface DeviceProtocol
 {
+
     /**
-     * Construct is cheap and headless. This is the call that actually talks to the GPU: instance,
-     * queue, frame slots, adapter line. Idempotent. Call it before attachSurface.
+     * Construct is cheap and headless.
+     * This is the call that actually talks to the GPU: instance, queue, frame slots, adapter line.
+     * Idempotent. Call it before attachSurface.
      */
     function initialize(const DeviceOptions& $options) : status<DeviceError>;
 
     /**
-     * Bind a window surface so this device can present. Needs initialize first. Builds the
-     * swapchain (Vulkan) or the CAMetalLayer (Metal).
+     * Bind a window surface so this device can present. Needs initialize first.
+     * Builds the swapchain (Vulkan) or the CAMetalLayer (Metal).
      */
     function attachSurface(Surface $surface, int32 $width, int32 $height) : status<DeviceError>;
 
     /**
-     * Record a new drawable size. Applied on the next beginFrame, not mid-frame. 0x0 is a skip,
-     * not a crash.
+     * Record a new drawable size. Applied on the next beginFrame, not mid-frame.
+     * 0x0 is a skip, not a crash.
      */
     function resizeSurface(int32 $width, int32 $height) : void;
 
     /**
-     * Drop the surface and swapchain so the window can die. The device stays: later destroy()
-     * still works. This is a clean stop, not a die.
+     * Drop the surface and swapchain so the window can die.
+     * The device stays: later destroy() still works. This is a clean stop, not a die.
      */
     function loseSurface() : void;
 
@@ -38,14 +40,14 @@ public interface DeviceProtocol
     const function surfaceLost() : bool;
 
     /**
-     * Stall until in-flight GPU work is done. Call this before destroying pool, shaders, or the
-     * window.
+     * Stall until in-flight GPU work is done.
+     * Call this before destroying pool, shaders, or the window.
      */
     function waitIdle() : void;
 
     /**
-     * Alignment and caps (uniform offset, max range, vertex textures). Use these instead of
-     * hardcoding 256.
+     * Alignment and caps (uniform offset, max range, vertex textures).
+     * Use these instead of hardcoding 256.
      */
     const function limits() : DeviceLimits;
 
@@ -60,8 +62,8 @@ public interface DeviceProtocol
     const function memoryStats() : MemoryStats;
 
     /**
-     * Acquire the next swapchain image and open the frame. `.skipped` for a 0-size drawable. Don't
-     * call this after shouldClose, or once surfaceLost().
+     * Acquire the next swapchain image and open the frame. `.skipped` for a 0-size drawable.
+     * Don't call this after shouldClose, or once surfaceLost().
      */
     function beginFrame(int32 $width, int32 $height) : result<FrameStatus, DeviceError>;
 
@@ -72,8 +74,8 @@ public interface DeviceProtocol
     function endFrame() : status<DeviceError>;
 
     /**
-     * Index into the in-flight ring (0 .. frames-in-flight-1). Transient slices and per-frame GPU
-     * objects live on this slot.
+     * Index into the in-flight ring (0 .. frames-in-flight-1).
+     * Transient slices and per-frame GPU objects live on this slot.
      */
     const function frameSlot() : uint32;
 
@@ -83,26 +85,26 @@ public interface DeviceProtocol
     const function frameIndex() : uint64;
 
     /**
-     * This frame's swapchain image as an imported Texture. Only valid between beginFrame and
-     * endFrame. Don't dump it: endFrame drops it, and Metal cannot blit the drawable.
+     * This frame's swapchain image as an imported Texture. Only valid between beginFrame and endFrame.
+     * Don't dump it: endFrame drops it, and Metal cannot blit the drawable.
      */
     function backbuffer() : Texture;
 
     /**
-     * Pixel format of the swapchain. Match this when you mint an offscreen target you later blit
-     * to the window.
+     * Pixel format of the swapchain.
+     * Match this when you mint an offscreen target you later blit to the window.
      */
     const function backbufferFormat() : PixelFormat;
 
     /**
-     * Tear vs wait-for-vblank. Takes effect on the next present (Metal on the layer, Vulkan by
-     * rebuilding the swapchain).
+     * Tear vs wait-for-vblank.
+     * Takes effect on the next present (Metal on the layer, Vulkan by rebuilding the swapchain).
      */
     function setVsync(bool $on) : void;
 
     /**
-     * Requested present rate in Hz. 0 means the panel default. This is the wish, not a measured
-     * fps.
+     * Requested present rate in Hz. 0 means the panel default.
+     * This is the wish, not a measured fps.
      */
     function setPresentRate(int32 $hz) : void;
 
@@ -112,8 +114,8 @@ public interface DeviceProtocol
     const function presentRate() : int32;
 
     /**
-     * Backing scale of the surface, framebuffer pixels per point. Metal actually resizes the
-     * layer; Vulkan stores it because the swapchain is already in pixels.
+     * Backing scale of the surface, framebuffer pixels per point.
+     * Metal actually resizes the layer; Vulkan stores it because the swapchain is already in pixels.
      */
     function setContentsScale(float64 $scale) : void;
 
@@ -129,20 +131,20 @@ public interface DeviceProtocol
     function beginRender(const RenderPassDesc& $desc) : RenderEncoder;
 
     /**
-     * Put `$texture` into `$to`. Vulkan emits a barrier; Metal just stores the enum. Not inside a
-     * render pass.
+     * Put `$texture` into `$to`. Vulkan emits a barrier; Metal just stores the enum.
+     * Not inside a render pass.
      */
     function transitionTexture(Texture $texture, ResourceState $to) : void;
 
     /**
-     * Carve a host-visible slice from this frame's ring (uniforms, dynamic verts). Dies at
-     * endFrame. Aligns up to `limits()->uniformAlign`.
+     * Carve a host-visible slice from this frame's ring (uniforms, dynamic verts).
+     * Dies at endFrame. Aligns up to `limits()->uniformAlign`.
      */
     function allocTransient(uint64 $bytes, uint64 $align) : TransientSlice;
 
     /**
-     * Copy one mip of one array slice to CPU bytes. After endFrame; stalls. Needs
-     * TEXTURE_TRANSFER_SRC. Depth and imported textures fail.
+     * Copy one mip of one array slice to CPU bytes. After endFrame; stalls.
+     * Needs TEXTURE_TRANSFER_SRC. Depth and imported textures fail.
      */
     function readbackTexture(Texture $texture, int32 $mip, int32 $layer) : result<array<uint8>, DeviceError>;
 
@@ -172,8 +174,8 @@ public interface DeviceProtocol
     function createTexture(const TextureDesc& $desc) : result<TextureHandle, DeviceError>;
 
     /**
-     * Tear down a texture the backend allocated. Imported swapchain images no-op; the layer owns
-     * those.
+     * Tear down a texture the backend allocated.
+     * Imported swapchain images no-op; the layer owns those.
      */
     function destroyTexture(TextureHandle $handle) : void;
 
@@ -191,8 +193,8 @@ public interface DeviceProtocol
     ) : void;
 
     /**
-     * Fill mip 1+ from mip 0, every slice. Needs TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST and
-     * `mips > 1`; leaves the texture shaderRead. Legal inside a frame.
+     * Fill mip 1+ from mip 0, every slice. Needs TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST and `mips > 1`.
+     * Leaves the texture shaderRead. Legal inside a frame.
      */
     function generateMipmaps(Texture $texture) : void;
 
@@ -202,8 +204,7 @@ public interface DeviceProtocol
     function createSampler(const SamplerDesc& $desc) : Sampler;
 
     /**
-     * Compile a shader stage from `$bytes` (SPIR-V or Metal source). Metal entry points are `vs` /
-     * `fs`.
+     * Compile a shader stage from `$bytes` (SPIR-V or Metal source). Metal entry points are `vs` / `fs`.
      */
     function createShaderModule(ShaderKind $kind, const string& $bytes, string $name) : result<ShaderModuleHandle, DeviceError>;
 

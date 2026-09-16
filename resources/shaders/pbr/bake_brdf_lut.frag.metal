@@ -8,7 +8,7 @@ using namespace metal;
 
 struct fs_out
 {
-    float2 frag_color [[color(0)]];
+    float4 frag_color [[color(0)]];
 };
 
 struct fs_in
@@ -80,10 +80,10 @@ float2 integrate_brdf(thread const float& NdotV, thread const float& roughness)
     float3 N = float3(0.0, 0.0, 1.0);
     float A = 0.0;
     float B = 0.0;
-    for (uint i = 0u; i < 4096u; i++)
+    for (uint i = 0u; i < 256u; i++)
     {
         uint param = i;
-        uint param_1 = 4096u;
+        uint param_1 = 256u;
         float2 Xi = hammersley(param, param_1);
         float2 param_2 = Xi;
         float3 param_3 = N;
@@ -106,7 +106,7 @@ float2 integrate_brdf(thread const float& NdotV, thread const float& roughness)
             B += (Fc * G_Vis);
         }
     }
-    return float2(A, B) / float2(4096.0);
+    return float2(A, B) / float2(256.0);
 }
 
 fragment fs_out fs(fs_in in [[stage_in]])
@@ -114,7 +114,8 @@ fragment fs_out fs(fs_in in [[stage_in]])
     fs_out out = {};
     float param = in.v_uv.x;
     float param_1 = in.v_uv.y;
-    out.frag_color = integrate_brdf(param, param_1);
+    float2 lut = integrate_brdf(param, param_1);
+    out.frag_color = float4(lut, 0.0, 1.0);
     return out;
 }
 

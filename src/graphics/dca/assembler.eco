@@ -1,15 +1,12 @@
 /**
  * Turns per-frame submissions into merged instanced draw calls.
- * `register` names a mesh range once, `submit` adds a transform plus
- * payload, `build` culls / sorts / merges, `execute` records the
- * draws. The instance stream goes through this frame's ring, so
- * nothing is uploaded twice.
+ * `register` names a mesh range once; `submit` adds a transform plus payload;
+ * `build` culls, sorts, and merges; `execute` records the draws.
+ * The instance stream goes through this frame's ring, so nothing is uploaded twice.
  *
- * The PHP predecessor was php-glfw's C `DrawCallAssembler`. Dropped
- * on the way over: the octree culler (linear only here), LOD tables,
- * material and program ids in the sort key, the transparent
- * back-to-front pass, and the per-command callback — the caller sets
- * its own uniforms before `execute`.
+ * The PHP predecessor was php-glfw's C `DrawCallAssembler`. Dropped on the way over:
+ * the octree culler (linear only here), LOD tables, material and program ids in the sort key, the transparent back-to-front pass, and the per-command callback.
+ * The caller sets its own uniforms before `execute`.
  */
 
 namespace visu::graphics;
@@ -17,21 +14,32 @@ namespace visu::graphics;
 use visu::geo::{AABB, Frustum};
 use visu::math::{Mat4, Vec3, Vec4, length};
 
-/** distance quantization; 20 bits of the sort key */
+/**
+ * Distance quantization; 20 bits of the sort key.
+ */
 internal const uint64 DCA_DEPTH_MAX = 1048575;
 
 public class DrawCallAssembler<P>
 {
-    /** frustum-cull submissions against their mesh bounds */
+
+    /**
+     * Frustum-cull submissions against their mesh bounds.
+     */
     public bool $cull;
-    /** group by mesh, then near to far inside a group */
+
+    /**
+     * Group by mesh, then near to far inside a group.
+     */
     public bool $sortFrontToBack;
     public Device $device;
     private array<RegisteredMesh> $meshes;
     private array<Submission<P>> $pending;
     private array<Instance<P>> $stream;
     private array<DrawCommand> $commands;
-    /** per-frame scratch, kept so the capacity survives across builds */
+
+    /**
+     * Per-frame scratch, kept so the capacity survives across builds.
+     */
     private array<uint32> $visible;
     private array<uint64> $keys;
     private int32 $culled;
@@ -50,7 +58,9 @@ public class DrawCallAssembler<P>
         $this->culled = 0;
     }
 
-    /** the whole mesh; bounds come from the mesh's own extents */
+    /**
+     * Register the whole mesh. Bounds come from the mesh's own extents.
+     */
     public function register(Mesh $mesh, const AABB& $bounds) : MeshHandle
     {
         return $this->register($mesh, 0, $mesh->vertexCount, $bounds);
@@ -77,7 +87,9 @@ public class DrawCallAssembler<P>
         $this->pending[] = Submission<P>($mesh->index, $model, $payload, $sortBias, $ignoreCull);
     }
 
-    /** drop the submissions; the mesh table stays */
+    /**
+     * Drop the submissions; the mesh table stays.
+     */
     public function clearInstances() : void
     {
         $this->pending->clear();
@@ -93,8 +105,8 @@ public class DrawCallAssembler<P>
     }
 
     /**
-     * Cull, sort, and merge into draw commands. Returns the command
-     * count. Call once per frame after the last `submit`.
+     * Cull, sort, and merge into draw commands. The result is the command count.
+     * Call once per frame after the last `submit`.
      */
     public function build(const Frustum& $frustum, Vec3 $cameraPosition) : int32
     {
@@ -117,8 +129,7 @@ public class DrawCallAssembler<P>
             Submission<P> $sub = $this->pending[$i];
             RegisteredMesh $mesh = $this->meshes[$sub->mesh as usize];
             Vec3 $centre = worldPoint($sub->model, $mesh->centre);
-            // one key per submission, culled included: sortByKey looks
-            // them up by submission index, not by position in $visible
+            // one key per submission, culled included: sortByKey looks them up by submission index, not by position in $visible
             $this->keys[] = sortKey($sub->mesh, $this->depthBucket($centre, $cameraPosition, $sub->sortBias));
 
             if ($this->cull && !$sub->ignoreCull) {
@@ -145,9 +156,8 @@ public class DrawCallAssembler<P>
     }
 
     /**
-     * Binds the pass, uploads the instance stream once, then one draw
-     * per command. `build` must have run this frame. Shared uniforms
-     * go on the encoder before this call.
+     * Bind the pass, upload the instance stream once, then one draw per command.
+     * `build` must have run this frame. Shared uniforms go on the encoder before this call.
      */
     public function execute(RenderEncoder $enc, GpuPass $pass) : void
     {
@@ -200,14 +210,19 @@ public class DrawCallAssembler<P>
         return $this->pending->count() as int32;
     }
 
-    /** command `$i`, for tests and metrics */
+    /**
+     * Draw command `$i`. Tests and metrics read this; it is not the execute path.
+     */
     public const function command(int32 $i) : DrawCommand
     {
         assert($i >= 0 && ($i as usize) < $this->commands->count(), 'dca: command index');
         return $this->commands[$i as usize];
     }
 
-    /** over $this->visible, which sortByKey has just ordered */
+    /**
+     * Merge consecutive visible submissions of the same mesh into one instanced command.
+     * Walks `$this->visible`, which `sortByKey` has just ordered.
+     */
     private function merge() : void
     {
         usize $n = $this->visible->count();
@@ -262,7 +277,9 @@ public class DrawCallAssembler<P>
     }
 }
 
-/** mesh in the high bits so instances of one mesh stay adjacent */
+/**
+ * Pack mesh index in the high bits so instances of one mesh stay adjacent.
+ */
 internal function sortKey(int32 $mesh, uint64 $depth) : uint64
 {
     return (($mesh as uint64) << 32) | $depth;
@@ -274,7 +291,9 @@ internal function worldPoint(const Mat4& $model, Vec3 $point) : Vec3
     return Vec3($world->x, $world->y, $world->z);
 }
 
-/** the largest column length: a sphere scaled by this still contains the mesh */
+/**
+ * Largest column length of `$model`. A sphere scaled by this still contains the mesh.
+ */
 internal function maxAxisScale(const Mat4& $model) : float32
 {
     float32 $x = length(Vec3($model->c0->x, $model->c0->y, $model->c0->z));
@@ -295,8 +314,7 @@ internal function maxAxisScale(const Mat4& $model) : float32
 
 /**
  * Bottom-up merge sort; stable, so equal keys keep submit order.
- * `$keys` is indexed by the *value*, not by its position: a sparse
- * `$values` still reads `$keys[$values[$i]]`.
+ * `$keys` is indexed by the stored value, not by its position; a sparse `$values` still reads `$keys[$values[$i]]`.
  */
 internal function sortByKey(array<uint32>& $values, const array<uint64>& $keys) : void
 {
@@ -316,8 +334,7 @@ internal function sortByKey(array<uint32>& $values, const array<uint64>& $keys) 
     }
 
     usize $width = 1;
-    // ping-pong: each pass merges into the other buffer instead of
-    // merging and then copying the whole array back
+    // ping-pong: each pass merges into the other buffer instead of merging and then copying the whole array back
     bool $sorted = false;
 
     while ($width < $n) {

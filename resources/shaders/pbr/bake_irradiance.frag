@@ -5,7 +5,9 @@ layout(location = 0) out vec4 frag_color;
 
 layout(set = 1, binding = 0) uniform samplerCube u_env_cubemap;
 
+#include "visu/capture.glsl"
 #include "visu/constants.glsl"
+#include "visu/functions/importance_sampling.glsl"
 
 void main()
 {
@@ -16,21 +18,21 @@ void main()
     vec3 right = normalize(cross(up, N));
     up = normalize(cross(N, right));
 
-    float sample_delta = 0.025;
-    float samples = 0.0;
+    uint sample_count = uint(max(u_capture_params.z, 64.0));
 
-    for (float phi = 0.0; phi < 2.0 * PI; phi += sample_delta)
+    for (uint i = 0u; i < sample_count; ++i)
     {
-        for (float theta = 0.0; theta < 0.5 * PI; theta += sample_delta)
-        {
-            vec3 tangent = vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
-            vec3 dir = tangent.x * right + tangent.y * up + tangent.z * N;
-            irradiance += textureLod(u_env_cubemap, dir, 0.0).rgb * cos(theta) * sin(theta);
-            samples += 1.0;
-        }
+        vec2 Xi = hammersley(i, sample_count);
+        float phi = 2.0 * PI * Xi.x;
+        float cos_theta = sqrt(1.0 - Xi.y);
+        float sin_theta = sqrt(Xi.y);
+        vec3 tangent = vec3(sin_theta * cos(phi), sin_theta * sin(phi), cos_theta);
+        vec3 dir = tangent.x * right + tangent.y * up + tangent.z * N;
+        irradiance += min(textureLod(u_env_cubemap, dir, 0.0).rgb, vec3(8.0));
     }
 
+    // cosine-weighted hemisphere: pdf = cos/PI, estimator is Li * PI / N
     // the light pass divides by PI again; the pair cancels
-    irradiance = PI * irradiance * (1.0 / samples);
+    irradiance = PI * irradiance / float(sample_count);
     frag_color = vec4(irradiance, 1.0);
 }

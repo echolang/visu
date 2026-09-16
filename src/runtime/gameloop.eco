@@ -1,11 +1,10 @@
 /**
- * Fixed-timestep loop. 0..n update() ticks then one
- * render(compensation), with a spiral-of-death cap. Compensation is
- * lag / timestep — 0 just after a tick, approaching 1 before the
- * next. Hitting the cap clamps leftover lag to one timestep so
- * interpolation stays in [0, 1]. Time is monotonic
- * (std::time::instant). The clock for start() begins at start(), not
- * construct — initialize time is not first-frame lag.
+ * Fixed-timestep loop.
+ * 0..n update() ticks then one render(compensation), with a spiral-of-death cap.
+ * Compensation is lag / timestep; 0 just after a tick, approaching 1 before the next.
+ * Hitting the cap clamps leftover lag to one timestep so interpolation stays in [0, 1].
+ * Time is monotonic (std::time::instant).
+ * The clock for start() begins at start(), not construct; initialize time is not first-frame lag.
  */
 
 namespace visu::runtime;
@@ -34,8 +33,8 @@ public class GameLoop
     public int32 $tickTimeSampleCount = 60;
 
     /**
-     * Last interpolant passed to render(). 0 just after a tick,
-     * approaching 1 before the next.
+     * Last interpolant passed to render().
+     * 0 just after a tick, approaching 1 before the next.
      */
     public float32 $compensation = 0.0f;
 
@@ -159,8 +158,7 @@ public class GameLoop
         $this->compensation = $compensation;
         $this->delegate->render($compensation);
 
-        // the inter-frame delta, not how long advance() took: a frame
-        // that blocks on present must show up in the fps readout
+        // the inter-frame delta, not how long advance() took: a frame that blocks on present must show up in the fps readout
         if ($delta > 0) {
             $this->push64($this->frameTimes, $delta, $this->frameTimeSampleCount);
         }
@@ -169,16 +167,33 @@ public class GameLoop
     }
 
     /**
-     * Run until the delegate shouldStop()s or forceStop(). The
-     * clock starts here so construct-to-start (window init, ready)
-     * is not a catch-up burst.
+     * Snap the clock so the next advance is not a catch-up burst.
+     * Host-driven loops call this once at start, and again on Resume.
+     */
+    public function prepare() : void
+    {
+        $this->lastNs = $this->nowNs();
+    }
+
+    /**
+     * Blocking pump: prepare, then advance until the delegate shouldStop()s or forceStop().
+     * Display-link hosts call prepare()/pulse() instead; this still exists so tests can.
      */
     public function start() : void
     {
-        $this->lastNs = $this->nowNs();
+        $this->prepare();
         while (!$this->delegate->shouldStop() && !$this->forceStop) {
             $this->advance($this->nowNs());
         }
+    }
+
+    /**
+     * One wall-clock frame.
+     * Display-link hosts call this instead of start().
+     */
+    public function pulse() : void
+    {
+        $this->advance($this->nowNs());
     }
 
     private function nowNs() : int64

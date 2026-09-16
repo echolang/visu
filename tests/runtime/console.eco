@@ -2,7 +2,8 @@
  * DebugConsole command side: Key / Char facts, no overlay.
  */
 
-use visu::os::{Input, Window, key};
+use visu::os::{Window, WindowHints};
+use visu::os::input::{InputHub, MOD_CONTROL};
 use visu::runtime::DebugConsole;
 use visu::signal::{Char, ConsoleCommand, Dispatcher, Flow, Key};
 
@@ -20,12 +21,12 @@ class ConsoleCaught
 
 function consoleToggle(Dispatcher $d) : void
 {
-    $d->dispatch(Key(key::C, 0, key::PRESS, key::MOD_CONTROL));
+    $d->dispatch(Key(.c, 0, .press, MOD_CONTROL));
 }
 
 function consolePair(Dispatcher $d) : DebugConsole
 {
-    return DebugConsole($d, Input(Window('console', 64, 64), $d));
+    return DebugConsole($d, InputHub(Window('console', 64, 64, WindowHints()), $d));
 }
 
 test console_ctrl_c_toggles
@@ -64,7 +65,7 @@ test console_enter_dispatches_command
     consoleToggle($d);
     $d->dispatch(Char(104));
     $d->dispatch(Char(105));
-    $d->dispatch(Key(key::ENTER, 0, key::RELEASE, 0));
+    $d->dispatch(Key(.enter, 0, .release, 0));
     assert($caught->n == 1, 'once');
     assert($caught->raw == 'hi', 'raw');
     assert($c->line() == '', 'cleared');
@@ -77,7 +78,7 @@ test console_backspace_trims
     consoleToggle($d);
     $d->dispatch(Char(65));
     $d->dispatch(Char(66));
-    $d->dispatch(Key(key::BACKSPACE, 0, key::PRESS, 0));
+    $d->dispatch(Key(.backspace, 0, .press, 0));
     assert($c->line() == 'A', 'trimmed');
 }
 
@@ -88,13 +89,13 @@ test console_history_up_down
     consoleToggle($d);
     $c->submit('one');
     $c->submit('two');
-    $d->dispatch(Key(key::UP, 0, key::RELEASE, 0));
+    $d->dispatch(Key(.up, 0, .release, 0));
     assert($c->line() == 'two', 'last');
-    $d->dispatch(Key(key::UP, 0, key::RELEASE, 0));
+    $d->dispatch(Key(.up, 0, .release, 0));
     assert($c->line() == 'one', 'prev');
-    $d->dispatch(Key(key::DOWN, 0, key::RELEASE, 0));
+    $d->dispatch(Key(.down, 0, .release, 0));
     assert($c->line() == 'two', 'next');
-    $d->dispatch(Key(key::DOWN, 0, key::RELEASE, 0));
+    $d->dispatch(Key(.down, 0, .release, 0));
     assert($c->line() == '', 'past end');
 }
 
@@ -114,8 +115,8 @@ test console_ctrl_c_stops_other_key_handlers
 test console_toggle_claims_and_releases_input
 {
     Dispatcher $d = Dispatcher();
-    Window $w = Window('console', 64, 64);
-    Input $in = Input($w, $d);
+    Window $w = Window('console', 64, 64, WindowHints());
+    InputHub $in = InputHub($w, $d);
     DebugConsole $c = DebugConsole($d, $in);
     assert($in->unclaimed(), 'free');
     consoleToggle($d);
@@ -129,8 +130,8 @@ test console_toggle_claims_and_releases_input
 test console_toggle_stays_off_when_claim_is_taken
 {
     Dispatcher $d = Dispatcher();
-    Window $w = Window('console', 64, 64);
-    Input $in = Input($w, $d);
+    Window $w = Window('console', 64, 64, WindowHints());
+    InputHub $in = InputHub($w, $d);
     guard $in->claim('camera') else ($e) {
         die($e->message());
     }

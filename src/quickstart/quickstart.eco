@@ -1,15 +1,16 @@
 /**
  * Prototyping harness: window + loop + pipeline behind closures.
- * Not for large apps. Cuts corners (die at the process edge).
+ * Not for large apps.
+ * Cuts corners (die at the process edge).
  */
 
 namespace visu::quickstart;
 
-use std::env;
 use visu::app::{HostError, Paths, Services, bootstrap};
 use visu::instrument::{DeviceSource, LoopSource};
-use visu::os::{init, terminate};
+use visu::os::{init, requestStop, resourceRoot, terminate};
 use visu::runtime::{GameLoop, registerMain, unregisterMain};
+use visu::signal::{Flow, Resume};
 
 public class Quickstart
 {
@@ -23,7 +24,7 @@ public class Quickstart
         $configure($options);
         $this->options = $options;
 
-        Services $services = $options->services ?? bootstrap(Paths(root: env::cwd()), function(Services $s) : void {
+        Services $services = $options->services ?? bootstrap(Paths(root: resourceRoot()), function(Services $s) : void {
         });
         
         $this->app = App($options, $services);
@@ -44,10 +45,10 @@ public class Quickstart
     }
 
     /**
-     * glfwInit, initialize the window, ready(), run the loop, tear
-     * down. Dies on HostError — this is the process edge.
+     * Bring the window and loop up.
+     * Called from os::run start.
      */
-    public function run() : void
+    public function prepare() : void
     {
         guard init() else ($e) {
             die($e->message());
@@ -60,8 +61,26 @@ public class Quickstart
 
         registerMain($this->app->events);
         $this->app->ready();
-        $this->loop->start();
+        $this->loop->prepare();
+        GameLoop $loop = $this->loop;
+        $this->app->dispatcher->register<Resume>(function(const Resume& $signal) : Flow {
+            $loop->prepare();
+            return .proceed;
+        });
+    }
 
+    public function tick() : void
+    {
+        if ($this->app->shouldStop()) {
+            requestStop();
+            return;
+        }
+
+        $this->loop->pulse();
+    }
+
+    public function shutdown() : void
+    {
         HostError $fail = $this->app->host->fail;
         $this->app->destroy();
         unregisterMain();
@@ -70,5 +89,25 @@ public class Quickstart
         if ($fail->failed()) {
             die($fail->message());
         }
+    }
+
+    /**
+     * Process edge.
+     * os::run: prepare after the host is up (iOS: after the key window exists), tick until requestStop.
+     */
+    public function run() : void
+    {
+        Quickstart $qs = $this;
+        visu::os::run(
+            function() : void {
+                $qs->prepare();
+            },
+            function() : void {
+                $qs->tick();
+            },
+            function() : void {
+                $qs->shutdown();
+            }
+        );
     }
 }

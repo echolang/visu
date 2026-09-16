@@ -1,0 +1,65 @@
+/**
+ * Drives the active entity when it has an `OrbitCamera`.
+ * Uses `InputHub.mouseDelta` / `mouseWheel` so it can live in the example module (signal `Queue` is not part of visu's public surface).
+ */
+
+use visu::components::OrbitCamera;
+use visu::ecs::{Entities, Entity, System};
+use visu::geo::Transform;
+use visu::graphics::Context;
+use visu::math::Vec2;
+use visu::os::input::InputHub;
+use visu::system::CameraSystem;
+
+public class OrbitCameraSystem : System
+{
+    public CameraSystem $cameras;
+    private InputHub $input;
+
+    public constructor(InputHub $input, CameraSystem $cameras)
+    {
+        $this->cameras = $cameras;
+        $this->input = $input;
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function update(Entities $entities) : void
+    {
+        Entity $active = $this->cameras->activeCamera;
+
+        if (!$this->cameras->valid($entities, $active)) {
+            return;
+        }
+
+        if (!$entities->has<OrbitCamera>($active)) {
+            return;
+        }
+
+        OrbitCamera& $orbit = $entities->get<OrbitCamera>($active);
+        Transform& $transform = $entities->get<Transform>($active);
+
+        if ($this->input->unclaimed()) {
+            if ($this->input->pointerDown() && !$this->input->pointerPressed()) {
+                Vec2 $delta = $this->input->mouseDelta();
+                $orbit->impulse->x = $orbit->impulse->x - $delta->x * $orbit->lookSpeed;
+                $orbit->impulse->y = $orbit->impulse->y - $delta->y * $orbit->lookSpeed;
+            }
+
+            Vec2 $wheel = $this->input->mouseScroll();
+            $orbit->slide = $orbit->slide - $wheel->y * $orbit->zoom * $orbit->distance;
+        }
+
+        $orbit->coast($this->input, $transform);
+    }
+
+    public function render(Entities $entities, const Context& $ctx) : void
+    {
+    }
+}

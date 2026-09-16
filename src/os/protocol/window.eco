@@ -1,0 +1,86 @@
+/**
+ * Compile-time window / host checklist.
+ * Each OS arm writes `: WindowProtocol` so a missing method fails at the class.
+ * Not a runtime switch: call sites still hold Window.
+ * Desktop-only methods (title, decorations, cursor, keyState) live on the GLFW class and are not listed here.
+ * InputHub owns pointer state; it does not read a window cursor.
+ */
+
+namespace visu::os;
+
+use visu::graphics::{Device, DeviceError, RenderTarget};
+use visu::math::Vec2;
+
+public interface WindowProtocol
+{
+
+    /**
+     * Construct does not create the OS resource; this does.
+     * Initializes the Device, builds the GPU surface, and attaches it.
+     */
+    function initialize(Device $device) : status<WindowError>;
+
+    /**
+     * Whether initialize ran and destroy has not.
+     * Queries that talk to the OS resource assert until this is true.
+     */
+    const function initialized() : bool;
+
+    /**
+     * Drop the GPU surface then the OS window.
+     * Idempotent.
+     */
+    function destroy() : void;
+
+    /**
+     * Drain queued OS events.
+     * GLFW: glfwPollEvents between will/did.
+     * Mobile: flush the host queue between will and did.
+     */
+    function poll() : void;
+
+    /**
+     * Submit and present.
+     * Window.swap is Device.endFrame.
+     */
+    function swap() : status<DeviceError>;
+
+    /**
+     * Desktop: the chrome close flag.
+     * Mobile: the app asked to stop.
+     */
+    const function shouldClose() : bool;
+
+    function setShouldClose(bool $value) : void;
+
+    const function width() : int32;
+
+    const function height() : int32;
+
+    const function size() : Vec2;
+
+    const function framebufferSize() : Vec2;
+
+    const function framebufferWidth() : int32;
+
+    const function framebufferHeight() : int32;
+
+    /**
+     * Unobscured inset in window coordinates.
+     * Zeros on desktop.
+     */
+    const function safeArea() : Insets;
+
+    /**
+     * Colour 0 is the backbuffer while a frame is open.
+     */
+    function renderTarget() : RenderTarget;
+
+    function setVsync(bool $on) : void;
+
+    /**
+     * InputHub is the usual handler.
+     * Set before or after initialize.
+     */
+    function setHandler(WindowEventHandler $handler) : void;
+}

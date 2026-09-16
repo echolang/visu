@@ -2,7 +2,7 @@
  * GBuffer writes. Four attachments, the cap visu's render passes
  * allow, so metallic and roughness ride in alpha channels:
  *
- *   0 rgba32f  xyz world position
+ *   0 rgba16f  xyz world position
  *   1 rgba16f  xyz world normal
  *   2 rgba8    rgb albedo, a metallic
  *   3 rgba16f  rgb emissive, a roughness

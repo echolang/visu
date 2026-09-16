@@ -245,7 +245,7 @@ fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _525 [[buffer
     float3 diffuseIBL = float3(0.0);
     diffuseIBL = float3(0.02999999932944774627685546875) * s.albedo;
     float3 specIBL = float3(0.0);
-    float maxLod = fast::max(_538.u_ibl.y - 1.0, 0.0);
+    float maxLod = fast::max(_538.u_ibl.y - 2.0, 0.0);
     float3 env = environment_cubemap.sample(environment_cubemapSmplr, R, level(s.roughness * maxLod)).xyz;
     specIBL = env * F;
     ambient = ((kD * diffuseIBL) * s.ao) + (specIBL * s.ao);

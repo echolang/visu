@@ -1,11 +1,23 @@
 /**
- * Real GLFW window. Hidden, so it can run without a click. Skip on
- * machines without a display via --filter group:glfw.
+ * Real GLFW window. Hidden, so it can run without a click.
+ * Skip on machines without a display via --filter group:glfw.
  */
 
 use visu::os::{Window, WindowHints, init, terminate, WindowError, WindowAttrib};
 use visu::graphics::{AdapterInfo, Device};
 use visu::app::{Logger, installLogger, uninstallLogger};
+
+#[if: os != ios]
+test window_safe_area_is_zero_on_desktop
+{
+    Window $window = Window('tap', 64, 64, WindowHints());
+    visu::os::Insets $area = $window->safeArea();
+    assert($area->left == 0.0f, 'l');
+    assert($area->top == 0.0f, 't');
+    assert($area->right == 0.0f, 'r');
+    assert($area->bottom == 0.0f, 'b');
+}
+#[end]
 
 test device_headless_construct_is_safe
 {
@@ -15,6 +27,7 @@ test device_headless_construct_is_safe
     assert(!$device->surfaceLost(), 'no instance, no vk calls');
 }
 
+#[if: os != ios]
 #[group: "glfw"]
 test window_initialize_sets_title_and_size
 {
@@ -51,7 +64,9 @@ test window_initialize_sets_title_and_size
     $state->shutdown();
     terminate();
 }
+#[end]
 
+#[if: os != ios]
 #[group: "glfw"]
 test window_initialize_twice_is_already_initialized
 {
@@ -154,10 +169,11 @@ test window_cursor_mode_and_key_state
 
     $window->setCursorMode(.normal);
     assert($window->cursorMode() == visu::os::CursorMode::normal, 'normal');
-    assert($window->keyState(visu::os::key::SPACE) == visu::os::key::RELEASE, 'key up');
-    assert($window->buttonState(visu::os::mouse::LEFT) == visu::os::key::RELEASE, 'button up');
+    assert($window->keyState(.space) == visu::os::input::KeyPhase::release, 'key up');
+    assert($window->buttonState(.left) == visu::os::input::KeyPhase::release, 'button up');
     $window->cursor();
     $window->destroy();
     $state->shutdown();
     terminate();
 }
+#[end]

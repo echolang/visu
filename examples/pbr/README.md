@@ -9,7 +9,15 @@ echoc run -m examples --target pbr --define VISU_FINITE
 echoc run -m examples --target pbr --define VISU_BACKEND_VULKAN
 ```
 
-Hold the left mouse button to look, WASD to fly.
+Hold the left mouse button to orbit, scroll wheel to zoom. On iOS,
+one finger orbits and pinch zooms. Same source is `$qs->run()`.
+
+```bash
+echoc build -m examples --target pbr --target-os ios
+./examples/ios/pack.sh examples/ecobuild/pbr --resources examples/pbr/resources
+xcrun simctl install booted var/Visu.app
+xcrun simctl launch booted com.echolibs.visu
+```
 
 ## The environment map
 
@@ -29,6 +37,6 @@ another name.
 
 ## Debug output
 
-`--define VISU_PBR_DUMP` writes the last frame to `var/` (scene,
-GBuffer albedo, light pass) so the render can be inspected without a
-window.
+`--define VISU_PBR_DUMP` writes the last IBL-ready frame to `var/`
+(or the iOS documents directory): scene, GBuffer albedo, light pass,
+so the render can be inspected without a window.

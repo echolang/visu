@@ -1,7 +1,7 @@
 /**
- * GLFW lifetime. Call init before creating a window; terminate after
- * the last one is gone. Hands GLFW the Vulkan loader before glfwInit
- * so MoltenVK is found on Darwin.
+ * GLFW lifetime.
+ * Call init before creating a window; terminate after the last one is gone.
+ * Hands GLFW the Vulkan loader before glfwInit so MoltenVK is found on Darwin.
  */
 
 namespace visu::os;
@@ -30,6 +30,40 @@ public function init() : status<OsError>
 public function terminate() : void
 {
     glfw::terminate();
+}
+
+public function resourceRoot() : string
+{
+    return std::env::cwd();
+}
+
+public function writableRoot() : string
+{
+    return 'var';
+}
+
+internal class Pump
+{
+    public static bool $halt = false;
+}
+
+/**
+ * Process edge.
+ * start, then tick until requestStop, then stop.
+ */
+public function run(function<void()> $start, function<void()> $tick, function<void()> $stop) : void
+{
+    Pump::$halt = false;
+    $start();
+    while (!Pump::$halt) {
+        $tick();
+    }
+    $stop();
+}
+
+public function requestStop() : void
+{
+    Pump::$halt = true;
 }
 
 internal function glfwFlag(bool $value) : int32

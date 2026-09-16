@@ -28,9 +28,9 @@ public const uint32 TEXTURE_TRANSFER_SRC = 4;
 public const uint32 TEXTURE_TRANSFER_DST = 8;
 
 /**
- * What the texture is shaped like. A cube is six square array
- * slices in the order +X -X +Y -Y +Z -Z; sampling takes a direction,
- * so wrap modes never apply to it.
+ * What the texture is shaped like.
+ * A cube is six square array slices in the order +X -X +Y -Y +Z -Z.
+ * Sampling takes a direction, so wrap modes never apply to it.
  */
 public enum TextureKind
 {
@@ -70,7 +70,9 @@ public struct SamplerDesc
     public Wrap $wrapS = .clampToEdge;
     public Wrap $wrapT = .clampToEdge;
 
-    /** the Device sampler cache key; a call inside a hole is plain text */
+    /**
+     * Device sampler cache key. A call inside a string hole is plain text, so the filter and wrap codes are locals.
+     */
     public const function key() : string
     {
         int32 $min = filterCode($this->min);
@@ -87,7 +89,10 @@ public struct ColorTarget
     public LoadOp $load = .load;
     public StoreOp $store = .store;
     public Vec4 $clear;
-    /** array slice; a cube face is a slice */
+
+    /**
+     * Array slice. A cube face is a slice.
+     */
     public int32 $face = 0;
     public int32 $mip = 0;
 
@@ -101,7 +106,9 @@ public struct ColorTarget
         $this->mip = 0;
     }
 
-    /** one face and mip of a cube or mipped texture */
+    /**
+     * Color target that writes one face and mip of a cube or mipped texture.
+     */
     public constructor(Texture $texture, face: int32 $face, int32 $mip = 0)
     {
         $this->texture = $texture;
@@ -112,7 +119,9 @@ public struct ColorTarget
         $this->mip = $mip;
     }
 
-    /** render area of the mip this target writes, not of mip 0 */
+    /**
+     * Pixel width of the mip this target writes, not of mip 0.
+     */
     public const function width() : int32
     {
         return mipSize($this->texture->desc->width, $this->mip);
@@ -123,7 +132,9 @@ public struct ColorTarget
         return mipSize($this->texture->desc->height, $this->mip);
     }
 
-    /** the face and mip have to exist; the fields are public and set late */
+    /**
+     * Assert the face and mip exist. The fields are public and can be set after construct.
+     */
     public const function validate() : void
     {
         assert($this->face >= 0 && $this->face < $this->texture->layers(), 'beginRender face');
@@ -177,15 +188,19 @@ public struct TargetFormats
         uint32 $i = 0;
 
         while ($i < $this->colorCount) {
-            $out = "{$out}{pixelCode($this->colors[$i])}|";
+            int32 $color = pixelCode($this->colors[$i]);
+            $out = "{$out}{$color}|";
             $i = $i + 1;
         }
 
+        int32 $sample = sampleCode($this->samples);
+
         if (!$this->hasDepth) {
-            return "{$out}-|{sampleCode($this->samples)}";
+            return "{$out}-|{$sample}";
         }
 
-        return "{$out}{pixelCode($this->depth)}|{sampleCode($this->samples)}";
+        int32 $depth = pixelCode($this->depth);
+        return "{$out}{$depth}|{$sample}";
     }
 }
 
@@ -213,8 +228,8 @@ public enum AdapterKind
 }
 
 /**
- * GPU identity for boot logs and debug overlays. Headless
- * construct fills `$api` only; `initialize` fills the rest.
+ * GPU identity for boot logs and debug overlays.
+ * Headless construct fills `$api` only; `initialize` fills the rest.
  */
 public struct AdapterInfo
 {
@@ -225,7 +240,7 @@ public struct AdapterInfo
     public AdapterKind $kind = .unknown;
 
     /**
-     * `Metal — Apple M4 Pro` / `Vulkan 1.2 — Apple M4 Pro`.
+     * One-line GPU identity for logs. Backend and version, then the adapter name.
      */
     public const function line() : string
     {
@@ -247,9 +262,8 @@ public struct AdapterInfo
 }
 
 /**
- * GPU memory snapshot for instruments. `$budget` is 0 when
- * unknown. Metal fills driver numbers; Vulkan counts Device-owned
- * allocations against the device-local heap size.
+ * GPU memory snapshot for instruments. `$budget` is 0 when unknown.
+ * Metal fills driver numbers; Vulkan counts Device-owned allocations against the device-local heap size.
  */
 public struct MemoryStats
 {
@@ -258,7 +272,9 @@ public struct MemoryStats
     public bool $unified = false;
 }
 
-/** size of mip `$level` of a `$size`-wide image, never below one */
+/**
+ * Size of mip `$level` of a `$size`-wide image, never below one.
+ */
 public function mipSize(int32 $size, int32 $level) : int32
 {
     int32 $out = $size >> $level;
@@ -270,7 +286,9 @@ public function mipSize(int32 $size, int32 $level) : int32
     return $out;
 }
 
-/** how many mips a `$width` by `$height` image can carry */
+/**
+ * How many mips a `$width` by `$height` image can carry.
+ */
 public function mipCount(int32 $width, int32 $height) : int32
 {
     int32 $largest = $width;

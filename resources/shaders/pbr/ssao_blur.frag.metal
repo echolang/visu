@@ -19,14 +19,14 @@ fragment fs_out fs(fs_in in [[stage_in]], texture2d<float> ssao_noisy [[texture(
     fs_out out = {};
     float2 texel = float2(1.0) / float2(int2(ssao_noisy.get_width(), ssao_noisy.get_height()));
     float total = 0.0;
-    for (int x = -2; x <= 1; x++)
+    for (int x = -3; x <= 3; x++)
     {
-        for (int y = -2; y <= 1; y++)
+        for (int y = -3; y <= 3; y++)
         {
             total += ssao_noisy.sample(ssao_noisySmplr, (in.v_uv + (float2(float(x), float(y)) * texel))).x;
         }
     }
-    out.frag_ao = total / 16.0;
+    out.frag_ao = total / 49.0;
     return out;
 }
 

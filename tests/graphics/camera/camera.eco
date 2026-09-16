@@ -3,7 +3,8 @@
  * No GPU calls.
  */
 
-use visu::geo::{Pose, Ray};
+use visu::ecs::Entities;
+use visu::geo::{Pose, Ray, Transform};
 use visu::graphics::{Camera, CameraData, CameraUniforms, Projection};
 use visu::math::{Mat4, Quat, Vec2, Vec3, Vec4, length};
 
@@ -115,4 +116,44 @@ test camera_frustum_contains_what_is_in_front
     assert($data->frustum->contains(Vec3(0.0f, 0.0f, -10.0f), 1.0f), 'ahead');
     assert(!$data->frustum->contains(Vec3(0.0f, 0.0f, 10.0f), 1.0f), 'behind');
     assert(!$data->frustum->contains(Vec3(500.0f, 0.0f, -10.0f), 1.0f), 'far off to the side');
+}
+
+test camera_spawn_attaches_camera_and_transform
+{
+    Entities $world = Entities();
+    $entity = Camera::spawn($world, Vec3(1.0f, 2.0f, 3.0f));
+    assert($world->has<Camera>($entity), 'camera');
+    assert($world->has<Transform>($entity), 'transform');
+    Transform& $transform = $world->get<Transform>($entity);
+    assert($transform->position->x == 1.0f, 'x');
+    assert($transform->position->z == 3.0f, 'z');
+    Camera& $camera = $world->get<Camera>($entity);
+    assert($camera->mode == Projection::perspective, 'perspective');
+}
+
+test camera_orthographic_static_world_sets_height
+{
+    Camera $camera = Camera(orthographicStaticWorld: 180.0f);
+    assert($camera->mode == Projection::orthographicStaticWorld, 'mode');
+    assert($camera->staticWorldHeight == 180.0f, 'height');
+    $vp = $camera->viewport(200, 100, 1.0f, 1.0f);
+    assert($vp->top == 90.0f, 'half height');
+    assert($vp->right == 180.0f, 'aspect 2:1');
+}
+
+test camera_orthographic_screen_can_flip_y
+{
+    Camera $camera = Camera(orthographicScreen: true);
+    assert($camera->mode == Projection::orthographicScreen, 'mode');
+    assert($camera->flipViewportY, 'flip');
+    assert($camera->orthographic(), 'ortho');
+}
+
+test camera_spawn_attaches_a_static_world_camera
+{
+    Entities $world = Entities();
+    $entity = Camera::spawn($world, Vec3(0.0f, 0.0f, 0.0f), Camera(orthographicStaticWorld: 100.0f));
+    Camera& $camera = $world->get<Camera>($entity);
+    assert($camera->mode == Projection::orthographicStaticWorld, 'mode');
+    assert($camera->staticWorldHeight == 100.0f, 'height');
 }

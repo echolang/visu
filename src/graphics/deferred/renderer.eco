@@ -1,11 +1,8 @@
 /**
- * Deferred PBR: fill a packed GBuffer, shade it once, blit the
- * result. Not an ECS system — the app owns one and calls `render`
- * with the geometry it wants in the buffer, so the same renderer
- * serves an ECS scene and a hand-rolled one.
+ * Deferred PBR: fill a packed GBuffer, shade it once, blit the result.
+ * Not an ECS system; the app owns one and calls `render` with the geometry it wants in the buffer, so the same renderer serves an ECS scene and a hand-rolled one.
  *
- * Programs come from the module bake (`tools/shaders.php --bake`),
- * so nothing has to ship shader files.
+ * Programs come from the module bake (`tools/shaders.php --bake`), so nothing has to ship shader files.
  */
 
 namespace visu::graphics;
@@ -15,12 +12,22 @@ use visu::math::Vec4;
 public class DeferredRenderer
 {
     public DirectionalLight $sun;
-    /** shows wherever no geometry drew, until a skybox covers it */
+
+    /**
+     * Shows wherever no geometry drew, until a skybox covers it.
+     */
     public Vec4 $background;
-    /** draw the environment cube behind the scene */
+
+    /**
+     * Draw the environment cube behind the scene.
+     */
     public bool $renderSkybox;
-    /** null quality means off */
+
+    /**
+     * Null quality means off.
+     */
     public SsaoQuality? $ssao;
+    public IblQuality $ibl;
     public Device $device;
     private DeferredGpu? $gpu;
     private Environment? $environment;
@@ -31,12 +38,15 @@ public class DeferredRenderer
         $this->background = Vec4(0.05f, 0.05f, 0.06f, 1.0f);
         $this->renderSkybox = true;
         $this->ssao = SsaoQuality::ultra();
+        $this->ibl = IblQuality();
         $this->device = $device;
         $this->gpu = null;
         $this->environment = null;
     }
 
-    /** links the programs and builds the fallback textures */
+    /**
+     * Links the programs and builds the fallback textures.
+     */
     public function load() : status<ShaderError>
     {
         DeferredGpu $gpu = guard DeferredGpu::load($this->device) else ($e) {
@@ -47,35 +57,36 @@ public class DeferredRenderer
     }
 
     /**
-     * Takes an equirectangular HDRI and bakes it into a cubemap on
-     * the next frame. Takes ownership of `$equirect`; it is released
-     * once the bake has retired from the GPU.
+     * Takes an equirectangular HDRI and bakes it into a cubemap on the next frame.
+     * Takes ownership of `$equirect`; it is released once the bake has retired from the GPU.
      */
     public function setEnvironment(hdri: Texture $equirect, int32 $size = 1024) : void
     {
         assert($this->gpu != null, 'setEnvironment before load');
         $this->dropEnvironment();
-        $this->environment = Environment(hdri: $this->device, $equirect, $size);
+        $this->environment = Environment(hdri: $this->device, $equirect, $size, $this->ibl);
     }
 
     /**
-     * An already-baked cube. Takes ownership of `$cube`; the renderer
-     * will destroy it.
+     * An already-baked cube. Takes ownership of `$cube`; the renderer will destroy it.
      */
     public function setEnvironment(Texture $cube) : void
     {
         assert($this->gpu != null, 'setEnvironment before load');
         $this->dropEnvironment();
-        $this->environment = Environment($this->device, $cube);
+        $this->environment = Environment($this->device, $cube, $this->ibl);
     }
 
-    /** re-bake the lighting maps on the next frame */
+    /**
+     * Re-bake the lighting maps on the next frame.
+     */
     public function invalidateIbl() : void
     {
         Environment $env = guard $this->environment else {
             return;
         }
         $env->iblReady = false;
+        $env->iblStep = 0;
     }
 
     public const function hasEnvironment() : bool
@@ -83,10 +94,17 @@ public class DeferredRenderer
         return $this->environment != null;
     }
 
+    public const function iblReady() : bool
+    {
+        Environment $env = guard $this->environment else {
+            return false;
+        }
+        return $env->iblReady;
+    }
+
     /**
-     * Adds the deferred passes for this frame. `$fill` runs between
-     * the GBuffer allocation and the shading pass; add the geometry
-     * passes there, writing `$gbuffer->target`.
+     * Adds the deferred passes for this frame. `$fill` runs between the GBuffer allocation and the shading pass;
+     * add the geometry passes there, writing `$gbuffer->target`.
      */
     public function render(
         Context $ctx,
@@ -144,8 +162,7 @@ public class DeferredRenderer
     }
 
     /**
-     * The common fill: cull/sort the assembler and draw it into the
-     * GBuffer with the instanced geometry program.
+     * The common fill: cull/sort the assembler and draw it into the GBuffer with the instanced geometry program.
      */
     public function draw<P>(
         Context $ctx,
@@ -184,7 +201,9 @@ public class DeferredRenderer
         ));
     }
 
-    /** a linked program by its baked name, e.g. 'skybox' or 'hdri_to_cubemap' */
+    /**
+     * Fetches a linked program by its baked name, e.g. 'skybox' or 'hdri_to_cubemap'.
+     */
     public function program(string $name) : result<ShaderProgram, ShaderError>
     {
         assert($this->gpu != null, 'DeferredRenderer.program before load');
@@ -192,7 +211,9 @@ public class DeferredRenderer
         return $gpu->shaders->program($name);
     }
 
-    /** the pass a geometry filler draws with, joined to its own layout */
+    /**
+     * The pass a geometry filler draws with, joined to its own layout.
+     */
     public function geometryPass(const VertexLayout& $layout) : GpuPass
     {
         assert($this->gpu != null, 'DeferredRenderer.geometryPass before load');

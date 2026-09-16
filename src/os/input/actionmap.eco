@@ -1,0 +1,189 @@
+/**
+ * Named actions bound to a key, a mouse button, or a virtual click (press then release without travelling far).
+ * A matching handle consumes the signal (`Flow::stop`).
+ * Analog (composite WASD, virtual stick, control schemes) is the next layer; putting `evaluate(const InputHub&)` on this type currently trips an Echo `size<T>` instantiation limit.
+ */
+
+namespace visu::os::input;
+
+use visu::signal::{Click, Flow};
+
+public enum Binding
+{
+    case key(Key $code);
+    case button(MouseButton $code);
+    case click;
+
+    public const function label() : string
+    {
+        return match ($this) {
+            .key($code) => "key {$code->value()}",
+            .button($code) => "button {$code->value()}",
+            .click => 'click',
+        };
+    }
+}
+
+public class ActionMap
+{
+    private map<int32, string> $keys;
+    private map<int32, string> $buttons;
+    private string? $click;
+    private map<string, bool> $didPress;
+    private map<string, bool> $didRelease;
+    private map<string, bool> $held;
+
+    public constructor()
+    {
+        $this->keys = map<int32, string>();
+        $this->buttons = map<int32, string>();
+        $this->click = null;
+        $this->didPress = map<string, bool>();
+        $this->didRelease = map<string, bool>();
+        $this->held = map<string, bool>();
+    }
+
+    public function bind(string $action, Binding $binding) : status<InputError>
+    {
+        return match ($binding) {
+            .key($code) => $this->bindKey($action, $code),
+            .button($code) => $this->bindButton($action, $code),
+            .click => $this->bindClick($action),
+        };
+    }
+
+    public const function pressed(string $action) : bool
+    {
+        return $this->didPress->has($action);
+    }
+
+    public const function released(string $action) : bool
+    {
+        return $this->didRelease->has($action);
+    }
+
+    public const function down(string $action) : bool
+    {
+        if (!$this->held->has($action)) {
+            return false;
+        }
+
+        return $this->held->get($action);
+    }
+
+    public const function up(string $action) : bool
+    {
+        return !$this->down($action);
+    }
+
+    /**
+     * Drop per-tick edges.
+     * Held state stays.
+     */
+    public function reset() : void
+    {
+        $this->didPress->clear();
+        $this->didRelease->clear();
+    }
+
+    public function handle(const visu::signal::Key& $signal) : Flow
+    {
+        int32 $id = $signal->key->value();
+        if (!$this->keys->has($id)) {
+            return .proceed;
+        }
+
+        string $action = $this->keys->get($id);
+        $this->note($action, $signal->phase);
+        return .stop;
+    }
+
+    /**
+     * Held state only, no press / release edge.
+     */
+    internal function track(const visu::signal::Key& $signal) : void
+    {
+        int32 $id = $signal->key->value();
+        if (!$this->keys->has($id)) {
+            return;
+        }
+
+        string $action = $this->keys->get($id);
+        $this->held[$action] = $signal->phase->down();
+    }
+
+    public function handle(const visu::signal::MouseButton& $signal) : Flow
+    {
+        int32 $id = $signal->button->value();
+        if (!$this->buttons->has($id)) {
+            return .proceed;
+        }
+
+        string $action = $this->buttons->get($id);
+        $this->note($action, $signal->phase);
+        return .stop;
+    }
+
+    internal function track(const visu::signal::MouseButton& $signal) : void
+    {
+        int32 $id = $signal->button->value();
+        if (!$this->buttons->has($id)) {
+            return;
+        }
+
+        string $action = $this->buttons->get($id);
+        $this->held[$action] = $signal->phase->down();
+    }
+
+    public function handle(const Click& $signal) : Flow
+    {
+        string $action = guard $this->click else {
+            return .proceed;
+        }
+        $this->didRelease[$action] = true;
+        return .stop;
+    }
+
+    private function bindKey(string $action, Key $code) : status<InputError>
+    {
+        int32 $id = $code->value();
+        if ($this->keys->has($id)) {
+            return .error(.taken(.key($code), $this->keys->get($id)));
+        }
+
+        $this->keys[$id] = $action;
+        return .ok;
+    }
+
+    private function bindButton(string $action, MouseButton $code) : status<InputError>
+    {
+        int32 $id = $code->value();
+        if ($this->buttons->has($id)) {
+            return .error(.taken(.button($code), $this->buttons->get($id)));
+        }
+
+        $this->buttons[$id] = $action;
+        return .ok;
+    }
+
+    private function bindClick(string $action) : status<InputError>
+    {
+        string $existing = guard $this->click else {
+            $this->click = $action;
+            return .ok;
+        }
+
+        return .error(.taken(.click, $existing));
+    }
+
+    private function note(string $action, KeyPhase $phase) : void
+    {
+        if ($phase == KeyPhase::press) {
+            $this->didPress[$action] = true;
+        } else if ($phase == KeyPhase::release) {
+            $this->didRelease[$action] = true;
+        }
+
+        $this->held[$action] = $phase->down();
+    }
+}

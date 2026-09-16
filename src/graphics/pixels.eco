@@ -1,6 +1,5 @@
 /**
- * CPU-side rgba8 image, top-left origin. Swizzle of Device.readbackTexture
- * bytes, then PNG write / load for dump.
+ * CPU-side rgba8 image, top-left origin. Swizzle of Device.readbackTexture bytes, then PNG write / load for dump.
  */
 
 namespace visu::graphics;
@@ -14,10 +13,8 @@ public struct Pixels
     public array<uint8> $rgba;
 
     /**
-     * Native readback bytes → packed rgba8. rgba8 / rgba8Srgb
-     * identity, bgra8 swaps R/B, r8 expands to gray. Float formats
-     * clamp to 0..1 — enough to eyeball a GBuffer or an IBL bake,
-     * not a tone mapper.
+     * Native readback bytes to packed rgba8. rgba8 / rgba8Srgb identity; bgra8 swaps R/B; r8 expands to gray.
+     * Float formats clamp to 0..1; enough to eyeball a GBuffer or an IBL bake, not a tone mapper.
      */
     public static function from(
         PixelFormat $format,
@@ -135,7 +132,9 @@ internal function pixelsSwizzle(
     return .error(.unsupported($format));
 }
 
-/** 0..1 clamp then 8-bit quantize; missing channels read black, alpha opaque */
+/**
+ * Clamp `$value` to 0..1 then quantize to 8-bit. Missing channels read black; alpha is opaque.
+ */
 internal function pixelsChannelByte(float32 $value) : uint8
 {
     if ($value <= 0.0f) {
@@ -204,9 +203,8 @@ internal function pixelsFromFloat16(const array<uint8>& $raw, usize $channels) :
 }
 
 /**
- * IEEE float to half, truncating the mantissa. Subnormals flush to
- * zero and anything above the half range saturates at 65504, which is
- * what radiance data wants anyway.
+ * IEEE float to half, truncating the mantissa.
+ * Subnormals flush to zero and anything above the half range saturates at 65504, which is what radiance data wants anyway.
  */
 internal function pixelsFloatToHalf(float32 $value) : uint16
 {
@@ -231,7 +229,9 @@ internal function pixelsFloatToHalf(float32 $value) : uint16
     return ($sign | $exponent | $mantissa) as uint16;
 }
 
-/** IEEE half to float; denormals and NaN land on 0, which is fine for a dump */
+/**
+ * IEEE half to float. Denormals and NaN land on 0, which is fine for a dump.
+ */
 internal function pixelsHalfToFloat(uint16 $half) : float32
 {
     uint32 $exponent = (($half as uint32) >> 10) & 31;

@@ -1,28 +1,28 @@
 /**
- * Immediate-mode FlyUI. Widget calls append a packed node table;
- * endFrame lays out, then last-frame rects feed the next frame's
- * hits. Window-scoped — the app constructs one, like Input.
+ * Immediate-mode FlyUI.
+ * Widget calls append a packed node table; endFrame lays out, then last-frame rects feed the next frame's hits.
+ * Window-scoped; the app constructs one, like InputHub.
  */
 
 namespace visu::ui;
 
 use visu::graphics::{Device, Pipeline, TargetRef};
 use visu::math::Vec2;
-use visu::os::Input;
-use visu::os::mouse;
+use visu::os::input::{InputHub, Key};
 use visu::vg::{Canvas, Color, Font};
 
 public const string UI_CLAIM = 'flyui';
 
 internal struct FrameInput
 {
-    public Vec2 $mouse = Vec2(0.0f);
+    public Vec2 $pointer = Vec2(0.0f);
     public bool $leftPressed = false;
     public bool $leftReleased = false;
     public bool $leftDown = false;
+    public bool $hovering = false;
     public bool $consumed = false;
     public array<int32> $chars;
-    public int32 $key = 0;
+    public Key? $key = null;
 
     init
     {
@@ -51,12 +51,12 @@ public class Ui
     internal Vec2 $frame;
     internal float32 $scale;
     internal float64 $tick;
-    internal Input? $input;
+    internal InputHub? $input;
     internal UiBatch $batch;
     internal UiGpu? $gpu;
     private bool $dead;
 
-    public constructor(Device $device, Input? $input = null)
+    public constructor(Device $device, InputHub? $input = null)
     {
         $this->device = $device;
         $this->input = $input;
@@ -115,10 +115,11 @@ public class Ui
      */
     public function seed(Vec2 $mouse, bool $pressed, bool $released, bool $down = false) : void
     {
-        $this->io->mouse = $mouse;
+        $this->io->pointer = $mouse;
         $this->io->leftPressed = $pressed;
         $this->io->leftReleased = $released;
         $this->io->leftDown = $down;
+        $this->io->hovering = true;
     }
 
     public function seedChars(array<int32> $chars) : void
@@ -126,7 +127,7 @@ public class Ui
         $this->io->chars = $chars;
     }
 
-    public function seedKey(int32 $key) : void
+    public function seedKey(Key $key) : void
     {
         $this->io->key = $key;
     }
@@ -141,16 +142,17 @@ public class Ui
             $this->scale = 0.0001f;
         }
 
-        Input? $maybe = $this->input;
+        InputHub? $maybe = $this->input;
 
         if ($maybe != null) {
-            Input $in = guard $maybe;
-            $this->io->mouse = $in->cursor();
-            $this->io->leftPressed = $in->framePressed(button: mouse::LEFT);
-            $this->io->leftReleased = $in->frameReleased(button: mouse::LEFT);
-            $this->io->leftDown = $in->down(button: mouse::LEFT);
+            InputHub $in = guard $maybe;
+            $this->io->pointer = $in->pointer();
+            $this->io->leftPressed = $in->pointerPressed();
+            $this->io->leftReleased = $in->pointerReleased();
+            $this->io->leftDown = $in->pointerDown();
+            $this->io->hovering = $in->hovering();
             $this->io->chars = $in->frameChars();
-            $this->io->key = 0;
+            $this->io->key = null;
         }
 
         $this->io->consumed = false;
@@ -208,7 +210,7 @@ public class Ui
         $this->claimHover();
         $this->open = false;
         $this->io->chars = array<int32>();
-        $this->io->key = 0;
+        $this->io->key = null;
     }
 
     public function load(string $fontDir) : status<UiError>
@@ -481,7 +483,7 @@ public class Ui
 
         touchSlot($this->slots, $id);
         Slot $s = $this->slots[$id];
-        bool $over = contains($s->pos, $s->size, $this->io->mouse);
+        bool $over = contains($s->pos, $s->size, $this->io->pointer);
         bool $fire = false;
 
         if ($over && $this->io->leftDown) {
@@ -506,19 +508,28 @@ public class Ui
         $this->io->consumed = true;
     }
 
-    internal function pressedKey(int32 $code) : bool
+    internal function pressedKey(Key $code) : bool
     {
-        if ($this->io->key == $code) {
+        Key $seeded = guard $this->io->key else {
+            return $this->framePressedKey($code);
+        }
+
+        if ($seeded == $code) {
             return true;
         }
 
-        Input? $maybe = $this->input;
+        return $this->framePressedKey($code);
+    }
+
+    private function framePressedKey(Key $code) : bool
+    {
+        InputHub? $maybe = $this->input;
 
         if ($maybe == null) {
             return false;
         }
 
-        Input $in = guard $maybe;
+        InputHub $in = guard $maybe;
         return $in->framePressed($code);
     }
 
@@ -544,20 +555,22 @@ public class Ui
         while (!$this->hoverAny && $i < $n) {
             Node $node = $this->nodes[$i];
 
-            if (interactive($node->kind) && contains($node, $this->io->mouse)) {
+            if (interactive($node->kind) && contains($node, $this->io->pointer)
+                && ($this->io->leftDown || $this->io->hovering)
+            ) {
                 $this->hoverAny = true;
             }
 
             $i = $i + 1;
         }
 
-        Input? $maybe = $this->input;
+        InputHub? $maybe = $this->input;
 
         if ($maybe == null) {
             return;
         }
 
-        Input $in = guard $maybe;
+        InputHub $in = guard $maybe;
 
         if ($this->hoverAny) {
             if (!$this->holdsClaim) {
@@ -577,10 +590,10 @@ public class Ui
             return;
         }
 
-        Input? $maybe = $this->input;
+        InputHub? $maybe = $this->input;
 
         if ($maybe != null) {
-            Input $in = guard $maybe;
+            InputHub $in = guard $maybe;
             guard $in->release(UI_CLAIM) else {
                 $this->holdsClaim = false;
                 return;

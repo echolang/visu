@@ -243,7 +243,7 @@ fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _525 [[buffer
     float3 kS = F;
     float3 kD = (float3(1.0) - kS) * (1.0 - s.metallic);
     float3 diffuseIBL = float3(0.0);
-    float3 irradiance = ibl_irradiance_map.sample(ibl_irradiance_mapSmplr, s.N).xyz;
+    float3 irradiance = ibl_irradiance_map.sample(ibl_irradiance_mapSmplr, s.N, level(0.0)).xyz;
     diffuseIBL = (irradiance * s.albedo) / float3(3.1415927410125732421875);
     float3 specIBL = float3(0.0);
     float maxLod = fast::max(_538.u_ibl.x - 1.0, 0.0);

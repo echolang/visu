@@ -1,0 +1,396 @@
+/**
+ * Fullscreen iOS view.
+ * Construct matches the desktop Window so Host / Quickstart stay portable.
+ * No cursor, title, or decorations.
+ * Touches enqueue; poll() drains them between will and did.
+ */
+
+namespace visu::os;
+
+use visu::app::info;
+use visu::graphics::{Device, DeviceError, DeviceOptions, RenderTarget, Surface};
+use visu::math::Vec2;
+use visu::os::input::TouchPhase;
+
+internal extern {
+    function visu_ios_create_view as cCreateView(int32 $width, int32 $height) : ptr<uint8>;
+    function visu_ios_destroy_view as cDestroyView(ptr<uint8> $view) : void;
+    function visu_ios_view_size as cViewSize(ptr<uint8> $view, ptr<int32> $w, ptr<int32> $h) : void;
+    function visu_ios_view_fb as cViewFb(ptr<uint8> $view, ptr<int32> $w, ptr<int32> $h) : void;
+    function visu_ios_view_scale as cViewScale(ptr<uint8> $view) : float64;
+    function visu_ios_safe_area as cSafeArea(
+        ptr<uint8> $view,
+        ptr<float32> $left,
+        ptr<float32> $top,
+        ptr<float32> $right,
+        ptr<float32> $bottom
+    ) : void;
+    function visu_ios_set_hooks as cSetHooks(
+        extern function<void(int32, int32)> $resize,
+        extern function<void(int32, int32, float32, float32, float32)> $touch,
+        extern function<void()> $pause,
+        extern function<void()> $resume,
+        extern function<void(int32)> $focus
+    ) : void;
+}
+
+internal class IosWindow
+{
+    public static Window? $current = null;
+    public static array<HostEvent> $pending = array<HostEvent>();
+}
+
+internal function iosPost(HostEvent $event) : void
+{
+    Window $window = guard IosWindow::$current else {
+        array<HostEvent> $pending = IosWindow::$pending;
+        $pending->push($event);
+        IosWindow::$pending = $pending;
+        return;
+    }
+    $window->post($event);
+}
+
+internal function iosFlush() : void
+{
+    Window $window = guard IosWindow::$current else {
+        return;
+    }
+    $window->flush();
+}
+
+internal function iosEnqueueTouch(
+    int32 $id,
+    TouchPhase $phase,
+    float32 $x,
+    float32 $y,
+    float32 $force
+) : void
+{
+    iosPost(.touch($id, $phase, $x, $y, $force));
+}
+
+internal function iosResize(int32 $width, int32 $height) : void
+{
+    iosPost(.framebuffer($width, $height));
+}
+
+internal function iosTouch(int32 $id, int32 $phase, float32 $x, float32 $y, float32 $force) : void
+{
+    TouchPhase $kind = .began;
+    if ($phase == 1) {
+        $kind = .moved;
+    } else if ($phase == 2) {
+        $kind = .ended;
+    } else if ($phase == 3) {
+        $kind = .cancelled;
+    }
+    iosEnqueueTouch($id, $kind, $x, $y, $force);
+}
+
+internal function iosPause() : void
+{
+    iosPost(.pause);
+    iosFlush();
+}
+
+internal function iosResume() : void
+{
+    iosPost(.resume);
+    iosFlush();
+}
+
+internal function iosFocus(int32 $gained) : void
+{
+    iosPost(.focus($gained != 0));
+}
+
+public class Window : WindowProtocol
+{
+    private string $title;
+    private int32 $width;
+    private int32 $height;
+    private int32 $fbWidth;
+    private int32 $fbHeight;
+    public const WindowHints $hints;
+    private ptr<uint8> $view;
+    private RenderTarget $target;
+    private WindowEventHandler? $handler;
+    private Device? $device;
+    private EventQueue $events;
+    private bool $vsync;
+    private bool $close;
+    private Insets $insets;
+
+    public constructor(string $title, int32 $width, int32 $height, WindowHints $hints)
+    {
+        $this->title = $title;
+        $this->width = $width;
+        $this->height = $height;
+        $this->fbWidth = $width;
+        $this->fbHeight = $height;
+        $this->hints = $hints;
+        $this->view:$ = null;
+        $this->target = RenderTarget($width, $height);
+        $this->handler = null;
+        $this->device = null;
+        $this->events = EventQueue();
+        $this->vsync = true;
+        $this->close = false;
+        $this->insets = Insets();
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function initialize(Device $device) : status<WindowError>
+    {
+        if ($this->view:$ != null) {
+            return .error(.alreadyInitialized);
+        }
+
+        DeviceOptions $options = DeviceOptions();
+        $options->appName = $this->title;
+        $options->vsync = $this->vsync;
+        guard $device->initialize($options) else ($e) {
+            return .error(.device($e));
+        }
+
+        // size comes from the key window; the constructor values are unused
+        ptr<uint8> $created = cCreateView(0, 0);
+
+        if ($created:$ == null) {
+            return .error(.createFailed('no ui view'));
+        }
+
+        $this->view:$ = $created:$;
+        IosWindow::$current = $this;
+        cSetHooks(&iosResize, &iosTouch, &iosPause, &iosResume, &iosFocus);
+        Surface $surface = guard createSurface($this, $device) else ($e) {
+            $this->abandonView();
+            return .error(.device($e));
+        }
+
+        int32 $fbW = 0;
+        int32 $fbH = 0;
+        cViewFb($this->view, &$fbW, &$fbH);
+        $device->setContentsScale(cViewScale($this->view));
+        guard $device->attachSurface($surface, $fbW, $fbH) else ($e) {
+            $device->loseSurface();
+            $this->abandonView();
+            return .error(.device($e));
+        }
+
+        $this->fbWidth = $fbW;
+        $this->fbHeight = $fbH;
+        $this->device = $device;
+        $this->pullSize();
+        $this->pullInsets();
+        $this->syncTarget();
+        info("window: '{$this->title}' {$this->width}x{$this->height} (fb {$fbW}x{$fbH})");
+        return .ok;
+    }
+
+    public const function initialized() : bool
+    {
+        return $this->view:$ != null;
+    }
+
+    public function destroy() : void
+    {
+        if ($this->view:$ == null) {
+            return;
+        }
+
+        Device? $device = $this->device;
+
+        if ($device != null) {
+            Device $held = guard $device;
+            $held->waitIdle();
+            $held->loseSurface();
+            $this->device = null;
+        }
+
+        $this->abandonView();
+        $this->handler = null;
+    }
+
+    internal const function uiView() : ptr<uint8>
+    {
+        return $this->view;
+    }
+
+    public function swap() : status<DeviceError>
+    {
+        Device $device = guard $this->device else {
+            return .ok;
+        }
+        return $device->endFrame();
+    }
+
+    public function poll() : void
+    {
+        WindowEventHandler $handler = guard $this->handler else {
+            $this->takePending();
+            $this->flush();
+            return;
+        }
+        $handler->handleWillPoll($this);
+        $this->takePending();
+        $this->flush();
+        $handler->handleDidPoll($this);
+    }
+
+    public function post(HostEvent $event) : void
+    {
+        $this->events->post($event);
+    }
+
+    public function flush() : void
+    {
+        while (!$this->events->empty()) {
+            array<HostEvent> $batch = $this->events->take();
+            foreach ($batch as $event) {
+                applyHostEvent($this, $this->handler, $event);
+            }
+        }
+    }
+
+    public const function shouldClose() : bool
+    {
+        return $this->close;
+    }
+
+    public function setShouldClose(bool $value) : void
+    {
+        $this->close = $value;
+    }
+
+    public const function width() : int32
+    {
+        return $this->width;
+    }
+
+    public const function height() : int32
+    {
+        return $this->height;
+    }
+
+    public const function size() : Vec2
+    {
+        return Vec2($this->width as float32, $this->height as float32);
+    }
+
+    public const function framebufferSize() : Vec2
+    {
+        return Vec2($this->fbWidth as float32, $this->fbHeight as float32);
+    }
+
+    public const function framebufferWidth() : int32
+    {
+        return $this->fbWidth;
+    }
+
+    public const function framebufferHeight() : int32
+    {
+        return $this->fbHeight;
+    }
+
+    public const function safeArea() : Insets
+    {
+        return $this->insets;
+    }
+
+    public function renderTarget() : RenderTarget
+    {
+        $this->syncTarget();
+        presentBackbuffer($this->target, $this->device);
+
+        return $this->target;
+    }
+
+    public function setVsync(bool $on) : void
+    {
+        $this->vsync = $on;
+        Device $device = guard $this->device else {
+            return;
+        }
+        $device->setVsync($on);
+    }
+
+    public function setHandler(WindowEventHandler $handler) : void
+    {
+        $this->handler = $handler;
+    }
+
+    internal function noteFramebuffer(int32 $width, int32 $height) : void
+    {
+        if ($width == $this->fbWidth && $height == $this->fbHeight) {
+            return;
+        }
+
+        $this->fbWidth = $width;
+        $this->fbHeight = $height;
+        Device $device = guard $this->device else {
+            return;
+        }
+        $device->setContentsScale(cViewScale($this->view));
+        $device->resizeSurface($width, $height);
+        $this->pullSize();
+        $this->pullInsets();
+        info("backbuffer: {$width}x{$height}");
+    }
+
+    private function takePending() : void
+    {
+        array<HostEvent> $pending = IosWindow::$pending;
+        IosWindow::$pending = array<HostEvent>();
+        foreach ($pending as $event) {
+            $this->events->post($event);
+        }
+    }
+
+    private function abandonView() : void
+    {
+        IosWindow::$current = null;
+        IosWindow::$pending = array<HostEvent>();
+        $this->events->clear();
+
+        if ($this->view:$ == null) {
+            return;
+        }
+
+        cDestroyView($this->view);
+        $this->view:$ = null;
+    }
+
+    private function syncTarget() : void
+    {
+        $this->target->width = $this->fbWidth;
+        $this->target->height = $this->fbHeight;
+        float32 $s = cViewScale($this->view) as float32;
+        $this->target->contentScaleX = $s;
+        $this->target->contentScaleY = $s;
+    }
+
+    private function pullSize() : void
+    {
+        int32 $w = 0;
+        int32 $h = 0;
+        cViewSize($this->view, &$w, &$h);
+        $this->width = $w;
+        $this->height = $h;
+    }
+
+    private function pullInsets() : void
+    {
+        float32 $l = 0.0f;
+        float32 $t = 0.0f;
+        float32 $r = 0.0f;
+        float32 $b = 0.0f;
+        cSafeArea($this->view, &$l, &$t, &$r, &$b);
+        $this->insets = Insets($l, $t, $r, $b);
+    }
+}

@@ -9,33 +9,42 @@
 use std::env;
 use std::io;
 use visu::app::{HostError, Paths, Services, bootstrap};
-use visu::os::{init, terminate};
+use visu::os::{init, run, terminate};
 use visu::runtime::{registerMain, unregisterMain};
 
 Services $services = bootstrap(Paths(root: fullappRoot()), function(Services $s) : void {
 });
 
-guard init() else ($e) {
-    die($e->message());
-}
-
 Game $game = Game($services);
-guard $game->initialize() else ($e) {
-    $game->destroy();
-    terminate();
-    die($e->message());
-}
+run(
+    function() : void {
+        guard init() else ($e) {
+            die($e->message());
+        }
 
-registerMain($game->host->events);
-$game->start();
-HostError $fail = $game->host->fail;
-$game->destroy();
-unregisterMain();
-terminate();
+        guard $game->initialize() else ($e) {
+            $game->destroy();
+            terminate();
+            die($e->message());
+        }
 
-if ($fail->failed()) {
-    die($fail->message());
-}
+        registerMain($game->host->events);
+        $game->prepare();
+    },
+    function() : void {
+        $game->tick();
+    },
+    function() : void {
+        HostError $fail = $game->host->fail;
+        $game->destroy();
+        unregisterMain();
+        terminate();
+
+        if ($fail->failed()) {
+            die($fail->message());
+        }
+    }
+);
 
 internal function fullappRoot() : string
 {

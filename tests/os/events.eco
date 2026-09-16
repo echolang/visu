@@ -2,71 +2,37 @@
  * WindowEventHandler dispatch. setHandler works before initialize.
  */
 
-use visu::os::{Window, WindowEventAdapter};
+use visu::os::{Window, WindowHints};
+use visu::os::input::{InputHub, Key, MouseButton};
+use visu::signal::Dispatcher;
 
-class Counts
+test window_handler_receives_injected_key
 {
-    public int32 $keys;
-    public int32 $chars;
-    public int32 $buttons;
-    public int32 $scrolls;
-    public int32 $drops;
-
-    public constructor()
-    {
-        $this->keys = 0;
-        $this->chars = 0;
-        $this->buttons = 0;
-        $this->scrolls = 0;
-        $this->drops = 0;
-    }
+    Window $window = Window('tap', 64, 64, WindowHints());
+    InputHub $in = InputHub($window, Dispatcher());
+    $window->setHandler($in);
+    $in->handleKey($window, .space, 0, .press, 0);
+    assert($in->down(.space), 'held');
 }
 
-test window_triggers_dispatch_to_the_handler
+#[if: os == ios]
+test window_post_flushes_to_input
 {
-    Window $window = Window('tap', 64, 64);
-    Counts $n = Counts();
-    WindowEventAdapter $tap = WindowEventAdapter();
-
-    $window->triggerKey(visu::os::key::SPACE, 0, visu::os::key::PRESS, 0);
-    assert($n->keys == 0, 'no handler yet');
-
-    $tap->onKey = function(Window $w, int32 $key, int32 $scancode, int32 $action, int32 $mods) : void {
-        $n->keys = $n->keys + 1;
-    };
-    $tap->onChar = function(Window $w, int32 $codepoint) : void {
-        $n->chars = $n->chars + 1;
-    };
-    $tap->onMouseButton = function(Window $w, int32 $button, int32 $action, int32 $mods) : void {
-        $n->buttons = $n->buttons + 1;
-    };
-    $tap->onScroll = function(Window $w, float64 $x, float64 $y) : void {
-        $n->scrolls = $n->scrolls + 1;
-    };
-    $tap->onDrop = function(Window $w, array<string> $paths) : void {
-        $n->drops = $n->drops + $paths->count() as int32;
-    };
-
-    $window->setHandler($tap);
-    $window->triggerKey(visu::os::key::SPACE, 0, visu::os::key::PRESS, 0);
-    $window->triggerChar(65);
-    $window->triggerMouseButton(visu::os::mouse::LEFT, visu::os::key::PRESS, 0);
-    $window->triggerScroll(0.0, 1.0);
-    array<string> $paths = array<string>();
-    $paths[] = '/tmp/a';
-    $window->triggerDrop($paths);
-    assert($n->keys == 1, 'key');
-    assert($n->chars == 1, 'char');
-    assert($n->buttons == 1, 'button');
-    assert($n->scrolls == 1, 'scroll');
-    assert($n->drops == 1, 'drop');
+    Window $window = Window('tap', 64, 64, WindowHints());
+    InputHub $in = InputHub($window, Dispatcher());
+    $window->setHandler($in);
+    $window->post(visu::os::HostEvent::key(.space, 0, .press, 0));
+    $window->flush();
+    assert($in->down(.space), 'held');
 }
+#[end]
 
+#[if: os != ios]
 test key_constants_are_glfw
 {
-    assert(visu::os::key::SPACE == glfw::KEY_SPACE, 'space');
-    assert(visu::os::key::ESCAPE == glfw::KEY_ESCAPE, 'escape');
-    assert(visu::os::mouse::LEFT == glfw::MOUSE_BUTTON_LEFT, 'left');
+    assert(Key::space->glfw() == glfw::KEY_SPACE, 'space');
+    assert(Key::escape->glfw() == glfw::KEY_ESCAPE, 'escape');
+    assert(MouseButton::left->glfw() == glfw::MOUSE_BUTTON_LEFT, 'left');
 }
 
 test cursor_mode_values_are_glfw
@@ -76,3 +42,4 @@ test cursor_mode_values_are_glfw
     assert(visu::os::glfwCursorMode(.hidden) == glfw::CURSOR_HIDDEN, 'hidden');
     assert(visu::os::glfwCursorMode(.disabled) == glfw::CURSOR_DISABLED, 'disabled');
 }
+#[end]

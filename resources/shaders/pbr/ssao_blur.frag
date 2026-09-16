@@ -10,14 +10,15 @@ void main()
     vec2 texel = 1.0 / vec2(textureSize(ssao_noisy, 0));
     float total = 0.0;
 
-    // the noise repeats every four texels, so a four-wide box clears it
-    for (int x = -2; x <= 1; ++x)
+    // 7-wide box; the 4x4 noise tile is gone and leftover kernel
+    // variance on curved surfaces is softened
+    for (int x = -3; x <= 3; ++x)
     {
-        for (int y = -2; y <= 1; ++y)
+        for (int y = -3; y <= 3; ++y)
         {
             total += texture(ssao_noisy, v_uv + vec2(float(x), float(y)) * texel).r;
         }
     }
 
-    frag_ao = total / 16.0;
+    frag_ao = total / 49.0;
 }

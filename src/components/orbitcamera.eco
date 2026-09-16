@@ -1,0 +1,161 @@
+/**
+ * Sphere around a target.
+ * An ECS component on a camera entity; drag / pinch / wheel write spin and slide.
+ * `place` puts the transform on the sphere looking at `$target`.
+ */
+
+namespace visu::components;
+
+use visu::geo::Transform;
+use visu::math::{Vec2, Vec3, radians};
+use visu::os::input::{InputHub, Pinch};
+use visu::signal::{Cursor, Scroll};
+
+public struct OrbitCamera
+{
+    public Vec3 $target;
+    public float32 $distance;
+    public float32 $min = 0.5f;
+    public float32 $max = 100.0f;
+
+    /**
+     * Fraction of distance dropped per scroll-wheel unit.
+     */
+    public float32 $zoom = 0.1f;
+
+    /**
+     * Fraction of orbit velocity kept each tick.
+     */
+    public float32 $damp = 0.9f;
+
+    /**
+     * Degrees of yaw / pitch per cursor pixel.
+     */
+    public float32 $lookSpeed = 0.1f;
+
+    /**
+     * Degrees; x is yaw about world up, y is pitch.
+     */
+    public Vec2 $euler;
+
+    /**
+     * Degrees per tick; x is yaw, y is pitch.
+     */
+    public Vec2 $spin;
+
+    /**
+     * This poll's drag, consumed as spin on the orbit tick.
+     */
+    public Vec2 $impulse;
+
+    /**
+     * World units per tick, signed along the look vector.
+     */
+    public float32 $slide = 0.0f;
+
+    init
+    {
+        $this->euler = Vec2(0.0f, 0.0f);
+        $this->spin = Vec2(0.0f, 0.0f);
+        $this->impulse = Vec2(0.0f, 0.0f);
+    }
+
+    /**
+     * Clamp pitch and distance, sit on the sphere, and look at the target.
+     */
+    public function place(Transform& $transform) : void
+    {
+        if ($this->euler->y > 89.0f) {
+            $this->euler->y = 89.0f;
+        }
+
+        if ($this->euler->y < -89.0f) {
+            $this->euler->y = -89.0f;
+        }
+
+        if ($this->distance < $this->min) {
+            $this->distance = $this->min;
+        }
+
+        if ($this->distance > $this->max) {
+            $this->distance = $this->max;
+        }
+
+        float32 $yaw = radians($this->euler->x);
+        float32 $pitch = radians($this->euler->y);
+        float32 $cp = std::math::cos($pitch);
+        float32 $sp = std::math::sin($pitch);
+        float32 $cy = std::math::cos($yaw);
+        float32 $sy = std::math::sin($yaw);
+        Vec3 $offset = Vec3(
+            $this->distance * $cp * $sy,
+            $this->distance * $sp,
+            $this->distance * $cp * $cy
+        );
+        $transform->position = $this->target + $offset;
+        $transform->lookAt($this->target);
+    }
+
+    public function drag(InputHub $input, const Cursor& $signal) : void
+    {
+        if (!$input->unclaimed()) {
+            return;
+        }
+
+        if ($input->touches()->count() >= 2) {
+            return;
+        }
+
+        if ($input->pointerPressed()) {
+            return;
+        }
+
+        if (!$input->pointerDown()) {
+            return;
+        }
+
+        $this->impulse->x = $this->impulse->x - ($signal->offsetX as float32) * $this->lookSpeed;
+        $this->impulse->y = $this->impulse->y - ($signal->offsetY as float32) * $this->lookSpeed;
+    }
+
+    public function zoom(const Scroll& $signal) : void
+    {
+        float32 $y = $signal->y as float32;
+        $this->slide = $this->slide - $y * $this->zoom * $this->distance;
+    }
+
+    public function coast(InputHub $input, Transform& $transform) : void
+    {
+        bool $pinching = false;
+
+        if ($input->unclaimed()) {
+            if ($input->pointerPressed()) {
+                $this->spin = Vec2(0.0f, 0.0f);
+            } else if ($input->pointerDown()) {
+                $this->spin = $this->impulse;
+            }
+
+            Pinch? $maybe = $input->pinch();
+            if ($maybe != null) {
+                Pinch $pinch = guard $maybe;
+                // spread (scale > 1) moves in, same as iOS photos
+                $this->slide = (1.0f - $pinch->scale) * $this->distance;
+                $pinching = true;
+            }
+        }
+
+        $this->impulse = Vec2(0.0f, 0.0f);
+        $this->euler = $this->euler + $this->spin;
+        $this->distance = $this->distance + $this->slide;
+
+        if (!$input->pointerDown()) {
+            $this->spin = $this->spin * $this->damp;
+        }
+
+        if (!$pinching) {
+            $this->slide = $this->slide * $this->damp;
+        }
+
+        $this->place($transform);
+    }
+}

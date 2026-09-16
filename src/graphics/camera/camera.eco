@@ -1,55 +1,104 @@
 /**
- * Projection parameters as an ECS component. The pose lives on the
- * entity's `Transform`; `CameraSystem` snapshots it every tick and
- * interpolates on render, so this struct holds no pose of its own.
+ * Projection parameters as an ECS component. The pose lives on the entity's `Transform`;
+ * `CameraSystem` snapshots it every tick and interpolates on render, so this struct holds no pose of its own.
  */
 
 namespace visu::graphics;
 
-use visu::geo::{Frustum, Pose};
+use visu::ecs::{Entities, Entity};
+use visu::geo::{Frustum, Pose, Transform};
 use visu::math::{Mat4, Vec2, Vec3, Vec4, clipZeroOne, inverse, lookAt, ortho, perspective, radians, translate};
 
 public enum Projection
 {
     case perspective;
-    /** 0,0 top-left, y down, one unit per logical point */
+
+    /**
+     * Screen-space ortho: origin at the top-left, y down, one unit per logical point.
+     */
     case orthographicScreen;
-    /** 0,0 centred, DPI aware */
+
+    /**
+     * World-space ortho: origin at the centre of the target, size in world units, DPI aware.
+     */
     case orthographicWorld;
-    /** fixed world height, aspect from the target */
+
+    /**
+     * World-space ortho with a fixed world height; width follows the target aspect.
+     */
     case orthographicStaticWorld;
 }
 
 public struct Camera
 {
-    public Projection $mode;
-    public float32 $near;
-    public float32 $far;
-    /** vertical field of view in degrees; see `legacyFov` */
-    public float32 $fov;
+    public Projection $mode = .perspective;
+    public float32 $near = 0.1f;
+    public float32 $far = 65536.0f;
+
     /**
-     * PHP VISU handed `fieldOfView` straight to a radians-taking
-     * perspective, so its 45 was really ~58.3 degrees. False reads
-     * `fov` as degrees; true keeps that PHP framing.
+     * Vertical field of view in degrees. `legacyFov` changes how `projection()` consumes this.
      */
-    public bool $legacyFov;
-    public float32 $staticWorldHeight;
-    public float32 $zoom;
-    public bool $flipViewportY;
+    public float32 $fov = 45.0f;
+
+    /**
+     * PHP VISU handed `fieldOfView` straight to a radians-taking perspective, so its 45 was really ~58.3 degrees.
+     * False reads `fov` as degrees; true keeps that PHP framing.
+     */
+    public bool $legacyFov = false;
+
+    /**
+     * World height for `orthographicStaticWorld`. Width is derived from the target aspect.
+     */
+    public float32 $staticWorldHeight = 100.0f;
+    public float32 $zoom = 1.0f;
+
+    /**
+     * Negates the orthographic world's half-height, flipping y.
+     */
+    public bool $flipViewportY = false;
 
     public constructor(Projection $mode = .perspective)
     {
         $this->mode = $mode;
-        $this->near = 0.1f;
-        $this->far = 65536.0f;
-        $this->fov = 45.0f;
-        $this->legacyFov = false;
-        $this->staticWorldHeight = 100.0f;
-        $this->zoom = 1.0f;
-        $this->flipViewportY = false;
     }
 
-    /** ready for the GPU: 0..1 depth on both backends */
+    public constructor(orthographicStaticWorld: float32 $height, bool $flipY = false)
+    {
+        $this->mode = .orthographicStaticWorld;
+        $this->staticWorldHeight = $height;
+        $this->flipViewportY = $flipY;
+    }
+
+    public constructor(orthographicScreen: bool $flipY = false)
+    {
+        $this->mode = .orthographicScreen;
+        $this->flipViewportY = $flipY;
+    }
+
+    public constructor(orthographicWorld: bool $flipY = false)
+    {
+        $this->mode = .orthographicWorld;
+        $this->flipViewportY = $flipY;
+    }
+
+    /**
+     * Camera + Transform at `$position`, looking down -Z. `$camera` is
+     * perspective unless you pass one of the labelled constructors.
+     */
+    public static function spawn(Entities $entities, Vec3 $position, Camera $camera = Camera(.perspective)) : Entity
+    {
+        Entity $entity = $entities->create();
+        Transform $transform = Transform();
+        $transform->position = $position;
+        $entities->attach($entity, $transform);
+        $entities->attach($entity, $camera);
+        return $entity;
+    }
+
+    /**
+     * Projection matrix for a `$width`×`$height` target. Perspective uses `$fov` and aspect; ortho uses `viewport()`.
+     * Depth is remapped to 0..1 so Vulkan and Metal share the same matrix.
+     */
     public const function projection(int32 $width, int32 $height, float32 $scaleX, float32 $scaleY) : Mat4
     {
         float32 $w = $width as float32;
@@ -84,9 +133,8 @@ public struct Camera
     }
 
     /**
-     * World rectangle of an orthographic camera. Perspective has none —
-     * check `orthographic()` first; it returns an empty rect there
-     * because `Viewport?` still miscompiles.
+     * World rectangle of an orthographic camera. Perspective has none; check `orthographic()` first.
+     * Returns an empty rect there because `Viewport?` still miscompiles.
      */
     public const function viewport(int32 $width, int32 $height, float32 $scaleX, float32 $scaleY) : Viewport
     {
@@ -125,7 +173,9 @@ public struct Camera
         );
     }
 
-    /** scale is ignored — a scaled camera would scale the whole scene */
+    /**
+     * View matrix from an interpolated pose. Pose scale is ignored; a scaled camera would scale the whole scene.
+     */
     public const function view(const Pose& $pose) : Mat4
     {
         Mat4 $model = translate($pose->position) * Mat4($pose->orientation);
@@ -133,8 +183,7 @@ public struct Camera
     }
 
     /**
-     * The per-frame fact later passes read. `$pose` is the
-     * interpolated camera pose (`Transform.mix($compensation)`).
+     * The per-frame fact later passes read. `$pose` is the interpolated camera pose (`Transform.mix($compensation)`).
      */
     public const function data(
         const Pose& $pose,

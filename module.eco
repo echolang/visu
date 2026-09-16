@@ -8,9 +8,15 @@
 
 #[module: "visu"]
 #[version: "0.2.0"]
+#[if: os != ios]
 #[requires: "echolang/libglfw" { version: "^0.1", source: git "https://github.com/echolang/libglfw" }]
+#[end]
+#[if: os == ios || os == darwin]
 #[requires: "echolang/libmetal" { version: "^0.1", source: git "https://github.com/echolang/libmetal" }]
+#[end]
+#[if: os != ios]
 #[requires: "echolang/libvulkan" { version: "^0.1", source: git "https://github.com/echolang/libvulkan" }]
+#[end]
 #[requires: "echolang/libminiaudio" { version: "^0.1", source: git "https://github.com/echolang/libminiaudio" }]
 #[epm::license: "MIT"]
 #[epm::description: "VISU Game Framework for Echolang"]
@@ -21,11 +27,12 @@
     "src/geo/*.eco",
     "src/geo/primitive/*.eco",
     "src/os/*.eco",
+    "src/os/input/*.eco",
+    "src/os/protocol/*.eco",
     "src/app/*.eco",
     "src/runtime/*.eco",
-    "src/audio/*.eco",
     "src/quickstart/*.eco",
-    "src/ecs/*.eco", "src/system/*.eco", "src/scene/*.eco",
+    "src/ecs/*.eco", "src/components/*.eco", "src/system/*.eco", "src/scene/*.eco",
     "src/signal/*.eco",
     "src/graphics/*.eco", "src/graphics/camera/*.eco", "src/graphics/dca/*.eco", "src/graphics/deferred/*.eco",
     "src/graphics/device/*.eco",
@@ -43,6 +50,8 @@
     "src/instrument/font/*.eco"
 ]]
 
+#[sources: "src/audio/*.eco"]
+
 #[cc: sources "src/vg/font/vgfont.c"]
 #[cc: include "src/vg/font"]
 #[cc: sources "src/instrument/font/debugfont.c"]
@@ -50,15 +59,27 @@
 #[cc: sources "src/graphics/image/image.c"]
 #[cc: include "src/graphics/image"]
 
+#[if: os == ios]
+#[sources: "src/os/ios/*.eco"]
+#[cc: sources "src/os/ios/host.m"]
+#[cc: sources "src/os/ios/boot.m"]
+#[cc: flag "-fobjc-arc"]
+#[link: framework "UIKit"]
+#[link: framework "QuartzCore"]
+#[link: framework "Metal"]
+#[else]
+#[sources: "src/os/glfw/*.eco"]
+#[end]
+
 #[if: os == darwin]
-#[cc: sources "src/os/display.m"]
+#[cc: sources "src/os/glfw/display.m"]
 #[cc: flag "-fobjc-arc"]
 #[link: framework "QuartzCore"]
 #[link: framework "AppKit"]
 #[link: framework "Metal"]
 #[end]
 
-#[if: os == darwin && !VISU_BACKEND_VULKAN]
+#[if: os == ios || (os == darwin && !VISU_BACKEND_VULKAN)]
 #[sources: "src/graphics/metal/*.eco"]
 #[cc: sources "src/graphics/metal/memory.m"]
 #[cc: flag "-fobjc-arc"]
@@ -76,11 +97,12 @@
         "tests/geo/**/*.eco",
         "tests/math/*.eco",
         "tests/os/*.eco",
+        "tests/os/input/*.eco",
         "tests/runtime/*.eco",
-        "tests/audio/*.eco",
         "tests/scene/*.eco",
         "tests/signal/*.eco",
         "tests/system/*.eco",
+        "tests/components/*.eco",
         "tests/graphics/adapter.eco",
         "tests/graphics/camera/*.eco",
         "tests/graphics/dca/*.eco",
@@ -104,4 +126,5 @@
         "tests/ui/*.eco",
         "tests/instrument/*.eco"
     ]]
+    #[sources: "tests/audio/*.eco"]
 }

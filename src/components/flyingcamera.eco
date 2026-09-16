@@ -1,0 +1,97 @@
+/**
+ * WASD + hold-pointer look.
+ * An ECS component on a camera entity; `FlyingCameraSystem` drives the active one.
+ * Holds the tunables and the euler the look writes.
+ */
+
+namespace visu::components;
+
+use visu::geo::Transform;
+use visu::math::{Quat, Vec2, Vec3, radians};
+use visu::os::CursorMode;
+use visu::os::input::InputHub;
+use visu::signal::Cursor;
+
+public struct FlyingCamera
+{
+
+    /**
+     * World units per fixed update tick.
+     */
+    public float32 $speed = 0.5f;
+
+    /**
+     * Degrees of yaw / pitch per cursor pixel.
+     */
+    public float32 $lookSpeed = 0.1f;
+
+    /**
+     * Degrees; x is yaw about world up, y is pitch.
+     */
+    public Vec2 $euler;
+
+    init
+    {
+        $this->euler = Vec2(0.0f, 0.0f);
+    }
+
+    /**
+     * Yaw about world up then pitch about local right.
+     * No roll, no clamp.
+     */
+    public function aim(Transform& $transform) : void
+    {
+        Quat $yaw = Quat(angleAxis: radians($this->euler->x), Vec3(0.0f, 1.0f, 0.0f));
+        Quat $pitch = Quat(angleAxis: radians($this->euler->y), Vec3(1.0f, 0.0f, 0.0f));
+        $transform->orientation = $yaw * $pitch;
+    }
+
+    public function look(InputHub $input, const Cursor& $signal) : void
+    {
+        if (!$input->unclaimed()) {
+            return;
+        }
+
+        if ($input->touches()->count() >= 2) {
+            return;
+        }
+
+        // the press frame carries the jump from wherever the pointer was
+        if ($input->pointerPressed()) {
+            return;
+        }
+
+        if (!$input->pointerDown()) {
+            $input->setCursorMode(CursorMode::normal);
+            return;
+        }
+
+        $this->euler->x = $this->euler->x - ($signal->offsetX as float32) * $this->lookSpeed;
+        $this->euler->y = $this->euler->y - ($signal->offsetY as float32) * $this->lookSpeed;
+    }
+
+    public function fly(InputHub $input, Transform& $transform) : void
+    {
+        if ($input->pointerPressed()) {
+            $input->setCursorMode(CursorMode::disabled);
+        }
+
+        if ($input->down(.w)) {
+            $transform->moveForward($this->speed);
+        }
+
+        if ($input->down(.s)) {
+            $transform->moveBackward($this->speed);
+        }
+
+        if ($input->down(.a)) {
+            $transform->moveLeft($this->speed);
+        }
+
+        if ($input->down(.d)) {
+            $transform->moveRight($this->speed);
+        }
+
+        $this->aim($transform);
+    }
+}

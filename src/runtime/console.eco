@@ -1,14 +1,15 @@
 /**
- * Tilde / Ctrl+C command line. Types into a buffer, dispatches
- * ConsoleCommand on enter. Overlay drawing waits on bitmap fonts.
- * Toggle claims the input-context mutex. ContextMap then skips
- * action handle so bound keys are not stolen while the line is
- * open (`track` still updates down()).
+ * Tilde / Ctrl+C command line.
+ * Types into a buffer, dispatches ConsoleCommand on enter.
+ * Overlay drawing waits on bitmap fonts.
+ * Toggle claims the input-context mutex.
+ * ContextMap then skips action handle so bound keys are not stolen while the line is open (`track` still updates down()).
  */
 
 namespace visu::runtime;
 
-use visu::os::{Input, key};
+use visu::os::input;
+use visu::os::input::{InputHub, KeyPhase};
 use visu::signal::{Char, ConsoleCommand, Dispatcher, Flow, Key};
 
 internal const HISTORY_LIMIT = 100;
@@ -17,7 +18,7 @@ internal const CONSOLE_CONTEXT = 'visu/dev/console';
 public class DebugConsole
 {
     private Dispatcher $dispatcher;
-    private Input $input;
+    private InputHub $input;
     private bool $enabled;
     private string $line;
     private array<string> $history;
@@ -25,7 +26,7 @@ public class DebugConsole
     private int32 $keyId;
     private int32? $charListener;
 
-    public constructor(Dispatcher $dispatcher, Input $input)
+    public constructor(Dispatcher $dispatcher, InputHub $input)
     {
         $this->dispatcher = $dispatcher;
         $this->input = $input;
@@ -82,8 +83,7 @@ public class DebugConsole
     }
 
     /**
-     * Submit `$raw` as if enter was pressed (tests, and later a
-     * typed line).
+     * Submit `$raw` as if enter was pressed (tests, and later a typed line).
      */
     public function submit(string $raw) : void
     {
@@ -95,12 +95,12 @@ public class DebugConsole
     internal function handleKey(const Key& $signal) : Flow
     {
         if ($this->enabled) {
-            if ($signal->key == key::ENTER && $signal->action == key::RELEASE) {
+            if ($signal->key == input::Key::enter && $signal->phase == KeyPhase::release) {
                 string $raw = $this->line;
                 $this->submit($raw);
             }
 
-            if ($signal->key == key::UP && $signal->action == key::RELEASE) {
+            if ($signal->key == input::Key::up && $signal->phase == KeyPhase::release) {
                 $this->historyIndex = $this->historyIndex - 1;
                 if ($this->historyIndex < 0) {
                     $this->historyIndex = 0;
@@ -109,7 +109,7 @@ public class DebugConsole
                 $this->line = $this->historyLine($this->historyIndex);
             }
 
-            if ($signal->key == key::DOWN && $signal->action == key::RELEASE) {
+            if ($signal->key == input::Key::down && $signal->phase == KeyPhase::release) {
                 int32 $end = $this->history->count() as int32;
                 $this->historyIndex = $this->historyIndex + 1;
                 if ($this->historyIndex > $end) {
@@ -119,7 +119,7 @@ public class DebugConsole
                 $this->line = $this->historyLine($this->historyIndex);
             }
 
-            if ($signal->key == key::BACKSPACE && ($signal->action == key::PRESS || $signal->action == key::REPEAT)) {
+            if ($signal->key == input::Key::backspace && $signal->phase->down()) {
                 usize $n = $this->line->size();
                 if ($n > 0) {
                     $this->line = $this->line->sub(0, $n - 1);
@@ -127,7 +127,7 @@ public class DebugConsole
             }
         }
 
-        if ($signal->key == key::C && $signal->isControl() && $signal->action == key::PRESS) {
+        if ($signal->key == input::Key::c && $signal->isControl() && $signal->phase == KeyPhase::press) {
             $this->setEnabled(!$this->enabled);
             return .stop;
         }
