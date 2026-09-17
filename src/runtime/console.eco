@@ -1,6 +1,6 @@
 /**
  * Tilde / Ctrl+C command line.
- * Types into a buffer, dispatches ConsoleCommand on enter.
+ * Types into a buffer, dispatches ConsoleCommandSignal on enter.
  * Overlay drawing waits on bitmap fonts.
  * Toggle claims the input-context mutex.
  * ContextMap then skips action handle so bound keys are not stolen while the line is open (`track` still updates down()).
@@ -10,7 +10,7 @@ namespace visu::runtime;
 
 use visu::os::input;
 use visu::os::input::{InputHub, KeyPhase};
-use visu::signal::{Char, ConsoleCommand, Dispatcher, Flow, Key};
+use visu::signal::{CharSignal, ConsoleCommandSignal, Dispatcher, Flow, KeySignal};
 
 internal const HISTORY_LIMIT = 100;
 internal const CONSOLE_CONTEXT = 'visu/dev/console';
@@ -35,17 +35,17 @@ public class DebugConsole
         $this->history = array<string>();
         $this->historyIndex = 0;
         $this->charListener = null;
-        $this->keyId = $this->dispatcher->register<Key>(function(const Key& $signal) : Flow {
+        $this->keyId = $this->dispatcher->register<KeySignal>(function(const KeySignal& $signal) : Flow {
             return $this->handleKey($signal);
         }, -1000);
     }
 
     destructor()
     {
-        $this->dispatcher->unregister<Key>($this->keyId);
+        $this->dispatcher->unregister<KeySignal>($this->keyId);
         if ($this->charListener != null) {
             int32 $id = guard $this->charListener;
-            $this->dispatcher->unregister<Char>($id);
+            $this->dispatcher->unregister<CharSignal>($id);
             $this->charListener = null;
         }
 
@@ -89,10 +89,10 @@ public class DebugConsole
     {
         $this->writeLine($raw);
         $this->line = '';
-        $this->dispatcher->dispatch(ConsoleCommand($raw));
+        $this->dispatcher->dispatch(ConsoleCommandSignal($raw));
     }
 
-    internal function handleKey(const Key& $signal) : Flow
+    internal function handleKey(const KeySignal& $signal) : Flow
     {
         if ($this->enabled) {
             if ($signal->key == input::Key::enter && $signal->phase == KeyPhase::release) {
@@ -135,7 +135,7 @@ public class DebugConsole
         return .proceed;
     }
 
-    internal function handleChar(const Char& $signal) : Flow
+    internal function handleChar(const CharSignal& $signal) : Flow
     {
         string $ch = guard $signal->text() else {
             return .proceed;
@@ -155,7 +155,7 @@ public class DebugConsole
                 return;
             }
 
-            int32 $id = $this->dispatcher->register<Char>(function(const Char& $signal) : Flow {
+            int32 $id = $this->dispatcher->register<CharSignal>(function(const CharSignal& $signal) : Flow {
                 return $this->handleChar($signal);
             }, -1000);
             $this->charListener = $id;
@@ -172,7 +172,7 @@ public class DebugConsole
         int32 $id = guard $this->charListener else {
             return;
         }
-        $this->dispatcher->unregister<Char>($id);
+        $this->dispatcher->unregister<CharSignal>($id);
         $this->charListener = null;
     }
 

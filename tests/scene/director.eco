@@ -2,8 +2,8 @@
  * Director: deferred switch, load/unload order, dispatcher listen.
  */
 
-use visu::graphics::{Context, Device, Frame, Pipeline, Pool, RenderTarget};
-use visu::scene::{Director, Scene, Switch};
+use visu::graphics::{RenderContext, Device, Frame, Pipeline, Pool, RenderTarget};
+use visu::scene::{Director, Scene, SwitchSignal};
 use visu::signal::Dispatcher;
 use visu::ui::Ui;
 
@@ -56,7 +56,7 @@ class Dummy : Scene
         $this->hits->updates = $this->hits->updates + 1;
     }
 
-    public function render(const Context& $ctx) : void
+    public function render(RenderContext $ctx) : void
     {
         $this->hits->renders = $this->hits->renders + 1;
     }
@@ -67,14 +67,14 @@ class Dummy : Scene
     }
 }
 
-internal function testContext() : Context
+internal function testContext() : RenderContext
 {
     Device $device = Device();
     Pool $pool = Pool($device);
     Frame $frame = Frame();
     RenderTarget $rt = RenderTarget(64, 64);
     Pipeline $pipeline = Pipeline($pool, $frame, $rt);
-    return Context($device, $pipeline, $frame, $pool);
+    return RenderContext($device, $pipeline, $frame, $pool);
 }
 
 test director_load_then_update_and_render
@@ -83,7 +83,7 @@ test director_load_then_update_and_render
     Director $director = Director(Dummy($hits));
     $director->load();
     $director->update();
-    Context $ctx = testContext();
+    RenderContext $ctx = testContext();
     $director->render($ctx);
     Device $device = Device();
     Ui $ui = Ui($device);
@@ -156,7 +156,7 @@ test listen_dispatches_switch
     $director->listen($dispatcher);
     $director->load();
     Scene $queued = Dummy($b);
-    $dispatcher->dispatch(Switch($queued));
+    $dispatcher->dispatch(SwitchSignal($queued));
 
     assert($director->pending(), 'queued from signal');
     $director->apply();

@@ -14,14 +14,14 @@ use visu::os::{resourceRoot, writableRoot};
 use visu::ecs::{Entities, Entity, System};
 use visu::geo::{AABB, Transform, PrimitiveBuilder, PrimitiveLayout, sphere};
 use visu::graphics::{
-    Camera, Context, DeferredRenderer, DrawCallAssembler, GBufferData, IblQuality, Mesh, MeshHandle,
+    Camera, RenderContext, DeferredRenderer, DrawCallAssembler, GBufferData, IblQuality, Mesh, MeshHandle,
     HdrPixels, SceneTarget, Texture, TextureOptions, TextureRef, VertexBuilder,
     VertexLayout, instanceLayout
 };
 use visu::math::{Vec3, Vec4};
 use visu::quickstart::{App, Options, Quickstart};
-use visu::components::OrbitCamera;
-use visu::system::CameraSystem;
+use visu::components::{activateCamera, OrbitCamera};
+use visu::system::{CameraSystem, OrbitCameraSystem};
 
 /**
  * Any equirectangular radiance map. Missing means sun-only lighting.
@@ -88,9 +88,8 @@ public class SphereSystem : System
     {
     }
 
-    public function render(Entities $entities, const Context& $ctx) : void
+    public function render(Entities $entities, RenderContext $ctx) : void
     {
-        Context $frameCtx = $ctx;
         DrawCallAssembler<SphereInstance> $dca = $this->dca;
         MeshHandle $sphere = $this->sphere;
         $dca->clearInstances();
@@ -101,10 +100,10 @@ public class SphereSystem : System
             ));
         });
 
-        SceneTarget $scene = $frameCtx->frame->get<SceneTarget>();
+        SceneTarget $scene = $ctx->frame->get<SceneTarget>();
         VertexLayout $layout = $this->layout;
         DeferredRenderer $renderer = $this->renderer;
-        $renderer->render($frameCtx, $scene->target, function(Context $inner, GBufferData $gbuffer) : void {
+        $renderer->render($ctx, $scene->target, function(RenderContext $inner, GBufferData $gbuffer) : void {
             $renderer->draw($inner, $gbuffer, $dca, $layout);
         });
     }
@@ -119,19 +118,16 @@ public class PbrScene
     public DeferredRenderer $renderer;
     public Mesh $mesh;
     public DrawCallAssembler<SphereInstance> $dca;
-    public CameraSystem $cameras;
 
     public constructor(
         DeferredRenderer $renderer,
         Mesh $mesh,
-        DrawCallAssembler<SphereInstance> $dca,
-        CameraSystem $cameras
+        DrawCallAssembler<SphereInstance> $dca
     )
     {
         $this->renderer = $renderer;
         $this->mesh = $mesh;
         $this->dca = $dca;
-        $this->cameras = $cameras;
     }
 }
 
@@ -159,18 +155,15 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
         SphereSystem $spheres = SphereSystem($dca, $renderer);
         $spheres->sphere = $dca->register($mesh, AABB(Vec3(-0.5f, -0.5f, -0.5f), Vec3(0.5f, 0.5f, 0.5f)));
 
-        CameraSystem $camera = CameraSystem();
         // the camera has to publish CameraData before anything reads it
-        $app->systems->bind($camera);
-        $app->systems->bind(OrbitCameraSystem($app->input, $camera));
+        $app->systems->bind(CameraSystem());
+        $app->systems->bind(OrbitCameraSystem($app->input));
         $app->systems->bind($spheres);
 
-        $app->services->set(PbrScene($renderer, $mesh, $dca, $camera));
+        $app->services->set(PbrScene($renderer, $mesh, $dca));
     };
 
     $opt->initializeScene = function(App $app) : void {
-        PbrScene $scene = $app->services->get<PbrScene>();
-        CameraSystem $camera = $scene->cameras;
         float32 $gridWidth = (ROUGHNESS_STEPS as float32) * SPHERE_SPACING;
         float32 $gridHeight = (METALLIC_STEPS as float32) * SPHERE_SPACING;
         float32 $distance = $gridWidth;
@@ -188,7 +181,7 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
         OrbitCamera $orbit = OrbitCamera($center, $distance * 1.2f);
         $orbit->place($app->entities->get<Transform>($cam));
         $app->entities->attach($cam, $orbit);
-        $camera->activeCamera = $cam;
+        activateCamera($app->entities, $cam);
 
         int32 $metallicLast = METALLIC_STEPS - 1;
         float32 $metallicSteps = $metallicLast as float32;

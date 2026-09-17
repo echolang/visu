@@ -1,0 +1,87 @@
+/**
+ * Drives the `OrbitCamera` that also has `ActiveCamera`.
+ * Bind after `CameraSystem`; only the marked camera consumes input.
+ */
+
+namespace visu::system;
+
+use visu::components::{ActiveCamera, OrbitCamera};
+use visu::ecs::{Entities, Entity, System};
+use visu::geo::Transform;
+use visu::graphics::RenderContext;
+use visu::math::Vec2;
+use visu::os::input::{InputHub, Pinch};
+
+public class OrbitCameraSystem : System
+{
+    private InputHub $input;
+
+    public constructor(InputHub $input)
+    {
+        $this->input = $input;
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function update(Entities $entities) : void
+    {
+        Entity $active = guard $entities->firstWith<ActiveCamera>() else {
+            return;
+        }
+
+        if (!$entities->has<OrbitCamera>($active) || !$entities->has<Transform>($active)) {
+            return;
+        }
+
+        OrbitCamera& $orbit = $entities->get<OrbitCamera>($active);
+        Transform& $transform = $entities->get<Transform>($active);
+        InputHub $input = $this->input;
+        bool $pinching = false;
+
+        if ($input->unclaimed()) {
+            Vec2 $wheel = $input->mouseScroll();
+            $orbit->slide = $orbit->slide - $wheel->y * $orbit->zoom * $orbit->distance;
+
+            if ($input->hasBeenPressed()) {
+                $orbit->spin = Vec2(0.0f, 0.0f);
+            } else if ($input->pointerDown() && $input->touches()->count() < 2) {
+                Vec2 $delta = $input->pointerDelta();
+                $orbit->impulse->x = $orbit->impulse->x - $delta->x * $orbit->lookSpeed;
+                $orbit->impulse->y = $orbit->impulse->y - $delta->y * $orbit->lookSpeed;
+                $orbit->spin = $orbit->impulse;
+            }
+
+            Pinch? $maybe = $input->pinch();
+            if ($maybe != null) {
+                Pinch $pinch = guard $maybe;
+                // spread (scale > 1) moves in, same as iOS photos
+                $orbit->slide = (1.0f - $pinch->scale) * $orbit->distance;
+                $pinching = true;
+            }
+        }
+
+        $orbit->impulse = Vec2(0.0f, 0.0f);
+        $orbit->euler = $orbit->euler + $orbit->spin;
+        $orbit->distance = $orbit->distance + $orbit->slide;
+
+        if (!$input->pointerDown()) {
+            $orbit->spin = $orbit->spin * $orbit->damp;
+        }
+
+        if (!$pinching) {
+            $orbit->slide = $orbit->slide * $orbit->damp;
+        }
+
+        $orbit->place($transform);
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+    }
+}

@@ -1,9 +1,9 @@
 # iOS pack
 
-Windowed examples are iOS apps. `visu::os::run` is the process edge
-(UIApplicationMain + a display link). Quickstart calls it; `clear`,
-`pipeline`, and `shader` do too. This directory only holds the
-bundle plist and a pack script.
+Windowed examples are iOS apps. `visu::os::run` is the OS pump
+(UIApplicationMain + a display link). Host-backed apps go through
+`visu::app::run(Application)` (Quickstart, fullapp). This directory
+only holds the bundle plist and a pack script.
 
 ```bash
 echoc build -m examples --target pbr --target-os ios

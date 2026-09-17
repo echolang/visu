@@ -4,6 +4,7 @@
  * Local matrix is rebuilt from TRS on read; Mat4 is a struct, so there is no dirty cache.
  * Parent is `Entity::none()` when unparented.
  * Previous pose is a `Pose` snapshot, not a nested Transform.
+ * World axes: +Y up, +X right, forward is -Z.
  */
 
 namespace visu::geo;
@@ -13,6 +14,10 @@ use visu::math::{Mat4, Quat, Vec3, conjugate, lookAt, scale, slerp, translate};
 
 internal const TRANSFORM_PARENT_LIMIT = 64;
 
+/**
+ * TRS snapshot for interpolation between ticks.
+ * `storePrevious` copies the current pose here; `mix` lerps from it.
+ */
 public struct Pose
 {
     public Vec3 $position;
@@ -22,10 +27,29 @@ public struct Pose
 
 public struct Transform
 {
+    /**
+     * Position in local space.
+     */
     public Vec3 $position;
+
+    /**
+     * Orientation in local space.
+     */
     public Quat $orientation;
+
+    /**
+     * Scale in local space.
+     */
     public Vec3 $scale;
+
+    /**
+     * Parent entity. `Entity::none()` when unparented.
+     */
     public Entity $parent;
+
+    /**
+     * Pose captured by `storePrevious` for interpolation between ticks.
+     */
     private Pose? $previous;
 
     public constructor()
@@ -57,6 +81,9 @@ public struct Transform
         return Vec3(-1.0f, 0.0f, 0.0f);
     }
 
+    /**
+     * World -Z. OpenGL look direction; a camera at identity looks down this axis.
+     */
     public static function worldForward() : Vec3
     {
         return Vec3(0.0f, 0.0f, -1.0f);
@@ -67,6 +94,11 @@ public struct Transform
         return Vec3(0.0f, 0.0f, 1.0f);
     }
 
+    /**
+     * Parent this transform under `$e`.
+     * `$e` must already have a Transform; `Entity::none()` unparents.
+     * Walks the chain and asserts there is no cycle.
+     */
     public function parent(Entities $world, Entity $e) : void
     {
         if ($e != Entity::none()) {
@@ -84,33 +116,51 @@ public struct Transform
         $this->parent = $e;
     }
 
+    /**
+     * Local TRS matrix. Rebuilt from position, orientation, and scale on every read.
+     */
     public const function local() : Mat4
     {
         return translate($this->position) * Mat4($this->orientation) * scale($this->scale);
     }
 
+    /**
+     * Interpolated local TRS matrix. `mix($alpha)` then the same T * R * S as `local()`.
+     */
     public const function local(float32 $alpha) : Mat4
     {
         Pose $p = $this->mix($alpha);
         return translate($p->position) * Mat4($p->orientation) * scale($p->scale);
     }
 
+    /**
+     * World matrix. Walks the parent chain and asserts there is no cycle.
+     */
     public const function world(Entities $world) : Mat4
     {
         return $this->worldAt($world, 0);
     }
 
+    /**
+     * Translation of the world matrix. Parent scale and rotation apply; this is not a sum of local positions.
+     */
     public const function worldPosition(Entities $world) : Vec3
     {
         Mat4 $m = $this->world($world);
         return Vec3($m->c3->x, $m->c3->y, $m->c3->z);
     }
 
+    /**
+     * Orientation composed along the parent chain.
+     */
     public const function worldOrientation(Entities $world) : Quat
     {
         return $this->orientAt($world, 0);
     }
 
+    /**
+     * Scale multiplied along the parent chain.
+     */
     public const function worldScale(Entities $world) : Vec3
     {
         return $this->scaleAt($world, 0);
@@ -153,97 +203,155 @@ public struct Transform
         return $parent->scaleAt($world, $depth + 1) * $this->scale;
     }
 
+    /**
+     * Local orientation as Euler angles.
+     */
     public const function euler() : Vec3
     {
         return visu::math::euler($this->orientation);
     }
 
+    /**
+     * World orientation as Euler angles.
+     */
     public const function euler(Entities $world) : Vec3
     {
         return visu::math::euler($this->worldOrientation($world));
     }
 
+    /**
+     * Local-space forward. This orientation applied to world forward (-Z).
+     */
     public const function forward() : Vec3
     {
         return $this->orientation * Transform::worldForward();
     }
 
+    /**
+     * Local-space backward. This orientation applied to world backward (+Z).
+     */
     public const function backward() : Vec3
     {
         return $this->orientation * Transform::worldBackward();
     }
 
+    /**
+     * Local-space right. This orientation applied to world right (+X).
+     */
     public const function right() : Vec3
     {
         return $this->orientation * Transform::worldRight();
     }
 
+    /**
+     * Local-space left. This orientation applied to world left (-X).
+     */
     public const function left() : Vec3
     {
         return $this->orientation * Transform::worldLeft();
     }
 
+    /**
+     * Local-space up. This orientation applied to world up (+Y).
+     */
     public const function up() : Vec3
     {
         return $this->orientation * Transform::worldUp();
     }
 
+    /**
+     * Local-space down. This orientation applied to world down (-Y).
+     */
     public const function down() : Vec3
     {
         return $this->orientation * Transform::worldDown();
     }
 
+    /**
+     * Translate along local forward.
+     */
     public function moveForward(float32 $distance) : void
     {
         $this->position = $this->position + $this->forward() * $distance;
     }
 
+    /**
+     * Translate along local backward.
+     */
     public function moveBackward(float32 $distance) : void
     {
         $this->position = $this->position + $this->backward() * $distance;
     }
 
+    /**
+     * Translate along local right.
+     */
     public function moveRight(float32 $distance) : void
     {
         $this->position = $this->position + $this->right() * $distance;
     }
 
+    /**
+     * Translate along local left.
+     */
     public function moveLeft(float32 $distance) : void
     {
         $this->position = $this->position + $this->left() * $distance;
     }
 
+    /**
+     * Translate along local up.
+     */
     public function moveUp(float32 $distance) : void
     {
         $this->position = $this->position + $this->up() * $distance;
     }
 
+    /**
+     * Translate along local down.
+     */
     public function moveDown(float32 $distance) : void
     {
         $this->position = $this->position + $this->down() * $distance;
     }
 
+    /**
+     * Orient this transform to look at `$point` in world space.
+     */
     public function lookAt(Vec3 $point) : void
     {
         Mat4 $view = lookAt(eye: $this->position, center: $point, up: Transform::worldUp());
         $this->orientation = conjugate(Quat($view));
     }
 
+    /**
+     * Orient this transform to look along `$direction` in world space.
+     */
     public function lookIn(Vec3 $direction) : void
     {
         $this->lookAt($this->position + $direction);
     }
 
+    /**
+     * Snapshot the current TRS as the previous pose for interpolation.
+     */
     public function storePrevious() : void
     {
         $this->previous = Pose($this->position, $this->orientation, $this->scale);
     }
 
+    /**
+     * Drop the previous pose. `mix` then returns the current TRS.
+     */
     public function resetPrevious() : void
     {
         $this->previous = null;
     }
 
+    /**
+     * Interpolate between the previous pose and the current TRS.
+     * Position and scale lerp; orientation slerps. Current TRS when nothing was stored.
+     */
     public const function mix(float32 $alpha) : Pose
     {
         if ($this->previous == null) {
@@ -258,16 +366,25 @@ public struct Transform
         );
     }
 
+    /**
+     * Interpolated position between the previous pose and the current TRS.
+     */
     public const function mixPosition(float32 $alpha) : Vec3
     {
         return $this->mix($alpha)->position;
     }
 
+    /**
+     * Interpolated orientation between the previous pose and the current TRS.
+     */
     public const function mixOrientation(float32 $alpha) : Quat
     {
         return $this->mix($alpha)->orientation;
     }
 
+    /**
+     * Interpolated scale between the previous pose and the current TRS.
+     */
     public const function mixScale(float32 $alpha) : Vec3
     {
         return $this->mix($alpha)->scale;

@@ -1,5 +1,6 @@
 /**
  * WindowEventHandler dispatch. setHandler works before initialize.
+ * HostEvent is the inject path on every OS.
  */
 
 use visu::os::{Window, WindowHints};
@@ -11,21 +12,55 @@ test window_handler_receives_injected_key
     Window $window = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($window, Dispatcher());
     $window->setHandler($in);
-    $in->handleKey($window, .space, 0, .press, 0);
+    $in->handle($window, .key(.space, 0, .press, 0));
     assert($in->down(.space), 'held');
 }
 
-#[if: os == ios]
 test window_post_flushes_to_input
 {
     Window $window = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($window, Dispatcher());
     $window->setHandler($in);
-    $window->post(visu::os::HostEvent::key(.space, 0, .press, 0));
+    $window->post(.key(.space, 0, .press, 0));
     $window->flush();
     assert($in->down(.space), 'held');
 }
-#[end]
+
+test window_flush_does_not_clear_poll_edges
+{
+    Window $window = Window('tap', 64, 64, WindowHints());
+    InputHub $in = InputHub($window, Dispatcher());
+    $window->setHandler($in);
+    $window->post(.key(.space, 0, .press, 0));
+    $window->flush();
+    assert($in->hasBeenPressed(.space), 'pressed');
+    $window->post(.pause);
+    $window->flush();
+    assert($in->hasBeenPressed(.space), 'still');
+}
+
+test window_post_flushes_file
+{
+    Window $window = Window('tap', 64, 64, WindowHints());
+    InputHub $in = InputHub($window, Dispatcher());
+    $window->setHandler($in);
+    $window->post(.file('a.obj'));
+    $window->flush();
+    assert($in->files()->count() == 1, 'n');
+    assert($in->files()[0] == 'a.obj', 'path');
+}
+
+test window_post_flushes_touch
+{
+    Window $window = Window('tap', 64, 64, WindowHints());
+    InputHub $in = InputHub($window, Dispatcher());
+    $window->setHandler($in);
+    $window->post(.touch(1, .began, 4.0f, 5.0f, 1.0f));
+    $window->flush();
+    assert($in->hasBeenPressed(), 'edge');
+    assert($in->pointerDown(), 'held');
+    assert(!$in->down(button: .left), 'not a mouse button');
+}
 
 #[if: os != ios]
 test key_constants_are_glfw

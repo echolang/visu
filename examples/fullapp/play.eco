@@ -7,13 +7,13 @@ use visu::app::Host;
 use visu::ecs::{Entities, Entity, System, Systems};
 use visu::geo::Transform;
 use visu::graphics::{
-    CallbackPass, Camera, CameraData, CameraUniforms, Context, Frame, GpuPass, IoSink,
+    CallbackPass, Camera, CameraData, CameraUniforms, RenderContext, Frame, GpuPass, IoSink,
     Mesh, Pipeline, PipelineError, Raster, RenderEncoder, SceneTarget,
     ShaderProgram, VertexLayout
 };
 use visu::math::{Mat4, Quat, Vec3, Vec4};
-use visu::scene::{Scene, Switch};
-use visu::components::FlyingCamera;
+use visu::scene::{Scene, SwitchSignal};
+use visu::components::{activateCamera, FlyingCamera};
 use visu::system::{CameraSystem, FlyingCameraSystem};
 use visu::ui::Ui;
 
@@ -59,24 +59,23 @@ public class CubeSystem : System
         }
     }
 
-    public function render(Entities $entities, const Context& $ctx) : void
+    public function render(Entities $entities, RenderContext $ctx) : void
     {
         CubeSystem $sys = $this;
         Entities $world = $entities;
-        Context $frameCtx = $ctx;
-        $frameCtx->pipeline->add(CallbackPass(
+        $ctx->pipeline->add(CallbackPass(
             'cubes',
             setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
                 SceneTarget $scene = $frame->get<SceneTarget>();
                 $io->writes($scene->target);
             },
-            execute: function(Context $inner) : status<PipelineError> {
+            execute: function(RenderContext $inner) : status<PipelineError> {
                 return $sys->draw($world, $inner);
             }
         ));
     }
 
-    public function draw(Entities $entities, Context $ctx) : status<PipelineError>
+    public function draw(Entities $entities, RenderContext $ctx) : status<PipelineError>
     {
         SceneTarget $scene = $ctx->frame->get<SceneTarget>();
         CameraData $camera = guard $ctx->frame->find<CameraData>() else {
@@ -107,7 +106,6 @@ public class Play : Scene
     private Host $host;
     public Entities $entities;
     public Systems $systems;
-    public CameraSystem $cameras;
     private Mesh? $mesh;
 
     public constructor(Host $host)
@@ -115,9 +113,8 @@ public class Play : Scene
         $this->host = $host;
         $this->entities = Entities();
         $this->systems = Systems();
-        $this->cameras = CameraSystem();
-        $this->systems->bind($this->cameras);
-        $this->systems->bind(FlyingCameraSystem($host->input, $host->dispatcher, $this->cameras));
+        $this->systems->bind(CameraSystem());
+        $this->systems->bind(FlyingCameraSystem($host->input));
         $this->mesh = null;
     }
 
@@ -145,7 +142,7 @@ public class Play : Scene
         $this->systems->register($this->entities);
         Entity $cam = Camera::spawn($this->entities, Vec3(0.0f, 2.5f, 9.0f));
         $this->entities->attach($cam, FlyingCamera());
-        $this->cameras->activeCamera = $cam;
+        activateCamera($this->entities, $cam);
         $this->spawnCubes();
     }
 
@@ -157,22 +154,22 @@ public class Play : Scene
 
     public function update() : void
     {
-        if ($this->host->inputContext->actions()->pressed('menu')) {
+        if ($this->host->inputContext->actions()->hasBeenPressed('menu')) {
             Scene $menu = Menu($this->host);
-            $this->host->dispatcher->dispatch(Switch($menu));
+            $this->host->dispatcher->dispatch(SwitchSignal($menu));
             return;
         }
 
-        if ($this->host->inputContext->actions()->pressed('reload')) {
+        if ($this->host->inputContext->actions()->hasBeenPressed('reload')) {
             Scene $again = Play($this->host);
-            $this->host->dispatcher->dispatch(Switch($again));
+            $this->host->dispatcher->dispatch(SwitchSignal($again));
             return;
         }
 
         $this->systems->update($this->entities);
     }
 
-    public function render(const Context& $ctx) : void
+    public function render(RenderContext $ctx) : void
     {
         $this->systems->render($this->entities, $ctx);
     }

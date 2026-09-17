@@ -1,85 +1,88 @@
 /**
- * Drives the active entity when it has a `FlyingCamera`.
- * Bind alongside `CameraSystem`; only the active camera consumes input.
+ * Drives the `FlyingCamera` that also has `ActiveCamera`.
+ * Bind after `CameraSystem`; only the marked camera consumes input.
  */
 
 namespace visu::system;
 
-use visu::components::FlyingCamera;
+use visu::components::{ActiveCamera, FlyingCamera};
 use visu::ecs::{Entities, Entity, System};
 use visu::geo::Transform;
-use visu::graphics::Context;
+use visu::graphics::RenderContext;
+use visu::math::Vec2;
+use visu::os::CursorMode;
 use visu::os::input::InputHub;
-use visu::signal::{Cursor, Dispatcher, Queue};
 
 public class FlyingCameraSystem : System
 {
-    public CameraSystem $cameras;
     private InputHub $input;
-    private Dispatcher $dispatcher;
-    private Queue<Cursor>? $cursors;
 
-    public constructor(InputHub $input, Dispatcher $dispatcher, CameraSystem $cameras)
+    public constructor(InputHub $input)
     {
-        $this->cameras = $cameras;
         $this->input = $input;
-        $this->dispatcher = $dispatcher;
-        $this->cursors = null;
     }
 
     public function register(Entities $entities) : void
     {
-        $this->cursors = $this->dispatcher->queue<Cursor>();
     }
 
     public function unregister(Entities $entities) : void
     {
-        Queue<Cursor> $cursors = guard $this->cursors else {
-            return;
-        }
-        $this->dispatcher->unqueue<Cursor>($cursors);
-        $this->cursors = null;
     }
 
     public function update(Entities $entities) : void
     {
-        Entity $active = $this->cameras->activeCamera;
-
-        if (!$this->cameras->valid($entities, $active)) {
+        Entity $active = guard $entities->firstWith<ActiveCamera>() else {
             return;
         }
 
-        if (!$entities->has<FlyingCamera>($active)) {
-            return;
-        }
-
-        $this->drain($entities, $active);
-
-        if (!$this->input->unclaimed()) {
+        if (!$entities->has<FlyingCamera>($active) || !$entities->has<Transform>($active)) {
             return;
         }
 
         FlyingCamera& $fly = $entities->get<FlyingCamera>($active);
         Transform& $transform = $entities->get<Transform>($active);
-        $fly->fly($this->input, $transform);
-    }
+        InputHub $input = $this->input;
 
-    public function render(Entities $entities, const Context& $ctx) : void
-    {
-    }
+        if (!$input->pointerDown()) {
+            $input->setCursorMode(CursorMode::normal);
+        }
 
-    private function drain(Entities $entities, Entity $active) : void
-    {
-        Queue<Cursor> $cursors = guard $this->cursors else {
+        if (!$input->unclaimed()) {
             return;
         }
 
-        while (true) {
-            Cursor $signal = guard $cursors->shift() else {
-                break;
-            }
-            FlyingCamera& $fly = $entities->get<FlyingCamera>($active);
-            $fly->look($this->input, $signal);
+        if ($input->hasBeenPressed()) {
+            $input->setCursorMode(CursorMode::disabled);
         }
+
+        if ($input->down(.w)) {
+            $transform->moveForward($fly->speed);
+        }
+
+        if ($input->down(.s)) {
+            $transform->moveBackward($fly->speed);
+        }
+
+        if ($input->down(.a)) {
+            $transform->moveLeft($fly->speed);
+        }
+
+        if ($input->down(.d)) {
+            $transform->moveRight($fly->speed);
+        }
+
+        // the press poll carries the jump from wherever the pointer was
+        if ($input->pointerDown() && !$input->hasBeenPressed() && $input->touches()->count() < 2) {
+            Vec2 $delta = $input->pointerDelta();
+            $fly->euler->x = $fly->euler->x - $delta->x * $fly->lookSpeed;
+            $fly->euler->y = $fly->euler->y - $delta->y * $fly->lookSpeed;
+        }
+
+        $fly->aim($transform);
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
     }
 }

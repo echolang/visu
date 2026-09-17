@@ -5,7 +5,7 @@
 use visu::math::Vec2;
 use visu::os::{Window, WindowHints};
 use visu::os::input::{ActionMap, ContextMap, InputError, InputHub};
-use visu::signal::{Click, Dispatcher, Flow, Key, MouseButton};
+use visu::signal::{ClickSignal, Dispatcher, Flow, KeySignal, MouseButtonSignal};
 
 class MapHits
 {
@@ -23,13 +23,13 @@ test action_map_key_press_release
     guard $map->bind('jump', .key(.space)) else ($e) {
         die($e->message());
     }
-    Flow $flow = $map->handle(Key(.space, 0, .press, 0));
+    Flow $flow = $map->handle(KeySignal(.space, 0, .press, 0));
     assert($flow == Flow::stop, 'consumed');
-    assert($map->pressed('jump'), 'pressed');
+    assert($map->hasBeenPressed('jump'), 'pressed');
     assert($map->down('jump'), 'down');
     assert(!$map->up('jump'), 'not up');
-    $map->handle(Key(.space, 0, .release, 0));
-    assert($map->released('jump'), 'released');
+    $map->handle(KeySignal(.space, 0, .release, 0));
+    assert($map->hasBeenReleased('jump'), 'released');
     assert(!$map->down('jump'), 'up');
 }
 
@@ -39,8 +39,8 @@ test action_map_repeat_is_down_not_pressed
     guard $map->bind('jump', .key(.space)) else ($e) {
         die($e->message());
     }
-    $map->handle(Key(.space, 0, .repeat, 0));
-    assert(!$map->pressed('jump'), 'not edge');
+    $map->handle(KeySignal(.space, 0, .repeat, 0));
+    assert(!$map->hasBeenPressed('jump'), 'not edge');
     assert($map->down('jump'), 'held');
 }
 
@@ -50,18 +50,18 @@ test action_map_reset_clears_edges
     guard $map->bind('jump', .key(.space)) else ($e) {
         die($e->message());
     }
-    $map->handle(Key(.space, 0, .press, 0));
+    $map->handle(KeySignal(.space, 0, .press, 0));
     $map->reset();
-    assert(!$map->pressed('jump'), 'cleared');
+    assert(!$map->hasBeenPressed('jump'), 'cleared');
     assert($map->down('jump'), 'held');
 }
 
 test action_map_unbound_proceeds
 {
     ActionMap $map = ActionMap();
-    Flow $flow = $map->handle(Key(.a, 0, .press, 0));
+    Flow $flow = $map->handle(KeySignal(.a, 0, .press, 0));
     assert($flow == Flow::proceed, 'unbound');
-    assert(!$map->pressed('jump'), 'none');
+    assert(!$map->hasBeenPressed('jump'), 'none');
     assert($map->up('jump'), 'up');
 }
 
@@ -74,11 +74,11 @@ test action_map_button_and_click
     guard $map->bind('select', .click) else ($e) {
         die($e->message());
     }
-    $map->handle(MouseButton(.left, .press, 0));
-    assert($map->pressed('fire'), 'fire');
-    Flow $click = $map->handle(Click(0, Vec2(0.0f), Vec2(0.0f), 0.0f));
+    $map->handle(MouseButtonSignal(.left, .press, 0));
+    assert($map->hasBeenPressed('fire'), 'fire');
+    Flow $click = $map->handle(ClickSignal(0, Vec2(0.0f), Vec2(0.0f), 0.0f));
     assert($click == Flow::stop, 'consumed');
-    assert($map->released('select'), 'click is a release');
+    assert($map->hasBeenReleased('select'), 'click is a release');
     assert(!$map->down('select'), 'no held click');
 }
 
@@ -116,16 +116,16 @@ test context_map_switch_and_next
     guard $ctx->register('ui', $ui) else ($e) {
         die($e->message());
     }
-    $d->dispatch(Key(.space, 0, .press, 0));
-    assert($ctx->actions()->pressed('jump'), 'game');
+    $d->dispatch(KeySignal(.space, 0, .press, 0));
+    assert($ctx->actions()->hasBeenPressed('jump'), 'game');
     guard $ctx->switch(next: 'ui') else ($e) {
         die($e->message());
     }
-    assert($ctx->actions()->pressed('jump'), 'still game this tick');
+    assert($ctx->actions()->hasBeenPressed('jump'), 'still game this tick');
     $ctx->reset();
-    assert(!$ctx->actions()->pressed('jump'), 'switched');
-    $d->dispatch(Click(0, Vec2(0.0f), Vec2(0.0f), 0.0f));
-    assert($ctx->actions()->released('click'), 'ui click');
+    assert(!$ctx->actions()->hasBeenPressed('jump'), 'switched');
+    $d->dispatch(ClickSignal(0, Vec2(0.0f), Vec2(0.0f), 0.0f));
+    assert($ctx->actions()->hasBeenReleased('click'), 'ui click');
 }
 
 test context_map_matching_key_stops_later_handlers
@@ -140,13 +140,13 @@ test context_map_matching_key_stops_later_handlers
         die($e->message());
     }
     MapHits $hits = MapHits();
-    $d->register<Key>(function(const Key& $k) : Flow {
+    $d->register<KeySignal>(function(const KeySignal& $k) : Flow {
         $hits->n = $hits->n + 1;
         return .proceed;
     }, 1);
-    $d->dispatch(Key(.space, 0, .press, 0));
+    $d->dispatch(KeySignal(.space, 0, .press, 0));
     assert($hits->n == 0, 'stopped');
-    $d->dispatch(Key(.a, 0, .press, 0));
+    $d->dispatch(KeySignal(.a, 0, .press, 0));
     assert($hits->n == 1, 'unbound proceeds');
 }
 
@@ -175,8 +175,8 @@ test context_map_switch_next_to_current_cancels_pending
         die($e->message());
     }
     $ctx->reset();
-    $d->dispatch(Key(.space, 0, .press, 0));
-    assert($ctx->actions()->pressed('jump'), 'still game');
+    $d->dispatch(KeySignal(.space, 0, .press, 0));
+    assert($ctx->actions()->hasBeenPressed('jump'), 'still game');
 }
 
 test context_map_release_while_inactive_clears_down
@@ -197,12 +197,12 @@ test context_map_release_while_inactive_clears_down
     guard $ctx->register('ui', $ui) else ($e) {
         die($e->message());
     }
-    $d->dispatch(Key(.w, 0, .press, 0));
+    $d->dispatch(KeySignal(.w, 0, .press, 0));
     assert($game->down('walk'), 'held');
     guard $ctx->switch('ui') else ($e) {
         die($e->message());
     }
-    $d->dispatch(Key(.w, 0, .release, 0));
+    $d->dispatch(KeySignal(.w, 0, .release, 0));
     guard $ctx->switch('game') else ($e) {
         die($e->message());
     }
@@ -227,7 +227,7 @@ test context_map_held_key_stays_down_across_switch
     guard $ctx->register('ui', $ui) else ($e) {
         die($e->message());
     }
-    $d->dispatch(Key(.w, 0, .press, 0));
+    $d->dispatch(KeySignal(.w, 0, .press, 0));
     guard $ctx->switch('ui') else ($e) {
         die($e->message());
     }
@@ -255,17 +255,17 @@ test context_map_switch_clears_inactive_pressed
     guard $ctx->register('ui', $ui) else ($e) {
         die($e->message());
     }
-    $d->dispatch(Key(.w, 0, .press, 0));
-    assert($game->pressed('walk'), 'edge');
+    $d->dispatch(KeySignal(.w, 0, .press, 0));
+    assert($game->hasBeenPressed('walk'), 'edge');
     guard $ctx->switch('ui') else ($e) {
         die($e->message());
     }
-    $d->dispatch(Key(.w, 0, .release, 0));
+    $d->dispatch(KeySignal(.w, 0, .release, 0));
     $ctx->reset();
     guard $ctx->switch('game') else ($e) {
         die($e->message());
     }
-    assert(!$game->pressed('walk'), 'stale edge');
+    assert(!$game->hasBeenPressed('walk'), 'stale edge');
     assert(!$game->down('walk'), 'up');
 }
 
@@ -285,15 +285,15 @@ test context_map_skips_handle_when_input_claimed
     guard $in->claim('console') else ($e) {
         die($e->message());
     }
-    $d->dispatch(Key(.space, 0, .press, 0));
-    assert(!$game->pressed('jump'), 'claimed');
+    $d->dispatch(KeySignal(.space, 0, .press, 0));
+    assert(!$game->hasBeenPressed('jump'), 'claimed');
     assert($game->down('jump'), 'track');
     guard $in->release('console') else ($e) {
         die($e->message());
     }
     $ctx->reset();
-    $d->dispatch(Key(.space, 0, .press, 0));
-    assert($game->pressed('jump'), 'free');
+    $d->dispatch(KeySignal(.space, 0, .press, 0));
+    assert($game->hasBeenPressed('jump'), 'free');
 }
 
 test context_map_duplicate_and_missing

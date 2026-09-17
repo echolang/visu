@@ -1,26 +1,24 @@
 /**
- * Picks the active camera entity and publishes `CameraData` for the frame.
- * Controllers (`FlyingCamera`, `OrbitCamera`) live on the entity and are driven by their own systems.
+ * Snapshots every `Camera` + `Transform` and publishes `CameraData` from the `ActiveCamera`.
+ * Controllers (`FlyingCamera`, `OrbitCamera`) are separate systems that join on the same marker.
  * An entity with only `Camera` + `Transform` is static or scripted; this system still publishes it, and does not move it.
  *
- * Bind this before any system that reads `CameraData`.
+ * Bind this before any system that reads `CameraData`, and before the controllers so the snapshot lands before they move.
  */
 
 namespace visu::system;
 
+use visu::components::ActiveCamera;
 use visu::ecs::{Entities, Entity, System};
 use visu::geo::{Pose, Transform};
 use visu::graphics::{
-    Backbuffer, Camera, CameraData, Context, SceneTarget, TargetRef
+    Backbuffer, Camera, CameraData, RenderContext, SceneTarget, TargetRef
 };
 
 public class CameraSystem : System
 {
-    public Entity $activeCamera;
-
     public constructor()
     {
-        $this->activeCamera = Entity::none();
     }
 
     public function register(Entities $entities) : void
@@ -33,32 +31,31 @@ public class CameraSystem : System
 
     public function update(Entities $entities) : void
     {
-        Entity $active = $this->activeCamera;
-
-        if (!$this->valid($entities, $active)) {
-            return;
-        }
-
         // snapshot before this tick moves anything, so render interpolates from where the camera actually was
-        Transform& $transform = $entities->get<Transform>($active);
-        $transform->storePrevious();
+        foreach ($entities->view<Camera>() as $e => &$camera) {
+            if (!$entities->has<Transform>($e)) {
+                continue;
+            }
+
+            $entities->get<Transform>($e)->storePrevious();
+        }
     }
 
-    public function render(Entities $entities, const Context& $ctx) : void
+    public function render(Entities $entities, RenderContext $ctx) : void
     {
-        Entity $active = $this->activeCamera;
-
-        if (!$this->valid($entities, $active)) {
+        Entity $active = guard $entities->firstWith<ActiveCamera>() else {
             return;
         }
 
-        // the borrow is const; the handles inside are not
-        Context $frameCtx = $ctx;
-        TargetRef $target = $this->target($frameCtx);
+        if (!$entities->has<Camera>($active) || !$entities->has<Transform>($active)) {
+            return;
+        }
+
+        TargetRef $target = $this->target($ctx);
         Camera& $camera = $entities->get<Camera>($active);
         Transform& $transform = $entities->get<Transform>($active);
-        Pose $pose = $transform->mix($frameCtx->compensation);
-        $frameCtx->frame->set($camera->data(
+        Pose $pose = $transform->mix($ctx->compensation);
+        $ctx->frame->set($camera->data(
             $pose,
             $target->width,
             $target->height,
@@ -68,16 +65,7 @@ public class CameraSystem : System
         ));
     }
 
-    public const function valid(Entities $entities, Entity $entity) : bool
-    {
-        if (!$entities->valid($entity)) {
-            return false;
-        }
-
-        return $entities->has<Camera>($entity) && $entities->has<Transform>($entity);
-    }
-
-    private const function target(Context $ctx) : TargetRef
+    private const function target(RenderContext $ctx) : TargetRef
     {
         SceneTarget $scene = guard $ctx->frame->find<SceneTarget>() else {
             return $ctx->frame->get<Backbuffer>()->target;

@@ -1,7 +1,7 @@
 /**
  * Named ActionMap sets.
  * Switch when the UI or a vehicle takes over.
- * Forwards Key / MouseButton / Click to the active map.
+ * Forwards KeySignal / MouseButtonSignal / ClickSignal to the active map.
  * Inactive maps still update held state so down() cannot stick across a switch.
  * When constructed with InputHub, handle is skipped while claimed (track still runs).
  * Dispatcher closures capture a slot, not this.
@@ -9,7 +9,7 @@
 
 namespace visu::os::input;
 
-use visu::signal::{Click, Dispatcher, Flow};
+use visu::signal::{ClickSignal, Dispatcher, Flow, KeySignal, MouseButtonSignal};
 
 internal class ActionSlot
 {
@@ -35,7 +35,7 @@ internal class ActionSlot
         return !$input->unclaimed();
     }
 
-    public function handle(const visu::signal::Key& $signal) : Flow
+    public function handle(const KeySignal& $signal) : Flow
     {
         foreach ($this->maps as $map) {
             $map->track($signal);
@@ -48,7 +48,7 @@ internal class ActionSlot
         return $this->current->handle($signal);
     }
 
-    public function handle(const visu::signal::MouseButton& $signal) : Flow
+    public function handle(const MouseButtonSignal& $signal) : Flow
     {
         foreach ($this->maps as $map) {
             $map->track($signal);
@@ -61,7 +61,7 @@ internal class ActionSlot
         return $this->current->handle($signal);
     }
 
-    public function handle(const Click& $signal) : Flow
+    public function handle(const ClickSignal& $signal) : Flow
     {
         if ($this->claimed()) {
             return .proceed;
@@ -90,22 +90,22 @@ public class ContextMap
         $this->pending = null;
 
         ActionSlot $slot = $this->slot;
-        $this->keyId = $dispatcher->register<visu::signal::Key>(function(const visu::signal::Key& $signal) : Flow {
+        $this->keyId = $dispatcher->register<KeySignal>(function(const KeySignal& $signal) : Flow {
             return $slot->handle($signal);
         });
-        $this->buttonId = $dispatcher->register<visu::signal::MouseButton>(function(const visu::signal::MouseButton& $signal) : Flow {
+        $this->buttonId = $dispatcher->register<MouseButtonSignal>(function(const MouseButtonSignal& $signal) : Flow {
             return $slot->handle($signal);
         });
-        $this->clickId = $dispatcher->register<Click>(function(const Click& $signal) : Flow {
+        $this->clickId = $dispatcher->register<ClickSignal>(function(const ClickSignal& $signal) : Flow {
             return $slot->handle($signal);
         });
     }
 
     destructor()
     {
-        $this->dispatcher->unregister<visu::signal::Key>($this->keyId);
-        $this->dispatcher->unregister<visu::signal::MouseButton>($this->buttonId);
-        $this->dispatcher->unregister<Click>($this->clickId);
+        $this->dispatcher->unregister<KeySignal>($this->keyId);
+        $this->dispatcher->unregister<MouseButtonSignal>($this->buttonId);
+        $this->dispatcher->unregister<ClickSignal>($this->clickId);
     }
 
     public const function actions() : ActionMap

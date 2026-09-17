@@ -9,18 +9,18 @@ namespace visu::quickstart;
 use visu::app::{Host, HostConfig, HostError, HostPassData, Services};
 use visu::ecs::{Entities, Systems};
 use visu::graphics::{
-    CallbackPass, Context, Device, Frame, IoSink, Pipeline, PipelineError,
+    CallbackPass, RenderContext, Device, Frame, IoSink, Pipeline, PipelineError,
     Pool, RenderEncoder, RenderTarget, ShaderCollection, TargetRef
 };
 use visu::instrument::Instruments;
 use visu::math::Vec2;
 use visu::os::Window;
 use visu::os::input::{ContextMap, InputHub};
-use visu::runtime::{Delegate, EventLoop};
+use visu::runtime::{EventLoop, GameLoopDelegate};
 use visu::signal::Dispatcher;
 use visu::ui::Ui;
 
-public class App : Delegate
+public class App : GameLoopDelegate
 {
     public Host $host;
     public Device $device;
@@ -90,7 +90,7 @@ public class App : Delegate
         App $app = $this;
         $this->host->renderFrame(
             $compensation,
-            function(Context $ctx, TargetRef $target) : void {
+            function(RenderContext $ctx, TargetRef $target) : void {
                 $app->runRender($ctx, $target);
                 $app->systems->render($app->entities, $ctx);
                 $app->addDraw($ctx->pipeline);
@@ -124,8 +124,8 @@ public class App : Delegate
                 HostPassData $data = $frame->get<HostPassData>();
                 $io->writes($data->renderTarget);
             },
-            execute: function(Context $ctx) : status<PipelineError> {
-                function<void(App, Context, RenderTarget)> $draw = guard $this->options->draw else {
+            execute: function(RenderContext $ctx) : status<PipelineError> {
+                function<void(App, RenderContext, RenderTarget)> $draw = guard $this->options->draw else {
                     return .ok;
                 }
                 HostPassData $data = $ctx->frame->get<HostPassData>();
@@ -167,9 +167,9 @@ public class App : Delegate
         $fn($this);
     }
 
-    internal function runRender(Context $ctx, TargetRef $target) : void
+    internal function runRender(RenderContext $ctx, TargetRef $target) : void
     {
-        function<void(App, Context, TargetRef)> $fn = guard $this->options->render else {
+        function<void(App, RenderContext, TargetRef)> $fn = guard $this->options->render else {
             return;
         }
         $fn($this, $ctx, $target);

@@ -1,0 +1,56 @@
+/**
+ * Host-backed process: initialize, prepare, pulse, destroy.
+ * GameLoopDelegate is the tick/render contract; this is the window lifetime.
+ */
+
+namespace visu::app;
+
+use visu::os::{init, terminate};
+use visu::runtime::{registerMain, unregisterMain};
+
+public interface Application
+{
+    const function host() : Host;
+    function initialize() : status<HostError>;
+    function prepare() : void;
+    function tick() : void;
+    function destroy() : void;
+}
+
+/**
+ * Process edge: OS init, host up, event loop, pulse until stop, tear down.
+ * iOS: start runs after the key window exists.
+ */
+public function run(Application $app) : void
+{
+    Application $held = $app;
+    visu::os::run(
+        function() : void {
+            guard init() else ($e) {
+                die($e->message());
+            }
+
+            guard $held->initialize() else ($e) {
+                $held->destroy();
+                terminate();
+                die($e->message());
+            }
+
+            registerMain($held->host()->events);
+            $held->prepare();
+        },
+        function() : void {
+            $held->tick();
+        },
+        function() : void {
+            HostError $fail = $held->host()->fail;
+            $held->destroy();
+            unregisterMain();
+            terminate();
+
+            if ($fail->failed()) {
+                die($fail->message());
+            }
+        }
+    );
+}

@@ -1,6 +1,6 @@
 /**
  * Pollable input hub.
- * The window's event handler: records press / release edges (per poll and per frame), dispatches typed facts, and turns a pointer down+up that did not travel far into Click.
+ * The window's event handler: records press / release edges (per poll and per frame), dispatches typed facts, and turns a pointer down+up that did not travel far into ClickSignal.
  * Pointer is its own record (cursor or first finger); buttons stay physical.
  * Systems claim a mutex string so they do not steal each other's pointer.
  */
@@ -9,19 +9,20 @@ namespace visu::os::input;
 
 use visu::math::{Vec2, distance};
 use visu::os::{
-    CursorMode, Window, WindowEventHandler, liveCursor, liveCursorMode,
+    CursorMode, HostEvent, Window, WindowEventHandler, liveCursor, liveCursorMode,
     warpCursor, warpCursorMode
 };
 use visu::signal::{
-    Char, CharMod, Click, Cursor, CursorEnter, Dispatcher, Drop, Focus,
-    Pause, Resume, Scroll, Touch
+    CharModSignal, CharSignal, ClickSignal, CursorEnterSignal, CursorSignal,
+    Dispatcher, DropSignal, FocusSignal, KeySignal, MouseButtonSignal, PauseSignal,
+    ResumeSignal, ScrollSignal, TouchSignal
 };
 
 public class InputHub : WindowEventHandler
 {
 
     /**
-     * Max pointer travel between down and up for a Click.
+     * Max pointer travel between down and up for a ClickSignal.
      */
     public float32 $clickSlop = 10.0f;
 
@@ -50,10 +51,12 @@ public class InputHub : WindowEventHandler
     private map<int32, bool> $buttonPressFrame;
     private map<int32, bool> $buttonReleaseFrame;
     private array<int32> $charFrame;
+    private array<string> $dropped;
     private map<int32, TouchState> $touchHeld;
     private int32 $primaryTouch;
     private bool $mousePresent;
     private Vec2 $mouseDelta;
+    private Vec2 $pointerDelta;
     private Vec2 $mouseWheel;
     private int32 $pinchA;
     private int32 $pinchB;
@@ -86,10 +89,12 @@ public class InputHub : WindowEventHandler
         $this->buttonPressFrame = map<int32, bool>();
         $this->buttonReleaseFrame = map<int32, bool>();
         $this->charFrame = array<int32>();
+        $this->dropped = array<string>();
         $this->touchHeld = map<int32, TouchState>();
         $this->primaryTouch = -1;
         $this->mousePresent = false;
         $this->mouseDelta = Vec2(0.0f);
+        $this->pointerDelta = Vec2(0.0f);
         $this->mouseWheel = Vec2(0.0f);
         $this->pinchA = -1;
         $this->pinchB = -1;
@@ -120,44 +125,84 @@ public class InputHub : WindowEventHandler
         return !$this->down(button: $button);
     }
 
-    public const function pressed(Key $key) : bool
+    /**
+     * Press edge this poll.
+     * Cleared in `handleWillPoll`.
+     */
+    public const function hasBeenPressed(Key $key) : bool
     {
         return $this->keyPress->has($key->value());
     }
 
-    public const function pressed(button: MouseButton $button) : bool
+    public const function hasBeenPressed(button: MouseButton $button) : bool
     {
         return $this->buttonPress->has($button->value());
     }
 
-    public const function released(Key $key) : bool
+    /**
+     * Primary pointer press edge this poll.
+     * Mouse left or first finger. Cleared in `handleWillPoll`.
+     */
+    public const function hasBeenPressed() : bool
+    {
+        return $this->pointerPress;
+    }
+
+    /**
+     * Release edge this poll.
+     * Cleared in `handleWillPoll`.
+     */
+    public const function hasBeenReleased(Key $key) : bool
     {
         return $this->keyRelease->has($key->value());
     }
 
-    public const function released(button: MouseButton $button) : bool
+    public const function hasBeenReleased(button: MouseButton $button) : bool
     {
         return $this->buttonRelease->has($button->value());
     }
 
-    public const function framePressed(Key $key) : bool
+    public const function hasBeenReleased() : bool
+    {
+        return $this->pointerRelease;
+    }
+
+    /**
+     * Press edge this displayed frame.
+     * Cleared in `endFrame`.
+     */
+    public const function hasBeenPressedThisFrame(Key $key) : bool
     {
         return $this->keyPressFrame->has($key->value());
     }
 
-    public const function framePressed(button: MouseButton $button) : bool
+    public const function hasBeenPressedThisFrame(button: MouseButton $button) : bool
     {
         return $this->buttonPressFrame->has($button->value());
     }
 
-    public const function frameReleased(Key $key) : bool
+    public const function hasBeenPressedThisFrame() : bool
+    {
+        return $this->pointerPressFrame;
+    }
+
+    /**
+     * Release edge this displayed frame.
+     * Cleared in `endFrame`.
+     */
+    public const function hasBeenReleasedThisFrame(Key $key) : bool
     {
         return $this->keyReleaseFrame->has($key->value());
     }
 
-    public const function frameReleased(button: MouseButton $button) : bool
+    public const function hasBeenReleasedThisFrame(button: MouseButton $button) : bool
     {
         return $this->buttonReleaseFrame->has($button->value());
+    }
+
+    public const function hasBeenReleasedThisFrame() : bool
+    {
+        return $this->pointerReleaseFrame;
     }
 
     public const function presses() : array<Key>
@@ -179,6 +224,15 @@ public class InputHub : WindowEventHandler
     }
 
     /**
+     * Paths dropped this poll.
+     * One entry per HostEvent.file.
+     */
+    public const function files() : array<string>
+    {
+        return $this->dropped;
+    }
+
+    /**
      * Primary pointer.
      * Desktop: mouse.
      * Mobile: first active finger, or the last tap when none.
@@ -193,16 +247,6 @@ public class InputHub : WindowEventHandler
         return $this->pointerHeld;
     }
 
-    public const function pointerPressed() : bool
-    {
-        return $this->pointerPressFrame;
-    }
-
-    public const function pointerReleased() : bool
-    {
-        return $this->pointerReleaseFrame;
-    }
-
     public const function pointerSource() : PointerSource
     {
         return $this->pointerOrigin;
@@ -215,6 +259,15 @@ public class InputHub : WindowEventHandler
     public const function mouseDelta() : Vec2
     {
         return $this->mouseDelta;
+    }
+
+    /**
+     * Primary pointer delta this poll.
+     * Mouse and the first finger both write this.
+     */
+    public const function pointerDelta() : Vec2
+    {
+        return $this->pointerDelta;
     }
 
     /**
@@ -357,7 +410,81 @@ public class InputHub : WindowEventHandler
         return .ok;
     }
 
-    public function handleKey(Window $window, Key $key, int32 $scancode, KeyPhase $phase, int32 $mods) : void
+    public function handle(Window $window, const HostEvent& $event) : void
+    {
+        match ($event) {
+            .key($key, $scancode, $phase, $mods) => {
+                $this->applyKey($key, $scancode, $phase, $mods);
+            },
+            .char($codepoint) => {
+                $this->applyChar($codepoint);
+            },
+            .charMods($codepoint, $mods) => {
+                $this->applyCharMods($codepoint, $mods);
+            },
+            .button($button, $phase, $mods) => {
+                $this->applyButton($button, $phase, $mods);
+            },
+            .cursor($x, $y) => {
+                $this->applyCursor($x, $y);
+            },
+            .cursorEnter($entered) => {
+                $this->applyCursorEnter($entered);
+            },
+            .scroll($x, $y) => {
+                $this->applyScroll($x, $y);
+            },
+            .touch($id, $phase, $x, $y, $force) => {
+                $this->applyTouch($id, $phase, $x, $y, $force);
+            },
+            .focus($gained) => {
+                $this->applyFocus($gained);
+            },
+            .pause => {
+                $this->applyPause();
+            },
+            .resume => {
+                $this->applyResume();
+            },
+            .file($path) => {
+                $this->emitDrop($path);
+            },
+            .size($width, $height) => {},
+            .framebuffer($width, $height) => {},
+            .moved => {},
+        }
+    }
+
+    public function handleWillPoll(Window $window) : void
+    {
+        $this->pinchPrev = $this->pinchSpan();
+        $this->keyPress->clear();
+        $this->keyRelease->clear();
+        $this->buttonPress->clear();
+        $this->buttonRelease->clear();
+        $this->pointerPress = false;
+        $this->pointerRelease = false;
+        $this->mouseDelta = Vec2(0.0f);
+        $this->pointerDelta = Vec2(0.0f);
+        $this->mouseWheel = Vec2(0.0f);
+        $this->dropped->clear();
+        if ($this->pointerSeeded) {
+            return;
+        }
+
+        Vec2 $seed = guard liveCursor($window) else {
+            return;
+        }
+        $this->pointerPos = $seed;
+        $this->pointerSeeded = true;
+        $this->pointerOrigin = .cursor;
+    }
+
+    public function handleDidPoll(Window $window) : void
+    {
+    }
+
+    private function applyKey(Key $key, int32 $scancode, KeyPhase $phase, int32 $mods) : void
     {
         int32 $id = $key->value();
         if ($phase->down()) {
@@ -376,21 +503,59 @@ public class InputHub : WindowEventHandler
             $this->keyReleaseFrame[$id] = true;
         }
 
-        $this->dispatcher->dispatch(visu::signal::Key($key, $scancode, $phase, $mods));
+        $this->dispatcher->dispatch(KeySignal($key, $scancode, $phase, $mods));
     }
 
-    public function handleChar(Window $window, int32 $codepoint) : void
+    private function applyChar(int32 $codepoint) : void
     {
         $this->charFrame[] = $codepoint;
-        $this->dispatcher->dispatch(Char($codepoint));
+        $this->dispatcher->dispatch(CharSignal($codepoint));
     }
 
-    public function handleCharMods(Window $window, int32 $codepoint, int32 $mods) : void
+    private function applyCursor(float64 $x, float64 $y) : void
     {
-        $this->dispatcher->dispatch(CharMod($codepoint, $mods));
+        $this->mousePresent = true;
+        $this->movePointer($x, $y, .cursor);
     }
 
-    public function handleMouseButton(Window $window, MouseButton $button, KeyPhase $phase, int32 $mods) : void
+    private function applyScroll(float64 $x, float64 $y) : void
+    {
+        $this->mouseWheel = $this->mouseWheel + Vec2($x as float32, $y as float32);
+        $this->dispatcher->dispatch(ScrollSignal($x, $y));
+    }
+
+    private function applyCharMods(int32 $codepoint, int32 $mods) : void
+    {
+        $this->dispatcher->dispatch(CharModSignal($codepoint, $mods));
+    }
+
+    private function applyCursorEnter(bool $entered) : void
+    {
+        $this->dispatcher->dispatch(CursorEnterSignal($entered));
+    }
+
+    private function applyFocus(bool $gained) : void
+    {
+        $this->dispatcher->dispatch(FocusSignal($gained));
+    }
+
+    private function applyPause() : void
+    {
+        $this->dispatcher->dispatch(PauseSignal());
+    }
+
+    private function applyResume() : void
+    {
+        $this->dispatcher->dispatch(ResumeSignal());
+    }
+
+    private function emitDrop(string $path) : void
+    {
+        $this->dropped[] = $path;
+        $this->dispatcher->dispatch(DropSignal($path));
+    }
+
+    private function applyButton(MouseButton $button, KeyPhase $phase, int32 $mods) : void
     {
         int32 $id = $button->value();
         if ($phase == KeyPhase::press) {
@@ -406,7 +571,7 @@ public class InputHub : WindowEventHandler
             $this->buttonReleaseFrame[$id] = true;
         }
 
-        $this->dispatcher->dispatch(visu::signal::MouseButton($button, $phase, $mods));
+        $this->dispatcher->dispatch(MouseButtonSignal($button, $phase, $mods));
 
         if ($button != MouseButton::left) {
             return;
@@ -422,30 +587,7 @@ public class InputHub : WindowEventHandler
         }
     }
 
-    public function handleCursorPos(Window $window, float64 $x, float64 $y) : void
-    {
-        $this->mousePresent = true;
-        $this->movePointer($x, $y, .cursor);
-    }
-
-    public function handleCursorEnter(Window $window, bool $entered) : void
-    {
-        $this->dispatcher->dispatch(CursorEnter($entered));
-    }
-
-    public function handleScroll(Window $window, float64 $x, float64 $y) : void
-    {
-        $this->mouseWheel = $this->mouseWheel + Vec2($x as float32, $y as float32);
-        $this->dispatcher->dispatch(Scroll($x, $y));
-    }
-
-    public function handleDrop(Window $window, array<string> $paths) : void
-    {
-        $this->dispatcher->dispatch(Drop($paths));
-    }
-
-    public function handleTouch(
-        Window $window,
+    private function applyTouch(
         int32 $id,
         TouchPhase $phase,
         float32 $x,
@@ -454,7 +596,7 @@ public class InputHub : WindowEventHandler
     ) : void
     {
         Vec2 $pos = Vec2($x, $y);
-        $this->dispatcher->dispatch(Touch($id, $phase, $pos, $force));
+        $this->dispatcher->dispatch(TouchSignal($id, $phase, $pos, $force));
 
         if ($phase == TouchPhase::began) {
             $this->touchHeld[$id] = TouchState($id, $pos, $force);
@@ -502,48 +644,6 @@ public class InputHub : WindowEventHandler
         $this->releasePointer($phase == TouchPhase::ended);
     }
 
-    public function handleFocus(Window $window, bool $gained) : void
-    {
-        $this->dispatcher->dispatch(Focus($gained));
-    }
-
-    public function handlePause(Window $window) : void
-    {
-        $this->dispatcher->dispatch(Pause());
-    }
-
-    public function handleResume(Window $window) : void
-    {
-        $this->dispatcher->dispatch(Resume());
-    }
-
-    public function handleWillPoll(Window $window) : void
-    {
-        $this->pinchPrev = $this->pinchSpan();
-        $this->keyPress->clear();
-        $this->keyRelease->clear();
-        $this->buttonPress->clear();
-        $this->buttonRelease->clear();
-        $this->pointerPress = false;
-        $this->pointerRelease = false;
-        $this->mouseDelta = Vec2(0.0f);
-        $this->mouseWheel = Vec2(0.0f);
-        if ($this->pointerSeeded) {
-            return;
-        }
-
-        Vec2 $seed = guard liveCursor($window) else {
-            return;
-        }
-        $this->pointerPos = $seed;
-        $this->pointerSeeded = true;
-        $this->pointerOrigin = .cursor;
-    }
-
-    public function handleDidPoll(Window $window) : void
-    {
-    }
-
     private function pressPointer(PointerSource $source, int32 $mods) : void
     {
         $this->pointerHeld = true;
@@ -567,7 +667,7 @@ public class InputHub : WindowEventHandler
 
         float32 $travel = distance($this->pointerPos, $this->pointerDownAt);
         if ($travel < $this->clickSlop) {
-            $this->dispatcher->dispatch(Click(
+            $this->dispatcher->dispatch(ClickSignal(
                 $this->pointerMods,
                 $this->pointerPos,
                 $this->pointerDownAt,
@@ -580,12 +680,14 @@ public class InputHub : WindowEventHandler
     {
         float64 $offsetX = $x - ($this->pointerPos->x as float64);
         float64 $offsetY = $y - ($this->pointerPos->y as float64);
-        $this->dispatcher->dispatch(Cursor($x, $y, $offsetX, $offsetY));
+        $this->dispatcher->dispatch(CursorSignal($x, $y, $offsetX, $offsetY));
         $this->pointerPos = Vec2($x as float32, $y as float32);
         $this->pointerSeeded = true;
         $this->pointerOrigin = $source;
+        Vec2 $step = Vec2($offsetX as float32, $offsetY as float32);
+        $this->pointerDelta = $this->pointerDelta + $step;
         if ($source->isMouse()) {
-            $this->mouseDelta = $this->mouseDelta + Vec2($offsetX as float32, $offsetY as float32);
+            $this->mouseDelta = $this->mouseDelta + $step;
         }
     }
 

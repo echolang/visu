@@ -1,6 +1,6 @@
 /**
  * Per-frame pass list. `setup()` runs at `add()`; `execute()` runs in scheduled I/O order.
- * Pending clears live here until `Context.beginRender` consumes them.
+ * Pending clears live here until `RenderContext.beginRender` consumes them.
  */
 
 namespace visu::graphics;
@@ -120,7 +120,7 @@ public class Pipeline
     }
 
     /**
-     * Remember a clear until `Context.beginRender` or the unconsumed flush at the end of execute.
+     * Remember a clear until `RenderContext.beginRender` or the unconsumed flush at the end of execute.
      */
     public function requestClear(TargetRef $target, ClearPassOptions $options) : void
     {
@@ -161,7 +161,7 @@ public class Pipeline
         }
         $this->touchIo();
 
-        Context $ctx = Context($this->pool->device, $this, $this->frame, $this->pool, $compensation);
+        RenderContext $ctx = RenderContext($this->pool->device, $this, $this->frame, $this->pool, $compensation);
 
         foreach ($order as $index) {
             guard $this->flushClearsForReads($index, $ctx) else ($e) {
@@ -277,7 +277,7 @@ public class Pipeline
         $this->pool->device->transitionTexture($tex, .shaderRead);
     }
 
-    private function flushClearsForReads(int32 $passIndex, Context $ctx) : status<PipelineError>
+    private function flushClearsForReads(int32 $passIndex, RenderContext $ctx) : status<PipelineError>
     {
         array<Io> $edges = $this->io;
 
@@ -303,7 +303,7 @@ public class Pipeline
         return .ok;
     }
 
-    private function flushClearOf(ResourceIo $resource, Context $ctx) : status<PipelineError>
+    private function flushClearOf(ResourceIo $resource, RenderContext $ctx) : status<PipelineError>
     {
         match ($resource) {
             ResourceIo::target($ref) => {
@@ -317,7 +317,7 @@ public class Pipeline
         return .ok;
     }
 
-    private function flushParentOf(TextureRef $ref, Context $ctx) : status<PipelineError>
+    private function flushParentOf(TextureRef $ref, RenderContext $ctx) : status<PipelineError>
     {
         array<string> $names = $this->clears->keys();
 
@@ -335,7 +335,7 @@ public class Pipeline
         return .ok;
     }
 
-    private function flushNamed(string $name, Context $ctx) : status<PipelineError>
+    private function flushNamed(string $name, RenderContext $ctx) : status<PipelineError>
     {
         if (!$this->clears->has($name)) {
             return .ok;
@@ -349,7 +349,7 @@ public class Pipeline
         return .ok;
     }
 
-    private function flushClears(Context $ctx) : status<PipelineError>
+    private function flushClears(RenderContext $ctx) : status<PipelineError>
     {
         array<string> $names = $this->clears->keys();
 

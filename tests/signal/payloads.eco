@@ -7,14 +7,14 @@ use visu::math::Vec2;
 use visu::os::input;
 use visu::os::input::{KeyPhase, MOD_CONTROL, MOD_SHIFT};
 use visu::signal::{
-    Char, CharMod, Click, ConsoleCommand, Cursor, CursorEnter, Drop,
-    EntitySelected, Focus, Key, MouseButton, Pause, Pick,
-    Resume, Scroll, Touch
+    CharModSignal, CharSignal, ClickSignal, ConsoleCommandSignal, CursorEnterSignal,
+    CursorSignal, DropSignal, EntitySelectedSignal, FocusSignal, KeySignal,
+    MouseButtonSignal, PauseSignal, Pick, ResumeSignal, ScrollSignal, TouchSignal
 };
 
 test console_command_parts
 {
-    ConsoleCommand $cmd = ConsoleCommand('spawn box');
+    ConsoleCommandSignal $cmd = ConsoleCommandSignal('spawn box');
     assert($cmd->raw == 'spawn box', 'raw');
     assert($cmd->parts->count() == 2, 'n');
     assert($cmd->isAction('spawn'), 'action');
@@ -24,7 +24,7 @@ test console_command_parts
 test entity_selected
 {
     Entity $e = Entity(index: 3, version: 1);
-    EntitySelected $sel = EntitySelected($e, Pick::picker);
+    EntitySelectedSignal $sel = EntitySelectedSignal($e, Pick::picker);
     assert($sel->entity == $e, 'entity');
     bool $fromPicker = match ($sel->pick) {
         Pick::picker => true,
@@ -35,7 +35,7 @@ test entity_selected
 test key_fields
 {
     int32 $mods = MOD_SHIFT | MOD_CONTROL;
-    Key $k = Key(.a, 0, .press, $mods);
+    KeySignal $k = KeySignal(.a, 0, .press, $mods);
     assert($k->key == input::Key::a, 'key');
     assert($k->phase == KeyPhase::press, 'press');
     assert($k->isShift(), 'shift');
@@ -48,19 +48,19 @@ test key_fields
 
 test char_text_utf8
 {
-    Char $a = Char(65);
+    CharSignal $a = CharSignal(65);
     string $at = guard $a->text() else {
         die('A');
     }
     assert($at == 'A', 'A');
-    Char $e = Char(0xE9);
+    CharSignal $e = CharSignal(0xE9);
     string $et = guard $e->text() else {
         die('e-acute');
     }
     assert($et == 'é', 'e-acute');
-    string? $bad = Char(-1)->text();
+    string? $bad = CharSignal(-1)->text();
     assert($bad == null, 'invalid');
-    CharMod $cm = CharMod(66, 0);
+    CharModSignal $cm = CharModSignal(66, 0);
     string $bt = guard $cm->text() else {
         die('B');
     }
@@ -69,28 +69,28 @@ test char_text_utf8
 
 test touch_and_lifecycle_fields
 {
-    Touch $t = Touch(3, .began, Vec2(1.0f, 2.0f), 0.5f);
+    TouchSignal $t = TouchSignal(3, .began, Vec2(1.0f, 2.0f), 0.5f);
     assert($t->id == 3, 'id');
     assert($t->position->x == 1.0f, 'x');
     assert($t->force == 0.5f, 'force');
-    Pause $p = Pause();
-    Resume $r = Resume();
-    Focus $f = Focus(true);
+    PauseSignal $p = PauseSignal();
+    ResumeSignal $r = ResumeSignal();
+    FocusSignal $f = FocusSignal(true);
     assert($f->gained, 'gained');
 
 }
 
 test mouse_button_fields
 {
-    MouseButton $left = MouseButton(.left, .press, 0);
+    MouseButtonSignal $left = MouseButtonSignal(.left, .press, 0);
     assert($left->isLeft(), 'left');
     assert($left->isLeftDown(), 'down');
     assert(!$left->isLeftUp(), 'not up');
-    MouseButton $right = MouseButton(.right, .release, 0);
+    MouseButtonSignal $right = MouseButtonSignal(.right, .release, 0);
     assert($right->isRight(), 'right');
     assert($right->isRightUp(), 'up');
     assert(!$right->isRightDown(), 'not down');
-    MouseButton $mid = MouseButton(.middle, .press, 0);
+    MouseButtonSignal $mid = MouseButtonSignal(.middle, .press, 0);
     assert($mid->isMiddle(), 'middle');
     assert($mid->isMiddleDown(), 'mid down');
     assert(!$mid->isMiddleUp(), 'mid not up');
@@ -100,22 +100,18 @@ test click_cursor_scroll_enter_drop
 {
     Vec2 $pos = Vec2(4.0f, 8.0f);
     Vec2 $start = Vec2(1.0f, 2.0f);
-    Click $click = Click(0, $pos, $start, 5.0f);
+    ClickSignal $click = ClickSignal(0, $pos, $start, 5.0f);
     assert($click->travel == 5.0f, 'travel');
     assert($click->position->x == 4.0f, 'px');
-    Cursor $cursor = Cursor(10.0, 20.0, 1.0, -2.0);
+    CursorSignal $cursor = CursorSignal(10.0, 20.0, 1.0, -2.0);
     assert($cursor->x == 10.0, 'x');
     assert($cursor->offsetY == -2.0, 'oy');
-    Scroll $scroll = Scroll(0.0, 3.0);
+    ScrollSignal $scroll = ScrollSignal(0.0, 3.0);
     assert($scroll->y == 3.0, 'sy');
-    CursorEnter $enter = CursorEnter(true);
+    CursorEnterSignal $enter = CursorEnterSignal(true);
     assert($enter->entered, 'in');
-    CursorEnter $leave = CursorEnter(false);
+    CursorEnterSignal $leave = CursorEnterSignal(false);
     assert(!$leave->entered, 'out');
-    array<string> $paths = array<string>();
-    $paths->push('a.obj');
-    $paths->push('b.png');
-    Drop $drop = Drop($paths);
-    assert($drop->paths->count() == 2, 'n');
-    assert($drop->paths[0] == 'a.obj', 'first');
+    DropSignal $drop = DropSignal('a.obj');
+    assert($drop->path == 'a.obj', 'path');
 }

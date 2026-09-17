@@ -72,7 +72,7 @@ public class LightPass : Pass
         $io->writes($target);
     }
 
-    public function execute(Context $ctx) : status<PipelineError>
+    public function execute(RenderContext $ctx) : status<PipelineError>
     {
         LightPassData $data = $ctx->frame->get<LightPassData>();
         GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
@@ -130,7 +130,7 @@ public class LightPass : Pass
      * Binds slots 5..7. Image-based lighting binds irradiance, prefiltered specular and the BRDF lookup;
      * the environment variant binds the raw cube at slot 5.
      */
-    private function bindEnvironment(Context $ctx, RenderEncoder $enc, Lighting $mode) : status<PipelineError>
+    private function bindEnvironment(RenderContext $ctx, RenderEncoder $enc, Lighting $mode) : status<PipelineError>
     {
         if ($mode == Lighting::sun) {
             return .ok;
@@ -143,7 +143,7 @@ public class LightPass : Pass
         return $this->bindCube($ctx, $enc);
     }
 
-    private function bindIbl(Context $ctx, RenderEncoder $enc) : status<PipelineError>
+    private function bindIbl(RenderContext $ctx, RenderEncoder $enc) : status<PipelineError>
     {
         IblData $maps = $ctx->frame->get<IblData>();
         // irradiance is a single mip; a mip-linear cube sampler reads
@@ -157,7 +157,7 @@ public class LightPass : Pass
         return bindPooled($ctx, $enc, 7, $maps->brdfLut, $this->gpu->linear);
     }
 
-    private function bindCube(Context $ctx, RenderEncoder $enc) : status<PipelineError>
+    private function bindCube(RenderContext $ctx, RenderEncoder $enc) : status<PipelineError>
     {
         EnvironmentData $environment = $ctx->frame->get<EnvironmentData>();
         Texture $cube = guard $ctx->pool->getTexture($environment->cubemap) else ($e) {
@@ -170,7 +170,7 @@ public class LightPass : Pass
     /**
      * Binds the SSAO blur when there is one, otherwise a white 1x1.
      */
-    private function bindAmbient(Context $ctx, RenderEncoder $enc, Sampler $sampler) : status<PipelineError>
+    private function bindAmbient(RenderContext $ctx, RenderEncoder $enc, Sampler $sampler) : status<PipelineError>
     {
         SsaoData? $ssao = $ctx->frame->find<SsaoData>();
 

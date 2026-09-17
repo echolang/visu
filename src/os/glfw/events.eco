@@ -2,7 +2,7 @@
  * GLFW callback bridge.
  * GLFW takes C function pointers, not methods.
  * Named functions look the window up through a table of weaks so the table never keeps a window alive.
- * Callbacks run during pollEvents, between willPoll and didPoll.
+ * Callbacks enqueue HostEvent; poll() drains after pollEvents.
  */
 
 namespace visu::os;
@@ -75,7 +75,7 @@ internal function onKey(ptr<glfw::Window> $handle, int32 $key, int32 $scancode, 
     }
     Key $code = Key::from(glfw: $key) ?? .unknown;
     KeyPhase $phase = KeyPhase::from(glfw: $action) ?? .release;
-    $window->triggerKey($code, $scancode, $phase, $mods);
+    $window->post(.key($code, $scancode, $phase, $mods));
 }
 
 internal function onChar(ptr<glfw::Window> $handle, uint32 $codepoint) : void
@@ -83,7 +83,7 @@ internal function onChar(ptr<glfw::Window> $handle, uint32 $codepoint) : void
     Window $window = guard windowOf($handle) else {
         return;
     }
-    $window->triggerChar($codepoint as int32);
+    $window->post(.char($codepoint as int32));
 }
 
 internal function onCharMods(ptr<glfw::Window> $handle, uint32 $codepoint, int32 $mods) : void
@@ -91,7 +91,7 @@ internal function onCharMods(ptr<glfw::Window> $handle, uint32 $codepoint, int32
     Window $window = guard windowOf($handle) else {
         return;
     }
-    $window->triggerCharMods($codepoint as int32, $mods);
+    $window->post(.charMods($codepoint as int32, $mods));
 }
 
 internal function onMouseButton(ptr<glfw::Window> $handle, int32 $button, int32 $action, int32 $mods) : void
@@ -103,7 +103,7 @@ internal function onMouseButton(ptr<glfw::Window> $handle, int32 $button, int32 
         return;
     }
     KeyPhase $phase = KeyPhase::from(glfw: $action) ?? .release;
-    $window->triggerMouseButton($code, $phase, $mods);
+    $window->post(.button($code, $phase, $mods));
 }
 
 internal function onCursorPos(ptr<glfw::Window> $handle, float64 $x, float64 $y) : void
@@ -111,7 +111,7 @@ internal function onCursorPos(ptr<glfw::Window> $handle, float64 $x, float64 $y)
     Window $window = guard windowOf($handle) else {
         return;
     }
-    $window->triggerCursorPos($x, $y);
+    $window->post(.cursor($x, $y));
 }
 
 internal function onCursorEnter(ptr<glfw::Window> $handle, int32 $entered) : void
@@ -119,7 +119,7 @@ internal function onCursorEnter(ptr<glfw::Window> $handle, int32 $entered) : voi
     Window $window = guard windowOf($handle) else {
         return;
     }
-    $window->triggerCursorEnter($entered == glfw::TRUE);
+    $window->post(.cursorEnter($entered == glfw::TRUE));
 }
 
 internal function onScroll(ptr<glfw::Window> $handle, float64 $x, float64 $y) : void
@@ -127,7 +127,7 @@ internal function onScroll(ptr<glfw::Window> $handle, float64 $x, float64 $y) : 
     Window $window = guard windowOf($handle) else {
         return;
     }
-    $window->triggerScroll($x, $y);
+    $window->post(.scroll($x, $y));
 }
 
 internal function onDrop(ptr<glfw::Window> $handle, int32 $count, ptr<ptr<const uint8>> $paths) : void
@@ -136,20 +136,17 @@ internal function onDrop(ptr<glfw::Window> $handle, int32 $count, ptr<ptr<const 
         return;
     }
 
-    array<string> $out = array<string>();
     int32 $i = 0;
 
     while ($i < $count) {
         ptr<const uint8> $p = $paths:$[$i];
 
         if ($p:$ != null) {
-            $out->push(str::from($p:$));
+            $window->post(.file(str::from($p:$)));
         }
 
         $i = $i + 1;
     }
-
-    $window->triggerDrop($out);
 }
 
 internal function onSize(ptr<glfw::Window> $handle, int32 $width, int32 $height) : void
@@ -157,7 +154,7 @@ internal function onSize(ptr<glfw::Window> $handle, int32 $width, int32 $height)
     Window $window = guard windowOf($handle) else {
         return;
     }
-    $window->noteSize($width, $height);
+    $window->post(.size($width, $height));
 }
 
 internal function onFramebufferSize(ptr<glfw::Window> $handle, int32 $width, int32 $height) : void
@@ -165,7 +162,7 @@ internal function onFramebufferSize(ptr<glfw::Window> $handle, int32 $width, int
     Window $window = guard windowOf($handle) else {
         return;
     }
-    $window->noteFramebuffer($width, $height);
+    $window->post(.framebuffer($width, $height));
 }
 
 internal function onWindowPos(ptr<glfw::Window> $handle, int32 $x, int32 $y) : void
@@ -173,7 +170,7 @@ internal function onWindowPos(ptr<glfw::Window> $handle, int32 $x, int32 $y) : v
     Window $window = guard windowOf($handle) else {
         return;
     }
-    $window->notePos();
+    $window->post(.moved);
 }
 
 internal function onFocus(ptr<glfw::Window> $handle, int32 $gained) : void
@@ -181,5 +178,5 @@ internal function onFocus(ptr<glfw::Window> $handle, int32 $gained) : void
     Window $window = guard windowOf($handle) else {
         return;
     }
-    $window->triggerFocus($gained == glfw::TRUE);
+    $window->post(.focus($gained == glfw::TRUE));
 }

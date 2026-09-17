@@ -1,28 +1,15 @@
 /**
  * Window event handler.
- * Hosts translate platform events into these methods; InputHub is the usual implementor.
- * Key and mouse buttons use KeyPhase, not GLFW action ints.
+ * Hosts post HostEvent; this is the consumer.
+ * willPoll / didPoll bracket a drain and are not facts.
  * GLFW C callbacks live in glfw/events.eco.
  */
 
 namespace visu::os;
 
-use visu::os::input::{Key, KeyPhase, MouseButton, TouchPhase};
-
 public interface WindowEventHandler
 {
-    function handleKey(Window $window, Key $key, int32 $scancode, KeyPhase $phase, int32 $mods) : void;
-    function handleChar(Window $window, int32 $codepoint) : void;
-    function handleCharMods(Window $window, int32 $codepoint, int32 $mods) : void;
-    function handleMouseButton(Window $window, MouseButton $button, KeyPhase $phase, int32 $mods) : void;
-    function handleCursorPos(Window $window, float64 $x, float64 $y) : void;
-    function handleCursorEnter(Window $window, bool $entered) : void;
-    function handleScroll(Window $window, float64 $x, float64 $y) : void;
-    function handleDrop(Window $window, array<string> $paths) : void;
-    function handleTouch(Window $window, int32 $id, TouchPhase $phase, float32 $x, float32 $y, float32 $force) : void;
-    function handleFocus(Window $window, bool $gained) : void;
-    function handlePause(Window $window) : void;
-    function handleResume(Window $window) : void;
+    function handle(Window $window, const HostEvent& $event) : void;
     function handleWillPoll(Window $window) : void;
     function handleDidPoll(Window $window) : void;
 }
@@ -33,122 +20,16 @@ public interface WindowEventHandler
  */
 public class WindowEventAdapter : WindowEventHandler
 {
-    public function<void(Window, Key, int32, KeyPhase, int32)>? $onKey = null;
-    public function<void(Window, int32)>? $onChar = null;
-    public function<void(Window, int32, int32)>? $onCharMods = null;
-    public function<void(Window, MouseButton, KeyPhase, int32)>? $onMouseButton = null;
-    public function<void(Window, float64, float64)>? $onCursorPos = null;
-    public function<void(Window, bool)>? $onCursorEnter = null;
-    public function<void(Window, float64, float64)>? $onScroll = null;
-    public function<void(Window, array<string>)>? $onDrop = null;
-    public function<void(Window, int32, TouchPhase, float32, float32, float32)>? $onTouch = null;
-    public function<void(Window, bool)>? $onFocus = null;
-    public function<void(Window)>? $onPause = null;
-    public function<void(Window)>? $onResume = null;
+    public function<void(Window, HostEvent)>? $onEvent = null;
     public function<void(Window)>? $onWillPoll = null;
     public function<void(Window)>? $onDidPoll = null;
 
-    public function handleKey(Window $window, Key $key, int32 $scancode, KeyPhase $phase, int32 $mods) : void
+    public function handle(Window $window, const HostEvent& $event) : void
     {
-        function<void(Window, Key, int32, KeyPhase, int32)> $fn = guard $this->onKey else {
+        function<void(Window, HostEvent)> $fn = guard $this->onEvent else {
             return;
         }
-        $fn($window, $key, $scancode, $phase, $mods);
-    }
-
-    public function handleChar(Window $window, int32 $codepoint) : void
-    {
-        function<void(Window, int32)> $fn = guard $this->onChar else {
-            return;
-        }
-        $fn($window, $codepoint);
-    }
-
-    public function handleCharMods(Window $window, int32 $codepoint, int32 $mods) : void
-    {
-        function<void(Window, int32, int32)> $fn = guard $this->onCharMods else {
-            return;
-        }
-        $fn($window, $codepoint, $mods);
-    }
-
-    public function handleMouseButton(Window $window, MouseButton $button, KeyPhase $phase, int32 $mods) : void
-    {
-        function<void(Window, MouseButton, KeyPhase, int32)> $fn = guard $this->onMouseButton else {
-            return;
-        }
-        $fn($window, $button, $phase, $mods);
-    }
-
-    public function handleCursorPos(Window $window, float64 $x, float64 $y) : void
-    {
-        function<void(Window, float64, float64)> $fn = guard $this->onCursorPos else {
-            return;
-        }
-        $fn($window, $x, $y);
-    }
-
-    public function handleCursorEnter(Window $window, bool $entered) : void
-    {
-        function<void(Window, bool)> $fn = guard $this->onCursorEnter else {
-            return;
-        }
-        $fn($window, $entered);
-    }
-
-    public function handleScroll(Window $window, float64 $x, float64 $y) : void
-    {
-        function<void(Window, float64, float64)> $fn = guard $this->onScroll else {
-            return;
-        }
-        $fn($window, $x, $y);
-    }
-
-    public function handleDrop(Window $window, array<string> $paths) : void
-    {
-        function<void(Window, array<string>)> $fn = guard $this->onDrop else {
-            return;
-        }
-        $fn($window, $paths);
-    }
-
-    public function handleTouch(
-        Window $window,
-        int32 $id,
-        TouchPhase $phase,
-        float32 $x,
-        float32 $y,
-        float32 $force
-    ) : void
-    {
-        function<void(Window, int32, TouchPhase, float32, float32, float32)> $fn = guard $this->onTouch else {
-            return;
-        }
-        $fn($window, $id, $phase, $x, $y, $force);
-    }
-
-    public function handleFocus(Window $window, bool $gained) : void
-    {
-        function<void(Window, bool)> $fn = guard $this->onFocus else {
-            return;
-        }
-        $fn($window, $gained);
-    }
-
-    public function handlePause(Window $window) : void
-    {
-        function<void(Window)> $fn = guard $this->onPause else {
-            return;
-        }
-        $fn($window);
-    }
-
-    public function handleResume(Window $window) : void
-    {
-        function<void(Window)> $fn = guard $this->onResume else {
-            return;
-        }
-        $fn($window);
+        $fn($window, $event);
     }
 
     public function handleWillPoll(Window $window) : void

@@ -1,14 +1,13 @@
 /**
- * One host event.
- * Callbacks enqueue; poll() / flush() drain onto the handler.
- * Framebuffer is applied on the window itself.
+ * Host-to-window fact.
+ * Both arms enqueue; poll() / flush() drain.
+ * Geometry (size, framebuffer, moved) applies on the window; everything else goes to the handler.
  */
 
 namespace visu::os;
 
 use visu::os::input::{Key, KeyPhase, MouseButton, TouchPhase};
 
-#[if: os == ios]
 public enum HostEvent
 {
     case key(Key $key, int32 $scancode, KeyPhase $phase, int32 $mods);
@@ -18,12 +17,14 @@ public enum HostEvent
     case cursor(float64 $x, float64 $y);
     case cursorEnter(bool $entered);
     case scroll(float64 $x, float64 $y);
-    case drop(array<string> $paths);
+    case file(string $path);
     case touch(int32 $id, TouchPhase $phase, float32 $x, float32 $y, float32 $force);
     case focus(bool $gained);
     case pause;
     case resume;
+    case size(int32 $width, int32 $height);
     case framebuffer(int32 $width, int32 $height);
+    case moved;
 }
 
 internal function applyHostEvent(
@@ -33,80 +34,20 @@ internal function applyHostEvent(
 ) : void
 {
     match ($event) {
+        .size($width, $height) => {
+            $window->noteSize($width, $height);
+        },
         .framebuffer($width, $height) => {
             $window->noteFramebuffer($width, $height);
         },
-        .pause => {
-            WindowEventHandler $to = guard $handler else {
-                return;
-            }
-            $to->handlePause($window);
+        .moved => {
+            $window->notePos();
         },
-        .resume => {
+        else => {
             WindowEventHandler $to = guard $handler else {
                 return;
             }
-            $to->handleResume($window);
-        },
-        .focus($gained) => {
-            WindowEventHandler $to = guard $handler else {
-                return;
-            }
-            $to->handleFocus($window, $gained);
-        },
-        .key($key, $scancode, $phase, $mods) => {
-            WindowEventHandler $to = guard $handler else {
-                return;
-            }
-            $to->handleKey($window, $key, $scancode, $phase, $mods);
-        },
-        .char($codepoint) => {
-            WindowEventHandler $to = guard $handler else {
-                return;
-            }
-            $to->handleChar($window, $codepoint);
-        },
-        .charMods($codepoint, $mods) => {
-            WindowEventHandler $to = guard $handler else {
-                return;
-            }
-            $to->handleCharMods($window, $codepoint, $mods);
-        },
-        .button($button, $phase, $mods) => {
-            WindowEventHandler $to = guard $handler else {
-                return;
-            }
-            $to->handleMouseButton($window, $button, $phase, $mods);
-        },
-        .cursor($x, $y) => {
-            WindowEventHandler $to = guard $handler else {
-                return;
-            }
-            $to->handleCursorPos($window, $x, $y);
-        },
-        .cursorEnter($entered) => {
-            WindowEventHandler $to = guard $handler else {
-                return;
-            }
-            $to->handleCursorEnter($window, $entered);
-        },
-        .scroll($x, $y) => {
-            WindowEventHandler $to = guard $handler else {
-                return;
-            }
-            $to->handleScroll($window, $x, $y);
-        },
-        .drop($paths) => {
-            WindowEventHandler $to = guard $handler else {
-                return;
-            }
-            $to->handleDrop($window, $paths);
-        },
-        .touch($id, $phase, $x, $y, $force) => {
-            WindowEventHandler $to = guard $handler else {
-                return;
-            }
-            $to->handleTouch($window, $id, $phase, $x, $y, $force);
+            $to->handle($window, $event);
         },
     }
 }
@@ -141,5 +82,14 @@ internal class EventQueue
     {
         $this->items = array<HostEvent>();
     }
+
+    public function drain(Window $window, WindowEventHandler? $handler) : void
+    {
+        while (!$this->empty()) {
+            array<HostEvent> $batch = $this->take();
+            foreach ($batch as $event) {
+                applyHostEvent($window, $handler, $event);
+            }
+        }
+    }
 }
-#[end]

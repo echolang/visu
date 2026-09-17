@@ -1,6 +1,6 @@
 /**
  * InputHub edges, dispatch, click, and the context mutex.
- * Headless tests inject events through the handler methods; the glfw group covers cursor seed and warp.
+ * Headless tests inject HostEvent through handle(); the glfw group covers cursor seed and warp.
  */
 
 use visu::graphics::Device;
@@ -9,7 +9,10 @@ use visu::os::{Window, WindowHints, init, terminate};
 use visu::os::input::{
     ActionMap, ContextMap, InputError, InputHub, Pinch, PointerSource
 };
-use visu::signal::{Char, Click, Cursor, Dispatcher, Flow, Focus, Key, Pause, Resume, Scroll};
+use visu::signal::{
+    CharSignal, ClickSignal, CursorSignal, Dispatcher, DropSignal, Flow, FocusSignal,
+    KeySignal, PauseSignal, ResumeSignal, ScrollSignal
+};
 
 class InputHits
 {
@@ -42,25 +45,56 @@ test input_poll_edge_clears_on_will_poll
 {
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, Dispatcher());
-    $in->handleKey($w, .space, 0, .press, 0);
-    assert($in->pressed(.space), 'pressed');
-    assert($in->framePressed(.space), 'frame');
+    $in->handle($w, .key(.space, 0, .press, 0));
+    assert($in->hasBeenPressed(.space), 'pressed');
+    assert($in->hasBeenPressedThisFrame(.space), 'frame');
     assert($in->presses()->count() == 1, 'presses');
     $in->handleWillPoll($w);
-    assert(!$in->pressed(.space), 'poll cleared');
-    assert($in->framePressed(.space), 'frame kept');
+    assert(!$in->hasBeenPressed(.space), 'poll cleared');
+    assert($in->hasBeenPressedThisFrame(.space), 'frame kept');
     assert($in->presses()->count() == 0, 'empty');
     $in->endFrame();
-    assert(!$in->framePressed(.space), 'frame cleared');
+    assert(!$in->hasBeenPressedThisFrame(.space), 'frame cleared');
+}
+
+test input_pointer_poll_edge_clears_on_will_poll
+{
+    Window $w = Window('tap', 64, 64, WindowHints());
+    InputHub $in = InputHub($w, Dispatcher());
+    $in->handle($w, .button(.left, .press, 0));
+    assert($in->hasBeenPressed(), 'poll');
+    assert($in->hasBeenPressedThisFrame(), 'frame');
+    $in->handleWillPoll($w);
+    assert(!$in->hasBeenPressed(), 'poll cleared');
+    assert($in->hasBeenPressedThisFrame(), 'frame kept');
+    $in->endFrame();
+    assert(!$in->hasBeenPressedThisFrame(), 'frame cleared');
+}
+
+test input_drop_dispatches_one_signal_per_path
+{
+    Dispatcher $d = Dispatcher();
+    Window $w = Window('tap', 64, 64, WindowHints());
+    InputHub $in = InputHub($w, $d);
+    InputHits $hits = InputHits();
+    $d->register<DropSignal>(function(const DropSignal& $drop) : Flow {
+        $hits->keys = $hits->keys + 1;
+        return .proceed;
+    });
+    $in->handle($w, .file('a.obj'));
+    $in->handle($w, .file('b.obj'));
+    assert($hits->keys == 2, 'two');
+    assert($in->files()->count() == 2, 'files');
+    assert($in->files()[0] == 'a.obj', 'a');
 }
 
 test input_repeat_is_not_pressed
 {
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, Dispatcher());
-    $in->handleKey($w, .a, 0, .repeat, 0);
-    assert(!$in->pressed(.a), 'repeat');
-    assert(!$in->framePressed(.a), 'frame');
+    $in->handle($w, .key(.a, 0, .repeat, 0));
+    assert(!$in->hasBeenPressed(.a), 'repeat');
+    assert(!$in->hasBeenPressedThisFrame(.a), 'frame');
     assert($in->down(.a), 'held');
 }
 
@@ -68,12 +102,12 @@ test input_down_survives_will_poll
 {
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, Dispatcher());
-    $in->handleKey($w, .space, 0, .press, 0);
+    $in->handle($w, .key(.space, 0, .press, 0));
     assert($in->down(.space), 'held after press');
     $in->handleWillPoll($w);
-    assert(!$in->pressed(.space), 'edge cleared');
+    assert(!$in->hasBeenPressed(.space), 'edge cleared');
     assert($in->down(.space), 'still held');
-    $in->handleKey($w, .space, 0, .release, 0);
+    $in->handle($w, .key(.space, 0, .release, 0));
     assert(!$in->down(.space), 'up');
 }
 
@@ -82,14 +116,15 @@ test input_pointer_follows_cursor_and_touch
     Dispatcher $d = Dispatcher();
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, $d);
-    $in->handleCursorPos($w, 10.0, 20.0);
+    $in->handle($w, .cursor(10.0, 20.0));
     assert($in->pointer()->x == 10.0f, 'cursor x');
     assert($in->pointer()->y == 20.0f, 'cursor y');
     assert(!$in->pointerDown(), 'no pointer');
-    $in->handleTouch($w, 1, .began, 4.0f, 5.0f, 0.5f);
+    $in->handle($w, .touch(1, .began, 4.0f, 5.0f, 0.5f));
     assert($in->pointer()->x == 4.0f, 'touch x');
     assert($in->pointerDown(), 'finger down');
-    assert($in->pointerPressed(), 'began this frame');
+    assert($in->hasBeenPressed(), 'began this poll');
+    assert($in->hasBeenPressedThisFrame(), 'began this frame');
     assert($in->touches()->count() == 1, 'one finger');
     bool $fromTouch = match ($in->pointerSource()) {
         .finger($id) => $id == 1,
@@ -98,22 +133,23 @@ test input_pointer_follows_cursor_and_touch
     assert($fromTouch, 'source touch');
     assert(!$in->down(button: .left), 'mouse stays up');
     $in->endFrame();
-    assert(!$in->pointerPressed(), 'frame cleared');
+    assert(!$in->hasBeenPressedThisFrame(), 'frame cleared');
     assert($in->pointerDown(), 'still down');
-    $in->handleTouch($w, 1, .ended, 6.0f, 5.0f, 0.0f);
+    $in->handle($w, .touch(1, .ended, 6.0f, 5.0f, 0.0f));
     assert(!$in->pointerDown(), 'up');
-    assert($in->pointerReleased(), 'ended this frame');
+    assert($in->hasBeenReleased(), 'ended this poll');
+    assert($in->hasBeenReleasedThisFrame(), 'ended this frame');
 }
 
 test input_primary_touch_promotes_the_next_finger
 {
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, Dispatcher());
-    $in->handleTouch($w, 1, .began, 4.0f, 5.0f, 1.0f);
-    $in->handleTouch($w, 2, .began, 10.0f, 12.0f, 1.0f);
+    $in->handle($w, .touch(1, .began, 4.0f, 5.0f, 1.0f));
+    $in->handle($w, .touch(2, .began, 10.0f, 12.0f, 1.0f));
     assert($in->pointerDown(), 'two down');
     assert($in->touches()->count() == 2, 'two fingers');
-    $in->handleTouch($w, 1, .ended, 4.0f, 5.0f, 0.0f);
+    $in->handle($w, .touch(1, .ended, 4.0f, 5.0f, 0.0f));
     assert($in->pointerDown(), 'still down');
     assert($in->touches()->count() == 1, 'one left');
     assert($in->pointer()->x == 10.0f, 'promoted x');
@@ -126,13 +162,13 @@ test input_tap_within_slop_is_a_click
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, $d);
     InputHits $hits = InputHits();
-    $d->register<Click>(function(const Click& $c) : Flow {
+    $d->register<ClickSignal>(function(const ClickSignal& $c) : Flow {
         $hits->clicks = $hits->clicks + 1;
         $hits->travel = $c->travel;
         return .proceed;
     });
-    $in->handleTouch($w, 7, .began, 0.0f, 0.0f, 1.0f);
-    $in->handleTouch($w, 7, .ended, 3.0f, 0.0f, 0.0f);
+    $in->handle($w, .touch(7, .began, 0.0f, 0.0f, 1.0f));
+    $in->handle($w, .touch(7, .ended, 3.0f, 0.0f, 0.0f));
     assert($hits->clicks == 1, 'tap');
     assert($hits->travel == 3.0f, 'travel');
 }
@@ -143,12 +179,12 @@ test input_cancelled_touch_is_not_a_click
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, $d);
     InputHits $hits = InputHits();
-    $d->register<Click>(function(const Click& $c) : Flow {
+    $d->register<ClickSignal>(function(const ClickSignal& $c) : Flow {
         $hits->clicks = $hits->clicks + 1;
         return .proceed;
     });
-    $in->handleTouch($w, 1, .began, 0.0f, 0.0f, 1.0f);
-    $in->handleTouch($w, 1, .cancelled, 1.0f, 0.0f, 0.0f);
+    $in->handle($w, .touch(1, .began, 0.0f, 0.0f, 1.0f));
+    $in->handle($w, .touch(1, .cancelled, 1.0f, 0.0f, 0.0f));
     assert($hits->clicks == 0, 'cancel');
     assert(!$in->pointerDown(), 'up');
     assert(!$in->down(button: .left), 'no button');
@@ -158,16 +194,16 @@ test input_pinch_scale_is_one_on_first_span
 {
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, Dispatcher());
-    $in->handleTouch($w, 1, .began, 0.0f, 0.0f, 1.0f);
-    $in->handleTouch($w, 2, .began, 10.0f, 0.0f, 1.0f);
+    $in->handle($w, .touch(1, .began, 0.0f, 0.0f, 1.0f));
+    $in->handle($w, .touch(2, .began, 10.0f, 0.0f, 1.0f));
     Pinch $first = guard $in->pinch() else {
         die('two fingers');
     }
     assert($first->span == 10.0f, 'span');
     assert($first->scale == 1.0f, 'first');
     $in->handleWillPoll($w);
-    $in->handleTouch($w, 1, .moved, 0.0f, 0.0f, 1.0f);
-    $in->handleTouch($w, 2, .moved, 20.0f, 0.0f, 1.0f);
+    $in->handle($w, .touch(1, .moved, 0.0f, 0.0f, 1.0f));
+    $in->handle($w, .touch(2, .moved, 20.0f, 0.0f, 1.0f));
     Pinch $grown = guard $in->pinch() else {
         die('still two');
     }
@@ -181,23 +217,23 @@ test input_pause_and_focus_dispatch
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, $d);
     InputHits $hits = InputHits();
-    $d->register<Pause>(function(const Pause& $s) : Flow {
+    $d->register<PauseSignal>(function(const PauseSignal& $s) : Flow {
         $hits->keys = $hits->keys + 1;
         return .proceed;
     });
-    $d->register<Resume>(function(const Resume& $s) : Flow {
+    $d->register<ResumeSignal>(function(const ResumeSignal& $s) : Flow {
         $hits->chars = $hits->chars + 1;
         return .proceed;
     });
-    $d->register<Focus>(function(const Focus& $s) : Flow {
+    $d->register<FocusSignal>(function(const FocusSignal& $s) : Flow {
         if ($s->gained) {
             $hits->clicks = $hits->clicks + 1;
         }
         return .proceed;
     });
-    $in->handlePause($w);
-    $in->handleResume($w);
-    $in->handleFocus($w, true);
+    $in->handle($w, .pause);
+    $in->handle($w, .resume);
+    $in->handle($w, .focus(true));
     assert($hits->keys == 1, 'pause');
     assert($hits->chars == 1, 'resume');
     assert($hits->clicks == 1, 'focus');
@@ -208,8 +244,9 @@ test input_poll_contract_events_after_will_poll
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, Dispatcher());
     $in->handleWillPoll($w);
-    $in->handleTouch($w, 1, .began, 4.0f, 5.0f, 1.0f);
-    assert($in->pointerPressed(), 'edge after drain');
+    $in->handle($w, .touch(1, .began, 4.0f, 5.0f, 1.0f));
+    assert($in->hasBeenPressed(), 'poll edge after drain');
+    assert($in->hasBeenPressedThisFrame(), 'frame edge after drain');
     assert($in->pointerDown(), 'held');
     assert(!$in->down(button: .left), 'not a mouse button');
 }
@@ -223,7 +260,7 @@ test ios_poll_drains_queued_touch
     $w->setHandler($in);
     visu::os::iosEnqueueTouch(1, .began, 4.0f, 5.0f, 1.0f);
     $w->poll();
-    assert($in->pointerPressed(), 'poll edge');
+    assert($in->hasBeenPressed(), 'poll edge');
     assert($in->pointerDown(), 'held');
     assert(!$in->down(button: .left), 'not a mouse button');
 }
@@ -246,7 +283,7 @@ test ios_poll_drains_tap_into_click_action
     visu::os::iosEnqueueTouch(7, .ended, 3.0f, 0.0f, 0.0f);
     $ctx->reset();
     $w->poll();
-    assert($ctx->actions()->released('select'), 'click');
+    assert($ctx->actions()->hasBeenReleased('select'), 'click');
 }
 #[end]
 
@@ -254,8 +291,8 @@ test input_mouse_left_is_pointer_source_mouse
 {
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, Dispatcher());
-    $in->handleCursorPos($w, 8.0, 9.0);
-    $in->handleMouseButton($w, .left, .press, 0);
+    $in->handle($w, .cursor(8.0, 9.0));
+    $in->handle($w, .button(.left, .press, 0));
     assert($in->down(button: .left), 'physical');
     assert($in->pointerSource()->isMouse(), 'source');
     assert($in->presses()->count() == 0, 'no key');
@@ -265,11 +302,11 @@ test input_button_down_tracks_held
 {
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, Dispatcher());
-    $in->handleMouseButton($w, .left, .press, 0);
+    $in->handle($w, .button(.left, .press, 0));
     assert($in->down(button: .left), 'held');
     $in->handleWillPoll($w);
     assert($in->down(button: .left), 'survives poll');
-    $in->handleMouseButton($w, .left, .release, 0);
+    $in->handle($w, .button(.left, .release, 0));
     assert(!$in->down(button: .left), 'up');
 }
 
@@ -277,24 +314,24 @@ test input_release_edge
 {
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, Dispatcher());
-    $in->handleKey($w, .a, 0, .press, 0);
-    $in->handleKey($w, .a, 0, .release, 0);
-    assert($in->pressed(.a), 'still pressed this poll');
-    assert($in->released(.a), 'released');
-    assert($in->frameReleased(.a), 'frame released');
+    $in->handle($w, .key(.a, 0, .press, 0));
+    $in->handle($w, .key(.a, 0, .release, 0));
+    assert($in->hasBeenPressed(.a), 'still pressed this poll');
+    assert($in->hasBeenReleased(.a), 'released');
+    assert($in->hasBeenReleasedThisFrame(.a), 'frame released');
 }
 
 test input_button_edges
 {
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, Dispatcher());
-    $in->handleMouseButton($w, .right, .press, 0);
-    assert($in->pressed(button: .right), 'down');
-    $in->handleMouseButton($w, .right, .release, 0);
-    assert($in->released(button: .right), 'up');
+    $in->handle($w, .button(.right, .press, 0));
+    assert($in->hasBeenPressed(button: .right), 'down');
+    $in->handle($w, .button(.right, .release, 0));
+    assert($in->hasBeenReleased(button: .right), 'up');
     $in->handleWillPoll($w);
-    assert(!$in->pressed(button: .right), 'poll');
-    assert($in->framePressed(button: .right), 'frame');
+    assert(!$in->hasBeenPressed(button: .right), 'poll');
+    assert($in->hasBeenPressedThisFrame(button: .right), 'frame');
 }
 
 test input_dispatches_key_and_char
@@ -303,16 +340,16 @@ test input_dispatches_key_and_char
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, $d);
     InputHits $hits = InputHits();
-    $d->register<Key>(function(const Key& $k) : Flow {
+    $d->register<KeySignal>(function(const KeySignal& $k) : Flow {
         $hits->keys = $hits->keys + 1;
         return .proceed;
     });
-    $d->register<Char>(function(const Char& $c) : Flow {
+    $d->register<CharSignal>(function(const CharSignal& $c) : Flow {
         $hits->chars = $hits->chars + 1;
         return .proceed;
     });
-    $in->handleKey($w, .a, 0, .press, 0);
-    $in->handleChar($w, 65);
+    $in->handle($w, .key(.a, 0, .press, 0));
+    $in->handle($w, .char(65));
     assert($hits->keys == 1, 'key');
     assert($hits->chars == 1, 'char');
     assert($in->frameChars()->count() == 1, 'frame chars');
@@ -329,14 +366,14 @@ test input_cursor_offset_is_from_last
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, $d);
     InputHits $hits = InputHits();
-    $d->register<Cursor>(function(const Cursor& $c) : Flow {
+    $d->register<CursorSignal>(function(const CursorSignal& $c) : Flow {
         $hits->cursors = $hits->cursors + 1;
         $hits->offsetX = $c->offsetX;
         return .proceed;
     });
-    $in->handleCursorPos($w, 10.0, 0.0);
+    $in->handle($w, .cursor(10.0, 0.0));
     assert($hits->offsetX == 10.0, 'from origin');
-    $in->handleCursorPos($w, 15.0, 0.0);
+    $in->handle($w, .cursor(15.0, 0.0));
     assert($hits->offsetX == 5.0, 'delta');
     assert($in->pointer()->x == 15.0f, 'last');
 }
@@ -347,13 +384,13 @@ test input_will_poll_without_window_keeps_last_cursor
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, $d);
     InputHits $hits = InputHits();
-    $d->register<Cursor>(function(const Cursor& $c) : Flow {
+    $d->register<CursorSignal>(function(const CursorSignal& $c) : Flow {
         $hits->offsetX = $c->offsetX;
         return .proceed;
     });
-    $in->handleCursorPos($w, 10.0, 0.0);
+    $in->handle($w, .cursor(10.0, 0.0));
     $in->handleWillPoll($w);
-    $in->handleCursorPos($w, 15.0, 0.0);
+    $in->handle($w, .cursor(15.0, 0.0));
     assert($hits->offsetX == 5.0, 'uninitialized poll does not reseed');
 }
 
@@ -363,15 +400,15 @@ test input_left_click_within_slop
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, $d);
     InputHits $hits = InputHits();
-    $d->register<Click>(function(const Click& $c) : Flow {
+    $d->register<ClickSignal>(function(const ClickSignal& $c) : Flow {
         $hits->clicks = $hits->clicks + 1;
         $hits->travel = $c->travel;
         return .proceed;
     });
-    $in->handleCursorPos($w, 4.0, 0.0);
-    $in->handleMouseButton($w, .left, .press, 0);
-    $in->handleCursorPos($w, 8.0, 0.0);
-    $in->handleMouseButton($w, .left, .release, 0);
+    $in->handle($w, .cursor(4.0, 0.0));
+    $in->handle($w, .button(.left, .press, 0));
+    $in->handle($w, .cursor(8.0, 0.0));
+    $in->handle($w, .button(.left, .release, 0));
     assert($hits->clicks == 1, 'click');
     assert($hits->travel == 4.0f, 'travel');
 }
@@ -382,14 +419,14 @@ test input_left_click_past_slop_is_not_a_click
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, $d);
     InputHits $hits = InputHits();
-    $d->register<Click>(function(const Click& $c) : Flow {
+    $d->register<ClickSignal>(function(const ClickSignal& $c) : Flow {
         $hits->clicks = $hits->clicks + 1;
         return .proceed;
     });
-    $in->handleCursorPos($w, 0.0, 0.0);
-    $in->handleMouseButton($w, .left, .press, 0);
-    $in->handleCursorPos($w, 40.0, 0.0);
-    $in->handleMouseButton($w, .left, .release, 0);
+    $in->handle($w, .cursor(0.0, 0.0));
+    $in->handle($w, .button(.left, .press, 0));
+    $in->handle($w, .cursor(40.0, 0.0));
+    $in->handle($w, .button(.left, .release, 0));
     assert($hits->clicks == 0, 'travelled');
 }
 
@@ -399,13 +436,13 @@ test input_right_button_is_not_a_click
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, $d);
     InputHits $hits = InputHits();
-    $d->register<Click>(function(const Click& $c) : Flow {
+    $d->register<ClickSignal>(function(const ClickSignal& $c) : Flow {
         $hits->clicks = $hits->clicks + 1;
         return .proceed;
     });
-    $in->handleCursorPos($w, 0.0, 0.0);
-    $in->handleMouseButton($w, .right, .press, 0);
-    $in->handleMouseButton($w, .right, .release, 0);
+    $in->handle($w, .cursor(0.0, 0.0));
+    $in->handle($w, .button(.right, .press, 0));
+    $in->handle($w, .button(.right, .release, 0));
     assert($hits->clicks == 0, 'right');
 }
 
@@ -413,13 +450,28 @@ test input_mouse_delta_is_this_poll
 {
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, Dispatcher());
-    $in->handleCursorPos($w, 3.0, 4.0);
+    $in->handle($w, .cursor(3.0, 4.0));
     assert($in->mouseDelta()->x == 3.0f, 'dx');
     assert($in->mouseDelta()->y == 4.0f, 'dy');
+    assert($in->pointerDelta()->x == 3.0f, 'pointer dx');
     $in->handleWillPoll($w);
     assert($in->mouseDelta()->x == 0.0f, 'cleared');
-    $in->handleCursorPos($w, 5.0, 4.0);
+    assert($in->pointerDelta()->x == 0.0f, 'pointer cleared');
+    $in->handle($w, .cursor(5.0, 4.0));
     assert($in->mouseDelta()->x == 2.0f, 'next');
+}
+
+test input_finger_writes_pointer_delta_not_mouse
+{
+    Window $w = Window('tap', 64, 64, WindowHints());
+    InputHub $in = InputHub($w, Dispatcher());
+    $in->handle($w, .touch(1, .began, 4.0f, 5.0f, 1.0f));
+    $in->handleWillPoll($w);
+    $in->handle($w, .touch(1, .moved, 10.0f, 9.0f, 1.0f));
+    assert($in->pointerDelta()->x == 6.0f, 'finger dx');
+    assert($in->pointerDelta()->y == 4.0f, 'finger dy');
+    assert($in->mouseDelta()->x == 0.0f, 'mouse stays');
+    assert($in->mouseDelta()->y == 0.0f, 'mouse stays y');
 }
 
 test input_scroll_dispatches
@@ -428,11 +480,11 @@ test input_scroll_dispatches
     Window $w = Window('tap', 64, 64, WindowHints());
     InputHub $in = InputHub($w, $d);
     InputHits $hits = InputHits();
-    $d->register<Scroll>(function(const Scroll& $s) : Flow {
+    $d->register<ScrollSignal>(function(const ScrollSignal& $s) : Flow {
         $hits->scrolls = $hits->scrolls + 1;
         return .proceed;
     });
-    $in->handleScroll($w, 0.0, 1.0);
+    $in->handle($w, .scroll(0.0, 1.0));
     assert($hits->scrolls == 1, 'scroll');
 }
 
@@ -507,11 +559,11 @@ test input_poll_seeds_pointer_from_window_cursor
     assert($in->pointer()->x == 40.0f, 'warped x');
     assert($in->pointer()->y == 50.0f, 'warped y');
     InputHits $hits = InputHits();
-    $d->register<Cursor>(function(const Cursor& $c) : Flow {
+    $d->register<CursorSignal>(function(const CursorSignal& $c) : Flow {
         $hits->offsetX = $c->offsetX;
         return .proceed;
     });
-    $in->handleCursorPos($w, 41.0, 50.0);
+    $in->handle($w, .cursor(41.0, 50.0));
     assert($hits->offsetX == 1.0, 'delta from warp');
     $w->destroy();
     $gpu->shutdown();

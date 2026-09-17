@@ -2,7 +2,7 @@
  * Fullscreen iOS view.
  * Construct matches the desktop Window so Host / Quickstart stay portable.
  * No cursor, title, or decorations.
- * Touches enqueue; poll() drains them between will and did.
+ * Host callbacks enqueue; poll() drains between will and did.
  */
 
 namespace visu::os;
@@ -250,12 +250,7 @@ public class Window : WindowProtocol
 
     public function flush() : void
     {
-        while (!$this->events->empty()) {
-            array<HostEvent> $batch = $this->events->take();
-            foreach ($batch as $event) {
-                applyHostEvent($this, $this->handler, $event);
-            }
-        }
+        $this->events->drain($this, $this->handler);
     }
 
     public const function shouldClose() : bool
@@ -323,6 +318,17 @@ public class Window : WindowProtocol
     public function setHandler(WindowEventHandler $handler) : void
     {
         $this->handler = $handler;
+    }
+
+    internal function noteSize(int32 $width, int32 $height) : void
+    {
+        $this->width = $width;
+        $this->height = $height;
+    }
+
+    internal function notePos() : void
+    {
+        // desktop chrome; iOS is a fullscreen view
     }
 
     internal function noteFramebuffer(int32 $width, int32 $height) : void

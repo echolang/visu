@@ -6,13 +6,13 @@
 
 namespace visu::quickstart;
 
-use visu::app::{HostError, Paths, Services, bootstrap};
+use visu::app::{Application, Host, HostError, Paths, Services, bootstrap};
 use visu::instrument::{DeviceSource, LoopSource};
-use visu::os::{init, requestStop, resourceRoot, terminate};
-use visu::runtime::{GameLoop, registerMain, unregisterMain};
-use visu::signal::{Flow, Resume};
+use visu::os::{requestStop, resourceRoot};
+use visu::runtime::GameLoop;
+use visu::signal::{Flow, ResumeSignal};
 
-public class Quickstart
+public class Quickstart : Application
 {
     private App $app;
     private Options $options;
@@ -26,7 +26,7 @@ public class Quickstart
 
         Services $services = $options->services ?? bootstrap(Paths(root: resourceRoot()), function(Services $s) : void {
         });
-        
+
         $this->app = App($options, $services);
         $this->loop = GameLoop($this->app, $options->tickRate, $options->maxUpdatesPerFrame);
 
@@ -44,26 +44,25 @@ public class Quickstart
         return $this->loop;
     }
 
+    public const function host() : Host
+    {
+        return $this->app->host;
+    }
+
+    public function initialize() : status<HostError>
+    {
+        return $this->app->initialize();
+    }
+
     /**
-     * Bring the window and loop up.
-     * Called from os::run start.
+     * After the host is up: ready callbacks, loop clock, snap the clock on resume.
      */
     public function prepare() : void
     {
-        guard init() else ($e) {
-            die($e->message());
-        }
-
-        guard $this->app->initialize() else ($e) {
-            terminate();
-            die($e->message());
-        }
-
-        registerMain($this->app->events);
         $this->app->ready();
         $this->loop->prepare();
         GameLoop $loop = $this->loop;
-        $this->app->dispatcher->register<Resume>(function(const Resume& $signal) : Flow {
+        $this->app->dispatcher->register<ResumeSignal>(function(const ResumeSignal& $signal) : Flow {
             $loop->prepare();
             return .proceed;
         });
@@ -79,35 +78,17 @@ public class Quickstart
         $this->loop->pulse();
     }
 
-    public function shutdown() : void
+    public function destroy() : void
     {
-        HostError $fail = $this->app->host->fail;
         $this->app->destroy();
-        unregisterMain();
-        terminate();
-
-        if ($fail->failed()) {
-            die($fail->message());
-        }
     }
 
     /**
      * Process edge.
-     * os::run: prepare after the host is up (iOS: after the key window exists), tick until requestStop.
+     * visu::app::run: prepare after the host is up (iOS: after the key window exists), tick until requestStop.
      */
     public function run() : void
     {
-        Quickstart $qs = $this;
-        visu::os::run(
-            function() : void {
-                $qs->prepare();
-            },
-            function() : void {
-                $qs->tick();
-            },
-            function() : void {
-                $qs->shutdown();
-            }
-        );
+        visu::app::run($this);
     }
 }

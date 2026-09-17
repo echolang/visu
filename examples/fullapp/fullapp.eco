@@ -1,5 +1,5 @@
 /*
- * Starter-shaped app: Game as Delegate, Director, menu + play.
+ * Starter-shaped app: Game as GameLoopDelegate + Application, Director, menu + play.
  * Not Quickstart.
  *
  *   echoc run -m examples --target fullapp
@@ -8,43 +8,12 @@
 
 use std::env;
 use std::io;
-use visu::app::{HostError, Paths, Services, bootstrap};
-use visu::os::{init, run, terminate};
-use visu::runtime::{registerMain, unregisterMain};
+use visu::app::{Paths, Services, bootstrap, run};
 
 Services $services = bootstrap(Paths(root: fullappRoot()), function(Services $s) : void {
 });
 
-Game $game = Game($services);
-run(
-    function() : void {
-        guard init() else ($e) {
-            die($e->message());
-        }
-
-        guard $game->initialize() else ($e) {
-            $game->destroy();
-            terminate();
-            die($e->message());
-        }
-
-        registerMain($game->host->events);
-        $game->prepare();
-    },
-    function() : void {
-        $game->tick();
-    },
-    function() : void {
-        HostError $fail = $game->host->fail;
-        $game->destroy();
-        unregisterMain();
-        terminate();
-
-        if ($fail->failed()) {
-            die($fail->message());
-        }
-    }
-);
+run(Game($services));
 
 internal function fullappRoot() : string
 {

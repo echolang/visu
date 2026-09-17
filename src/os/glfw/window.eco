@@ -24,6 +24,7 @@ public class Window : WindowProtocol
     private RenderTarget $target;
     private WindowEventHandler? $handler;
     private Device? $device;
+    private EventQueue $events;
     private int32 $appliedHz;
     private bool $vsync = true;
 
@@ -39,6 +40,7 @@ public class Window : WindowProtocol
         $this->target = RenderTarget($width, $height);
         $this->handler = null;
         $this->device = null;
+        $this->events = EventQueue();
         $this->appliedHz = 0;
         $this->vsync = true;
     }
@@ -92,14 +94,9 @@ public class Window : WindowProtocol
         $this->syncTarget();
         $this->device = $device;
         windowRegister($this);
-        glfw::setFramebufferSizeCallback($this->handle, &onFramebufferSize);
-        glfw::setWindowPosCallback($this->handle, &onWindowPos);
+        $this->installCallbacks();
         applyDisplaySync($this->handle, $this->vsync);
         $this->syncPresentRate();
-
-        if ($this->handler != null) {
-            $this->installCallbacks();
-        }
 
         int32 $hz = $this->appliedHz;
         info("window: '{$this->title}' {$this->width}x{$this->height} (fb {$fbW}x{$fbH}, {$hz} Hz)");
@@ -130,6 +127,7 @@ public class Window : WindowProtocol
         glfw::destroyWindow($this->handle);
         $this->handle:$ = null;
         $this->handler = null;
+        $this->events->clear();
     }
 
     internal const function glfwHandle() : ptr<glfw::Window>
@@ -157,11 +155,23 @@ public class Window : WindowProtocol
         $this->requireHandle();
         WindowEventHandler $handler = guard $this->handler else {
             glfw::pollEvents();
+            $this->flush();
             return;
         }
         $handler->handleWillPoll($this);
         glfw::pollEvents();
+        $this->flush();
         $handler->handleDidPoll($this);
+    }
+
+    public function post(HostEvent $event) : void
+    {
+        $this->events->post($event);
+    }
+
+    public function flush() : void
+    {
+        $this->events->drain($this, $this->handler);
     }
 
     public const function shouldClose() : bool
@@ -316,10 +326,6 @@ public class Window : WindowProtocol
     public function setHandler(WindowEventHandler $handler) : void
     {
         $this->handler = $handler;
-
-        if ($this->handle:$ != null) {
-            $this->installCallbacks();
-        }
     }
 
     private function installCallbacks() : void
@@ -335,78 +341,8 @@ public class Window : WindowProtocol
         glfw::setDropCallback($glfwWindow, &onDrop);
         glfw::setWindowFocusCallback($glfwWindow, &onFocus);
         glfw::setWindowSizeCallback($glfwWindow, &onSize);
-    }
-
-    internal function triggerKey(Key $key, int32 $scancode, KeyPhase $phase, int32 $mods) : void
-    {
-        WindowEventHandler $handler = guard $this->handler else {
-            return;
-        }
-        $handler->handleKey($this, $key, $scancode, $phase, $mods);
-    }
-
-    internal function triggerChar(int32 $codepoint) : void
-    {
-        WindowEventHandler $handler = guard $this->handler else {
-            return;
-        }
-        $handler->handleChar($this, $codepoint);
-    }
-
-    internal function triggerCharMods(int32 $codepoint, int32 $mods) : void
-    {
-        WindowEventHandler $handler = guard $this->handler else {
-            return;
-        }
-        $handler->handleCharMods($this, $codepoint, $mods);
-    }
-
-    internal function triggerMouseButton(MouseButton $button, KeyPhase $phase, int32 $mods) : void
-    {
-        WindowEventHandler $handler = guard $this->handler else {
-            return;
-        }
-        $handler->handleMouseButton($this, $button, $phase, $mods);
-    }
-
-    internal function triggerCursorPos(float64 $x, float64 $y) : void
-    {
-        WindowEventHandler $handler = guard $this->handler else {
-            return;
-        }
-        $handler->handleCursorPos($this, $x, $y);
-    }
-
-    internal function triggerCursorEnter(bool $entered) : void
-    {
-        WindowEventHandler $handler = guard $this->handler else {
-            return;
-        }
-        $handler->handleCursorEnter($this, $entered);
-    }
-
-    internal function triggerScroll(float64 $x, float64 $y) : void
-    {
-        WindowEventHandler $handler = guard $this->handler else {
-            return;
-        }
-        $handler->handleScroll($this, $x, $y);
-    }
-
-    internal function triggerDrop(array<string> $paths) : void
-    {
-        WindowEventHandler $handler = guard $this->handler else {
-            return;
-        }
-        $handler->handleDrop($this, $paths);
-    }
-
-    internal function triggerFocus(bool $gained) : void
-    {
-        WindowEventHandler $handler = guard $this->handler else {
-            return;
-        }
-        $handler->handleFocus($this, $gained);
+        glfw::setFramebufferSizeCallback($glfwWindow, &onFramebufferSize);
+        glfw::setWindowPosCallback($glfwWindow, &onWindowPos);
     }
 
     internal function noteSize(int32 $width, int32 $height) : void

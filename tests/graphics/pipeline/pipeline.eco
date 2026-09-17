@@ -5,7 +5,7 @@
 use visu::graphics::{
     Pipeline, Pool, Frame, CallbackPass, Backbuffer, TargetRef,
     TextureRef, RenderTarget, Device, PipelineError,
-    TextureOptions, IoSink, Context
+    TextureOptions, IoSink, RenderContext
 };
 
 class Log
@@ -54,7 +54,7 @@ test pipeline_setup_sees_earlier_mailbox
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $f->set(Marker(9));
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             return .ok;
         }
     ));
@@ -65,7 +65,7 @@ test pipeline_setup_sees_earlier_mailbox
             Marker $m = $f->get<Marker>();
             assert($m->n == 9, 'mailbox');
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             return .ok;
         }
     ));
@@ -88,7 +88,7 @@ test pipeline_execute_order
     $pipeline->add(CallbackPass(
         'a',
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {},
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('a');
             return .ok;
@@ -98,7 +98,7 @@ test pipeline_execute_order
     $pipeline->add(CallbackPass(
         'b',
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {},
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('b');
             return .ok;
@@ -128,7 +128,7 @@ test pipeline_unread_created_target_is_an_error
             TargetRef $t = $pipe->createTarget('orphan', 8, 8);
             $io->reads( $t);
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             return .ok;
         }
     ));
@@ -151,7 +151,7 @@ test pipeline_imported_backbuffer_readable_without_writer
             Backbuffer $bb = $f->get<Backbuffer>();
             $io->reads( $bb->target);
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             return .ok;
         }
     ));
@@ -176,7 +176,7 @@ test pipeline_reader_of_shared_target_waits_for_writer
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->reads( $x);
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('reader');
             return .ok;
@@ -188,7 +188,7 @@ test pipeline_reader_of_shared_target_waits_for_writer
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->writes( $x);
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('writer');
             return .ok;
@@ -219,7 +219,7 @@ test pipeline_two_writers_keep_add_order
             Backbuffer $bb = $f->get<Backbuffer>();
             $io->writes( $bb->target);
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('clear');
             return .ok;
@@ -232,7 +232,7 @@ test pipeline_two_writers_keep_add_order
             Backbuffer $bb = $f->get<Backbuffer>();
             $io->writes( $bb->target);
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('draw');
             return .ok;
@@ -263,7 +263,7 @@ test pipeline_cycle_is_an_error
             $io->reads( $x);
             $io->writes( $y);
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             return .ok;
         }
     ));
@@ -274,7 +274,7 @@ test pipeline_cycle_is_an_error
             $io->reads( $y);
             $io->writes( $x);
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             return .ok;
         }
     ));
@@ -299,7 +299,7 @@ test pipeline_writing_target_happens_before_reading_color
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->reads( $color);
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('reader');
             return .ok;
@@ -311,7 +311,7 @@ test pipeline_writing_target_happens_before_reading_color
         setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
             $io->writes( $g);
         },
-        execute: function(Context $ctx) : status<PipelineError> {
+        execute: function(RenderContext $ctx) : status<PipelineError> {
             Log $log = $ctx->frame->get<Log>();
             $log->names->push('writer');
             return .ok;
