@@ -31,19 +31,13 @@ public const uint32 TEXTURE_TRANSFER_DST = 8;
  * What the texture is shaped like.
  * A cube is six square array slices in the order +X -X +Y -Y +Z -Z.
  * Sampling takes a direction, so wrap modes never apply to it.
+ * An array2D is N 2D slices; `TextureDesc.arrayLength` is the slice count.
  */
 public enum TextureKind
 {
     case texture2D;
     case cube;
-
-    public const function layers() : int32
-    {
-        return match ($this) {
-            TextureKind::texture2D => 1,
-            TextureKind::cube => 6,
-        };
-    }
+    case array2D;
 }
 
 public struct TextureDesc
@@ -53,6 +47,11 @@ public struct TextureDesc
     public int32 $width;
     public int32 $height;
     public int32 $mips = 1;
+
+    /**
+     * Slice count when `kind` is `array2D`. Ignored for 2D (always 1) and cube (always 6).
+     */
+    public int32 $arrayLength = 1;
     public uint32 $usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
     public SampleCount $samples = .one;
     public string $label = '';
@@ -60,6 +59,18 @@ public struct TextureDesc
     public const function isDepth() : bool
     {
         return $this->format->isDepth();
+    }
+
+    /**
+     * Array slices the GPU object holds. Cube faces count as slices.
+     */
+    public const function layers() : int32
+    {
+        return match ($this->kind) {
+            TextureKind::texture2D => 1,
+            TextureKind::cube => 6,
+            TextureKind::array2D => $this->arrayLength,
+        };
     }
 }
 
@@ -159,7 +170,7 @@ public struct RenderPassDesc
 
 public struct TargetFormats
 {
-    public PixelFormat[4] $colors;
+    public PixelFormat[8] $colors;
     public uint32 $colorCount;
     public PixelFormat $depth;
     public bool $hasDepth;
@@ -167,10 +178,10 @@ public struct TargetFormats
 
     public constructor()
     {
-        PixelFormat[4] $colors;
+        PixelFormat[8] $colors;
         uint32 $i = 0;
 
-        while ($i < 4) {
+        while ($i < MAX_COLOR_TARGETS) {
             $colors[$i] = .rgba8;
             $i = $i + 1;
         }
@@ -216,6 +227,8 @@ public struct DeviceLimits
     public uint64 $uniformAlign = 256;
     public uint64 $maxUniformRange = 65536;
     public bool $vertexTextures = false;
+    public int32 $maxTessellationFactor = 0;
+    public uint64 $tessFactorAlign = 256;
 }
 
 public enum AdapterKind
@@ -312,6 +325,7 @@ internal function kindCode(TextureKind $kind) : int32
     return match ($kind) {
         TextureKind::texture2D => 0,
         TextureKind::cube => 1,
+        TextureKind::array2D => 2,
     };
 }
 
@@ -329,6 +343,10 @@ internal function pixelCode(PixelFormat $format) : int32
         PixelFormat::rg16f => 8,
         PixelFormat::depth32f => 9,
         PixelFormat::depth32fStencil8 => 10,
+        PixelFormat::bc7 => 11,
+        PixelFormat::bc7Srgb => 12,
+        PixelFormat::astc4x4 => 13,
+        PixelFormat::astc4x4Srgb => 14,
     };
 }
 

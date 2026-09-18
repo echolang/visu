@@ -1,0 +1,103 @@
+/**
+ * heightmesh emits a triangle list with +Y normals on a flat map.
+ */
+
+use visu::geo::{Heightmap, PrimitiveBuilder, PrimitiveLayout, heightmesh};
+use visu::math::{Vec3, equal, length};
+
+test heightmesh_flat_y_and_count
+{
+    Heightmap $map = Heightmap::flat(3, 3, 0.0f, 1.0f);
+    PrimitiveLayout $layout = PrimitiveLayout::pos3n3();
+    PrimitiveBuilder $b = PrimitiveBuilder($layout);
+    heightmesh($b, $map);
+    usize $stride = 6;
+    assert($b->data->count() == (6 * 2 * 2 * 6) as usize, 'verts');
+    usize $n = $b->data->count();
+
+    for ($i = 0 as usize; $i < $n; $i = $i + $stride) {
+        assert(equal($b->data[$i + 1], 0.0f), 'y');
+        Vec3 $normal = Vec3($b->data[$i + 3], $b->data[$i + 4], $b->data[$i + 5]);
+        assert(equal($normal->y, 1.0f, 0.0001f), 'ny');
+        assert(equal(length($normal), 1.0f, 0.0001f), 'unit');
+    }
+}
+
+test heightmesh_raised_vertex
+{
+    Heightmap $map = Heightmap::flat(2, 2, 0.0f, 1.0f);
+    $map->set(0, 0, 4.0f);
+    PrimitiveBuilder $b = PrimitiveBuilder(PrimitiveLayout::pos3n3());
+    heightmesh($b, $map);
+    bool $saw = false;
+
+    for ($i = 0 as usize; $i < $b->data->count(); $i = $i + 6) {
+        if (equal($b->data[$i + 1], 4.0f)) {
+            $saw = true;
+        }
+    }
+
+    assert($saw, 'peak');
+}
+
+test heightmesh_region_step1_is_four_quads
+{
+    Heightmap $map = Heightmap::flat(5, 5, 0.0f, 1.0f);
+    PrimitiveBuilder $b = PrimitiveBuilder(PrimitiveLayout::pos3n3());
+    heightmesh($b, $map, 0, 0, 2, 2, 1);
+    assert($b->data->count() == (6 * 2 * 2 * 6) as usize, '2x2 cells');
+}
+
+test heightmesh_step2_one_quad
+{
+    Heightmap $map = Heightmap::flat(5, 5, 0.0f, 1.0f);
+    PrimitiveBuilder $b = PrimitiveBuilder(PrimitiveLayout::pos3n3());
+    heightmesh($b, $map, 0, 0, 2, 2, 2);
+    assert($b->data->count() == (6 * 6) as usize, 'one quad');
+}
+
+test heightmesh_west_stitch_skips_t_junction
+{
+    Heightmap $map = Heightmap::flat(5, 5, 0.0f, 1.0f);
+    PrimitiveBuilder $b = PrimitiveBuilder(PrimitiveLayout::pos3n3());
+    heightmesh($b, $map, 0, 0, 4, 4, 1, 2);
+    assert($b->data->count() == (90 * 6) as usize, 'stitched verts');
+    float32 $westX = $map->worldX(0);
+    float32 $oddZ = $map->worldZ(1);
+    bool $tJunction = false;
+    usize $n = $b->data->count();
+
+    for ($i = 0 as usize; $i < $n; $i = $i + 6) {
+        if (equal($b->data[$i], $westX) && equal($b->data[$i + 2], $oddZ)) {
+            $tJunction = true;
+        }
+    }
+
+    assert(!$tJunction, 'no west midpoint');
+}
+
+test heightmesh_west_and_south_stitch_skips_t_junctions
+{
+    Heightmap $map = Heightmap::flat(5, 5, 0.0f, 1.0f);
+    PrimitiveBuilder $b = PrimitiveBuilder(PrimitiveLayout::pos3n3());
+    heightmesh($b, $map, 0, 0, 4, 4, 1, 2, 0, 2);
+    float32 $westX = $map->worldX(0);
+    float32 $southZ = $map->worldZ(0);
+    float32 $oddX = $map->worldX(1);
+    float32 $oddZ = $map->worldZ(1);
+    bool $tJunction = false;
+    usize $n = $b->data->count();
+
+    for ($i = 0 as usize; $i < $n; $i = $i + 6) {
+        if (equal($b->data[$i], $westX) && equal($b->data[$i + 2], $oddZ)) {
+            $tJunction = true;
+        }
+
+        if (equal($b->data[$i], $oddX) && equal($b->data[$i + 2], $southZ)) {
+            $tJunction = true;
+        }
+    }
+
+    assert(!$tJunction, 'no west/south midpoints');
+    assert($b->data->count() > 0, 'emitted');
+}

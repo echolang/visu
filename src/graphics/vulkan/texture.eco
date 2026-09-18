@@ -30,7 +30,7 @@ internal function vkCreateTexture(Device $device, const TextureDesc& $desc) : re
         }
     }
 
-    uint32 $layers = $desc->kind->layers() as uint32;
+    uint32 $layers = $desc->layers() as uint32;
     vk::ImageCreateInfo $ci = vk::ImageCreateInfo();
     $ci->imageType = vk::IMAGE_TYPE_2D;
     $ci->format = vkFormat($desc->format);
@@ -41,6 +41,10 @@ internal function vkCreateTexture(Device $device, const TextureDesc& $desc) : re
     if ($desc->kind == TextureKind::cube) {
         assert($desc->width == $desc->height, 'cube textures are square');
         $ci->flags = vk::IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    }
+
+    if ($desc->kind == TextureKind::array2D) {
+        assert($desc->arrayLength >= 1, 'array2D arrayLength');
     }
 
     $ci->samples = vkSampleCount($desc->samples);
@@ -81,6 +85,10 @@ internal function vkCreateTexture(Device $device, const TextureDesc& $desc) : re
 
     if ($desc->kind == TextureKind::cube) {
         $vci->viewType = vk::IMAGE_VIEW_TYPE_CUBE;
+    }
+
+    if ($desc->kind == TextureKind::array2D) {
+        $vci->viewType = vk::IMAGE_VIEW_TYPE_2D_ARRAY;
     }
 
     $vci->format = $ci->format;
@@ -146,12 +154,13 @@ internal function vkUploadTexture(
     assert(!$device->encoderOpen, 'uploadTexture with an open encoder');
     assert($bytes > 0, 'uploadTexture size');
     assert($layer >= 0 && $layer < $texture->layers(), 'uploadTexture layer');
-    uint32 $bpp = pixelByteCount($texture->desc->format);
+    PixelFormat $fmt = $texture->desc->format;
+    uint32 $bpp = pixelByteCount($fmt);
     int32 $w = mipSize($texture->desc->width, $mip);
     uint64 $row = $bytesPerRow as uint64;
 
     if ($row == 0) {
-        $row = ($w as uint64) * ($bpp as uint64);
+        $row = mipRowBytes($fmt, $w);
     }
 
     BufferHandle $staging = guard vkCreateBoundBuffer(
@@ -194,7 +203,7 @@ internal function vkReadbackTexture(
         return .error(.missingUsage);
     }
 
-    if ($texture->desc->format->isDepth()) {
+    if ($texture->desc->format->isDepth() || $texture->desc->format->isCompressed()) {
         return .error(.unsupportedFormat($texture->desc->format));
     }
 

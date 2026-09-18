@@ -252,6 +252,7 @@ internal function vkPickDevice(Device $device) : status<DeviceError>
 
     $device->limits->uniformAlign = $props->limits->minUniformBufferOffsetAlignment;
     $device->limits->maxUniformRange = $props->limits->maxUniformBufferRange as uint64;
+    $device->limits->maxTessellationFactor = $props->limits->maxTessellationGenerationLevel as int32;
     $device->adapter = vkAdapterInfo($props, $major, $minor);
     $device->heapBudget = vkHeapBudget($device);
     return .ok;
@@ -379,12 +380,19 @@ internal function vkCreateDevice(Device $device) : status<DeviceError>
     vk::PhysicalDeviceDynamicRenderingFeatures $dyn = vk::PhysicalDeviceDynamicRenderingFeatures();
     $dyn->dynamicRendering = vk::TRUE;
 
+    vk::PhysicalDeviceFeatures $available = vk::PhysicalDeviceFeatures();
+    vk::GetPhysicalDeviceFeatures($device->physical, &$available);
+    vk::PhysicalDeviceFeatures $enable = vk::PhysicalDeviceFeatures();
+    $enable->fillModeNonSolid = $available->fillModeNonSolid;
+    $enable->tessellationShader = $available->tessellationShader;
+
     vk::DeviceCreateInfo $dci = vk::DeviceCreateInfo();
     $dci->pNext:$ = ptr<const uint8>(&$dyn);
     $dci->queueCreateInfoCount = 1;
     $dci->pQueueCreateInfos:$ = &$qci;
     $dci->enabledExtensionCount = $devN;
     $dci->ppEnabledExtensionNames:$ = &$devBuf[0];
+    $dci->pEnabledFeatures:$ = &$enable;
     guard vkCheck(vk::CreateDevice($device->physical, &$dci, null, &$device->logical), 'CreateDevice') else ($e) {
         return .error($e);
     }

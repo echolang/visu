@@ -63,6 +63,7 @@ public class Device : DeviceProtocol
         $this->inFrame = false;
         $this->limits = DeviceLimits();
         $this->limits->uniformAlign = 16;
+        $this->limits->vertexTextures = true;
         AdapterInfo $info = AdapterInfo();
         $info->api = 'Metal';
         $this->adapter = $info;
@@ -108,6 +109,9 @@ public class Device : DeviceProtocol
         $info->name = $gpu->name();
         $info->vendor = 'Apple';
         $this->adapter = $info;
+        $this->limits->maxTessellationFactor = $gpu->maxTessellationFactor() as int32;
+        $this->limits->tessFactorAlign = TESS_FACTOR_ALIGN;
+        $this->limits->vertexTextures = true;
         $this->ready = true;
         announceVersion();
         string $line = $info->line();
@@ -336,7 +340,7 @@ public class Device : DeviceProtocol
             die('beginRender without a command buffer');
         }
         uint32 $n = $desc->colors->count() as uint32;
-        assert($n > 0 && $n <= 4, 'beginRender needs 1..4 color targets');
+        assert($n > 0 && $n <= MAX_COLOR_TARGETS, 'beginRender color targets');
         mtl::RenderPassDescriptor $pass = mtl::RenderPassDescriptor();
         TargetFormats $formats = TargetFormats();
         uint32 $i = 0;
@@ -422,7 +426,7 @@ public class Device : DeviceProtocol
             return .error(.missingUsage);
         }
 
-        if ($texture->desc->format->isDepth()) {
+        if ($texture->desc->format->isDepth() || $texture->desc->format->isCompressed()) {
             return .error(.unsupportedFormat($texture->desc->format));
         }
 
@@ -430,11 +434,10 @@ public class Device : DeviceProtocol
             return .error(.metal('readback', 'texture handle is empty'));
         }
         $this->waitIdle();
-        uint32 $bpp = pixelByteCount($texture->desc->format);
         int32 $w = mipSize($texture->desc->width, $mip);
         int32 $h = mipSize($texture->desc->height, $mip);
-        uint64 $row = ($w as uint64) * ($bpp as uint64);
-        uint64 $total = $row * ($h as uint64);
+        uint64 $row = mipRowBytes($texture->desc->format, $w);
+        uint64 $total = mipByteCount($texture->desc->format, $w, $h);
         array<uint8> $pixels = pixelsFilled($total);
 
         if ($total == 0) {
@@ -551,6 +554,12 @@ public class Device : DeviceProtocol
             $td->textureType = .typeCube;
         }
 
+        if ($desc->kind == TextureKind::array2D) {
+            assert($desc->arrayLength >= 1, 'array2D arrayLength');
+            $td->textureType = .type2DArray;
+            $td->arrayLength = $desc->arrayLength as usize;
+        }
+
         if ($desc->samples == SampleCount::four) {
             $td->sampleCount = 4;
             $td->textureType = .type2DMultisample;
@@ -583,13 +592,12 @@ public class Device : DeviceProtocol
         mtl::Texture $mt = guard $texture->handle->texture else {
             die('uploadTexture handle is empty');
         }
-        uint32 $bpp = pixelByteCount($texture->desc->format);
         int32 $w = mipSize($texture->desc->width, $mip);
         int32 $h = mipSize($texture->desc->height, $mip);
         uint64 $row = $bytesPerRow as uint64;
 
         if ($row == 0) {
-            $row = ($w as uint64) * ($bpp as uint64);
+            $row = mipRowBytes($texture->desc->format, $w);
         }
 
         mtl::Region $region = mtl::Region(mtl::Origin(), mtl::Size($w as usize, $h as usize));
@@ -600,7 +608,7 @@ public class Device : DeviceProtocol
             $row as usize,
             $mip as uint32,
             slice: $layer as uint32,
-            bytesPerImage: ($row as usize) * ($h as usize)
+            bytesPerImage: mipByteCount($texture->desc->format, $w, $h) as usize
         );
         $texture->state = .shaderRead;
     }

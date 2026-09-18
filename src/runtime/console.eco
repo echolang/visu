@@ -1,22 +1,31 @@
 /**
  * Tilde / Ctrl+C command line.
  * Types into a buffer, dispatches ConsoleCommandSignal on enter.
- * Overlay drawing waits on bitmap fonts.
+ * Overlay is VG on the backbuffer (Host.attachPass after the instrument HUD).
  * Toggle claims the input-context mutex.
  * ContextMap then skips action handle so bound keys are not stolen while the line is open (`track` still updates down()).
  */
 
 namespace visu::runtime;
 
+use visu::graphics::{Device, Pipeline, TargetRef};
+use visu::math::Vec2;
 use visu::os::input;
 use visu::os::input::{InputHub, KeyPhase};
 use visu::signal::{CharSignal, ConsoleCommandSignal, Dispatcher, Flow, KeySignal};
+use visu::vg::{Canvas, Color, TextAlign, VgError, VgRenderer};
 
 internal const HISTORY_LIMIT = 100;
 internal const CONSOLE_CONTEXT = 'visu/dev/console';
+internal const int32 CONSOLE_RENDER_LIMIT = 10;
+internal const float32 CONSOLE_FONT_SIZE = 14.0f;
+internal const float32 CONSOLE_LINE_HEIGHT = 18.0f;
+internal const float32 CONSOLE_PAD = 10.0f;
+internal const float32 CONSOLE_MIN_HEIGHT = 40.0f;
 
 public class DebugConsole
 {
+    public ConsoleCommandRegistry $registry;
     private Dispatcher $dispatcher;
     private InputHub $input;
     private bool $enabled;
@@ -25,9 +34,13 @@ public class DebugConsole
     private int32 $historyIndex;
     private int32 $keyId;
     private int32? $charListener;
+    private VgRenderer? $vg;
+    private bool $loaded;
+    private bool $dead;
 
     public constructor(Dispatcher $dispatcher, InputHub $input)
     {
+        $this->registry = ConsoleCommandRegistry();
         $this->dispatcher = $dispatcher;
         $this->input = $input;
         $this->enabled = false;
@@ -35,6 +48,9 @@ public class DebugConsole
         $this->history = array<string>();
         $this->historyIndex = 0;
         $this->charListener = null;
+        $this->vg = null;
+        $this->loaded = false;
+        $this->dead = false;
         $this->keyId = $this->dispatcher->register<KeySignal>(function(const KeySignal& $signal) : Flow {
             return $this->handleKey($signal);
         }, -1000);
@@ -51,9 +67,12 @@ public class DebugConsole
 
         if ($this->input->holds(CONSOLE_CONTEXT)) {
             guard $this->input->release(CONSOLE_CONTEXT) else {
+                $this->destroy();
                 return;
             }
         }
+
+        $this->destroy();
     }
 
     public const function enabled() : bool
@@ -64,6 +83,14 @@ public class DebugConsole
     public const function line() : string
     {
         return $this->line;
+    }
+
+    /**
+     * Copy of the history ring. Overlay and tests read this; writeLine is the mutator.
+     */
+    public function history() : array<string>
+    {
+        return $this->history->clone();
     }
 
     public function writeLine(string $text) : void
@@ -83,13 +110,79 @@ public class DebugConsole
     }
 
     /**
+     * Compile the VG overlay. Command side works without this; attachPass no-ops until it succeeds.
+     */
+    public function load(Device $device) : status<VgError>
+    {
+        if ($this->loaded) {
+            return .ok;
+        }
+
+        VgRenderer $vg = VgRenderer($device);
+        guard $vg->load() else ($e) {
+            $vg->destroy();
+            return .error($e);
+        }
+        string $bytes = visu::instrument::debugFontBytes();
+        guard $vg->canvas->createFont(name: 'debug', bytes: $bytes) else ($e) {
+            $vg->destroy();
+            return .error($e);
+        }
+        $this->vg = $vg;
+        $this->loaded = true;
+        return .ok;
+    }
+
+    /**
+     * Bottom bar on `$target` when the console is open and the overlay loaded. Host calls this after the instrument HUD.
+     */
+    public function attachPass(Pipeline $pipeline, TargetRef $target) : void
+    {
+        if (!$this->enabled || !$this->loaded) {
+            return;
+        }
+
+        VgRenderer $vg = guard $this->vg else {
+            return;
+        }
+        array<string> $lines = $this->recentLines();
+        string $prompt = $this->promptText();
+        $vg->pass($pipeline, $target, function(Canvas $canvas) : void {
+            paintConsole($canvas, $lines, $prompt);
+        });
+    }
+
+    /**
+     * Drop the VG overlay. Idempotent. Host.destroy waitIdle first.
+     */
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->dead = true;
+        $this->loaded = false;
+        VgRenderer? $maybe = $this->vg;
+
+        if ($maybe != null) {
+            VgRenderer $vg = guard $maybe;
+            $vg->destroy();
+            $this->vg = null;
+        }
+    }
+
+    /**
      * Submit `$raw` as if enter was pressed (tests, and later a typed line).
+     * Dispatches ConsoleCommandSignal first, then routes help / clear / registered names.
      */
     public function submit(string $raw) : void
     {
         $this->writeLine($raw);
         $this->line = '';
-        $this->dispatcher->dispatch(ConsoleCommandSignal($raw));
+        ConsoleCommandSignal $cmd = ConsoleCommandSignal($raw);
+        $this->dispatcher->dispatch($cmd);
+        $this->route($cmd);
     }
 
     internal function handleKey(const KeySignal& $signal) : Flow
@@ -144,6 +237,41 @@ public class DebugConsole
         return .proceed;
     }
 
+    private function route(const ConsoleCommandSignal& $cmd) : void
+    {
+        if ($cmd->parts->empty()) {
+            return;
+        }
+
+        if ($cmd->isAction('help')) {
+            $this->writeHelp();
+            return;
+        }
+
+        if ($cmd->isAction('clear')) {
+            $this->clearHistory();
+            $this->writeLine('cleared');
+            return;
+        }
+
+        ConsoleCommandHandler $handler = guard $this->registry->find($cmd->parts[0]) else {
+            string $name = $cmd->parts[0];
+            $this->writeLine("unknown command: {$name}. type help");
+            return;
+        }
+        $handler->onConsoleCommand($cmd, $this);
+    }
+
+    private function writeHelp() : void
+    {
+        $this->writeLine('help - list commands');
+        $this->writeLine('clear - clear console history');
+        array<string> $names = $this->registry->names();
+        foreach ($names as $name) {
+            $this->writeLine($name);
+        }
+    }
+
     private function setEnabled(bool $on) : void
     {
         if ($on) {
@@ -188,4 +316,63 @@ public class DebugConsole
 
         return $this->history[$index as usize];
     }
+
+    private function recentLines() : array<string>
+    {
+        int32 $n = $this->history->count() as int32;
+        int32 $start = $n - CONSOLE_RENDER_LIMIT;
+        if ($start < 0) {
+            $start = 0;
+        }
+
+        array<string> $out = array<string>();
+        for (int32 $i = $start; $i < $n; $i = $i + 1) {
+            $out[] = $this->history[$i as usize];
+        }
+
+        return $out;
+    }
+
+    private function promptText() : string
+    {
+        string $text = "CONSOLE: {$this->line}";
+        int32 $tick = seconds() as int32;
+        if ($tick % 2 == 0) {
+            $text->append('_');
+        }
+
+        return $text;
+    }
+}
+
+internal function paintConsole(Canvas $vg, const array<string>& $lines, const string& $prompt) : void
+{
+    guard $vg->fontFace('debug') else {
+        return;
+    }
+    $vg->fontSize(CONSOLE_FONT_SIZE);
+    $vg->textAlign(TextAlign(.left, .top));
+    float32 $w = $vg->width;
+    float32 $h = $vg->height;
+    float32 $block = CONSOLE_PAD * 2.0f + CONSOLE_LINE_HEIGHT * (($lines->count() as float32) + 1.0f);
+    if ($block < CONSOLE_MIN_HEIGHT) {
+        $block = CONSOLE_MIN_HEIGHT;
+    }
+
+    float32 $top = $h - $block;
+    if ($top < 0.0f) {
+        $top = 0.0f;
+    }
+
+    $vg->fillColor(Color(0.0f, 0.0f, 0.0f, 0.5f));
+    $vg->fillRect(Vec2(0.0f, $top), Vec2($w, $h - $top));
+    $vg->fillColor(Color::white());
+    float32 $y = $top + CONSOLE_PAD;
+    foreach ($lines as $line) {
+        $vg->text(Vec2(CONSOLE_PAD, $y), $line);
+        $y = $y + CONSOLE_LINE_HEIGHT;
+    }
+
+    $vg->fillColor(Color(1.0f, 0.494f, 0.459f, 1.0f));
+    $vg->text(Vec2(CONSOLE_PAD, $y), $prompt);
 }

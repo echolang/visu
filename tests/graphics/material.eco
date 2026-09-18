@@ -1,0 +1,189 @@
+/**
+ * Material fills named slots from a cooked `.vmat` sheet.
+ */
+
+use std::env;
+use std::io;
+use visu::graphics::{Device, Material, Pixels};
+use visu::asset::{
+    AssetError, AssetRef, Assets, Blob, CookedImage, DirectoryStore, KIND_TEXTURE, KIND_VMAT,
+    Kitchen, TextureCooker, Vmat, decodeTexture, decodeVmat
+};
+use visu::math::equal;
+
+function matTmp(string $tag) : string
+{
+    $tmp = env::tmp();
+    string $ds = env::DS;
+    return "{$tmp}{$ds}visu-mat-{$tag}";
+}
+
+function mkdirMat(string $dir) : void
+{
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return;
+        }
+
+        die($e->message());
+    }
+}
+
+function writeMatDot(const string& $path, int32 $w, int32 $h) : void
+{
+    array<uint8> $rgba = array<uint8>();
+    int32 $n = $w * $h;
+    int32 $i = 0;
+
+    while ($i < $n) {
+        $rgba[] = 255;
+        $rgba[] = 0;
+        $rgba[] = 0;
+        $rgba[] = 255;
+        $i = $i + 1;
+    }
+
+    Pixels $px = Pixels($w, $h, $rgba);
+    guard $px->write($path) else ($e) {
+        die($e->message());
+    }
+}
+
+function mountMat(const string& $out) : Assets
+{
+    DirectoryStore $store = guard DirectoryStore::open($out) else ($e) {
+        die($e->message());
+    }
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    $assets->register(KIND_TEXTURE, function(Assets $a, Blob $b) : result<CookedImage, AssetError> {
+        return decodeTexture($a, $b);
+    });
+    $assets->register(KIND_VMAT, function(Assets $a, Blob $b) : result<Vmat, AssetError> {
+        return decodeVmat($a, $b);
+    });
+    guard $assets->mount($store) else ($e) {
+        die($e->message());
+    }
+    return $assets;
+}
+
+test material_load_convention_binds
+{
+    string $src = matTmp('conv-src');
+    mkdirMat($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}rock";
+    mkdirMat($folder);
+    writeMatDot("{$folder}{$ds}albedo.png", 1, 1);
+    writeMatDot("{$folder}{$ds}normal.png", 1, 1);
+    guard io::writefile(
+        "{$folder}{$ds}rock.vmat",
+        '{"shader":"pbr","textureScale":0.05,"fallback":[0.22,0.38,0.16]}'
+    ) else ($e) {
+        die($e->message());
+    }
+
+    string $out = matTmp('conv-out');
+    mkdirMat($out);
+    Kitchen $k = Kitchen();
+    $k->add(TextureCooker());
+    guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+
+    Assets $assets = mountMat($out);
+    Material $mat = guard Material::load($assets, 'rock') else ($e) {
+        die($e->message());
+    }
+    AssetRef $albedo = guard $mat->albedo else {
+        die('albedo bind');
+    }
+    AssetRef $normal = guard $mat->normal else {
+        die('normal bind');
+    }
+    assert($albedo->id->equals('rock/albedo'), 'albedo id');
+    assert($normal->id->equals('rock/normal'), 'normal id');
+    assert($mat->roughness == null, 'no rough');
+    assert(equal($mat->textureScale->x, 0.05f), 'scale');
+    assert(equal($mat->diffuseColor->x, 0.22f), 'fallback r');
+    assert(equal($mat->diffuseColor->y, 0.38f), 'fallback g');
+    assert(equal($mat->diffuseColor->z, 0.16f), 'fallback b');
+    assert(($mat->sheet->root['shader']->asStr() ?? '')->equals('pbr'), 'shader stays');
+}
+
+test material_roughness_stem
+{
+    string $src = matTmp('rough-src');
+    mkdirMat($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}dirt";
+    mkdirMat($folder);
+    writeMatDot("{$folder}{$ds}albedo.png", 1, 1);
+    writeMatDot("{$folder}{$ds}roughness.png", 1, 1);
+    guard io::writefile("{$folder}{$ds}dirt.vmat", '{}') else ($e) {
+        die($e->message());
+    }
+
+    string $out = matTmp('rough-out');
+    mkdirMat($out);
+    Kitchen $k = Kitchen();
+    $k->add(TextureCooker());
+    guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+
+    Assets $assets = mountMat($out);
+    Material $mat = guard Material::load($assets, 'dirt') else ($e) {
+        die($e->message());
+    }
+    AssetRef $rough = guard $mat->roughness else {
+        die('rough bind');
+    }
+    assert($rough->id->equals('dirt/roughness'), 'roughness stem');
+}
+
+test material_overlay_maps
+{
+    string $src = matTmp('ovl-src');
+    mkdirMat($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}rock";
+    mkdirMat($folder);
+    writeMatDot("{$folder}{$ds}albedo.png", 1, 1);
+    writeMatDot("{$folder}{$ds}normal.png", 1, 1);
+    writeMatDot("{$folder}{$ds}ao.png", 1, 1);
+    writeMatDot("{$folder}{$ds}height.png", 1, 1);
+    writeMatDot("{$folder}{$ds}roughness.png", 1, 1);
+    guard io::writefile(
+        "{$folder}{$ds}rock.vmat",
+        '{"normal":{"srgb":false},"ao":{"srgb":false},"height":{"srgb":false},"roughness":{"srgb":false}}'
+    ) else ($e) {
+        die($e->message());
+    }
+
+    string $out = matTmp('ovl-out');
+    mkdirMat($out);
+    Kitchen $k = Kitchen();
+    $k->add(TextureCooker());
+    guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+
+    Assets $assets = mountMat($out);
+    Material $mat = guard Material::load($assets, 'rock') else ($e) {
+        die($e->message());
+    }
+    assert(($mat->normal?->id ?? '')->equals('rock/normal'), 'normal');
+    assert(($mat->ao?->id ?? '')->equals('rock/ao'), 'ao');
+    assert(($mat->height?->id ?? '')->equals('rock/height'), 'height');
+    assert(($mat->roughness?->id ?? '')->equals('rock/roughness'), 'rough');
+}
+
+test material_empty_id
+{
+    Material $mat = Material(id: 'missing/rock');
+    assert($mat->id->equals('missing/rock'), 'id');
+    assert($mat->albedo == null, 'no albedo');
+    assert(equal($mat->textureScale->x, 1.0f), 'default scale');
+}

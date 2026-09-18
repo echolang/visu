@@ -6,6 +6,7 @@
 namespace visu::ecs;
 
 use visu::graphics::RenderContext;
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
 
 public interface System
 {
@@ -18,10 +19,14 @@ public interface System
 public class Systems
 {
     private array<System> $bound;
+    private array<ConsoleCommandHandler> $handlers;
+    private DebugConsole? $console;
 
     public constructor()
     {
         $this->bound = array<System>();
+        $this->handlers = array<ConsoleCommandHandler>();
+        $this->console = null;
     }
 
     public function bind(System $system) : void
@@ -29,6 +34,21 @@ public class Systems
         $this->bound->push($system);
     }
 
+    /**
+     * Bind a system that also owns debug-console verbs.
+     * Selected when the argument conforms, so `register()` can ask it for names.
+     * A stored `System` cannot be recast; the widening happens here while the class is known.
+     */
+    public function bind<T : ConsoleCommandHandler>(T $system) : void
+    {
+        System $asSystem = $system;
+        $this->bind($asSystem);
+        $this->handlers[] = $system;
+    }
+
+    /**
+     * Bind already-erased systems. Console verbs on those values are not registered; bind the concrete class instead.
+     */
     public function bindAll(const array<System>& $systems) : void
     {
         foreach ($systems as $system) {
@@ -36,15 +56,26 @@ public class Systems
         }
     }
 
+    /**
+     * Scene load attaches the host console so register() can walk ConsoleCommandHandler systems.
+     */
+    public function listen(DebugConsole $console) : void
+    {
+        $this->console = $console;
+    }
+
     public function register(Entities $entities) : void
     {
         foreach ($this->bound as $system) {
             $system->register($entities);
         }
+
+        $this->installConsole();
     }
 
     public function unregister(Entities $entities) : void
     {
+        $this->removeConsole();
         foreach ($this->bound as $system) {
             $system->unregister($entities);
         }
@@ -62,5 +93,25 @@ public class Systems
         foreach ($this->bound as $system) {
             $system->render($entities, $ctx);
         }
+    }
+
+    private function installConsole() : void
+    {
+        DebugConsole $console = guard $this->console else {
+            return;
+        }
+        ConsoleCommandRegistry $registry = $console->registry;
+        $registry->clear();
+        foreach ($this->handlers as $handler) {
+            $handler->registerConsoleCommands($registry);
+        }
+    }
+
+    private function removeConsole() : void
+    {
+        DebugConsole $console = guard $this->console else {
+            return;
+        }
+        $console->registry->clear();
     }
 }

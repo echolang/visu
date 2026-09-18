@@ -2,7 +2,7 @@
  * Gribb/Hartmann frustum from a view-projection matrix.
  */
 
-use visu::geo::Frustum;
+use visu::geo::{AABB, Frustum};
 use visu::math::{Mat4, Vec3, lookAt, perspective};
 
 test frustum_contains_points_on_the_look_axis
@@ -15,4 +15,17 @@ test frustum_contains_points_on_the_look_axis
     assert($f->contains(Vec3(0.0f, 0.0f, 2.0f), 0.1f), 'ahead');
     assert(!$f->contains(Vec3(0.0f, 0.0f, 50.0f), 0.1f), 'behind');
     assert(!$f->contains(Vec3(80.0f, 0.0f, 0.0f), 0.1f), 'side');
+}
+
+test frustum_contains_aabb_on_the_look_axis
+{
+    Mat4 $proj = perspective(fovY: std::math::PI_F32 / 2.0f, aspect: 1.0f, near: 1.0f, far: 20.0f);
+    Mat4 $view = lookAt(eye: Vec3(0.0f, 0.0f, 5.0f), center: Vec3(0.0f, 0.0f, 0.0f), up: Vec3(0.0f, 1.0f, 0.0f));
+    Frustum $f = Frustum($proj * $view);
+    AABB $ahead = AABB(Vec3(-0.2f, -0.2f, -0.2f), Vec3(0.2f, 0.2f, 0.2f));
+    AABB $behind = AABB(Vec3(-0.5f, -0.5f, 40.0f), Vec3(0.5f, 0.5f, 50.0f));
+    AABB $side = AABB(Vec3(70.0f, -1.0f, -1.0f), Vec3(90.0f, 1.0f, 1.0f));
+    assert($f->contains($ahead), 'origin box');
+    assert(!$f->contains($behind), 'behind box');
+    assert(!$f->contains($side), 'side box');
 }

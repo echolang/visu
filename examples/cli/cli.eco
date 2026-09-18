@@ -10,13 +10,18 @@ use command;
 use std::env;
 use std::io;
 use visu::app::{Services, Paths, bootstrap, info};
+use visu::asset::Kitchen;
 
 command::Command $app = command::Command('visu', '0.1.0', 'framework tools wired through Services');
 command::Subcommand $pathsCmd = $app->command('paths', 'print application roots', 'Shows the Paths fact from the container.');
 command::Subcommand $logCmd = $app->command('log', 'write a line through Logger', 'Resolves Logger and writes one info line.');
+command::Subcommand $cookCmd = $app->command('cook', 'cook resources/source', 'Writes catalog.vcat into var/cache/asset.');
+command::Subcommand $packCmd = $app->command('pack', 'cook and write a vpack', 'Writes resources/pack/main.vpack.');
 
 command::Arg $rootArg = $app->arg('root', '', '<dir>', 'application root');
 $app->accept($rootArg, $pathsCmd);
+$app->accept($rootArg, $cookCmd);
+$app->accept($rootArg, $packCmd);
 $app->fallback($rootArg, env::cwd());
 
 command::Arg $msgArg = $app->arg('message', 'm', '<text>', 'line to write');
@@ -46,7 +51,7 @@ if ($parsed->wantsHelp || !$parsed->hasCommand) {
 }
 
 string $root = env::cwd();
-if ($parsed->command->id == $pathsCmd->id) {
+if ($parsed->command->id == $pathsCmd->id || $parsed->command->id == $cookCmd->id || $parsed->command->id == $packCmd->id) {
     $root = $parsed->value($rootArg);
 }
 
@@ -63,7 +68,60 @@ if ($parsed->command->id == $pathsCmd->id) {
     echo "store: {$paths->store}";
     echo "resources: {$paths->resources}";
     echo "shaders: {$paths->resourcesShader}";
+    echo "source: {$paths->resourcesSource}";
+    echo "pack: {$paths->resourcesPack}";
     env::exit(0);
+}
+
+if ($parsed->command->id == $cookCmd->id || $parsed->command->id == $packCmd->id) {
+    Paths $paths = $s->get<Paths>();
+    bool $srcOk = guard io::exists($paths->resourcesSource) else ($e) {
+        echo $e->message();
+        env::exit(1);
+    }
+    if (!$srcOk) {
+        echo "no source tree at {$paths->resourcesSource}";
+        env::exit(0);
+    }
+
+    Kitchen $k = Kitchen::defaults();
+    if ($parsed->command->id == $packCmd->id) {
+        cliEnsureDir($paths->resourcesPack);
+        string $packFile = $paths->resourcesPack;
+        $packFile->append('/main.vpack');
+        guard $k->pack($paths->resourcesSource, $packFile) else ($e) {
+            echo $e->message();
+            env::exit(1);
+        }
+
+        echo $packFile;
+        env::exit(0);
+    }
+
+    cliEnsureDir($paths->cache);
+    string $out = $paths->cache;
+    $out->append('/asset');
+    cliEnsureDir($out);
+    array<visu::asset::PackItem> $items = guard $k->cook($paths->resourcesSource, $out) else ($e) {
+        echo $e->message();
+        env::exit(1);
+    }
+
+    echo "{$items->count()} items -> {$out}";
+    env::exit(0);
+}
+
+function cliEnsureDir(const string& $path) : void
+{
+    string $p = $path->clone();
+    guard io::mkdir($p) else ($e) {
+        if ($e->exists()) {
+            return;
+        }
+
+        echo $e->message();
+        env::exit(1);
+    }
 }
 
 info($parsed->value($msgArg));

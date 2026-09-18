@@ -135,9 +135,33 @@ internal function vkPipelineFromPass(
     $fsStage->stage = vk::SHADER_STAGE_FRAGMENT_BIT;
     $fsStage->module = $pass->program->fs->module;
     $fsStage->pName:$ = $entry->cstr();
-    vk::PipelineShaderStageCreateInfo[2] $stages;
+    vk::PipelineShaderStageCreateInfo[4] $stages;
+    uint32 $stageN = 2;
     $stages[0] = $vsStage;
     $stages[1] = $fsStage;
+    vk::PipelineTessellationStateCreateInfo $tess = vk::PipelineTessellationStateCreateInfo();
+    if ($pass->program->tessellated) {
+        assert($pass->program->tcs->alive(), 'vulkan tessellation needs tessc');
+        assert($pass->program->tes->alive(), 'vulkan tessellation needs tesse');
+        vk::PipelineShaderStageCreateInfo $tcsStage = vk::PipelineShaderStageCreateInfo();
+        $tcsStage->stage = vk::SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+        $tcsStage->module = $pass->program->tcs->module;
+        $tcsStage->pName:$ = $entry->cstr();
+        vk::PipelineShaderStageCreateInfo $tesStage = vk::PipelineShaderStageCreateInfo();
+        $tesStage->stage = vk::SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+        $tesStage->module = $pass->program->tes->module;
+        $tesStage->pName:$ = $entry->cstr();
+        $stages[1] = $tcsStage;
+        $stages[2] = $tesStage;
+        $stages[3] = $fsStage;
+        $stageN = 4;
+        int32 $points = $pass->patchControlPoints;
+        if ($points < 1) {
+            $points = 4;
+        }
+
+        $tess->patchControlPoints = $points as uint32;
+    }
 
     vk::VertexInputBindingDescription[2] $binds;
     vk::VertexInputAttributeDescription[16] $attrs;
@@ -197,7 +221,7 @@ internal function vkPipelineFromPass(
     $viewport->scissorCount = 1;
 
     vk::PipelineRasterizationStateCreateInfo $raster = vk::PipelineRasterizationStateCreateInfo();
-    $raster->polygonMode = vk::POLYGON_MODE_FILL;
+    $raster->polygonMode = vkPolygonMode($pass->raster->fill);
     $raster->cullMode = vkCull($pass->raster->cull);
     $raster->frontFace = vkFront($pass->raster->front);
     $raster->lineWidth = 1.0f;
@@ -217,12 +241,12 @@ internal function vkPipelineFromPass(
 
     $depth->depthCompareOp = vkCompare($pass->raster->depthCompare);
 
-    vk::PipelineColorBlendAttachmentState[4] $blendAtts;
-    uint32[4] $colorFormats;
+    vk::PipelineColorBlendAttachmentState[8] $blendAtts;
+    uint32[8] $colorFormats;
     uint32 $colorN = $formats->colorCount;
 
-    if ($colorN > 4) {
-        $colorN = 4;
+    if ($colorN > MAX_COLOR_TARGETS) {
+        $colorN = MAX_COLOR_TARGETS;
     }
 
     if ($colorN == 0) {
@@ -260,10 +284,14 @@ internal function vkPipelineFromPass(
 
     vk::GraphicsPipelineCreateInfo $gpci = vk::GraphicsPipelineCreateInfo();
     $gpci->pNext:$ = ptr<const uint8>(&$rendering);
-    $gpci->stageCount = 2;
+    $gpci->stageCount = $stageN;
     $gpci->pStages:$ = &$stages[0];
     $gpci->pVertexInputState:$ = &$vertex;
     $gpci->pInputAssemblyState:$ = &$ia;
+    if ($pass->program->tessellated) {
+        $gpci->pTessellationState:$ = &$tess;
+    }
+
     $gpci->pViewportState:$ = &$viewport;
     $gpci->pRasterizationState:$ = &$raster;
     $gpci->pMultisampleState:$ = &$ms;

@@ -3,7 +3,7 @@
  */
 
 use visu::geo::{AABB, Ray};
-use visu::math::{Vec3, equal};
+use visu::math::{Mat4, Vec3, equal, rotateY, translate};
 
 test aabb_size_center_contains
 {
@@ -71,4 +71,24 @@ test aabb_avoid_and_corners
     assert(equal($nudge->x, -1.0f), 'push left');
     array<Vec3> $c = $a->corners();
     assert($c->count() == 8, '8 corners');
+}
+
+test aabb_closest_clamps_outside_and_keeps_inside
+{
+    AABB $box = AABB(Vec3(0.0f, 0.0f, 0.0f), Vec3(2.0f, 4.0f, 6.0f));
+    assert(equal($box->closest(Vec3(1.0f, 2.0f, 3.0f)), Vec3(1.0f, 2.0f, 3.0f)), 'inside');
+    assert(equal($box->closest(Vec3(-4.0f, 2.0f, 3.0f)), Vec3(0.0f, 2.0f, 3.0f)), 'x-');
+    assert(equal($box->closest(Vec3(1.0f, 9.0f, 3.0f)), Vec3(1.0f, 4.0f, 3.0f)), 'y+');
+}
+
+test aabb_transformed_translates_and_rotates
+{
+    AABB $box = AABB(Vec3(-1.0f, -1.0f, -1.0f), Vec3(1.0f, 1.0f, 1.0f));
+    AABB $moved = $box->transformed(translate(Vec3(3.0f, 4.0f, 5.0f)));
+    assert(equal($moved->min, Vec3(2.0f, 3.0f, 4.0f)), 'tmin');
+    assert(equal($moved->max, Vec3(4.0f, 5.0f, 6.0f)), 'tmax');
+    Mat4 $rot = rotateY(std::math::PI_F32 * 0.5f);
+    AABB $turned = $box->transformed($rot);
+    assert(equal($turned->min->x, -1.0f, 0.0001f), 'rx');
+    assert(equal($turned->max->z, 1.0f, 0.0001f), 'rz');
 }

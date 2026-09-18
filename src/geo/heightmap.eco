@@ -1,0 +1,327 @@
+/**
+ * CPU height grid in XZ, origin at the centre.
+ * `sample` is bilinear in world units; `cast` is the PHP binary-search ray march.
+ * One texel is `1 / ppu` world units. `smoothed` is a binomial low-pass copy.
+ */
+
+namespace visu::geo;
+
+use visu::math::{Vec2, Vec3, mix, normalize};
+
+public class Heightmap
+{
+    public const int32 $width;
+    public const int32 $height;
+    public const float32 $ppu;
+    private array<float32> $data;
+
+    /**
+     * `$data` is row-major in Z, `width * height` samples. `$ppu` must be > 0.
+     */
+    public constructor(const array<float32>& $data, int32 $width, int32 $height, float32 $ppu = 1.0f)
+    {
+        assert($width > 0, 'heightmap width');
+        assert($height > 0, 'heightmap height');
+        assert($ppu > 0.0f, 'heightmap ppu');
+        assert(($data->count() as int32) == $width * $height, 'heightmap count');
+        $this->width = $width;
+        $this->height = $height;
+        $this->ppu = $ppu;
+        $this->data = $data;
+    }
+
+    /**
+     * Every sample set to `$value`.
+     */
+    public static function flat(int32 $width, int32 $height, float32 $value = 0.0f, float32 $ppu = 1.0f) : Heightmap
+    {
+        int32 $n = $width * $height;
+        array<float32> $data = array<float32>();
+        $data->reserve($n as usize);
+
+        for (int32 $i = 0; $i < $n; $i = $i + 1) {
+            $data[] = $value;
+        }
+
+        return Heightmap($data, $width, $height, $ppu);
+    }
+
+    /**
+     * Grid sample. `$ix` along X, `$iz` along Z.
+     */
+    public const function at(int32 $ix, int32 $iz) : float32
+    {
+        assert($ix >= 0 && $ix < $this->width, 'heightmap x');
+        assert($iz >= 0 && $iz < $this->height, 'heightmap z');
+        return $this->data[($iz * $this->width + $ix) as usize];
+    }
+
+    public function set(int32 $ix, int32 $iz, float32 $h) : void
+    {
+        assert($ix >= 0 && $ix < $this->width, 'heightmap x');
+        assert($iz >= 0 && $iz < $this->height, 'heightmap z');
+        $this->data[($iz * $this->width + $ix) as usize] = $h;
+    }
+
+    /**
+     * Binomial low-pass copy, same size and ppu. `$radius` is samples; 1 is a 3-tap, 2 is a 5-tap.
+     * Edges clamp. Interior linear ramps stay linear; a one-sample spike is spread across the kernel.
+     */
+    public const function smoothed(int32 $radius = 2) : Heightmap
+    {
+        assert($radius >= 1, 'heightmap smooth radius');
+        int32 $degree = $radius * 2;
+        array<float32> $kernel = array<float32>();
+        $kernel->reserve(($degree + 1) as usize);
+        float64 $coeff = 1.0;
+        float64 $sum = 0.0;
+        for (int32 $k = 0; $k <= $degree; $k = $k + 1) {
+            $kernel[] = $coeff as float32;
+            $sum = $sum + $coeff;
+            $coeff = $coeff * (($degree - $k) as float64) / (($k + 1) as float64);
+        }
+
+        float32 $inv = (1.0 / $sum) as float32;
+        usize $taps = $kernel->count();
+        for (usize $i = 0; $i < $taps; $i = $i + 1) {
+            $kernel[$i] = $kernel[$i] * $inv;
+        }
+
+        int32 $w = $this->width;
+        int32 $h = $this->height;
+        usize $n = ($w * $h) as usize;
+        array<float32> $tmp = arr::room<float32>($n);
+        $tmp->commit($n);
+        array<float32> $out = arr::room<float32>($n);
+        $out->commit($n);
+        for (int32 $iz = 0; $iz < $h; $iz = $iz + 1) {
+            int32 $row = $iz * $w;
+            for (int32 $ix = 0; $ix < $w; $ix = $ix + 1) {
+                float32 $acc = 0.0f;
+                for (int32 $k = -$radius; $k <= $radius; $k = $k + 1) {
+                    int32 $sx = $ix + $k;
+                    if ($sx < 0) {
+                        $sx = 0;
+                    }
+
+                    if ($sx >= $w) {
+                        $sx = $w - 1;
+                    }
+
+                    $acc = $acc + $this->data[($row + $sx) as usize] * $kernel[($k + $radius) as usize];
+                }
+
+                $tmp[($row + $ix) as usize] = $acc;
+            }
+        }
+
+        for (int32 $iz = 0; $iz < $h; $iz = $iz + 1) {
+            for (int32 $ix = 0; $ix < $w; $ix = $ix + 1) {
+                float32 $acc = 0.0f;
+                for (int32 $k = -$radius; $k <= $radius; $k = $k + 1) {
+                    int32 $sz = $iz + $k;
+                    if ($sz < 0) {
+                        $sz = 0;
+                    }
+
+                    if ($sz >= $h) {
+                        $sz = $h - 1;
+                    }
+
+                    $acc = $acc + $tmp[($sz * $w + $ix) as usize] * $kernel[($k + $radius) as usize];
+                }
+
+                $out[($iz * $w + $ix) as usize] = $acc;
+            }
+        }
+
+        return Heightmap($out, $w, $h, $this->ppu);
+    }
+
+    /**
+     * Central-difference world-space normal, Y-up. Neighbours clamp at the edge.
+     * Y is 2 so the slope matches a span of two cells; `1 / ppu` is the cell size.
+     */
+    public const function normal(int32 $ix, int32 $iz) : Vec3
+    {
+        int32 $xL = $ix - 1;
+        int32 $xR = $ix + 1;
+        int32 $zD = $iz - 1;
+        int32 $zU = $iz + 1;
+
+        if ($xL < 0) {
+            $xL = 0;
+        }
+
+        if ($xR >= $this->width) {
+            $xR = $this->width - 1;
+        }
+
+        if ($zD < 0) {
+            $zD = 0;
+        }
+
+        if ($zU >= $this->height) {
+            $zU = $this->height - 1;
+        }
+
+        float32 $cell = 1.0f / $this->ppu;
+        float32 $dx = ($this->at($xR, $iz) - $this->at($xL, $iz)) / $cell;
+        float32 $dz = ($this->at($ix, $zU) - $this->at($ix, $zD)) / $cell;
+        return normalize(Vec3(-$dx, 2.0f, -$dz));
+    }
+
+    /**
+     * World X of column `$ix`. Column 0 is `-width / (2 * ppu)`.
+     */
+    public const function worldX(int32 $ix) : float32
+    {
+        return (($ix as float32) - ($this->width as float32) * 0.5f) / $this->ppu;
+    }
+
+    /**
+     * World Z of row `$iz`. Row 0 is `-height / (2 * ppu)`.
+     */
+    public const function worldZ(int32 $iz) : float32
+    {
+        return (($iz as float32) - ($this->height as float32) * 0.5f) / $this->ppu;
+    }
+
+    /**
+     * Height at world XZ, or null outside the grid.
+     */
+    public const function sample(float32 $x, float32 $z) : float32?
+    {
+        float32 $px = $x * $this->ppu + ($this->width as float32) * 0.5f;
+        float32 $pz = $z * $this->ppu + ($this->height as float32) * 0.5f;
+        float32 $w = $this->width as float32;
+        float32 $h = $this->height as float32;
+
+        if ($px < 0.0f || $pz < 0.0f || $px >= $w || $pz >= $h) {
+            return null;
+        }
+
+        int32 $ix0 = std::math::floor($px) as int32;
+        int32 $iz0 = std::math::floor($pz) as int32;
+        int32 $ix1 = $ix0 + 1;
+        int32 $iz1 = $iz0 + 1;
+
+        if ($ix1 >= $this->width) {
+            $ix1 = $this->width - 1;
+        }
+
+        if ($iz1 >= $this->height) {
+            $iz1 = $this->height - 1;
+        }
+
+        float32 $fx = $px - ($ix0 as float32);
+        float32 $fz = $pz - ($iz0 as float32);
+        float32 $h00 = $this->at($ix0, $iz0);
+        float32 $h10 = $this->at($ix1, $iz0);
+        float32 $h01 = $this->at($ix0, $iz1);
+        float32 $h11 = $this->at($ix1, $iz1);
+        return mix(mix($h00, $h10, $fx), mix($h01, $h11, $fx), $fz);
+    }
+
+    /**
+     * Approximate intersection by halving `$maxDistance` `$lookups` times.
+     * Outside the grid counts as below the ray so the march can walk off the map.
+     */
+    public const function cast(const Ray& $ray, float32 $maxDistance = 1000.0f, int32 $lookups = 16) : Vec3?
+    {
+        Ray $r = $ray;
+        float32 $span = $maxDistance;
+        Vec3 $test = $ray->origin;
+
+        for (int32 $i = 0; $i < $lookups; $i = $i + 1) {
+            $span = $span * 0.5f;
+            $test = $r->at($span);
+            float32? $sampled = $this->sample($test->x, $test->z);
+            float32 $height = $sampled ?? ($test->y - 1.0f);
+
+            if ($height < $test->y) {
+                $r->origin = $test;
+            }
+        }
+
+        return $test;
+    }
+
+    public const function min() : float32
+    {
+        float32 $lo = $this->data[0];
+
+        foreach ($this->data as $h) {
+            if ($h < $lo) {
+                $lo = $h;
+            }
+        }
+
+        return $lo;
+    }
+
+    public const function max() : float32
+    {
+        float32 $hi = $this->data[0];
+
+        foreach ($this->data as $h) {
+            if ($h > $hi) {
+                $hi = $h;
+            }
+        }
+
+        return $hi;
+    }
+
+    /**
+     * World AABB covering every grid vertex, Y from min sample to max sample.
+     */
+    public const function bounds() : AABB
+    {
+        return $this->bounds(0, 0, $this->width - 1, $this->height - 1);
+    }
+
+    /**
+     * Inclusive vertex rectangle. `$range.x` is min height, `$range.y` is max.
+     */
+    public const function range(int32 $ix0, int32 $iz0, int32 $ix1, int32 $iz1) : Vec2
+    {
+        $this->checkRect($ix0, $iz0, $ix1, $iz1);
+        float32 $lo = $this->at($ix0, $iz0);
+        float32 $hi = $lo;
+
+        for (int32 $iz = $iz0; $iz <= $iz1; $iz = $iz + 1) {
+            for (int32 $ix = $ix0; $ix <= $ix1; $ix = $ix + 1) {
+                float32 $h = $this->at($ix, $iz);
+                if ($h < $lo) {
+                    $lo = $h;
+                }
+
+                if ($h > $hi) {
+                    $hi = $h;
+                }
+            }
+        }
+
+        return Vec2($lo, $hi);
+    }
+
+    /**
+     * World AABB of an inclusive vertex rectangle. Y from the samples in that rect.
+     */
+    public const function bounds(int32 $ix0, int32 $iz0, int32 $ix1, int32 $iz1) : AABB
+    {
+        Vec2 $y = $this->range($ix0, $iz0, $ix1, $iz1);
+        return AABB(
+            Vec3($this->worldX($ix0), $y->x, $this->worldZ($iz0)),
+            Vec3($this->worldX($ix1), $y->y, $this->worldZ($iz1))
+        );
+    }
+
+    private const function checkRect(int32 $ix0, int32 $iz0, int32 $ix1, int32 $iz1) : void
+    {
+        assert($ix0 >= 0 && $iz0 >= 0, 'heightmap rect min');
+        assert($ix1 >= $ix0 && $iz1 >= $iz0, 'heightmap rect empty');
+        assert($ix1 < $this->width && $iz1 < $this->height, 'heightmap rect max');
+    }
+}

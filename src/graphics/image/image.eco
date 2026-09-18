@@ -32,4 +32,55 @@ internal extern {
         ptr<const float32> $rgba
     ) : int32;
     function visu_hdr_free(ptr<float32> $p) : void;
+    function visu_compress_bc7(
+        ptr<const uint8> $rgba,
+        int32 $w,
+        int32 $h,
+        ptr<uint8> $dst,
+        int32 $cap
+    ) : int32;
+    function visu_compress_astc4x4(
+        ptr<const uint8> $rgba,
+        int32 $w,
+        int32 $h,
+        ptr<uint8> $dst,
+        int32 $cap
+    ) : int32;
+}
+
+/**
+ * BC7 mode 6 or ASTC 4x4 void-extent from tightly packed rgba8. Empty string on failure.
+ */
+internal function compressRgba(PixelFormat $format, ptr<const uint8> $rgba, int32 $width, int32 $height) : string
+{
+    uint64 $need = mipByteCount($format, $width, $height);
+    if ($need == 0 || $need > 2147483647) {
+        return '';
+    }
+
+    int32 $cap = $need as int32;
+    ptr<uint8> $dst = mem::alloc<uint8>($need as usize);
+    if ($dst:$ == null) {
+        return '';
+    }
+
+    int32 $n = 0;
+    if ($format == PixelFormat::bc7 || $format == PixelFormat::bc7Srgb) {
+        $n = visu_compress_bc7($rgba, $width, $height, $dst, $cap);
+    } else if ($format == PixelFormat::astc4x4 || $format == PixelFormat::astc4x4Srgb) {
+        $n = visu_compress_astc4x4($rgba, $width, $height, $dst, $cap);
+    }
+
+    string $out = '';
+    if ($n == $cap) {
+        usize $i = 0;
+
+        while ($i < ($n as usize)) {
+            $out->push($dst:$[$i]);
+            $i = $i + 1;
+        }
+    }
+
+    mem::free($dst);
+    return $out;
 }

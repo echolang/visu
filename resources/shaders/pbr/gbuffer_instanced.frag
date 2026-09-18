@@ -15,6 +15,7 @@ void main()
         v_albedo_metallic.rgb,
         v_albedo_metallic.a,
         v_emissive_roughness.a,
-        v_emissive_roughness.rgb
+        v_emissive_roughness.rgb,
+        1.0
     );
 }

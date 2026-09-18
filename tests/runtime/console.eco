@@ -90,13 +90,28 @@ test console_history_up_down
     $c->submit('one');
     $c->submit('two');
     $d->dispatch(KeySignal(.up, 0, .release, 0));
-    assert($c->line() == 'two', 'last');
+    assert($c->line() == 'unknown command: two. type help', 'last');
     $d->dispatch(KeySignal(.up, 0, .release, 0));
-    assert($c->line() == 'one', 'prev');
+    assert($c->line() == 'two', 'cmd');
     $d->dispatch(KeySignal(.down, 0, .release, 0));
-    assert($c->line() == 'two', 'next');
+    assert($c->line() == 'unknown command: two. type help', 'next');
     $d->dispatch(KeySignal(.down, 0, .release, 0));
     assert($c->line() == '', 'past end');
+}
+
+test console_history_copy
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    $c->submit('one');
+    $c->writeLine('reply');
+    array<string> $h = $c->history();
+    assert($h->count() == 3, 'cmd, miss, reply');
+    assert($h[0] == 'one', 'cmd');
+    assert($h[1] == 'unknown command: one. type help', 'miss');
+    assert($h[2] == 'reply', 'out');
+    $c->clearHistory();
+    assert($c->history()->count() == 0, 'cleared');
 }
 
 test console_ctrl_c_stops_other_key_handlers

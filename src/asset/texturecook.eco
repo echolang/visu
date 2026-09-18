@@ -1,0 +1,99 @@
+/**
+ * png → vtex. Cook knobs come from the folder `.vmat` view on `Source.$meta`.
+ */
+
+namespace visu::asset;
+
+use json;
+use visu::graphics::{Pixels, PixelFormat};
+
+public class TextureCooker : Cooker
+{
+    public function kind() : string
+    {
+        return KIND_TEXTURE;
+    }
+
+    public function accepts(const string& $path) : bool
+    {
+        return str::lower($path)->ends('.png');
+    }
+
+    public function cook(const Source& $src) : result<PackItem, AssetError>
+    {
+        Pixels $px = guard Pixels::load($src->path) else ($e) {
+            return .error(.io($src->path, $e->message()));
+        }
+        bool $srgb = guard vmatBool($src->meta, 'srgb', true) else ($e) {
+            return .error($e);
+        }
+        bool $mips = guard vmatBool($src->meta, 'mips', true) else ($e) {
+            return .error($e);
+        }
+        PixelFormat $fmt = guard cookPixelFormat($src->meta, $srgb) else ($e) {
+            return .error($e);
+        }
+        Blob $blob = guard encodeTexture($px, $fmt, $mips) else ($e) {
+            return .error($e);
+        }
+        return .ok(PackItem($src->id, KIND_TEXTURE, $blob));
+    }
+}
+
+internal function cookPixelFormat(json::Value $meta, bool $srgb) : result<PixelFormat, AssetError>
+{
+    string $name = str::lower(vmatStr($meta, 'format', ''));
+    if ($name->empty() || $name->equals('rgba8')) {
+        if ($srgb) {
+            return .ok(PixelFormat::rgba8Srgb);
+        }
+
+        return .ok(PixelFormat::rgba8);
+    }
+
+    if ($name->equals('rgba8srgb')) {
+        return .ok(PixelFormat::rgba8Srgb);
+    }
+
+    if ($name->equals('compressed')) {
+        #[if: os == ios]
+        if ($srgb) {
+            return .ok(PixelFormat::astc4x4Srgb);
+        }
+
+        return .ok(PixelFormat::astc4x4);
+        #[else]
+        if ($srgb) {
+            return .ok(PixelFormat::bc7Srgb);
+        }
+
+        return .ok(PixelFormat::bc7);
+        #[end]
+    }
+
+    if ($name->equals('bc7')) {
+        if ($srgb) {
+            return .ok(PixelFormat::bc7Srgb);
+        }
+
+        return .ok(PixelFormat::bc7);
+    }
+
+    if ($name->equals('bc7srgb')) {
+        return .ok(PixelFormat::bc7Srgb);
+    }
+
+    if ($name->equals('astc') || $name->equals('astc4x4')) {
+        if ($srgb) {
+            return .ok(PixelFormat::astc4x4Srgb);
+        }
+
+        return .ok(PixelFormat::astc4x4);
+    }
+
+    if ($name->equals('astc4x4srgb')) {
+        return .ok(PixelFormat::astc4x4Srgb);
+    }
+
+    return .error(.decode('format', "unknown format '{$name}'"));
+}

@@ -1,0 +1,258 @@
+/**
+ * Cooked files on disk plus `catalog.vcat`. Dev loop: kitchen writes here, Host mounts it.
+ */
+
+namespace visu::asset;
+
+use std::io;
+use visu::app::slashDir;
+
+public class DirectoryStore : Store
+{
+    public const string $root;
+    private map<string, CatalogEntry> $index;
+    private array<CatalogEntry> $all;
+
+    public constructor(string $root, map<string, CatalogEntry> $index, array<CatalogEntry> $all)
+    {
+        $this->root = slashDir($root);
+        $this->index = $index;
+        $this->all = $all;
+    }
+
+    public static function open(const string& $root) : result<DirectoryStore, AssetError>
+    {
+        string $path = slashDir($root);
+        $path->append('catalog.vcat');
+        string $text = guard io::readfile($path) else ($e) {
+            return .error(.io($path, $e->message()));
+        }
+        return parseCatalog($root, $text);
+    }
+
+    public function find(string $id) : CatalogEntry?
+    {
+        if (!$this->index->has($id)) {
+            return null;
+        }
+
+        return $this->index[$id];
+    }
+
+    public function read(const CatalogEntry& $entry) : result<Blob, AssetError>
+    {
+        string $bytes = guard io::readfile($entry->path) else ($e) {
+            return .error(.io($entry->path, $e->message()));
+        }
+        return .ok(Blob($bytes));
+    }
+
+    public function entries() : array<CatalogEntry>
+    {
+        return $this->all;
+    }
+}
+
+/**
+ * Write `$items` as one file each plus `catalog.vcat` under `$root`.
+ */
+public function writeDirectory(const string& $root, const array<PackItem>& $items) : status<AssetError>
+{
+    string $base = slashDir($root);
+    string $vcat = '';
+    array<CatalogEntry> $all = array<CatalogEntry>();
+
+    foreach ($items as $item) {
+        string $rel = $item->id;
+        $rel->append('.');
+        $rel->append($item->kind);
+        string $path = $base;
+        $path->append($rel);
+        guard ensureParent($path) else ($e) {
+            return .error($e);
+        }
+        guard io::writefile($path, $item->blob->bytes) else ($e) {
+            return .error(.io($path, $e->message()));
+        }
+        uint64 $hash = blobHash($item->blob->bytes);
+        $vcat->append($item->id);
+        $vcat->append(' ');
+        $vcat->append($item->kind);
+        $vcat->append(' ');
+        $vcat->append($rel);
+        $vcat->append(' ');
+        $vcat->append("{$hash}");
+        $vcat->append("\n");
+        CatalogEntry $ent = CatalogEntry();
+        $ent->id = $item->id;
+        $ent->kind = $item->kind;
+        $ent->size = $item->blob->bytes->size() as uint64;
+        $ent->hash = $hash;
+        $ent->path = $path;
+        $all[] = $ent;
+    }
+
+    string $catPath = $base;
+    $catPath->append('catalog.vcat');
+    guard io::writefile($catPath, $vcat) else ($e) {
+        return .error(.io($catPath, $e->message()));
+    }
+
+    return .ok;
+}
+
+internal function parseCatalog(const string& $root, const string& $text) : result<DirectoryStore, AssetError>
+{
+    string $base = slashDir($root);
+    map<string, CatalogEntry> $map = map<string, CatalogEntry>();
+    array<CatalogEntry> $all = array<CatalogEntry>();
+    usize $i = 0;
+    usize $n = $text->size();
+
+    while ($i < $n) {
+        usize $nl = $text->find("\n", $i);
+        usize $end = $nl;
+
+        if ($nl == $n) {
+            $end = $n;
+        }
+
+        string $line = str::trim($text->sub($i, $end - $i));
+        if (!$line->empty() && !$line->starts('#')) {
+            CatalogEntry $ent = guard parseCatalogLine($base, $line) else ($e) {
+                return .error($e);
+            }
+            $map[$ent->id] = $ent;
+            $all[] = $ent;
+        }
+
+        if ($nl == $n) {
+            break;
+        }
+
+        $i = $nl + 1;
+    }
+
+    return .ok(DirectoryStore($root, $map, $all));
+}
+
+internal function parseCatalogLine(const string& $base, const string& $line) : result<CatalogEntry, AssetError>
+{
+    array<string> $parts = split4($line);
+    if ($parts->count() != 4) {
+        return .error(.corrupt($base, 'catalog line needs id kind rel hash'));
+    }
+
+    CatalogEntry $ent = CatalogEntry();
+    $ent->id = $parts[0];
+    $ent->kind = $parts[1];
+    string $path = $base;
+    $path->append($parts[2]);
+    $ent->path = $path;
+    uint64? $hash = str::uint($parts[3]);
+    uint64 $h = guard $hash else {
+        return .error(.corrupt($ent->id, 'bad hash'));
+    }
+    $ent->hash = $h;
+    return .ok($ent);
+}
+
+internal function split4(const string& $line) : array<string>
+{
+    array<string> $out = array<string>();
+    usize $i = 0;
+    usize $n = $line->size();
+
+    while ($i < $n && $out->count() < 4) {
+        while ($i < $n && $line->byte($i) == 32) {
+            $i = $i + 1;
+        }
+
+        if ($i >= $n) {
+            break;
+        }
+
+        if ($out->count() == 3) {
+            $out[] = $line->sub($i, $n - $i);
+            break;
+        }
+
+        usize $j = $i;
+
+        while ($j < $n && $line->byte($j) != 32) {
+            $j = $j + 1;
+        }
+
+        $out[] = $line->sub($i, $j - $i);
+        $i = $j;
+    }
+
+    return $out;
+}
+
+internal function ensureParent(const string& $path) : status<AssetError>
+{
+    usize $slash = 0;
+    usize $i = 0;
+    usize $n = $path->size();
+
+    while ($i < $n) {
+        uint8 $c = $path->byte($i);
+        if ($c == 47 || $c == 92) {
+            $slash = $i;
+        }
+
+        $i = $i + 1;
+    }
+
+    if ($slash == 0) {
+        return .ok;
+    }
+
+    string $parent = $path->sub(0, $slash);
+    return ensureDir($parent->clone());
+}
+
+internal function ensureDir(const string& $dir) : status<AssetError>
+{
+    if ($dir->empty() || $dir->equals('.') || $dir->equals('..')) {
+        return .ok;
+    }
+
+    bool $here = guard io::exists($dir) else ($e) {
+        return .error(.io($dir, $e->message()));
+    }
+    if ($here) {
+        return .ok;
+    }
+
+    usize $slash = 0;
+    usize $i = 0;
+    usize $n = $dir->size();
+
+    while ($i < $n) {
+        uint8 $c = $dir->byte($i);
+        if ($c == 47 || $c == 92) {
+            $slash = $i;
+        }
+
+        $i = $i + 1;
+    }
+
+    if ($slash > 0) {
+        string $parent = $dir->sub(0, $slash);
+        guard ensureDir($parent->clone()) else ($e) {
+            return .error($e);
+        }
+    }
+
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return .ok;
+        }
+
+        return .error(.io($dir, $e->message()));
+    }
+
+    return .ok;
+}

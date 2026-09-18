@@ -1,0 +1,109 @@
+/**
+ * Fullscreen remap of the packed GBuffer onto a single-color target.
+ * Binds every GBuffer attachment, same slots as the light pass, so Metal
+ * tracks the MRT store before any one texture is sampled.
+ */
+
+namespace visu::graphics;
+
+public class DeferredViewPass : Pass
+{
+    private DeferredGpu $gpu;
+    private TargetRef $target;
+    private GBufferData $gbuffer;
+    private DeferredViewData $data;
+
+    public constructor(
+        DeferredGpu $gpu,
+        TargetRef $target,
+        GBufferData $gbuffer,
+        DeferredViewData $data
+    )
+    {
+        $this->gpu = $gpu;
+        $this->target = $target;
+        $this->gbuffer = $gbuffer;
+        $this->data = $data;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.view';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        GBufferData $gbuffer = $this->gbuffer;
+        $io->reads($gbuffer->position);
+        $io->reads($gbuffer->normal);
+        $io->reads($gbuffer->albedo);
+        $io->reads($gbuffer->material);
+        $io->reads($gbuffer->emissive);
+        SsaoData? $ssao = $frame->find<SsaoData>();
+
+        if ($ssao != null) {
+            SsaoData $found = guard $ssao;
+            $io->reads($found->blurred);
+        }
+
+        $io->writes($this->target);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        ShaderProgram $program = guard $this->gpu->shaders->program('debug_view') else ($e) {
+            return .error(.shader($e));
+        }
+
+        $ctx->pipeline->requestClear($this->target, ClearPassOptions());
+        RenderEncoder $enc = guard $ctx->beginRender($this->target) else ($e) {
+            return .error($e);
+        }
+        Device $device = $ctx->device;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        $pass->bind($enc);
+        $enc->upload($this->data, slot: 0);
+        GBufferData $gbuffer = $this->gbuffer;
+        Sampler $point = $this->gpu->point;
+        array<TextureRef> $inputs = [
+            $gbuffer->position,
+            $gbuffer->normal,
+            $gbuffer->albedo,
+            $gbuffer->material,
+            $gbuffer->emissive,
+        ];
+        uint32 $slot = 0;
+
+        while ($slot < 5) {
+            guard bindPooled($ctx, $enc, $slot, $inputs[$slot as usize], $point) else ($e) {
+                $enc->endRender();
+                return .error($e);
+            }
+            $slot = $slot + 1;
+        }
+
+        guard $this->bindAmbient($ctx, $enc, $point) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        $mesh->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+
+    private function bindAmbient(RenderContext $ctx, RenderEncoder $enc, Sampler $sampler) : status<PipelineError>
+    {
+        SsaoData? $ssao = $ctx->frame->find<SsaoData>();
+
+        if ($ssao != null) {
+            SsaoData $found = guard $ssao;
+            return bindPooled($ctx, $enc, 5, $found->blurred, $sampler);
+        }
+
+        $enc->bindTexture(5, $this->gpu->white, $sampler);
+        return .ok;
+    }
+}

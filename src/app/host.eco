@@ -9,10 +9,15 @@ namespace visu::app;
 
 use std::env;
 use std::io;
+use visu::asset::{
+    AssetError, Assets, AudioClip, Blob, DirectoryStore, KIND_BYTES, KIND_SOUND,
+    KIND_TEXTURE, KIND_VMAT, PackStore, Vmat, decodeBytes, decodeGpuTexture,
+    decodeSound, decodeVmat
+};
 use visu::graphics::{
-    Backbuffer, ClearPass, ClearPassOptions, RenderContext, Device, DeviceError,
+    BackbufferData, ClearPass, ClearPassOptions, RenderContext, Device, DeviceError,
     Frame, FrameStatus, FullscreenTextureRenderer, Pipeline, PipelineError,
-    Pool, RenderTarget, SceneTarget, ShaderCollection, TargetRef,
+    Pool, RenderTarget, SceneTargetData, ShaderCollection, TargetRef, Texture,
     TextureOptions, TextureRef
 };
 use visu::instrument::{Instruments, Overlay, Sample};
@@ -33,15 +38,16 @@ public class Host
     public InputHub $input;
     public ContextMap $inputContext;
     public ShaderCollection $shaders;
+    public Assets $assets;
     public Services $services;
     public EventLoop $events;
     public Instruments $instruments;
     public Ui? $ui;
+    public DebugConsole? $console;
     public int32 $frameIndex;
     public HostError $fail;
     private FullscreenTextureRenderer $blit;
     private Overlay? $overlay;
-    private DebugConsole? $console;
 
     public constructor(HostConfig $config, Services $services)
     {
@@ -60,6 +66,7 @@ public class Host
         $this->inputContext = ContextMap($this->dispatcher, $this->input);
         $this->window->setHandler($this->input);
         $this->shaders = ShaderCollection($this->device, hostShaderDir($services));
+        $this->assets = Assets($this->device);
         $this->events = EventLoop();
         $this->instruments = Instruments();
         $this->ui = null;
@@ -89,6 +96,10 @@ public class Host
         $this->bootUi();
         $this->bootConsole();
         guard $this->scanShaders() else ($e) {
+            return .error($e);
+        }
+
+        guard $this->mountAssets() else ($e) {
             return .error($e);
         }
 
@@ -129,7 +140,7 @@ public class Host
                     $this->fail = .pipeline(.device($e));
                     return;
                 },
-            };
+            }
         }
 
         if ($status == FrameStatus::skipped) {
@@ -140,12 +151,12 @@ public class Host
         RenderTarget $windowRt = $this->window->renderTarget();
         Pipeline $pipeline = Pipeline($this->pool, $frame, $windowRt);
         RenderContext $ctx = RenderContext($this->device, $pipeline, $frame, $this->pool, $compensation);
-        Backbuffer $back = $frame->get<Backbuffer>();
+        BackbufferData $back = $frame->get<BackbufferData>();
         TargetRef $sceneTarget = $this->sceneTarget($pipeline, $windowRt);
         $sceneTarget->depthStencil = true;
         TextureRef $color = $pipeline->createColor($sceneTarget, $this->config->colorName, TextureOptions());
         $frame->set(HostPassData($sceneTarget, $color));
-        $frame->set(SceneTarget($sceneTarget));
+        $frame->set(SceneTargetData($sceneTarget));
         $pipeline->add(ClearPass($sceneTarget, ClearPassOptions(color: $this->config->clearColor)));
         $scene($ctx, $sceneTarget);
         $this->addUi($pipeline, $sceneTarget, $ui);
@@ -157,6 +168,13 @@ public class Host
         if ($maybeOverlay != null) {
             Overlay $overlay = guard $maybeOverlay;
             $overlay->pass($pipeline, $back->target, $sample);
+        }
+
+        DebugConsole? $maybeConsole = $this->console;
+
+        if ($maybeConsole != null) {
+            DebugConsole $console = guard $maybeConsole;
+            $console->attachPass($pipeline, $back->target);
         }
 
         $this->finishFrame($pipeline, $compensation, $afterPresent);
@@ -197,7 +215,15 @@ public class Host
             $this->overlay = null;
         }
 
-        $this->console = null;
+        DebugConsole? $maybeConsole = $this->console;
+
+        if ($maybeConsole != null) {
+            DebugConsole $console = guard $maybeConsole;
+            $console->destroy();
+            $this->console = null;
+        }
+
+        $this->assets->destroy();
         $this->shaders->destroy();
         $this->blit->destroy();
         $this->pool->destroy();
@@ -279,7 +305,7 @@ public class Host
                     $this->fail = .pipeline(.device($e));
                     return false;
                 },
-            };
+            }
         }
 
         return true;
@@ -324,7 +350,12 @@ public class Host
             return;
         }
 
-        $this->console = DebugConsole($this->dispatcher, $this->input);
+        DebugConsole $console = DebugConsole($this->dispatcher, $this->input);
+        if (!$this->config->headless) {
+            loadConsoleOverlay($console, $this->device);
+        }
+
+        $this->console = $console;
     }
 
     private function scanShaders() : status<HostError>
@@ -343,6 +374,96 @@ public class Host
         }
 
         return .ok;
+    }
+
+    private function mountAssets() : status<HostError>
+    {
+        $this->assets->register(KIND_BYTES, function(Assets $a, Blob $b) : result<Blob, AssetError> {
+            return decodeBytes($a, $b);
+        });
+        $this->assets->register(KIND_SOUND, function(Assets $a, Blob $b) : result<AudioClip, AssetError> {
+            return decodeSound($a, $b);
+        });
+        $this->assets->register(KIND_TEXTURE, function(Assets $a, Blob $b) : result<Texture, AssetError> {
+            return decodeGpuTexture($a, $b);
+        });
+        $this->assets->register(KIND_VMAT, function(Assets $a, Blob $b) : result<Vmat, AssetError> {
+            return decodeVmat($a, $b);
+        });
+        Paths? $paths = $this->services->find<Paths>();
+        Paths $p = guard $paths else {
+            return .ok;
+        }
+
+        guard $this->mountPackDir($p->resourcesPack) else ($e) {
+            return .error($e);
+        }
+        guard $this->mountCookedDir($p->cache) else ($e) {
+            return .error($e);
+        }
+        return .ok;
+    }
+
+    private function mountPackDir(const string& $dir) : status<HostError>
+    {
+        bool $here = guard io::exists($dir) else ($e) {
+            return .error(.asset(.io($dir, $e->message())));
+        }
+        if (!$here) {
+            return .ok;
+        }
+
+        io::dir $d = guard io::opendir($dir) else ($e) {
+            return .error(.asset(.io($dir, $e->message())));
+        }
+
+        foreach ($d as $entry) {
+            if ($entry->is_directory()) {
+                continue;
+            }
+
+            if (!$entry->name()->ends('.vpack')) {
+                continue;
+            }
+
+            PackStore $pack = guard PackStore::open($entry->path()) else ($e) {
+                return .error(.asset($e));
+            }
+            guard $this->assets->mount($pack) else ($e) {
+                return .error(.asset($e));
+            }
+        }
+
+        return .ok;
+    }
+
+    private function mountCookedDir(const string& $cache) : status<HostError>
+    {
+        string $ds = env::DS;
+        string $dir = "{$cache}{$ds}asset";
+        string $cat = "{$dir}{$ds}catalog.vcat";
+        bool $here = guard io::exists($cat) else ($e) {
+            return .error(.asset(.io($cat, $e->message())));
+        }
+        if (!$here) {
+            return .ok;
+        }
+
+        DirectoryStore $store = guard DirectoryStore::open($dir) else ($e) {
+            return .error(.asset($e));
+        }
+        guard $this->assets->mount($store) else ($e) {
+            return .error(.asset($e));
+        }
+        return .ok;
+    }
+}
+
+internal function loadConsoleOverlay(DebugConsole $console, Device $device) : void
+{
+    guard $console->load($device) else ($e) {
+        info("debug console overlay: {$e->message()}");
+        return;
     }
 }
 

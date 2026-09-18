@@ -1,0 +1,185 @@
+/**
+ * One `.vpack` file in memory. Header, then blobs, then the index `indexAt` points at.
+ */
+
+namespace visu::asset;
+
+use std::io;
+
+internal const string PACK_MAGIC = 'VPAK';
+internal const uint16 PACK_VERSION = 1;
+
+public class PackStore : Store
+{
+    public const string $path;
+    private string $bytes;
+    private map<string, CatalogEntry> $index;
+    private array<CatalogEntry> $all;
+
+    public constructor(string $path, string $bytes, map<string, CatalogEntry> $index, array<CatalogEntry> $all)
+    {
+        $this->path = $path;
+        $this->bytes = $bytes;
+        $this->index = $index;
+        $this->all = $all;
+    }
+
+    public static function open(const string& $path) : result<PackStore, AssetError>
+    {
+        string $bytes = guard io::readfile($path) else ($e) {
+            return .error(.io($path, $e->message()));
+        }
+        return parsePack($path, $bytes);
+    }
+
+    public function find(string $id) : CatalogEntry?
+    {
+        if (!$this->index->has($id)) {
+            return null;
+        }
+
+        return $this->index[$id];
+    }
+
+    public function read(const CatalogEntry& $entry) : result<Blob, AssetError>
+    {
+        usize $off = $entry->offset as usize;
+        usize $n = $entry->size as usize;
+        if ($off + $n > $this->bytes->size()) {
+            return .error(.corrupt($entry->id, 'blob past end of pack'));
+        }
+
+        return .ok(Blob($this->bytes->sub($off, $n)));
+    }
+
+    public function entries() : array<CatalogEntry>
+    {
+        return $this->all;
+    }
+}
+
+/**
+ * Write `$items` as a `.vpack`. Overwrites `$path`.
+ */
+public function writePack(const string& $path, const array<PackItem>& $items) : status<AssetError>
+{
+    string $body = '';
+    array<CatalogEntry> $index = array<CatalogEntry>();
+    uint64 $header = 18;
+
+    foreach ($items as $item) {
+        uint64 $fileOff = $header + ($body->size() as uint64);
+        uint64 $rem = $fileOff % 4;
+        if ($rem != 0) {
+            uint64 $pad = 4 - $rem;
+            usize $p = 0;
+
+            while ($p < ($pad as usize)) {
+                putU8($body, 0);
+                $p = $p + 1;
+            }
+        }
+
+        uint64 $off = $header + ($body->size() as uint64);
+        putMagic($body, $item->blob->bytes);
+        CatalogEntry $ent = CatalogEntry();
+        $ent->id = $item->id;
+        $ent->kind = $item->kind;
+        $ent->offset = $off;
+        $ent->size = $item->blob->bytes->size() as uint64;
+        $ent->hash = blobHash($item->blob->bytes);
+        $ent->path = $path;
+        $index[] = $ent;
+    }
+
+    string $idx = '';
+    putU32($idx, $index->count() as uint32);
+
+    foreach ($index as $ent) {
+        putStr($idx, $ent->id);
+        putStr($idx, $ent->kind);
+        putU64($idx, $ent->offset);
+        putU64($idx, $ent->size);
+        putU64($idx, $ent->hash);
+    }
+
+    string $out = '';
+    putMagic($out, PACK_MAGIC);
+    putU16($out, PACK_VERSION);
+    putU32($out, $index->count() as uint32);
+    putU64($out, 18 + ($body->size() as uint64));
+    putMagic($out, $body);
+    putMagic($out, $idx);
+
+    guard io::writefile($path, $out) else ($e) {
+        return .error(.io($path, $e->message()));
+    }
+
+    return .ok;
+}
+
+internal function parsePack(const string& $path, const string& $bytes) : result<PackStore, AssetError>
+{
+    usize $i = 0;
+    guard getMagic($bytes, $i, PACK_MAGIC, $path) else ($e) {
+        return .error($e);
+    }
+    uint16 $ver = guard getU16($bytes, $i, $path) else ($e) {
+        return .error($e);
+    }
+    if ($ver != PACK_VERSION) {
+        return .error(.corrupt($path, 'unsupported version'));
+    }
+
+    uint32 $count = guard getU32($bytes, $i, $path) else ($e) {
+        return .error($e);
+    }
+    uint64 $indexAt = guard getU64($bytes, $i, $path) else ($e) {
+        return .error($e);
+    }
+    if (($indexAt as usize) > $bytes->size()) {
+        return .error(.corrupt($path, 'index past end'));
+    }
+
+    usize $at = $indexAt as usize;
+    uint32 $n = guard getU32($bytes, $at, $path) else ($e) {
+        return .error($e);
+    }
+    if ($n != $count) {
+        return .error(.corrupt($path, 'index count mismatch'));
+    }
+
+    map<string, CatalogEntry> $map = map<string, CatalogEntry>();
+    array<CatalogEntry> $all = array<CatalogEntry>();
+    uint32 $k = 0;
+
+    while ($k < $n) {
+        string $id = guard getStr($bytes, $at, $path) else ($e) {
+            return .error($e);
+        }
+        string $kind = guard getStr($bytes, $at, $path) else ($e) {
+            return .error($e);
+        }
+        uint64 $off = guard getU64($bytes, $at, $path) else ($e) {
+            return .error($e);
+        }
+        uint64 $size = guard getU64($bytes, $at, $path) else ($e) {
+            return .error($e);
+        }
+        uint64 $hash = guard getU64($bytes, $at, $path) else ($e) {
+            return .error($e);
+        }
+        CatalogEntry $ent = CatalogEntry();
+        $ent->id = $id;
+        $ent->kind = $kind;
+        $ent->offset = $off;
+        $ent->size = $size;
+        $ent->hash = $hash;
+        $ent->path = $path;
+        $map[$id] = $ent;
+        $all[] = $ent;
+        $k = $k + 1;
+    }
+
+    return .ok(PackStore($path, $bytes, $map, $all));
+}

@@ -1,0 +1,62 @@
+/**
+ * A named slot. Draw objects and systems hold this, not the bank.
+ * `get<T>()` is a field read; the string map is only the catalog.
+ */
+
+namespace visu::asset;
+
+public class AssetRef
+{
+    public const string $id;
+    public const string $kind;
+    private weak<Assets> $bank;
+    internal erased? $ready;
+
+    public constructor(Assets $bank, string $id, string $kind)
+    {
+        $this->bank = &$bank;
+        $this->id = $id;
+        $this->kind = $kind;
+        $this->ready = null;
+    }
+
+    /**
+     * Decode if needed and return the live object.
+     */
+    public function load<T : class>() : result<T, AssetError>
+    {
+        erased? $held = $this->ready;
+        if ($held != null) {
+            erased $e = guard $held;
+            unsafe {
+                return .ok(assume<T>($e));
+            }
+        }
+
+        Assets $col = guard strong($this->bank) else {
+            return .error(.decode($this->id, 'bank is gone'));
+        }
+        return $col->fill<T>($this);
+    }
+
+    /**
+     * Hot-path lookup. Asserts the object was load()ed.
+     */
+    public function get<T : class>() : T
+    {
+        erased? $held = $this->ready;
+        assert($held != null, 'asset: object was never loaded');
+        erased $e = guard $held;
+        unsafe {
+            return assume<T>($e);
+        }
+    }
+
+    /**
+     * Drop the live object. The slot stays.
+     */
+    public function forget() : void
+    {
+        $this->ready = null;
+    }
+}

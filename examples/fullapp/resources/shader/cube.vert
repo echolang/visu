@@ -4,7 +4,7 @@ layout(location = 0) in vec3 aPos;
 layout(location = 0) out vec3 vPos;
 layout(location = 1) out vec4 vColor;
 
-layout(std140, set = 0, binding = 0) uniform CubeDraw {
+layout(std140, set = 0, binding = 0) uniform CubeDrawData {
     mat4 u_model;
     vec4 u_color;
 };

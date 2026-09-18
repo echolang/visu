@@ -9,7 +9,7 @@ layout(location = 0) out float frag_ao;
 #define SSAO_MAX_SAMPLES 64
 
 layout(std140, set = 0, binding = 0) uniform SsaoUniforms {
-    // radius, bias, strength, sample count
+    // radius, bias ratio, strength, sample count
     vec4 u_params;
     // target width, height, noise scale x, noise scale y
     vec4 u_screen;
@@ -21,10 +21,11 @@ layout(set = 1, binding = 1) uniform sampler2D gbuffer_normal;
 layout(set = 1, binding = 2) uniform sampler2D noise_texture;
 
 /*
- * Occlusion is measured against the world position attachment rather
- * than the depth buffer: the comparison then happens in view-space
- * units, which survive a change of depth range, and the pass needs no
- * depth texture binding at all.
+ * The position attachment stores camera-relative xyz (P - eye). A view
+ * matrix is [R | -R·eye], so mat3(u_view) * P_relative equals
+ * (u_view * vec4(P_world, 1)).xyz. Measuring against that rather than
+ * depth keeps the comparison in view-space units, survives a change of
+ * depth range, and needs no depth texture binding.
  */
 void main()
 {
@@ -35,16 +36,27 @@ void main()
         return;
     }
 
-    vec3 view_pos = (u_view * vec4(P.xyz, 1.0)).xyz;
+    float radius = u_params.x;
+    // rgba16f camera-relative P has ulp |P|/1024. Four ulps covers both
+    // ends of a sample plus the binade step that made the far squares.
+    // Beyond that the kernel is smaller than the lattice, so fade out.
+    float quant = length(P.xyz) * (1.0 / 256.0);
+    float bias = max(u_params.y * radius, quant);
+    float fade = 1.0 - smoothstep(0.4, 1.0, bias / max(radius, 1e-5));
+    float strength = u_params.z;
+
+    if (fade <= 0.0) {
+        frag_ao = 1.0;
+        return;
+    }
+
+    vec3 view_pos = mat3(u_view) * P.xyz;
     vec3 view_normal = normalize(mat3(u_view) * texture(gbuffer_normal, v_uv).xyz);
     vec3 noise = normalize(texture(noise_texture, v_uv * u_screen.zw).xyz * 2.0 - 1.0);
     vec3 tangent = normalize(noise - view_normal * dot(noise, view_normal));
     vec3 bitangent = cross(view_normal, tangent);
     mat3 TBN = mat3(tangent, bitangent, view_normal);
 
-    float radius = u_params.x;
-    float bias = u_params.y;
-    float strength = u_params.z;
     int count = int(u_params.w);
     float occlusion = 0.0;
 
@@ -63,7 +75,7 @@ void main()
             continue;
         }
 
-        float occluder_z = (u_view * vec4(occluder.xyz, 1.0)).z;
+        float occluder_z = (mat3(u_view) * occluder.xyz).z;
 
         // view space looks down -Z, so a larger z sits nearer the camera
         if (occluder_z >= sample_view.z + bias) {
@@ -71,6 +83,7 @@ void main()
         }
     }
 
-    occlusion = 1.0 - (occlusion / float(count));
-    frag_ao = pow(clamp(occlusion, 0.0, 1.0), strength);
+    float ao = 1.0 - (occlusion / float(count));
+    ao = mix(1.0, ao, fade);
+    frag_ao = pow(clamp(ao, 0.0, 1.0), strength);
 }

@@ -14,9 +14,9 @@ public class RenderEncoder : RenderEncoderProtocol
     private bool $viewportSet;
     private bool $scissorSet;
     private bool $pipelineSet;
-    internal TextureHandle[8] $texHandles;
-    internal SamplerHandle[8] $sampHandles;
-    internal bool[8] $texSet;
+    internal TextureHandle[16] $texHandles;
+    internal SamplerHandle[16] $sampHandles;
+    internal bool[16] $texSet;
     internal bool $texturesDirty;
 
     public constructor(Device $device, TargetFormats $formats, int32 $width, int32 $height)
@@ -30,9 +30,9 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->scissorSet = false;
         $this->pipelineSet = false;
         $this->texturesDirty = false;
-        TextureHandle[8] $texes;
-        SamplerHandle[8] $samps;
-        bool[8] $bound;
+        TextureHandle[16] $texes;
+        SamplerHandle[16] $samps;
+        bool[16] $bound;
         uint32 $i = 0;
 
         while ($i < TEXTURE_SLOTS) {
@@ -190,6 +190,13 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->sampHandles[$slot] = $sampler->handle;
         $this->texSet[$slot] = true;
         $this->texturesDirty = true;
+    }
+
+    public function setTessellationFactors(TransientSlice $slice, uint32 $instanceStride) : void
+    {
+        assert(!$this->ended, 'setTessellationFactors after endRender');
+        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
+        // vulkan tess levels come from the tess control shader
     }
 
     public function draw(int32 $first, int32 $count, int32 $instances = 1) : void

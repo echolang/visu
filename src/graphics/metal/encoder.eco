@@ -22,11 +22,15 @@ public class RenderEncoder : RenderEncoderProtocol
     private mtl::Buffer? $indexTransient;
     private IndexType $indexType;
     private uint64 $indexOffset;
-    private TextureHandle[8] $texHandles;
-    private SamplerHandle[8] $sampHandles;
+    private TextureHandle[16] $texHandles;
+    private SamplerHandle[16] $sampHandles;
     private bool $texturesDirty;
     private uint64[4] $uniformOff;
     private bool[4] $uniformSet;
+    private int32 $patchControlPoints;
+    private uint64 $tessFactorOff;
+    private bool $tessFactorSet;
+    private uint32 $tessInstanceStride;
 
     public constructor(
         Device $device,
@@ -48,6 +52,10 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->enc = $enc;
         $this->depthFmt = $depthFmt;
         $this->topology = .triangles;
+        $this->patchControlPoints = 0;
+        $this->tessFactorOff = 0;
+        $this->tessFactorSet = false;
+        $this->tessInstanceStride = 0;
         $this->indexBuffer = null;
         $this->indexTransient = null;
         $this->indexType = .uint16;
@@ -65,8 +73,8 @@ public class RenderEncoder : RenderEncoderProtocol
 
         $this->uniformOff = mv $off;
         $this->uniformSet = mv $set;
-        TextureHandle[8] $texes;
-        SamplerHandle[8] $samps;
+        TextureHandle[16] $texes;
+        SamplerHandle[16] $samps;
         $i = 0;
 
         while ($i < TEXTURE_SLOTS) {
@@ -109,15 +117,18 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->enc->setRenderPipelineState($state);
         $this->enc->setCullMode(mtlCull($pass->raster->cull));
         $this->enc->setFrontFacing(mtlWinding($pass->raster->front));
+        $this->enc->setTriangleFillMode(mtlFill($pass->raster->fill));
         mtl::DepthStencilState $ds = guard metalDepthState($this->device, $pass->raster) else {
             $this->pipelineSet = true;
             $this->topology = $pass->topology;
+            $this->patchControlPoints = $pass->patchControlPoints;
             $this->applyDefaults();
             return;
         }
         $this->enc->setDepthStencilState($ds);
         $this->pipelineSet = true;
         $this->topology = $pass->topology;
+        $this->patchControlPoints = $pass->patchControlPoints;
         $this->applyDefaults();
     }
 
@@ -216,6 +227,15 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->texturesDirty = true;
     }
 
+    public function setTessellationFactors(TransientSlice $slice, uint32 $instanceStride) : void
+    {
+        assert(!$this->ended, 'setTessellationFactors after endRender');
+        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
+        $this->tessFactorOff = $slice->offset;
+        $this->tessFactorSet = true;
+        $this->tessInstanceStride = $instanceStride;
+    }
+
     public function draw(int32 $first, int32 $count, int32 $instances = 1) : void
     {
         assert(!$this->ended, 'draw after endRender');
@@ -225,6 +245,22 @@ public class RenderEncoder : RenderEncoderProtocol
 
         if ($instances > 1) {
             $n = $instances as uint32;
+        }
+
+        if ($this->topology == Topology::patches) {
+            int32 $cps = $this->patchControlPoints;
+            if ($cps < 1) {
+                $cps = 4;
+            }
+
+            uint32 $patchCount = ($count / $cps) as uint32;
+            if ($patchCount < 1) {
+                $patchCount = 1;
+            }
+
+            uint32 $patchStart = ($first / $cps) as uint32;
+            $this->enc->drawPatches($cps as uint32, $patchStart, $patchCount, $n);
+            return;
         }
 
         $this->enc->drawPrimitives(mtlTopology($this->topology), $first as uint32, $count as uint32, $n);
@@ -310,6 +346,10 @@ public class RenderEncoder : RenderEncoderProtocol
             $i = $i + 1;
         }
 
+        if ($this->tessFactorSet) {
+            $this->enc->setTessellationFactorBuffer($ring, $this->tessFactorOff, $this->tessInstanceStride);
+        }
+
         if (!$this->texturesDirty) {
             return;
         }
@@ -338,5 +378,7 @@ public class RenderEncoder : RenderEncoderProtocol
         }
         $this->enc->setFragmentTexture($mt, index: $slot);
         $this->enc->setFragmentSamplerState($ss, index: $slot);
+        $this->enc->setVertexTexture($mt, index: $slot);
+        $this->enc->setVertexSamplerState($ss, index: $slot);
     }
 }

@@ -1,0 +1,85 @@
+/**
+ * vpack and directory store roundtrip. No GPU.
+ */
+
+use std::env;
+use std::io;
+use visu::asset::{
+    Blob, CatalogEntry, DirectoryStore, KIND_BYTES, PackItem, PackStore,
+    writeDirectory, writePack
+};
+
+function assetTmp(string $tag) : string
+{
+    $tmp = env::tmp();
+    string $ds = env::DS;
+    return "{$tmp}{$ds}visu-asset-{$tag}";
+}
+
+function mkdirAsset(string $dir) : void
+{
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return;
+        }
+
+        die($e->message());
+    }
+}
+
+test pack_roundtrip_two_blobs
+{
+    string $dir = assetTmp('pack');
+    mkdirAsset($dir);
+    string $ds = env::DS;
+    string $path = "{$dir}{$ds}main.vpack";
+    array<PackItem> $items = array<PackItem>();
+    $items[] = PackItem('notes/a', KIND_BYTES, Blob('hello'));
+    $items[] = PackItem('notes/b', KIND_BYTES, Blob('world'));
+    guard writePack($path, $items) else ($e) {
+        die($e->message());
+    }
+
+    PackStore $store = guard PackStore::open($path) else ($e) {
+        die($e->message());
+    }
+    assert($store->entries()->count() == 2, 'count');
+    CatalogEntry? $maybe = $store->find('notes/a');
+    CatalogEntry $a = guard $maybe else {
+        die('missing a');
+    }
+    Blob $blob = guard $store->read($a) else ($e) {
+        die($e->message());
+    }
+    assert($blob->bytes->equals('hello'), 'a');
+    CatalogEntry $b = guard $store->find('notes/b') else {
+        die('missing b');
+    }
+    Blob $blobB = guard $store->read($b) else ($e) {
+        die($e->message());
+    }
+    assert($blobB->bytes->equals('world'), 'b');
+}
+
+test directory_roundtrip
+{
+    string $dir = assetTmp('dir');
+    mkdirAsset($dir);
+    array<PackItem> $items = array<PackItem>();
+    $items[] = PackItem('ui/click', KIND_BYTES, Blob('ding'));
+    guard writeDirectory($dir, $items) else ($e) {
+        die($e->message());
+    }
+
+    DirectoryStore $store = guard DirectoryStore::open($dir) else ($e) {
+        die($e->message());
+    }
+    CatalogEntry $ent = guard $store->find('ui/click') else {
+        die('missing');
+    }
+    Blob $blob = guard $store->read($ent) else ($e) {
+        die($e->message());
+    }
+    assert($blob->bytes->equals('ding'), 'bytes');
+    assert($ent->kind->equals(KIND_BYTES), 'kind');
+}

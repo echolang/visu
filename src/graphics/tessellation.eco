@@ -1,0 +1,123 @@
+/**
+ * Quad tessellation factor packing. Matches Apple's MTLQuadTessellationFactorsHalf
+ * plus 4 bytes of pad so the stride is 16 (a multiple of 8).
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+/**
+ * Bytes per quad factor record. Matches MTLQuadTessellationFactorsHalf (4 edges + 2 insides).
+ * Metal steps this size per patch; padding to 16 made later patches read factor 0 and vanish.
+ */
+public const uint32 QUAD_TESS_FACTOR_STRIDE = 12;
+
+/**
+ * Factor buffer offset. Multiple of 8 on macOS.
+ */
+public const uint64 TESS_FACTOR_ALIGN = 256;
+
+public struct QuadTessFactors
+{
+    public uint16 $edge0;
+    public uint16 $edge1;
+    public uint16 $edge2;
+    public uint16 $edge3;
+    public uint16 $inside0;
+    public uint16 $inside1;
+}
+
+/**
+ * Positive finite float32 to IEEE-754 binary16. Tess factors are small integers.
+ */
+public function f32ToF16(float32 $x) : uint16
+{
+    if ($x <= 0.0f) {
+        return 0;
+    }
+
+    int32 $bits = mem::bit_cast<int32, float32>($x);
+    int32 $sign = ($bits >> 16) & 0x8000;
+    int32 $exp = (($bits >> 23) & 255) - 127 + 15;
+    int32 $mant = ($bits >> 13) & 0x3FF;
+    if ($exp <= 0) {
+        return $sign as uint16;
+    }
+
+    if ($exp >= 31) {
+        return ($sign | 0x7C00) as uint16;
+    }
+
+    return ($sign | ($exp << 10) | $mant) as uint16;
+}
+
+/**
+ * Same factor on every edge and both insides. `$factor` is clamped to >= 1.
+ */
+public function packQuadTessFactors(float32 $factor) : QuadTessFactors
+{
+    float32 $f = $factor;
+    if ($f < 1.0f) {
+        $f = 1.0f;
+    }
+
+    uint16 $h = f32ToF16($f);
+    return QuadTessFactors($h, $h, $h, $h, $h, $h);
+}
+
+/**
+ * Per-edge factors for a quad patch. `$edges` is GLSL `gl_TessLevelOuter` order
+ * (west, south, east, north) and Metal's `edgeTessellationFactor[0..3]`. Each
+ * component and `$inside` is clamped to >= 1. Both insides get `$inside`.
+ */
+public function packQuadTessFactors(edges: const Vec4& $edges, float32 $inside) : QuadTessFactors
+{
+    return QuadTessFactors(
+        f32ToF16(tessFactorAtLeastOne($edges->x)),
+        f32ToF16(tessFactorAtLeastOne($edges->y)),
+        f32ToF16(tessFactorAtLeastOne($edges->z)),
+        f32ToF16(tessFactorAtLeastOne($edges->w)),
+        f32ToF16(tessFactorAtLeastOne($inside)),
+        f32ToF16(tessFactorAtLeastOne($inside))
+    );
+}
+
+internal function tessFactorAtLeastOne(float32 $f) : float32
+{
+    if ($f < 1.0f) {
+        return 1.0f;
+    }
+
+    return $f;
+}
+
+test f32_to_f16_pow2
+{
+    assert(f32ToF16(1.0f) == 0x3C00);
+    assert(f32ToF16(2.0f) == 0x4000);
+    assert(f32ToF16(4.0f) == 0x4400);
+    assert(f32ToF16(16.0f) == 0x4C00);
+    assert(f32ToF16(64.0f) == 0x5400);
+}
+
+test quad_tess_stride_is_12
+{
+    assert(mem::size<QuadTessFactors>() == 12);
+    assert(QUAD_TESS_FACTOR_STRIDE == 12);
+}
+
+test pack_quad_tess_factors_per_edge
+{
+    QuadTessFactors $q = packQuadTessFactors(edges: Vec4(16.0f, 8.0f, 16.0f, 4.0f), 16.0f);
+    assert($q->edge0 == f32ToF16(16.0f), 'west');
+    assert($q->edge1 == f32ToF16(8.0f), 'south');
+    assert($q->edge2 == f32ToF16(16.0f), 'east');
+    assert($q->edge3 == f32ToF16(4.0f), 'north');
+    assert($q->inside0 == f32ToF16(16.0f), 'inside0');
+    assert($q->inside1 == f32ToF16(16.0f), 'inside1');
+    QuadTessFactors $clamped = packQuadTessFactors(edges: Vec4(0.0f, 2.0f, 0.5f, 8.0f), 0.0f);
+    assert($clamped->edge0 == f32ToF16(1.0f), 'clamp west');
+    assert($clamped->edge1 == f32ToF16(2.0f), 'keep south');
+    assert($clamped->inside0 == f32ToF16(1.0f), 'clamp inside');
+}

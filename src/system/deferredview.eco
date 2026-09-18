@@ -1,0 +1,62 @@
+/**
+ * Console verb `view` that picks which deferred buffer the renderer blits.
+ * Holds the renderer; does not draw.
+ */
+
+namespace visu::system;
+
+use visu::ecs::{Entities, System};
+use visu::graphics::{DeferredRenderer, DeferredView, RenderContext};
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal const VIEW_USAGE = 'usage: view [scene|albedo|normal|roughness|metallic|ao|emissive|position|ssao]';
+
+public class DeferredViewSystem : System, ConsoleCommandHandler
+{
+    public DeferredRenderer $renderer;
+
+    public constructor(DeferredRenderer $renderer)
+    {
+        $this->renderer = $renderer;
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function update(Entities $entities) : void
+    {
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : void
+    {
+        $registry->add('view', $this);
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if ($cmd->parts->count() < 2) {
+            string $name = $this->renderer->view->label();
+            $console->writeLine("view: {$name}");
+            return;
+        }
+
+        string $part = $cmd->parts[1];
+        DeferredView $view = guard DeferredView::parse($part) else {
+            $console->writeLine(VIEW_USAGE);
+            return;
+        }
+        $this->renderer->view = $view;
+        string $name = $view->label();
+        $console->writeLine("view: {$name}");
+    }
+}

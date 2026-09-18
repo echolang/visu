@@ -1,0 +1,384 @@
+/**
+ * JSON material / folder sheet (`*.vmat`). Generic bag: cook knobs, map binds, later shader scalars.
+ * One file per folder. Sibling textures fill missing binds by stem.
+ */
+
+namespace visu::asset;
+
+use std::io;
+use json;
+use visu::math::{Vec2, Vec3};
+
+public const string KIND_VMAT = 'vmat';
+
+public class Vmat
+{
+    public const string $id;
+    public json::Value $root;
+
+    public constructor(string $id, json::Value $root)
+    {
+        $this->id = $id;
+        $this->root = $root;
+    }
+
+    /**
+     * Folder object overlaid with the record named `$stem`, when that record is an object.
+     */
+    public function view(string $stem) : json::Value
+    {
+        return vmatView($this->root, $stem);
+    }
+}
+
+public function decodeVmat(Assets $assets, Blob $blob) : result<Vmat, AssetError>
+{
+    json::Value $root = guard json::parse($blob->bytes) else ($e) {
+        return .error(.decode($assets->loading, $e->message()));
+    }
+    if (!$root->isObject()) {
+        return .error(.decode($assets->loading, 'vmat is not a JSON object'));
+    }
+
+    return .ok(Vmat($assets->loading, $root));
+}
+
+/**
+ * Deep-merge two JSON objects. `$over` wins. Nested objects merge; other values replace.
+ */
+public function vmatMerge(json::Value $base, json::Value $over) : json::Value
+{
+    if (!$over->isObject()) {
+        return $over->clone();
+    }
+
+    if (!$base->isObject()) {
+        return $over->clone();
+    }
+
+    json::Value $out = $base->clone();
+    ordered_map<string, json::Value> $fields = guard $over->asObject() else {
+        return $out;
+    }
+    array<string> $keys = $fields->keys();
+
+    foreach ($keys as $key) {
+        json::Value $ov = guard $over->get($key) else {
+            continue;
+        }
+        json::Value? $had = $out->get($key);
+        json::Value $bv = guard $had else {
+            $out[$key] = $ov->clone();
+            continue;
+        }
+        if ($bv->isObject() && $ov->isObject()) {
+            $out[$key] = vmatMerge($bv, $ov);
+        } else {
+            $out[$key] = $ov->clone();
+        }
+    }
+
+    return $out;
+}
+
+public function vmatView(json::Value $root, string $stem) : json::Value
+{
+    json::Value? $rec = $root->get($stem);
+    json::Value $record = guard $rec else {
+        return $root->clone();
+    }
+    if ($record->isObject()) {
+        return vmatMerge($root, $record);
+    }
+
+    return $root->clone();
+}
+
+public function vmatBool(json::Value $v, string $key, bool $fallback) : result<bool, AssetError>
+{
+    json::Value? $got = $v->get($key);
+    json::Value $n = guard $got else {
+        return .ok($fallback);
+    }
+    bool? $b = $n->asBool();
+    bool $ok = guard $b else {
+        string? $s = $n->asStr();
+        string $text = guard $s else {
+            return .error(.decode($key, 'expected a bool'));
+        }
+        string $low = str::lower($text);
+        if ($low->equals('true') || $low->equals('yes') || $low->equals('1') || $low->equals('on')) {
+            return .ok(true);
+        }
+        if ($low->equals('false') || $low->equals('no') || $low->equals('0') || $low->equals('off')) {
+            return .ok(false);
+        }
+
+        return .error(.decode($key, "not a bool '{$text}'"));
+    }
+    return .ok($ok);
+}
+
+public function vmatStr(json::Value $v, string $key, string $fallback) : string
+{
+    json::Value? $got = $v->get($key);
+    json::Value $n = guard $got else {
+        return $fallback;
+    }
+    string? $s = $n->asStr();
+    string $text = guard $s else {
+        return $fallback;
+    }
+    return $text;
+}
+
+public function vmatF32(json::Value $v, string $key, float32 $fallback) : float32
+{
+    json::Value? $got = $v->get($key);
+    json::Value $n = guard $got else {
+        return $fallback;
+    }
+    float64? $f = $n->asFloat();
+    float64 $ok = guard $f else {
+        return $fallback;
+    }
+    return $ok as float32;
+}
+
+/**
+ * Number becomes both components. A two-float array is x, y.
+ */
+public function vmatVec2(json::Value $v, string $key, Vec2 $fallback) : Vec2
+{
+    json::Value? $got = $v->get($key);
+    json::Value $n = guard $got else {
+        return $fallback;
+    }
+    float64? $s = $n->asFloat();
+    if ($s != null) {
+        float64 $one = guard $s;
+        return Vec2($one as float32);
+    }
+
+    array<json::Value>? $arr = $n->asArray();
+    array<json::Value> $vals = guard $arr else {
+        return $fallback;
+    }
+    if ($vals->count() < 2) {
+        return $fallback;
+    }
+
+    float64 $x = $vals[0]->asFloat() ?? ($fallback->x as float64);
+    float64 $y = $vals[1]->asFloat() ?? ($fallback->y as float64);
+    return Vec2($x as float32, $y as float32);
+}
+
+/**
+ * JSON `[r, g, b]` in 0..1. Missing or the wrong shape keeps `$fallback`.
+ */
+public function vmatRgb(json::Value $v, string $key, Vec3 $fallback) : Vec3
+{
+    json::Value? $got = $v->get($key);
+    json::Value $n = guard $got else {
+        return $fallback;
+    }
+    array<json::Value>? $arr = $n->asArray();
+    array<json::Value> $vals = guard $arr else {
+        return $fallback;
+    }
+    if ($vals->count() < 3) {
+        return $fallback;
+    }
+
+    float64 $r = $vals[0]->asFloat() ?? ($fallback->x as float64);
+    float64 $g = $vals[1]->asFloat() ?? ($fallback->y as float64);
+    float64 $b = $vals[2]->asFloat() ?? ($fallback->z as float64);
+    return Vec3($r as float32, $g as float32, $b as float32);
+}
+
+/**
+ * Cooked bind: a string catalog id, or an object's `file`. `$alias` is tried when `$name` is absent.
+ */
+public function vmatMap(json::Value $root, string $name, string $alias = '') : string?
+{
+    string? $hit = vmatMapOne($root, $name);
+    if ($hit != null) {
+        return $hit;
+    }
+
+    if ($alias->empty()) {
+        return null;
+    }
+
+    return vmatMapOne($root, $alias);
+}
+
+internal function vmatMapOne(json::Value $root, string $name) : string?
+{
+    json::Value? $got = $root->get($name);
+    json::Value $v = guard $got else {
+        return null;
+    }
+    if ($v->isStr()) {
+        string $s = $v->asStr() ?? '';
+        if ($s->empty()) {
+            return null;
+        }
+
+        return $s;
+    }
+
+    if ($v->isObject()) {
+        json::Value? $file = $v->get('file');
+        json::Value $f = guard $file else {
+            return null;
+        }
+        string $s = $f->asStr() ?? '';
+        if ($s->empty()) {
+            return null;
+        }
+
+        return $s;
+    }
+
+    return null;
+}
+
+/**
+ * Turn sibling filenames into catalog ids, then fill conventional binds.
+ */
+public function vmatResolve(json::Value& $sheet, const string& $folderId, const array<string>& $stems) : void
+{
+    vmatRewriteBind($sheet, $folderId, 'albedo');
+    vmatRewriteBind($sheet, $folderId, 'normal');
+    vmatRewriteBind($sheet, $folderId, 'rough');
+    vmatRewriteBind($sheet, $folderId, 'metal');
+    vmatRewriteBind($sheet, $folderId, 'ao');
+    vmatRewriteBind($sheet, $folderId, 'emissive');
+    vmatRewriteBind($sheet, $folderId, 'height');
+    vmatFillBinds($sheet, $folderId, $stems);
+}
+
+internal function vmatRewriteBind(json::Value& $sheet, const string& $folderId, string $map) : void
+{
+    json::Value? $got = $sheet->get($map);
+    json::Value $v = guard $got else {
+        return;
+    }
+    if ($v->isStr()) {
+        string $raw = $v->asStr() ?? '';
+        $sheet[$map] = json::str(vmatBindId($folderId, $raw));
+        return;
+    }
+
+    if ($v->isObject()) {
+        json::Value? $file = $v->get('file');
+        json::Value $f = guard $file else {
+            return;
+        }
+        string $raw = $f->asStr() ?? '';
+        if ($raw->empty()) {
+            return;
+        }
+
+        $v['file'] = json::str(vmatBindId($folderId, $raw));
+    }
+}
+
+internal function vmatBindId(const string& $folderId, const string& $raw) : string
+{
+    if ($raw->find('/') != $raw->size() && !$raw->ends('.png') && !$raw->ends('.hdr')) {
+        return $raw;
+    }
+
+    string $stem = stripExt($raw);
+    if ($folderId->empty()) {
+        return $stem;
+    }
+
+    string $id = $folderId;
+    $id->append('/');
+    $id->append($stem);
+    return $id;
+}
+
+/**
+ * Fill conventional sibling binds. A string bind or a record that already names `file` wins.
+ * A cook overlay like `{ "srgb": false }` is not a bind: convention still writes `file`.
+ */
+public function vmatFillBinds(json::Value& $sheet, const string& $folderId, const array<string>& $stems) : void
+{
+    vmatBindIfMissing($sheet, $folderId, $stems, 'albedo', 'albedo');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'diffuse', 'albedo');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'color', 'albedo');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'basecolor', 'albedo');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'normal', 'normal');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'n', 'normal');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'rough', 'rough');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'roughness', 'rough');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'metal', 'metal');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'metallic', 'metal');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'ao', 'ao');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'orm', 'ao');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'emissive', 'emissive');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'height', 'height');
+}
+
+internal function vmatBindIfMissing(
+    json::Value& $sheet,
+    const string& $folderId,
+    const array<string>& $stems,
+    string $stem,
+    string $map
+) : void
+{
+    bool $hit = false;
+    foreach ($stems as $s) {
+        if ($s->equals($stem)) {
+            $hit = true;
+            break;
+        }
+    }
+
+    if (!$hit) {
+        return;
+    }
+
+    string $id = $folderId;
+    if (!$id->empty()) {
+        $id->append('/');
+    }
+
+    $id->append($stem);
+    json::Value? $got = $sheet->get($map);
+    json::Value $existing = guard $got else {
+        $sheet[$map] = json::str($id);
+        return;
+    }
+    if ($existing->isStr()) {
+        return;
+    }
+
+    if ($existing->isObject()) {
+        if ($existing->get('file') != null) {
+            return;
+        }
+
+        $existing['file'] = json::str($id);
+    }
+}
+
+public function loadVmatFile(const string& $path) : result<json::Value, AssetError>
+{
+    string $text = guard io::readfile($path) else ($e) {
+        return .error(.io($path, $e->message()));
+    }
+    json::Value $root = guard json::parse($text) else ($e) {
+        return .error(.corrupt($path, $e->message()));
+    }
+    if (!$root->isObject()) {
+        return .error(.corrupt($path, 'vmat is not a JSON object'));
+    }
+
+    return .ok($root);
+}

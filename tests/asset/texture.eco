@@ -1,0 +1,135 @@
+/**
+ * png → vtex cook. CPU header check, no GPU upload.
+ */
+
+use std::env;
+use std::io;
+use visu::graphics::{Device, PixelFormat, Pixels};
+use visu::asset::{
+    AssetError, Assets, Blob, CookedImage, DirectoryStore, KIND_TEXTURE, Kitchen,
+    PackItem, TextureCooker, decodeTexture
+};
+
+function texTmp(string $tag) : string
+{
+    $tmp = env::tmp();
+    string $ds = env::DS;
+    return "{$tmp}{$ds}visu-vtex-{$tag}";
+}
+
+function mkdirTex(string $dir) : void
+{
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return;
+        }
+
+        die($e->message());
+    }
+}
+
+test vtex_cook_png_has_mips
+{
+    string $src = texTmp('src');
+    mkdirTex($src);
+    string $ds = env::DS;
+    array<uint8> $rgba = array<uint8>();
+    $rgba[] = 255;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 255;
+    $rgba[] = 0;
+    $rgba[] = 255;
+    $rgba[] = 0;
+    $rgba[] = 255;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 255;
+    $rgba[] = 255;
+    $rgba[] = 255;
+    $rgba[] = 255;
+    $rgba[] = 255;
+    $rgba[] = 255;
+    Pixels $px = Pixels(2, 2, $rgba);
+    string $png = "{$src}{$ds}quad.png";
+    guard $px->write($png) else ($e) {
+        die($e->message());
+    }
+
+    string $out = texTmp('out');
+    mkdirTex($out);
+    Kitchen $k = Kitchen();
+    $k->add(TextureCooker());
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+    assert($items->count() == 1, 'one');
+    assert($items[0]->id->equals('quad'), 'id');
+
+    DirectoryStore $store = guard DirectoryStore::open($out) else ($e) {
+        die($e->message());
+    }
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    $assets->register(KIND_TEXTURE, function(Assets $a, Blob $b) : result<CookedImage, AssetError> {
+        return decodeTexture($a, $b);
+    });
+    guard $assets->mount($store) else ($e) {
+        die($e->message());
+    }
+    CookedImage $img = guard $assets->load<CookedImage>('quad') else ($e) {
+        die($e->message());
+    }
+    assert($img->width == 2, 'w');
+    assert($img->height == 2, 'h');
+    assert($img->mips >= 2, 'mips');
+    assert($img->format == PixelFormat::rgba8Srgb, 'srgb');
+}
+
+test vtex_cook_vmat_linear
+{
+    string $src = texTmp('vmat-lin-src');
+    mkdirTex($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}rock";
+    mkdirTex($folder);
+    array<uint8> $rgba = array<uint8>();
+    $rgba[] = 128;
+    $rgba[] = 64;
+    $rgba[] = 32;
+    $rgba[] = 255;
+    Pixels $px = Pixels(1, 1, $rgba);
+    string $png = "{$folder}{$ds}normal.png";
+    guard $px->write($png) else ($e) {
+        die($e->message());
+    }
+
+    guard io::writefile("{$folder}{$ds}rock.vmat", '{"normal":{"srgb":false}}') else ($e) {
+        die($e->message());
+    }
+
+    string $out = texTmp('vmat-lin-out');
+    mkdirTex($out);
+    Kitchen $k = Kitchen();
+    $k->add(TextureCooker());
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+    assert($items->count() == 2, 'vmat + png');
+
+    DirectoryStore $store = guard DirectoryStore::open($out) else ($e) {
+        die($e->message());
+    }
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    $assets->register(KIND_TEXTURE, function(Assets $a, Blob $b) : result<CookedImage, AssetError> {
+        return decodeTexture($a, $b);
+    });
+    guard $assets->mount($store) else ($e) {
+        die($e->message());
+    }
+    CookedImage $img = guard $assets->load<CookedImage>('rock/normal') else ($e) {
+        die($e->message());
+    }
+    assert($img->format == PixelFormat::rgba8, 'linear');
+}

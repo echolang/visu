@@ -1,0 +1,374 @@
+/**
+ * vtex blob: GPU-ready texels, mip 0 first. CPU mipgen lives here so runtime does not generateMipmaps.
+ */
+
+namespace visu::asset;
+
+use visu::graphics::{
+    Device, PixelFormat, Pixels, Texture, TextureDesc, compressRgba, mipByteCount, mipRowBytes,
+    mipSize, pixelCode, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST, TEXTURE_TRANSFER_SRC
+};
+
+internal const string TEXTURE_MAGIC = 'VTEX';
+internal const uint16 TEXTURE_VERSION = 1;
+public const string KIND_TEXTURE = 'texture';
+
+public class CookedImage
+{
+    public const PixelFormat $format;
+    public const int32 $width;
+    public const int32 $height;
+    public const int32 $mips;
+    public const string $texels;
+
+    public constructor(PixelFormat $format, int32 $width, int32 $height, int32 $mips, string $texels)
+    {
+        $this->format = $format;
+        $this->width = $width;
+        $this->height = $height;
+        $this->mips = $mips;
+        $this->texels = $texels;
+    }
+
+    /**
+     * GPU 2D texture, every cooked mip uploaded. Caller destroy()s.
+     */
+    public const function upload(Device $device, string $name) : Texture
+    {
+        assert($this->width > 0 && $this->height > 0, 'CookedImage: empty size');
+        assert($this->mips >= 1, 'CookedImage: mips');
+        TextureDesc $desc = TextureDesc($format: $this->format, $width: $this->width, $height: $this->height);
+        $desc->mips = $this->mips;
+        if ($this->format->isCompressed()) {
+            $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_DST;
+        } else {
+            $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
+        }
+
+        $desc->label = $name;
+        Texture $tex = Texture($device, $name, $desc);
+        ptr<const uint8> $base = $this->texels->data();
+        assert($base:$ != null, 'CookedImage: empty texels');
+        usize $off = 0;
+        int32 $mip = 0;
+
+        while ($mip < $this->mips) {
+            int32 $w = mipSize($this->width, $mip);
+            int32 $h = mipSize($this->height, $mip);
+            uint64 $bytes = mipByteCount($this->format, $w, $h);
+            uint64 $row = mipRowBytes($this->format, $w);
+            assert($off + ($bytes as usize) <= $this->texels->size(), 'CookedImage: truncated mip');
+            ptr<const uint8> $src = $base;
+            $src:$ = $base:$ + ($off as isize);
+            $tex->upload($mip, $src, $bytes, $row as int32);
+            $off = $off + ($bytes as usize);
+            $mip = $mip + 1;
+        }
+
+        return $tex;
+    }
+
+    /**
+     * Write every cooked mip into one array (or cube) slice. Sizes must match.
+     */
+    public const function uploadSlice(Texture $array, int32 $layer) : void
+    {
+        assert($array->desc->width == $this->width && $array->desc->height == $this->height, 'CookedImage: slice size');
+        assert($array->desc->mips == $this->mips, 'CookedImage: slice mips');
+        assert($array->desc->format == $this->format, 'CookedImage: slice format');
+        ptr<const uint8> $base = $this->texels->data();
+        assert($base:$ != null, 'CookedImage: empty texels');
+        usize $off = 0;
+        int32 $mip = 0;
+
+        while ($mip < $this->mips) {
+            int32 $w = mipSize($this->width, $mip);
+            int32 $h = mipSize($this->height, $mip);
+            uint64 $bytes = mipByteCount($this->format, $w, $h);
+            uint64 $row = mipRowBytes($this->format, $w);
+            assert($off + ($bytes as usize) <= $this->texels->size(), 'CookedImage: truncated mip');
+            ptr<const uint8> $src = $base;
+            $src:$ = $base:$ + ($off as isize);
+            $array->upload(face: $layer, $mip, $src, $bytes, $row as int32);
+            $off = $off + ($bytes as usize);
+            $mip = $mip + 1;
+        }
+    }
+}
+
+public function encodeTexture(const Pixels& $pixels, PixelFormat $fmt, bool $mips) : result<Blob, AssetError>
+{
+    string $rgba = rgbaToBytes($pixels->rgba);
+    int32 $levels = 1;
+    if ($mips) {
+        $levels = appendMips($rgba, $pixels->width, $pixels->height);
+    }
+
+    string $texels = $rgba;
+    if ($fmt->isCompressed()) {
+        string $packed = guard compressLevels($fmt, $rgba, $pixels->width, $pixels->height, $levels) else ($e) {
+            return .error($e);
+        }
+        $texels = $packed;
+    }
+
+    string $out = '';
+    putMagic($out, TEXTURE_MAGIC);
+    putU16($out, TEXTURE_VERSION);
+    putU16($out, 0);
+    putU32($out, pixelCode($fmt) as uint32);
+    putU32($out, $pixels->width as uint32);
+    putU32($out, $pixels->height as uint32);
+    putU8($out, $levels as uint8);
+    putU8($out, 1);
+    putU16($out, 0);
+    putMagic($out, $texels);
+    return .ok(Blob($out));
+}
+
+public function decodeTexture(Assets $assets, Blob $blob) : result<CookedImage, AssetError>
+{
+    usize $i = 0;
+    guard getMagic($blob->bytes, $i, TEXTURE_MAGIC, 'texture') else ($e) {
+        return .error($e);
+    }
+    uint16 $ver = guard getU16($blob->bytes, $i, 'texture') else ($e) {
+        return .error($e);
+    }
+    if ($ver != TEXTURE_VERSION) {
+        return .error(.corrupt('texture', 'unsupported version'));
+    }
+
+    uint16 $flags = guard getU16($blob->bytes, $i, 'texture') else ($e) {
+        return .error($e);
+    }
+    uint32 $code = guard getU32($blob->bytes, $i, 'texture') else ($e) {
+        return .error($e);
+    }
+    uint32 $w = guard getU32($blob->bytes, $i, 'texture') else ($e) {
+        return .error($e);
+    }
+    uint32 $h = guard getU32($blob->bytes, $i, 'texture') else ($e) {
+        return .error($e);
+    }
+    uint8 $mips = guard getU8($blob->bytes, $i, 'texture') else ($e) {
+        return .error($e);
+    }
+    uint8 $faces = guard getU8($blob->bytes, $i, 'texture') else ($e) {
+        return .error($e);
+    }
+    uint16 $pad = guard getU16($blob->bytes, $i, 'texture') else ($e) {
+        return .error($e);
+    }
+    if ($w == 0 || $h == 0 || $mips == 0) {
+        return .error(.corrupt('texture', 'empty size'));
+    }
+
+    PixelFormat $fmt = guard pixelFromCode($code as int32) else {
+        return .error(.corrupt('texture', 'unknown pixel format'));
+    }
+    string $texels = $blob->bytes->sub($i, $blob->bytes->size() - $i)->clone();
+    return .ok(CookedImage($fmt, $w as int32, $h as int32, $mips as int32, $texels));
+}
+
+public function decodeGpuTexture(Assets $assets, Blob $blob) : result<Texture, AssetError>
+{
+    CookedImage $img = guard decodeTexture($assets, $blob) else ($e) {
+        return .error($e);
+    }
+    string $name = $assets->loading;
+    if ($name->empty()) {
+        $name = 'texture';
+    }
+
+    return .ok($img->upload($assets->device, $name));
+}
+
+internal function pixelFromCode(int32 $code) : PixelFormat?
+{
+    if ($code == 0) {
+        return PixelFormat::rgba8;
+    }
+    if ($code == 1) {
+        return PixelFormat::bgra8;
+    }
+    if ($code == 2) {
+        return PixelFormat::rgba8Srgb;
+    }
+    if ($code == 3) {
+        return PixelFormat::rgba16f;
+    }
+    if ($code == 4) {
+        return PixelFormat::rgba32f;
+    }
+    if ($code == 5) {
+        return PixelFormat::r8;
+    }
+    if ($code == 6) {
+        return PixelFormat::r16f;
+    }
+    if ($code == 7) {
+        return PixelFormat::r32f;
+    }
+    if ($code == 8) {
+        return PixelFormat::rg16f;
+    }
+    if ($code == 9) {
+        return PixelFormat::depth32f;
+    }
+    if ($code == 10) {
+        return PixelFormat::depth32fStencil8;
+    }
+    if ($code == 11) {
+        return PixelFormat::bc7;
+    }
+    if ($code == 12) {
+        return PixelFormat::bc7Srgb;
+    }
+    if ($code == 13) {
+        return PixelFormat::astc4x4;
+    }
+    if ($code == 14) {
+        return PixelFormat::astc4x4Srgb;
+    }
+
+    return null;
+}
+
+internal function compressLevels(
+    PixelFormat $fmt,
+    const string& $rgba,
+    int32 $width,
+    int32 $height,
+    int32 $levels
+) : result<string, AssetError>
+{
+    string $out = '';
+    ptr<const uint8> $base = $rgba->data();
+    usize $off = 0;
+    int32 $mip = 0;
+
+    while ($mip < $levels) {
+        int32 $w = mipSize($width, $mip);
+        int32 $h = mipSize($height, $mip);
+        uint64 $srcBytes = (($w as uint64) * ($h as uint64)) * 4;
+        assert($off + ($srcBytes as usize) <= $rgba->size(), 'compress: rgba overflow');
+        ptr<const uint8> $src = $base;
+        $src:$ = $base:$ + ($off as isize);
+        string $block = compressRgba($fmt, $src, $w, $h);
+        if ($block->empty()) {
+            return .error(.decode('texture', 'compress failed'));
+        }
+
+        putMagic($out, $block);
+        $off = $off + ($srcBytes as usize);
+        $mip = $mip + 1;
+    }
+
+    return .ok($out);
+}
+
+internal function rgbaToBytes(const array<uint8>& $rgba) : string
+{
+    string $out = '';
+    usize $n = $rgba->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        $out->push($rgba[$i]);
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function appendMips(string& $texels, int32 $width, int32 $height) : int32
+{
+    int32 $levels = 1;
+    int32 $w = $width;
+    int32 $h = $height;
+    usize $srcOff = 0;
+
+    while ($w > 1 || $h > 1) {
+        int32 $nw = $w / 2;
+        int32 $nh = $h / 2;
+        if ($nw < 1) {
+            $nw = 1;
+        }
+        if ($nh < 1) {
+            $nh = 1;
+        }
+
+        string $mip = boxMip($texels, $srcOff, $w, $h, $nw, $nh);
+        $srcOff = $texels->size();
+        putMagic($texels, $mip);
+        $w = $nw;
+        $h = $nh;
+        $levels = $levels + 1;
+    }
+
+    return $levels;
+}
+
+internal function boxMip(
+    const string& $texels,
+    usize $srcOff,
+    int32 $w,
+    int32 $h,
+    int32 $nw,
+    int32 $nh
+) : string
+{
+    string $out = '';
+    int32 $y = 0;
+
+    while ($y < $nh) {
+        int32 $x = 0;
+
+        while ($x < $nw) {
+            int32 $sx = $x * 2;
+            int32 $sy = $y * 2;
+            uint32 $r = 0;
+            uint32 $g = 0;
+            uint32 $b = 0;
+            uint32 $a = 0;
+            int32 $n = 0;
+            int32 $oy = 0;
+
+            while ($oy < 2) {
+                int32 $ox = 0;
+
+                while ($ox < 2) {
+                    int32 $px = $sx + $ox;
+                    int32 $py = $sy + $oy;
+                    if ($px < $w && $py < $h) {
+                        usize $i = $srcOff + ((($py * $w) + $px) * 4) as usize;
+                        $r = $r + ($texels->byte($i) as uint32);
+                        $g = $g + ($texels->byte($i + 1) as uint32);
+                        $b = $b + ($texels->byte($i + 2) as uint32);
+                        $a = $a + ($texels->byte($i + 3) as uint32);
+                        $n = $n + 1;
+                    }
+
+                    $ox = $ox + 1;
+                }
+
+                $oy = $oy + 1;
+            }
+
+            if ($n < 1) {
+                $n = 1;
+            }
+
+            $out->push(($r / ($n as uint32)) as uint8);
+            $out->push(($g / ($n as uint32)) as uint8);
+            $out->push(($b / ($n as uint32)) as uint8);
+            $out->push(($a / ($n as uint32)) as uint8);
+            $x = $x + 1;
+        }
+
+        $y = $y + 1;
+    }
+
+    return $out;
+}

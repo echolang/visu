@@ -8,12 +8,12 @@ use visu::ecs::{Entities, Entity, System, Systems};
 use visu::geo::Transform;
 use visu::graphics::{
     CallbackPass, Camera, CameraData, CameraUniforms, RenderContext, Frame, GpuPass, IoSink,
-    Mesh, Pipeline, PipelineError, Raster, RenderEncoder, SceneTarget,
+    Mesh, Pipeline, PipelineError, Raster, RenderEncoder, SceneTargetData,
     ShaderProgram, VertexLayout
 };
 use visu::math::{Mat4, Quat, Vec3, Vec4};
 use visu::scene::{Scene, SwitchSignal};
-use visu::components::{activateCamera, FlyingCamera};
+use visu::components::{ActiveCamera, FlyingCamera};
 use visu::system::{CameraSystem, FlyingCameraSystem};
 use visu::ui::Ui;
 
@@ -24,7 +24,7 @@ public struct Cube
     public float32 $angle;
 }
 
-public struct CubeDraw
+public struct CubeDrawData
 {
     public Mat4 $model;
     public Vec4 $color;
@@ -66,7 +66,7 @@ public class CubeSystem : System
         $ctx->pipeline->add(CallbackPass(
             'cubes',
             setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
-                SceneTarget $scene = $frame->get<SceneTarget>();
+                SceneTargetData $scene = $frame->get<SceneTargetData>();
                 $io->writes($scene->target);
             },
             execute: function(RenderContext $inner) : status<PipelineError> {
@@ -77,7 +77,7 @@ public class CubeSystem : System
 
     public function draw(Entities $entities, RenderContext $ctx) : status<PipelineError>
     {
-        SceneTarget $scene = $ctx->frame->get<SceneTarget>();
+        SceneTargetData $scene = $ctx->frame->get<SceneTargetData>();
         CameraData $camera = guard $ctx->frame->find<CameraData>() else {
             return .ok;
         }
@@ -92,7 +92,7 @@ public class CubeSystem : System
 
         foreach ($entities->view<Cube>() as $id => &$cube) {
             Transform& $t = $entities->get<Transform>($id);
-            CubeDraw $draw = CubeDraw($t->local($alpha), $cube->color);
+            CubeDrawData $draw = CubeDrawData($t->local($alpha), $cube->color);
             $pass->draw($enc, $mesh, $draw);
         }
 
@@ -142,7 +142,7 @@ public class Play : Scene
         $this->systems->register($this->entities);
         Entity $cam = Camera::spawn($this->entities, Vec3(0.0f, 2.5f, 9.0f));
         $this->entities->attach($cam, FlyingCamera());
-        activateCamera($this->entities, $cam);
+        ActiveCamera::activate($this->entities, $cam);
         $this->spawnCubes();
     }
 

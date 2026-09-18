@@ -1,0 +1,145 @@
+/**
+ * Heightmap sample, set, bounds, and ray march.
+ */
+
+use visu::geo::{AABB, Heightmap, Ray};
+use visu::math::{Vec2, Vec3, equal, length};
+
+test heightmap_flat_sample_origin
+{
+    Heightmap $map = Heightmap::flat(4, 4, 1.5f, 1.0f);
+    float32? $h = $map->sample(0.0f, 0.0f);
+    assert($h != null, 'in');
+    float32 $v = $h ?? 0.0f;
+    assert(equal($v, 1.5f), 'origin');
+}
+
+test heightmap_sample_out_of_range_is_null
+{
+    Heightmap $map = Heightmap::flat(4, 4, 0.0f, 1.0f);
+    assert($map->sample(-3.0f, 0.0f) == null, 'x-');
+    assert($map->sample(3.0f, 0.0f) == null, 'x+');
+    assert($map->sample(0.0f, -3.0f) == null, 'z-');
+}
+
+test heightmap_set_at_and_bilinear_midpoint
+{
+    Heightmap $map = Heightmap::flat(2, 2, 0.0f, 1.0f);
+    $map->set(0, 0, 0.0f);
+    $map->set(1, 0, 2.0f);
+    $map->set(0, 1, 0.0f);
+    $map->set(1, 1, 2.0f);
+    assert(equal($map->at(1, 0), 2.0f), 'at');
+    float32 $x0 = $map->worldX(0);
+    float32 $x1 = $map->worldX(1);
+    float32 $mid = ($x0 + $x1) * 0.5f;
+    float32 $z = $map->worldZ(0);
+    float32? $h = $map->sample($mid, $z);
+    assert($h != null, 'mid in');
+    float32 $v = $h ?? 0.0f;
+    assert(equal($v, 1.0f), 'lerp');
+}
+
+test heightmap_ppu_world_extent
+{
+    Heightmap $map = Heightmap::flat(4, 4, 0.0f, 2.0f);
+    assert(equal($map->worldX(0), -1.0f), 'x0');
+    assert(equal($map->worldX(2), 0.0f), 'x2');
+    AABB $box = $map->bounds();
+    assert(equal($box->min->x, -1.0f), 'bmin');
+    assert(equal($box->max->x, $map->worldX(3)), 'bmax');
+}
+
+test heightmap_min_max
+{
+    Heightmap $map = Heightmap::flat(2, 2, 1.0f, 1.0f);
+    $map->set(0, 1, -3.0f);
+    $map->set(1, 0, 5.0f);
+    assert(equal($map->min(), -3.0f), 'min');
+    assert(equal($map->max(), 5.0f), 'max');
+}
+
+test heightmap_region_range_and_bounds
+{
+    Heightmap $map = Heightmap::flat(4, 4, 0.0f, 1.0f);
+    $map->set(0, 0, -2.0f);
+    $map->set(3, 3, 7.0f);
+    $map->set(1, 1, 4.0f);
+    $map->set(2, 1, -1.0f);
+    Vec2 $all = $map->range(0, 0, 3, 3);
+    assert(equal($all->x, -2.0f), 'all min');
+    assert(equal($all->y, 7.0f), 'all max');
+    Vec2 $mid = $map->range(1, 1, 2, 1);
+    assert(equal($mid->x, -1.0f), 'mid min');
+    assert(equal($mid->y, 4.0f), 'mid max');
+    AABB $box = $map->bounds(1, 1, 2, 1);
+    assert(equal($box->min->x, $map->worldX(1)), 'xmin');
+    assert(equal($box->max->x, $map->worldX(2)), 'xmax');
+    assert(equal($box->min->y, -1.0f), 'ymin');
+    assert(equal($box->max->y, 4.0f), 'ymax');
+}
+
+test heightmap_normal_ramp_points_left
+{
+    Heightmap $map = Heightmap::flat(3, 3, 0.0f, 1.0f);
+    $map->set(0, 0, 0.0f);
+    $map->set(0, 1, 0.0f);
+    $map->set(0, 2, 0.0f);
+    $map->set(1, 0, 1.0f);
+    $map->set(1, 1, 1.0f);
+    $map->set(1, 2, 1.0f);
+    $map->set(2, 0, 2.0f);
+    $map->set(2, 1, 2.0f);
+    $map->set(2, 2, 2.0f);
+    Vec3 $n = $map->normal(1, 1);
+    assert($n->x < 0.0f, 'points -x');
+    assert($n->y > 0.0f, 'up');
+    assert(equal($n->z, 0.0f, 0.0001f), 'no z');
+    assert(equal(length($n), 1.0f, 0.0001f), 'unit');
+}
+
+test heightmap_cast_hits_plateau
+{
+    Heightmap $map = Heightmap::flat(8, 8, 1.0f, 1.0f);
+    Ray $ray = Ray(Vec3(0.0f, 10.0f, 0.0f), Vec3(0.0f, -1.0f, 0.0f));
+    Vec3? $hit = $map->cast($ray, 20.0f, 16);
+    assert($hit != null, 'hit');
+    Vec3 $p = $hit ?? Vec3(0.0f, 0.0f, 0.0f);
+    assert(equal($p->y, 1.0f, 0.05f), 'y');
+    assert(equal($p->x, 0.0f, 0.05f), 'x');
+}
+
+test heightmap_smoothed_keeps_size_ppu_and_flat
+{
+    Heightmap $map = Heightmap::flat(5, 5, 3.0f, 2.0f);
+    Heightmap $out = $map->smoothed(2);
+    assert($out->width == 5, 'w');
+    assert($out->height == 5, 'h');
+    assert(equal($out->ppu, 2.0f), 'ppu');
+    assert(equal($out->at(2, 2), 3.0f), 'flat');
+}
+
+test heightmap_smoothed_spreads_spike_and_leaves_source
+{
+    Heightmap $map = Heightmap::flat(3, 3, 0.0f, 1.0f);
+    $map->set(1, 1, 9.0f);
+    Heightmap $out = $map->smoothed(1);
+    assert(equal($map->at(1, 1), 9.0f), 'src');
+    // separable [1,2,1]/4, centre 9 → 2.25, edge 1.125, corner 0.5625
+    assert(equal($out->at(1, 1), 2.25f), 'centre');
+    assert(equal($out->at(0, 1), 1.125f), 'edge');
+    assert(equal($out->at(0, 0), 0.5625f), 'corner');
+}
+
+test heightmap_smoothed_preserves_interior_ramp
+{
+    Heightmap $map = Heightmap::flat(5, 5, 0.0f, 1.0f);
+    for (int32 $iz = 0; $iz < 5; $iz = $iz + 1) {
+        for (int32 $ix = 0; $ix < 5; $ix = $ix + 1) {
+            $map->set($ix, $iz, $ix as float32);
+        }
+    }
+
+    Heightmap $out = $map->smoothed(1);
+    assert(equal($out->at(2, 2), 2.0f), 'ramp');
+}

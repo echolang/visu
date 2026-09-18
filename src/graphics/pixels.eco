@@ -6,6 +6,17 @@ namespace visu::graphics;
 
 use std::io;
 
+/**
+ * How to turn a GPU attachment into an 8-bit PNG. `.color` clamps 0..1 and forces opaque
+ * alpha. `.normal` remaps signed xyz to 0..1. `.gray` extracts one channel as grayscale.
+ */
+public enum PixelDump
+{
+    case color;
+    case normal;
+    case gray(int32 $channel);
+}
+
 public struct Pixels
 {
     public const int32 $width;
@@ -23,6 +34,17 @@ public struct Pixels
         const array<uint8>& $raw
     ) : result<Pixels, DumpError>
     {
+        return Pixels::from($format, $width, $height, $raw, .color);
+    }
+
+    public static function from(
+        PixelFormat $format,
+        int32 $width,
+        int32 $height,
+        const array<uint8>& $raw,
+        PixelDump $dump
+    ) : result<Pixels, DumpError>
+    {
         if ($width <= 0 || $height <= 0) {
             return .error(.empty);
         }
@@ -36,7 +58,7 @@ public struct Pixels
             return .error(.sizeMismatch($raw->count() as uint64, $want));
         }
 
-        array<uint8> $rgba = guard pixelsSwizzle($format, $raw) else ($e) {
+        array<uint8> $rgba = guard pixelsSwizzle($format, $raw, $dump) else ($e) {
             return .error($e);
         }
         return .ok(Pixels($width, $height, $rgba));
@@ -59,6 +81,22 @@ public struct Pixels
         mem::copy<uint8>(ptr<uint8>(&$rgba[0]), $data, $n);
         visu_png_free($data);
         return .ok(Pixels($w, $h, $rgba));
+    }
+
+    /**
+     * Same rgb, alpha 255. GBuffer albedo stores metallic in alpha; a PNG with a=0 looks empty.
+     */
+    public const function opaque() : Pixels
+    {
+        array<uint8> $rgba = $this->rgba->clone();
+        usize $n = $rgba->count();
+        usize $i = 3;
+        while ($i < $n) {
+            $rgba[$i] = 255;
+            $i = $i + 4;
+        }
+
+        return Pixels($this->width, $this->height, $rgba);
     }
 
     public const function write(const string& $path) : status<DumpError>
@@ -103,33 +141,80 @@ internal function pixelsRawSize(PixelFormat $format, int32 $width, int32 $height
 
 internal function pixelsSwizzle(
     PixelFormat $format,
-    const array<uint8>& $raw
+    const array<uint8>& $raw,
+    PixelDump $dump
 ) : result<array<uint8>, DumpError>
 {
-    // channel order is the one thing the format accessors do not carry
     if ($format == PixelFormat::bgra8) {
-        return .ok(pixelsSwapRb($raw));
+        return .ok(pixelsFinishDump(pixelsSwapRb($raw), $dump));
     }
 
     usize $channels = $format->channels() as usize;
 
     if ($format->component() == Component::unorm8) {
         if ($channels == 4) {
-            return .ok($raw->clone());
+            return .ok(pixelsFinishDump($raw->clone(), $dump));
         }
 
-        return .ok(pixelsExpandR8($raw));
+        return .ok(pixelsFinishDump(pixelsExpandR8($raw), $dump));
     }
 
     if ($format->component() == Component::float32) {
-        return .ok(pixelsFromFloat32($raw, $channels));
+        return .ok(pixelsFinishDump(pixelsFromFloat32($raw, $channels, $dump), $dump));
     }
 
     if ($format->component() == Component::half) {
-        return .ok(pixelsFromFloat16($raw, $channels));
+        return .ok(pixelsFinishDump(pixelsFromFloat16($raw, $channels, $dump), $dump));
     }
 
     return .error(.unsupported($format));
+}
+
+internal function pixelsFinishDump(array<uint8> $rgba, PixelDump $dump) : array<uint8>
+{
+    return match ($dump) {
+        PixelDump::gray($ch) => pixelsGray($rgba, $ch),
+        else => pixelsOpaqueRgba($rgba),
+    };
+}
+
+internal function pixelsOpaqueRgba(array<uint8> $rgba) : array<uint8>
+{
+    usize $n = $rgba->count();
+    usize $i = 3;
+    while ($i < $n) {
+        $rgba[$i] = 255;
+        $i = $i + 4;
+    }
+
+    return $rgba;
+}
+
+internal function pixelsGray(const array<uint8>& $rgba, int32 $channel) : array<uint8>
+{
+    int32 $ch = $channel;
+    if ($ch < 0) {
+        $ch = 0;
+    }
+
+    if ($ch > 2) {
+        $ch = 2;
+    }
+
+    usize $n = $rgba->count();
+    array<uint8> $out = $rgba->clone();
+    usize $i = 0;
+    usize $c = $ch as usize;
+    while ($i + 3 < $n) {
+        uint8 $v = $rgba[$i + $c];
+        $out[$i] = $v;
+        $out[$i + 1] = $v;
+        $out[$i + 2] = $v;
+        $out[$i + 3] = 255;
+        $i = $i + 4;
+    }
+
+    return $out;
 }
 
 /**
@@ -148,7 +233,15 @@ internal function pixelsChannelByte(float32 $value) : uint8
     return ($value * 255.0f) as uint8;
 }
 
-internal function pixelsFromFloat32(const array<uint8>& $raw, usize $channels) : array<uint8>
+internal function pixelsDumpValue(float32 $value, PixelDump $dump) : float32
+{
+    return match ($dump) {
+        PixelDump::normal => $value * 0.5f + 0.5f,
+        else => $value,
+    };
+}
+
+internal function pixelsFromFloat32(const array<uint8>& $raw, usize $channels, PixelDump $dump) : array<uint8>
 {
     usize $texels = $raw->count() / ($channels * 4);
     array<uint8> $out = pixelsFilled(($texels * 4) as uint64);
@@ -161,7 +254,7 @@ internal function pixelsFromFloat32(const array<uint8>& $raw, usize $channels) :
         usize $c = 0;
 
         while ($c < $channels && $c < 4) {
-            $out[$o + $c] = pixelsChannelByte($src:$[$s + $c]);
+            $out[$o + $c] = pixelsChannelByte(pixelsDumpValue($src:$[$s + $c], $dump));
             $c = $c + 1;
         }
 
@@ -175,7 +268,7 @@ internal function pixelsFromFloat32(const array<uint8>& $raw, usize $channels) :
     return $out;
 }
 
-internal function pixelsFromFloat16(const array<uint8>& $raw, usize $channels) : array<uint8>
+internal function pixelsFromFloat16(const array<uint8>& $raw, usize $channels, PixelDump $dump) : array<uint8>
 {
     usize $texels = $raw->count() / ($channels * 2);
     array<uint8> $out = pixelsFilled(($texels * 4) as uint64);
@@ -188,7 +281,7 @@ internal function pixelsFromFloat16(const array<uint8>& $raw, usize $channels) :
         usize $c = 0;
 
         while ($c < $channels && $c < 4) {
-            $out[$o + $c] = pixelsChannelByte(pixelsHalfToFloat($src:$[$s + $c]));
+            $out[$o + $c] = pixelsChannelByte(pixelsDumpValue(pixelsHalfToFloat($src:$[$s + $c]), $dump));
             $c = $c + 1;
         }
 

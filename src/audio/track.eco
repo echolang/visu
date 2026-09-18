@@ -11,12 +11,21 @@ use visu::app::info;
 public class Track
 {
     public const string $path;
+    public const string $encoded;
     public bool $looping = true;
     public ma::Sound? $sound;
 
     public constructor(string $path)
     {
         $this->path = $path;
+        $this->encoded = '';
+        $this->sound = null;
+    }
+
+    public constructor(memory: string $bytes)
+    {
+        $this->path = '';
+        $this->encoded = $bytes;
         $this->sound = null;
     }
 
@@ -26,13 +35,22 @@ public class Track
             return .ok;
         }
 
-        string $base = fileBase($this->path);
-        info("[MusicPlayer] Loading track '{$base}'");
         ma::SoundOptions $opt = ma::SoundOptions(
             $stream: true,
             $looping: $this->looping,
             $noSpatialization: true
         );
+        if (!$this->encoded->empty()) {
+            info('[MusicPlayer] Loading track from memory');
+            ma::Sound $fromMem = guard $engine->sound(memory: $this->encoded, $opt) else ($e) {
+                return .error(.engine($e));
+            }
+            $this->sound = $fromMem;
+            return .ok;
+        }
+
+        string $base = fileBase($this->path);
+        info("[MusicPlayer] Loading track '{$base}'");
         ma::Sound $sound = guard $engine->sound($this->path, $opt) else ($e) {
             return .error(.engine($e));
         }

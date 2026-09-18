@@ -1,9 +1,10 @@
 /**
- * A GPU texture, 2D or cube. Stores Device; destroy() defers through the handle.
+ * A GPU texture: 2D, cube, or 2D array. Stores Device; destroy() defers through the handle.
  * Swapchain images use the `imported:` constructor.
  *
  * A cube is six square slices in the order +X -X +Y -Y +Z -Z:
  * `upload(face:)` writes one, `ColorTarget(tex, face:)` renders into one, and sampling takes a direction.
+ * An array2D is N slices; `upload(face:)` writes one slice and sampling takes `vec3(uv, layer)`.
  * Identity is `$desc`.
  */
 
@@ -96,7 +97,7 @@ public class Texture : GpuObject
 
     public const function layers() : int32
     {
-        return $this->desc->kind->layers();
+        return $this->desc->layers();
     }
 
     public const function cube() : bool
@@ -184,7 +185,8 @@ public class Texture : GpuObject
             $this->desc->format,
             mipSize($this->desc->width, $mip),
             mipSize($this->desc->height, $mip),
-            $raw
+            $raw,
+            .color
         );
     }
 
@@ -198,7 +200,44 @@ public class Texture : GpuObject
 
     public function dump(const string& $path, face: int32 $face, int32 $mip = 0) : status<DumpError>
     {
-        Pixels $px = guard $this->capture(face: $face, $mip) else ($e) {
+        return $this->dump($path, face: $face, $mip, opaque: false);
+    }
+
+    public function dump(
+        const string& $path,
+        face: int32 $face,
+        int32 $mip,
+        opaque: bool $opaque
+    ) : status<DumpError>
+    {
+        return $this->dump($path, face: $face, $mip, dump: .color);
+    }
+
+    public function dump(
+        const string& $path,
+        face: int32 $face,
+        int32 $mip,
+        dump: PixelDump $dump
+    ) : status<DumpError>
+    {
+        if ($this->imported) {
+            return .error(.imported);
+        }
+
+        if (($this->desc->usage & TEXTURE_TRANSFER_SRC) == 0) {
+            return .error(.device(.missingUsage));
+        }
+
+        array<uint8> $raw = guard $this->device->readbackTexture($this, $mip, $face) else ($e) {
+            return .error(.device($e));
+        }
+        Pixels $px = guard Pixels::from(
+            $this->desc->format,
+            mipSize($this->desc->width, $mip),
+            mipSize($this->desc->height, $mip),
+            $raw,
+            $dump
+        ) else ($e) {
             return .error($e);
         }
         return $px->write($path);

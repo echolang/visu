@@ -18,12 +18,30 @@ public enum PixelFormat
     case rg16f;
     case depth32f;
     case depth32fStencil8;
+    case bc7;
+    case bc7Srgb;
+    case astc4x4;
+    case astc4x4Srgb;
 
     public const function isDepth() : bool
     {
         return match ($this) {
             PixelFormat::depth32f => true,
             PixelFormat::depth32fStencil8 => true,
+            else => false,
+        };
+    }
+
+    /**
+     * BC7 and ASTC 4x4. Upload is block rows, not bytes-per-pixel.
+     */
+    public const function isCompressed() : bool
+    {
+        return match ($this) {
+            PixelFormat::bc7 => true,
+            PixelFormat::bc7Srgb => true,
+            PixelFormat::astc4x4 => true,
+            PixelFormat::astc4x4Srgb => true,
             else => false,
         };
     }
@@ -43,6 +61,10 @@ public enum PixelFormat
             PixelFormat::r8 => 1,
             PixelFormat::r16f => 1,
             PixelFormat::r32f => 1,
+            PixelFormat::bc7 => 4,
+            PixelFormat::bc7Srgb => 4,
+            PixelFormat::astc4x4 => 4,
+            PixelFormat::astc4x4Srgb => 4,
             else => 0,
         };
     }
@@ -57,6 +79,10 @@ public enum PixelFormat
             PixelFormat::bgra8 => Component::unorm8,
             PixelFormat::rgba8Srgb => Component::unorm8,
             PixelFormat::r8 => Component::unorm8,
+            PixelFormat::bc7 => Component::unorm8,
+            PixelFormat::bc7Srgb => Component::unorm8,
+            PixelFormat::astc4x4 => Component::unorm8,
+            PixelFormat::astc4x4Srgb => Component::unorm8,
             PixelFormat::rgba16f => Component::half,
             PixelFormat::rg16f => Component::half,
             PixelFormat::r16f => Component::half,
@@ -106,6 +132,7 @@ public enum Topology
     case lineStrip;
     case triangles;
     case triangleStrip;
+    case patches;
 }
 
 public enum Filter
@@ -161,5 +188,53 @@ internal function pixelByteCount(PixelFormat $format) : uint32
         PixelFormat::rg16f => 4,
         PixelFormat::depth32f => 4,
         PixelFormat::depth32fStencil8 => 5,
+        PixelFormat::bc7 => 0,
+        PixelFormat::bc7Srgb => 0,
+        PixelFormat::astc4x4 => 0,
+        PixelFormat::astc4x4Srgb => 0,
     };
+}
+
+/**
+ * Bytes for one tightly packed mip of `$width` x `$height`. Compressed is 16-byte 4x4 blocks.
+ */
+internal function mipByteCount(PixelFormat $format, int32 $width, int32 $height) : uint64
+{
+    if ($format->isCompressed()) {
+        int32 $bw = ($width + 3) / 4;
+        int32 $bh = ($height + 3) / 4;
+        if ($bw < 1) {
+            $bw = 1;
+        }
+        if ($bh < 1) {
+            $bh = 1;
+        }
+
+        return (($bw as uint64) * ($bh as uint64)) * 16;
+    }
+
+    uint32 $bpp = pixelByteCount($format);
+    if ($bpp == 0) {
+        return 0;
+    }
+
+    return (($width as uint64) * ($height as uint64)) * ($bpp as uint64);
+}
+
+/**
+ * Bytes from one row of texels (or one row of blocks) to the next.
+ */
+internal function mipRowBytes(PixelFormat $format, int32 $width) : uint64
+{
+    if ($format->isCompressed()) {
+        int32 $bw = ($width + 3) / 4;
+        if ($bw < 1) {
+            $bw = 1;
+        }
+
+        return ($bw as uint64) * 16;
+    }
+
+    uint32 $bpp = pixelByteCount($format);
+    return ($width as uint64) * ($bpp as uint64);
 }

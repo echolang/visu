@@ -60,20 +60,20 @@ struct fs_in
 };
 
 static inline __attribute__((always_inline))
-GBuffer gbuffer_make(thread const float2& uv, texture2d<float> gbuffer_position, sampler gbuffer_positionSmplr, texture2d<float> gbuffer_normal, sampler gbuffer_normalSmplr, texture2d<float> gbuffer_albedo, sampler gbuffer_albedoSmplr, texture2d<float> gbuffer_emissive, sampler gbuffer_emissiveSmplr, texture2d<float> gbuffer_ao, sampler gbuffer_aoSmplr)
+GBuffer gbuffer_make(thread const float2& uv, texture2d<float> gbuffer_position, sampler gbuffer_positionSmplr, texture2d<float> gbuffer_normal, sampler gbuffer_normalSmplr, texture2d<float> gbuffer_albedo, sampler gbuffer_albedoSmplr, texture2d<float> gbuffer_material, sampler gbuffer_materialSmplr, constant CameraUniforms& _365, texture2d<float> gbuffer_ao, sampler gbuffer_aoSmplr, texture2d<float> gbuffer_emissive, sampler gbuffer_emissiveSmplr)
 {
     float4 position = gbuffer_position.sample(gbuffer_positionSmplr, uv);
     float4 normal = gbuffer_normal.sample(gbuffer_normalSmplr, uv);
     float4 albedo = gbuffer_albedo.sample(gbuffer_albedoSmplr, uv);
-    float4 emissive = gbuffer_emissive.sample(gbuffer_emissiveSmplr, uv);
+    float4 material = gbuffer_material.sample(gbuffer_materialSmplr, uv);
     GBuffer gbuffer;
-    gbuffer.P = position.xyz;
+    gbuffer.P = position.xyz + _365.u_camera_position.xyz;
     gbuffer.N = normal.xyz;
     gbuffer.albedo = albedo.xyz;
-    gbuffer.metallic = albedo.w;
-    gbuffer.roughness = emissive.w;
-    gbuffer.emissive = emissive.xyz;
-    gbuffer.ao = gbuffer_ao.sample(gbuffer_aoSmplr, uv).x;
+    gbuffer.roughness = material.x;
+    gbuffer.metallic = material.y;
+    gbuffer.ao = material.z * gbuffer_ao.sample(gbuffer_aoSmplr, uv).x;
+    gbuffer.emissive = gbuffer_emissive.sample(gbuffer_emissiveSmplr, uv).xyz;
     gbuffer.coverage = position.w;
     return gbuffer;
 }
@@ -159,9 +159,9 @@ float3 pbr_shade(thread const PBRSurface& s, thread const float3& L, thread cons
     float3 param_4 = s.F0;
     float param_5 = s.roughness;
     float3 param_6;
-    float3 _480 = pbr_specular(param, param_1, param_2, param_3, param_4, param_5, param_6);
+    float3 _495 = pbr_specular(param, param_1, param_2, param_3, param_4, param_5, param_6);
     float3 F = param_6;
-    float3 spec = _480;
+    float3 spec = _495;
     float3 kS = F;
     float3 kD = (float3(1.0) - kS) * (1.0 - s.metallic);
     float3 diff = (kD * s.albedo) / float3(3.1415927410125732421875);
@@ -214,21 +214,21 @@ float3 gamma_correct(thread const float3& color)
     return pow(color, float3(0.4545454680919647216796875));
 }
 
-fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _525 [[buffer(3)]], constant LightUniforms& _538 [[buffer(4)]], texture2d<float> gbuffer_position [[texture(0)]], texture2d<float> gbuffer_normal [[texture(1)]], texture2d<float> gbuffer_albedo [[texture(2)]], texture2d<float> gbuffer_emissive [[texture(3)]], texture2d<float> gbuffer_ao [[texture(4)]], sampler gbuffer_positionSmplr [[sampler(0)]], sampler gbuffer_normalSmplr [[sampler(1)]], sampler gbuffer_albedoSmplr [[sampler(2)]], sampler gbuffer_emissiveSmplr [[sampler(3)]], sampler gbuffer_aoSmplr [[sampler(4)]])
+fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _365 [[buffer(3)]], constant LightUniforms& _548 [[buffer(4)]], texture2d<float> gbuffer_position [[texture(0)]], texture2d<float> gbuffer_normal [[texture(1)]], texture2d<float> gbuffer_albedo [[texture(2)]], texture2d<float> gbuffer_material [[texture(3)]], texture2d<float> gbuffer_emissive [[texture(4)]], texture2d<float> gbuffer_ao [[texture(5)]], sampler gbuffer_positionSmplr [[sampler(0)]], sampler gbuffer_normalSmplr [[sampler(1)]], sampler gbuffer_albedoSmplr [[sampler(2)]], sampler gbuffer_materialSmplr [[sampler(3)]], sampler gbuffer_emissiveSmplr [[sampler(4)]], sampler gbuffer_aoSmplr [[sampler(5)]])
 {
     fs_out out = {};
     float2 param = in.v_uv;
-    GBuffer gbuffer = gbuffer_make(param, gbuffer_position, gbuffer_positionSmplr, gbuffer_normal, gbuffer_normalSmplr, gbuffer_albedo, gbuffer_albedoSmplr, gbuffer_emissive, gbuffer_emissiveSmplr, gbuffer_ao, gbuffer_aoSmplr);
+    GBuffer gbuffer = gbuffer_make(param, gbuffer_position, gbuffer_positionSmplr, gbuffer_normal, gbuffer_normalSmplr, gbuffer_albedo, gbuffer_albedoSmplr, gbuffer_material, gbuffer_materialSmplr, _365, gbuffer_ao, gbuffer_aoSmplr, gbuffer_emissive, gbuffer_emissiveSmplr);
     if (gbuffer.coverage < 0.5)
     {
         discard_fragment();
     }
     GBuffer param_1 = gbuffer;
-    float3 param_2 = _525.u_camera_position.xyz;
+    float3 param_2 = _365.u_camera_position.xyz;
     PBRSurface s = pbr_surface_make(param_1, param_2);
     float3 Lo = float3(0.0);
-    float3 L = fast::normalize(-_538.u_sun_direction.xyz);
-    float3 radiance = _538.u_sun_color.xyz * _538.u_sun_direction.w;
+    float3 L = fast::normalize(-_548.u_sun_direction.xyz);
+    float3 radiance = _548.u_sun_color.xyz * _548.u_sun_direction.w;
     PBRSurface param_3 = s;
     float3 param_4 = L;
     float3 param_5 = radiance;

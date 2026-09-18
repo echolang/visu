@@ -1,0 +1,139 @@
+/**
+ * ConsoleCommandRegistry routing and Systems ConsoleCommandHandler walk.
+ */
+
+use visu::ecs::{Entities, System, Systems};
+use visu::graphics::RenderContext;
+use visu::os::{Window, WindowHints};
+use visu::os::input::InputHub;
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::{ConsoleCommandSignal, Dispatcher};
+
+class PingSystem : System, ConsoleCommandHandler
+{
+    public int32 $hits;
+    public string $last;
+
+    public constructor()
+    {
+        $this->hits = 0;
+        $this->last = '';
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function update(Entities $entities) : void
+    {
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : void
+    {
+        $registry->add('ping', $this);
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        $this->hits = $this->hits + 1;
+        $this->last = $cmd->raw;
+        $console->writeLine('pong');
+    }
+}
+
+test registry_add_and_find
+{
+    PingSystem $ping = PingSystem();
+    ConsoleCommandRegistry $reg = ConsoleCommandRegistry();
+    $reg->add('ping', $ping);
+    array<string> $names = $reg->names();
+    assert($names->count() == 1, 'one');
+    assert($names[0] == 'ping', 'name');
+    ConsoleCommandHandler $found = guard $reg->find('ping') else {
+        assert(false, 'missing');
+        return;
+    }
+    assert($found instanceof PingSystem, 'same');
+    assert($reg->find('nope') == null, 'absent');
+}
+
+#[tests: expects death]
+test registry_duplicate_add_dies
+{
+    PingSystem $ping = PingSystem();
+    ConsoleCommandRegistry $reg = ConsoleCommandRegistry();
+    $reg->add('ping', $ping);
+    $reg->add('ping', $ping);
+}
+
+test systems_register_routes_handler
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d, InputHub(Window('commands', 64, 64, WindowHints()), $d));
+    PingSystem $ping = PingSystem();
+    CountingSystem $other = CountingSystem();
+    Systems $systems = Systems();
+    $systems->listen($c);
+    $systems->bind($other);
+    $systems->bind($ping);
+
+    Entities $world = Entities();
+    $systems->register($world);
+    $c->submit('ping extra');
+    assert($ping->hits == 1, 'routed');
+    assert($ping->last == 'ping extra', 'raw');
+    assert($other->registers == 1, 'sibling register');
+
+    array<string> $h = $c->history();
+    assert($h->count() == 2, 'cmd plus pong');
+    assert($h[1] == 'pong', 'reply');
+
+    array<string> $regNames = $c->registry->names();
+    assert($regNames->count() == 1, 'registry has ping');
+    assert($regNames[0] == 'ping', 'registry name');
+
+    $c->submit('help');
+    array<string> $help = $c->history();
+    bool $listed = false;
+    foreach ($help as $line) {
+        if ($line == 'ping') {
+            $listed = true;
+        }
+    }
+    assert($listed, 'help lists ping');
+
+    $systems->unregister($world);
+    $c->submit('ping');
+    assert($ping->hits == 1, 'unregistered');
+}
+
+test console_help_and_clear_builtins
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d, InputHub(Window('commands', 64, 64, WindowHints()), $d));
+    $c->submit('help');
+    array<string> $h = $c->history();
+    assert($h->count() >= 3, 'help lines');
+    $c->submit('clear');
+    array<string> $after = $c->history();
+    assert($after->count() == 1, 'cleared then note');
+    assert($after[0] == 'cleared', 'note');
+}
+
+test console_unknown_command
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d, InputHub(Window('commands', 64, 64, WindowHints()), $d));
+    $c->submit('spawn box');
+    array<string> $h = $c->history();
+    assert($h->count() == 2, 'cmd plus miss');
+    assert($h[1] == 'unknown command: spawn. type help', 'miss');
+}

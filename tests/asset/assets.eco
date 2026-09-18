@@ -1,0 +1,156 @@
+/**
+ * Assets bank: mount, load, missing, wrongKind. No GPU.
+ */
+
+use std::env;
+use std::io;
+use visu::graphics::Device;
+use visu::asset::{
+    AssetError, Assets, Blob, KIND_BYTES, PackItem, PackStore,
+    decodeBytes, writePack
+};
+
+class DummyClip
+{
+    public const string $n;
+
+    public constructor(string $n)
+    {
+        $this->n = $n;
+    }
+}
+
+function assetsTmp(string $tag) : string
+{
+    $tmp = env::tmp();
+    string $ds = env::DS;
+    return "{$tmp}{$ds}visu-bank-{$tag}";
+}
+
+function mkdirBank(string $dir) : void
+{
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return;
+        }
+
+        die($e->message());
+    }
+}
+
+function packedBank(string $tag, const array<PackItem>& $items) : Assets
+{
+    string $dir = assetsTmp($tag);
+    mkdirBank($dir);
+    string $ds = env::DS;
+    string $path = "{$dir}{$ds}main.vpack";
+    guard writePack($path, $items) else ($e) {
+        die($e->message());
+    }
+
+    PackStore $store = guard PackStore::open($path) else ($e) {
+        die($e->message());
+    }
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    $assets->register(KIND_BYTES, function(Assets $a, Blob $b) : result<Blob, AssetError> {
+        return decodeBytes($a, $b);
+    });
+    guard $assets->mount($store) else ($e) {
+        die($e->message());
+    }
+    return $assets;
+}
+
+test assets_load_bytes
+{
+    array<PackItem> $items = array<PackItem>();
+    $items[] = PackItem('raw/hello', KIND_BYTES, Blob('abc'));
+    Assets $assets = packedBank('load', $items);
+    Blob $blob = guard $assets->load<Blob>('raw/hello') else ($e) {
+        die($e->message());
+    }
+    assert($blob->bytes->equals('abc'), 'bytes');
+}
+
+test assets_load_bytes_via_ref
+{
+    array<PackItem> $items = array<PackItem>();
+    $items[] = PackItem('raw/hello', KIND_BYTES, Blob('abc'));
+    Assets $assets = packedBank('ref', $items);
+    $ref = guard $assets->handle<Blob>('raw/hello') else ($e) {
+        die($e->message());
+    }
+    Blob $blob = guard $ref->load<Blob>() else ($e) {
+        die($e->message());
+    }
+    assert($blob->bytes->equals('abc'), 'bytes');
+    assert($ref->get<Blob>()->bytes->equals('abc'), 'get');
+}
+
+test assets_missing
+{
+    array<PackItem> $items = array<PackItem>();
+    Assets $assets = packedBank('miss', $items);
+    result<Blob, AssetError> $r = $assets->load<Blob>('nope');
+    assert($r->failed(), 'fail');
+    AssetError $e = $r->failure();
+    match ($e) {
+        AssetError::missing($id) => {
+            assert($id->equals('nope'), 'id');
+        },
+        else => {
+            die($e->message());
+        },
+    };
+}
+
+test assets_wrong_kind
+{
+    array<PackItem> $items = array<PackItem>();
+    $items[] = PackItem('raw/hello', KIND_BYTES, Blob('abc'));
+    Assets $assets = packedBank('kind', $items);
+    $assets->register('clip', function(Assets $a, Blob $blob) : result<DummyClip, AssetError> {
+        return .ok(DummyClip($blob->bytes));
+    });
+    result<DummyClip, AssetError> $r = $assets->load<DummyClip>('raw/hello');
+    assert($r->failed(), 'fail');
+    AssetError $e = $r->failure();
+    match ($e) {
+        AssetError::wrongKind($id, $want, $have) => {
+            assert($id->equals('raw/hello'), 'id');
+            assert($want->equals('clip'), 'want');
+            assert($have->equals(KIND_BYTES), 'have');
+        },
+        else => {
+            die($e->message());
+        },
+    };
+}
+
+test assets_first_mount_wins
+{
+    array<PackItem> $first = array<PackItem>();
+    $first[] = PackItem('raw/hello', KIND_BYTES, Blob('one'));
+    Assets $assets = packedBank('win-a', $first);
+    array<PackItem> $second = array<PackItem>();
+    $second[] = PackItem('raw/hello', KIND_BYTES, Blob('two'));
+    string $dir = assetsTmp('win-b');
+    mkdirBank($dir);
+    string $ds = env::DS;
+    string $path = "{$dir}{$ds}other.vpack";
+    guard writePack($path, $second) else ($e) {
+        die($e->message());
+    }
+
+    PackStore $store = guard PackStore::open($path) else ($e) {
+        die($e->message());
+    }
+    guard $assets->mount($store) else ($e) {
+        die($e->message());
+    }
+    Blob $blob = guard $assets->load<Blob>('raw/hello') else ($e) {
+        die($e->message());
+    }
+    assert($blob->bytes->equals('one'), 'first');
+}

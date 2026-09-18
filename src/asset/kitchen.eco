@@ -1,0 +1,223 @@
+/**
+ * Walk a source tree, run the first matching cooker, write a directory store.
+ */
+
+namespace visu::asset;
+
+use std::io;
+use json;
+use visu::app::slashDir;
+
+public class Kitchen
+{
+    private array<Cooker> $cookers;
+
+    public constructor()
+    {
+        $this->cookers = array<Cooker>();
+    }
+
+    /**
+     * Texture png + sound wav/flac/mp3. Games add more with `add`.
+     */
+    public static function defaults() : Kitchen
+    {
+        Kitchen $k = Kitchen();
+        $k->add(TextureCooker());
+        $k->add(SoundCooker());
+        return $k;
+    }
+
+    public function add(Cooker $cooker) : void
+    {
+        $this->cookers[] = $cooker;
+    }
+
+    /**
+     * Cook every accepted file under `$sourceRoot` into `$outRoot` (catalog.vcat + blobs).
+     */
+    public function cook(const string& $sourceRoot, const string& $outRoot) : result<array<PackItem>, AssetError>
+    {
+        array<PackItem> $items = array<PackItem>();
+        string $root = slashDir($sourceRoot);
+        guard $this->walk($root, '', json::object(), $items) else ($e) {
+            return .error($e);
+        }
+        guard writeDirectory($outRoot, $items) else ($e) {
+            return .error($e);
+        }
+        return .ok($items);
+    }
+
+    /**
+     * Cook then write `$packPath` as a vpack.
+     */
+    public function pack(const string& $sourceRoot, const string& $packPath) : status<AssetError>
+    {
+        string $tmp = $packPath;
+        $tmp->append('.dir');
+        array<PackItem> $items = guard $this->cook($sourceRoot, $tmp) else ($e) {
+            return .error($e);
+        }
+        return writePack($packPath, $items);
+    }
+
+    private function walk(
+        const string& $dir,
+        const string& $prefix,
+        json::Value $parent,
+        array<PackItem>& $items
+    ) : status<AssetError>
+    {
+        io::dir $d = guard io::opendir($dir) else ($e) {
+            return .error(.io($dir, $e->message()));
+        }
+        array<string> $subs = array<string>();
+        array<string> $files = array<string>();
+        array<string> $vmats = array<string>();
+
+        foreach ($d as $entry) {
+            if ($entry->is_directory()) {
+                $subs[] = $entry->path();
+                continue;
+            }
+
+            string $name = $entry->name();
+            if ($name->starts('.')) {
+                continue;
+            }
+
+            if (str::lower($name)->ends('.vmat')) {
+                $vmats[] = $entry->path();
+                continue;
+            }
+
+            $files[] = $entry->path();
+        }
+
+        if ($vmats->count() > 1) {
+            return .error(.corrupt($dir, 'two .vmat files in one folder'));
+        }
+
+        json::Value $sheet = $parent;
+        if ($vmats->count() == 1) {
+            json::Value $parsed = guard loadVmatFile($vmats[0]) else ($e) {
+                return .error($e);
+            }
+            $sheet = vmatMerge($parent, $parsed);
+        }
+
+        array<string> $stems = array<string>();
+        foreach ($files as $path) {
+            if ($this->matchCooker($path) != null) {
+                $stems[] = stripExt(dirBase($path));
+            }
+        }
+
+        if ($vmats->count() == 1 && !$prefix->empty()) {
+            json::Value $resolved = $sheet->clone();
+            vmatResolve($resolved, $prefix, $stems);
+            $items[] = PackItem($prefix, KIND_VMAT, Blob(json::pretty($resolved)));
+        }
+
+        foreach ($files as $path) {
+            Cooker? $cooker = $this->matchCooker($path);
+            Cooker $c = guard $cooker else {
+                continue;
+            }
+            string $name = dirBase($path);
+            Source $src = Source();
+            $src->path = $path;
+            $src->id = sourceId($prefix, $name);
+            $src->meta = vmatView($sheet, stripExt($name));
+            PackItem $item = guard $c->cook($src) else ($e) {
+                return .error($e);
+            }
+            $items[] = $item;
+        }
+
+        foreach ($subs as $sub) {
+            string $next = $prefix;
+            if (!$next->empty()) {
+                $next->append('/');
+            }
+            $next->append(dirBase($sub));
+            guard $this->walk($sub, $next, $sheet, $items) else ($e) {
+                return .error($e);
+            }
+        }
+
+        return .ok;
+    }
+
+    private function matchCooker(const string& $path) : Cooker?
+    {
+        foreach ($this->cookers as $cooker) {
+            if ($cooker->accepts($path)) {
+                return $cooker;
+            }
+        }
+
+        return null;
+    }
+}
+
+internal function sourceId(const string& $prefix, const string& $name) : string
+{
+    string $stem = stripExt($name);
+    if ($prefix->empty()) {
+        return $stem;
+    }
+
+    string $id = $prefix;
+    $id->append('/');
+    $id->append($stem);
+    return $id;
+}
+
+internal function stripExt(const string& $name) : string
+{
+    usize $n = $name->size();
+    usize $i = $n;
+    usize $dot = $n;
+
+    while ($i > 0) {
+        $i = $i - 1;
+        uint8 $c = $name->byte($i);
+        if ($c == 46) {
+            $dot = $i;
+            break;
+        }
+        if ($c == 47 || $c == 92) {
+            break;
+        }
+    }
+
+    if ($dot == $n) {
+        return $name;
+    }
+
+    return $name->sub(0, $dot)->clone();
+}
+
+internal function dirBase(const string& $path) : string
+{
+    usize $n = $path->size();
+    usize $i = $n;
+    usize $slash = $n;
+
+    while ($i > 0) {
+        $i = $i - 1;
+        uint8 $c = $path->byte($i);
+        if ($c == 47 || $c == 92) {
+            $slash = $i;
+            break;
+        }
+    }
+
+    if ($slash == $n) {
+        return $path;
+    }
+
+    return $path->sub($slash + 1, $n - $slash - 1)->clone();
+}

@@ -4,7 +4,7 @@
 
 namespace visu::graphics;
 
-internal function metalVertexDescriptor(const VertexLayout& $layout) : mtl::VertexDescriptor
+internal function metalVertexDescriptor(const VertexLayout& $layout, bool $patches) : mtl::VertexDescriptor
 {
     mtl::VertexDescriptor $vd = mtl::VertexDescriptor();
     bool $hasVertex = false;
@@ -36,7 +36,12 @@ internal function metalVertexDescriptor(const VertexLayout& $layout) : mtl::Vert
     }
 
     if ($hasVertex) {
-        $vd->layouts[] = mtl::VertexBufferLayout(VERTEX_BINDING, $vertexStride);
+        mtl::VertexStepFunction $step = mtl::VertexStepFunction::perVertex;
+        if ($patches) {
+            $step = mtl::VertexStepFunction::perPatchControlPoint;
+        }
+
+        $vd->layouts[] = mtl::VertexBufferLayout(VERTEX_BINDING, $vertexStride, $step, 1);
     }
 
     if ($hasInstance) {
@@ -61,15 +66,32 @@ internal function metalPipelineFromPass(
     mtl::Device $gpu = guard $device->gpu else {
         return .error(.noDevice);
     }
-    mtl::Function $vs = guard $pass->program->vs->fn else {
+    mtl::Function? $vsFn = $pass->program->vs->fn;
+    if ($pass->program->tessellated && $pass->program->tes->alive()) {
+        $vsFn = $pass->program->tes->fn;
+    }
+
+    mtl::Function $vs = guard $vsFn else {
         return .error(.pipeline($pass->key(), 'missing vertex function'));
     }
     mtl::Function $fs = guard $pass->program->fs->fn else {
         return .error(.pipeline($pass->key(), 'missing fragment function'));
     }
-    mtl::VertexDescriptor $vd = metalVertexDescriptor($pass->layout);
+    mtl::VertexDescriptor $vd = metalVertexDescriptor($pass->layout, $pass->program->tessellated);
     mtl::RenderPipelineDescriptor $desc = mtl::RenderPipelineDescriptor($vs, $vertexDescriptor: $vd);
     $desc->fragmentFunction = $fs;
+    if ($pass->program->tessellated) {
+        $desc->tessellationEnabled = true;
+        uint32 $max = $device->limits->maxTessellationFactor as uint32;
+        if ($max < 1) {
+            $max = 16;
+        }
+
+        $desc->maxTessellationFactor = $max;
+        $desc->tessellationPartitionMode = mtl::TessellationPartitionMode::pow2;
+        $desc->tessellationFactorStepFunction = mtl::TessellationFactorStepFunction::perPatch;
+        $desc->tessellationOutputWindingOrder = mtl::Winding::counterClockwise;
+    }
     uint32 $ci = 0;
     uint32 $colorN = $formats->colorCount;
 

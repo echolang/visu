@@ -4,7 +4,7 @@
 
 using namespace metal;
 
-struct CubeDraw
+struct CubeDrawData
 {
     float4x4 u_model;
     float4 u_color;
@@ -33,7 +33,7 @@ struct vs_in
     float3 aPos [[attribute(0)]];
 };
 
-vertex vs_out vs(vs_in in [[stage_in]], constant CubeDraw& _13 [[buffer(2)]], constant CameraUniforms& _47 [[buffer(3)]])
+vertex vs_out vs(vs_in in [[stage_in]], constant CubeDrawData& _13 [[buffer(2)]], constant CameraUniforms& _47 [[buffer(3)]])
 {
     vs_out out = {};
     float4 world = _13.u_model * float4(in.aPos, 1.0);

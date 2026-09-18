@@ -24,13 +24,13 @@ layout(std140, set = 0, binding = 2) uniform LightUniforms {
 };
 
 #ifdef USE_ENV_CUBEMAP
-layout(set = 1, binding = 5) uniform samplerCube environment_cubemap;
+layout(set = 1, binding = 6) uniform samplerCube environment_cubemap;
 #endif
 
 #ifdef USE_IBL
-layout(set = 1, binding = 5) uniform samplerCube ibl_irradiance_map;
-layout(set = 1, binding = 6) uniform samplerCube ibl_prefilter_map;
-layout(set = 1, binding = 7) uniform sampler2D ibl_brdf_lut;
+layout(set = 1, binding = 6) uniform samplerCube ibl_irradiance_map;
+layout(set = 1, binding = 7) uniform samplerCube ibl_prefilter_map;
+layout(set = 1, binding = 8) uniform sampler2D ibl_brdf_lut;
 #endif
 
 void main()

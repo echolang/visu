@@ -17,6 +17,7 @@ public class Mesh : GpuObject
     public int32 $indexCount;
     public Topology $topology;
     private int32 $vertexStride;
+    private int32 $vertexCapacity;
     private int32 $instanceStride;
     private bool $dead;
 
@@ -31,6 +32,30 @@ public class Mesh : GpuObject
         int32 $bytes = ($data->count() as int32) * (mem::size<float32>() as int32);
         assert($bytes % $stride == 0, 'upload size');
         $this->vertexCount = $bytes / $stride;
+        $this->vertexCapacity = $this->vertexCount;
+        $this->instanceCount = 0;
+        $this->indexCount = 0;
+        $this->topology = .triangles;
+        $this->vertexStride = $stride;
+        $this->instanceStride = 0;
+        $this->dead = false;
+    }
+
+    /**
+     * Empty vertex buffer of `$capacity` vertices. `write` fills a prefix before the first draw.
+     */
+    public constructor(Device $device, stride: int32 $stride, vertices: int32 $capacity)
+    {
+        assert($stride > 0, 'mesh stride');
+        assert($capacity > 0, 'mesh capacity');
+        uint64 $bytes = ($capacity as uint64) * ($stride as uint64);
+        $this->device = $device;
+        $this->vertices = Buffer($device, BufferDesc(.vertex, $bytes));
+        $this->instanceBuffer = null;
+        $this->indices = null;
+        $this->indexType = .uint16;
+        $this->vertexCount = 0;
+        $this->vertexCapacity = $capacity;
         $this->instanceCount = 0;
         $this->indexCount = 0;
         $this->topology = .triangles;
@@ -107,6 +132,42 @@ public class Mesh : GpuObject
         }
 
         $enc->draw(0, $this->vertexCount, $instances);
+    }
+
+    /**
+     * Replace the vertex prefix. `$data` must fit the buffer allocated at construction.
+     */
+    public function write(const array<float32>& $data) : void
+    {
+        assert(!$this->dead, 'mesh write');
+        int32 $bytes = ($data->count() as int32) * (mem::size<float32>() as int32);
+        assert($bytes % $this->vertexStride == 0, 'upload size');
+        int32 $count = $bytes / $this->vertexStride;
+        assert($count > 0, 'mesh write empty');
+        assert($count <= $this->vertexCapacity, 'mesh write overflow');
+        ptr<const float32> $src = $data->data();
+        $this->vertices->upload(ptr<const uint8>($src:$), $bytes as uint64);
+        $this->vertexCount = $count;
+    }
+
+    /**
+     * Index buffer. `$data` is triangle-list indices. Call once after construct.
+     */
+    public function index(const array<uint16>& $data) : void
+    {
+        usize $n = $data->count();
+        assert($n > 0, 'mesh index empty');
+        uint64 $bytes = ($n as uint64) * (mem::size<uint16>() as uint64);
+        ptr<const uint16> $src = $data->data();
+        Buffer? $old = $this->indices;
+        if ($old != null) {
+            Buffer $prev = guard $old;
+            $prev->destroy();
+        }
+
+        $this->indices = Buffer($this->device, .index, ptr<const uint8>($src:$), $bytes);
+        $this->indexType = .uint16;
+        $this->indexCount = $n as int32;
     }
 
     /**

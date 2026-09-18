@@ -1,0 +1,212 @@
+/**
+ * Process-lifetime catalog of cooked objects.
+ * Host owns one; Device is stored for texture decoders, CPU kinds ignore it.
+ * `register` is boot; `mount` adds a store; `load` decodes through the kind's decoder.
+ */
+
+namespace visu::asset;
+
+use visu::graphics::Device;
+
+internal class Mounted
+{
+    public Store $store;
+    public CatalogEntry $entry;
+
+    public constructor(Store $store, CatalogEntry $entry)
+    {
+        $this->store = $store;
+        $this->entry = $entry;
+    }
+}
+
+public class Assets
+{
+    public Device $device;
+    public string $loading = '';
+    private map<string, type_id> $kinds;
+    private map<type_id, string> $kindNames;
+    private map<type_id, DecodeThunk> $decoders;
+    private map<string, Mounted> $catalog;
+    private map<string, AssetRef> $refs;
+
+    public constructor(Device $device)
+    {
+        $this->device = $device;
+        $this->kinds = map<string, type_id>();
+        $this->kindNames = map<type_id, string>();
+        $this->decoders = map<type_id, DecodeThunk>();
+        $this->catalog = map<string, Mounted>();
+        $this->refs = map<string, AssetRef>();
+    }
+
+    /**
+     * Boot-time. Occupied kind or a second decoder for T is a wiring bug.
+     */
+    public function register<T : class>(string $kind, function<result<T, AssetError>(Assets, Blob)> $decode) : void
+    {
+        type_id $id = type_id<T>();
+        assert(!$this->kinds->has($kind), 'asset: kind already registered');
+        assert(!$this->decoders->has($id), 'asset: a second decoder for this type');
+        $this->kinds[$kind] = $id;
+        $this->kindNames[$id] = $kind;
+        function<result<T, AssetError>(Assets, Blob)> $fn = $decode;
+        $this->decoders[$id] = DecodeThunk(function(Assets $assets, Blob $blob) : result<erased, AssetError> {
+            T $value = guard $fn($assets, $blob) else ($e) {
+                return .error($e);
+            }
+            return .ok(erased::from($value));
+        });
+    }
+
+    /**
+     * Add a store. First hit wins when an id is already mounted.
+     */
+    public function mount(Store $store) : status<AssetError>
+    {
+        array<CatalogEntry> $entries = $store->entries();
+
+        foreach ($entries as $entry) {
+            if ($this->catalog->has($entry->id)) {
+                continue;
+            }
+
+            $this->catalog[$entry->id] = Mounted($store, $entry);
+        }
+
+        return .ok;
+    }
+
+    /**
+     * Directory lookup. One map hit, then hold the class.
+     */
+    public function handle<T : class>(string $id) : result<AssetRef, AssetError>
+    {
+        if (!$this->catalog->has($id)) {
+            return .error(.missing($id));
+        }
+
+        Mounted $slot = $this->catalog[$id];
+        type_id $want = type_id<T>();
+        if (!$this->decoders->has($want)) {
+            return .error(.decode($id, 'no decoder for this type'));
+        }
+
+        string $haveKind = $slot->entry->kind;
+        if (!$this->kinds->has($haveKind)) {
+            return .error(.decode($id, "unknown kind '{$haveKind}'"));
+        }
+
+        type_id $have = $this->kinds[$haveKind];
+        if ($have != $want) {
+            string $wantKind = $this->kindNames[$want];
+            return .error(.wrongKind($id, $wantKind, $haveKind));
+        }
+
+        if ($this->refs->has($id)) {
+            return .ok($this->refs[$id]);
+        }
+
+        AssetRef $ref = AssetRef($this, $id, $haveKind);
+        $this->refs[$id] = $ref;
+        return .ok($ref);
+    }
+
+    /**
+     * Named slot when the id is mounted. Kind is whatever the catalog says.
+     */
+    public function slot(string $id) : AssetRef?
+    {
+        if (!$this->catalog->has($id)) {
+            return null;
+        }
+
+        if ($this->refs->has($id)) {
+            return $this->refs[$id];
+        }
+
+        Mounted $mounted = $this->catalog[$id];
+        AssetRef $ref = AssetRef($this, $id, $mounted->entry->kind);
+        $this->refs[$id] = $ref;
+        return $ref;
+    }
+
+    /**
+     * Decode if needed and return the live object.
+     */
+    public function load<T : class>(string $id) : result<T, AssetError>
+    {
+        AssetRef $ref = guard $this->handle<T>($id) else ($e) {
+            return .error($e);
+        }
+        return $ref->load<T>();
+    }
+
+    public function forget(string $id) : void
+    {
+        if (!$this->refs->has($id)) {
+            return;
+        }
+
+        $this->refs[$id]->forget();
+    }
+
+    public function destroy() : void
+    {
+        array<string> $ids = $this->refs->keys();
+
+        foreach ($ids as $id) {
+            $this->refs[$id]->forget();
+        }
+
+        $this->refs->clear();
+        $this->catalog->clear();
+    }
+
+    /**
+     * Raw cooked bytes. Terrain and other CPU readers use this plus decodeTexture.
+     */
+    public function blob(string $id) : result<Blob, AssetError>
+    {
+        if (!$this->catalog->has($id)) {
+            return .error(.missing($id));
+        }
+
+        Mounted $slot = $this->catalog[$id];
+        return $slot->store->read($slot->entry);
+    }
+
+    /**
+     * Fill a slot. AssetRef.load is the caller; the string map is not on the hot path.
+     */
+    internal function fill<T : class>(AssetRef $ref) : result<T, AssetError>
+    {
+        erased? $held = $ref->ready;
+        if ($held != null) {
+            erased $e = guard $held;
+            unsafe {
+                return .ok(assume<T>($e));
+            }
+        }
+
+        string $id = $ref->id;
+        if (!$this->catalog->has($id)) {
+            return .error(.missing($id));
+        }
+
+        Mounted $slot = $this->catalog[$id];
+        Blob $blob = guard $slot->store->read($slot->entry) else ($e) {
+            return .error($e);
+        }
+        type_id $tid = type_id<T>();
+        DecodeThunk $decoder = $this->decoders[$tid];
+        $this->loading = $id;
+        erased $value = guard $decoder->decode($this, $blob) else ($e) {
+            return .error($e);
+        }
+        $ref->ready = $value;
+        unsafe {
+            return .ok(assume<T>($value));
+        }
+    }
+}

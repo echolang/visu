@@ -6,6 +6,13 @@
 
 using namespace metal;
 
+struct SsaoUniforms
+{
+    float4 u_params;
+    float4 u_screen;
+    float4 u_samples[64];
+};
+
 struct CameraUniforms
 {
     float4x4 u_projection;
@@ -15,13 +22,6 @@ struct CameraUniforms
     float4x4 u_inverse_projection_view;
     float4 u_camera_position;
     float4 u_resolution;
-};
-
-struct SsaoUniforms
-{
-    float4 u_params;
-    float4 u_screen;
-    float4 u_samples[64];
 };
 
 struct fs_out
@@ -40,7 +40,7 @@ float2 uv_from_ndc(thread const float2& ndc)
     return float2((ndc.x * 0.5) + 0.5, 0.5 - (ndc.y * 0.5));
 }
 
-fragment fs_out fs(fs_in in [[stage_in]], constant SsaoUniforms& _98 [[buffer(2)]], constant CameraUniforms& _58 [[buffer(3)]], texture2d<float> gbuffer_position [[texture(0)]], texture2d<float> gbuffer_normal [[texture(1)]], texture2d<float> noise_texture [[texture(2)]], sampler gbuffer_positionSmplr [[sampler(0)]], sampler gbuffer_normalSmplr [[sampler(1)]], sampler noise_textureSmplr [[sampler(2)]])
+fragment fs_out fs(fs_in in [[stage_in]], constant SsaoUniforms& _57 [[buffer(2)]], constant CameraUniforms& _101 [[buffer(3)]], texture2d<float> gbuffer_position [[texture(0)]], texture2d<float> gbuffer_normal [[texture(1)]], texture2d<float> noise_texture [[texture(2)]], sampler gbuffer_positionSmplr [[sampler(0)]], sampler gbuffer_normalSmplr [[sampler(1)]], sampler noise_textureSmplr [[sampler(2)]])
 {
     fs_out out = {};
     float4 P = gbuffer_position.sample(gbuffer_positionSmplr, in.v_uv);
@@ -49,21 +49,28 @@ fragment fs_out fs(fs_in in [[stage_in]], constant SsaoUniforms& _98 [[buffer(2)
         out.frag_ao = 1.0;
         return out;
     }
-    float3 view_pos = (_58.u_view * float4(P.xyz, 1.0)).xyz;
-    float3 view_normal = fast::normalize(float3x3(_58.u_view[0].xyz, _58.u_view[1].xyz, _58.u_view[2].xyz) * gbuffer_normal.sample(gbuffer_normalSmplr, in.v_uv).xyz);
-    float3 _noise = fast::normalize((noise_texture.sample(noise_textureSmplr, (in.v_uv * _98.u_screen.zw)).xyz * 2.0) - float3(1.0));
+    float radius = _57.u_params.x;
+    float quant = length(P.xyz) * 0.00390625;
+    float bias0 = fast::max(_57.u_params.y * radius, quant);
+    float fade = 1.0 - smoothstep(0.4000000059604644775390625, 1.0, bias0 / fast::max(radius, 9.9999997473787516355514526367188e-06));
+    float strength = _57.u_params.z;
+    if (fade <= 0.0)
+    {
+        out.frag_ao = 1.0;
+        return out;
+    }
+    float3 view_pos = float3x3(_101.u_view[0].xyz, _101.u_view[1].xyz, _101.u_view[2].xyz) * P.xyz;
+    float3 view_normal = fast::normalize(float3x3(_101.u_view[0].xyz, _101.u_view[1].xyz, _101.u_view[2].xyz) * gbuffer_normal.sample(gbuffer_normalSmplr, in.v_uv).xyz);
+    float3 _noise = fast::normalize((noise_texture.sample(noise_textureSmplr, (in.v_uv * _57.u_screen.zw)).xyz * 2.0) - float3(1.0));
     float3 tangent = fast::normalize(_noise - (view_normal * dot(_noise, view_normal)));
     float3 bitangent = cross(view_normal, tangent);
     float3x3 TBN = float3x3(float3(tangent), float3(bitangent), float3(view_normal));
-    float radius = _98.u_params.x;
-    float bias0 = _98.u_params.y;
-    float strength = _98.u_params.z;
-    int count = int(_98.u_params.w);
+    int count = int(_57.u_params.w);
     float occlusion = 0.0;
     for (int i = 0; i < count; i++)
     {
-        float3 sample_view = view_pos + ((TBN * _98.u_samples[i].xyz) * radius);
-        float4 clip = _58.u_projection * float4(sample_view, 1.0);
+        float3 sample_view = view_pos + ((TBN * _57.u_samples[i].xyz) * radius);
+        float4 clip = _101.u_projection * float4(sample_view, 1.0);
         if (clip.w <= 0.0)
         {
             continue;
@@ -74,14 +81,15 @@ fragment fs_out fs(fs_in in [[stage_in]], constant SsaoUniforms& _98 [[buffer(2)
         {
             continue;
         }
-        float occluder_z = (_58.u_view * float4(occluder.xyz, 1.0)).z;
+        float occluder_z = (float3x3(_101.u_view[0].xyz, _101.u_view[1].xyz, _101.u_view[2].xyz) * occluder.xyz).z;
         if (occluder_z >= (sample_view.z + bias0))
         {
             occlusion += smoothstep(0.0, 1.0, radius / abs(view_pos.z - occluder_z));
         }
     }
-    occlusion = 1.0 - (occlusion / float(count));
-    out.frag_ao = pow(fast::clamp(occlusion, 0.0, 1.0), strength);
+    float ao = 1.0 - (occlusion / float(count));
+    ao = mix(1.0, ao, fade);
+    out.frag_ao = pow(fast::clamp(ao, 0.0, 1.0), strength);
     return out;
 }
 

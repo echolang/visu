@@ -1,0 +1,51 @@
+/**
+ * DeferredViewSystem console routing.
+ */
+
+use visu::ecs::{Entities, Systems};
+use visu::graphics::{DeferredRenderer, DeferredView, Device};
+use visu::os::{Window, WindowHints};
+use visu::os::input::InputHub;
+use visu::runtime::DebugConsole;
+use visu::signal::Dispatcher;
+use visu::system::DeferredViewSystem;
+
+test deferred_view_console_sets_renderer
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d, InputHub(Window('view', 64, 64, WindowHints()), $d));
+    DeferredRenderer $renderer = DeferredRenderer(Device());
+    DeferredViewSystem $sys = DeferredViewSystem($renderer);
+    Systems $systems = Systems();
+    $systems->listen($c);
+    $systems->bind($sys);
+
+    Entities $world = Entities();
+    $systems->register($world);
+
+    $c->submit('view');
+    array<string> $h0 = $c->history();
+    assert($h0[$h0->count() - 1] == 'view: scene', 'default');
+    assert($renderer->view == DeferredView::scene, 'still scene');
+
+    $c->submit('view albedo');
+    assert($renderer->view == DeferredView::albedo, 'albedo');
+    array<string> $h1 = $c->history();
+    assert($h1[$h1->count() - 1] == 'view: albedo', 'albedo line');
+
+    $c->submit('view ssao');
+    assert($renderer->view == DeferredView::ssao, 'ssao');
+
+    $c->submit('view nope');
+    assert($renderer->view == DeferredView::ssao, 'unchanged');
+    array<string> $h2 = $c->history();
+    assert(
+        $h2[$h2->count() - 1] == 'usage: view [scene|albedo|normal|roughness|metallic|ao|emissive|position|ssao]',
+        'usage'
+    );
+
+    $c->submit('view scene');
+    assert($renderer->view == DeferredView::scene, 'back');
+
+    $systems->unregister($world);
+}

@@ -1,0 +1,136 @@
+/**
+ * Little-endian bytes in a string. Packs and vtex/vsnd share this.
+ */
+
+namespace visu::asset;
+
+internal function blobHash(const string& $bytes) : uint64
+{
+    if ($bytes->empty()) {
+        return 0;
+    }
+
+    ptr<const uint8> $data = $bytes->data();
+    if ($data:$ == null) {
+        return 0;
+    }
+
+    return hash::bytes($data, $bytes->size(), 0);
+}
+
+internal function putU8(string& $out, uint8 $v) : void
+{
+    $out->push($v);
+}
+
+internal function putU16(string& $out, uint16 $v) : void
+{
+    $out->push(($v & 0xff) as uint8);
+    $out->push((($v >> 8) & 0xff) as uint8);
+}
+
+internal function putU32(string& $out, uint32 $v) : void
+{
+    $out->push(($v & 0xff) as uint8);
+    $out->push((($v >> 8) & 0xff) as uint8);
+    $out->push((($v >> 16) & 0xff) as uint8);
+    $out->push((($v >> 24) & 0xff) as uint8);
+}
+
+internal function putU64(string& $out, uint64 $v) : void
+{
+    putU32($out, ($v & 0xffffffff) as uint32);
+    putU32($out, (($v >> 32) & 0xffffffff) as uint32);
+}
+
+internal function putMagic(string& $out, const string& $magic) : void
+{
+    usize $n = $magic->size();
+    usize $i = 0;
+
+    while ($i < $n) {
+        $out->push($magic->byte($i));
+        $i = $i + 1;
+    }
+}
+
+internal function getU8(const string& $s, usize& $i, const string& $id) : result<uint8, AssetError>
+{
+    if ($i >= $s->size()) {
+        return .error(.corrupt($id, 'truncated'));
+    }
+
+    uint8 $v = $s->byte($i);
+    $i = $i + 1;
+    return .ok($v);
+}
+
+internal function getU16(const string& $s, usize& $i, const string& $id) : result<uint16, AssetError>
+{
+    uint8 $lo = guard getU8($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    uint8 $hi = guard getU8($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    return .ok(($lo as uint16) | (($hi as uint16) << 8));
+}
+
+internal function getU32(const string& $s, usize& $i, const string& $id) : result<uint32, AssetError>
+{
+    uint16 $lo = guard getU16($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    uint16 $hi = guard getU16($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    return .ok(($lo as uint32) | (($hi as uint32) << 16));
+}
+
+internal function getU64(const string& $s, usize& $i, const string& $id) : result<uint64, AssetError>
+{
+    uint32 $lo = guard getU32($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    uint32 $hi = guard getU32($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    return .ok(($lo as uint64) | (($hi as uint64) << 32));
+}
+
+internal function getMagic(const string& $s, usize& $i, const string& $want, const string& $id) : status<AssetError>
+{
+    usize $n = $want->size();
+    if ($i + $n > $s->size()) {
+        return .error(.corrupt($id, 'truncated magic'));
+    }
+
+    string $got = $s->sub($i, $n);
+    $i = $i + $n;
+    if (!$got->equals($want)) {
+        return .error(.corrupt($id, 'bad magic'));
+    }
+
+    return .ok;
+}
+
+internal function getStr(const string& $s, usize& $i, const string& $id) : result<string, AssetError>
+{
+    uint16 $n = guard getU16($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    usize $len = $n as usize;
+    if ($i + $len > $s->size()) {
+        return .error(.corrupt($id, 'truncated string'));
+    }
+
+    string $v = $s->sub($i, $len);
+    $i = $i + $len;
+    return .ok($v);
+}
+
+internal function putStr(string& $out, const string& $v) : void
+{
+    putU16($out, $v->size() as uint16);
+    putMagic($out, $v);
+}

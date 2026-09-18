@@ -1,0 +1,43 @@
+/**
+ * wav / flac / mp3 → vsnd. Identity plus header; miniaudio decodes at play.
+ */
+
+namespace visu::asset;
+
+use std::io;
+
+public class SoundCooker : Cooker
+{
+    public function kind() : string
+    {
+        return KIND_SOUND;
+    }
+
+    public function accepts(const string& $path) : bool
+    {
+        string $lower = str::lower($path);
+        if ($lower->ends('.wav')) {
+            return true;
+        }
+        if ($lower->ends('.flac')) {
+            return true;
+        }
+        if ($lower->ends('.mp3')) {
+            return true;
+        }
+
+        return false;
+    }
+
+    public function cook(const Source& $src) : result<PackItem, AssetError>
+    {
+        string $bytes = guard io::readfile($src->path) else ($e) {
+            return .error(.io($src->path, $e->message()));
+        }
+        if ($bytes->empty()) {
+            return .error(.corrupt($src->id, 'empty sound'));
+        }
+
+        return .ok(PackItem($src->id, KIND_SOUND, encodeSound($bytes)));
+    }
+}

@@ -12,6 +12,7 @@ public struct GpuPass
     public Raster $raster;
     public Topology $topology;
     public uint32 $slot;
+    public int32 $patchControlPoints;
     private string $key;
 
     public constructor(
@@ -19,7 +20,8 @@ public struct GpuPass
         VertexLayout $layout,
         Raster $raster,
         topology: Topology $topology = .triangles,
-        slot: uint32 $slot = 0
+        slot: uint32 $slot = 0,
+        patchControlPoints: int32 $patchControlPoints = 0
     )
     {
         $this->program = $program;
@@ -27,6 +29,13 @@ public struct GpuPass
         $this->raster = $raster;
         $this->topology = $topology;
         $this->slot = $slot;
+        $this->patchControlPoints = $patchControlPoints;
+        if ($this->program->tessellated && $this->patchControlPoints < 1) {
+            $this->patchControlPoints = 4;
+        }
+        if ($this->program->tessellated && $this->topology != Topology::patches) {
+            $this->topology = .patches;
+        }
     }
 
     init
@@ -39,7 +48,9 @@ public struct GpuPass
         }
 
         int32 $topo = topologyCode($this->topology);
+        int32 $patches = $this->patchControlPoints;
         int32 $cull = cullCode($this->raster->cull);
+        int32 $fill = fillCode($this->raster->fill);
         int32 $front = 0;
 
         if ($this->raster->front == FrontFace::cw) {
@@ -58,7 +69,7 @@ public struct GpuPass
             $dwrite = 1;
         }
 
-        $this->key = "{$this->program->id}|{$this->layout->fingerprint()}|{$blend}|{$write}|{$topo}|{$cull}|{$front}|{$dtest}|{$dwrite}|{$depth}";
+        $this->key = "{$this->program->id}|{$this->layout->fingerprint()}|{$blend}|{$write}|{$topo}|{$cull}|{$fill}|{$front}|{$dtest}|{$dwrite}|{$depth}|{$patches}";
     }
 
     public const function key() : string
@@ -98,6 +109,7 @@ internal function topologyCode(Topology $topology) : int32
         Topology::lineStrip => 2,
         Topology::triangles => 3,
         Topology::triangleStrip => 4,
+        Topology::patches => 5,
     };
 }
 
@@ -107,6 +119,14 @@ internal function cullCode(CullMode $cull) : int32
         CullMode::none => 0,
         CullMode::front => 1,
         CullMode::back => 2,
+    };
+}
+
+internal function fillCode(FillMode $fill) : int32
+{
+    return match ($fill) {
+        FillMode::fill => 0,
+        FillMode::lines => 1,
     };
 }
 

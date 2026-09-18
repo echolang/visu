@@ -1,0 +1,90 @@
+/**
+ * Two-slice array texture: slot 0 red, slot 1 blue. The shader samples layer 1.
+ */
+
+use visu::graphics::{
+    CallbackPass, ClearPass, ClearPassOptions, RenderContext, Device, Frame, GpuPass,
+    IoSink, Mesh, Pipeline, PipelineError, Raster, RenderEncoder, Sampler,
+    SamplerDesc, ShaderCollection, TargetRef, Texture, TextureDesc, TextureKind,
+    VertexLayout, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST
+};
+use visu::math::Vec4;
+
+public function checkArrayTexture(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('arraylayer') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    TextureDesc $desc = TextureDesc($width: 2, $height: 2);
+    $desc->kind = .array2D;
+    $desc->arrayLength = 2;
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_DST;
+    Texture $arr = Texture($gpu->device, 'array2', $desc);
+    array<uint8> $red = [
+        255, 0, 0, 255,
+        255, 0, 0, 255,
+        255, 0, 0, 255,
+        255, 0, 0, 255
+    ];
+    array<uint8> $blue = [
+        0, 0, 255, 255,
+        0, 0, 255, 255,
+        0, 0, 255, 255,
+        0, 0, 255, 255
+    ];
+    $arr->upload(face: 0, 0, ptr<const uint8>(&$red[0]), 16 as uint64, 8);
+    $arr->upload(face: 1, 0, ptr<const uint8>(&$blue[0]), 16 as uint64, 8);
+    Sampler $samp = $gpu->device->createSampler(SamplerDesc());
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'arraylayer');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 1.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'arraylayer-draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(RenderContext $ctx) : status<PipelineError> {
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                Device $device = $ctx->device;
+                Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+                    return .quad($device);
+                });
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3uv2(), Raster::none());
+                $pass->bind($enc);
+                $enc->bindTexture(0, $arr, $samp);
+                $mesh->draw($enc);
+                $enc->endRender();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('arraylayer');
+    $shaders->destroy();
+    $arr->destroy();
+    assert($pixels[0] < 16, 'not red');
+    assert($pixels[1] < 16, 'not green');
+    assert($pixels[2] > 240, 'layer 1 blue');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_array_texture
+{
+    GpuContext $gpu = gpuHidden('arraytex');
+    checkArrayTexture($gpu);
+    $gpu->end();
+}
+#[end]

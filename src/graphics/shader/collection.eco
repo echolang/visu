@@ -352,6 +352,8 @@ public class ShaderCollection
 
         string $vs = '';
         string $fs = '';
+        string $tcs = '';
+        string $tes = '';
 
         foreach ($ref->files as $file) {
             string $bytes = guard $this->loader->read($file->path) else ($e) {
@@ -362,8 +364,12 @@ public class ShaderCollection
                 $vs = $bytes;
             } else if ($file->kind == ShaderKind::fragment) {
                 $fs = $bytes;
+            } else if ($file->kind == ShaderKind::tessControl) {
+                $tcs = $bytes;
+            } else if ($file->kind == ShaderKind::tessEvaluation) {
+                $tes = $bytes;
             } else {
-                return .error(.compile("shader '{$ref->name}': only vertex+fragment"));
+                return .error(.compile("shader '{$ref->name}': unsupported stage"));
             }
         }
 
@@ -373,14 +379,28 @@ public class ShaderCollection
 
         string $linkName = $ref->name;
         string $v = guard $ref->variant else {
-            ShaderProgram $program = guard ShaderProgram::link($this->device, $linkName, $vs, $fs) else ($e) {
+            ShaderProgram $program = guard ShaderProgram::link(
+                $this->device,
+                $linkName,
+                $vs,
+                $fs,
+                tessControl: $tcs,
+                tessEvaluation: $tes
+            ) else ($e) {
                 return .error($e);
             }
             $ref->compiled = $program;
             return .ok($program);
         }
         $linkName = "{$ref->name}+{$v}";
-        ShaderProgram $program = guard ShaderProgram::link($this->device, $linkName, $vs, $fs) else ($e) {
+        ShaderProgram $program = guard ShaderProgram::link(
+            $this->device,
+            $linkName,
+            $vs,
+            $fs,
+            tessControl: $tcs,
+            tessEvaluation: $tes
+        ) else ($e) {
             return .error($e);
         }
         $ref->compiled = $program;

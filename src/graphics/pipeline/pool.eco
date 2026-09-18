@@ -134,6 +134,27 @@ public class Pool
     }
 
     /**
+     * Capture `$ref` to a PNG. After endFrame; stalls. Float attachments clamp to 0..1.
+     */
+    public function dump(TextureRef $ref, const string& $path) : status<DumpError>
+    {
+        return $this->dump($ref, $path, opaque: false);
+    }
+
+    public function dump(TextureRef $ref, const string& $path, opaque: bool $opaque) : status<DumpError>
+    {
+        return $this->dump($ref, $path, dump: .color);
+    }
+
+    public function dump(TextureRef $ref, const string& $path, dump: PixelDump $dump) : status<DumpError>
+    {
+        Texture $tex = guard $this->getTexture($ref) else ($e) {
+            return .error(.io($path, $e->message()));
+        }
+        return $tex->dump($path, face: 0, 0, dump: $dump);
+    }
+
+    /**
      * The GPU texture for `$ref`. Attachments are created by `getTarget`; this never allocates.
      */
     public function getTexture(TextureRef $ref) : result<Texture, PoolError>
@@ -336,7 +357,7 @@ public class Pool
     private function makeColor(TextureRef $ref, TargetRef $target) : Texture
     {
         TextureDesc $desc = $ref->options->desc($target->width, $target->height);
-        assert($desc->kind == TextureKind::texture2D, 'pool: cube attachments are imported, not pooled');
+        assert($desc->kind == TextureKind::texture2D, 'pool: cube and array attachments are imported, not pooled');
         $desc->usage = TEXTURE_RENDER_TARGET | TEXTURE_SAMPLED | TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
         $desc->label = $ref->name;
         return Texture($this->device, $ref->name, $desc);

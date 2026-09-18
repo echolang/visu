@@ -1,0 +1,48 @@
+/**
+ * DeferredView parse / label / needsSsao. No GPU.
+ */
+
+use visu::graphics::{DeferredView, DeferredViewError};
+
+test deferred_view_parse_and_label
+{
+    array<string> $names = [
+        'scene',
+        'albedo',
+        'normal',
+        'roughness',
+        'metallic',
+        'ao',
+        'emissive',
+        'position',
+        'ssao',
+    ];
+    foreach ($names as $name) {
+        DeferredView $view = guard DeferredView::parse($name) else ($e) {
+            assert(false, 'parse');
+            return;
+        }
+        assert($view->label() == $name, 'label');
+    }
+}
+
+test deferred_view_parse_unknown
+{
+    result<DeferredView, DeferredViewError> $r = DeferredView::parse('depth');
+    assert($r->failed(), 'failed');
+    DeferredViewError $e = $r->failure();
+    assert($e->message() == 'unknown view: depth', 'message');
+}
+
+test deferred_view_scene_and_ssao
+{
+    DeferredView $scene = .scene;
+    assert($scene->isScene(), 'scene');
+    assert(!$scene->needsSsao(), 'scene ssao');
+    DeferredView $ssao = .ssao;
+    assert(!$ssao->isScene(), 'ssao scene');
+    assert($ssao->needsSsao(), 'ssao');
+    DeferredView $albedo = .albedo;
+    assert(!$albedo->isScene(), 'albedo scene');
+    assert(!$albedo->needsSsao(), 'albedo ssao');
+}

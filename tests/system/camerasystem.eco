@@ -3,12 +3,12 @@
  * GPU-free.
  */
 
-use visu::components::{activateCamera, ActiveCamera, FlyingCamera};
+use visu::components::{ActiveCamera, FlyingCamera};
 use visu::ecs::{Entities, Entity};
 use visu::geo::{Pose, Transform};
 use visu::graphics::{
     Camera, CameraData, RenderContext, Device, Frame, Pipeline, Pool,
-    Projection, RenderTarget, SceneTarget, TargetRef
+    Projection, RenderTarget, SceneTargetData, TargetRef
 };
 use visu::math::Vec3;
 use visu::system::CameraSystem;
@@ -28,10 +28,10 @@ test camera_marker_records_the_tick
     Entities $world = Entities();
     Entity $entity = Camera::spawn($world, Vec3(0.0f, 0.0f, 4.0f));
     assert(!$world->has<ActiveCamera>($entity), 'spawn is not active');
-    activateCamera($world, $entity);
+    ActiveCamera::activate($world, $entity);
     assert($world->has<ActiveCamera>($entity), 'marked');
     assert($world->get<ActiveCamera>($entity)->tick == 0, 'tick default');
-    activateCamera($world, $entity, 12);
+    ActiveCamera::activate($world, $entity, 12);
     assert($world->get<ActiveCamera>($entity)->tick == 12, 'tick');
 }
 
@@ -40,8 +40,8 @@ test camera_activate_detaches_the_previous_marker
     Entities $world = Entities();
     Entity $a = Camera::spawn($world, Vec3(0.0f, 0.0f, 1.0f));
     Entity $b = Camera::spawn($world, Vec3(0.0f, 0.0f, 8.0f));
-    activateCamera($world, $a);
-    activateCamera($world, $b, 3);
+    ActiveCamera::activate($world, $a);
+    ActiveCamera::activate($world, $b, 3);
     assert(!$world->has<ActiveCamera>($a), 'old marker gone');
     assert($world->has<ActiveCamera>($b), 'new marker');
     assert($world->get<ActiveCamera>($b)->tick == 3, 'tick');
@@ -54,7 +54,7 @@ test camera_system_publishes_from_the_marker
     CameraSystem $system = CameraSystem();
     Entity $entity = Camera::spawn($world, Vec3(5.4f, 2.4f, 14.4f));
     $world->attach($entity, FlyingCamera());
-    activateCamera($world, $entity);
+    ActiveCamera::activate($world, $entity);
     Transform& $transform = $world->get<Transform>($entity);
     assert($transform->position->x == 5.4f, 'position x');
     assert($transform->position->z == 14.4f, 'position z');
@@ -68,14 +68,14 @@ test camera_system_publishes_camera_data_for_the_scene_target
     CameraSystem $system = CameraSystem();
     Entity $entity = Camera::spawn($world, Vec3(0.0f, 0.0f, 4.0f));
     $world->attach($entity, FlyingCamera());
-    activateCamera($world, $entity);
+    ActiveCamera::activate($world, $entity);
     Device $device = Device();
     Pool $pool = Pool($device);
     Frame $frame = Frame();
     RenderTarget $rt = RenderTarget(64, 64);
     Pipeline $pipeline = Pipeline($pool, $frame, $rt);
     TargetRef $scene = $pipeline->createTarget('scene', 320, 200);
-    $frame->set(SceneTarget($scene));
+    $frame->set(SceneTargetData($scene));
     RenderContext $ctx = RenderContext($device, $pipeline, $frame, $pool, 0.5f);
     $system->render($world, $ctx);
     assert($frame->has<CameraData>(), 'published');
@@ -92,7 +92,7 @@ test camera_system_falls_back_to_the_backbuffer
     CameraSystem $system = CameraSystem();
     Entity $entity = Camera::spawn($world, Vec3(0.0f, 0.0f, 0.0f));
     $world->attach($entity, FlyingCamera());
-    activateCamera($world, $entity);
+    ActiveCamera::activate($world, $entity);
     RenderContext $ctx = headlessFrame(128, 64);
     $system->render($world, $ctx);
     CameraData $data = $ctx->frame->get<CameraData>();
@@ -106,7 +106,7 @@ test camera_system_publishes_the_marked_camera
     Entity $a = Camera::spawn($world, Vec3(0.0f, 0.0f, 1.0f));
     Entity $b = Camera::spawn($world, Vec3(0.0f, 0.0f, 8.0f));
     assert($a != $b, 'two cameras');
-    activateCamera($world, $b);
+    ActiveCamera::activate($world, $b);
     RenderContext $ctx = headlessFrame(64, 64);
     $system->render($world, $ctx);
     CameraData $data = $ctx->frame->get<CameraData>();
@@ -130,7 +130,7 @@ test camera_system_snapshots_every_camera
     CameraSystem $system = CameraSystem();
     Entity $a = Camera::spawn($world, Vec3(1.0f, 0.0f, 0.0f));
     Entity $b = Camera::spawn($world, Vec3(2.0f, 0.0f, 0.0f));
-    activateCamera($world, $a);
+    ActiveCamera::activate($world, $a);
     $system->update($world);
     $world->get<Transform>($a)->position = Vec3(10.0f, 0.0f, 0.0f);
     $world->get<Transform>($b)->position = Vec3(20.0f, 0.0f, 0.0f);

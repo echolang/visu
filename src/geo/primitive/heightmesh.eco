@@ -1,0 +1,326 @@
+/**
+ * Heightfield as a non-indexed triangle list, Y from the map, XZ from its world mapping.
+ * Vertex normals are finite differences; edges clamp the neighbour.
+ * A region overload tessellates a vertex rectangle at `$step`; coarser neighbour steps skip T-junctions.
+ */
+
+namespace visu::geo;
+
+use visu::math::Vec3;
+
+public function heightmesh(PrimitiveBuilder& $b, Heightmap $map) : void
+{
+    heightmesh($b, $map, 0, 0, $map->width - 1, $map->height - 1, 1);
+}
+
+/**
+ * Inclusive vertex rectangle `$ix0..$ix1`, `$iz0..$iz1`. `$step` must divide both spans.
+ * An edge step of 0 means same as `$step`. A larger edge step (2:1 neighbour) stitches that side.
+ */
+public function heightmesh(
+    PrimitiveBuilder& $b,
+    Heightmap $map,
+    int32 $ix0,
+    int32 $iz0,
+    int32 $ix1,
+    int32 $iz1,
+    int32 $step = 1,
+    int32 $stepNegX = 0,
+    int32 $stepPosX = 0,
+    int32 $stepNegZ = 0,
+    int32 $stepPosZ = 0
+) : void
+{
+    assert($ix0 >= 0 && $iz0 >= 0, 'heightmesh min');
+    assert($ix1 > $ix0 && $iz1 > $iz0, 'heightmesh empty');
+    assert($ix1 < $map->width && $iz1 < $map->height, 'heightmesh max');
+    assert($step >= 1, 'heightmesh step');
+    int32 $spanX = $ix1 - $ix0;
+    int32 $spanZ = $iz1 - $iz0;
+    assert($spanX % $step == 0 && $spanZ % $step == 0, 'heightmesh step divides');
+    $b->room(($spanX / $step) * ($spanZ / $step) * 6);
+    int32 $west = edgeStep($step, $stepNegX, $spanZ);
+    int32 $east = edgeStep($step, $stepPosX, $spanZ);
+    int32 $south = edgeStep($step, $stepNegZ, $spanX);
+    int32 $north = edgeStep($step, $stepPosZ, $spanX);
+    bool $westCoarse = $west > $step;
+    bool $eastCoarse = $east > $step;
+    bool $southCoarse = $south > $step;
+    bool $northCoarse = $north > $step;
+    int32 $innerX0 = $ix0;
+    int32 $innerX1 = $ix1;
+    int32 $innerZ0 = $iz0;
+    int32 $innerZ1 = $iz1;
+    if ($westCoarse) {
+        $innerX0 = $ix0 + $step;
+    }
+
+    if ($eastCoarse) {
+        $innerX1 = $ix1 - $step;
+    }
+
+    if ($southCoarse) {
+        $innerZ0 = $iz0 + $step;
+    }
+
+    if ($northCoarse) {
+        $innerZ1 = $iz1 - $step;
+    }
+
+    if ($innerX1 > $innerX0 && $innerZ1 > $innerZ0) {
+        for (int32 $iz = $innerZ0; $iz < $innerZ1; $iz = $iz + $step) {
+            for (int32 $ix = $innerX0; $ix < $innerX1; $ix = $ix + $step) {
+                heightQuad($b, $map, $ix, $iz, $step, $step);
+            }
+        }
+    }
+
+    int32 $s2 = $step * 2;
+    if ($westCoarse) {
+        int32 $z0 = $iz0;
+        if ($southCoarse) {
+            $z0 = $iz0 + $s2;
+        }
+
+        int32 $z1 = $iz1;
+        if ($northCoarse) {
+            $z1 = $iz1 - $s2;
+        }
+
+        for (int32 $iz = $z0; $iz < $z1; $iz = $iz + $s2) {
+            heightWestStitch($b, $map, $ix0, $iz, $step);
+        }
+    }
+
+    if ($eastCoarse) {
+        int32 $z0 = $iz0;
+        if ($southCoarse) {
+            $z0 = $iz0 + $s2;
+        }
+
+        int32 $z1 = $iz1;
+        if ($northCoarse) {
+            $z1 = $iz1 - $s2;
+        }
+
+        for (int32 $iz = $z0; $iz < $z1; $iz = $iz + $s2) {
+            heightEastStitch($b, $map, $ix1, $iz, $step);
+        }
+    }
+
+    if ($southCoarse) {
+        int32 $x0 = $ix0;
+        if ($westCoarse) {
+            $x0 = $ix0 + $s2;
+        }
+
+        int32 $x1 = $ix1;
+        if ($eastCoarse) {
+            $x1 = $ix1 - $s2;
+        }
+
+        for (int32 $ix = $x0; $ix < $x1; $ix = $ix + $s2) {
+            heightSouthStitch($b, $map, $ix, $iz0, $step);
+        }
+    }
+
+    if ($northCoarse) {
+        int32 $x0 = $ix0;
+        if ($westCoarse) {
+            $x0 = $ix0 + $s2;
+        }
+
+        int32 $x1 = $ix1;
+        if ($eastCoarse) {
+            $x1 = $ix1 - $s2;
+        }
+
+        for (int32 $ix = $x0; $ix < $x1; $ix = $ix + $s2) {
+            heightNorthStitch($b, $map, $ix, $iz1, $step);
+        }
+    }
+
+    if ($westCoarse && $southCoarse) {
+        heightCornerSW($b, $map, $ix0, $iz0, $step);
+    }
+
+    if ($eastCoarse && $southCoarse) {
+        heightCornerSE($b, $map, $ix1, $iz0, $step);
+    }
+
+    if ($westCoarse && $northCoarse) {
+        heightCornerNW($b, $map, $ix0, $iz1, $step);
+    }
+
+    if ($eastCoarse && $northCoarse) {
+        heightCornerNE($b, $map, $ix1, $iz1, $step);
+    }
+}
+
+internal function edgeStep(int32 $step, int32 $edge, int32 $span) : int32
+{
+    if ($edge <= $step) {
+        return $step;
+    }
+
+    if ($span % $edge != 0) {
+        return $step;
+    }
+
+    return $edge;
+}
+
+internal function heightTri(
+    PrimitiveBuilder& $b,
+    Heightmap $map,
+    int32 $ax,
+    int32 $az,
+    int32 $bx,
+    int32 $bz,
+    int32 $cx,
+    int32 $cz
+) : void
+{
+    $b->add(heightVertex($map, $ax, $az), heightNormal($map, $ax, $az));
+    $b->add(heightVertex($map, $bx, $bz), heightNormal($map, $bx, $bz));
+    $b->add(heightVertex($map, $cx, $cz), heightNormal($map, $cx, $cz));
+}
+
+internal function heightQuad(
+    PrimitiveBuilder& $b,
+    Heightmap $map,
+    int32 $ix,
+    int32 $iz,
+    int32 $sx,
+    int32 $sz
+) : void
+{
+    heightTri($b, $map, $ix, $iz, $ix, $iz + $sz, $ix + $sx, $iz + $sz);
+    heightTri($b, $map, $ix, $iz, $ix + $sx, $iz + $sz, $ix + $sx, $iz);
+}
+
+internal function heightWestStitch(
+    PrimitiveBuilder& $b,
+    Heightmap $map,
+    int32 $ix0,
+    int32 $iz,
+    int32 $step
+) : void
+{
+    int32 $s2 = $step * 2;
+    heightTri($b, $map, $ix0, $iz, $ix0, $iz + $s2, $ix0 + $step, $iz + $step);
+    heightTri($b, $map, $ix0, $iz, $ix0 + $step, $iz + $step, $ix0 + $step, $iz);
+    heightTri($b, $map, $ix0, $iz + $s2, $ix0 + $step, $iz + $s2, $ix0 + $step, $iz + $step);
+}
+
+internal function heightEastStitch(
+    PrimitiveBuilder& $b,
+    Heightmap $map,
+    int32 $ix1,
+    int32 $iz,
+    int32 $step
+) : void
+{
+    int32 $s2 = $step * 2;
+    heightTri($b, $map, $ix1 - $step, $iz, $ix1 - $step, $iz + $step, $ix1, $iz);
+    heightTri($b, $map, $ix1 - $step, $iz + $step, $ix1, $iz + $s2, $ix1, $iz);
+    heightTri($b, $map, $ix1 - $step, $iz + $step, $ix1 - $step, $iz + $s2, $ix1, $iz + $s2);
+}
+
+internal function heightSouthStitch(
+    PrimitiveBuilder& $b,
+    Heightmap $map,
+    int32 $ix,
+    int32 $iz0,
+    int32 $step
+) : void
+{
+    int32 $s2 = $step * 2;
+    heightTri($b, $map, $ix, $iz0, $ix, $iz0 + $step, $ix + $step, $iz0 + $step);
+    heightTri($b, $map, $ix, $iz0, $ix + $step, $iz0 + $step, $ix + $s2, $iz0);
+    heightTri($b, $map, $ix + $s2, $iz0, $ix + $step, $iz0 + $step, $ix + $s2, $iz0 + $step);
+}
+
+internal function heightNorthStitch(
+    PrimitiveBuilder& $b,
+    Heightmap $map,
+    int32 $ix,
+    int32 $iz1,
+    int32 $step
+) : void
+{
+    int32 $s2 = $step * 2;
+    heightTri($b, $map, $ix, $iz1 - $step, $ix, $iz1, $ix + $step, $iz1 - $step);
+    heightTri($b, $map, $ix + $step, $iz1 - $step, $ix, $iz1, $ix + $s2, $iz1);
+    heightTri($b, $map, $ix + $step, $iz1 - $step, $ix + $s2, $iz1, $ix + $s2, $iz1 - $step);
+}
+
+internal function heightCornerSW(
+    PrimitiveBuilder& $b,
+    Heightmap $map,
+    int32 $ix0,
+    int32 $iz0,
+    int32 $step
+) : void
+{
+    int32 $s2 = $step * 2;
+    heightTri($b, $map, $ix0, $iz0, $ix0, $iz0 + $s2, $ix0 + $step, $iz0 + $step);
+    heightTri($b, $map, $ix0, $iz0, $ix0 + $step, $iz0 + $step, $ix0 + $s2, $iz0 + $step);
+    heightTri($b, $map, $ix0, $iz0, $ix0 + $s2, $iz0 + $step, $ix0 + $s2, $iz0);
+    heightTri($b, $map, $ix0 + $step, $iz0 + $step, $ix0, $iz0 + $s2, $ix0 + $step, $iz0 + $s2);
+}
+
+internal function heightCornerSE(
+    PrimitiveBuilder& $b,
+    Heightmap $map,
+    int32 $ix1,
+    int32 $iz0,
+    int32 $step
+) : void
+{
+    int32 $s2 = $step * 2;
+    heightTri($b, $map, $ix1, $iz0, $ix1 - $s2, $iz0, $ix1 - $s2, $iz0 + $step);
+    heightTri($b, $map, $ix1, $iz0, $ix1 - $s2, $iz0 + $step, $ix1 - $step, $iz0 + $step);
+    heightTri($b, $map, $ix1, $iz0, $ix1 - $step, $iz0 + $step, $ix1, $iz0 + $s2);
+    heightTri($b, $map, $ix1 - $step, $iz0 + $step, $ix1 - $step, $iz0 + $s2, $ix1, $iz0 + $s2);
+}
+
+internal function heightCornerNW(
+    PrimitiveBuilder& $b,
+    Heightmap $map,
+    int32 $ix0,
+    int32 $iz1,
+    int32 $step
+) : void
+{
+    int32 $s2 = $step * 2;
+    heightTri($b, $map, $ix0, $iz1, $ix0 + $s2, $iz1, $ix0 + $s2, $iz1 - $step);
+    heightTri($b, $map, $ix0, $iz1, $ix0 + $s2, $iz1 - $step, $ix0 + $step, $iz1 - $step);
+    heightTri($b, $map, $ix0, $iz1, $ix0 + $step, $iz1 - $step, $ix0, $iz1 - $s2);
+    heightTri($b, $map, $ix0 + $step, $iz1 - $step, $ix0 + $step, $iz1 - $s2, $ix0, $iz1 - $s2);
+}
+
+internal function heightCornerNE(
+    PrimitiveBuilder& $b,
+    Heightmap $map,
+    int32 $ix1,
+    int32 $iz1,
+    int32 $step
+) : void
+{
+    int32 $s2 = $step * 2;
+    heightTri($b, $map, $ix1, $iz1, $ix1, $iz1 - $s2, $ix1 - $step, $iz1 - $step);
+    heightTri($b, $map, $ix1, $iz1, $ix1 - $step, $iz1 - $step, $ix1 - $s2, $iz1 - $step);
+    heightTri($b, $map, $ix1, $iz1, $ix1 - $s2, $iz1 - $step, $ix1 - $s2, $iz1);
+    heightTri($b, $map, $ix1 - $step, $iz1 - $step, $ix1, $iz1 - $s2, $ix1 - $step, $iz1 - $s2);
+}
+
+internal function heightVertex(Heightmap $map, int32 $ix, int32 $iz) : Vec3
+{
+    return Vec3($map->worldX($ix), $map->at($ix, $iz), $map->worldZ($iz));
+}
+
+internal function heightNormal(Heightmap $map, int32 $ix, int32 $iz) : Vec3
+{
+    return $map->normal($ix, $iz);
+}

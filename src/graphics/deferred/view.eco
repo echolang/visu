@@ -1,0 +1,124 @@
+/**
+ * Which deferred buffer the renderer blits to the scene target.
+ * `.scene` is the full light + skybox path. Anything else skips shading
+ * and writes a remapped GBuffer (or SSAO) attachment instead.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+internal const float32 DEFERRED_VIEW_ALBEDO = 0.0f;
+internal const float32 DEFERRED_VIEW_NORMAL = 1.0f;
+internal const float32 DEFERRED_VIEW_GRAY = 2.0f;
+internal const float32 DEFERRED_VIEW_POSITION = 3.0f;
+internal const float32 DEFERRED_VIEW_EMISSIVE = 4.0f;
+internal const float32 DEFERRED_VIEW_SSAO = 5.0f;
+
+/**
+ * GPU payload for `debug_view`. x is the remap mode, y is the gray channel.
+ */
+public struct DeferredViewData
+{
+    public Vec4 $params;
+}
+
+public enum DeferredViewError
+{
+    case unknown(string $name);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            DeferredViewError::unknown($name) => "unknown view: {$name}",
+        };
+    }
+}
+
+public enum DeferredView
+{
+    case scene;
+    case albedo;
+    case normal;
+    case roughness;
+    case metallic;
+    case ao;
+    case emissive;
+    case position;
+    case ssao;
+
+    public const function isScene() : bool
+    {
+        return $this == DeferredView::scene;
+    }
+
+    public const function needsSsao() : bool
+    {
+        return $this == DeferredView::ssao;
+    }
+
+    public const function label() : string
+    {
+        return match ($this) {
+            DeferredView::scene => 'scene',
+            DeferredView::albedo => 'albedo',
+            DeferredView::normal => 'normal',
+            DeferredView::roughness => 'roughness',
+            DeferredView::metallic => 'metallic',
+            DeferredView::ao => 'ao',
+            DeferredView::emissive => 'emissive',
+            DeferredView::position => 'position',
+            DeferredView::ssao => 'ssao',
+        };
+    }
+
+    public static function parse(const string& $name) : result<DeferredView, DeferredViewError>
+    {
+        if ($name == 'scene') {
+            return .ok(.scene);
+        }
+        if ($name == 'albedo') {
+            return .ok(.albedo);
+        }
+        if ($name == 'normal') {
+            return .ok(.normal);
+        }
+        if ($name == 'roughness') {
+            return .ok(.roughness);
+        }
+        if ($name == 'metallic') {
+            return .ok(.metallic);
+        }
+        if ($name == 'ao') {
+            return .ok(.ao);
+        }
+        if ($name == 'emissive') {
+            return .ok(.emissive);
+        }
+        if ($name == 'position') {
+            return .ok(.position);
+        }
+        if ($name == 'ssao') {
+            return .ok(.ssao);
+        }
+
+        return .error(.unknown($name));
+    }
+
+    /**
+     * Uniforms the debug blit uploads. `.scene` is unused.
+     */
+    public const function params() : DeferredViewData
+    {
+        return match ($this) {
+            DeferredView::normal => DeferredViewData(Vec4(DEFERRED_VIEW_NORMAL, 0.0f, 0.0f, 0.0f)),
+            DeferredView::roughness => DeferredViewData(Vec4(DEFERRED_VIEW_GRAY, 0.0f, 0.0f, 0.0f)),
+            DeferredView::metallic => DeferredViewData(Vec4(DEFERRED_VIEW_GRAY, 1.0f, 0.0f, 0.0f)),
+            DeferredView::ao => DeferredViewData(Vec4(DEFERRED_VIEW_GRAY, 2.0f, 0.0f, 0.0f)),
+            DeferredView::position => DeferredViewData(Vec4(DEFERRED_VIEW_POSITION, 0.0f, 0.0f, 0.0f)),
+            DeferredView::emissive => DeferredViewData(Vec4(DEFERRED_VIEW_EMISSIVE, 0.0f, 0.0f, 0.0f)),
+            DeferredView::ssao => DeferredViewData(Vec4(DEFERRED_VIEW_SSAO, 0.0f, 0.0f, 0.0f)),
+            else => DeferredViewData(Vec4(DEFERRED_VIEW_ALBEDO, 0.0f, 0.0f, 0.0f)),
+        };
+    }
+}

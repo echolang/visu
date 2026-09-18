@@ -1,0 +1,111 @@
+/**
+ * PBR material filled from a cooked `.vmat` sheet. Named map slots are `AssetRef`s, not live GPU
+ * textures: terrain packs CPU texels, a mesh path `load<Texture>`s the same ids.
+ */
+
+namespace visu::graphics;
+
+use json;
+use visu::asset::{AssetError, AssetRef, Assets, Vmat, vmatBool, vmatMap, vmatRgb, vmatVec2};
+use visu::math::{Vec2, Vec3};
+
+public class Material
+{
+    public const string $id;
+    public const Vmat $sheet;
+
+    /**
+     * Tiles per world unit. JSON `textureScale`, factory may overwrite.
+     */
+    public Vec2 $textureScale;
+
+    /**
+     * Solid albedo when a map is missing. JSON `fallback`.
+     */
+    public Vec3 $diffuseColor;
+
+    public bool $backfaceCull;
+
+    public AssetRef? $albedo;
+    public AssetRef? $normal;
+    public AssetRef? $roughness;
+    public AssetRef? $metal;
+    public AssetRef? $height;
+    public AssetRef? $ao;
+    public AssetRef? $emissive;
+    public AssetRef? $alpha;
+
+    public constructor(Vmat $sheet)
+    {
+        $this->id = $sheet->id;
+        $this->sheet = $sheet;
+        $this->textureScale = vmatVec2($sheet->root, 'textureScale', Vec2(1.0f));
+        $this->diffuseColor = vmatRgb($sheet->root, 'fallback', Vec3(1.0f));
+        $this->backfaceCull = vmatBool($sheet->root, 'backfaceCull', true)->or(true);
+        $this->albedo = null;
+        $this->normal = null;
+        $this->roughness = null;
+        $this->metal = null;
+        $this->height = null;
+        $this->ao = null;
+        $this->emissive = null;
+        $this->alpha = null;
+    }
+
+    /**
+     * Empty slots. Used when the sheet is missing.
+     */
+    public constructor(id: string $id)
+    {
+        $this->id = $id;
+        $this->sheet = Vmat($id, json::object());
+        $this->textureScale = Vec2(1.0f);
+        $this->diffuseColor = Vec3(1.0f);
+        $this->backfaceCull = true;
+        $this->albedo = null;
+        $this->normal = null;
+        $this->roughness = null;
+        $this->metal = null;
+        $this->height = null;
+        $this->ao = null;
+        $this->emissive = null;
+        $this->alpha = null;
+    }
+
+    /**
+     * Load the folder sheet and bind catalog slots.
+     */
+    public static function load(Assets $assets, string $id) : result<Material, AssetError>
+    {
+        Vmat $sheet = guard $assets->load<Vmat>($id) else ($e) {
+            return .error($e);
+        }
+        Material $mat = Material($sheet);
+        $mat->bind($assets);
+        return .ok($mat);
+    }
+
+    /**
+     * Resolve map binds against the mounted catalog. Missing ids stay null.
+     */
+    public function bind(Assets $assets) : void
+    {
+        json::Value $root = $this->sheet->root;
+        $this->albedo = materialSlot($assets, vmatMap($root, 'albedo', 'diffuse'));
+        $this->normal = materialSlot($assets, vmatMap($root, 'normal'));
+        $this->roughness = materialSlot($assets, vmatMap($root, 'rough', 'roughness'));
+        $this->metal = materialSlot($assets, vmatMap($root, 'metal', 'metallic'));
+        $this->height = materialSlot($assets, vmatMap($root, 'height'));
+        $this->ao = materialSlot($assets, vmatMap($root, 'ao'));
+        $this->emissive = materialSlot($assets, vmatMap($root, 'emissive'));
+        $this->alpha = materialSlot($assets, vmatMap($root, 'alpha'));
+    }
+}
+
+internal function materialSlot(Assets $assets, string? $id) : AssetRef?
+{
+    string $have = guard $id else {
+        return null;
+    }
+    return $assets->slot($have);
+}

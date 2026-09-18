@@ -38,6 +38,7 @@ public class LightPass : Pass
         $io->reads($gbuffer->position);
         $io->reads($gbuffer->normal);
         $io->reads($gbuffer->albedo);
+        $io->reads($gbuffer->material);
         $io->reads($gbuffer->emissive);
         SsaoData? $ssao = $frame->find<SsaoData>();
 
@@ -95,16 +96,16 @@ public class LightPass : Pass
         $enc->upload(lightUniforms($this->sun, $this->environment), slot: 2);
         Sampler $point = $this->gpu->point;
 
-        // slots 0..3 in gbuffer_layout order
         array<TextureRef> $inputs = [
             $gbuffer->position,
             $gbuffer->normal,
             $gbuffer->albedo,
+            $gbuffer->material,
             $gbuffer->emissive,
         ];
         uint32 $slot = 0;
 
-        while ($slot < 4) {
+        while ($slot < 5) {
             guard bindPooled($ctx, $enc, $slot, $inputs[$slot as usize], $point) else ($e) {
                 $enc->endRender();
                 return .error($e);
@@ -127,8 +128,7 @@ public class LightPass : Pass
     }
 
     /**
-     * Binds slots 5..7. Image-based lighting binds irradiance, prefiltered specular and the BRDF lookup;
-     * the environment variant binds the raw cube at slot 5.
+     * Binds slots 6..8. IBL: irradiance, prefiltered specular, BRDF LUT. Environment cube at slot 6.
      */
     private function bindEnvironment(RenderContext $ctx, RenderEncoder $enc, Lighting $mode) : status<PipelineError>
     {
@@ -148,13 +148,13 @@ public class LightPass : Pass
         IblData $maps = $ctx->frame->get<IblData>();
         // irradiance is a single mip; a mip-linear cube sampler reads
         // garbage on iOS when lod > 0
-        guard bindPooled($ctx, $enc, 5, $maps->irradiance, $this->gpu->linear) else ($e) {
+        guard bindPooled($ctx, $enc, 6, $maps->irradiance, $this->gpu->linear) else ($e) {
             return .error($e);
         }
-        guard bindPooled($ctx, $enc, 6, $maps->prefilter, $this->gpu->cube) else ($e) {
+        guard bindPooled($ctx, $enc, 7, $maps->prefilter, $this->gpu->cube) else ($e) {
             return .error($e);
         }
-        return bindPooled($ctx, $enc, 7, $maps->brdfLut, $this->gpu->linear);
+        return bindPooled($ctx, $enc, 8, $maps->brdfLut, $this->gpu->linear);
     }
 
     private function bindCube(RenderContext $ctx, RenderEncoder $enc) : status<PipelineError>
@@ -163,7 +163,7 @@ public class LightPass : Pass
         Texture $cube = guard $ctx->pool->getTexture($environment->cubemap) else ($e) {
             return .error(.pool($e));
         }
-        $enc->bindTexture(5, $cube, $this->gpu->cube);
+        $enc->bindTexture(6, $cube, $this->gpu->cube);
         return .ok;
     }
 
@@ -176,10 +176,10 @@ public class LightPass : Pass
 
         if ($ssao != null) {
             SsaoData $found = guard $ssao;
-            return bindPooled($ctx, $enc, 4, $found->blurred, $sampler);
+            return bindPooled($ctx, $enc, 5, $found->blurred, $sampler);
         }
 
-        $enc->bindTexture(4, $this->gpu->white, $sampler);
+        $enc->bindTexture(5, $this->gpu->white, $sampler);
         return .ok;
     }
 }

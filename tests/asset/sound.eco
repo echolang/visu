@@ -1,0 +1,76 @@
+/**
+ * vsnd cook and AudioClip load. No device audio; bytes only.
+ */
+
+use std::env;
+use std::io;
+use visu::graphics::Device;
+use visu::asset::{
+    AssetError, Assets, AudioClip, Blob, DirectoryStore, KIND_SOUND, Kitchen,
+    PackItem, SoundCooker, decodeSound
+};
+
+function soundTmp(string $tag) : string
+{
+    $tmp = env::tmp();
+    string $ds = env::DS;
+    return "{$tmp}{$ds}visu-vsnd-{$tag}";
+}
+
+function mkdirSound(string $dir) : void
+{
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return;
+        }
+
+        die($e->message());
+    }
+}
+
+test vsnd_cook_and_load
+{
+    string $wav = 'tests/audio/resources/sine.wav';
+    bool $here = guard io::exists($wav) else ($e) {
+        die($e->message());
+    }
+    assert($here, 'fixture');
+
+    string $src = soundTmp('src');
+    mkdirSound($src);
+    string $ds = env::DS;
+    string $copy = "{$src}{$ds}beep.wav";
+    string $bytes = guard io::readfile($wav) else ($e) {
+        die($e->message());
+    }
+    guard io::writefile($copy, $bytes) else ($e) {
+        die($e->message());
+    }
+
+    string $out = soundTmp('out');
+    mkdirSound($out);
+    Kitchen $k = Kitchen();
+    $k->add(SoundCooker());
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+    assert($items->count() == 1, 'one');
+    assert($items[0]->id->equals('beep'), 'id');
+    assert($items[0]->kind->equals(KIND_SOUND), 'kind');
+
+    DirectoryStore $store = guard DirectoryStore::open($out) else ($e) {
+        die($e->message());
+    }
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    $assets->register(KIND_SOUND, function(Assets $a, Blob $b) : result<AudioClip, AssetError> {
+        return decodeSound($a, $b);
+    });
+    guard $assets->mount($store) else ($e) {
+        die($e->message());
+    }
+    AudioClip $clip = guard $assets->load<AudioClip>('beep') else ($e) {
+        die($e->message());
+    }
+    assert($clip->bytes->size() == $bytes->size(), 'payload');
+}

@@ -60,6 +60,10 @@ internal function mtlPixelFormat(PixelFormat $format) : mtl::PixelFormat
         PixelFormat::rg16f => mtl::PixelFormat::rg16Float,
         PixelFormat::depth32f => mtl::PixelFormat::depth32Float,
         PixelFormat::depth32fStencil8 => mtl::PixelFormat::depth32Float_stencil8,
+        PixelFormat::bc7 => mtl::PixelFormat::bc7RgbaUnorm,
+        PixelFormat::bc7Srgb => mtl::PixelFormat::bc7RgbaUnorm_srgb,
+        PixelFormat::astc4x4 => mtl::PixelFormat::astc4x4Ldr,
+        PixelFormat::astc4x4Srgb => mtl::PixelFormat::astc4x4Srgb,
     };
 }
 
@@ -88,6 +92,7 @@ internal function mtlTopology(Topology $topology) : mtl::PrimitiveType
         Topology::lineStrip => mtl::PrimitiveType::lineStrip,
         Topology::triangles => mtl::PrimitiveType::triangle,
         Topology::triangleStrip => mtl::PrimitiveType::triangleStrip,
+        Topology::patches => mtl::PrimitiveType::triangle,
     };
 }
 
@@ -97,6 +102,14 @@ internal function mtlCull(CullMode $cull) : mtl::CullMode
         CullMode::none => mtl::CullMode::none,
         CullMode::front => mtl::CullMode::front,
         CullMode::back => mtl::CullMode::back,
+    };
+}
+
+internal function mtlFill(FillMode $fill) : mtl::TriangleFillMode
+{
+    return match ($fill) {
+        FillMode::fill => mtl::TriangleFillMode::fill,
+        FillMode::lines => mtl::TriangleFillMode::lines,
     };
 }
 
@@ -183,6 +196,7 @@ internal function mtlFunctionName(ShaderKind $kind) : string
     return match ($kind) {
         ShaderKind::vertex => 'vs',
         ShaderKind::fragment => 'fs',
+        ShaderKind::tessEvaluation => 'vs',
         else => '',
     };
 }
@@ -203,7 +217,7 @@ internal function mtlTextureUsage(const TextureDesc& $desc) : uint32
         $usage = $usage | mtl::TEXTURE_USAGE_SHADER_READ;
     }
 
-    if (($desc->usage & TEXTURE_TRANSFER_DST) != 0) {
+    if (($desc->usage & TEXTURE_TRANSFER_DST) != 0 && !$desc->format->isCompressed()) {
         $usage = $usage | mtl::TEXTURE_USAGE_SHADER_WRITE;
     }
 

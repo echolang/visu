@@ -7,6 +7,7 @@
 
 namespace visu::graphics;
 
+use visu::app::info;
 use visu::math::Vec4;
 
 public class DeferredRenderer
@@ -28,6 +29,11 @@ public class DeferredRenderer
      */
     public SsaoQuality? $ssao;
     public IblQuality $ibl;
+
+    /**
+     * `.scene` runs light + skybox. Any other case skips shading and blits that buffer.
+     */
+    public DeferredView $view;
     public Device $device;
     private DeferredGpu? $gpu;
     private Environment? $environment;
@@ -39,6 +45,7 @@ public class DeferredRenderer
         $this->renderSkybox = true;
         $this->ssao = SsaoQuality::ultra();
         $this->ibl = IblQuality();
+        $this->view = .scene;
         $this->device = $device;
         $this->gpu = null;
         $this->environment = null;
@@ -136,10 +143,16 @@ public class DeferredRenderer
         GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
         $fill($ctx, $gbuffer);
 
-        SsaoQuality? $ssao = $this->ssao;
+        DeferredView $view = $this->view;
+        if ($view->needsSsao() && $this->ssao == null) {
+            info('view: ssao is off');
+            $view = .scene;
+        }
 
-        if ($ssao != null) {
-            SsaoQuality $quality = guard $ssao;
+        bool $runSsao = $view->needsSsao() || ($view->isScene() && $this->ssao != null);
+
+        if ($runSsao) {
+            SsaoQuality $quality = guard $this->ssao;
             $pipeline->add(SsaoPass($gpu, $quality));
             $pipeline->add(SsaoBlurPass($gpu));
         }
@@ -150,15 +163,27 @@ public class DeferredRenderer
             $pipeline->add(IblPass($gpu, $environment));
         }
 
-        $pipeline->add(LightPass($gpu, $env, $this->sun, $this->background));
+        if ($view->isScene()) {
+            $pipeline->add(LightPass($gpu, $env, $this->sun, $this->background));
 
-        if ($this->renderSkybox && $env != null) {
-            Environment $environment = guard $env;
-            $pipeline->add(SkyboxPass($gpu, $environment));
+            if ($this->renderSkybox && $env != null) {
+                Environment $environment = guard $env;
+                $pipeline->add(SkyboxPass($gpu, $environment));
+            }
+
+            LightPassData $light = $ctx->frame->get<LightPassData>();
+            $gpu->blit->pass($pipeline, $output, $light->output);
+            return;
         }
 
-        LightPassData $light = $ctx->frame->get<LightPassData>();
-        $gpu->blit->pass($pipeline, $output, $light->output);
+        TargetRef $debug = $pipeline->createTarget(
+            'deferred.view',
+            $gbuffer->target->width,
+            $gbuffer->target->height
+        );
+        TextureRef $debugColor = $pipeline->createColor($debug, 'output', TextureOptions());
+        $pipeline->add(DeferredViewPass($gpu, $debug, $gbuffer, $view->params()));
+        $gpu->blit->pass($pipeline, $output, $debugColor);
     }
 
     /**

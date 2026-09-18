@@ -1,0 +1,46 @@
+/**
+ * vsnd blob: original encoded audio plus a tiny header.
+ */
+
+namespace visu::asset;
+
+internal const string SOUND_MAGIC = 'VSND';
+internal const uint16 SOUND_VERSION = 1;
+
+public function encodeSound(const string& $encoded) : Blob
+{
+    string $out = '';
+    putMagic($out, SOUND_MAGIC);
+    putU16($out, SOUND_VERSION);
+    putU16($out, 0);
+    putU32($out, 0);
+    putMagic($out, $encoded);
+    return Blob($out);
+}
+
+public function decodeSound(Assets $assets, Blob $blob) : result<AudioClip, AssetError>
+{
+    usize $i = 0;
+    guard getMagic($blob->bytes, $i, SOUND_MAGIC, 'sound') else ($e) {
+        return .error($e);
+    }
+    uint16 $ver = guard getU16($blob->bytes, $i, 'sound') else ($e) {
+        return .error($e);
+    }
+    if ($ver != SOUND_VERSION) {
+        return .error(.corrupt('sound', 'unsupported version'));
+    }
+
+    uint16 $codec = guard getU16($blob->bytes, $i, 'sound') else ($e) {
+        return .error($e);
+    }
+    uint32 $pad = guard getU32($blob->bytes, $i, 'sound') else ($e) {
+        return .error($e);
+    }
+    if ($i > $blob->bytes->size()) {
+        return .error(.corrupt('sound', 'truncated'));
+    }
+
+    string $payload = $blob->bytes->sub($i, $blob->bytes->size() - $i);
+    return .ok(AudioClip($payload->clone()));
+}
