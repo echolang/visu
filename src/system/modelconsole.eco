@@ -1,0 +1,140 @@
+/**
+ * Console grammar and overlay ramps for `ModelSystem`. The system remains the handler; this file
+ * is the parser and the colours so the draw path does not carry them.
+ */
+
+namespace visu::system;
+
+use visu::math::Vec4;
+use visu::signal::ConsoleCommandSignal;
+
+internal enum ModelConsoleAction
+{
+    case status;
+    case usage;
+    case lod(float32 $bias);
+    case wire(bool $on);
+    case wireToggle;
+    case bounds(bool $on);
+    case boundsToggle;
+    case octree(bool $on);
+    case octreeToggle;
+}
+
+/**
+ * `model` alone is status; `model lod <bias>`; `model wire [on|off]`.
+ */
+internal function parseModelConsole(const ConsoleCommandSignal& $cmd) : ModelConsoleAction
+{
+    if (!$cmd->isAction('model')) {
+        return .usage;
+    }
+
+    if ($cmd->parts->count() == 1) {
+        return .status;
+    }
+
+    string $arg = $cmd->parts[1];
+    if ($arg == 'lod') {
+        if ($cmd->parts->count() < 3) {
+            return .usage;
+        }
+
+        float64? $parsed = str::float($cmd->parts[2]);
+        float64 $bias = guard $parsed else {
+            return .usage;
+        }
+        return .lod($bias as float32);
+    }
+
+    if ($arg == 'wire') {
+        return consoleFlag($cmd, .wireToggle, function(bool $on) : ModelConsoleAction {
+            return .wire($on);
+        });
+    }
+
+    if ($arg == 'bounds') {
+        return consoleFlag($cmd, .boundsToggle, function(bool $on) : ModelConsoleAction {
+            return .bounds($on);
+        });
+    }
+
+    if ($arg == 'octree') {
+        return consoleFlag($cmd, .octreeToggle, function(bool $on) : ModelConsoleAction {
+            return .octree($on);
+        });
+    }
+
+    return .usage;
+}
+
+internal function consoleFlag(
+    const ConsoleCommandSignal& $cmd,
+    ModelConsoleAction $toggle,
+    function<ModelConsoleAction(bool)> $set
+) : ModelConsoleAction
+{
+    if ($cmd->parts->count() < 3) {
+        return $toggle;
+    }
+
+    bool? $on = consoleSwitch($cmd->parts[2]);
+    bool $setOn = guard $on else {
+        return .usage;
+    }
+    return $set($setOn);
+}
+
+internal function consoleSwitch(const string& $word) : bool?
+{
+    if ($word == 'on') {
+        return true;
+    }
+
+    if ($word == 'off') {
+        return false;
+    }
+
+    return null;
+}
+
+/**
+ * The LOD ramp the bounds overlay draws with: green at full detail through magenta at the last
+ * level, which for BetaBrain foliage is the impostor card.
+ */
+public function lodColor(int32 $lod) : Vec4
+{
+    array<Vec4> $ramp = array<Vec4>();
+    $ramp[] = Vec4(0.20f, 1.00f, 0.30f, 1.0f);
+    $ramp[] = Vec4(0.85f, 1.00f, 0.15f, 1.0f);
+    $ramp[] = Vec4(1.00f, 0.60f, 0.10f, 1.0f);
+    $ramp[] = Vec4(1.00f, 0.25f, 0.15f, 1.0f);
+    $ramp[] = Vec4(1.00f, 0.15f, 0.90f, 1.0f);
+    $ramp[] = Vec4(0.35f, 0.80f, 1.00f, 1.0f);
+    int32 $i = $lod;
+    if ($i < 0) {
+        $i = 0;
+    }
+
+    int32 $last = ($ramp->count() as int32) - 1;
+    if ($i > $last) {
+        $i = $last;
+    }
+
+    return $ramp[$i as usize];
+}
+
+/**
+ * Octree cells in blue, brighter the deeper the cell. The ramp stays blue rather than climbing to
+ * white: these lines go into the emissive channel, and a line the sun cannot wash out still has to
+ * read as a different thing from the bounds cages drawn over it.
+ */
+public function octreeColor(int32 $depth) : Vec4
+{
+    float32 $t = ($depth as float32) / 8.0f;
+    if ($t > 1.0f) {
+        $t = 1.0f;
+    }
+
+    return Vec4(0.04f + 0.10f * $t, 0.12f + 0.26f * $t, 0.40f + 0.60f * $t, 1.0f);
+}

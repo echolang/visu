@@ -78,19 +78,86 @@ public function formatRows(const Sample& $sample) : array<HudRow>
         $rows[] = HudRow("ALLOC: {$allocs:>6}", 'alloc', $allocs as float32, true, true);
     }
 
-    array<Gauge> $gauges = $sample->gauges;
+    return $rows;
+}
 
-    foreach ($gauges as $g) {
-        $rows[] = HudRow(
-            formatGauge($g),
-            $g->name,
-            $g->value as float32,
-            true,
-            $g->unit != Unit::fps,
-        );
+/**
+ * One tab as overlay lines: section headers, metrics, then pass rows.
+ */
+public function formatTab(const Tab& $tab) : array<string>
+{
+    array<string> $lines = array<string>();
+    array<Section> $sections = $tab->sections;
+    foreach ($sections as $sec) {
+        if (!$sec->id->empty()) {
+            $lines[] = $sec->id;
+        }
+
+        array<Metric> $metrics = $sec->metrics;
+        foreach ($metrics as $m) {
+            string $line = formatMetric($m);
+            if ($sec->id->empty()) {
+                $lines[] = $line;
+            } else {
+                $lines[] = "  {$line}";
+            }
+        }
     }
 
-    return $rows;
+    array<PassTiming> $passes = sortPasses($tab->passes);
+    foreach ($passes as $p) {
+        $lines[] = formatPass($p);
+        array<Metric> $extras = $p->extras;
+        foreach ($extras as $m) {
+            string $extra = formatMetric($m);
+            $lines[] = "    {$extra}";
+        }
+    }
+
+    return $lines;
+}
+
+public function formatMetric(const Metric& $m) : string
+{
+    string $value = formatMetricValue($m->value, $m->unit);
+    if ($m->of > 0.0) {
+        string $right = formatMetricValue($m->of, $m->unit);
+        return "{$m->name}: {$value} / {$right}";
+    }
+
+    return "{$m->name}: {$value}";
+}
+
+public function formatPass(const PassTiming& $p) : string
+{
+    string $name = padPassName($p->name);
+    string $cpu = formatNs($p->cpuNs);
+    string $gpu = formatGpu($p->gpuNs);
+    string $draws = formatCount($p->draw->draws as float64);
+    string $tri = formatGeom($p->draw->triangles);
+    return "{$name}  CPU: {$cpu}  GPU: {$gpu}  draws: {$draws}  tri: {$tri}";
+}
+
+public function sortPasses(array<PassTiming> $passes) : array<PassTiming>
+{
+    array<PassTiming> $out = array<PassTiming>();
+    foreach ($passes as $p) {
+        $out = insertPass($out, $p);
+    }
+
+    return $out;
+}
+
+public function findTab(const Sample& $sample, string $id) : Tab?
+{
+    array<Tab> $tabs = $sample->tabs;
+    foreach ($tabs as $tab) {
+        if ($tab->id == $id) {
+            return $tab;
+        }
+    }
+
+    return null;
 }
 
 public function formatLine(const Sample& $sample) : string
@@ -156,4 +223,78 @@ internal function formatDuration(float64 $v, string $unit) : string
 internal function formatSize(float64 $v, string $unit) : string
 {
     return "{$v:>6.1f} {$unit:<3}";
+}
+
+internal function formatMetricValue(float64 $n, Unit $unit) : string
+{
+    return match ($unit) {
+        Unit::fps => formatWhole($n),
+        Unit::ns => formatNs($n),
+        Unit::bytes => formatBytes(($n as uint64)),
+        Unit::count => formatCount($n),
+        Unit::ratio => formatRatio($n),
+    };
+}
+
+internal function formatCount(float64 $n) : string
+{
+    float64 $round = $n + 0.5;
+    int64 $v = $round as int64;
+    return "{$v:>8}";
+}
+
+internal function formatGeom(int64 $n) : string
+{
+    if ($n <= 0) {
+        return '       —';
+    }
+
+    return "{$n:>8}";
+}
+
+internal function formatGpu(float64 $ns) : string
+{
+    if ($ns <= 0.0) {
+        return '       —  ';
+    }
+
+    return formatNs($ns);
+}
+
+internal function padPassName(string $name) : string
+{
+    if ($name->size() > 16) {
+        return $name->sub(0, 16);
+    }
+
+    return str::rpad($name, 16, 32 as uint8);
+}
+
+internal function insertPass(array<PassTiming> $passes, PassTiming $p) : array<PassTiming>
+{
+    array<PassTiming> $out = array<PassTiming>();
+    bool $placed = false;
+    foreach ($passes as $have) {
+        if (!$placed && passBefore($p, $have)) {
+            $out[] = $p;
+            $placed = true;
+        }
+
+        $out[] = $have;
+    }
+
+    if (!$placed) {
+        $out[] = $p;
+    }
+
+    return $out;
+}
+
+internal function passBefore(const PassTiming& $a, const PassTiming& $b) : bool
+{
+    if ($a->gpuNs != $b->gpuNs) {
+        return $a->gpuNs > $b->gpuNs;
+    }
+
+    return $a->cpuNs > $b->cpuNs;
 }

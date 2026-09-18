@@ -1,0 +1,213 @@
+/**
+ * Process-lifetime knobs any system can read at init: `flags()->bool('terrain.wireframe', false)`.
+ * A string-keyed map on purpose: the key set is open and arrives from outside the program
+ * (`--flag k=v`, a dcapture script, the `flag` console verb), which is the one legitimate map shape.
+ * bootstrap installs the bag; `flags()` fills an empty one when nothing did, so library code never dies.
+ */
+
+namespace visu::app;
+
+public enum FlagValue
+{
+    case boolean(bool $v);
+    case integer(int64 $n);
+    case floating(float64 $n);
+    case text(string $s);
+
+    /**
+     * The value as the console and the manifest print it.
+     */
+    public const function label() : string
+    {
+        return match ($this) {
+            FlagValue::boolean($v) => boolLabel($v),
+            FlagValue::integer($n) => "{$n}",
+            FlagValue::floating($n) => "{$n}",
+            FlagValue::text($s) => $s,
+        };
+    }
+
+    /**
+     * `true` / `false` become a boolean, an integer spelling an integer, a float spelling a float,
+     * anything else stays text.
+     */
+    public static function parse(const string& $raw) : FlagValue
+    {
+        if ($raw == 'true') {
+            return .boolean(true);
+        }
+
+        if ($raw == 'false') {
+            return .boolean(false);
+        }
+
+        int64? $whole = str::int($raw);
+        if ($whole != null) {
+            int64 $n = guard $whole;
+            return .integer($n);
+        }
+
+        float64? $real = str::float($raw);
+        if ($real != null) {
+            float64 $f = guard $real;
+            return .floating($f);
+        }
+
+        return .text($raw);
+    }
+}
+
+internal function truncate(float64 $f) : int64
+{
+    return $f as int64;
+}
+
+internal function widen(int64 $n) : float64
+{
+    return $n as float64;
+}
+
+internal function boolLabel(bool $v) : string
+{
+    if ($v) {
+        return 'true';
+    }
+
+    return 'false';
+}
+
+public class Flags
+{
+    private map<string, FlagValue> $values;
+
+    /**
+     * Bumps on every set so a system can cache a derived value and re-read only when this moved.
+     */
+    public int32 $version;
+
+    public constructor()
+    {
+        $this->values = map<string, FlagValue>();
+        $this->version = 0;
+    }
+
+    public const function has(const string& $name) : bool
+    {
+        return $this->values->has($name);
+    }
+
+    public const function get(const string& $name) : FlagValue?
+    {
+        if (!$this->values->has($name)) {
+            return null;
+        }
+
+        return $this->values->get($name);
+    }
+
+    /**
+     * A boolean flag; an integer counts as true when non-zero. Anything else is the fallback.
+     */
+    public const function bool(const string& $name, bool $fallback) : bool
+    {
+        FlagValue $v = guard $this->get($name) else {
+            return $fallback;
+        }
+        return match ($v) {
+            FlagValue::boolean($b) => $b,
+            FlagValue::integer($n) => $n != 0,
+            else => $fallback,
+        };
+    }
+
+    /**
+     * An integer flag; a float truncates. Anything else is the fallback.
+     */
+    public const function int(const string& $name, int64 $fallback) : int64
+    {
+        FlagValue $v = guard $this->get($name) else {
+            return $fallback;
+        }
+        return match ($v) {
+            FlagValue::integer($n) => $n,
+            FlagValue::floating($f) => truncate($f),
+            else => $fallback,
+        };
+    }
+
+    /**
+     * A float flag; an integer widens. Anything else is the fallback.
+     */
+    public const function float(const string& $name, float64 $fallback) : float64
+    {
+        FlagValue $v = guard $this->get($name) else {
+            return $fallback;
+        }
+        return match ($v) {
+            FlagValue::floating($f) => $f,
+            FlagValue::integer($n) => widen($n),
+            else => $fallback,
+        };
+    }
+
+    /**
+     * The flag as text, whatever its type.
+     */
+    public const function str(const string& $name, const string& $fallback) : string
+    {
+        FlagValue $v = guard $this->get($name) else {
+            return $fallback;
+        }
+        return $v->label();
+    }
+
+    public function set(const string& $name, FlagValue $value) : void
+    {
+        $this->values->set($name, $value);
+        $this->version = $this->version + 1;
+    }
+
+    /**
+     * Set from raw text, autotyped by `FlagValue::parse`.
+     */
+    public function parse(const string& $name, const string& $raw) : void
+    {
+        $this->set($name, FlagValue::parse($raw));
+    }
+
+    public const function names() : array<string>
+    {
+        return $this->values->keys();
+    }
+}
+
+internal class ProcessFlags
+{
+    public static Flags? $flags = null;
+}
+
+public function installFlags(Flags $flags) : void
+{
+    ProcessFlags::$flags = $flags;
+}
+
+public function hasFlags() : bool
+{
+    return ProcessFlags::$flags != null;
+}
+
+/**
+ * The process flag bag. Fill-if-absent so a system may read flags before bootstrap ran.
+ */
+public function flags() : Flags
+{
+    Flags? $held = ProcessFlags::$flags;
+    if ($held != null) {
+        Flags $current = guard $held;
+        return $current;
+    }
+
+    Flags $fresh = Flags();
+    installFlags($fresh);
+    return $fresh;
+}

@@ -1,8 +1,9 @@
 /**
- * Dispatcher queues: FIFO drain, cap, two queues of one type.
+ * Dispatcher queues: FIFO drain, cap, two queues of one type,
+ * and two distinct `queue<T>` instantiations on one class.
  */
 
-use visu::signal::{Dispatcher, Queue};
+use visu::signal::{CursorSignal, Dispatcher, Queue, ScrollSignal};
 
 struct Pulse
 {
@@ -103,6 +104,35 @@ test queue_two_of_same_type
     }
     assert($c->n == 9, 'c');
     assert($g->n == 9, 'g');
+}
+
+// two distinct `queue<T>` calls on one class used to abort echoc at the
+// instantiation cap while compiling this module. the standalone Bus
+// reduction did not; visu's Dispatcher is the trigger
+class TwoQueues
+{
+    private Dispatcher $dispatcher;
+    private Queue<CursorSignal>? $cursors;
+    private Queue<ScrollSignal>? $scrolls;
+
+    public constructor(Dispatcher $dispatcher)
+    {
+        $this->dispatcher = $dispatcher;
+        $this->cursors = null;
+        $this->scrolls = null;
+    }
+
+    public function start() : void
+    {
+        $this->cursors = $this->dispatcher->queue<CursorSignal>();
+        $this->scrolls = $this->dispatcher->queue<ScrollSignal>();
+    }
+}
+
+test two_dispatcher_queues_on_one_class
+{
+    TwoQueues $h = TwoQueues(Dispatcher());
+    $h->start();
 }
 
 test queue_unqueue_stops_collecting

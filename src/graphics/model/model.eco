@@ -1,0 +1,119 @@
+/**
+ * A decoded model: one GPU mesh (shared vertices + indices), its LOD table, and one `Material` per
+ * slot resolved from the folder `.vmat`. `Assets.load<Model>` builds it through `decodeModel`.
+ * The `ModelBank` owns every live model and is the only thing that destroys one; the destructor
+ * is the safety net for a handle that never reached a bank.
+ */
+
+namespace visu::graphics;
+
+use json;
+use visu::asset::{
+    AssetError, Assets, Blob, CookedModel, MODEL_VERTEX_BYTES, ModelLodDesc, Vmat, decodeCookedModel,
+    parentId
+};
+use visu::geo::AABB;
+
+public class Model
+{
+    public const string $id;
+    public Mesh $mesh;
+    public const AABB $bounds;
+
+    /**
+     * Multiplies the measured distance before the LOD table is read. From the sheet.
+     */
+    public const float32 $lodBias;
+
+    /**
+     * Instances further away than this are skipped. 0 means never.
+     */
+    public const float32 $cullDistance;
+    public array<ModelLodDesc> $lods;
+    public array<string> $slots;
+
+    /**
+     * One per slot, in slot order. A slot without a sheet record gets the folder material.
+     */
+    public array<Material> $materials;
+    private bool $dead;
+
+    public constructor(string $id, Mesh $mesh, CookedModel $cooked, array<Material> $materials)
+    {
+        assert($materials->count() == $cooked->slots->count(), 'model: one material per slot');
+        $this->id = $id;
+        $this->mesh = $mesh;
+        $this->bounds = $cooked->bounds;
+        $this->lodBias = $cooked->lodBias;
+        $this->cullDistance = $cooked->cullDistance;
+        $this->lods = $cooked->lods;
+        $this->slots = $cooked->slots;
+        $this->materials = $materials;
+        $this->dead = false;
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->mesh->destroy();
+        $this->dead = true;
+    }
+
+    public const function lodCount() : int32
+    {
+        return $this->lods->count() as int32;
+    }
+}
+
+/**
+ * The `model` kind decoder: cooked bytes to GPU buffers plus bound materials. Needs the folder
+ * sheet only if there is one; a model with no `.vmat` beside it gets empty materials.
+ */
+public function decodeModel(Assets $assets, Blob $blob) : result<Model, AssetError>
+{
+    // nested loads overwrite `loading`, so take the id before touching the sheet
+    string $id = $assets->loading;
+    CookedModel $cooked = guard decodeCookedModel($assets, $blob) else ($e) {
+        return .error($e);
+    }
+    Mesh $mesh = Mesh($assets->device, bytes: $cooked->vertices, stride: MODEL_VERTEX_BYTES);
+    $mesh->index(bytes: $cooked->indices, $cooked->indexType);
+    array<Material> $materials = modelMaterials($assets, $id, $cooked->slots);
+    return .ok(Model($id, $mesh, $cooked, $materials));
+}
+
+/**
+ * The folder sheet viewed per slot name. Without a sheet every slot is an empty material.
+ */
+internal function modelMaterials(Assets $assets, const string& $id, const array<string>& $slots) : array<Material>
+{
+    array<Material> $out = array<Material>();
+    string $folder = parentId($id);
+    Vmat? $found = null;
+    if (!$folder->empty()) {
+        result<Vmat, AssetError> $r = $assets->load<Vmat>($folder);
+        if (!$r->failed()) {
+            $found = $r->or(Vmat($folder, json::object()));
+        }
+    }
+
+    foreach ($slots as $slot) {
+        Vmat $sheet = guard $found else {
+            $out[] = Material(id: "{$id}:{$slot}");
+            continue;
+        }
+        Material $mat = Material($sheet, view: $slot);
+        $mat->bind($assets);
+        $out[] = $mat;
+    }
+
+    return $out;
+}

@@ -1,0 +1,127 @@
+/**
+ * VMDL round trip and corruption checks, no GPU.
+ */
+
+use visu::asset::{
+    Assets, Blob, CookedModel, MODEL_VERTEX_BYTES, ModelLodDesc, ModelPrimitive, decodeCookedModel,
+    encodeModel
+};
+use visu::geo::AABB;
+use visu::graphics::{Device, IndexType};
+use visu::math::{Vec3, equal};
+
+internal function modelBytes(int32 $count, uint8 $fill) : string
+{
+    string $out = '';
+    $out->reserve($count as usize);
+    int32 $i = 0;
+    while ($i < $count) {
+        $out->push($fill);
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function modelIndices16(int32 $count) : string
+{
+    string $out = '';
+    int32 $i = 0;
+    while ($i < $count) {
+        $out->push(($i & 0xff) as uint8);
+        $out->push((($i >> 8) & 0xff) as uint8);
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function sampleModel() : CookedModel
+{
+    array<string> $slots = array<string>();
+    $slots[] = 'model.bush';
+    $slots[] = 'model.bush_01_imp';
+    ModelLodDesc $lod0 = ModelLodDesc();
+    $lod0->distance = 0.0f;
+    $lod0->bounds = AABB(Vec3(-1.0f, 0.0f, -1.0f), Vec3(1.0f, 2.0f, 1.0f));
+    $lod0->primitives[] = ModelPrimitive(0, 0, 6);
+    $lod0->primitives[] = ModelPrimitive(1, 6, 3);
+    ModelLodDesc $lod1 = ModelLodDesc();
+    $lod1->distance = 50.0f;
+    $lod1->bounds = AABB(Vec3(-1.0f, 0.0f, -1.0f), Vec3(1.0f, 1.9f, 1.0f));
+    $lod1->primitives[] = ModelPrimitive(1, 9, 3);
+    array<ModelLodDesc> $lods = array<ModelLodDesc>();
+    $lods[] = $lod0;
+    $lods[] = $lod1;
+    return CookedModel(
+        $slots,
+        $lods,
+        AABB(Vec3(-1.0f, 0.0f, -1.0f), Vec3(1.0f, 2.0f, 1.0f)),
+        1.5f,
+        900.0f,
+        IndexType::uint16,
+        modelBytes(8 * MODEL_VERTEX_BYTES, 7),
+        modelIndices16(12)
+    );
+}
+
+internal function modelAssets() : Assets
+{
+    Device $device = Device();
+    return Assets($device);
+}
+
+test model_round_trip_keeps_every_field
+{
+    CookedModel $src = sampleModel();
+    Blob $blob = guard encodeModel($src) else ($e) {
+        die($e->message());
+    }
+    CookedModel $got = guard decodeCookedModel(modelAssets(), $blob) else ($e) {
+        die($e->message());
+    }
+    assert($got->slots->count() == 2, 'slots');
+    assert($got->slots[1]->equals('model.bush_01_imp'), 'slot name');
+    assert($got->lods->count() == 2, 'lods');
+    assert(equal($got->lods[1]->distance, 50.0f), 'lod distance');
+    assert($got->lods[0]->primitives->count() == 2, 'lod0 primitives');
+    assert($got->lods[0]->primitives[1]->slot == 1, 'primitive slot');
+    assert($got->lods[0]->primitives[1]->firstIndex == 6, 'primitive first');
+    assert($got->lods[1]->primitives[0]->indexCount == 3, 'primitive count');
+    assert(equal($got->lods[1]->bounds->max->y, 1.9f), 'lod bounds');
+    assert(equal($got->bounds->max->y, 2.0f), 'model bounds');
+    assert(equal($got->lodBias, 1.5f), 'lod bias');
+    assert(equal($got->cullDistance, 900.0f), 'cull distance');
+    assert($got->indexType == IndexType::uint16, 'index type');
+    assert($got->vertexCount() == 8, 'vertex count');
+    assert($got->indexCount() == 12, 'index count');
+    assert($got->vertices->byte(3) == 7, 'vertex bytes');
+    assert($got->indices->byte(2) == 1 && $got->indices->byte(3) == 0, 'index bytes');
+}
+
+test model_encode_rejects_bad_ranges
+{
+    CookedModel $bad = sampleModel();
+    ModelLodDesc $lod = $bad->lods[0];
+    $lod->primitives[0] = ModelPrimitive(0, 10, 6);
+    $bad->lods[0] = $lod;
+    $r = encodeModel($bad);
+    assert($r->failed(), 'index range past the end');
+    CookedModel $badSlot = sampleModel();
+    ModelLodDesc $lod2 = $badSlot->lods[0];
+    $lod2->primitives[0] = ModelPrimitive(5, 0, 6);
+    $badSlot->lods[0] = $lod2;
+    assert(encodeModel($badSlot)->failed(), 'slot out of range');
+}
+
+test model_decode_rejects_truncated_and_foreign_blobs
+{
+    CookedModel $src = sampleModel();
+    Blob $blob = guard encodeModel($src) else ($e) {
+        die($e->message());
+    }
+    string $cut = $blob->bytes->sub(0, $blob->bytes->size() - 20)->clone();
+    assert(decodeCookedModel(modelAssets(), Blob($cut))->failed(), 'truncated');
+    assert(decodeCookedModel(modelAssets(), Blob('VTEXnope'))->failed(), 'wrong magic');
+    assert(decodeCookedModel(modelAssets(), Blob(''))->failed(), 'empty');
+}

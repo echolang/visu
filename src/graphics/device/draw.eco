@@ -1,0 +1,190 @@
+/**
+ * CPU-side draw accounting for the instrument overlay.
+ * Encoders increment `$frame`; `roll` at endFrame publishes it as `$last`.
+ */
+
+namespace visu::graphics;
+
+public struct DrawStats
+{
+    public int32 $draws = 0;
+    public int32 $indexed = 0;
+    public int32 $pipelineBinds = 0;
+    public int64 $vertices = 0;
+    public int64 $triangles = 0;
+    public int32 $patches = 0;
+
+    /**
+     * Counts since `$start` (this minus start), clamped at zero.
+     */
+    public const function since(const DrawStats& $start) : DrawStats
+    {
+        DrawStats $d = DrawStats();
+        $d->draws = sub32($this->draws, $start->draws);
+        $d->indexed = sub32($this->indexed, $start->indexed);
+        $d->pipelineBinds = sub32($this->pipelineBinds, $start->pipelineBinds);
+        $d->vertices = sub64($this->vertices, $start->vertices);
+        $d->triangles = sub64($this->triangles, $start->triangles);
+        $d->patches = sub32($this->patches, $start->patches);
+        return $d;
+    }
+}
+
+/**
+ * One GPU scope sample, resolved from a previous frame slot.
+ * `$ns` is 0 when the backend has no timestamp yet.
+ */
+public struct GpuScopeSample
+{
+    public string $name = '';
+    public float64 $ns = 0.0;
+}
+
+public class DrawCounters
+{
+    public DrawStats $frame;
+    public DrawStats $last;
+
+    public constructor()
+    {
+        $this->frame = DrawStats();
+        $this->last = DrawStats();
+    }
+
+    /**
+     * Publish this frame as last and start a new counter. Device.endFrame calls this.
+     */
+    public function roll() : void
+    {
+        $this->last = $this->frame;
+        $this->frame = DrawStats();
+    }
+
+    public function bind() : void
+    {
+        DrawStats $s = $this->frame;
+        $s->pipelineBinds = $s->pipelineBinds + 1;
+        $this->frame = $s;
+    }
+
+    public function draw(Topology $top, int32 $count, int32 $instances, int32 $cps = 0) : void
+    {
+        $this->add($top, $count, $instances, $cps, false);
+    }
+
+    public function drawIndexed(Topology $top, int32 $count, int32 $instances, int32 $cps = 0) : void
+    {
+        $this->add($top, $count, $instances, $cps, true);
+    }
+
+    private function add(
+        Topology $top,
+        int32 $count,
+        int32 $instances,
+        int32 $cps,
+        bool $indexed
+    ) : void
+    {
+        int32 $n = $instances;
+        if ($n < 1) {
+            $n = 1;
+        }
+
+        int32 $c = $count;
+        if ($c < 0) {
+            $c = 0;
+        }
+
+        DrawStats $s = $this->frame;
+        $s->draws = $s->draws + 1;
+        if ($indexed) {
+            $s->indexed = $s->indexed + 1;
+        }
+
+        $s->vertices = $s->vertices + (($c as int64) * ($n as int64));
+        $s->triangles = $s->triangles + drawTriangles($top, $c, $n);
+        $s->patches = $s->patches + drawPatches($top, $c, $n, $cps);
+        $this->frame = $s;
+    }
+}
+
+internal function drawTriangles(Topology $top, int32 $count, int32 $instances) : int64
+{
+    int32 $strip = $count - 2;
+    if ($strip < 0) {
+        $strip = 0;
+    }
+
+    return match ($top) {
+        Topology::triangles => (($count / 3) as int64) * ($instances as int64),
+        Topology::triangleStrip => ($strip as int64) * ($instances as int64),
+        else => 0 as int64,
+    };
+}
+
+internal function drawPatches(Topology $top, int32 $count, int32 $instances, int32 $cps) : int32
+{
+    int32 $p = $cps;
+    if ($p < 1) {
+        $p = 4;
+    }
+
+    return match ($top) {
+        Topology::patches => ($count / $p) * $instances,
+        else => 0,
+    };
+}
+
+/**
+ * Nested GPU scopes are refused. Backends fill `$resolved` when timestamps land.
+ */
+public class GpuScopes
+{
+    public string $current;
+    public array<GpuScopeSample> $resolved;
+
+    public constructor()
+    {
+        $this->current = '';
+        $this->resolved = array<GpuScopeSample>();
+    }
+
+    public function begin(string $name) : void
+    {
+        if ($name->empty()) {
+            return;
+        }
+
+        assert($this->current->empty(), 'nested gpu scope');
+        $this->current = $name;
+    }
+
+    public function end() : void
+    {
+        if ($this->current->empty()) {
+            return;
+        }
+
+        $this->current = '';
+    }
+}
+
+internal function sub32(int32 $a, int32 $b) : int32
+{
+    int32 $d = $a - $b;
+    if ($d < 0) {
+        return 0;
+    }
+
+    return $d;
+}
+
+internal function sub64(int64 $a, int64 $b) : int64
+{
+    int64 $d = $a - $b;
+    if ($d < 0) {
+        return 0;
+    }
+
+    return $d;
+}

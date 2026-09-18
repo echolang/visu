@@ -9,21 +9,188 @@ namespace visu::instrument;
 public class Instruments
 {
     private array<Source> $sources;
+    private map<string, Source> $named;
+    private array<string> $namedOrder;
     private map<string, Gauge> $gauges;
+    private array<TabSpec> $declared;
+    private Sink $push;
+    private array<PassTiming> $graph;
+    private map<string, array<Metric>> $passExtras;
     private Sample? $last;
     private float64 $renderNs;
 
     public constructor()
     {
         $this->sources = array<Source>();
+        $this->named = map<string, Source>();
+        $this->namedOrder = array<string>();
         $this->gauges = map<string, Gauge>();
+        $this->declared = array<TabSpec>();
+        $this->push = Sink::empty();
+        $this->graph = array<PassTiming>();
+        $this->passExtras = map<string, array<Metric>>();
         $this->last = null;
         $this->renderNs = 0.0;
+        $this->declareTab('rendering', 'Rendering', 0);
+        $this->declareTab('graph', 'Graph', 10);
+        $this->declareTab('app', 'App', 50);
     }
 
     public function add(Source $source) : void
     {
         $this->sources[] = $source;
+    }
+
+    /**
+     * Replace a source by id so a reloaded scene does not stack collectors.
+     */
+    public function add(id: string $id, Source $source) : void
+    {
+        if (!$this->named->has($id)) {
+            $this->namedOrder[] = $id;
+        }
+
+        $this->named[$id] = $source;
+    }
+
+    public function remove(id: string $id) : void
+    {
+        if (!$this->named->has($id)) {
+            return;
+        }
+
+        $this->named->remove($id);
+        array<string> $kept = array<string>();
+        array<string> $order = $this->namedOrder;
+        foreach ($order as $have) {
+            if ($have != $id) {
+                $kept[] = $have;
+            }
+        }
+
+        $this->namedOrder = $kept;
+    }
+
+    public function declareTab(string $id, string $title, int32 $order) : void
+    {
+        array<TabSpec> $kept = array<TabSpec>();
+        bool $replaced = false;
+        array<TabSpec> $have = $this->declared;
+        foreach ($have as $spec) {
+            if ($spec->id == $id) {
+                $kept[] = TabSpec($id, $title, $order);
+                $replaced = true;
+            } else {
+                $kept[] = $spec;
+            }
+        }
+
+        if (!$replaced) {
+            $kept[] = TabSpec($id, $title, $order);
+        }
+
+        $this->declared = $kept;
+    }
+
+    /**
+     * Push-path: select a tab on the pending mailbox. Lands on the next sample().
+     */
+    public function tab(string $id) : void
+    {
+        $this->push->tab($id);
+    }
+
+    public function tab(string $id, title: string $title, int32 $order) : void
+    {
+        $this->push->tab($id, title: $title, $order);
+    }
+
+    public function section(string $id) : void
+    {
+        $this->push->section($id);
+    }
+
+    public function metric(string $name, float64 $value, Unit $unit, of: float64 $of = 0.0) : void
+    {
+        $this->push->metric($name, $value, $unit, of: $of);
+    }
+
+    public function passExtra(string $pass, string $name, float64 $value, Unit $unit) : void
+    {
+        $this->passExtras[$pass] = replaceMetric(
+            extrasFor($this->passExtras, $pass),
+            Metric($name, $value, $unit, 0.0)
+        );
+    }
+
+    public function noteGraph(const array<PassTiming>& $passes) : void
+    {
+        $this->graph = $passes->clone();
+    }
+
+    public function noteGraph(const array<visu::graphics::PassProfile>& $passes) : void
+    {
+        array<PassTiming> $out = array<PassTiming>();
+        foreach ($passes as $p) {
+            PassTiming $t = PassTiming();
+            $t->name = $p->name;
+            $t->cpuNs = $p->cpuNs;
+            $t->draw = $p->draw;
+            $out[] = $t;
+        }
+
+        $this->graph = $out;
+    }
+
+    /**
+     * Fold resolved GPU timestamps onto the last noteGraph rows, by pass name.
+     * Unknown names (e.g. `submit`) append a GPU-only row.
+     */
+    public function noteGpu(const array<visu::graphics::GpuScopeSample>& $samples) : void
+    {
+        foreach ($samples as $s) {
+            if ($s->name->empty() || $s->ns <= 0.0) {
+                continue;
+            }
+
+            array<PassTiming> $kept = array<PassTiming>();
+            bool $found = false;
+            array<PassTiming> $have = $this->graph;
+            foreach ($have as $p) {
+                if ($p->name == $s->name) {
+                    PassTiming $row = $p;
+                    $row->gpuNs = $s->ns;
+                    $kept[] = $row;
+                    $found = true;
+                } else {
+                    $kept[] = $p;
+                }
+            }
+
+            if (!$found) {
+                PassTiming $row = PassTiming();
+                $row->name = $s->name;
+                $row->gpuNs = $s->ns;
+                $kept[] = $row;
+            }
+
+            $this->graph = $kept;
+        }
+    }
+
+    /**
+     * Last graph row for `$name`, if noteGraph saw it.
+     */
+    public const function lastPass(string $name) : PassTiming?
+    {
+        array<PassTiming> $passes = $this->graph;
+        foreach ($passes as $p) {
+            if ($p->name == $name) {
+                return $p;
+            }
+        }
+
+        return null;
     }
 
     public function gauge(string $name, float64 $value, Unit $unit = Unit::count) : void
@@ -49,30 +216,64 @@ public class Instruments
     public function sample() : Sample
     {
         Sink $sink = .empty();
-        array<Source> $sources = $this->sources;
+        array<TabSpec> $declared = $this->declared;
+        foreach ($declared as $spec) {
+            $sink->tab($spec->id, title: $spec->title, $spec->order);
+        }
 
+        array<Source> $sources = $this->sources;
         foreach ($sources as $source) {
             $source->collect($sink);
         }
 
-        array<string> $names = $this->gauges->keys();
+        array<string> $namedIds = $this->namedOrder;
+        foreach ($namedIds as $id) {
+            if (!$this->named->has($id)) {
+                continue;
+            }
 
+            Source $named = $this->named[$id];
+            $named->collect($sink);
+        }
+
+        mergeSink($sink, $this->push);
+        $sink->tab('graph', title: 'Graph', 10);
+        array<PassTiming> $graph = $this->graph;
+        foreach ($graph as $p) {
+            $sink->pass($p);
+        }
+
+        map<string, array<Metric>> $extras = $this->passExtras;
+        array<string> $extraNames = $extras->keys();
+        foreach ($extraNames as $pass) {
+            array<Metric> $list = $extras[$pass];
+            foreach ($list as $m) {
+                $sink->passExtra($pass, $m->name, $m->value, $m->unit);
+            }
+        }
+
+        array<string> $names = $this->gauges->keys();
         foreach ($names as $name) {
             Gauge $g = $this->gauges[$name];
             $sink->gauge($g->name, $g->value, $g->unit);
+            $sink->tab('app', title: 'App', 50);
+            $sink->section('gauges');
+            $sink->metric($g->name, $g->value, $g->unit);
         }
 
         array<Gauge> $list = array<Gauge>();
         array<string> $gaugeNames = $sink->gauges->keys();
-
         foreach ($gaugeNames as $gaugeName) {
             $list[] = $sink->gauges[$gaugeName];
         }
 
         LoopStats $loop = $sink->loop;
         $loop->renderNs = $this->renderNs;
-        Sample $snap = Sample($loop, $sink->memory, $sink->adapter, $list, liveAllocations());
+        array<Tab> $tabs = $sink->snapshotTabs();
+        Sample $snap = Sample($loop, $sink->memory, $sink->adapter, $list, liveAllocations(), $tabs);
         $this->last = $snap;
+        $this->push = Sink::empty();
+        $this->passExtras = map<string, array<Metric>>();
         return $snap;
     }
 
@@ -104,4 +305,43 @@ internal function liveAllocations() : usize
     #[else]
     return 0;
     #[end]
+}
+
+internal function extrasFor(const map<string, array<Metric>>& $extras, string $pass) : array<Metric>
+{
+    if (!$extras->has($pass)) {
+        return array<Metric>();
+    }
+
+    return $extras[$pass];
+}
+
+internal function mergeSink(Sink $dst, Sink $src) : void
+{
+    array<string> $order = $src->tabOrder;
+    foreach ($order as $id) {
+        TabMail $mail = $src->tabs[$id];
+        $dst->tab($id, title: $mail->title, $mail->order);
+        array<string> $sections = $mail->sectionOrder;
+        foreach ($sections as $sec) {
+            $dst->section($sec);
+            array<Metric> $metrics = $mail->sections[$sec];
+            foreach ($metrics as $m) {
+                $dst->metric($m->name, $m->value, $m->unit, of: $m->of);
+            }
+        }
+
+        array<PassTiming> $passes = $mail->passes;
+        foreach ($passes as $p) {
+            $dst->pass($p);
+        }
+    }
+
+    array<string> $extraNames = $src->passExtras->keys();
+    foreach ($extraNames as $pass) {
+        array<Metric> $list = $src->passExtras[$pass];
+        foreach ($list as $m) {
+            $dst->passExtra($pass, $m->name, $m->value, $m->unit);
+        }
+    }
 }

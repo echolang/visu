@@ -1,0 +1,514 @@
+/**
+ * Loose octree over a fixed world box. Items are caller ids with a bounds box; nodes and items sit in
+ * packed arrays and point at each other by index, so a query is a stack walk with no pointers.
+ * An item lands in the deepest node whose loose box (the node box scaled by `looseness` about its
+ * centre) contains it, so where an item lives depends only on its size and position, and insert and
+ * remove are O(depth). Items that do not fit the root stay on the root.
+ */
+
+namespace visu::geo;
+
+use visu::math::Vec3;
+
+/**
+ * An inserted item. `remove` and `update` take it back; the id is the caller's, not the tree's.
+ */
+public struct OctreeHandle
+{
+    public const int32 $index;
+
+    public static function none() : OctreeHandle
+    {
+        return OctreeHandle(-1);
+    }
+
+    public const function valid() : bool
+    {
+        return $this->index >= 0;
+    }
+}
+
+/**
+ * One node as a debug overlay sees it. `$items` counts what sits on the node itself; `$total` counts
+ * the whole subtree, so a branch that has been emptied reads as 0 and can be left undrawn.
+ */
+public struct OctreeNodeInfo
+{
+    public AABB $bounds;
+
+    /**
+     * The box the node actually accepts items into: `$bounds` scaled by the tree's looseness.
+     */
+    public AABB $loose;
+    public int32 $depth;
+    public int32 $items;
+    public int32 $total;
+}
+
+/**
+ * One cube of space. `$firstChild` is the index of eight consecutive children, or -1 while a leaf.
+ * `$firstItem` heads a doubly linked list through `OctreeItem.$next` / `$prev`.
+ */
+internal struct OctreeNode
+{
+    public AABB $bounds;
+    public AABB $loose;
+    public int32 $firstChild;
+    public int32 $firstItem;
+    public int32 $itemCount;
+    public int32 $depth;
+
+    public constructor()
+    {
+        $this->bounds = AABB(Vec3(0.0f), Vec3(0.0f));
+        $this->loose = $this->bounds;
+        $this->firstChild = -1;
+        $this->firstItem = -1;
+        $this->itemCount = 0;
+        $this->depth = 0;
+    }
+}
+
+/**
+ * One inserted box. A freed slot keeps `$node = -1` and chains through `$next` on the free list.
+ */
+internal struct OctreeItem
+{
+    public AABB $bounds;
+    public uint32 $id;
+    public int32 $node;
+    public int32 $next;
+    public int32 $prev;
+
+    public constructor()
+    {
+        $this->bounds = AABB(Vec3(0.0f), Vec3(0.0f));
+        $this->id = 0;
+        $this->node = -1;
+        $this->next = -1;
+        $this->prev = -1;
+    }
+}
+
+/**
+ * The depth at which a cell is about `$leaf` across the widest axis of `$world`. A tree is built for
+ * a world, not for a constant: the same depth that gives a 4 km estate 16 m cells leaves a 40 km one
+ * at 160 m, which is the difference between an index and a rough sort. Clamped to 1 through 12.
+ */
+public function octreeDepthFor(const AABB& $world, float32 $leaf) : int32
+{
+    assert($leaf > 0.0f, 'octree: leaf size');
+    float32 $widest = $world->width();
+    if ($world->height() > $widest) {
+        $widest = $world->height();
+    }
+
+    if ($world->depth() > $widest) {
+        $widest = $world->depth();
+    }
+
+    int32 $depth = 1;
+    float32 $cell = $widest * 0.5f;
+    while ($cell > $leaf && $depth < 12) {
+        $cell = $cell * 0.5f;
+        $depth = $depth + 1;
+    }
+
+    return $depth;
+}
+
+public class Octree
+{
+    public const AABB $bounds;
+
+    /**
+     * Levels below the root a node may split into. 8 over a 4 km world is a 16 m finest cell.
+     */
+    public const int32 $maxDepth;
+
+    /**
+     * Loose box scale. 2.0 is the usual loose octree: a node accepts anything up to its own size.
+     */
+    public const float32 $looseness;
+    private array<OctreeNode> $nodes;
+    private array<OctreeItem> $items;
+    private int32 $freeItem;
+    private int32 $count;
+
+    public constructor(const AABB& $bounds, int32 $maxDepth = 8, float32 $looseness = 2.0f)
+    {
+        assert($maxDepth >= 0, 'octree: depth');
+        assert($looseness >= 1.0f, 'octree: looseness below 1 loses items');
+        $this->bounds = $bounds;
+        $this->maxDepth = $maxDepth;
+        $this->looseness = $looseness;
+        $this->nodes = array<OctreeNode>();
+        $this->items = array<OctreeItem>();
+        $this->freeItem = -1;
+        $this->count = 0;
+        OctreeNode $root = OctreeNode();
+        $root->bounds = $bounds;
+        $root->loose = $bounds->scaled($looseness);
+        $this->nodes[] = $root;
+    }
+
+    /**
+     * Place `$box` in the deepest node whose loose box contains it.
+     */
+    public function insert(const AABB& $box, uint32 $id) : OctreeHandle
+    {
+        int32 $node = $this->fit($box);
+        int32 $slot = $this->allocItem();
+        OctreeItem $item = OctreeItem();
+        $item->bounds = $box;
+        $item->id = $id;
+        $item->node = $node;
+        $this->items[$slot as usize] = $item;
+        $this->link($node, $slot);
+        $this->count = $this->count + 1;
+        return OctreeHandle($slot);
+    }
+
+    public function remove(OctreeHandle $h) : void
+    {
+        assert($h->valid() && ($h->index as usize) < $this->items->count(), 'octree: handle');
+        OctreeItem $item = $this->items[$h->index as usize];
+        assert($item->node >= 0, 'octree: item already removed');
+        $this->unlink($item->node, $h->index);
+        $item->node = -1;
+        $item->prev = -1;
+        $item->next = $this->freeItem;
+        $this->items[$h->index as usize] = $item;
+        $this->freeItem = $h->index;
+        $this->count = $this->count - 1;
+    }
+
+    /**
+     * Move an item. The handle it returns may differ from `$h`.
+     */
+    public function update(OctreeHandle $h, const AABB& $box) : OctreeHandle
+    {
+        uint32 $id = $this->items[$h->index as usize]->id;
+        $this->remove($h);
+        return $this->insert($box, $id);
+    }
+
+    /**
+     * Append the id of every item whose box the frustum does not reject. A node wholly inside the
+     * frustum hands over its subtree without testing a single item.
+     */
+    public function query(const Frustum& $frustum, array<uint32>& $out) : void
+    {
+        array<int32> $stack = array<int32>();
+        array<bool> $accepted = array<bool>();
+        $stack[] = 0;
+        $accepted[] = false;
+
+        while ($stack->count() > 0) {
+            usize $top = $stack->count() - 1;
+            int32 $index = $stack[$top];
+            bool $inside = $accepted[$top];
+            $stack->pop();
+            $accepted->pop();
+            OctreeNode $node = $this->nodes[$index as usize];
+
+            if ($node->itemCount == 0 && $node->firstChild < 0) {
+                continue;
+            }
+
+            // the root also holds whatever lies outside the world, so its box never rejects
+            if (!$inside && $index != 0) {
+                Containment $c = $frustum->classify($node->loose);
+                if ($c == Containment::outside) {
+                    continue;
+                }
+
+                $inside = $c == Containment::inside;
+            }
+
+            int32 $i = $node->firstItem;
+            while ($i >= 0) {
+                OctreeItem $item = $this->items[$i as usize];
+                if ($inside || $frustum->contains($item->bounds)) {
+                    $out[] = $item->id;
+                }
+
+                $i = $item->next;
+            }
+
+            if ($node->firstChild >= 0) {
+                int32 $child = 0;
+                while ($child < 8) {
+                    $stack[] = $node->firstChild + $child;
+                    $accepted[] = $inside;
+                    $child = $child + 1;
+                }
+            }
+        }
+    }
+
+    /**
+     * Append the id of every item whose box overlaps `$box`.
+     */
+    public function query(const AABB& $box, array<uint32>& $out) : void
+    {
+        array<int32> $stack = array<int32>();
+        $stack[] = 0;
+
+        while ($stack->count() > 0) {
+            usize $top = $stack->count() - 1;
+            int32 $index = $stack[$top];
+            $stack->pop();
+            OctreeNode $node = $this->nodes[$index as usize];
+
+            if ($node->itemCount == 0 && $node->firstChild < 0) {
+                continue;
+            }
+
+            if ($index != 0 && !$node->loose->intersects($box)) {
+                continue;
+            }
+
+            int32 $i = $node->firstItem;
+            while ($i >= 0) {
+                OctreeItem $item = $this->items[$i as usize];
+                if ($item->bounds->intersects($box)) {
+                    $out[] = $item->id;
+                }
+
+                $i = $item->next;
+            }
+
+            if ($node->firstChild >= 0) {
+                int32 $child = 0;
+                while ($child < 8) {
+                    $stack[] = $node->firstChild + $child;
+                    $child = $child + 1;
+                }
+            }
+        }
+    }
+
+    /**
+     * Drop every item; the node grid stays allocated.
+     */
+    public function clear() : void
+    {
+        $this->items->clear();
+        $this->freeItem = -1;
+        $this->count = 0;
+        usize $n = $this->nodes->count();
+        usize $i = 0;
+        while ($i < $n) {
+            OctreeNode $node = $this->nodes[$i];
+            $node->firstItem = -1;
+            $node->itemCount = 0;
+            $this->nodes[$i] = $node;
+            $i = $i + 1;
+        }
+    }
+
+    public const function count() : int32
+    {
+        return $this->count;
+    }
+
+    public const function nodeCount() : int32
+    {
+        return $this->nodes->count() as int32;
+    }
+
+    /**
+     * Every allocated node, parents before children, for a debug overlay. Nodes survive `remove` and
+     * `clear`, so filter on `$total` to draw only the branches that still hold something.
+     */
+    public const function nodes(array<OctreeNodeInfo>& $out) : void
+    {
+        if ($this->nodes->count() == 0) {
+            return;
+        }
+
+        $this->describe(0, $out);
+    }
+
+    /**
+     * Append `$index` and its subtree, and answer how many items the subtree holds.
+     */
+    private const function describe(int32 $index, array<OctreeNodeInfo>& $out) : int32
+    {
+        OctreeNode $node = $this->nodes[$index as usize];
+        usize $slot = $out->count();
+        $out[] = OctreeNodeInfo($node->bounds, $node->loose, $node->depth, $node->itemCount, $node->itemCount);
+        int32 $total = $node->itemCount;
+        if ($node->firstChild >= 0) {
+            int32 $i = 0;
+            while ($i < 8) {
+                $total = $total + $this->describe($node->firstChild + $i, $out);
+                $i = $i + 1;
+            }
+        }
+
+        OctreeNodeInfo& $written = $out->at($slot);
+        $written->total = $total;
+        return $total;
+    }
+
+    /**
+     * Depth of the node an item sits in. Tests read this; it is not on the hot path.
+     */
+    public const function depthOf(OctreeHandle $h) : int32
+    {
+        OctreeItem $item = $this->items[$h->index as usize];
+        assert($item->node >= 0, 'octree: item removed');
+        return $this->nodes[$item->node as usize]->depth;
+    }
+
+    /**
+     * Descend from the root while a child's loose box still holds the box, splitting on the way.
+     */
+    private function fit(const AABB& $box) : int32
+    {
+        int32 $index = 0;
+
+        while (true) {
+            OctreeNode $node = $this->nodes[$index as usize];
+            if ($node->depth >= $this->maxDepth) {
+                return $index;
+            }
+
+            int32 $octant = octantOf($node->bounds, $box->center());
+            AABB $childBounds = octantBounds($node->bounds, $octant);
+            if (!$childBounds->scaled($this->looseness)->contains($box)) {
+                return $index;
+            }
+
+            if ($node->firstChild < 0) {
+                $this->split($index);
+                $node = $this->nodes[$index as usize];
+            }
+
+            $index = $node->firstChild + $octant;
+        }
+    }
+
+    /**
+     * Append eight children and point the node at them. Appending grows `$nodes`, so the parent is
+     * re-read by index and written back rather than held as a borrow across the growth.
+     */
+    private function split(int32 $index) : void
+    {
+        OctreeNode $parent = $this->nodes[$index as usize];
+        assert($parent->firstChild < 0, 'octree: node already split');
+        int32 $first = $this->nodes->count() as int32;
+        int32 $octant = 0;
+        while ($octant < 8) {
+            OctreeNode $child = OctreeNode();
+            $child->bounds = octantBounds($parent->bounds, $octant);
+            $child->loose = $child->bounds->scaled($this->looseness);
+            $child->depth = $parent->depth + 1;
+            $this->nodes[] = $child;
+            $octant = $octant + 1;
+        }
+
+        $parent->firstChild = $first;
+        $this->nodes[$index as usize] = $parent;
+    }
+
+    private function allocItem() : int32
+    {
+        if ($this->freeItem >= 0) {
+            int32 $slot = $this->freeItem;
+            $this->freeItem = $this->items[$slot as usize]->next;
+            return $slot;
+        }
+
+        int32 $slot = $this->items->count() as int32;
+        $this->items[] = OctreeItem();
+        return $slot;
+    }
+
+    private function link(int32 $node, int32 $slot) : void
+    {
+        OctreeNode $n = $this->nodes[$node as usize];
+        OctreeItem $item = $this->items[$slot as usize];
+        $item->prev = -1;
+        $item->next = $n->firstItem;
+        $this->items[$slot as usize] = $item;
+        if ($n->firstItem >= 0) {
+            OctreeItem $head = $this->items[$n->firstItem as usize];
+            $head->prev = $slot;
+            $this->items[$n->firstItem as usize] = $head;
+        }
+
+        $n->firstItem = $slot;
+        $n->itemCount = $n->itemCount + 1;
+        $this->nodes[$node as usize] = $n;
+    }
+
+    private function unlink(int32 $node, int32 $slot) : void
+    {
+        OctreeNode $n = $this->nodes[$node as usize];
+        OctreeItem $item = $this->items[$slot as usize];
+        if ($item->prev >= 0) {
+            OctreeItem $prev = $this->items[$item->prev as usize];
+            $prev->next = $item->next;
+            $this->items[$item->prev as usize] = $prev;
+        } else {
+            $n->firstItem = $item->next;
+        }
+
+        if ($item->next >= 0) {
+            OctreeItem $next = $this->items[$item->next as usize];
+            $next->prev = $item->prev;
+            $this->items[$item->next as usize] = $next;
+        }
+
+        $n->itemCount = $n->itemCount - 1;
+        $this->nodes[$node as usize] = $n;
+    }
+}
+
+/**
+ * Which of the eight children of `$node` holds `$point`: bit 0 is +x, bit 1 is +y, bit 2 is +z.
+ */
+internal function octantOf(const AABB& $node, Vec3 $point) : int32
+{
+    Vec3 $centre = $node->center();
+    int32 $octant = 0;
+    if ($point->x >= $centre->x) {
+        $octant = $octant | 1;
+    }
+
+    if ($point->y >= $centre->y) {
+        $octant = $octant | 2;
+    }
+
+    if ($point->z >= $centre->z) {
+        $octant = $octant | 4;
+    }
+
+    return $octant;
+}
+
+internal function octantBounds(const AABB& $node, int32 $octant) : AABB
+{
+    Vec3 $centre = $node->center();
+    Vec3 $lo = $node->min;
+    Vec3 $hi = $centre;
+    if (($octant & 1) != 0) {
+        $lo->x = $centre->x;
+        $hi->x = $node->max->x;
+    }
+
+    if (($octant & 2) != 0) {
+        $lo->y = $centre->y;
+        $hi->y = $node->max->y;
+    }
+
+    if (($octant & 4) != 0) {
+        $lo->z = $centre->z;
+        $hi->z = $node->max->z;
+    }
+
+    return AABB($lo, $hi);
+}

@@ -1,22 +1,39 @@
 /**
- * Turns an equirectangular HDRI into a cubemap, once.
- * The bake runs on the first frame that has one; `Device.beginRender` needs an open frame, so this cannot happen at load time.
- * Then the pass only imports the finished cube.
+ * Renders the environment cube: an equirectangular HDRI unwrapped once, or one probe state at a
+ * time from the procedural sky plus the app's capture callback.
+ * The render needs an open frame (`Device.beginRender`), so it cannot happen at load time.
+ * On frames with nothing to render the pass only imports the cube.
  */
 
 namespace visu::graphics;
 
 use visu::math::{Mat4, Vec4};
 
+// probe depth range in metres: a few decimetres to well past any terrain
+internal const float32 PROBE_NEAR = 0.5f;
+internal const float32 PROBE_FAR = 60000.0f;
+internal const float32 PROBE_VIEW_SAMPLES = 32.0f;
+internal const float32 PROBE_LIGHT_SAMPLES = 8.0f;
+
 public class EnvironmentPass : Pass
 {
     private DeferredGpu $gpu;
     private Environment $environment;
 
+    /**
+     * The state whose cube this frame renders, negative to leave the cube alone.
+     */
+    private int32 $state;
+
     public constructor(DeferredGpu $gpu, Environment $environment)
     {
         $this->gpu = $gpu;
         $this->environment = $environment;
+        $this->state = -1;
+
+        if ($environment->wantsCubeBake()) {
+            $this->state = $environment->nextState();
+        }
     }
 
     public function name() : string
@@ -31,17 +48,34 @@ public class EnvironmentPass : Pass
         $frame->set(EnvironmentData($ref, $cube->desc->mips));
 
         // the bake writes the cube; later passes read it, which orders them
-        if (!$this->environment->ready) {
+        if ($this->state >= 0) {
             $io->writes($ref);
         }
     }
 
     public function execute(RenderContext $ctx) : status<PipelineError>
     {
-        if ($this->environment->ready) {
+        if ($this->state < 0) {
             return .ok;
         }
 
+        if ($this->environment->procedural) {
+            guard $this->bakeSky($ctx) else ($e) {
+                return .error($e);
+            }
+        } else {
+            guard $this->bakeHdri($ctx) else ($e) {
+                return .error($e);
+            }
+        }
+
+        $ctx->device->generateMipmaps($this->environment->cube);
+        $this->environment->cubeDone($this->state);
+        return .ok;
+    }
+
+    private function bakeHdri(RenderContext $ctx) : status<PipelineError>
+    {
         Texture $cube = $this->environment->cube;
         Texture $source = $this->environment->equirect();
         ShaderProgram $program = guard $this->gpu->shaders->program('hdri_to_cubemap') else ($e) {
@@ -63,8 +97,61 @@ public class EnvironmentPass : Pass
             0,
             CaptureUniforms(captureProjection(), Mat4(), Vec4(0.0f, 0.0f, 0.0f, 0.0f))
         );
-        $device->generateMipmaps($cube);
-        $this->environment->cubeDone();
+        return .ok;
+    }
+
+    /**
+     * Six faces from the probe: the sky without its disk first, then whatever the app draws over it
+     * with the face camera at slot 1 and the sky still bound at slot 2.
+     */
+    private function bakeSky(RenderContext $ctx) : status<PipelineError>
+    {
+        Environment $env = $this->environment;
+        ShaderProgram $program = guard $this->gpu->shaders->program('bake_sky') else ($e) {
+            return .error(.shader($e));
+        }
+        Device $device = $ctx->device;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
+            return .cube($device);
+        });
+        Texture $depth = guard $env->probeDepth;
+        IblState $state = $env->states[$this->state as usize];
+        Sky $sky = $env->sky->withDirection($state->direction);
+        SkyUniforms $skyUniforms = skyUniforms($sky, $env->probe, false, PROBE_VIEW_SAMPLES, PROBE_LIGHT_SAMPLES);
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3(), captureRaster());
+        function<void(RenderContext, RenderEncoder, ProbeCapture)> $capture = $env->capture;
+        int32 $size = $env->cube->desc->width;
+        Mat4 $projection = captureProjection();
+        int32 $face = 0;
+
+        while ($face < CUBE_FACES) {
+            ColorTarget $color = ColorTarget($env->cube, face: $face, 0);
+            $color->load = .clear;
+            $color->store = .store;
+            $color->clear = Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+            DepthTarget $depthTarget = DepthTarget($depth);
+            $depthTarget->load = .clear;
+            $depthTarget->store = .dontCare;
+            $depthTarget->clearDepth = 1.0f;
+            RenderPassDesc $desc = RenderPassDesc();
+            $desc->colors[] = $color;
+            $desc->depth = $depthTarget;
+            RenderEncoder $enc = $device->beginRender($desc);
+            $pass->bind($enc);
+            CaptureUniforms $captureUniforms = CaptureUniforms($projection, captureView($face), Vec4(0.0f, 0.0f, 0.0f, 0.0f));
+            $enc->upload($captureUniforms, slot: 0);
+            $enc->upload($skyUniforms, slot: 2);
+            $mesh->draw($enc);
+            ProbeCapture $view = ProbeCapture(
+                probeCamera($face, $env->probe, $size, PROBE_NEAR, PROBE_FAR),
+                $skyUniforms,
+                $face
+            );
+            $capture($ctx, $enc, $view);
+            $enc->endRender();
+            $face = $face + 1;
+        }
+
         return .ok;
     }
 }

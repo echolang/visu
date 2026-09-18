@@ -1,0 +1,414 @@
+/**
+ * glTF 2.0 container and typed document. Reads `.glb` (JSON + BIN chunk) or `.gltf` with one
+ * sibling `.bin`, then parses nodes, meshes, accessors and material names once so later stages
+ * do not walk the JSON bag again.
+ */
+
+namespace visu::asset;
+
+use std::io;
+use json;
+use visu::math::{Mat4, Quat, Vec3, Vec4, scale, translate};
+
+internal struct GltfNode
+{
+    public string $name;
+    public int32 $mesh;
+    public array<int32> $children;
+    public Mat4 $local;
+
+    public constructor()
+    {
+        $this->name = '';
+        $this->mesh = -1;
+        $this->children = array<int32>();
+        $this->local = Mat4();
+    }
+}
+
+internal struct GltfPrim
+{
+    public int32 $mode;
+    public int32 $material;
+    public int32 $position;
+    public int32 $normal;
+    public int32 $tangent;
+    public int32 $uv;
+    public int32 $indices;
+
+    public constructor()
+    {
+        $this->mode = GLTF_TRIANGLES;
+        $this->material = -1;
+        $this->position = -1;
+        $this->normal = -1;
+        $this->tangent = -1;
+        $this->uv = -1;
+        $this->indices = -1;
+    }
+}
+
+internal struct GltfMesh
+{
+    public array<GltfPrim> $primitives;
+
+    public constructor()
+    {
+        $this->primitives = array<GltfPrim>();
+    }
+}
+
+/**
+ * Parsed file: one binary buffer and the arrays every later stage indexes.
+ */
+public class GltfFile
+{
+    public string $bin;
+    public array<GltfNode> $nodes;
+    public array<GltfMesh> $meshes;
+    public array<GltfAccessor> $accessors;
+    public array<string> $materials;
+    public array<int32> $roots;
+
+    public constructor(
+        string $bin,
+        array<GltfNode> $nodes,
+        array<GltfMesh> $meshes,
+        array<GltfAccessor> $accessors,
+        array<string> $materials,
+        array<int32> $roots
+    )
+    {
+        $this->bin = $bin;
+        $this->nodes = $nodes;
+        $this->meshes = $meshes;
+        $this->accessors = $accessors;
+        $this->materials = $materials;
+        $this->roots = $roots;
+    }
+
+    /**
+     * `.glb` by magic, otherwise JSON text whose `buffers[0].uri` names a file next to it.
+     */
+    public static function load(const string& $path) : result<GltfFile, GltfError>
+    {
+        string $bytes = guard io::readfile($path) else ($e) {
+            return .error(.io($path, $e->message()));
+        }
+        if ($bytes->size() >= 12 && gltfU32($bytes, 0) == GLB_MAGIC) {
+            return GltfFile::parseGlb($bytes);
+        }
+
+        return GltfFile::parseText($bytes, gltfDir($path));
+    }
+
+    public static function parseGlb(const string& $bytes) : result<GltfFile, GltfError>
+    {
+        if ($bytes->size() < 20 || gltfU32($bytes, 0) != GLB_MAGIC) {
+            return .error(.notGltf('bad magic'));
+        }
+
+        uint32 $version = gltfU32($bytes, 4);
+        if ($version != 2) {
+            return .error(.notGltf("glb version {$version}"));
+        }
+
+        usize $total = gltfU32($bytes, 8) as usize;
+        if ($total > $bytes->size()) {
+            return .error(.notGltf('truncated'));
+        }
+
+        usize $at = 12;
+        json::Value? $root = null;
+        string $bin = '';
+        while ($at + 8 <= $total) {
+            usize $len = gltfU32($bytes, $at) as usize;
+            uint32 $type = gltfU32($bytes, $at + 4);
+            $at = $at + 8;
+            if ($at + $len > $total) {
+                return .error(.notGltf('chunk past the end'));
+            }
+
+            if ($type == GLB_CHUNK_JSON) {
+                string $text = $bytes->sub($at, $len)->clone();
+                json::Value $parsed = guard json::parse($text) else ($e) {
+                    return .error(.json($e->message()));
+                }
+                $root = $parsed;
+            } else if ($type == GLB_CHUNK_BIN) {
+                $bin = $bytes->sub($at, $len)->clone();
+            }
+
+            // chunks are padded to four bytes
+            $at = $at + (($len + 3) / 4) * 4;
+        }
+
+        json::Value $json = guard $root else {
+            return .error(.notGltf('no JSON chunk'));
+        }
+        return gltfDocument($json, $bin);
+    }
+
+    /**
+     * A `.gltf` text file. The first buffer must be a plain relative uri; data uris are not decoded.
+     */
+    public static function parseText(const string& $text, const string& $dir) : result<GltfFile, GltfError>
+    {
+        json::Value $root = guard json::parse($text) else ($e) {
+            return .error(.json($e->message()));
+        }
+        array<json::Value> $buffers = gltfArray($root, 'buffers');
+        if ($buffers->count() == 0) {
+            return gltfDocument($root, '');
+        }
+
+        string $uri = gltfStr($buffers[0], 'uri', '');
+        if ($uri->empty()) {
+            return .error(.unsupported('a .gltf whose buffer has no uri'));
+        }
+
+        if ($uri->starts('data:')) {
+            return .error(.unsupported('base64 data uri; export as .glb or a sibling .bin'));
+        }
+
+        string $path = $dir;
+        $path->append($uri);
+        string $bin = guard io::readfile($path) else ($e) {
+            return .error(.io($path, $e->message()));
+        }
+        return gltfDocument($root, $bin);
+    }
+}
+
+internal function gltfDocument(json::Value $root, string $bin) : result<GltfFile, GltfError>
+{
+    if (!$root->isObject()) {
+        return .error(.json('root is not an object'));
+    }
+
+    array<GltfAccessor> $accessors = guard gltfParseAccessors($root, $bin) else ($e) {
+        return .error($e);
+    }
+    array<GltfNode> $nodes = guard gltfParseNodes($root) else ($e) {
+        return .error($e);
+    }
+    array<GltfMesh> $meshes = guard gltfParseMeshes($root) else ($e) {
+        return .error($e);
+    }
+    array<string> $materials = gltfParseMaterials($root);
+    array<int32> $roots = gltfSceneRoots($root, $nodes->count() as int32);
+    return .ok(GltfFile($bin, $nodes, $meshes, $accessors, $materials, $roots));
+}
+
+internal function gltfParseNodes(json::Value $root) : result<array<GltfNode>, GltfError>
+{
+    array<json::Value> $items = gltfArray($root, 'nodes');
+    array<GltfNode> $out = array<GltfNode>();
+    int32 $i = 0;
+    while (($i as usize) < $items->count()) {
+        json::Value $node = $items[$i as usize];
+        Mat4 $local = guard gltfLocal($node) else ($e) {
+            return .error($e);
+        }
+        GltfNode $parsed = GltfNode();
+        $parsed->name = gltfStr($node, 'name', "node_{$i}");
+        $parsed->mesh = (gltfInt($node, 'mesh') ?? -1) as int32;
+        $parsed->children = gltfChildIds($node, $items->count() as int32);
+        $parsed->local = $local;
+        $out[] = $parsed;
+        $i = $i + 1;
+    }
+
+    return .ok($out);
+}
+
+internal function gltfParseMeshes(json::Value $root) : result<array<GltfMesh>, GltfError>
+{
+    array<json::Value> $items = gltfArray($root, 'meshes');
+    array<GltfMesh> $out = array<GltfMesh>();
+    foreach ($items as $mesh) {
+        GltfMesh $parsed = GltfMesh();
+        $parsed->primitives = array<GltfPrim>();
+        array<json::Value> $prims = gltfArray($mesh, 'primitives');
+        foreach ($prims as $prim) {
+            $parsed->primitives[] = gltfParsePrim($prim);
+        }
+
+        $out[] = $parsed;
+    }
+
+    return .ok($out);
+}
+
+internal function gltfParsePrim(json::Value $prim) : GltfPrim
+{
+    GltfPrim $out = GltfPrim();
+    $out->mode = (gltfInt($prim, 'mode') ?? (GLTF_TRIANGLES as int64)) as int32;
+    $out->material = (gltfInt($prim, 'material') ?? -1) as int32;
+    $out->position = -1;
+    $out->normal = -1;
+    $out->tangent = -1;
+    $out->uv = -1;
+    $out->indices = (gltfInt($prim, 'indices') ?? -1) as int32;
+    json::Value? $attrs = $prim->get('attributes');
+    json::Value $attributes = guard $attrs else {
+        return $out;
+    }
+    $out->position = (gltfInt($attributes, 'POSITION') ?? -1) as int32;
+    $out->normal = (gltfInt($attributes, 'NORMAL') ?? -1) as int32;
+    $out->tangent = (gltfInt($attributes, 'TANGENT') ?? -1) as int32;
+    $out->uv = (gltfInt($attributes, 'TEXCOORD_0') ?? -1) as int32;
+    return $out;
+}
+
+internal function gltfParseMaterials(json::Value $root) : array<string>
+{
+    array<json::Value> $items = gltfArray($root, 'materials');
+    array<string> $out = array<string>();
+    int32 $i = 0;
+    while (($i as usize) < $items->count()) {
+        $out[] = gltfStr($items[$i as usize], 'name', "material_{$i}");
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function gltfChildIds(json::Value $node, int32 $nodeCount) : array<int32>
+{
+    array<int32> $out = array<int32>();
+    array<json::Value> $children = gltfArray($node, 'children');
+    foreach ($children as $c) {
+        int64? $n = $c->asInt();
+        if ($n == null) {
+            continue;
+        }
+
+        int32 $child = ($n ?? 0) as int32;
+        if ($child >= 0 && $child < $nodeCount) {
+            $out[] = $child;
+        }
+    }
+
+    return $out;
+}
+
+internal function gltfSceneRoots(json::Value $root, int32 $nodeCount) : array<int32>
+{
+    array<int32> $out = array<int32>();
+    array<json::Value> $scenes = gltfArray($root, 'scenes');
+    int32 $scene = (gltfInt($root, 'scene') ?? 0) as int32;
+    if ($scene >= 0 && ($scene as usize) < $scenes->count()) {
+        array<json::Value> $ids = gltfArray($scenes[$scene as usize], 'nodes');
+        foreach ($ids as $id) {
+            int64? $n = $id->asInt();
+            if ($n != null) {
+                int32 $index = ($n ?? 0) as int32;
+                if ($index >= 0 && $index < $nodeCount) {
+                    $out[] = $index;
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    array<bool> $isChild = array<bool>();
+    int32 $i = 0;
+    while ($i < $nodeCount) {
+        $isChild[] = false;
+        $i = $i + 1;
+    }
+
+    array<json::Value> $nodes = gltfArray($root, 'nodes');
+    foreach ($nodes as $node) {
+        array<int32> $children = gltfChildIds($node, $nodeCount);
+        foreach ($children as $child) {
+            $isChild[$child as usize] = true;
+        }
+    }
+
+    $i = 0;
+    while ($i < $nodeCount) {
+        if (!$isChild[$i as usize]) {
+            $out[] = $i;
+        }
+
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+/**
+ * A node's local matrix: `matrix` (column-major, 16 numbers) or translation * rotation * scale.
+ * A present `matrix` of the wrong length is an error, not a silent fallthrough to TRS.
+ */
+internal function gltfLocal(json::Value $node) : result<Mat4, GltfError>
+{
+    array<float32>? $m = gltfFloats($node, 'matrix');
+    if ($m != null) {
+        array<float32> $v = guard $m;
+        if ($v->count() != 16) {
+            return .error(.json('node matrix is not 16 numbers'));
+        }
+
+        return .ok(Mat4(
+            Vec4($v[0], $v[1], $v[2], $v[3]),
+            Vec4($v[4], $v[5], $v[6], $v[7]),
+            Vec4($v[8], $v[9], $v[10], $v[11]),
+            Vec4($v[12], $v[13], $v[14], $v[15])
+        ));
+    }
+
+    Mat4 $out = Mat4();
+    array<float32>? $t = gltfFloats($node, 'translation');
+    if ($t != null) {
+        array<float32> $v = guard $t;
+        if ($v->count() != 3) {
+            return .error(.json('node translation is not 3 numbers'));
+        }
+
+        $out = translate(Vec3($v[0], $v[1], $v[2]));
+    }
+
+    array<float32>? $r = gltfFloats($node, 'rotation');
+    if ($r != null) {
+        array<float32> $v = guard $r;
+        if ($v->count() != 4) {
+            return .error(.json('node rotation is not 4 numbers'));
+        }
+
+        $out = $out * Mat4(Quat($v[0], $v[1], $v[2], $v[3]));
+    }
+
+    array<float32>? $s = gltfFloats($node, 'scale');
+    if ($s != null) {
+        array<float32> $v = guard $s;
+        if ($v->count() != 3) {
+            return .error(.json('node scale is not 3 numbers'));
+        }
+
+        $out = $out * scale(Vec3($v[0], $v[1], $v[2]));
+    }
+
+    return .ok($out);
+}
+
+/**
+ * Directory of `$path` including the trailing separator, or empty for a bare file name.
+ */
+internal function gltfDir(const string& $path) : string
+{
+    usize $n = $path->size();
+    usize $i = $n;
+    while ($i > 0) {
+        $i = $i - 1;
+        uint8 $c = $path->byte($i);
+        if ($c == 47 || $c == 92) {
+            return $path->sub(0, $i + 1)->clone();
+        }
+    }
+
+    return '';
+}

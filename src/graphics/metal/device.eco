@@ -37,6 +37,8 @@ public class Device : DeviceProtocol
     internal map<string, SamplerHandle> $samplerHandles;
     internal map<uint32, mtl::DepthStencilState> $depthStates;
     internal PixelFormat $bbFormat;
+    public DrawCounters $draws;
+    public GpuScopes $gpuScopes;
 
     public constructor()
     {
@@ -72,6 +74,8 @@ public class Device : DeviceProtocol
         $this->samplerHandles = map<string, SamplerHandle>();
         $this->depthStates = map<uint32, mtl::DepthStencilState>();
         $this->bbFormat = .bgra8;
+        $this->draws = DrawCounters();
+        $this->gpuScopes = GpuScopes();
     }
 
     destructor()
@@ -219,6 +223,21 @@ public class Device : DeviceProtocol
             if (!$ready) {
                 return .error(.metal('beginFrame', 'gpu timeline wait timed out'));
             }
+
+            mtl::CommandBuffer $prev = guard $slot->prev else {
+                $slot->prev = null;
+                return $this->acquireFrame($width, $height);
+            }
+            float64 $t0 = $prev->gpuStart();
+            float64 $t1 = $prev->gpuEnd();
+            if ($t1 > $t0 && $t0 > 0.0) {
+                GpuScopeSample $sample = GpuScopeSample();
+                $sample->name = 'submit';
+                $sample->ns = ($t1 - $t0) * 1000000000.0;
+                array<GpuScopeSample> $resolved = array<GpuScopeSample>();
+                $resolved[] = $sample;
+                $this->gpuScopes->resolved = $resolved;
+            }
         }
         $slot->prev = null;
         return $this->acquireFrame($width, $height);
@@ -232,6 +251,7 @@ public class Device : DeviceProtocol
         FrameSlot $slot = $this->slots[$this->slot];
         mtl::CommandBuffer $cmd = guard $this->cmd else {
             $this->inFrame = false;
+            $this->draws->roll();
             return .ok;
         }
         $slot->epoch = $slot->epoch + 1;
@@ -243,6 +263,7 @@ public class Device : DeviceProtocol
             $this->inFrame = false;
             $this->frames = $this->frames + 1;
             $this->slot = ($this->slot + 1) % FRAMES_IN_FLIGHT;
+            $this->draws->roll();
             return .ok;
         }
 
@@ -255,6 +276,7 @@ public class Device : DeviceProtocol
         $this->inFrame = false;
         $this->frames = $this->frames + 1;
         $this->slot = ($this->slot + 1) % FRAMES_IN_FLIGHT;
+        $this->draws->roll();
         return .ok;
     }
 

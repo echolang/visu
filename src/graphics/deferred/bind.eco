@@ -1,6 +1,7 @@
 /**
- * Bind a pooled texture by graph ref. Shared by the light and SSAO passes;
- * a missing pool entry is a wiring bug surfaced as PipelineError.
+ * Bind a pooled texture by graph ref. Shared by deferred passes that sample
+ * GBuffer or SSAO; a missing pool entry is a wiring bug surfaced as PipelineError.
+ * Metal needs every GBuffer MRT attachment bound before any one is sampled.
  */
 
 namespace visu::graphics;
@@ -17,5 +18,67 @@ internal function bindPooled(
         return .error(.pool($e));
     }
     $enc->bindTexture($slot, $texture, $sampler);
+    return .ok;
+}
+
+internal function readGBuffer(IoSink $io, GBufferData $gbuffer) : void
+{
+    $io->reads($gbuffer->position);
+    $io->reads($gbuffer->normal);
+    $io->reads($gbuffer->albedo);
+    $io->reads($gbuffer->material);
+    $io->reads($gbuffer->emissive);
+}
+
+internal function readSsao(IoSink $io, Frame $frame) : void
+{
+    SsaoData? $ssao = $frame->find<SsaoData>();
+    if ($ssao != null) {
+        SsaoData $found = guard $ssao;
+        $io->reads($found->blurred);
+    }
+}
+
+internal function bindGBuffer(
+    RenderContext $ctx,
+    RenderEncoder $enc,
+    GBufferData $gbuffer,
+    Sampler $sampler
+) : status<PipelineError>
+{
+    array<TextureRef> $inputs = [
+        $gbuffer->position,
+        $gbuffer->normal,
+        $gbuffer->albedo,
+        $gbuffer->material,
+        $gbuffer->emissive,
+    ];
+    uint32 $slot = 0;
+
+    while ($slot < 5) {
+        guard bindPooled($ctx, $enc, $slot, $inputs[$slot as usize], $sampler) else ($e) {
+            return .error($e);
+        }
+        $slot = $slot + 1;
+    }
+
+    return .ok;
+}
+
+internal function bindSsaoOrWhite(
+    RenderContext $ctx,
+    RenderEncoder $enc,
+    DeferredGpu $gpu,
+    Sampler $sampler
+) : status<PipelineError>
+{
+    SsaoData? $ssao = $ctx->frame->find<SsaoData>();
+
+    if ($ssao != null) {
+        SsaoData $found = guard $ssao;
+        return bindPooled($ctx, $enc, 5, $found->blurred, $sampler);
+    }
+
+    $enc->bindTexture(5, $gpu->white, $sampler);
     return .ok;
 }

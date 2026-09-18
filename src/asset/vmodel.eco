@@ -1,0 +1,340 @@
+/**
+ * vmodel blob (`VMDL`): one model object as LOD levels over a shared vertex and index buffer.
+ * `CookedModel` is the CPU form the cooker writes and `decodeCookedModel` reads back without a GPU;
+ * `visu::graphics::decodeModel` turns it into buffers. Every vertex is `MODEL_VERTEX_BYTES`:
+ * position, normal, tangent (w is handedness), uv. Indices are absolute into the vertex buffer.
+ */
+
+namespace visu::asset;
+
+use visu::geo::AABB;
+use visu::graphics::{IndexType, indexWidth};
+use visu::math::Vec3;
+
+internal const string MODEL_MAGIC = 'VMDL';
+internal const uint16 MODEL_VERSION = 1;
+public const string KIND_MODEL = 'model';
+
+/**
+ * Bytes per cooked vertex: float32 x (3 + 3 + 4 + 2).
+ */
+public const int32 MODEL_VERTEX_BYTES = 48;
+
+/**
+ * The one vertex format v1 writes. Header field kept so a later format can coexist.
+ */
+public const uint32 MODEL_VERTEX_P3N3T4UV2 = 1;
+public const int32 MODEL_MAX_LODS = 6;
+
+/**
+ * An index range drawn with one material slot.
+ */
+public struct ModelPrimitive
+{
+    public int32 $slot = 0;
+    public int32 $firstIndex = 0;
+    public int32 $indexCount = 0;
+}
+
+/**
+ * One level of detail. `$distance` is where this level switches in (0 for level 0).
+ */
+public struct ModelLodDesc
+{
+    public float32 $distance;
+    public AABB $bounds;
+    public array<ModelPrimitive> $primitives;
+
+    public constructor()
+    {
+        $this->distance = 0.0f;
+        $this->bounds = AABB(Vec3(0.0f), Vec3(0.0f));
+        $this->primitives = array<ModelPrimitive>();
+    }
+}
+
+public class CookedModel
+{
+    /**
+     * Material slot names, the glTF material names. `Material` records in the folder sheet bind by these.
+     */
+    public array<string> $slots;
+    public array<ModelLodDesc> $lods;
+    public AABB $bounds;
+
+    /**
+     * Multiplies the measured distance before the LOD table is read.
+     */
+    public float32 $lodBias;
+
+    /**
+     * Instances further away than this are not drawn. 0 means never culled by distance.
+     */
+    public float32 $cullDistance;
+    public IndexType $indexType;
+    public string $vertices;
+    public string $indices;
+
+    public constructor(
+        array<string> $slots,
+        array<ModelLodDesc> $lods,
+        const AABB& $bounds,
+        float32 $lodBias,
+        float32 $cullDistance,
+        IndexType $indexType,
+        string $vertices,
+        string $indices
+    )
+    {
+        $this->slots = $slots;
+        $this->lods = $lods;
+        $this->bounds = $bounds;
+        $this->lodBias = $lodBias;
+        $this->cullDistance = $cullDistance;
+        $this->indexType = $indexType;
+        $this->vertices = $vertices;
+        $this->indices = $indices;
+    }
+
+    public const function vertexCount() : int32
+    {
+        return ($this->vertices->size() as int32) / MODEL_VERTEX_BYTES;
+    }
+
+    public const function indexCount() : int32
+    {
+        return ($this->indices->size() as int32) / indexWidth($this->indexType);
+    }
+}
+
+public function encodeModel(const CookedModel& $model) : result<Blob, AssetError>
+{
+    string $id = 'model';
+    int32 $slots = $model->slots->count() as int32;
+    int32 $lods = $model->lods->count() as int32;
+    if ($slots < 1 || $slots > 65535) {
+        return .error(.corrupt($id, 'slot count'));
+    }
+
+    if ($lods < 1 || $lods > MODEL_MAX_LODS) {
+        return .error(.corrupt($id, 'lod count'));
+    }
+
+    if ($model->vertices->empty() || ($model->vertices->size() as int32) % MODEL_VERTEX_BYTES != 0) {
+        return .error(.corrupt($id, 'vertex bytes'));
+    }
+
+    int32 $width = indexWidth($model->indexType);
+    if ($model->indices->empty() || ($model->indices->size() as int32) % $width != 0) {
+        return .error(.corrupt($id, 'index bytes'));
+    }
+
+    int32 $indexCount = $model->indexCount();
+    string $out = '';
+    putMagic($out, MODEL_MAGIC);
+    putU16($out, MODEL_VERSION);
+    putU16($out, 0);
+    putU32($out, MODEL_VERTEX_P3N3T4UV2);
+    putU8($out, $width as uint8);
+    putU8($out, $lods as uint8);
+    putU16($out, $slots as uint16);
+    putAabb($out, $model->bounds);
+    putF32($out, $model->lodBias);
+    putF32($out, $model->cullDistance);
+
+    foreach ($model->slots as $slot) {
+        putStr($out, $slot);
+    }
+
+    foreach ($model->lods as $lod) {
+        int32 $prims = $lod->primitives->count() as int32;
+        if ($prims < 0 || $prims > 65535) {
+            return .error(.corrupt($id, 'primitive count'));
+        }
+
+        putF32($out, $lod->distance);
+        putAabb($out, $lod->bounds);
+        putU16($out, $prims as uint16);
+        foreach ($lod->primitives as $prim) {
+            if ($prim->slot < 0 || $prim->slot >= $slots) {
+                return .error(.corrupt($id, 'primitive slot'));
+            }
+
+            if ($prim->firstIndex < 0 || $prim->indexCount < 1 || $prim->firstIndex + $prim->indexCount > $indexCount) {
+                return .error(.corrupt($id, 'primitive index range'));
+            }
+
+            putU16($out, $prim->slot as uint16);
+            putU32($out, $prim->firstIndex as uint32);
+            putU32($out, $prim->indexCount as uint32);
+        }
+    }
+
+    putU32($out, $model->vertexCount() as uint32);
+    putMagic($out, $model->vertices);
+    putU32($out, $indexCount as uint32);
+    putMagic($out, $model->indices);
+    return .ok(Blob($out));
+}
+
+public function decodeCookedModel(Assets $assets, Blob $blob) : result<CookedModel, AssetError>
+{
+    string $id = $assets->loading;
+    if ($id->empty()) {
+        $id = 'model';
+    }
+
+    string $s = $blob->bytes;
+    usize $i = 0;
+    guard getMagic($s, $i, MODEL_MAGIC, $id) else ($e) {
+        return .error($e);
+    }
+    uint16 $ver = guard getU16($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    if ($ver != MODEL_VERSION) {
+        return .error(.corrupt($id, 'unsupported version'));
+    }
+
+    uint16 $flags = guard getU16($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    uint32 $format = guard getU32($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    if ($format != MODEL_VERTEX_P3N3T4UV2) {
+        return .error(.corrupt($id, 'unknown vertex format'));
+    }
+
+    uint8 $width = guard getU8($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    IndexType $indexType = .uint16;
+    if ($width == 4) {
+        $indexType = .uint32;
+    } else if ($width != 2) {
+        return .error(.corrupt($id, 'index width'));
+    }
+
+    uint8 $lodCount = guard getU8($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    uint16 $slotCount = guard getU16($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    if ($lodCount < 1 || ($lodCount as int32) > MODEL_MAX_LODS || $slotCount < 1) {
+        return .error(.corrupt($id, 'lod or slot count'));
+    }
+
+    AABB $bounds = guard getAabb($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    float32 $lodBias = guard getF32($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    float32 $cullDistance = guard getF32($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+
+    array<string> $slots = array<string>();
+    int32 $n = 0;
+    while ($n < ($slotCount as int32)) {
+        string $slot = guard getStr($s, $i, $id) else ($e) {
+            return .error($e);
+        }
+        $slots[] = $slot;
+        $n = $n + 1;
+    }
+
+    array<ModelLodDesc> $lods = array<ModelLodDesc>();
+    int32 $l = 0;
+    while ($l < ($lodCount as int32)) {
+        ModelLodDesc $lod = ModelLodDesc();
+        float32 $distance = guard getF32($s, $i, $id) else ($e) {
+            return .error($e);
+        }
+        AABB $lodBounds = guard getAabb($s, $i, $id) else ($e) {
+            return .error($e);
+        }
+        uint16 $prims = guard getU16($s, $i, $id) else ($e) {
+            return .error($e);
+        }
+        $lod->distance = $distance;
+        $lod->bounds = $lodBounds;
+        int32 $p = 0;
+        while ($p < ($prims as int32)) {
+            uint16 $slot = guard getU16($s, $i, $id) else ($e) {
+                return .error($e);
+            }
+            uint32 $first = guard getU32($s, $i, $id) else ($e) {
+                return .error($e);
+            }
+            uint32 $count = guard getU32($s, $i, $id) else ($e) {
+                return .error($e);
+            }
+            if (($slot as int32) >= ($slotCount as int32)) {
+                return .error(.corrupt($id, 'primitive slot'));
+            }
+
+            $lod->primitives[] = ModelPrimitive($slot as int32, $first as int32, $count as int32);
+            $p = $p + 1;
+        }
+
+        $lods[] = $lod;
+        $l = $l + 1;
+    }
+
+    uint32 $vertexCount = guard getU32($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    usize $vertexBytes = ($vertexCount as usize) * (MODEL_VERTEX_BYTES as usize);
+    if ($vertexCount == 0 || $i + $vertexBytes > $s->size()) {
+        return .error(.corrupt($id, 'truncated vertices'));
+    }
+
+    string $vertices = $s->sub($i, $vertexBytes)->clone();
+    $i = $i + $vertexBytes;
+    uint32 $indexCount = guard getU32($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    usize $indexBytes = ($indexCount as usize) * ($width as usize);
+    if ($indexCount == 0 || $i + $indexBytes > $s->size()) {
+        return .error(.corrupt($id, 'truncated indices'));
+    }
+
+    string $indices = $s->sub($i, $indexBytes)->clone();
+    foreach ($lods as $lod) {
+        foreach ($lod->primitives as $prim) {
+            if ($prim->firstIndex + $prim->indexCount > ($indexCount as int32)) {
+                return .error(.corrupt($id, 'primitive index range'));
+            }
+        }
+    }
+
+    return .ok(CookedModel($slots, $lods, $bounds, $lodBias, $cullDistance, $indexType, $vertices, $indices));
+}
+
+internal function putAabb(string& $out, const AABB& $box) : void
+{
+    putF32($out, $box->min->x);
+    putF32($out, $box->min->y);
+    putF32($out, $box->min->z);
+    putF32($out, $box->max->x);
+    putF32($out, $box->max->y);
+    putF32($out, $box->max->z);
+}
+
+internal function getAabb(const string& $s, usize& $i, const string& $id) : result<AABB, AssetError>
+{
+    float32[6] $v;
+    int32 $k = 0;
+    while ($k < 6) {
+        float32 $f = guard getF32($s, $i, $id) else ($e) {
+            return .error($e);
+        }
+        $v[$k] = $f;
+        $k = $k + 1;
+    }
+
+    return .ok(AABB(Vec3($v[0], $v[1], $v[2]), Vec3($v[3], $v[4], $v[5])));
+}

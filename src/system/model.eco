@@ -1,0 +1,734 @@
+/**
+ * Draws every `StaticModel` and `DynamicModel` into the GBuffer. Statics are placed once into an
+ * octree with a baked world matrix and culled by it; dynamics read their `Transform` every frame
+ * and are culled per instance by the draw-call assembler. Both pick a LOD by distance and batch by
+ * material through one `DrawCallAssembler`. Models and textures come from the `ModelBank`, which
+ * outlives the scene; the assembler's mesh handles are this system's and die with it.
+ * GPU acquisition happens in `render`, never inside the pass: an open encoder allows no uploads.
+ */
+
+namespace visu::system;
+
+use visu::app::{Flags, flags, info};
+use visu::asset::MODEL_MAX_LODS;
+use visu::components::{DynamicModel, StaticModel};
+use visu::ecs::{Entities, Entity, Schedule, System};
+use visu::geo::{AABB, Octree, OctreeHandle, OctreeNodeInfo, Transform, octreeDepthFor};
+use visu::graphics::{
+    CallbackPass, CameraData, DebugLines, DeferredRenderer, DrawCallAssembler, Frame, GBufferData,
+    GBufferGeometry, GpuPass, IoSink, MaterialGpu, MeshHandle, Model, ModelBank, ModelInstanceData,
+    Pipeline, PipelineError, Raster, RenderContext, RenderEncoder, ShaderProgram, VertexLayout,
+    debugLinePass, lodIndex, modelLayout
+};
+use visu::math::{Mat4, Vec3, Vec4, length};
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+/**
+ * Metres the finest octree cell aims for. The tree's depth is derived from this and the world box
+ * rather than fixed: a depth that indexes a 4 km estate finely leaves a 40 km one barely sorted.
+ */
+internal const float32 MODEL_OCTREE_LEAF = 32.0f;
+
+/**
+ * One model's assembler handles, lod-major: level `l` is `$handles[$lodStart[l] .. $lodStart[l + 1])`.
+ */
+internal class ModelHandles
+{
+    public Model $model;
+    public array<MeshHandle> $handles;
+    public array<int32> $lodStart;
+
+    public constructor(Model $model)
+    {
+        $this->model = $model;
+        $this->handles = array<MeshHandle>();
+        $this->lodStart = array<int32>();
+    }
+}
+
+/**
+ * A placed static: what the octree item id points at.
+ */
+internal struct StaticInstance
+{
+    public Entity $entity;
+    public int32 $handles;
+    public Mat4 $world;
+    public AABB $bounds;
+    public Vec4 $tint;
+    public float32 $lodBias;
+    public OctreeHandle $octree;
+    public bool $live;
+
+    public constructor()
+    {
+        $this->entity = Entity::none();
+        $this->handles = -1;
+        $this->world = Mat4();
+        $this->bounds = AABB(Vec3(0.0f), Vec3(0.0f));
+        $this->tint = Vec4(1.0f);
+        $this->lodBias = 1.0f;
+        $this->octree = OctreeHandle::none();
+        $this->live = false;
+    }
+}
+
+public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
+{
+    public ModelBank $bank;
+    public DeferredRenderer $renderer;
+
+    /**
+     * Global LOD distance multiplier. Console `model lod <bias>` or the `model.lod` flag;
+     * below 1 keeps detail further out.
+     */
+    public float32 $lodBias;
+    public bool $wireframe;
+
+    /**
+     * Draw each submitted instance's world bounds, coloured by the LOD level it drew at.
+     * Console `model bounds on`, or the `model.bounds` flag.
+     */
+    public bool $showBounds;
+
+    /**
+     * Draw the octree cells that still hold something, brighter the deeper they sit.
+     * Console `model octree on`, or the `model.octree` flag.
+     */
+    public bool $showOctree;
+
+    /**
+     * `Flags.version` last applied, so a flag set at runtime lands without fighting the console verb.
+     */
+    private int32 $flagsSeen;
+
+    /**
+     * Counts from the last draw, for the console and tests.
+     */
+    public int32 $staticCount;
+    public int32 $dynamicCount;
+    public int32 $submitted;
+    public int32 $distanceCulled;
+    public array<int32> $lodHistogram;
+    private Octree $octree;
+    private DrawCallAssembler<ModelInstanceData> $dca;
+    private VertexLayout $layout;
+    private GpuPass? $opaque;
+    private GpuPass? $doubleSided;
+    private map<string, int32> $modelIndex;
+    private array<ModelHandles> $models;
+    private array<StaticInstance> $statics;
+    private array<int32> $freeStatics;
+    private map<Entity, int32> $staticOf;
+    private map<Entity, int32> $dynamicOf;
+    private array<uint32> $visible;
+    private DebugLines $lines;
+    private GpuPass? $linePass;
+    private array<OctreeNodeInfo> $cells;
+    private int32 $detachStatic;
+    private int32 $detachDynamic;
+
+    /**
+     * `$world` bounds the octree; statics outside it still draw, from the root node.
+     */
+    public constructor(ModelBank $bank, DeferredRenderer $renderer, const AABB& $world)
+    {
+        $this->bank = $bank;
+        $this->renderer = $renderer;
+        $this->lodBias = flags()->float('model.lod', 1.0) as float32;
+        $this->wireframe = flags()->bool('model.wire', false);
+        $this->showBounds = flags()->bool('model.bounds', false);
+        $this->showOctree = flags()->bool('model.octree', false);
+        $this->flagsSeen = flags()->version;
+        $this->staticCount = 0;
+        $this->dynamicCount = 0;
+        $this->submitted = 0;
+        $this->distanceCulled = 0;
+        $this->lodHistogram = array<int32>();
+        int32 $i = 0;
+        while ($i < MODEL_MAX_LODS) {
+            $this->lodHistogram[] = 0;
+            $i = $i + 1;
+        }
+
+        $this->octree = Octree($world, octreeDepthFor($world, MODEL_OCTREE_LEAF));
+        $this->dca = DrawCallAssembler<ModelInstanceData>($bank->device);
+        $this->layout = modelLayout();
+        $this->opaque = null;
+        $this->doubleSided = null;
+        $this->modelIndex = map<string, int32>();
+        $this->models = array<ModelHandles>();
+        $this->statics = array<StaticInstance>();
+        $this->freeStatics = array<int32>();
+        $this->staticOf = map<Entity, int32>();
+        $this->dynamicOf = map<Entity, int32>();
+        $this->visible = array<uint32>();
+        $this->lines = DebugLines($bank->device);
+        $this->linePass = null;
+        $this->cells = array<OctreeNodeInfo>();
+        $this->detachStatic = -1;
+        $this->detachDynamic = -1;
+    }
+
+    /**
+     * A detached static leaves the octree at once, before its entity is reused.
+     */
+    public function register(Entities $entities) : void
+    {
+        ModelSystem $sys = $this;
+        $this->detachStatic = $entities->onDetach<StaticModel>(function(Entities $w, Entity $e, const StaticModel& $c) : void {
+            $sys->release($e);
+        });
+        $this->detachDynamic = $entities->onDetach<DynamicModel>(function(Entities $w, Entity $e, const DynamicModel& $c) : void {
+            $sys->forgetDynamic($e);
+        });
+    }
+
+    /**
+     * Drop handles, octree and statics. The bank keeps the models. Caller waitIdle first.
+     */
+    public function unregister(Entities $entities) : void
+    {
+        if ($this->detachStatic >= 0) {
+            $entities->releaseOnDetach($this->detachStatic);
+            $this->detachStatic = -1;
+        }
+
+        if ($this->detachDynamic >= 0) {
+            $entities->releaseOnDetach($this->detachDynamic);
+            $this->detachDynamic = -1;
+        }
+
+        $this->dca->clearMeshes();
+        $this->models->clear();
+        $this->modelIndex->clear();
+        $this->octree->clear();
+        $this->statics->clear();
+        $this->freeStatics->clear();
+        $this->staticOf->clear();
+        $this->dynamicOf->clear();
+        $this->lines->clear();
+        $this->cells->clear();
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+    }
+
+    public function update(Entities $entities) : void
+    {
+        Flags $bag = flags();
+        if ($bag->version == $this->flagsSeen) {
+            return;
+        }
+
+        $this->flagsSeen = $bag->version;
+        if ($bag->has('model.lod')) {
+            $this->lodBias = $bag->float('model.lod', $this->lodBias as float64) as float32;
+        }
+
+        if ($bag->has('model.wire')) {
+            bool $wire = $bag->bool('model.wire', $this->wireframe);
+            if ($wire != $this->wireframe) {
+                $this->wireframe = $wire;
+                $this->opaque = null;
+                $this->doubleSided = null;
+            }
+        }
+
+        if ($bag->has('model.bounds')) {
+            $this->showBounds = $bag->bool('model.bounds', $this->showBounds);
+        }
+
+        if ($bag->has('model.octree')) {
+            $this->showOctree = $bag->bool('model.octree', $this->showOctree);
+        }
+    }
+
+    /**
+     * Acquire models for new components and place new statics. Runs before any pass executes.
+     */
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+        $this->ensurePasses();
+        foreach ($entities->view<StaticModel>() as $id => &$static) {
+            if ($this->staticOf->has($id)) {
+                continue;
+            }
+
+            int32 $handles = $this->acquire($static->model);
+            if ($handles < 0) {
+                continue;
+            }
+
+            Transform& $t = $entities->get<Transform>($id);
+            $this->staticOf[$id] = $this->place($id, $handles, $t->world($entities), $static->tint, $static->lodBias);
+        }
+
+        foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
+            if ($this->dynamicOf->has($id)) {
+                continue;
+            }
+
+            int32 $handles = $this->acquire($dynamic->model);
+            if ($handles < 0) {
+                continue;
+            }
+
+            $this->dynamicOf[$id] = $handles;
+        }
+    }
+
+    /**
+     * Re-place a static whose Transform moved. It rejoins the octree on the next render.
+     */
+    public function restatic(Entities $entities, Entity $e) : void
+    {
+        $this->release($e);
+    }
+
+    /**
+     * One pass that writes the GBuffer with every visible instance.
+     */
+    public function fill(Entities $entities, RenderContext $ctx, GBufferData $gbuffer) : void
+    {
+        ModelSystem $sys = $this;
+        Entities $world = $entities;
+        $ctx->pipeline->add(CallbackPass(
+            'models',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($gbuffer->target);
+            },
+            execute: function(RenderContext $inner) : status<PipelineError> {
+                return $sys->draw($world, $inner, $gbuffer);
+            }
+        ));
+    }
+
+    /**
+     * Cull, pick LODs, build the batches and record them. No-op before CameraSystem published.
+     */
+    public function draw(Entities $entities, RenderContext $ctx, GBufferData $gbuffer) : status<PipelineError>
+    {
+        CameraData $camera = guard $ctx->frame->find<CameraData>() else {
+            return .ok;
+        }
+        GpuPass $opaque = guard $this->opaque else {
+            return .ok;
+        }
+        GpuPass $twoSided = guard $this->doubleSided else {
+            return .ok;
+        }
+        $this->submitAll($entities, $camera, $ctx->compensation);
+        $this->dca->build($camera->frustum, $camera->position);
+        bool $geometry = $this->dca->commandCount() > 0;
+        if (!$geometry && $this->lines->empty()) {
+            return .ok;
+        }
+
+        RenderEncoder $enc = guard $ctx->beginRender($gbuffer->target) else ($e) {
+            return .error($e);
+        }
+        $this->renderer->bindCamera($enc);
+        ModelBank $bank = $this->bank;
+        if ($geometry) {
+            $this->dca->execute($enc, function(RenderEncoder $e, int32 $material) : void {
+                MaterialGpu $m = $bank->material($material);
+                if ($m->doubleSided) {
+                    $twoSided->bind($e);
+                } else {
+                    $opaque->bind($e);
+                }
+
+                $m->bind($e);
+            });
+        }
+
+        $this->drawLines($enc);
+        $enc->endRender();
+        return .ok;
+    }
+
+    /**
+     * The overlay shares the model pass: same target, same camera, so it depth-tests against the
+     * geometry it describes. The vertices go through the frame's transient ring, not a buffer.
+     */
+    private function drawLines(RenderEncoder $enc) : void
+    {
+        if ($this->lines->empty()) {
+            return;
+        }
+
+        GpuPass $pass = guard $this->linePass else {
+            return;
+        }
+        $pass->bind($enc);
+        $this->lines->draw($enc);
+    }
+
+    public const function commandCount() : int32
+    {
+        return $this->dca->commandCount();
+    }
+
+    public const function frustumCulled() : int32
+    {
+        return $this->dca->culledCount();
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('model', $this);
+        array<string> $names = array<string>();
+        $names[] = 'model';
+        return $names;
+    }
+
+    /**
+     * `model` prints the last frame's counts; `model lod <bias>`, `model wire`, `model bounds` and
+     * `model octree` tune what is drawn.
+     */
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        ModelConsoleAction $action = parseModelConsole($cmd);
+        match ($action) {
+            ModelConsoleAction::status => {
+                $this->printStatus($console);
+            },
+            ModelConsoleAction::usage => {
+                $console->writeLine('usage: model [lod <bias>|wire [on|off]|bounds [on|off]|octree [on|off]]');
+            },
+            ModelConsoleAction::lod($bias) => {
+                $this->setLodBias($console, $bias);
+            },
+            ModelConsoleAction::wire($on) => {
+                $this->setWireframe($console, $on);
+            },
+            ModelConsoleAction::wireToggle => {
+                $this->setWireframe($console, !$this->wireframe);
+            },
+            ModelConsoleAction::bounds($on) => {
+                $this->setBounds($console, $on);
+            },
+            ModelConsoleAction::boundsToggle => {
+                $this->setBounds($console, !$this->showBounds);
+            },
+            ModelConsoleAction::octree($on) => {
+                $this->setOctree($console, $on);
+            },
+            ModelConsoleAction::octreeToggle => {
+                $this->setOctree($console, !$this->showOctree);
+            },
+        };
+    }
+
+    private function printStatus(DebugConsole $console) : void
+    {
+        int32 $commands = $this->dca->commandCount();
+        int32 $culled = $this->dca->culledCount();
+        int32 $models = $this->models->count() as int32;
+        $console->writeLine("model: {$models} models, {$this->staticCount} static, {$this->dynamicCount} dynamic");
+        $console->writeLine("model: {$this->submitted} submitted, {$this->distanceCulled} past cull distance, {$culled} frustum culled, {$commands} draws");
+        string $hist = '';
+        int32 $i = 0;
+        while ($i < MODEL_MAX_LODS) {
+            int32 $n = $this->lodHistogram[$i as usize];
+            $hist->append(" lod{$i}={$n}");
+            $i = $i + 1;
+        }
+
+        $console->writeLine("model: bias {$this->lodBias}{$hist}");
+        int32 $segments = $this->lines->count();
+        int32 $cells = $this->octree->nodeCount();
+        $console->writeLine("model: octree {$cells} cells, overlay {$segments} segments");
+    }
+
+    private function setBounds(DebugConsole $console, bool $on) : void
+    {
+        $this->showBounds = $on;
+        if ($on) {
+            $console->writeLine('model: bounds on, green lod0 through magenta lod4');
+            return;
+        }
+
+        $console->writeLine('model: bounds off');
+    }
+
+    private function setOctree(DebugConsole $console, bool $on) : void
+    {
+        $this->showOctree = $on;
+        if ($on) {
+            $console->writeLine('model: octree on');
+            return;
+        }
+
+        $console->writeLine('model: octree off');
+    }
+
+    private function setLodBias(DebugConsole $console, float32 $bias) : void
+    {
+        if ($bias <= 0.0f) {
+            $console->writeLine('model: lod bias must be positive');
+            return;
+        }
+
+        $this->lodBias = $bias;
+        $console->writeLine("model: lod bias {$bias}");
+    }
+
+    private function setWireframe(DebugConsole $console, bool $on) : void
+    {
+        $this->wireframe = $on;
+        $this->opaque = null;
+        $this->doubleSided = null;
+        if ($on) {
+            $console->writeLine('model: wire');
+            return;
+        }
+
+        $console->writeLine('model: fill');
+    }
+
+    /**
+     * Query the octree for statics, walk the dynamics, submit each at its LOD.
+     */
+    private function submitAll(Entities $entities, CameraData $camera, float32 $alpha) : void
+    {
+        $this->dca->clearInstances();
+        $this->submitted = 0;
+        $this->distanceCulled = 0;
+        $this->dynamicCount = 0;
+        int32 $i = 0;
+        while ($i < MODEL_MAX_LODS) {
+            $this->lodHistogram[$i as usize] = 0;
+            $i = $i + 1;
+        }
+
+        $this->lines->clear();
+        if ($this->showOctree) {
+            $this->drawOctree();
+        }
+
+        Vec3 $eye = $camera->position;
+        $this->visible->clear();
+        $this->octree->query($camera->frustum, $this->visible);
+        foreach ($this->visible as $id) {
+            StaticInstance $inst = $this->statics[$id as usize];
+            if (!$inst->live) {
+                continue;
+            }
+
+            ModelHandles $h = $this->models[$inst->handles as usize];
+            $this->submitInstance($h, $inst->world, $inst->bounds, $inst->tint, $inst->lodBias, $eye, true);
+        }
+
+        foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
+            if (!$this->dynamicOf->has($id)) {
+                continue;
+            }
+
+            $this->dynamicCount = $this->dynamicCount + 1;
+            ModelHandles $h = $this->models[$this->dynamicOf[$id] as usize];
+            Transform& $t = $entities->get<Transform>($id);
+            Mat4 $world = $t->world($entities, $alpha);
+            AABB $bounds = $h->model->bounds->transformed($world);
+            $this->submitInstance($h, $world, $bounds, $dynamic->tint, $dynamic->lodBias, $eye, false);
+        }
+    }
+
+    private function submitInstance(
+        ModelHandles $h,
+        const Mat4& $world,
+        const AABB& $bounds,
+        Vec4 $tint,
+        float32 $lodBias,
+        Vec3 $eye,
+        bool $ignoreCull
+    ) : void
+    {
+        float32 $dist = length($bounds->closest($eye) - $eye);
+        if ($h->model->cullDistance > 0.0f && $dist > $h->model->cullDistance) {
+            $this->distanceCulled = $this->distanceCulled + 1;
+            return;
+        }
+
+        int32 $lod = lodIndex($h->model->lods, $dist, $h->model->lodBias * $lodBias * $this->lodBias);
+        if ($this->showBounds) {
+            $this->lines->box($bounds, lodColor($lod));
+        }
+
+        $this->submitLod($h, $lod, $world, $tint, $ignoreCull);
+    }
+
+    /**
+     * The cells statics actually sit in, brighter the deeper they sit. Only cells holding items of
+     * their own are drawn: the ancestors are implied, and a tree spanning the whole map would
+     * otherwise bury the interesting cells under a handful of kilometre-wide boxes.
+     */
+    private function drawOctree() : void
+    {
+        $this->cells->clear();
+        $this->octree->nodes($this->cells);
+        foreach ($this->cells as $cell) {
+            if ($cell->items == 0) {
+                continue;
+            }
+
+            $this->lines->box($cell->bounds, octreeColor($cell->depth));
+        }
+    }
+
+    private function submitLod(ModelHandles $h, int32 $lod, const Mat4& $world, Vec4 $tint, bool $ignoreCull) : void
+    {
+        int32 $level = $lod;
+        if ($level < 0) {
+            $level = 0;
+        }
+
+        if ($level >= MODEL_MAX_LODS) {
+            $level = MODEL_MAX_LODS - 1;
+        }
+
+        $this->lodHistogram[$level as usize] = $this->lodHistogram[$level as usize] + 1;
+        $this->submitted = $this->submitted + 1;
+        int32 $start = $h->lodStart[$lod as usize];
+        int32 $end = $h->lodStart[($lod + 1) as usize];
+        int32 $i = $start;
+        while ($i < $end) {
+            $this->dca->submit($h->handles[$i as usize], $world, ModelInstanceData($tint), 0.0f, $ignoreCull);
+            $i = $i + 1;
+        }
+    }
+
+    /**
+     * The handle table for a model id: the bank's model registered into this scene's assembler.
+     * -1 when the model cannot be loaded; the failure is logged once.
+     */
+    private function acquire(const string& $id) : int32
+    {
+        if ($this->modelIndex->has($id)) {
+            return $this->modelIndex[$id];
+        }
+
+        Model $model = guard $this->bank->acquire($id) else ($e) {
+            string $why = $e->message();
+            info("model: '{$id}' could not be loaded: {$why}");
+            $this->modelIndex[$id] = -1;
+            return -1;
+        }
+        ModelHandles $h = ModelHandles($model);
+        foreach ($model->lods as $lod) {
+            $h->lodStart[] = $h->handles->count() as int32;
+            foreach ($lod->primitives as $prim) {
+                MaterialGpu $m = $this->bank->materialOf($model, $prim->slot);
+                $h->handles[] = $this->dca->register(
+                    $model->mesh,
+                    $lod->bounds,
+                    firstIndex: $prim->firstIndex,
+                    indexCount: $prim->indexCount,
+                    material: $m->index
+                );
+            }
+        }
+
+        $h->lodStart[] = $h->handles->count() as int32;
+        int32 $index = $this->models->count() as int32;
+        $this->models[] = $h;
+        $this->modelIndex[$id] = $index;
+        return $index;
+    }
+
+    /**
+     * Record a static and insert it into the octree. The record index is the octree item id.
+     */
+    private function place(Entity $e, int32 $handles, const Mat4& $world, Vec4 $tint, float32 $lodBias) : int32
+    {
+        ModelHandles $h = $this->models[$handles as usize];
+        StaticInstance $inst = StaticInstance();
+        $inst->entity = $e;
+        $inst->handles = $handles;
+        $inst->world = $world;
+        $inst->bounds = $h->model->bounds->transformed($world);
+        $inst->tint = $tint;
+        $inst->lodBias = $lodBias;
+        $inst->live = true;
+        int32 $slot = -1;
+        if ($this->freeStatics->count() > 0) {
+            usize $last = $this->freeStatics->count() - 1;
+            $slot = $this->freeStatics[$last];
+            $this->freeStatics->pop();
+        } else {
+            $slot = $this->statics->count() as int32;
+            $this->statics[] = $inst;
+        }
+
+        $inst->octree = $this->octree->insert($inst->bounds, $slot as uint32);
+        $this->statics[$slot as usize] = $inst;
+        $this->staticCount = $this->staticCount + 1;
+        return $slot;
+    }
+
+    /**
+     * Take a static out of the octree and free its record.
+     */
+    internal function release(Entity $e) : void
+    {
+        if (!$this->staticOf->has($e)) {
+            return;
+        }
+
+        int32 $slot = $this->staticOf[$e];
+        $this->staticOf->remove($e);
+        if ($slot < 0 || ($slot as usize) >= $this->statics->count()) {
+            return;
+        }
+
+        StaticInstance $inst = $this->statics[$slot as usize];
+        if (!$inst->live) {
+            return;
+        }
+
+        $this->octree->remove($inst->octree);
+        $inst->live = false;
+        $inst->octree = OctreeHandle::none();
+        $this->statics[$slot as usize] = $inst;
+        $this->freeStatics[] = $slot;
+        $this->staticCount = $this->staticCount - 1;
+    }
+
+    internal function forgetDynamic(Entity $e) : void
+    {
+        if ($this->dynamicOf->has($e)) {
+            $this->dynamicOf->remove($e);
+        }
+    }
+
+    /**
+     * The two GpuPasses (back-face culled and double-sided) once the renderer has linked `model`.
+     */
+    private function ensurePasses() : void
+    {
+        if ($this->opaque != null) {
+            return;
+        }
+
+        ShaderProgram $program = guard $this->renderer->program('model') else {
+            return;
+        }
+        Raster $raster = Raster::opaque();
+        $raster->cull = .back;
+        if ($this->wireframe) {
+            $raster->fill = .lines;
+        }
+
+        $this->opaque = GpuPass($program, $this->layout, $raster);
+        Raster $open = $raster;
+        $open->cull = .none;
+        $this->doubleSided = GpuPass($program, $this->layout, $open);
+        ShaderProgram $lines = guard $this->renderer->program('debug_lines') else {
+            return;
+        }
+        $this->linePass = debugLinePass($lines);
+    }
+}

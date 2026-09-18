@@ -1,0 +1,53 @@
+/**
+ * Manifest JSON shape round-trips through libjson. No GPU.
+ */
+
+use visu::app::Flags;
+use visu::dcapture::{DumpRecord, Manifest};
+
+test manifest_round_trips
+{
+    Manifest $m = Manifest();
+    $m->frames = 31;
+    $m->ticks = 30;
+    $m->dumps[] = DumpRecord('scene', 'var/dcapture/0030_top_scene.png', 30, 'top');
+    $m->events[] = 'frame 30: steps[0] at frame 30';
+    $m->errors[] = 'nope: matches nothing';
+    array<string> $catalog = ['scene', 'pbr.gbuffer.albedo'];
+    $m->catalog = $catalog;
+    Flags $flags = Flags();
+    $flags->parse('terrain.wireframe', 'true');
+    $flags->parse('scene', 'play');
+    $flags->parse('sky.hour', '10.5');
+    $flags->parse('n', '3');
+
+    json::Value $root = $m->toJson($flags);
+    string $text = json::pretty($root);
+    json::Value $back = guard json::parse($text) else ($e) {
+        die($e->message());
+    }
+    assert(($back['frames']->asInt() ?? 0) == 31, 'frames');
+    assert(($back['ticks']->asInt() ?? 0) == 30, 'ticks');
+    assert($back['dumps']->count() == 1, 'one dump');
+    json::Value $first = $back['dumps'][0 as usize];
+    assert(($first['name']->asStr() ?? '') == 'scene', 'dump name');
+    assert(($first['frame']->asInt() ?? 0) == 30, 'dump frame');
+    assert(($first['label']->asStr() ?? '') == 'top', 'dump label');
+    assert($back['events']->count() == 1, 'events');
+    assert($back['errors']->count() == 1, 'errors');
+    assert($back['skipped']->count() == 0, 'skipped');
+    assert($back['catalog']->count() == 2, 'catalog');
+    json::Value $flagsBack = $back['flags'];
+    assert(($flagsBack['terrain.wireframe']->asBool() ?? false), 'bool flag');
+    assert(($flagsBack['scene']->asStr() ?? '') == 'play', 'text flag');
+    assert(($flagsBack['sky.hour']->asFloat() ?? 0.0) == 10.5, 'float flag');
+    assert(($flagsBack['n']->asInt() ?? 0) == 3, 'int flag');
+}
+
+test manifest_without_catalog_omits_key
+{
+    Manifest $m = Manifest();
+    json::Value $root = $m->toJson(Flags());
+    assert($root->get('catalog') == null, 'no catalog key');
+    assert($root->get('dumps') != null, 'dumps key present');
+}

@@ -8,7 +8,8 @@
 
 namespace visu::graphics;
 
-use visu::math::{Mat4, Vec3, clipZeroOne, lookAt, perspective, radians};
+use visu::geo::Frustum;
+use visu::math::{Mat4, Vec3, clipZeroOne, inverse, lookAt, perspective, radians};
 
 public const int32 CUBE_FACES = 6;
 
@@ -26,29 +27,99 @@ public function captureProjection() : Mat4
 
 public function captureView(int32 $face) : Mat4
 {
-    Vec3 $origin = Vec3(0.0f, 0.0f, 0.0f);
+    return captureView($face, Vec3(0.0f, 0.0f, 0.0f));
+}
 
+/**
+ * The same six views from `$eye`, for a probe that photographs a scene rather than a sky.
+ */
+public function captureView(int32 $face, Vec3 $eye) : Mat4
+{
     if ($face == 0) {
-        return lookAt(eye: $origin, center: Vec3(1.0f, 0.0f, 0.0f), up: Vec3(0.0f, -1.0f, 0.0f));
+        return lookAt(eye: $eye, center: $eye + Vec3(1.0f, 0.0f, 0.0f), up: Vec3(0.0f, -1.0f, 0.0f));
     }
 
     if ($face == 1) {
-        return lookAt(eye: $origin, center: Vec3(-1.0f, 0.0f, 0.0f), up: Vec3(0.0f, -1.0f, 0.0f));
+        return lookAt(eye: $eye, center: $eye + Vec3(-1.0f, 0.0f, 0.0f), up: Vec3(0.0f, -1.0f, 0.0f));
     }
 
     if ($face == 2) {
-        return lookAt(eye: $origin, center: Vec3(0.0f, 1.0f, 0.0f), up: Vec3(0.0f, 0.0f, 1.0f));
+        return lookAt(eye: $eye, center: $eye + Vec3(0.0f, 1.0f, 0.0f), up: Vec3(0.0f, 0.0f, 1.0f));
     }
 
     if ($face == 3) {
-        return lookAt(eye: $origin, center: Vec3(0.0f, -1.0f, 0.0f), up: Vec3(0.0f, 0.0f, -1.0f));
+        return lookAt(eye: $eye, center: $eye + Vec3(0.0f, -1.0f, 0.0f), up: Vec3(0.0f, 0.0f, -1.0f));
     }
 
     if ($face == 4) {
-        return lookAt(eye: $origin, center: Vec3(0.0f, 0.0f, 1.0f), up: Vec3(0.0f, -1.0f, 0.0f));
+        return lookAt(eye: $eye, center: $eye + Vec3(0.0f, 0.0f, 1.0f), up: Vec3(0.0f, -1.0f, 0.0f));
     }
 
-    return lookAt(eye: $origin, center: Vec3(0.0f, 0.0f, -1.0f), up: Vec3(0.0f, -1.0f, 0.0f));
+    return lookAt(eye: $eye, center: $eye + Vec3(0.0f, 0.0f, -1.0f), up: Vec3(0.0f, -1.0f, 0.0f));
+}
+
+/**
+ * Which two probe states light the scene and how far towards the second one.
+ */
+public struct IblBlend
+{
+    public int32 $from;
+    public int32 $to;
+    public float32 $weight;
+
+    public constructor()
+    {
+        $this->from = 0;
+        $this->to = 0;
+        $this->weight = 0.0f;
+    }
+
+    public constructor(int32 $from, int32 $to, float32 $weight)
+    {
+        $this->from = $from;
+        $this->to = $to;
+        $this->weight = $weight;
+    }
+}
+
+/**
+ * What a probe capture callback gets per face: the camera looking out of that face from the probe,
+ * the sky already bound at uniform slot 2, and the face index.
+ */
+public struct ProbeCapture
+{
+    public CameraData $camera;
+    public SkyUniforms $sky;
+    public int32 $face;
+}
+
+/**
+ * Camera for one probe face: 90 degree square view from `$eye`, mirrored in Y like `captureProjection`
+ * so the face lands in cube orientation. `$size` is the face resolution in pixels.
+ */
+public function probeCamera(int32 $face, Vec3 $eye, int32 $size, float32 $near, float32 $far) : CameraData
+{
+    Mat4 $projection = clipZeroOne(perspective(fovY: radians(90.0f), aspect: 1.0f, near: $near, far: $far));
+    $projection->c1->y = -$projection->c1->y;
+    Mat4 $view = captureView($face, $eye);
+    Mat4 $projectionView = $projection * $view;
+    float32 $pixels = $size as float32;
+    return CameraData(
+        $projection,
+        $view,
+        $projectionView,
+        inverse($projection),
+        inverse($projectionView),
+        Frustum(zeroOne: $projectionView),
+        $eye,
+        0.0f,
+        $size,
+        $size,
+        1.0f,
+        1.0f,
+        Viewport(left: -1.0f, right: 1.0f, bottom: -1.0f, top: 1.0f, $pixels, $pixels),
+        false
+    );
 }
 
 /**

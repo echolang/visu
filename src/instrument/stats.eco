@@ -1,9 +1,12 @@
 /**
  * Typed built-in samples.
  * Loop numbers come from GameLoop; memory / adapter live on Device.
+ * Tabs are the expandable overlay; compact HUD still uses HudRow.
  */
 
 namespace visu::instrument;
+
+use visu::graphics::DrawStats;
 
 public struct LoopStats
 {
@@ -33,4 +36,67 @@ public struct Gauge
     public string $name;
     public float64 $value;
     public Unit $unit;
+}
+
+/**
+ * One named value on a tab. `$of` > 0 formats as `n / of` (quads drawn of leaves).
+ */
+public struct Metric
+{
+    public string $name;
+    public float64 $value;
+    public Unit $unit;
+    public float64 $of = 0.0;
+}
+
+public struct TabSpec
+{
+    public string $id;
+    public string $title;
+    public int32 $order = 100;
+}
+
+public struct Section
+{
+    public string $id;
+    public array<Metric> $metrics;
+}
+
+/**
+ * One render-graph pass. `$gpuNs` is 0 when the backend has no timestamp (overlay prints —).
+ */
+public struct PassTiming
+{
+    public string $name = '';
+    public float64 $cpuNs = 0.0;
+    public float64 $gpuNs = 0.0;
+    public DrawStats $draw = DrawStats();
+    public array<Metric> $extras = array<Metric>();
+}
+
+/**
+ * One overlay tab. Fact: written at sample(), Overlay only reads.
+ */
+public class Tab
+{
+    public const string $id;
+    public const string $title;
+    public const int32 $order;
+    public const array<Section> $sections;
+    public const array<PassTiming> $passes;
+
+    public constructor(
+        string $id,
+        string $title,
+        int32 $order,
+        array<Section> $sections,
+        array<PassTiming> $passes
+    )
+    {
+        $this->id = $id;
+        $this->title = $title;
+        $this->order = $order;
+        $this->sections = $sections;
+        $this->passes = $passes;
+    }
 }

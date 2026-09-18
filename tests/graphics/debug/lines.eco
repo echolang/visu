@@ -1,0 +1,92 @@
+/**
+ * The CPU half of the debug overlay: segment building, the box cage, and the drop limit.
+ * Nothing here touches the GPU, so a headless `Device` is enough.
+ */
+
+use visu::geo::AABB;
+use visu::graphics::{DEBUG_LINE_VERTEX_BYTES, DebugLineVertex, DebugLines, Device, debugLineLayout};
+use visu::math::{Mat4, Vec3, Vec4, translate};
+
+internal function lineColor() : Vec4
+{
+    return Vec4(1.0f, 0.0f, 0.5f, 1.0f);
+}
+
+test debug_line_vertex_is_packed_position_and_color
+{
+    assert((mem::size<DebugLineVertex>() as int32) == DEBUG_LINE_VERTEX_BYTES, 'no padding in the vertex');
+}
+
+test debug_lines_layout_is_two_attributes_in_one_stream
+{
+    VertexLayout $layout = debugLineLayout();
+    assert($layout->attrs->count() == 2, 'position and colour');
+    assert($layout->attrs[0]->components == 3, 'position is a vec3');
+    assert($layout->attrs[1]->components == 4, 'colour is a vec4');
+    assert($layout->attrs[0]->offset == 0, 'position leads');
+    assert($layout->attrs[1]->offset == 12, 'colour follows it');
+    assert($layout->attrs[0]->stride == DEBUG_LINE_VERTEX_BYTES, 'one packed stream');
+    assert($layout->attrs[0]->divisor == 0, 'per vertex, not per instance');
+}
+
+test debug_lines_line_writes_two_vertices
+{
+    Device $device = Device();
+    DebugLines $lines = DebugLines($device);
+    assert($lines->empty(), 'fresh');
+    $lines->line(Vec3(0.0f), Vec3(1.0f, 2.0f, 3.0f), lineColor());
+    assert($lines->count() == 1, 'one segment');
+    assert($lines->vertexCount() == 2, 'two vertices');
+    assert(!$lines->empty(), 'has something to draw');
+    $lines->clear();
+    assert($lines->empty(), 'cleared');
+    assert($lines->count() == 0, 'the counter resets too');
+    $device->shutdown();
+}
+
+test debug_lines_box_is_twelve_edges
+{
+    Device $device = Device();
+    DebugLines $lines = DebugLines($device);
+    $lines->box(AABB(Vec3(-1.0f), Vec3(1.0f)), lineColor());
+    assert($lines->count() == 12, 'a cage is twelve edges');
+    assert($lines->vertexCount() == 24, 'each edge is two vertices');
+    $device->shutdown();
+}
+
+test debug_lines_box_with_a_matrix_moves_the_cage
+{
+    Device $device = Device();
+    DebugLines $plain = DebugLines($device);
+    DebugLines $moved = DebugLines($device);
+    AABB $box = AABB(Vec3(-1.0f), Vec3(1.0f));
+    $plain->box($box, lineColor());
+    $moved->box($box, translate(Vec3(10.0f, 0.0f, 0.0f)), lineColor());
+    assert($plain->count() == $moved->count(), 'the same twelve edges');
+    assert($moved->vertexCount() == 24, 'still two vertices each');
+    $device->shutdown();
+}
+
+test debug_lines_past_the_limit_drop_but_still_count
+{
+    Device $device = Device();
+    DebugLines $lines = DebugLines($device, 3);
+    int32 $i = 0;
+    while ($i < 10) {
+        $lines->line(Vec3(0.0f), Vec3(1.0f), lineColor());
+        $i = $i + 1;
+    }
+
+    assert($lines->vertexCount() == 6, 'three segments made it into the buffer');
+    assert($lines->count() == 10, 'the overflow is still visible in the count');
+    $device->shutdown();
+}
+
+test debug_lines_cross_is_three_axes
+{
+    Device $device = Device();
+    DebugLines $lines = DebugLines($device);
+    $lines->cross(Vec3(4.0f, 5.0f, 6.0f), 2.0f);
+    assert($lines->count() == 3, 'one segment per axis');
+    $device->shutdown();
+}

@@ -1,0 +1,64 @@
+/**
+ * Schedule: each step fires once, in order, by frame or tick. No GPU.
+ */
+
+use visu::dcapture::{Script, Step, StepAt, StepQueue, resolveTiming};
+
+internal function script(const string& $text) : Script
+{
+    Script $s = guard Script::parse($text) else ($e) {
+        die($e->message());
+    }
+    return $s;
+}
+
+test schedule_resolves_after_to_absolute_frames
+{
+    Script $s = script('{"steps":[{"after":3},{"frame":10},{"after":2},{"tick":4},{"frame":20}]}');
+    array<StepAt> $at = resolveTiming($s->steps);
+    assert($at->count() == 5, 'count');
+    array<string> $labels = array<string>();
+    foreach ($at as $when) {
+        $labels[] = $when->label();
+    }
+    assert($labels[0] == 'frame 3', 'after from zero');
+    assert($labels[1] == 'frame 10', 'frame');
+    assert($labels[2] == 'frame 12', 'after previous frame');
+    assert($labels[3] == 'tick 4', 'tick');
+    assert($labels[4] == 'frame 20', 'later frame');
+}
+
+test schedule_advance_returns_each_step_once_in_order
+{
+    Script $s = script('{"frames":50,"steps":[{"frame":10,"label":"a"},{"after":0,"label":"b"},{"frame":5,"label":"c"},{"tick":3,"label":"d"}]}');
+    StepQueue $schedule = StepQueue($s->steps);
+    assert($schedule->pending() == 4, 'all pending');
+    array<Step> $none = $schedule->advance(0, 0);
+    assert($none->empty(), 'nothing at zero');
+    array<Step> $early = $schedule->advance(5, 1);
+    assert($early->count() == 1, 'frame 5');
+    assert($early[0]->label == 'c', 'c');
+    array<Step> $again = $schedule->advance(5, 1);
+    assert($again->empty(), 'idempotent');
+    array<Step> $tick = $schedule->advance(6, 3);
+    assert($tick->count() == 1, 'tick 3');
+    assert($tick[0]->label == 'd', 'd');
+    array<Step> $late = $schedule->advance(12, 9);
+    assert($late->count() == 2, 'both frame 10 steps');
+    assert($late[0]->label == 'a', 'script order a');
+    assert($late[1]->label == 'b', 'script order b');
+    assert($schedule->pending() == 0, 'done');
+    assert($schedule->remaining()->empty(), 'nothing left');
+}
+
+test schedule_remaining_lists_unfired_steps
+{
+    Script $s = script('{"steps":[{"frame":1},{"frame":99,"stop":true}]}');
+    StepQueue $schedule = StepQueue($s->steps);
+    $schedule->advance(1, 0);
+    array<Step> $left = $schedule->remaining();
+    assert($left->count() == 1, 'one left');
+    Step $only = $left[0];
+    string $described = $only->describe();
+    assert($described == 'steps[1] at frame 99', 'described');
+}

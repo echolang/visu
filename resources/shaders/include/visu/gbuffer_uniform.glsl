@@ -19,6 +19,7 @@ layout(set = 1, binding = 5) uniform sampler2D gbuffer_ao;
 struct GBuffer
 {
     vec3 P;
+    vec3 relative;
     vec3 N;
     vec3 albedo;
     float metallic;
@@ -36,6 +37,7 @@ GBuffer gbuffer_make(vec2 uv)
     vec4 material = texture(gbuffer_material, uv);
 
     GBuffer gbuffer;
+    gbuffer.relative = position.rgb;
     gbuffer.P = position.rgb + u_camera_position.xyz;
     gbuffer.N = normal.rgb;
     gbuffer.albedo = albedo.rgb;

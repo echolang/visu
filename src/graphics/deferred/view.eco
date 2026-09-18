@@ -57,6 +57,54 @@ public enum DeferredView
         return $this == DeferredView::ssao;
     }
 
+    /**
+     * CPU PNG remap for this buffer. Position stays clamp-to-8bit; the live
+     * view wraps metres instead.
+     */
+    public const function pixelDump() : PixelDump
+    {
+        PixelDump $dump = match ($this) {
+            DeferredView::normal => PixelDump::normal,
+            DeferredView::roughness => PixelDump::gray(0),
+            DeferredView::metallic => PixelDump::gray(1),
+            DeferredView::ao => PixelDump::gray(2),
+            else => PixelDump::color,
+        };
+        return $dump;
+    }
+
+    /**
+     * GBuffer attachment for this view. Null for `.scene` and `.ssao`.
+     */
+    public const function gbufferTexture(const GBufferData& $gbuffer) : TextureRef?
+    {
+        if ($this == DeferredView::albedo) {
+            return $gbuffer->albedo;
+        }
+
+        if ($this == DeferredView::normal) {
+            return $gbuffer->normal;
+        }
+
+        if (
+            $this == DeferredView::roughness
+            || $this == DeferredView::metallic
+            || $this == DeferredView::ao
+        ) {
+            return $gbuffer->material;
+        }
+
+        if ($this == DeferredView::emissive) {
+            return $gbuffer->emissive;
+        }
+
+        if ($this == DeferredView::position) {
+            return $gbuffer->position;
+        }
+
+        return null;
+    }
+
     public const function label() : string
     {
         return match ($this) {

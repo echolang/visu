@@ -7,12 +7,29 @@
 
 namespace visu::graphics;
 
-use visu::app::info;
-use visu::math::Vec4;
+use visu::math::{Vec3, Vec4};
 
 public class DeferredRenderer
 {
     public DirectionalLight $sun;
+
+    /**
+     * The procedural sky: drawn per pixel behind the scene and, with `setEnvironment(probe:)`, the
+     * atmosphere every probe state is rendered under. Only read when the environment is a probe.
+     */
+    public Sky $sky;
+
+    /**
+     * Exponential height fog applied to lit pixels and the sky, not to the probe bake. Sun-only
+     * frames with `renderSkybox = false` leave the cleared background unfogged.
+     */
+    public HeightFog $fog;
+
+    /**
+     * Which two probe states light the scene and how far towards the second. Apps that drive a
+     * time of day set this every frame; a single-state environment ignores it.
+     */
+    public IblBlend $iblBlend;
 
     /**
      * Shows wherever no geometry drew, until a skybox covers it.
@@ -41,6 +58,9 @@ public class DeferredRenderer
     public constructor(Device $device)
     {
         $this->sun = DirectionalLight();
+        $this->sky = Sky();
+        $this->fog = HeightFog();
+        $this->iblBlend = IblBlend();
         $this->background = Vec4(0.05f, 0.05f, 0.06f, 1.0f);
         $this->renderSkybox = true;
         $this->ssao = SsaoQuality::ultra();
@@ -85,15 +105,48 @@ public class DeferredRenderer
     }
 
     /**
-     * Re-bake the lighting maps on the next frame.
+     * A probe at `$position`: one lighting state per sun travel direction in `$suns`, prebaked over
+     * the next frames from `$this->sky` plus whatever `$capture` draws into each face. The callback
+     * gets an open encoder with the face camera at slot 1 and the sky at slot 2; it must not end the
+     * pass. `$this->iblBlend` then picks the two states that light the scene.
+     */
+    public function setEnvironment(
+        probe: Vec3 $position,
+        const array<Vec3>& $suns,
+        function<void(RenderContext, RenderEncoder, ProbeCapture)> $capture,
+        int32 $size = 256
+    ) : void
+    {
+        assert($this->gpu != null, 'setEnvironment before load');
+        $this->dropEnvironment();
+        $this->environment = Environment(probe: $this->device, $this->sky, $position, $suns, $capture, $size, $this->ibl);
+    }
+
+    /**
+     * Move the prebaked suns of an existing probe set and re-bake it over the next frames.
+     * `setEnvironment` would work too, but it drops the old environment first and destroying a
+     * texture the frames in flight still reference is a use-after-free; this keeps the current
+     * maps lighting the scene until the fresh bake lands.
+     * False when there is no procedural environment, or `$suns` is not the same length as the
+     * list it was built with.
+     */
+    public function updateEnvironmentSuns(const array<Vec3>& $suns) : bool
+    {
+        Environment $env = guard $this->environment else {
+            return false;
+        }
+        return $env->updateSuns($suns);
+    }
+
+    /**
+     * Re-bake every lighting state over the next frames. The current maps stay bound meanwhile.
      */
     public function invalidateIbl() : void
     {
         Environment $env = guard $this->environment else {
             return;
         }
-        $env->iblReady = false;
-        $env->iblStep = 0;
+        $env->invalidate();
     }
 
     public const function hasEnvironment() : bool
@@ -106,7 +159,7 @@ public class DeferredRenderer
         Environment $env = guard $this->environment else {
             return false;
         }
-        return $env->iblReady;
+        return $env->lighting() == Lighting::ibl;
     }
 
     /**
@@ -127,6 +180,12 @@ public class DeferredRenderer
             return;
         }
         $held->releaseEquirect();
+
+        if ($held->procedural) {
+            $held->updateSky($this->sky);
+            $held->blend = $this->iblBlend;
+        }
+
         $this->addScene($ctx, $output, $fill, $gpu, $held);
     }
 
@@ -144,12 +203,7 @@ public class DeferredRenderer
         $fill($ctx, $gbuffer);
 
         DeferredView $view = $this->view;
-        if ($view->needsSsao() && $this->ssao == null) {
-            info('view: ssao is off');
-            $view = .scene;
-        }
-
-        bool $runSsao = $view->needsSsao() || ($view->isScene() && $this->ssao != null);
+        bool $runSsao = $this->ssao != null && ($view->isScene() || $view->needsSsao());
 
         if ($runSsao) {
             SsaoQuality $quality = guard $this->ssao;
@@ -164,11 +218,11 @@ public class DeferredRenderer
         }
 
         if ($view->isScene()) {
-            $pipeline->add(LightPass($gpu, $env, $this->sun, $this->background));
+            $pipeline->add(LightPass($gpu, $env, $this->sun, $this->sky, $this->fog, $this->background));
 
             if ($this->renderSkybox && $env != null) {
                 Environment $environment = guard $env;
-                $pipeline->add(SkyboxPass($gpu, $environment));
+                $pipeline->add(SkyboxPass($gpu, $environment, $this->sky, $this->fog, $this->sun));
             }
 
             LightPassData $light = $ctx->frame->get<LightPassData>();
@@ -176,14 +230,7 @@ public class DeferredRenderer
             return;
         }
 
-        TargetRef $debug = $pipeline->createTarget(
-            'deferred.view',
-            $gbuffer->target->width,
-            $gbuffer->target->height
-        );
-        TextureRef $debugColor = $pipeline->createColor($debug, 'output', TextureOptions());
-        $pipeline->add(DeferredViewPass($gpu, $debug, $gbuffer, $view->params()));
-        $gpu->blit->pass($pipeline, $output, $debugColor);
+        $pipeline->add(DeferredViewPass($gpu, $output, $view->params()));
     }
 
     /**

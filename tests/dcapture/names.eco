@@ -1,0 +1,36 @@
+/**
+ * File naming and glob matching for dumps. No GPU.
+ */
+
+use std::env;
+use visu::dcapture::{dumpPath, sanitizeName, wildcard};
+
+test names_sanitize_keeps_word_characters
+{
+    assert(sanitizeName('pool:gbuffer.attachment.color_albedo') == 'pool_gbuffer_attachment_color_albedo', 'punctuation');
+    assert(sanitizeName('scene') == 'scene', 'plain');
+    assert(sanitizeName('a b/c') == 'a_b_c', 'space and slash');
+    assert(sanitizeName('Top-1') == 'Top-1', 'dash kept');
+}
+
+test names_dump_path_sorts_by_frame
+{
+    string $ds = env::DS;
+    assert(dumpPath('var/h', 7, 'sunrise', 'scene', '') == "var/h{$ds}0007_sunrise_scene.png", 'labelled');
+    assert(dumpPath('var/h', 120, '', 'pbr.gbuffer.albedo', '') == "var/h{$ds}0120_pbr_gbuffer_albedo.png", 'no label');
+    assert(dumpPath('out', 3, '', 'pbr.environment', '_px') == "out{$ds}0003_pbr_environment_px.png", 'cube face');
+}
+
+test names_wildcard
+{
+    assert(wildcard('pbr.gbuffer.*', 'pbr.gbuffer.albedo'), 'trailing star');
+    assert(!wildcard('pbr.gbuffer.*', 'pbr.ssao'), 'trailing star miss');
+    assert(wildcard('pool:*', 'pool:gbuffer.attachment.color_albedo'), 'prefix');
+    assert(wildcard('pbr.*.raw', 'pbr.ssao.raw'), 'middle star');
+    assert(!wildcard('pbr.*.raw', 'pbr.ssao'), 'middle star miss');
+    assert(wildcard('*ssao*', 'pbr.ssao.raw'), 'two stars');
+    assert(wildcard('*', 'anything'), 'lone star');
+    assert(wildcard('scene', 'scene'), 'literal');
+    assert(!wildcard('scene', 'scenes'), 'literal miss');
+    assert(!wildcard('', 'x'), 'empty pattern');
+}

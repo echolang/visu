@@ -9,6 +9,7 @@ using namespace metal;
 struct GBuffer
 {
     float3 P;
+    float3 relative;
     float3 N;
     float3 albedo;
     float metallic;
@@ -42,6 +43,25 @@ struct CameraUniforms
     float4 u_resolution;
 };
 
+struct SkyUniforms
+{
+    float4 u_sky_sun;
+    float4 u_sky_origin;
+    float4 u_sky_rayleigh;
+    float4 u_sky_mie;
+    float4 u_sky_ground;
+    float4 u_sky_params;
+};
+
+struct FogUniforms
+{
+    float4 u_fog_density;
+    float4 u_fog_color;
+    float4 u_fog_params;
+    float4 u_fog_sun;
+    float4 u_fog_samples;
+};
+
 struct LightUniforms
 {
     float4 u_sun_direction;
@@ -60,14 +80,15 @@ struct fs_in
 };
 
 static inline __attribute__((always_inline))
-GBuffer gbuffer_make(thread const float2& uv, texture2d<float> gbuffer_position, sampler gbuffer_positionSmplr, texture2d<float> gbuffer_normal, sampler gbuffer_normalSmplr, texture2d<float> gbuffer_albedo, sampler gbuffer_albedoSmplr, texture2d<float> gbuffer_material, sampler gbuffer_materialSmplr, constant CameraUniforms& _365, texture2d<float> gbuffer_ao, sampler gbuffer_aoSmplr, texture2d<float> gbuffer_emissive, sampler gbuffer_emissiveSmplr)
+GBuffer gbuffer_make(thread const float2& uv, texture2d<float> gbuffer_position, sampler gbuffer_positionSmplr, texture2d<float> gbuffer_normal, sampler gbuffer_normalSmplr, texture2d<float> gbuffer_albedo, sampler gbuffer_albedoSmplr, texture2d<float> gbuffer_material, sampler gbuffer_materialSmplr, constant CameraUniforms& _413, texture2d<float> gbuffer_ao, sampler gbuffer_aoSmplr, texture2d<float> gbuffer_emissive, sampler gbuffer_emissiveSmplr)
 {
     float4 position = gbuffer_position.sample(gbuffer_positionSmplr, uv);
     float4 normal = gbuffer_normal.sample(gbuffer_normalSmplr, uv);
     float4 albedo = gbuffer_albedo.sample(gbuffer_albedoSmplr, uv);
     float4 material = gbuffer_material.sample(gbuffer_materialSmplr, uv);
     GBuffer gbuffer;
-    gbuffer.P = position.xyz + _365.u_camera_position.xyz;
+    gbuffer.relative = position.xyz;
+    gbuffer.P = position.xyz + _413.u_camera_position.xyz;
     gbuffer.N = normal.xyz;
     gbuffer.albedo = albedo.xyz;
     gbuffer.roughness = material.x;
@@ -159,9 +180,9 @@ float3 pbr_shade(thread const PBRSurface& s, thread const float3& L, thread cons
     float3 param_4 = s.F0;
     float param_5 = s.roughness;
     float3 param_6;
-    float3 _495 = pbr_specular(param, param_1, param_2, param_3, param_4, param_5, param_6);
+    float3 _542 = pbr_specular(param, param_1, param_2, param_3, param_4, param_5, param_6);
     float3 F = param_6;
-    float3 spec = _495;
+    float3 spec = _542;
     float3 kS = F;
     float3 kD = (float3(1.0) - kS) * (1.0 - s.metallic);
     float3 diff = (kD * s.albedo) / float3(3.1415927410125732421875);
@@ -175,19 +196,213 @@ float3 fresnel_schlick_roughness(thread const float3& F0, thread const float& co
 }
 
 static inline __attribute__((always_inline))
+float fog_integral(thread const float& dy, thread const float& len, constant FogUniforms& _908)
+{
+    float k = _908.u_fog_density.y;
+    float d0 = _908.u_fog_density.x;
+    float x = fast::max((k * dy) * len, -60.0);
+    if (abs(x) < 9.9999997473787516355514526367188e-05)
+    {
+        return (d0 * len) * (1.0 - (0.5 * x));
+    }
+    return (d0 * (1.0 - exp(-x))) / (k * dy);
+}
+
+static inline __attribute__((always_inline))
+float3 fog_horizon_dir(thread const float3& dir, constant SkyUniforms& _611)
+{
+    float2 xz = dir.xz;
+    float horiz = length(xz);
+    if (horiz < 9.9999997473787516355514526367188e-05)
+    {
+        xz = _611.u_sky_sun.xz;
+        horiz = length(xz);
+        if (horiz < 9.9999997473787516355514526367188e-05)
+        {
+            xz = float2(1.0, 0.0);
+            horiz = 1.0;
+        }
+    }
+    xz /= float2(horiz);
+    return fast::normalize(float3(xz.x, fast::max(dir.y, 0.0199999995529651641845703125), xz.y));
+}
+
+static inline __attribute__((always_inline))
+float3 sky_observer(constant SkyUniforms& _611)
+{
+    return float3(0.0, _611.u_sky_params.z + fast::max(_611.u_sky_origin.y, 1.0), 0.0);
+}
+
+static inline __attribute__((always_inline))
+float2 sky_ray_sphere(thread const float3& o, thread const float3& d, thread const float& r)
+{
+    float b = dot(o, d);
+    float c = dot(o, o) - (r * r);
+    float disc = (b * b) - c;
+    if (disc < 0.0)
+    {
+        return float2(-1.0);
+    }
+    float s = sqrt(disc);
+    return float2((-b) - s, (-b) + s);
+}
+
+static inline __attribute__((always_inline))
+float2 sky_optical_depth(thread const float3& p, thread const float3& d, thread const float& len, thread const int& samples, constant SkyUniforms& _611)
+{
+    float step_len = len / float(samples);
+    float2 depth = float2(0.0);
+    float2 scale = float2(_611.u_sky_rayleigh.w, _611.u_sky_mie.w);
+    for (int i = 0; i < samples; i++)
+    {
+        float3 s = p + (d * ((float(i) + 0.5) * step_len));
+        float h = fast::max(length(s) - _611.u_sky_params.z, 0.0);
+        depth += (exp(float2(-h) / scale) * step_len);
+    }
+    return depth;
+}
+
+static inline __attribute__((always_inline))
+float3 sky_extinction(thread const float2& depth, constant SkyUniforms& _611)
+{
+    return exp(-((_611.u_sky_rayleigh.xyz * depth.x) + (float3(_611.u_sky_mie.y) * depth.y)));
+}
+
+static inline __attribute__((always_inline))
+float3 sky_inscatter_n(thread const float3& dir, thread const int& view_samples, thread const int& light_samples, thread float3& transmittance, thread float& t_ground, constant SkyUniforms& _611)
+{
+    float3 o = sky_observer(_611);
+    float rg = _611.u_sky_params.z;
+    float rt = _611.u_sky_params.w;
+    float3 param = o;
+    float3 param_1 = dir;
+    float param_2 = rt;
+    float2 atmo = sky_ray_sphere(param, param_1, param_2);
+    float t_max = fast::max(atmo.y, 0.0);
+    float3 param_3 = o;
+    float3 param_4 = dir;
+    float param_5 = rg;
+    float2 ground = sky_ray_sphere(param_3, param_4, param_5);
+    t_ground = -1.0;
+    if (ground.x > 0.0)
+    {
+        t_ground = ground.x;
+        t_max = ground.x;
+    }
+    float step_len = t_max / float(view_samples);
+    float3 to_sun = _611.u_sky_sun.xyz;
+    float mu = dot(dir, to_sun);
+    float g = _611.u_sky_mie.z;
+    float gg = g * g;
+    float phase_r = 0.0596831031143665313720703125 * (1.0 + (mu * mu));
+    float phase_m = (0.119366206228733062744140625 * ((1.0 - gg) * (1.0 + (mu * mu)))) / ((2.0 + gg) * pow((1.0 + gg) - ((2.0 * g) * mu), 1.5));
+    float2 scale = float2(_611.u_sky_rayleigh.w, _611.u_sky_mie.w);
+    float3 sum_r = float3(0.0);
+    float3 sum_m = float3(0.0);
+    float2 depth_view = float2(0.0);
+    for (int i = 0; i < view_samples; i++)
+    {
+        float3 p = o + (dir * ((float(i) + 0.5) * step_len));
+        float h = fast::max(length(p) - rg, 0.0);
+        float2 dens = exp(float2(-h) / scale) * step_len;
+        depth_view += dens;
+        float3 param_6 = p;
+        float3 param_7 = to_sun;
+        float param_8 = rg;
+        float2 sun_ground = sky_ray_sphere(param_6, param_7, param_8);
+        if (sun_ground.x > 0.0)
+        {
+            continue;
+        }
+        float3 param_9 = p;
+        float3 param_10 = to_sun;
+        float param_11 = rt;
+        float2 sun_atmo = sky_ray_sphere(param_9, param_10, param_11);
+        float3 param_12 = p;
+        float3 param_13 = to_sun;
+        float param_14 = fast::max(sun_atmo.y, 0.0);
+        int param_15 = light_samples;
+        float2 depth_light = sky_optical_depth(param_12, param_13, param_14, param_15, _611);
+        float2 param_16 = depth_view + depth_light;
+        float3 t = sky_extinction(param_16, _611);
+        sum_r += (t * dens.x);
+        sum_m += (t * dens.y);
+    }
+    float2 param_17 = depth_view;
+    transmittance = sky_extinction(param_17, _611);
+    return (((sum_r * _611.u_sky_rayleigh.xyz) * phase_r) + ((sum_m * float3(_611.u_sky_mie.x)) * phase_m)) * (_611.u_sky_sun.w * 4.0);
+}
+
+static inline __attribute__((always_inline))
+float3 fog_color(thread const float3& dir, constant SkyUniforms& _611, constant FogUniforms& _908)
+{
+    float3 tint = _908.u_fog_color.xyz;
+    if (_908.u_fog_color.w < 0.5)
+    {
+        return tint;
+    }
+    float3 param = dir;
+    float3 param_1 = fog_horizon_dir(param, _611);
+    int param_2 = int(_908.u_fog_samples.x);
+    int param_3 = int(_908.u_fog_samples.y);
+    float3 param_4;
+    float param_5;
+    float3 _1012 = sky_inscatter_n(param_1, param_2, param_3, param_4, param_5, _611);
+    float3 transmittance = param_4;
+    float t_ground = param_5;
+    float3 radiance = _1012;
+    return (tint * _611.u_sky_ground.w) * radiance;
+}
+
+static inline __attribute__((always_inline))
+float3 fog_apply(thread const float3& color, thread const float3& relative, constant SkyUniforms& _611, constant FogUniforms& _908)
+{
+    if (_908.u_fog_density.w < 0.5)
+    {
+        return color;
+    }
+    float len = length(relative);
+    if (len < 0.001000000047497451305389404296875)
+    {
+        return color;
+    }
+    float cutoff = _908.u_fog_params.y;
+    if ((cutoff > 0.0) && (len > cutoff))
+    {
+        return color;
+    }
+    float3 dir = relative / float3(len);
+    float dy = dir.y;
+    float start = _908.u_fog_params.x;
+    float param = dy;
+    float param_1 = len;
+    float optical = fog_integral(param, param_1, _908);
+    float param_2 = dy;
+    float param_3 = fast::min(len, start);
+    float t = fast::max(exp(-(optical - fog_integral(param_2, param_3, _908))), 1.0 - _908.u_fog_density.z);
+    float param_4 = dy;
+    float param_5 = fast::min(len, start + _908.u_fog_params.w);
+    float td = exp(-(optical - fog_integral(param_4, param_5, _908)));
+    float sun = pow(fast::max(dot(dir, _611.u_sky_sun.xyz), 0.0), _908.u_fog_sun.w);
+    float3 param_6 = dir;
+    float3 fog = (fog_color(param_6, _611, _908) * (1.0 - t)) + ((_908.u_fog_sun.xyz * sun) * (1.0 - td));
+    return (color * t) + fog;
+}
+
+static inline __attribute__((always_inline))
 float3 tonemap_neutral(thread float3& color)
 {
     float x = fast::min(color.x, fast::min(color.y, color.z));
-    float _97;
+    float _142;
     if (x < 0.07999999821186065673828125)
     {
-        _97 = x - ((6.25 * x) * x);
+        _142 = x - ((6.25 * x) * x);
     }
     else
     {
-        _97 = 0.039999999105930328369140625;
+        _142 = 0.039999999105930328369140625;
     }
-    float offset = _97;
+    float offset = _142;
     color -= float3(offset);
     float peak = fast::max(color.x, fast::max(color.y, color.z));
     if (peak < 0.7599999904632568359375)
@@ -204,8 +419,8 @@ static inline __attribute__((always_inline))
 float3 apply_tonemap(thread const float3& color)
 {
     float3 param = color;
-    float3 _163 = tonemap_neutral(param);
-    return _163;
+    float3 _208 = tonemap_neutral(param);
+    return _208;
 }
 
 static inline __attribute__((always_inline))
@@ -214,21 +429,21 @@ float3 gamma_correct(thread const float3& color)
     return pow(color, float3(0.4545454680919647216796875));
 }
 
-fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _365 [[buffer(3)]], constant LightUniforms& _548 [[buffer(4)]], texture2d<float> gbuffer_position [[texture(0)]], texture2d<float> gbuffer_normal [[texture(1)]], texture2d<float> gbuffer_albedo [[texture(2)]], texture2d<float> gbuffer_material [[texture(3)]], texture2d<float> gbuffer_emissive [[texture(4)]], texture2d<float> gbuffer_ao [[texture(5)]], texturecube<float> ibl_irradiance_map [[texture(6)]], texturecube<float> ibl_prefilter_map [[texture(7)]], texture2d<float> ibl_brdf_lut [[texture(8)]], sampler gbuffer_positionSmplr [[sampler(0)]], sampler gbuffer_normalSmplr [[sampler(1)]], sampler gbuffer_albedoSmplr [[sampler(2)]], sampler gbuffer_materialSmplr [[sampler(3)]], sampler gbuffer_emissiveSmplr [[sampler(4)]], sampler gbuffer_aoSmplr [[sampler(5)]], sampler ibl_irradiance_mapSmplr [[sampler(6)]], sampler ibl_prefilter_mapSmplr [[sampler(7)]], sampler ibl_brdf_lutSmplr [[sampler(8)]])
+fragment fs_out fs(fs_in in [[stage_in]], constant SkyUniforms& _611 [[buffer(2)]], constant CameraUniforms& _413 [[buffer(3)]], constant LightUniforms& _1158 [[buffer(4)]], constant FogUniforms& _908 [[buffer(5)]], texture2d<float> gbuffer_position [[texture(0)]], texture2d<float> gbuffer_normal [[texture(1)]], texture2d<float> gbuffer_albedo [[texture(2)]], texture2d<float> gbuffer_material [[texture(3)]], texture2d<float> gbuffer_emissive [[texture(4)]], texture2d<float> gbuffer_ao [[texture(5)]], texturecube<float> ibl_irradiance_map [[texture(6)]], texturecube<float> ibl_prefilter_map [[texture(7)]], texture2d<float> ibl_brdf_lut [[texture(8)]], texturecube<float> ibl_irradiance_map_b [[texture(9)]], texturecube<float> ibl_prefilter_map_b [[texture(10)]], sampler gbuffer_positionSmplr [[sampler(0)]], sampler gbuffer_normalSmplr [[sampler(1)]], sampler gbuffer_albedoSmplr [[sampler(2)]], sampler gbuffer_materialSmplr [[sampler(3)]], sampler gbuffer_emissiveSmplr [[sampler(4)]], sampler gbuffer_aoSmplr [[sampler(5)]], sampler ibl_irradiance_mapSmplr [[sampler(6)]], sampler ibl_prefilter_mapSmplr [[sampler(7)]], sampler ibl_brdf_lutSmplr [[sampler(8)]], sampler ibl_irradiance_map_bSmplr [[sampler(9)]], sampler ibl_prefilter_map_bSmplr [[sampler(10)]])
 {
     fs_out out = {};
     float2 param = in.v_uv;
-    GBuffer gbuffer = gbuffer_make(param, gbuffer_position, gbuffer_positionSmplr, gbuffer_normal, gbuffer_normalSmplr, gbuffer_albedo, gbuffer_albedoSmplr, gbuffer_material, gbuffer_materialSmplr, _365, gbuffer_ao, gbuffer_aoSmplr, gbuffer_emissive, gbuffer_emissiveSmplr);
+    GBuffer gbuffer = gbuffer_make(param, gbuffer_position, gbuffer_positionSmplr, gbuffer_normal, gbuffer_normalSmplr, gbuffer_albedo, gbuffer_albedoSmplr, gbuffer_material, gbuffer_materialSmplr, _413, gbuffer_ao, gbuffer_aoSmplr, gbuffer_emissive, gbuffer_emissiveSmplr);
     if (gbuffer.coverage < 0.5)
     {
         discard_fragment();
     }
     GBuffer param_1 = gbuffer;
-    float3 param_2 = _365.u_camera_position.xyz;
+    float3 param_2 = _413.u_camera_position.xyz;
     PBRSurface s = pbr_surface_make(param_1, param_2);
     float3 Lo = float3(0.0);
-    float3 L = fast::normalize(-_548.u_sun_direction.xyz);
-    float3 radiance = _548.u_sun_color.xyz * _548.u_sun_direction.w;
+    float3 L = fast::normalize(-_1158.u_sun_direction.xyz);
+    float3 radiance = _1158.u_sun_color.xyz * _1158.u_sun_direction.w;
     PBRSurface param_3 = s;
     float3 param_4 = L;
     float3 param_5 = radiance;
@@ -243,19 +458,22 @@ fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _365 [[buffer
     float3 kS = F;
     float3 kD = (float3(1.0) - kS) * (1.0 - s.metallic);
     float3 diffuseIBL = float3(0.0);
-    float3 irradiance = ibl_irradiance_map.sample(ibl_irradiance_mapSmplr, s.N, level(0.0)).xyz;
+    float3 irradiance = mix(ibl_irradiance_map.sample(ibl_irradiance_mapSmplr, s.N, level(0.0)).xyz, ibl_irradiance_map_b.sample(ibl_irradiance_map_bSmplr, s.N, level(0.0)).xyz, float3(_1158.u_ibl.z));
     diffuseIBL = (irradiance * s.albedo) / float3(3.1415927410125732421875);
     float3 specIBL = float3(0.0);
-    float maxLod = fast::max(_548.u_ibl.x - 1.0, 0.0);
-    float3 prefiltered = ibl_prefilter_map.sample(ibl_prefilter_mapSmplr, R, level(s.roughness * maxLod)).xyz;
+    float maxLod = fast::max(_1158.u_ibl.x - 1.0, 0.0);
+    float3 prefiltered = mix(ibl_prefilter_map.sample(ibl_prefilter_mapSmplr, R, level(s.roughness * maxLod)).xyz, ibl_prefilter_map_b.sample(ibl_prefilter_map_bSmplr, R, level(s.roughness * maxLod)).xyz, float3(_1158.u_ibl.z));
     float2 brdf = ibl_brdf_lut.sample(ibl_brdf_lutSmplr, float2(NdotV, s.roughness)).xy;
     specIBL = prefiltered * ((s.F0 * brdf.x) + float3(brdf.y));
     ambient = ((kD * diffuseIBL) * s.ao) + (specIBL * s.ao);
     float3 color = (Lo + ambient) + s.emissive;
     float3 param_9 = color;
-    color = apply_tonemap(param_9);
-    float3 param_10 = color;
-    color = gamma_correct(param_10);
+    float3 param_10 = gbuffer.relative;
+    color = fog_apply(param_9, param_10, _611, _908);
+    float3 param_11 = color;
+    color = apply_tonemap(param_11);
+    float3 param_12 = color;
+    color = gamma_correct(param_12);
     out.fragment_color = float4(color, 1.0);
     return out;
 }

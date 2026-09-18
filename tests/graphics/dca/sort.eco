@@ -8,11 +8,24 @@ use visu::math::{Mat4, Vec3, scale, translate};
 
 test dca_sort_key_groups_by_mesh_then_depth
 {
-    uint64 $near = sortKey(1, 10);
-    uint64 $far = sortKey(1, 900);
-    uint64 $other = sortKey(2, 0);
+    uint64 $near = sortKey(0, 1, 10);
+    uint64 $far = sortKey(0, 1, 900);
+    uint64 $other = sortKey(0, 2, 0);
     assert($near < $far, 'near sorts first inside a mesh');
     assert($far < $other, 'mesh dominates depth');
+}
+
+test dca_sort_key_material_dominates_mesh
+{
+    uint64 $matA = sortKey(1, 7, 500);
+    uint64 $matB = sortKey(2, 0, 0);
+    assert($matA < $matB, 'material dominates mesh and depth');
+    uint64 $maxDepth = sortKey(0, 0, 1048575);
+    uint64 $nextMesh = sortKey(0, 1, 0);
+    assert($maxDepth < $nextMesh, 'depth never overflows into the mesh field');
+    uint64 $maxMesh = sortKey(0, 65535, 0);
+    uint64 $nextMaterial = sortKey(1, 0, 0);
+    assert($maxMesh < $nextMaterial, 'mesh never overflows into the material field');
 }
 
 test dca_sort_is_stable_and_ordered

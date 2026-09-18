@@ -1,0 +1,60 @@
+/**
+ * Flags: autotyping, typed fallbacks, version, process accessor. No GPU.
+ */
+
+use visu::app::{FlagValue, Flags, flags, hasFlags, installFlags};
+
+test flags_parse_autotypes
+{
+    Flags $f = Flags();
+    $f->parse('a', 'true');
+    $f->parse('b', '12');
+    $f->parse('c', '1.5');
+    $f->parse('d', 'menu');
+    assert($f->bool('a', false), 'bool');
+    assert($f->int('b', 0) == 12, 'int');
+    assert($f->float('c', 0.0) == 1.5, 'float');
+    assert($f->str('d', '') == 'menu', 'text');
+    assert($f->str('b', '') == '12', 'int label');
+    assert($f->str('a', '') == 'true', 'bool label');
+}
+
+test flags_typed_reads_fall_back
+{
+    Flags $f = Flags();
+    $f->parse('name', 'menu');
+    assert($f->bool('name', true), 'text is not a bool');
+    assert($f->int('name', 7) == 7, 'text is not an int');
+    assert(!$f->has('nope'), 'absent');
+    assert(!$f->bool('nope', false), 'absent bool');
+    assert($f->str('nope', 'x') == 'x', 'absent text');
+    $f->parse('n', '3');
+    assert($f->bool('n', false), 'nonzero int is true');
+    assert($f->float('n', 0.0) == 3.0, 'int widens');
+    $f->parse('half', '2.9');
+    assert($f->int('half', 0) == 2, 'float truncates');
+}
+
+test flags_set_bumps_version
+{
+    Flags $f = Flags();
+    assert($f->version == 0, 'fresh');
+    $f->set('a', FlagValue::boolean(true));
+    assert($f->version == 1, 'one');
+    $f->parse('a', 'false');
+    assert($f->version == 2, 'two');
+    assert(!$f->bool('a', true), 'overwritten');
+    array<string> $names = $f->names();
+    assert($names->count() == 1, 'one name');
+}
+
+test flags_process_accessor_is_fill_if_absent
+{
+    assert(!hasFlags(), 'nothing installed');
+    Flags $bag = flags();
+    assert(hasFlags(), 'installed on first use');
+    $bag->parse('x', '1');
+    assert(flags()->int('x', 0) == 1, 'same bag');
+    installFlags(Flags());
+    assert(!flags()->has('x'), 'replaced');
+}

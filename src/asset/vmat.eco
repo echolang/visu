@@ -246,8 +246,18 @@ internal function vmatMapOne(json::Value $root, string $name) : string?
 
 /**
  * Turn sibling filenames into catalog ids, then fill conventional binds.
+ *
+ * Only the sheet's own binds are rewritten. A nested record (a model's per-material entry) keeps
+ * the names its author wrote, and `Material` resolves those against the folder when it binds, so
+ * a record reads the same whether it came from a cooked sheet or a hand-written one.
  */
 public function vmatResolve(json::Value& $sheet, const string& $folderId, const array<string>& $stems) : void
+{
+    vmatRewriteBinds($sheet, $folderId);
+    vmatFillBinds($sheet, $folderId, $stems);
+}
+
+internal function vmatRewriteBinds(json::Value& $sheet, const string& $folderId) : void
 {
     vmatRewriteBind($sheet, $folderId, 'albedo');
     vmatRewriteBind($sheet, $folderId, 'normal');
@@ -256,7 +266,7 @@ public function vmatResolve(json::Value& $sheet, const string& $folderId, const 
     vmatRewriteBind($sheet, $folderId, 'ao');
     vmatRewriteBind($sheet, $folderId, 'emissive');
     vmatRewriteBind($sheet, $folderId, 'height');
-    vmatFillBinds($sheet, $folderId, $stems);
+    vmatRewriteBind($sheet, $folderId, 'alpha');
 }
 
 internal function vmatRewriteBind(json::Value& $sheet, const string& $folderId, string $map) : void
@@ -322,6 +332,8 @@ public function vmatFillBinds(json::Value& $sheet, const string& $folderId, cons
     vmatBindIfMissing($sheet, $folderId, $stems, 'orm', 'ao');
     vmatBindIfMissing($sheet, $folderId, $stems, 'emissive', 'emissive');
     vmatBindIfMissing($sheet, $folderId, $stems, 'height', 'height');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'alpha', 'alpha');
+    vmatBindIfMissing($sheet, $folderId, $stems, 'opacity', 'alpha');
 }
 
 internal function vmatBindIfMissing(

@@ -1,0 +1,173 @@
+/**
+ * Script parsing: shape, timing, camera specs, errors with paths. No GPU.
+ */
+
+use visu::geo::Transform;
+use visu::dcapture::{CameraSpec, DCaptureError, Script, Step, StepAt};
+use visu::math::{Quat, Vec3, equal};
+
+internal function parsed(const string& $text) : Script
+{
+    Script $s = guard Script::parse($text) else ($e) {
+        die($e->message());
+    }
+    return $s;
+}
+
+internal function failure(const string& $text) : DCaptureError
+{
+    result<Script, DCaptureError> $r = Script::parse($text);
+    assert($r->failed(), 'expected a parse failure');
+    return $r->failure();
+}
+
+test script_parses_minimal
+{
+    Script $s = parsed('{"steps":[{"frame":30,"dump":"scene"}]}');
+    assert($s->out == 'var/dcapture', 'default out');
+    assert(!$s->headless, 'default windowed');
+    assert($s->frames == null, 'no cap');
+    assert($s->steps->count() == 1, 'one step');
+    Step $step = $s->steps[0];
+    assert($step->dump->count() == 1, 'one pattern');
+    assert($step->dump[0] == 'scene', 'pattern');
+    assert($step->label == '', 'no label');
+    assert(!$step->stop, 'no stop');
+    int32? $implied = $s->impliedFrames();
+    assert(($implied ?? -1) == 32, 'implied cap is last frame + 2');
+}
+
+test script_top_level_knobs
+{
+    Script $s = parsed('{"out":"var/x","headless":true,"window":[320,200],"frames":9,"list":true,"flags":{"a":true,"b":2,"c":1.5,"d":"menu"}}');
+    assert($s->out == 'var/x', 'out');
+    assert($s->headless, 'headless');
+    assert(($s->width ?? 0) == 320, 'width');
+    assert(($s->height ?? 0) == 200, 'height');
+    assert(($s->frames ?? 0) == 9, 'frames');
+    assert($s->list, 'list');
+    assert($s->flags->count() == 4, 'flags');
+    assert($s->flags[3]->name == 'd', 'order kept');
+    string $textFlag = $s->flags[3]->value->label();
+    assert($textFlag == 'menu', 'text flag');
+    int32? $implied = $s->impliedFrames();
+    assert(($implied ?? -1) == 9, 'explicit cap wins');
+}
+
+test script_step_needs_exactly_one_timing
+{
+    DCaptureError $none = failure('{"steps":[{"dump":"scene"}]}');
+    assert($none->message() == 'steps[0]: exactly one of frame, tick or after', 'none');
+    DCaptureError $two = failure('{"steps":[{"frame":1,"tick":2}]}');
+    assert($two->message() == 'steps[0]: exactly one of frame, tick or after', 'two');
+}
+
+test script_after_resolves_relative_to_previous_frame
+{
+    Script $s = parsed('{"steps":[{"frame":10},{"after":5},{"after":1,"stop":true}]}');
+    assert($s->hasStop(), 'stop');
+    int32? $implied = $s->impliedFrames();
+    assert($implied == null, 'a stop step needs no cap');
+    Script $open = parsed('{"steps":[{"frame":10},{"after":5}]}');
+    int32? $cap = $open->impliedFrames();
+    assert(($cap ?? -1) == 17, 'last resolved frame 15 plus 2');
+}
+
+test script_after_following_a_tick_is_refused
+{
+    DCaptureError $e = failure('{"frames":5,"steps":[{"tick":3},{"after":1}]}');
+    assert($e->message() == 'steps[1]: after must follow a frame step', 'message');
+}
+
+test script_tick_only_needs_a_cap_or_stop
+{
+    DCaptureError $e = failure('{"steps":[{"tick":3,"dump":"scene"}]}');
+    assert($e->message() == 'tick steps need a top-level frames cap or a stop step', 'open ended');
+    Script $capped = parsed('{"frames":20,"steps":[{"tick":3,"dump":"scene"}]}');
+    assert($capped->steps->count() == 1, 'capped is fine');
+    Script $stopped = parsed('{"steps":[{"tick":3,"stop":true}]}');
+    assert($stopped->hasStop(), 'stopped is fine');
+}
+
+test script_camera_lookat_matches_transform
+{
+    Script $s = parsed('{"steps":[{"frame":1,"camera":{"position":[0,10,20],"lookAt":[0,0,0],"fov":60}}]}');
+    CameraSpec $spec = $s->steps[0]->camera;
+    Transform $t = Transform();
+    $t->position = Vec3(0.0f, 10.0f, 20.0f);
+    $t->lookAt(Vec3(0.0f, 0.0f, 0.0f));
+    match ($spec) {
+        CameraSpec::pose($position, $orientation, $fov) => {
+            assert($position->y == 10.0f, 'position');
+            assert(equal($orientation, $t->orientation), 'same quaternion as Transform::lookAt');
+            assert($fov == 60.0f, 'fov');
+        },
+        else => {
+            assert(false, 'expected a pose');
+        },
+    }
+}
+
+test script_camera_euler_and_orientation
+{
+    Script $s = parsed('{"steps":[{"frame":1,"camera":{"position":[1,2,3],"euler":[0,0]}},{"frame":2,"camera":{"position":[0,0,0],"orientation":[0,0,0,2]}}]}');
+    CameraSpec $first = $s->steps[0]->camera;
+    match ($first) {
+        CameraSpec::pose($position, $orientation, $fov) => {
+            assert(equal($orientation, Quat()), 'zero euler is identity');
+            assert($fov == 0.0f, 'fov kept');
+        },
+        else => {
+            assert(false, 'expected a pose');
+        },
+    }
+    CameraSpec $second = $s->steps[1]->camera;
+    match ($second) {
+        CameraSpec::pose($position, $orientation, $fov) => {
+            assert(equal($orientation, Quat()), 'normalised to identity');
+        },
+        else => {
+            assert(false, 'expected a pose');
+        },
+    }
+}
+
+test script_camera_null_clears_and_two_aims_refused
+{
+    Script $s = parsed('{"steps":[{"frame":1,"camera":null}]}');
+    CameraSpec $spec = $s->steps[0]->camera;
+    bool $clear = match ($spec) {
+        CameraSpec::clear => true,
+        else => false,
+    };
+    assert($clear, 'null clears');
+    DCaptureError $e = failure('{"steps":[{"frame":1,"camera":{"position":[0,0,0],"lookAt":[1,0,0],"euler":[0,0]}}]}');
+    assert($e->message() == 'steps[0].camera: expected at most one of lookAt, euler or orientation', 'two aims');
+    DCaptureError $missing = failure('{"steps":[{"frame":1,"camera":{"lookAt":[1,0,0]}}]}');
+    assert($missing->message() == 'steps[0].camera.position: expected array of 3 numbers', 'position required');
+}
+
+test script_console_string_or_array
+{
+    Script $s = parsed('{"steps":[{"frame":1,"console":"sky time 18"},{"frame":2,"console":["a","b"],"dump":["x","y"],"label":"two","log":"hi"}]}');
+    assert($s->needsConsole(), 'needs console');
+    assert($s->steps[0]->console->count() == 1, 'single');
+    assert($s->steps[1]->console->count() == 2, 'array');
+    assert($s->steps[1]->dump->count() == 2, 'dumps');
+    assert($s->steps[1]->label == 'two', 'label');
+    assert($s->steps[1]->log == 'hi', 'log');
+    DCaptureError $e = failure('{"steps":[{"frame":1,"console":7}]}');
+    assert($e->message() == 'steps[0].console: expected string or array of strings', 'type');
+}
+
+test script_bad_json_and_shape
+{
+    DCaptureError $bad = failure('{"steps":[');
+    assert($bad->message()->starts('script is not JSON:'), 'json error');
+    DCaptureError $list = failure('[1,2]');
+    assert($list->message() == 'script: expected an object', 'not an object');
+    DCaptureError $step = failure('{"steps":[3]}');
+    assert($step->message() == 'steps[0]: expected an object', 'step not an object');
+    DCaptureError $flag = failure('{"flags":{"a":[1]}}');
+    assert($flag->message() == 'flags.a: expected boolean, number or string', 'flag type');
+}

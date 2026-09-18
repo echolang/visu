@@ -1,0 +1,296 @@
+/**
+ * Process-lifetime cache of live models and their bound material textures. One per Device; the
+ * app owns it (Game, not Services) and calls `destroy` once after `waitIdle`. Scenes come and go;
+ * the bank keeps the GPU objects so a reload does not re-upload every mesh and map.
+ * Fallback textures are minted on first use, so the bank may be built before the GPU is up.
+ */
+
+namespace visu::graphics;
+
+use visu::asset::{AssetError, AssetRef, Assets};
+use visu::math::{Vec2, Vec4};
+
+/**
+ * One material's textures on the GPU plus its slot 0 payload. `$index` is the dense key the
+ * draw-call assembler sorts by; the bank hands it out in acquisition order.
+ */
+public class MaterialGpu
+{
+    public const int32 $index;
+    public Material $material;
+    public Texture $albedo;
+    public Texture $normal;
+    public Texture $roughness;
+    public Texture $metallic;
+    public Texture $ao;
+    public Texture $alpha;
+    public Sampler $sampler;
+    public ModelMaterialData $params;
+    public bool $doubleSided;
+
+    public constructor(
+        int32 $index,
+        Material $material,
+        Texture $albedo,
+        Texture $normal,
+        Texture $roughness,
+        Texture $metallic,
+        Texture $ao,
+        Texture $alpha,
+        Sampler $sampler,
+        ModelMaterialData $params
+    )
+    {
+        $this->index = $index;
+        $this->material = $material;
+        $this->albedo = $albedo;
+        $this->normal = $normal;
+        $this->roughness = $roughness;
+        $this->metallic = $metallic;
+        $this->ao = $ao;
+        $this->alpha = $alpha;
+        $this->sampler = $sampler;
+        $this->params = $params;
+        $this->doubleSided = !$material->backfaceCull;
+    }
+
+    /**
+     * Slot 0 payload and the six samplers. The caller has bound the GpuPass.
+     */
+    public function bind(RenderEncoder $enc) : void
+    {
+        ModelMaterialData $params = $this->params;
+        $enc->upload($params, slot: 0);
+        $enc->bindTexture(0, $this->albedo, $this->sampler);
+        $enc->bindTexture(1, $this->normal, $this->sampler);
+        $enc->bindTexture(2, $this->roughness, $this->sampler);
+        $enc->bindTexture(3, $this->metallic, $this->sampler);
+        $enc->bindTexture(4, $this->ao, $this->sampler);
+        $enc->bindTexture(5, $this->alpha, $this->sampler);
+    }
+}
+
+public class ModelBank
+{
+    public Device $device;
+    public Assets $assets;
+    private map<string, Model> $models;
+    private map<string, MaterialGpu> $materials;
+    private array<MaterialGpu> $byIndex;
+    private Texture? $white;
+    private Texture? $flatNormal;
+    private Sampler? $sampler;
+
+    public constructor(Device $device, Assets $assets)
+    {
+        $this->device = $device;
+        $this->assets = $assets;
+        $this->models = map<string, Model>();
+        $this->materials = map<string, MaterialGpu>();
+        $this->byIndex = array<MaterialGpu>();
+        $this->white = null;
+        $this->flatNormal = null;
+        $this->sampler = null;
+    }
+
+    /**
+     * The live model for an id, loading it (and its materials' textures) the first time.
+     */
+    public function acquire(string $id) : result<Model, AssetError>
+    {
+        if ($this->models->has($id)) {
+            return .ok($this->models[$id]);
+        }
+
+        Model $model = guard $this->assets->load<Model>($id) else ($e) {
+            return .error($e);
+        }
+        foreach ($model->materials as $material) {
+            $this->materialGpu($material);
+        }
+
+        $this->models[$id] = $model;
+        return .ok($model);
+    }
+
+    public const function has(string $id) : bool
+    {
+        return $this->models->has($id);
+    }
+
+    /**
+     * The GPU side of a model's slot. `acquire` ran, so the entry exists.
+     */
+    public function materialOf(Model $model, int32 $slot) : MaterialGpu
+    {
+        assert($slot >= 0 && ($slot as usize) < $model->materials->count(), 'bank: slot');
+        Material $material = $model->materials[$slot as usize];
+        return $this->materialGpu($material);
+    }
+
+    /**
+     * By the dense index the assembler sorted on.
+     */
+    public const function material(int32 $index) : MaterialGpu
+    {
+        assert($index >= 0 && ($index as usize) < $this->byIndex->count(), 'bank: material index');
+        return $this->byIndex[$index as usize];
+    }
+
+    public const function materialCount() : int32
+    {
+        return $this->byIndex->count() as int32;
+    }
+
+    public const function modelCount() : int32
+    {
+        return $this->models->count() as int32;
+    }
+
+    /**
+     * Free the fallbacks and every model. Loaded map textures stay with Assets. waitIdle first.
+     */
+    public function destroy() : void
+    {
+        array<string> $ids = $this->models->keys();
+        foreach ($ids as $id) {
+            $this->models[$id]->destroy();
+        }
+
+        $this->models->clear();
+        $this->materials->clear();
+        $this->byIndex->clear();
+        Texture? $white = $this->white;
+        if ($white != null) {
+            Texture $w = guard $white;
+            $w->destroy();
+            $this->white = null;
+        }
+
+        Texture? $flat = $this->flatNormal;
+        if ($flat != null) {
+            Texture $f = guard $flat;
+            $f->destroy();
+            $this->flatNormal = null;
+        }
+    }
+
+    private function materialGpu(Material $material) : MaterialGpu
+    {
+        if ($this->materials->has($material->id)) {
+            return $this->materials[$material->id];
+        }
+
+        Texture $white = $this->whiteTexture();
+        Texture $flat = $this->flatNormalTexture();
+        int32 $flags = 0;
+        Texture $albedo = $this->mapOr($material->albedo, $white, MODEL_MAP_ALBEDO, $flags);
+        Texture $normal = $this->mapOr($material->normal, $flat, MODEL_MAP_NORMAL, $flags);
+        Texture $roughness = $this->mapOr($material->roughness, $white, MODEL_MAP_ROUGHNESS, $flags);
+        Texture $metallic = $this->mapOr($material->metal, $white, MODEL_MAP_METALLIC, $flags);
+        Texture $ao = $this->mapOr($material->ao, $white, MODEL_MAP_AO, $flags);
+        Texture $alpha = $this->mapOr($material->alpha, $white, MODEL_MAP_ALPHA, $flags);
+        Vec2 $scale = $material->textureScale;
+        ModelMaterialData $params = ModelMaterialData(
+            Vec4($material->diffuseColor->x, $material->diffuseColor->y, $material->diffuseColor->z, $material->alphaCutoff),
+            Vec4($material->roughnessFactor, $material->metallicFactor, $flags as float32, 0.0f),
+            Vec4($scale->x, $scale->y, 0.0f, 0.0f)
+        );
+        int32 $index = $this->byIndex->count() as int32;
+        MaterialGpu $gpu = MaterialGpu(
+            $index,
+            $material,
+            $albedo,
+            $normal,
+            $roughness,
+            $metallic,
+            $ao,
+            $alpha,
+            $this->modelSampler(),
+            $params
+        );
+        $this->materials[$material->id] = $gpu;
+        $this->byIndex[] = $gpu;
+        return $gpu;
+    }
+
+    /**
+     * The slot's live texture and its presence flag, or the fallback and no flag.
+     */
+    private function mapOr(AssetRef? $slot, Texture $fallback, int32 $flag, int32& $flags) : Texture
+    {
+        Texture? $found = $this->mapTexture($slot);
+        Texture $tex = guard $found else {
+            return $fallback;
+        }
+        $flags = $flags | $flag;
+        return $tex;
+    }
+
+    /**
+     * The live texture behind a slot, or null when the slot is empty or its blob fails to decode.
+     */
+    private function mapTexture(AssetRef? $slot) : Texture?
+    {
+        AssetRef $ref = guard $slot else {
+            return null;
+        }
+        result<Texture, AssetError> $r = $ref->load<Texture>();
+        if ($r->failed()) {
+            return null;
+        }
+
+        return $r->or($this->whiteTexture());
+    }
+
+    private function whiteTexture() : Texture
+    {
+        Texture? $have = $this->white;
+        Texture $tex = guard $have else {
+            Texture $fresh = onePixel($this->device, 'model.white', 255, 255, 255, 255);
+            $this->white = $fresh;
+            return $fresh;
+        }
+        return $tex;
+    }
+
+    private function flatNormalTexture() : Texture
+    {
+        Texture? $have = $this->flatNormal;
+        Texture $tex = guard $have else {
+            Texture $fresh = onePixel($this->device, 'model.flatnormal', 128, 128, 255, 255);
+            $this->flatNormal = $fresh;
+            return $fresh;
+        }
+        return $tex;
+    }
+
+    private function modelSampler() : Sampler
+    {
+        Sampler? $have = $this->sampler;
+        Sampler $sampler = guard $have else {
+            SamplerDesc $desc = SamplerDesc();
+            $desc->min = Filter::linearMipmapLinear;
+            $desc->mag = Filter::linear;
+            $desc->wrapS = Wrap::repeat;
+            $desc->wrapT = Wrap::repeat;
+            Sampler $fresh = $this->device->createSampler($desc);
+            $this->sampler = $fresh;
+            return $fresh;
+        }
+        return $sampler;
+    }
+}
+
+/**
+ * A 1x1 rgba8 texture, the stand-in for an absent map.
+ */
+internal function onePixel(Device $device, string $name, uint8 $r, uint8 $g, uint8 $b, uint8 $a) : Texture
+{
+    array<uint8> $rgba = array<uint8>();
+    $rgba[] = $r;
+    $rgba[] = $g;
+    $rgba[] = $b;
+    $rgba[] = $a;
+    return Texture($device, $name, Pixels(1, 1, $rgba));
+}

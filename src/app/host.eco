@@ -3,6 +3,8 @@
  * The app constructs one; Device stays off Services.
  * Construct fills the bag; initialize brings the window up; destroy tears it down.
  * Quickstart and a class-based app each own a Host and stay GameLoopDelegate.
+ * Dump-after-present is always on (`DumpQueue`). A `DCapture` on Services (only when `--dcapture`
+ * was given) is the script driver: advance, camera override, skipped-step finish.
  */
 
 namespace visu::app;
@@ -10,17 +12,18 @@ namespace visu::app;
 use std::env;
 use std::io;
 use visu::asset::{
-    AssetError, Assets, AudioClip, Blob, DirectoryStore, KIND_BYTES, KIND_SOUND,
+    AssetError, Assets, AudioClip, Blob, DirectoryStore, KIND_BYTES, KIND_MODEL, KIND_SOUND,
     KIND_TEXTURE, KIND_VMAT, PackStore, Vmat, decodeBytes, decodeGpuTexture,
     decodeSound, decodeVmat
 };
 use visu::graphics::{
-    BackbufferData, ClearPass, ClearPassOptions, RenderContext, Device, DeviceError,
-    Frame, FrameStatus, FullscreenTextureRenderer, Pipeline, PipelineError,
+    BackbufferData, CameraOverrideData, ClearPass, ClearPassOptions, RenderContext, Device, DeviceError,
+    Frame, FrameStatus, FullscreenTextureRenderer, Model, Pipeline, PipelineError, decodeModel,
     Pool, RenderTarget, SceneTargetData, ShaderCollection, TargetRef, Texture,
     TextureOptions, TextureRef
 };
-use visu::instrument::{Instruments, Overlay, Sample};
+use visu::dcapture::{DCapture, DCaptureConsole, DumpQueue};
+use visu::instrument::{DrawSource, Instruments, Overlay, Sample};
 use visu::math::Vec2;
 use visu::os::{Window, WindowHints};
 use visu::os::input::{ContextMap, InputHub};
@@ -45,12 +48,24 @@ public class Host
     public Ui? $ui;
     public DebugConsole? $console;
     public int32 $frameIndex;
+
+    /**
+     * Update ticks polled so far; DCapture addresses steps by it.
+     */
+    public int32 $tickIndex;
     public HostError $fail;
+    public DumpQueue $dumps;
+    private DCapture? $script;
     private FullscreenTextureRenderer $blit;
     private Overlay? $overlay;
+    private DCaptureConsole? $dcaptureConsole;
 
     public constructor(HostConfig $config, Services $services)
     {
+        $this->dumps = hostDumps($services, $config);
+        $this->script = $services->find<DCapture>();
+        $this->dcaptureConsole = null;
+        $this->tickIndex = 0;
         $this->config = $config;
         $this->services = $services;
         $this->device = Device();
@@ -69,6 +84,7 @@ public class Host
         $this->assets = Assets($this->device);
         $this->events = EventLoop();
         $this->instruments = Instruments();
+        $this->instruments->add(id: 'draw', DrawSource($this->device));
         $this->ui = null;
         $this->frameIndex = 0;
         $this->fail = .none;
@@ -115,6 +131,8 @@ public class Host
         $this->inputContext->reset();
         $this->window->poll();
         $this->events->tick();
+        $this->tickIndex = $this->tickIndex + 1;
+        $this->advanceDCapture();
     }
 
     public function renderFrame(
@@ -128,6 +146,8 @@ public class Host
             return;
         }
 
+        // a step due this frame lands even when no update tick ran since the last present
+        $this->advanceDCapture();
         int32 $w = $this->window->framebufferWidth();
         int32 $h = $this->window->framebufferHeight();
         FrameStatus $status = guard $this->device->beginFrame($w, $h) else ($e) {
@@ -157,6 +177,7 @@ public class Host
         TextureRef $color = $pipeline->createColor($sceneTarget, $this->config->colorName, TextureOptions());
         $frame->set(HostPassData($sceneTarget, $color));
         $frame->set(SceneTargetData($sceneTarget));
+        $this->publishCameraOverride($frame);
         $pipeline->add(ClearPass($sceneTarget, ClearPassOptions(color: $this->config->clearColor)));
         $scene($ctx, $sceneTarget);
         $this->addUi($pipeline, $sceneTarget, $ui);
@@ -177,7 +198,7 @@ public class Host
             $console->attachPass($pipeline, $back->target);
         }
 
-        $this->finishFrame($pipeline, $compensation, $afterPresent);
+        $this->finishFrame($pipeline, $frame, $compensation, $afterPresent);
     }
 
     public const function shouldStop() : bool
@@ -199,6 +220,14 @@ public class Host
     public function destroy() : void
     {
         $this->device->waitIdle();
+        DCapture? $maybeScript = $this->script;
+        if ($maybeScript != null) {
+            DCapture $dcapture = guard $maybeScript;
+            $dcapture->finish($this->frameIndex);
+        } else {
+            $this->dumps->finish($this->frameIndex, $this->tickIndex, false);
+        }
+
         Ui? $maybeUi = $this->ui;
 
         if ($maybeUi != null) {
@@ -265,6 +294,7 @@ public class Host
 
     private function finishFrame(
         Pipeline $pipeline,
+        Frame $frame,
         float32 $compensation,
         function<void()>? $afterPresent,
     ) : void
@@ -272,6 +302,8 @@ public class Host
         float64 $t0 = visu::runtime::seconds();
         status<PipelineError> $exec = $pipeline->execute($this->frameIndex, $compensation);
         $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
+        $this->instruments->noteGraph($pipeline->timings());
+        $this->instruments->noteGpu($this->device->gpuScopes->resolved);
         bool $presented = $this->present();
         guard $exec else ($e) {
             if (!$this->fail->failed()) {
@@ -287,10 +319,32 @@ public class Host
 
         $this->input->endFrame();
         $this->frameIndex = $this->frameIndex + 1;
+        // dumps before the app closure: a scene switch there may destroy what was drawn
+        $this->dumps->afterPresent($frame, $this->pool, $this->window, $this->frameIndex - 1, $this->tickIndex);
+
         function<void()> $after = guard $afterPresent else {
             return;
         }
         $after();
+    }
+
+    private function advanceDCapture() : void
+    {
+        DCapture $dcapture = guard $this->script else {
+            return;
+        }
+        $dcapture->advance($this->frameIndex, $this->tickIndex, $this->console);
+    }
+
+    private function publishCameraOverride(Frame $frame) : void
+    {
+        DCapture $dcapture = guard $this->script else {
+            return;
+        }
+        CameraOverrideData $override = guard $dcapture->cameraOverride() else {
+            return;
+        }
+        $frame->set($override);
     }
 
     private function present() : bool
@@ -355,6 +409,15 @@ public class Host
             loadConsoleOverlay($console, $this->device);
         }
 
+        DCaptureConsole $verbs = DCaptureConsole($this->dumps, $this->script);
+        $verbs->registerConsoleCommands($console->registry);
+        Overlay? $maybeOverlay = $this->overlay;
+        if ($maybeOverlay != null) {
+            Overlay $hud = guard $maybeOverlay;
+            $hud->registerConsoleCommands($console->registry);
+        }
+
+        $this->dcaptureConsole = $verbs;
         $this->console = $console;
     }
 
@@ -389,6 +452,9 @@ public class Host
         });
         $this->assets->register(KIND_VMAT, function(Assets $a, Blob $b) : result<Vmat, AssetError> {
             return decodeVmat($a, $b);
+        });
+        $this->assets->register(KIND_MODEL, function(Assets $a, Blob $b) : result<Model, AssetError> {
+            return decodeModel($a, $b);
         });
         Paths? $paths = $this->services->find<Paths>();
         Paths $p = guard $paths else {
@@ -465,6 +531,19 @@ internal function loadConsoleOverlay(DebugConsole $console, Device $device) : vo
         info("debug console overlay: {$e->message()}");
         return;
     }
+}
+
+/**
+ * Script dumps share the driver's queue so a `--dcapture` out dir is honoured; otherwise a
+ * process-lifetime queue so console `dump` still works.
+ */
+internal function hostDumps(Services $services, HostConfig $config) : DumpQueue
+{
+    DCapture $script = guard $services->find<DCapture>() else {
+        return DumpQueue('var/dcapture');
+    }
+    $script->configure($config);
+    return $script->dumps;
 }
 
 internal function hostHints(HostConfig $config) : WindowHints

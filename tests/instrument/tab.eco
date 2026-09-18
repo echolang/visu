@@ -1,0 +1,181 @@
+/**
+ * Tab board: declare, write into existing, named sources, pass extras.
+ */
+
+use visu::graphics::DrawStats;
+use visu::instrument::{
+    Instruments, Metric, PassTiming, Sink, Source, Tab, Unit, findTab, formatMetric, formatPass,
+    formatTab
+};
+
+class TerrainSource : Source
+{
+    public function collect(Sink $sink) : void
+    {
+        $sink->tab('terrain', title: 'Terrain', 20);
+        $sink->section('lod');
+        $sink->metric('quads', 12.0, .count, of: 64.0);
+        $sink->metric('cull', 1500000.0, .ns);
+        $sink->passExtra('terrain', 'cull', 1500000.0, .ns);
+    }
+}
+
+class GraphFiller : Source
+{
+    public function collect(Sink $sink) : void
+    {
+        $sink->tab('graph');
+        PassTiming $row = PassTiming();
+        $row->name = 'terrain';
+        $row->cpuNs = 2100000.0;
+        $row->draw->draws = 1;
+        $sink->pass($row);
+    }
+}
+
+test instruments_declared_tabs_exist_empty
+{
+    Instruments $inst = Instruments();
+    $sample = $inst->sample();
+    assert($sample->tabs->count() == 3, 'three built-ins');
+    Tab $r = guard findTab($sample, 'rendering') else {
+        die('rendering');
+    }
+    assert($r->title == 'Rendering', 'title');
+    assert($r->order == 0, 'order');
+}
+
+test instruments_source_registers_new_tab
+{
+    Instruments $inst = Instruments();
+    $inst->add(id: 'terrain', TerrainSource());
+    $sample = $inst->sample();
+    Tab $t = guard findTab($sample, 'terrain') else {
+        die('terrain');
+    }
+    assert($t->title == 'Terrain', 'title');
+    assert($t->order == 20, 'order');
+    assert($t->sections->count() == 1, 'lod');
+    assert($t->sections[0]->metrics[0]->name == 'quads', 'quads');
+    assert($t->sections[0]->metrics[0]->of == 64.0, 'of');
+}
+
+test instruments_named_add_replaces
+{
+    Instruments $inst = Instruments();
+    $inst->add(id: 'terrain', TerrainSource());
+    $inst->add(id: 'terrain', TerrainSource());
+    $sample = $inst->sample();
+    int32 $n = 0;
+    array<visu::instrument::Tab> $tabs = $sample->tabs;
+    foreach ($tabs as $tab) {
+        if ($tab->id == 'terrain') {
+            $n = $n + 1;
+        }
+    }
+
+    assert($n == 1, 'one terrain');
+}
+
+test instruments_named_remove_drops
+{
+    Instruments $inst = Instruments();
+    $inst->add(id: 'terrain', TerrainSource());
+    $inst->remove(id: 'terrain');
+    $sample = $inst->sample();
+    Tab? $t = findTab($sample, 'terrain');
+    assert($t == null, 'gone');
+}
+
+test instruments_write_into_existing_graph
+{
+    Instruments $inst = Instruments();
+    $inst->add(GraphFiller());
+    $inst->add(id: 'terrain', TerrainSource());
+    $sample = $inst->sample();
+    Tab $g = guard findTab($sample, 'graph') else {
+        die('graph');
+    }
+    assert($g->passes->count() == 1, 'one pass');
+    assert($g->passes[0]->name == 'terrain', 'name');
+    assert($g->passes[0]->extras->count() == 1, 'cull extra');
+    assert($g->passes[0]->extras[0]->name == 'cull', 'cull');
+}
+
+test instruments_gauge_lands_on_app_tab
+{
+    Instruments $inst = Instruments();
+    $inst->gauge('entities', 12.0, .count);
+    $sample = $inst->sample();
+    Tab $app = guard findTab($sample, 'app') else {
+        die('app');
+    }
+    assert($app->sections->count() >= 1, 'section');
+    bool $saw = false;
+    array<visu::instrument::Section> $sections = $app->sections;
+    foreach ($sections as $sec) {
+        array<visu::instrument::Metric> $metrics = $sec->metrics;
+        foreach ($metrics as $m) {
+            if ($m->name == 'entities') {
+                $saw = true;
+                assert($m->value == 12.0, 'value');
+            }
+        }
+    }
+
+    assert($saw, 'entities');
+    assert($sample->gauges->count() == 1, 'gauge still on sample');
+}
+
+test instruments_pass_extra_push_clears_next_sample
+{
+    Instruments $inst = Instruments();
+    PassTiming $row = PassTiming();
+    $row->name = 'terrain';
+    $row->cpuNs = 1000.0;
+    array<PassTiming> $passes = array<PassTiming>();
+    $passes[] = $row;
+    $inst->noteGraph($passes);
+    $inst->passExtra('terrain', 'cull', 50.0, .ns);
+    $first = $inst->sample();
+    Tab $g = guard findTab($first, 'graph') else {
+        die('graph');
+    }
+    assert($g->passes[0]->extras->count() == 1, 'extra');
+    $second = $inst->sample();
+    Tab $g2 = guard findTab($second, 'graph') else {
+        die('graph2');
+    }
+    assert($g2->passes[0]->extras->count() == 0, 'cleared');
+}
+
+test format_metric_ratio
+{
+    Metric $m = Metric('quads', 12.0, Unit::count, 64.0);
+    string $s = formatMetric($m);
+    assert($s->contains('quads:'), 'name');
+    assert($s->contains('/'), 'ratio');
+}
+
+test format_pass_missing_gpu_is_dash
+{
+    PassTiming $p = PassTiming();
+    $p->name = 'terrain';
+    $p->cpuNs = 2100000.0;
+    string $s = formatPass($p);
+    assert($s->contains('CPU:'), 'cpu');
+    assert($s->contains('—'), 'dash');
+}
+
+test format_tab_includes_section
+{
+    Sink $sink = Sink::empty();
+    $sink->tab('terrain', title: 'Terrain', 20);
+    $sink->section('lod');
+    $sink->metric('quads', 12.0, Unit::count, of: 64.0);
+    array<Tab> $tabs = $sink->snapshotTabs();
+    assert($tabs->count() == 1, 'one');
+    array<string> $lines = formatTab($tabs[0]);
+    assert($lines->count() >= 2, 'header+row');
+    assert($lines[0] == 'lod', 'header');
+}

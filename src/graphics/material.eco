@@ -6,13 +6,23 @@
 namespace visu::graphics;
 
 use json;
-use visu::asset::{AssetError, AssetRef, Assets, Vmat, vmatBool, vmatMap, vmatRgb, vmatVec2};
+use visu::asset::{AssetError, AssetRef, Assets, Vmat, vmatBool, vmatF32, vmatMap, vmatRgb, vmatVec2};
 use visu::math::{Vec2, Vec3};
 
 public class Material
 {
     public const string $id;
     public const Vmat $sheet;
+
+    /**
+     * The JSON this material reads: the sheet root, or one record overlaid on it (`view:`).
+     */
+    public const json::Value $root;
+
+    /**
+     * Catalog folder the sheet was cooked in. A bind that names a bare stem resolves against it.
+     */
+    public const string $folder;
 
     /**
      * Tiles per world unit. JSON `textureScale`, factory may overwrite.
@@ -23,6 +33,18 @@ public class Material
      * Solid albedo when a map is missing. JSON `fallback`.
      */
     public Vec3 $diffuseColor;
+
+    /**
+     * Scalar surface values used where the map is missing. JSON `roughnessFactor` / `metallicFactor`.
+     */
+    public float32 $roughnessFactor;
+    public float32 $metallicFactor;
+
+    /**
+     * Below this alpha a fragment is discarded. 0 means opaque, no test. JSON `alphaCutoff`;
+     * defaults to 0.5 when an `alpha` map is bound.
+     */
+    public float32 $alphaCutoff;
 
     public bool $backfaceCull;
 
@@ -39,9 +61,66 @@ public class Material
     {
         $this->id = $sheet->id;
         $this->sheet = $sheet;
-        $this->textureScale = vmatVec2($sheet->root, 'textureScale', Vec2(1.0f));
-        $this->diffuseColor = vmatRgb($sheet->root, 'fallback', Vec3(1.0f));
-        $this->backfaceCull = vmatBool($sheet->root, 'backfaceCull', true)->or(true);
+        $this->root = $sheet->root;
+        $this->folder = $sheet->id;
+        $this->textureScale = Vec2(1.0f);
+        $this->diffuseColor = Vec3(1.0f);
+        $this->roughnessFactor = 0.8f;
+        $this->metallicFactor = 0.0f;
+        $this->alphaCutoff = 0.0f;
+        $this->backfaceCull = true;
+        $this->albedo = null;
+        $this->normal = null;
+        $this->roughness = null;
+        $this->metal = null;
+        $this->height = null;
+        $this->ao = null;
+        $this->emissive = null;
+        $this->alpha = null;
+        $this->read();
+    }
+
+    /**
+     * One record of a folder sheet, overlaid on the folder root: a model's per-material entry.
+     */
+    public constructor(Vmat $sheet, view: string $record)
+    {
+        $this->id = "{$sheet->id}:{$record}";
+        $this->sheet = $sheet;
+        $this->root = $sheet->view($record);
+        $this->folder = $sheet->id;
+        $this->textureScale = Vec2(1.0f);
+        $this->diffuseColor = Vec3(1.0f);
+        $this->roughnessFactor = 0.8f;
+        $this->metallicFactor = 0.0f;
+        $this->alphaCutoff = 0.0f;
+        $this->backfaceCull = true;
+        $this->albedo = null;
+        $this->normal = null;
+        $this->roughness = null;
+        $this->metal = null;
+        $this->height = null;
+        $this->ao = null;
+        $this->emissive = null;
+        $this->alpha = null;
+        $this->read();
+    }
+
+    /**
+     * Empty slots. Used when the sheet is missing.
+     */
+    public constructor(id: string $id)
+    {
+        $this->id = $id;
+        $this->sheet = Vmat($id, json::object());
+        $this->root = json::object();
+        $this->folder = '';
+        $this->textureScale = Vec2(1.0f);
+        $this->diffuseColor = Vec3(1.0f);
+        $this->roughnessFactor = 0.8f;
+        $this->metallicFactor = 0.0f;
+        $this->alphaCutoff = 0.0f;
+        $this->backfaceCull = true;
         $this->albedo = null;
         $this->normal = null;
         $this->roughness = null;
@@ -53,23 +132,21 @@ public class Material
     }
 
     /**
-     * Empty slots. Used when the sheet is missing.
+     * Surface knobs from `$root`.
      */
-    public constructor(id: string $id)
+    private function read() : void
     {
-        $this->id = $id;
-        $this->sheet = Vmat($id, json::object());
-        $this->textureScale = Vec2(1.0f);
-        $this->diffuseColor = Vec3(1.0f);
-        $this->backfaceCull = true;
-        $this->albedo = null;
-        $this->normal = null;
-        $this->roughness = null;
-        $this->metal = null;
-        $this->height = null;
-        $this->ao = null;
-        $this->emissive = null;
-        $this->alpha = null;
+        $this->textureScale = vmatVec2($this->root, 'textureScale', Vec2(1.0f));
+        $this->diffuseColor = vmatRgb($this->root, 'fallback', Vec3(1.0f));
+        $this->roughnessFactor = vmatF32($this->root, 'roughnessFactor', 0.8f);
+        $this->metallicFactor = vmatF32($this->root, 'metallicFactor', 0.0f);
+        $this->backfaceCull = vmatBool($this->root, 'backfaceCull', true)->or(true);
+        float32 $cutoff = 0.0f;
+        if (vmatMap($this->root, 'alpha', 'opacity') != null) {
+            $cutoff = 0.5f;
+        }
+
+        $this->alphaCutoff = vmatF32($this->root, 'alphaCutoff', $cutoff);
     }
 
     /**
@@ -90,22 +167,56 @@ public class Material
      */
     public function bind(Assets $assets) : void
     {
-        json::Value $root = $this->sheet->root;
-        $this->albedo = materialSlot($assets, vmatMap($root, 'albedo', 'diffuse'));
-        $this->normal = materialSlot($assets, vmatMap($root, 'normal'));
-        $this->roughness = materialSlot($assets, vmatMap($root, 'rough', 'roughness'));
-        $this->metal = materialSlot($assets, vmatMap($root, 'metal', 'metallic'));
-        $this->height = materialSlot($assets, vmatMap($root, 'height'));
-        $this->ao = materialSlot($assets, vmatMap($root, 'ao'));
-        $this->emissive = materialSlot($assets, vmatMap($root, 'emissive'));
-        $this->alpha = materialSlot($assets, vmatMap($root, 'alpha'));
+        json::Value $root = $this->root;
+        string $folder = $this->folder;
+        $this->albedo = materialSlot($assets, $folder, vmatMap($root, 'albedo', 'diffuse'));
+        $this->normal = materialSlot($assets, $folder, vmatMap($root, 'normal'));
+        $this->roughness = materialSlot($assets, $folder, vmatMap($root, 'rough', 'roughness'));
+        $this->metal = materialSlot($assets, $folder, vmatMap($root, 'metal', 'metallic'));
+        $this->height = materialSlot($assets, $folder, vmatMap($root, 'height'));
+        $this->ao = materialSlot($assets, $folder, vmatMap($root, 'ao'));
+        $this->emissive = materialSlot($assets, $folder, vmatMap($root, 'emissive'));
+        $this->alpha = materialSlot($assets, $folder, vmatMap($root, 'alpha', 'opacity'));
+    }
+
+    /**
+     * The catalog id a bind names: a bare stem is relative to the material's folder, anything
+     * with a slash in it is already an id. The cooker rewrites the sheet's own binds; a record's
+     * binds are resolved here.
+     */
+    public const function mapId(const string& $bind) : string
+    {
+        return materialMapId($this->folder, $bind);
+    }
+
+    /**
+     * Cut-out surfaces test alpha; anything else writes every fragment.
+     */
+    public const function cutout() : bool
+    {
+        return $this->alphaCutoff > 0.0f;
     }
 }
 
-internal function materialSlot(Assets $assets, string? $id) : AssetRef?
+internal function materialSlot(Assets $assets, const string& $folder, string? $id) : AssetRef?
 {
     string $have = guard $id else {
         return null;
     }
-    return $assets->slot($have);
+    return $assets->slot(materialMapId($folder, $have));
+}
+
+/**
+ * `wood` in folder `props/crate_01` is `props/crate_01/wood`; `props/crate_01/wood` stays put.
+ */
+internal function materialMapId(const string& $folder, const string& $bind) : string
+{
+    if ($folder->empty() || $bind->find('/') != $bind->size()) {
+        return $bind;
+    }
+
+    string $id = $folder;
+    $id->append('/');
+    $id->append($bind);
+    return $id;
 }

@@ -1,0 +1,69 @@
+/**
+ * CPU draw accounting without a GPU.
+ */
+
+use visu::graphics::{DrawCounters, DrawStats, Topology};
+
+test draw_stats_triangles_list
+{
+    DrawCounters $c = DrawCounters();
+    $c->draw(Topology::triangles, 9, 2);
+    assert($c->frame->draws == 1, 'draws');
+    assert($c->frame->vertices == 18, 'verts');
+    assert($c->frame->triangles == 6, 'tris');
+    assert($c->frame->patches == 0, 'no patches');
+}
+
+test draw_stats_triangle_strip
+{
+    DrawCounters $c = DrawCounters();
+    $c->draw(Topology::triangleStrip, 5, 1);
+    assert($c->frame->triangles == 3, 'strip');
+}
+
+test draw_stats_patches_are_not_triangles
+{
+    DrawCounters $c = DrawCounters();
+    $c->draw(Topology::patches, 8, 1, 4);
+    assert($c->frame->patches == 2, 'patches');
+    assert($c->frame->triangles == 0, 'no fake tris');
+}
+
+test draw_stats_indexed_counts_both
+{
+    DrawCounters $c = DrawCounters();
+    $c->drawIndexed(Topology::triangles, 6, 1);
+    assert($c->frame->draws == 1, 'draws');
+    assert($c->frame->indexed == 1, 'indexed');
+    assert($c->frame->triangles == 2, 'tris');
+}
+
+test draw_stats_bind
+{
+    DrawCounters $c = DrawCounters();
+    $c->bind();
+    $c->bind();
+    assert($c->frame->pipelineBinds == 2, 'binds');
+}
+
+test draw_stats_roll_publishes_last
+{
+    DrawCounters $c = DrawCounters();
+    $c->draw(Topology::triangles, 3, 1);
+    $c->roll();
+    assert($c->last->draws == 1, 'last');
+    assert($c->frame->draws == 0, 'reset');
+}
+
+test draw_stats_since_is_delta
+{
+    DrawStats $a = DrawStats();
+    $a->draws = 2;
+    $a->triangles = 10;
+    DrawStats $b = DrawStats();
+    $b->draws = 5;
+    $b->triangles = 16;
+    DrawStats $d = $b->since($a);
+    assert($d->draws == 3, 'draws');
+    assert($d->triangles == 6, 'tris');
+}

@@ -11,7 +11,7 @@
 use std::io;
 use visu::app::info;
 use visu::os::{resourceRoot, writableRoot};
-use visu::ecs::{Entities, Entity, System};
+use visu::ecs::{Entities, Entity, Schedule, System};
 use visu::geo::{AABB, Transform, PrimitiveBuilder, PrimitiveLayout, sphere};
 use visu::graphics::{
     Camera, RenderContext, DeferredRenderer, DrawCallAssembler, GBufferData, IblQuality, Mesh, MeshHandle,
@@ -21,7 +21,8 @@ use visu::graphics::{
 use visu::math::{Vec3, Vec4};
 use visu::quickstart::{App, Options, Quickstart};
 use visu::components::{ActiveCamera, OrbitCamera};
-use visu::system::{CameraSystem, OrbitCameraSystem};
+use visu::runtime::DebugConsole;
+use visu::system::{CameraSystem, DeferredViewSystem, OrbitCameraSystem};
 
 /**
  * Any equirectangular radiance map. Missing means sun-only lighting.
@@ -84,6 +85,10 @@ public class SphereSystem : System
     {
     }
 
+    public function schedule(Schedule& $schedule) : void
+    {
+    }
+
     public function update(Entities $entities) : void
     {
     }
@@ -136,6 +141,7 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
     $opt->windowTitle = 'visu pbr';
     $opt->windowWidth = 1280;
     $opt->windowHeight = 720;
+    $opt->debugConsole = true;
 
     $opt->ready = function(App $app) : void {
         DeferredRenderer $renderer = DeferredRenderer($app->device);
@@ -159,6 +165,11 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
         $app->systems->bind(CameraSystem());
         $app->systems->bind(OrbitCameraSystem($app->input));
         $app->systems->bind($spheres);
+        $app->systems->bind(DeferredViewSystem($renderer));
+        if ($app->host->console != null) {
+            DebugConsole $console = guard $app->host->console;
+            $app->systems->listen($console);
+        }
 
         $app->services->set(PbrScene($renderer, $mesh, $dca));
     };
@@ -332,8 +343,8 @@ internal function dumpFrame(App $app) : void
     dumpPoolTexture($app, 'ssaoBlur.attachment.color_output', "{$dir}/pbr_ssao.png");
     // cube dumps write face 0, +X
     dumpPoolTexture($app, 'environment', "{$dir}/pbr_env.png");
-    dumpPoolTexture($app, 'ibl.irradiance', "{$dir}/pbr_irradiance.png");
-    dumpPoolTexture($app, 'ibl.prefilter', "{$dir}/pbr_prefilter.png");
+    dumpPoolTexture($app, 'ibl.irradiance.0', "{$dir}/pbr_irradiance.png");
+    dumpPoolTexture($app, 'ibl.prefilter.0', "{$dir}/pbr_prefilter.png");
     dumpPoolTexture($app, 'ibl.brdf', "{$dir}/pbr_brdf.png");
 }
 

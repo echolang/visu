@@ -1,9 +1,14 @@
 /**
  * Build the process Services: app definitions first, then framework defaults so the app can occupy a slot.
  * Device is never stored here.
+ * This is the process edge: `--dcapture` / `--flag` are read from argv here, and a script that does
+ * not parse ends the process with exit code 2 and the reason on the logger.
  */
 
 namespace visu::app;
+
+use std::env;
+use visu::dcapture::{DCapture, DCaptureError};
 
 public function bootstrap(Paths $paths, function<void(Services)> $define) : Services
 {
@@ -12,7 +17,45 @@ public function bootstrap(Paths $paths, function<void(Services)> $define) : Serv
     $define($s);
     defaults($s);
     announceVersion();
+    installDCapture($s, programArguments());
     return $s;
+}
+
+/**
+ * The program's arguments, or just the program name when nothing else was passed.
+ * `env::argv()` is only touched when there is a tail to read: with a lone program name the
+ * owned copy faults under `echoc test`, and there is nothing to parse anyway.
+ */
+internal function programArguments() : array<string>
+{
+    if (env::argc() > 1) {
+        return env::argv();
+    }
+
+    array<string> $lone = array<string>();
+    $lone[] = '';
+    return $lone;
+}
+
+/**
+ * Parse the dcapture arguments onto Services and apply their flags. A bad script is a user error
+ * at the process edge: log it and exit 2 so the agent that launched the run sees a clear failure.
+ */
+public function installDCapture(Services $s, const array<string>& $argv) : void
+{
+    result<DCapture, DCaptureError> $parsed = DCapture::fromArgs($argv);
+    if ($parsed->failed()) {
+        DCaptureError $e = $parsed->failure();
+        error("dcapture: {$e->message()}");
+        env::exit(2);
+        return;
+    }
+
+    DCapture $dcapture = $parsed->unwrap();
+    $dcapture->applyFlags(flags());
+    if ($dcapture->active) {
+        $s->set($dcapture);
+    }
 }
 
 /**
@@ -21,6 +64,10 @@ public function bootstrap(Paths $paths, function<void(Services)> $define) : Serv
  */
 public function defaults(Services $s) : void
 {
+    $s->once(function(Services $s) : Flags {
+        return Flags();
+    });
+    installFlags($s->get<Flags>());
     $s->once(function(Services $s) : Logger {
         Logger $log = Logger();
         $log->attach(StdoutConduit());

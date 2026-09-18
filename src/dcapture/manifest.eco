@@ -1,0 +1,109 @@
+/**
+ * `manifest.json`: what a dcapture run produced, for the agent that launched it.
+ * Rewritten after every dump batch so a crash mid-run still leaves the files written so far.
+ */
+
+namespace visu::dcapture;
+
+use std::io;
+use visu::app::{FlagValue, Flags};
+
+public class Manifest
+{
+    public int32 $frames;
+    public int32 $ticks;
+    public array<DumpRecord> $dumps;
+    public array<string> $events;
+    public array<string> $errors;
+    public array<string> $skipped;
+    public array<string>? $catalog;
+
+    public constructor()
+    {
+        $this->frames = 0;
+        $this->ticks = 0;
+        $this->dumps = array<DumpRecord>();
+        $this->events = array<string>();
+        $this->errors = array<string>();
+        $this->skipped = array<string>();
+        $this->catalog = null;
+    }
+
+    public function toJson(Flags $flags) : json::Value
+    {
+        json::Value $root = json::object();
+        $root['frames'] = json::int($this->frames as int64);
+        $root['ticks'] = json::int($this->ticks as int64);
+
+        json::Value $flagObj = json::object();
+        array<string> $names = $flags->names();
+        foreach ($names as $name) {
+            FlagValue $v = guard $flags->get($name) else {
+                continue;
+            }
+            match ($v) {
+                FlagValue::boolean($b) => {
+                    $flagObj[$name] = json::bool($b);
+                },
+                FlagValue::integer($n) => {
+                    $flagObj[$name] = json::int($n);
+                },
+                FlagValue::floating($f) => {
+                    $flagObj[$name] = json::float($f);
+                },
+                FlagValue::text($s) => {
+                    $flagObj[$name] = textValue($s);
+                },
+            }
+        }
+        $root['flags'] = $flagObj;
+
+        json::Value $dumps = json::arr();
+        foreach ($this->dumps as $record) {
+            json::Value $item = json::object();
+            $item['name'] = json::str($record->name);
+            $item['path'] = json::str($record->path);
+            $item['frame'] = json::int($record->frame as int64);
+            $item['label'] = json::str($record->label);
+            $dumps[] = $item;
+        }
+        $root['dumps'] = $dumps;
+
+        $root['events'] = stringList($this->events);
+        $root['errors'] = stringList($this->errors);
+        $root['skipped'] = stringList($this->skipped);
+        array<string>? $catalog = $this->catalog;
+        if ($catalog != null) {
+            array<string> $listed = guard $catalog;
+            $root['catalog'] = stringList($listed);
+        }
+
+        return $root;
+    }
+
+    public function write(const string& $path, Flags $flags) : status<DCaptureError>
+    {
+        json::Value $root = $this->toJson($flags);
+        string $text = json::pretty($root);
+        $text->append("\n");
+        guard io::writefile($path, $text) else ($e) {
+            return .error(.io($path, $e->message()));
+        }
+        return .ok;
+    }
+}
+
+internal function textValue(string $s) : json::Value
+{
+    return json::str($s);
+}
+
+internal function stringList(const array<string>& $items) : json::Value
+{
+    json::Value $out = json::arr();
+    foreach ($items as $item) {
+        $out[] = json::str($item);
+    }
+
+    return $out;
+}

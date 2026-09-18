@@ -1,5 +1,8 @@
 /**
- * Per-frame update/render extension point, plus the list that binds them.
+ * Update / render / tick extension point, plus the list that binds them.
+ * A system declares in `schedule()` which phases it takes part in and which tick handlers it owns;
+ * the binder sorts it into the phase lists once, so an opted-out system costs nothing per frame.
+ * Bind order is execution order within every phase.
  * From render(), add graph passes to `$ctx->pipeline`; do not store Device on a system unless the system owns GPU objects.
  */
 
@@ -12,6 +15,12 @@ public interface System
 {
     function register(Entities $entities) : void;
     function unregister(Entities $entities) : void;
+
+    /**
+     * Declare the phases this system runs in and the tick handlers it owns. Read once, at bind.
+     */
+    function schedule(Schedule& $schedule) : void;
+
     function update(Entities $entities) : void;
     function render(Entities $entities, RenderContext $ctx) : void;
 }
@@ -19,19 +28,58 @@ public interface System
 public class Systems
 {
     private array<System> $bound;
+
+    /**
+     * The phase lists, filled from each system's Schedule at bind. A system that opted out of a
+     * phase is simply absent from its list.
+     */
+    private array<System> $updaters;
+    private array<System> $renderers;
+    private array<Ticker> $tickers;
+
+    /**
+     * Simulation passes run so far. Starts at zero, so the first tick() is pass one and a ticker
+     * with offset one runs on it.
+     */
+    private int64 $passes;
+
     private array<ConsoleCommandHandler> $handlers;
     private DebugConsole? $console;
+
+    /**
+     * Verb names this list added to the console registry, so unregister removes only those.
+     */
+    private array<string> $installed;
 
     public constructor()
     {
         $this->bound = array<System>();
+        $this->updaters = array<System>();
+        $this->renderers = array<System>();
+        $this->tickers = array<Ticker>();
+        $this->passes = 0;
         $this->handlers = array<ConsoleCommandHandler>();
         $this->console = null;
+        $this->installed = array<string>();
     }
 
     public function bind(System $system) : void
     {
         $this->bound->push($system);
+        Schedule $schedule = Schedule();
+        $system->schedule($schedule);
+
+        if ($schedule->update) {
+            $this->updaters->push($system);
+        }
+
+        if ($schedule->render) {
+            $this->renderers->push($system);
+        }
+
+        foreach ($schedule->tickers as $ticker) {
+            $this->tickers->push($ticker);
+        }
     }
 
     /**
@@ -81,16 +129,51 @@ public class Systems
         }
     }
 
+    /**
+     * One simulation pass. The scene runs this as many times per update as the simulation speed
+     * asks for, so speeding the world up runs more passes rather than a longer step.
+     */
+    public function tick(Entities $entities) : void
+    {
+        $this->passes = $this->passes + 1;
+        int64 $pass = $this->passes;
+
+        foreach ($this->tickers as $ticker) {
+            int64 $offset = $ticker->offset as int64;
+
+            if ($pass < $offset) {
+                continue;
+            }
+
+            int64 $interval = $ticker->interval as int64;
+
+            if (($pass - $offset) % $interval != 0) {
+                continue;
+            }
+
+            function<void(Entities, int64)> $fn = $ticker->fn;
+            $fn($entities, $pass);
+        }
+    }
+
+    /**
+     * Simulation passes run so far.
+     */
+    public const function passes() : int64
+    {
+        return $this->passes;
+    }
+
     public function update(Entities $entities) : void
     {
-        foreach ($this->bound as $system) {
+        foreach ($this->updaters as $system) {
             $system->update($entities);
         }
     }
 
     public function render(Entities $entities, RenderContext $ctx) : void
     {
-        foreach ($this->bound as $system) {
+        foreach ($this->renderers as $system) {
             $system->render($entities, $ctx);
         }
     }
@@ -100,10 +183,13 @@ public class Systems
         DebugConsole $console = guard $this->console else {
             return;
         }
+        $this->removeConsole();
         ConsoleCommandRegistry $registry = $console->registry;
-        $registry->clear();
         foreach ($this->handlers as $handler) {
-            $handler->registerConsoleCommands($registry);
+            array<string> $added = $handler->registerConsoleCommands($registry);
+            foreach ($added as $name) {
+                $this->installed[] = $name;
+            }
         }
     }
 
@@ -112,6 +198,9 @@ public class Systems
         DebugConsole $console = guard $this->console else {
             return;
         }
-        $console->registry->clear();
+        foreach ($this->installed as $name) {
+            $console->registry->remove($name);
+        }
+        $this->installed = array<string>();
     }
 }

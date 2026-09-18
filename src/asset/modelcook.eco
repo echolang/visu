@@ -1,0 +1,129 @@
+/**
+ * glb / gltf → vmodel, one item per mesh-carrying object in the file. LOD distances, bias and cull
+ * distance come from the folder `.vmat` view for the object name (`Source.$meta` is the file's view;
+ * an object record overlays it).
+ */
+
+namespace visu::asset;
+
+use json;
+
+/**
+ * BetaBrain's defaults when the sheet names no distances: level n switches in at `[n - 1]`.
+ */
+internal function modelDefaultLodDistance(int32 $level) : float32
+{
+    if ($level <= 1) {
+        return 20.0f;
+    }
+
+    if ($level == 2) {
+        return 50.0f;
+    }
+
+    if ($level == 3) {
+        return 100.0f;
+    }
+
+    if ($level == 4) {
+        return 250.0f;
+    }
+
+    return 500.0f;
+}
+
+public class ModelCooker : Cooker
+{
+    public function kind() : string
+    {
+        return KIND_MODEL;
+    }
+
+    public function accepts(const string& $path) : bool
+    {
+        string $lower = str::lower($path);
+        return $lower->ends('.glb') || $lower->ends('.gltf');
+    }
+
+    public function cook(const Source& $src) : result<array<PackItem>, AssetError>
+    {
+        GltfFile $file = guard GltfFile::load($src->path) else ($e) {
+            return .error(gltfAssetError($src->path, $e));
+        }
+        array<GltfModel> $models = guard gltfModels($file) else ($e) {
+            return .error(gltfAssetError($src->id, $e));
+        }
+        string $folder = parentId($src->id);
+        array<PackItem> $items = array<PackItem>();
+        foreach ($models as $entry) {
+            json::Value $view = vmatView($src->meta, $entry->name);
+            CookedModel $model = $entry->model;
+            guard applyModelSheet($model, $view, $src->id) else ($e) {
+                return .error($e);
+            }
+            Blob $blob = guard encodeModel($model) else ($e) {
+                return .error($e);
+            }
+            $items[] = PackItem(sourceId($folder, $entry->name), KIND_MODEL, $blob);
+        }
+
+        return .ok($items);
+    }
+}
+
+/**
+ * `lod` (array of switch distances for level 1..n), `lodBias`, `cullDistance` from the sheet view.
+ * Defaults fill when `lod` is absent. A present `lod` must be an array of numbers of length `lods-1`.
+ */
+internal function applyModelSheet(CookedModel $model, json::Value $view, const string& $id) : status<AssetError>
+{
+    int32 $n = $model->lods->count() as int32;
+    json::Value? $got = $view->get('lod');
+    if ($got != null) {
+        json::Value $lod = guard $got;
+        array<json::Value>? $arr = $lod->asArray();
+        array<json::Value> $vals = guard $arr else {
+            return .error(.decode($id, 'lod must be an array of numbers'));
+        }
+        int32 $want = $n - 1;
+        if ($want < 0) {
+            $want = 0;
+        }
+
+        if (($vals->count() as int32) != $want) {
+            return .error(.decode($id, "lod must have {$want} distances"));
+        }
+
+        int32 $level = 1;
+        while ($level < $n) {
+            float64? $f = $vals[($level - 1) as usize]->asFloat();
+            float64 $distance = guard $f else {
+                return .error(.decode($id, 'lod must be an array of numbers'));
+            }
+            ModelLodDesc $desc = $model->lods[$level as usize];
+            $desc->distance = $distance as float32;
+            $model->lods[$level as usize] = $desc;
+            $level = $level + 1;
+        }
+    } else {
+        int32 $level = 1;
+        while ($level < $n) {
+            ModelLodDesc $desc = $model->lods[$level as usize];
+            $desc->distance = modelDefaultLodDistance($level);
+            $model->lods[$level as usize] = $desc;
+            $level = $level + 1;
+        }
+    }
+
+    $model->lodBias = vmatF32($view, 'lodBias', 1.0f);
+    $model->cullDistance = vmatF32($view, 'cullDistance', 0.0f);
+    return .ok;
+}
+
+internal function gltfAssetError(const string& $id, GltfError $e) : AssetError
+{
+    return match ($e) {
+        GltfError::io($path, $message) => AssetError::io($path, $message),
+        else => AssetError::decode($id, $e->message()),
+    };
+}

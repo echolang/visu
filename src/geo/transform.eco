@@ -138,7 +138,15 @@ public struct Transform
      */
     public const function world(Entities $world) : Mat4
     {
-        return $this->worldAt($world, 0);
+        return $this->worldAt($world, 0.0f, false, 0);
+    }
+
+    /**
+     * Interpolated world matrix. Each ancestor uses `local($alpha)`.
+     */
+    public const function world(Entities $world, float32 $alpha) : Mat4
+    {
+        return $this->worldAt($world, $alpha, true, 0);
     }
 
     /**
@@ -166,17 +174,21 @@ public struct Transform
         return $this->scaleAt($world, 0);
     }
 
-    private const function worldAt(Entities $world, int32 $depth) : Mat4
+    private const function worldAt(Entities $world, float32 $alpha, bool $mix, int32 $depth) : Mat4
     {
         assert($depth < TRANSFORM_PARENT_LIMIT, 'transform: parent cycle');
         Mat4 $local = $this->local();
+        if ($mix) {
+            $local = $this->local($alpha);
+        }
+
         if ($this->parent == Entity::none()) {
             return $local;
         }
 
         assert($world->has<Transform>($this->parent), 'transform: parent has no Transform');
         Transform $parent = $world->get<Transform>($this->parent);
-        return $parent->worldAt($world, $depth + 1) * $local;
+        return $parent->worldAt($world, $alpha, $mix, $depth + 1) * $local;
     }
 
     private const function orientAt(Entities $world, int32 $depth) : Quat

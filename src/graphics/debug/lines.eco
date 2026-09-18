@@ -1,0 +1,174 @@
+/**
+ * A frame's worth of debug line segments. Nothing here owns a GPU buffer: the vertices are built on
+ * the CPU every frame and handed to the encoder through the frame's transient ring, so a caller can
+ * add and drop as many lines as it likes without allocating, growing or outliving a buffer a frame
+ * in flight still reads.
+ *
+ * The `debug_lines` program writes the GBuffer with the colour in the emissive channel and nothing
+ * in albedo, so a line reads back as exactly its own colour and still sorts against the scene depth.
+ */
+
+namespace visu::graphics;
+
+use visu::geo::AABB;
+use visu::math::{Mat4, Vec3, Vec4};
+
+/**
+ * Bytes per debug vertex: position and colour.
+ */
+public const int32 DEBUG_LINE_VERTEX_BYTES = 28;
+
+public struct DebugLineVertex
+{
+    public Vec3 $position;
+    public Vec4 $color;
+}
+
+public class DebugLines
+{
+    public Device $device;
+
+    /**
+     * Segments beyond this are dropped rather than grown into: a runaway debug overlay should cost a
+     * frame's ring, not the frame. `count()` keeps counting so the caller can see it happened.
+     */
+    public int32 $limit;
+    private array<DebugLineVertex> $vertices;
+    private int32 $requested;
+
+    public constructor(Device $device, int32 $limit = 262144)
+    {
+        assert($limit > 0, 'debug lines: limit');
+        $this->device = $device;
+        $this->limit = $limit;
+        $this->vertices = array<DebugLineVertex>();
+        $this->requested = 0;
+    }
+
+    public function clear() : void
+    {
+        $this->vertices->clear();
+        $this->requested = 0;
+    }
+
+    public function line(Vec3 $a, Vec3 $b, Vec4 $color) : void
+    {
+        $this->requested = $this->requested + 1;
+        if (($this->vertices->count() as int32) >= $this->limit * 2) {
+            return;
+        }
+
+        $this->vertices[] = DebugLineVertex($a, $color);
+        $this->vertices[] = DebugLineVertex($b, $color);
+    }
+
+    /**
+     * The twelve edges of an axis-aligned box.
+     */
+    public function box(const AABB& $box, Vec4 $color) : void
+    {
+        array<Vec3> $c = $box->corners();
+        // 0..3 is the -z face in corner order, 4..7 the +z face directly above it
+        int32 $i = 0;
+        while ($i < 4) {
+            int32 $next = ($i + 1) % 4;
+            $this->line($c[$i as usize], $c[$next as usize], $color);
+            $this->line($c[($i + 4) as usize], $c[($next + 4) as usize], $color);
+            $this->line($c[$i as usize], $c[($i + 4) as usize], $color);
+            $i = $i + 1;
+        }
+    }
+
+    /**
+     * A box in some local space, drawn as the oriented cage `$world` puts it in rather than as the
+     * axis-aligned box that cage spans.
+     */
+    public function box(const AABB& $box, const Mat4& $world, Vec4 $color) : void
+    {
+        array<Vec3> $local = $box->corners();
+        array<Vec3> $c = array<Vec3>();
+        foreach ($local as $p) {
+            Vec4 $w = $world * Vec4($p->x, $p->y, $p->z, 1.0f);
+            $c[] = Vec3($w->x, $w->y, $w->z);
+        }
+
+        int32 $i = 0;
+        while ($i < 4) {
+            int32 $next = ($i + 1) % 4;
+            $this->line($c[$i as usize], $c[$next as usize], $color);
+            $this->line($c[($i + 4) as usize], $c[($next + 4) as usize], $color);
+            $this->line($c[$i as usize], $c[($i + 4) as usize], $color);
+            $i = $i + 1;
+        }
+    }
+
+    /**
+     * Three axis crosshairs `$size` long through `$at`, in red, green and blue.
+     */
+    public function cross(Vec3 $at, float32 $size) : void
+    {
+        float32 $h = $size * 0.5f;
+        $this->line($at - Vec3($h, 0.0f, 0.0f), $at + Vec3($h, 0.0f, 0.0f), Vec4(1.0f, 0.2f, 0.2f, 1.0f));
+        $this->line($at - Vec3(0.0f, $h, 0.0f), $at + Vec3(0.0f, $h, 0.0f), Vec4(0.2f, 1.0f, 0.2f, 1.0f));
+        $this->line($at - Vec3(0.0f, 0.0f, $h), $at + Vec3(0.0f, 0.0f, $h), Vec4(0.2f, 0.4f, 1.0f, 1.0f));
+    }
+
+    /**
+     * Segments held. Past the limit this keeps counting what was asked for, so the overflow shows.
+     */
+    public const function count() : int32
+    {
+        return $this->requested;
+    }
+
+    public const function vertexCount() : int32
+    {
+        return $this->vertices->count() as int32;
+    }
+
+    public const function empty() : bool
+    {
+        return $this->vertices->count() == 0;
+    }
+
+    /**
+     * Copy into this frame's ring and draw. The caller binds the pass and the camera first.
+     */
+    public function draw(RenderEncoder $enc) : void
+    {
+        int32 $count = $this->vertices->count() as int32;
+        if ($count == 0) {
+            return;
+        }
+
+        uint64 $stride = mem::size<DebugLineVertex>() as uint64;
+        uint64 $bytes = ($count as uint64) * $stride;
+        TransientSlice $slice = $this->device->allocTransient($bytes, 16);
+        ptr<const uint8> $src = ptr<const uint8>(&$this->vertices[0]);
+        mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $bytes);
+        $enc->setVertexTransient(VERTEX_BINDING, $slice);
+        $enc->draw(0, $count, 1);
+    }
+}
+
+/**
+ * Position at location 0, colour at location 1, one stream, per vertex.
+ */
+public function debugLineLayout() : VertexLayout
+{
+    return VertexLayout::of<DebugLineVertex>(function(VertexBuilder $b) : void {
+        ptr<DebugLineVertex> $v = $b->vertex<DebugLineVertex>();
+        $b->attr(0, &$v->position);
+        $b->attr(1, &$v->color);
+    });
+}
+
+/**
+ * The pass debug lines draw with: line list, depth tested against the scene, no culling.
+ */
+public function debugLinePass(ShaderProgram $program) : GpuPass
+{
+    Raster $raster = Raster::opaque();
+    $raster->cull = .none;
+    return GpuPass($program, debugLineLayout(), $raster, topology: .lines);
+}

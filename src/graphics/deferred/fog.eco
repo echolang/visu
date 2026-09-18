@@ -1,0 +1,306 @@
+/**
+ * Exponential height fog the deferred renderer applies to lit pixels and the sky.
+ * `HeightFog` is the artist-facing knob set; `FogUniforms` is its GPU mirror.
+ * Density at the camera is collapsed on the CPU, the same way Unreal packs
+ * `RayOriginTerms`. The probe bake does not include fog.
+ */
+
+namespace visu::graphics;
+
+use std::math;
+use visu::math::{Vec3, Vec4, length};
+
+internal const float32 FOG_VIEW_SAMPLES = 8.0f;
+internal const float32 FOG_LIGHT_SAMPLES = 4.0f;
+
+/**
+ * Height fog parameters. Copied on assignment, like `Sky`. Metres, Unreal 4.27
+ * semantics. Off until `enabled` is set.
+ */
+public struct HeightFog
+{
+    /**
+     * Master switch. `FogDensity` is still packed when this is off; the shader
+     * early-outs so a disabled frame is pixel-identical to no fog.
+     */
+    public bool $enabled;
+
+    /**
+     * Fog density at `height`, per metre. Unreal `FogDensity`.
+     */
+    public float32 $density;
+
+    /**
+     * Height falloff `k` (1/m). Unreal `FogHeightFalloff`.
+     */
+    public float32 $heightFalloff;
+
+    /**
+     * World Y the density is quoted at. Unreal `FogHeightOffset`.
+     */
+    public float32 $height;
+
+    /**
+     * Inscattering colour, or a tint on the atmosphere when `fromSky`. Unreal
+     * `FogInscatteringColor`.
+     */
+    public Vec3 $color;
+
+    /**
+     * Multiply `color` by the atmosphere's horizon radiance in the pixel's
+     * azimuth. Unreal's cubemap inscattering, pointed at our sky.
+     */
+    public bool $fromSky;
+
+    /**
+     * Caps how opaque the fog can get: transmittance never drops below
+     * `1 - maxOpacity`. Unreal `FogMaxOpacity`.
+     */
+    public float32 $maxOpacity;
+
+    /**
+     * Metres from the camera that stay clear. Unreal `StartDistance`.
+     */
+    public float32 $startDistance;
+
+    /**
+     * Metres beyond which the pixel is left untouched. Zero means no cutoff.
+     * Unreal `FogCutoffDistance`.
+     */
+    public float32 $cutoffDistance;
+
+    /**
+     * Ray length used for sky and skybox pixels, so the integral has a far
+     * plane. Not an Unreal knob; 100 km is past any map we draw.
+     */
+    public float32 $skyDistance;
+
+    /**
+     * Directional inscattering colour, tinted engine-side by the current sun.
+     * Unreal `DirectionalInscatteringColor`.
+     */
+    public Vec3 $sunColor;
+
+    /**
+     * Tightness of the sun glow. Unreal `DirectionalInscatteringExponent`.
+     */
+    public float32 $sunExponent;
+
+    /**
+     * Extra metres on top of `startDistance` before the sun glow starts.
+     * Unreal `DirectionalInscatteringStartDistance`.
+     */
+    public float32 $sunStartDistance;
+
+    public constructor()
+    {
+        $this->enabled = false;
+        $this->density = 0.00012f;
+        $this->heightFalloff = 0.008f;
+        $this->height = 0.0f;
+        $this->color = Vec3(1.0f, 1.0f, 1.0f);
+        $this->fromSky = false;
+        $this->maxOpacity = 1.0f;
+        $this->startDistance = 0.0f;
+        $this->cutoffDistance = 0.0f;
+        $this->skyDistance = 100000.0f;
+        $this->sunColor = Vec3(0.4f, 0.3f, 0.18f);
+        $this->sunExponent = 8.0f;
+        $this->sunStartDistance = 0.0f;
+    }
+}
+
+operator (HeightFog $a) == (HeightFog $b) : bool
+{
+    return $a->enabled == $b->enabled
+        && $a->density == $b->density
+        && $a->heightFalloff == $b->heightFalloff
+        && $a->height == $b->height
+        && $a->color == $b->color
+        && $a->fromSky == $b->fromSky
+        && $a->maxOpacity == $b->maxOpacity
+        && $a->startDistance == $b->startDistance
+        && $a->cutoffDistance == $b->cutoffDistance
+        && $a->skyDistance == $b->skyDistance
+        && $a->sunColor == $b->sunColor
+        && $a->sunExponent == $b->sunExponent
+        && $a->sunStartDistance == $b->sunStartDistance;
+}
+
+operator (HeightFog $a) != (HeightFog $b) : bool
+{
+    return !($a == $b);
+}
+
+/**
+ * Mirrors FogUniforms in resources/shaders/include/visu/fog.glsl at uniform slot 3; std140 with vec4 members only.
+ */
+public struct FogUniforms
+{
+
+    /**
+     * Density at the camera in x (D0, 1/m), height falloff k in y, max opacity in z, 1 enabled in w.
+     */
+    public Vec4 $density;
+
+    /**
+     * Inscattering colour or tint in rgb, 1 in w multiplies the atmosphere's horizon radiance.
+     */
+    public Vec4 $color;
+
+    /**
+     * Start distance in x, cutoff in y (0 none), sky distance in z, directional start in w.
+     */
+    public Vec4 $params;
+
+    /**
+     * Directional inscattering colour (already sun tinted) in rgb, exponent in w.
+     */
+    public Vec4 $sun;
+
+    /**
+     * Sky view samples in x, sky light samples in y.
+     */
+    public Vec4 $samples;
+}
+
+/**
+ * Packs fog for one draw. `$camera` is where the viewer stands; `$sunTint` is
+ * `fogSunTint` of the current sun so the glow reddens and vanishes at night.
+ */
+public function fogUniforms(
+    const HeightFog& $fog,
+    Vec3 $camera,
+    Vec3 $sunTint,
+    float32 $viewSamples,
+    float32 $lightSamples
+) : FogUniforms
+{
+    float32 $enabled = 0.0f;
+
+    if ($fog->enabled) {
+        $enabled = 1.0f;
+    }
+
+    float32 $fromSky = 0.0f;
+
+    if ($fog->fromSky) {
+        $fromSky = 1.0f;
+    }
+
+    Vec3 $sun = $fog->sunColor * $sunTint;
+    return FogUniforms(
+        Vec4(fogDensityAtCamera($fog, $camera), $fog->heightFalloff, $fog->maxOpacity, $enabled),
+        Vec4($fog->color->x, $fog->color->y, $fog->color->z, $fromSky),
+        Vec4($fog->startDistance, $fog->cutoffDistance, $fog->skyDistance, $fog->sunStartDistance),
+        Vec4($sun->x, $sun->y, $sun->z, $fog->sunExponent),
+        Vec4($viewSamples, $lightSamples, 0.0f, 0.0f)
+    );
+}
+
+/**
+ * Sun colour scaled by how much of the sky's noon intensity is still up.
+ * Zero below the horizon; matches the directional light `Sky.sunLight` writes.
+ */
+public function fogSunTint(const DirectionalLight& $sun, const Sky& $sky) : Vec3
+{
+    float32 $denom = $sky->sunIntensity;
+
+    if ($denom < 0.001f) {
+        $denom = 0.001f;
+    }
+
+    float32 $scale = $sun->intensity / $denom;
+
+    if ($scale < 0.0f) {
+        $scale = 0.0f;
+    }
+
+    if ($scale > 1.0f) {
+        $scale = 1.0f;
+    }
+
+    return $sun->color * $scale;
+}
+
+/**
+ * CPU twin of the shader's transmittance `T`: start, cutoff, opacity floor,
+ * Taylor branch. 1 when fog is off.
+ */
+public function fogTransmittance(const HeightFog& $fog, Vec3 $camera, Vec3 $relative) : float32
+{
+    if (!$fog->enabled) {
+        return 1.0f;
+    }
+
+    float32 $len = length($relative);
+
+    if ($len < 0.001f) {
+        return 1.0f;
+    }
+
+    if ($fog->cutoffDistance > 0.0f && $len > $fog->cutoffDistance) {
+        return 1.0f;
+    }
+
+    float32 $d0 = fogDensityAtCamera($fog, $camera);
+    float32 $dy = $relative->y / $len;
+    float32 $k = $fog->heightFalloff;
+    float32 $optical = fogIntegral($d0, $k, $dy, $len);
+    float32 $start = $fog->startDistance;
+
+    if ($start > $len) {
+        $start = $len;
+    }
+
+    float32 $t = math::exp(-($optical - fogIntegral($d0, $k, $dy, $start)));
+    float32 $floor = 1.0f - $fog->maxOpacity;
+
+    if ($t < $floor) {
+        $t = $floor;
+    }
+
+    return $t;
+}
+
+/**
+ * Density at the camera: `density * exp(-clamp(k * (yc - height), -30, 30))`.
+ */
+internal function fogDensityAtCamera(const HeightFog& $fog, Vec3 $camera) : float32
+{
+    float32 $arg = $fog->heightFalloff * ($camera->y - $fog->height);
+
+    if ($arg > 30.0f) {
+        $arg = 30.0f;
+    }
+
+    if ($arg < -30.0f) {
+        $arg = -30.0f;
+    }
+
+    return $fog->density * math::exp(-$arg);
+}
+
+/**
+ * Optical depth along a ray. Clamps `k * dy * len` at -60 so exp stays finite.
+ */
+internal function fogIntegral(float32 $d0, float32 $k, float32 $dy, float32 $len) : float32
+{
+    float32 $x = $k * $dy * $len;
+
+    if ($x < -60.0f) {
+        $x = -60.0f;
+    }
+
+    float32 $ax = $x;
+
+    if ($ax < 0.0f) {
+        $ax = -$ax;
+    }
+
+    if ($ax < 0.0001f) {
+        return $d0 * $len * (1.0f - 0.5f * $x);
+    }
+
+    return $d0 * (1.0f - math::exp(-$x)) / ($k * $dy);
+}

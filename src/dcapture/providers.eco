@@ -1,0 +1,133 @@
+/**
+ * The built-in dump providers: the host's scene colour, the deferred renderer's buffers, and
+ * every live pool texture under `pool:`. A game adds its own with `DCapture.addProvider`.
+ */
+
+namespace visu::dcapture;
+
+use visu::app::HostPassData;
+use visu::graphics::{
+    DeferredView, EnvironmentData, Frame, GBufferData, IblData, LightPassData, Pool,
+    SsaoData, SsaoRawData, TextureRef
+};
+
+public function builtinProviders() : array<DumpProvider>
+{
+    array<DumpProvider> $out = array<DumpProvider>();
+    $out[] = HostProvider();
+    $out[] = DeferredProvider();
+    $out[] = PoolProvider();
+    return $out;
+}
+
+/**
+ * `scene` is the offscreen colour the host blits to the window. `backbuffer` is the same image:
+ * the drawable itself cannot be read back on Metal.
+ */
+public class HostProvider : DumpProvider
+{
+    public constructor()
+    {
+    }
+
+    public function describe(Frame $frame, Pool $pool, DumpCatalog $out) : void
+    {
+        HostPassData $host = guard $frame->find<HostPassData>() else {
+            return;
+        }
+        $out->add('scene', .texture($host->outputTexture, .color));
+        $out->add('backbuffer', .texture($host->outputTexture, .color));
+    }
+}
+
+/**
+ * `pbr.gbuffer.*` with the DeferredView remaps, `pbr.light`, `pbr.ssao.raw`, `pbr.ssao`,
+ * `pbr.environment` and `pbr.ibl.*` (cubes write six faces).
+ */
+public class DeferredProvider : DumpProvider
+{
+    public constructor()
+    {
+    }
+
+    public function describe(Frame $frame, Pool $pool, DumpCatalog $out) : void
+    {
+        GBufferData? $gbuffer = $frame->find<GBufferData>();
+        if ($gbuffer != null) {
+            GBufferData $gb = guard $gbuffer;
+            $this->gbuffer($gb, $out);
+        }
+
+        LightPassData? $light = $frame->find<LightPassData>();
+        if ($light != null) {
+            LightPassData $lp = guard $light;
+            $out->add('pbr.light', .texture($lp->output, .color));
+        }
+
+        SsaoRawData? $ssaoRaw = $frame->find<SsaoRawData>();
+        if ($ssaoRaw != null) {
+            SsaoRawData $raw = guard $ssaoRaw;
+            $out->add('pbr.ssao.raw', .texture($raw->output, .color));
+        }
+
+        SsaoData? $ssao = $frame->find<SsaoData>();
+        if ($ssao != null) {
+            SsaoData $blurred = guard $ssao;
+            $out->add('pbr.ssao', .texture($blurred->blurred, .color));
+        }
+
+        EnvironmentData? $environment = $frame->find<EnvironmentData>();
+        if ($environment != null) {
+            EnvironmentData $env = guard $environment;
+            $out->add('pbr.environment', .cube($env->cubemap));
+        }
+
+        IblData? $ibl = $frame->find<IblData>();
+        if ($ibl != null) {
+            IblData $maps = guard $ibl;
+            $out->add('pbr.ibl.irradiance', .cube($maps->irradiance));
+            $out->add('pbr.ibl.prefilter', .cube($maps->prefilter));
+            $out->add('pbr.ibl.brdf', .texture($maps->brdfLut, .color));
+        }
+    }
+
+    private function gbuffer(GBufferData $gb, DumpCatalog $out) : void
+    {
+        array<DeferredView> $views = [
+            DeferredView::albedo,
+            DeferredView::normal,
+            DeferredView::roughness,
+            DeferredView::metallic,
+            DeferredView::ao,
+            DeferredView::emissive,
+            DeferredView::position,
+        ];
+        foreach ($views as $view) {
+            TextureRef $ref = guard $view->gbufferTexture($gb) else {
+                continue;
+            }
+            string $label = $view->label();
+            $out->add("pbr.gbuffer.{$label}", .texture($ref, $view->pixelDump()));
+        }
+
+        $out->add('pbr.gbuffer.material', .texture($gb->material, .color));
+    }
+}
+
+/**
+ * Every texture the pool holds, as `pool:<pool name>`. Needs no registration; the escape hatch.
+ */
+public class PoolProvider : DumpProvider
+{
+    public constructor()
+    {
+    }
+
+    public function describe(Frame $frame, Pool $pool, DumpCatalog $out) : void
+    {
+        array<string> $names = $pool->textureNames();
+        foreach ($names as $name) {
+            $out->add("pool:{$name}", .raw($name));
+        }
+    }
+}

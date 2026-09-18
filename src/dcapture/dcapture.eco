@@ -1,0 +1,318 @@
+/**
+ * Scripted debug run: `--dcapture '<json>'` or `--dcapture @file` drives the app without a hand
+ * on the keyboard. Steps apply flags, pin the camera, submit console lines, dump named GPU
+ * images at frames or ticks, and stop; `--flag k=v` sets a process flag on its own.
+ *
+ * Dump-after-present lives on `DumpQueue` so console `dump` works without a script. Host holds
+ * that queue always; this type is the script driver and is only put on Services when `--dcapture`
+ * was given.
+ */
+
+namespace visu::dcapture;
+
+use std::io;
+use visu::app::{FlagValue, Flags, HostConfig, flags, info};
+use visu::graphics::{CameraOverrideData, Frame, Pool};
+use visu::math::{Quat, Vec3};
+use visu::os::Window;
+use visu::runtime::DebugConsole;
+
+internal const ARG_NAME = '--dcapture';
+internal const ARG_INLINE = '--dcapture=';
+
+public class DCapture
+{
+    public const Script $script;
+
+    /**
+     * False when no `--dcapture` was passed: nothing is scheduled, no cap applies, and the
+     * manifest is only written if a console verb dumped something.
+     */
+    public const bool $active;
+    public DumpQueue $dumps;
+    private array<FlagAssign> $cliFlags;
+    private StepQueue $steps;
+    private CameraOverrideData? $camera;
+    private int32 $frame;
+    private int32 $tick;
+
+    public constructor(Script $script, bool $active, array<FlagAssign> $cliFlags)
+    {
+        $this->script = $script;
+        $this->active = $active;
+        $this->dumps = DumpQueue($script->out);
+        $this->cliFlags = $cliFlags;
+        $this->steps = StepQueue($script->steps);
+        $this->camera = null;
+        $this->frame = 0;
+        $this->tick = 0;
+        if ($script->list) {
+            $this->dumps->queueList();
+        }
+    }
+
+    /**
+     * Parse the program arguments. No `--dcapture` yields an idle dcapture that still carries `--flag`s.
+     * Argument zero is the program and is skipped.
+     */
+    public static function fromArgs(const array<string>& $argv) : result<DCapture, DCaptureError>
+    {
+        string $text = '';
+        bool $given = false;
+        array<FlagAssign> $cli = array<FlagAssign>();
+        usize $n = $argv->count();
+        usize $i = 1;
+        while ($i < $n) {
+            string $arg = $argv[$i];
+            if ($arg == ARG_NAME) {
+                if ($i + 1 >= $n) {
+                    return .error(.missingArgument(ARG_NAME));
+                }
+                $text = $argv[$i + 1];
+                $given = true;
+                $i = $i + 2;
+                continue;
+            }
+
+            if ($arg->starts(ARG_INLINE)) {
+                usize $prefix = ARG_INLINE->size();
+                $text = $arg->sub($prefix, $arg->size() - $prefix)->clone();
+                $given = true;
+                $i = $i + 1;
+                continue;
+            }
+
+            if ($arg == '--flag') {
+                if ($i + 1 >= $n) {
+                    return .error(.missingArgument('--flag'));
+                }
+                FlagAssign $assign = guard parseFlagArg($argv[$i + 1]) else ($e) {
+                    return .error($e);
+                }
+                $cli[] = $assign;
+                $i = $i + 2;
+                continue;
+            }
+
+            if ($arg->starts('--flag=')) {
+                string $spec = $arg->sub(7, $arg->size() - 7)->clone();
+                FlagAssign $assign = guard parseFlagArg($spec) else ($e) {
+                    return .error($e);
+                }
+                $cli[] = $assign;
+                $i = $i + 1;
+                continue;
+            }
+
+            $i = $i + 1;
+        }
+
+        if (!$given) {
+            return .ok(DCapture(Script::empty(), false, $cli));
+        }
+
+        if ($text->starts('@')) {
+            string $path = $text->sub(1, $text->size() - 1)->clone();
+            string $contents = guard io::readfile($path) else ($e) {
+                return .error(.io($path, $e->message()));
+            }
+            $text = $contents;
+        }
+
+        Script $script = guard Script::parse($text) else ($e) {
+            return .error($e);
+        }
+        return .ok(DCapture($script, true, $cli));
+    }
+
+    /**
+     * Script flags first, then `--flag` overrides.
+     */
+    public function applyFlags(Flags $flags) : void
+    {
+        foreach ($this->script->flags as $assign) {
+            $flags->set($assign->name, $assign->value);
+        }
+
+        foreach ($this->cliFlags as $assign) {
+            $flags->set($assign->name, $assign->value);
+        }
+    }
+
+    /**
+     * Window and run-length knobs the script asked for. Before the Host builds its window.
+     */
+    public function configure(HostConfig $config) : void
+    {
+        if (!$this->active) {
+            return;
+        }
+
+        if ($this->script->headless) {
+            $config->headless = true;
+        }
+
+        int32? $width = $this->script->width;
+        if ($width != null) {
+            int32 $w = guard $width;
+            $config->width = $w;
+        }
+
+        int32? $height = $this->script->height;
+        if ($height != null) {
+            int32 $h = guard $height;
+            $config->height = $h;
+        }
+
+        int32? $frames = $this->script->impliedFrames();
+        if ($frames != null) {
+            int32 $cap = guard $frames;
+            $config->maxFrames = $cap;
+        }
+
+        if ($this->script->needsConsole()) {
+            $config->debugConsole = true;
+        }
+    }
+
+    public function addProvider(DumpProvider $provider) : void
+    {
+        $this->dumps->addProvider($provider);
+    }
+
+    /**
+     * Fire every step due at this frame and tick. Idempotent; the Host calls it from poll
+     * and again at the top of renderFrame so a step lands even when no tick ran in between.
+     */
+    public function advance(int32 $frame, int32 $tick, DebugConsole? $console) : void
+    {
+        $this->frame = $frame;
+        $this->tick = $tick;
+        array<Step> $due = $this->steps->advance($frame, $tick);
+        foreach ($due as $step) {
+            $this->apply($step, $console);
+        }
+    }
+
+    public const function cameraOverride() : CameraOverrideData?
+    {
+        return $this->camera;
+    }
+
+    /**
+     * Ask for a dump after the next present (the `dump` console verb).
+     */
+    public function queue(const string& $pattern) : void
+    {
+        $this->dumps->queue($pattern);
+    }
+
+    public function queueList() : void
+    {
+        $this->dumps->queueList();
+    }
+
+    public const function status() : string
+    {
+        int32 $pending = $this->steps->pending();
+        int32 $queued = $this->dumps->queued();
+        string $state = 'idle';
+        if ($this->active) {
+            $state = 'active';
+        }
+        return "dcapture {$state}: frame {$this->frame} tick {$this->tick}, {$pending} steps pending, {$queued} dumps queued, out {$this->script->out}";
+    }
+
+    /**
+     * Write the queued dumps, list the catalog, then stop. The Host calls this before the app's
+     * own afterPresent closure so a scene switch cannot destroy the textures first.
+     */
+    public function afterPresent(Frame $frame, Pool $pool, Window $window, int32 $presented) : void
+    {
+        $this->dumps->afterPresent($frame, $pool, $window, $presented, $this->tick);
+    }
+
+    /**
+     * Final manifest with the steps that never fired. From Host.destroy.
+     */
+    public function finish(int32 $framesRun) : void
+    {
+        $this->dumps->skip($this->steps->remaining());
+        $this->dumps->finish($framesRun, $this->tick, $this->active);
+    }
+
+    private function apply(Step $step, DebugConsole? $console) : void
+    {
+        string $when = $step->describe();
+        $this->dumps->note("frame {$this->frame} tick {$this->tick}: {$when}");
+        Flags $bag = flags();
+        foreach ($step->flags as $assign) {
+            $bag->set($assign->name, $assign->value);
+            string $shown = $assign->value->label();
+            $this->dumps->note("flag {$assign->name} = {$shown}");
+        }
+
+        CameraSpec $spec = $step->camera;
+        match ($spec) {
+            CameraSpec::none => {
+            },
+            CameraSpec::clear => {
+                $this->camera = null;
+                $this->dumps->note('camera released');
+            },
+            CameraSpec::pose($position, $orientation, $fov) => {
+                $this->pinCamera($position, $orientation, $fov);
+            },
+        }
+
+        foreach ($step->console as $line) {
+            DebugConsole $target = guard $console else {
+                $this->dumps->fail("console line '{$line}' dropped: no debug console");
+                continue;
+            }
+            $target->submit($line);
+            $this->dumps->note("console: {$line}");
+        }
+
+        if (!$step->log->empty()) {
+            info("dcapture: {$step->log}");
+            $this->dumps->note($step->log);
+        }
+
+        foreach ($step->dump as $pattern) {
+            $this->dumps->queue($pattern, $step->label);
+        }
+
+        if ($step->list) {
+            $this->dumps->queueList();
+        }
+
+        if ($step->stop) {
+            $this->dumps->queueStop();
+        }
+    }
+
+    private function pinCamera(Vec3 $position, Quat $orientation, float32 $fov) : void
+    {
+        $this->camera = CameraOverrideData($position, $orientation, $fov);
+        float32 $x = $position->x;
+        float32 $y = $position->y;
+        float32 $z = $position->z;
+        $this->dumps->note("camera at {$x:.2f} {$y:.2f} {$z:.2f}");
+    }
+}
+
+/**
+ * `name=value` from `--flag`. The value is autotyped like a console `flag` line.
+ */
+internal function parseFlagArg(const string& $spec) : result<FlagAssign, DCaptureError>
+{
+    usize $eq = $spec->find('=');
+    if ($eq == $spec->size() || $eq == 0) {
+        return .error(.flag($spec));
+    }
+
+    string $name = $spec->sub(0, $eq)->clone();
+    string $raw = $spec->sub($eq + 1, $spec->size() - $eq - 1)->clone();
+    return .ok(FlagAssign($name, FlagValue::parse($raw)));
+}

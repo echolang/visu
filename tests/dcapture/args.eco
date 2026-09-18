@@ -1,0 +1,85 @@
+/**
+ * DCapture::fromArgs: inline JSON, @file, --flag, and the idle path. No GPU.
+ */
+
+use std::env;
+use std::io;
+use visu::app::Flags;
+use visu::dcapture::{DCapture, DCaptureError};
+
+internal function parsedArgs(const array<string>& $argv) : DCapture
+{
+    DCapture $h = guard DCapture::fromArgs($argv) else ($e) {
+        die($e->message());
+    }
+    return $h;
+}
+
+internal function failedArgs(const array<string>& $argv) : DCaptureError
+{
+    result<DCapture, DCaptureError> $r = DCapture::fromArgs($argv);
+    assert($r->failed(), 'expected failure');
+    return $r->failure();
+}
+
+test args_without_dcapture_is_idle
+{
+    array<string> $argv = ['prog'];
+    DCapture $h = parsedArgs($argv);
+    assert(!$h->active, 'idle');
+    assert($h->script->steps->empty(), 'no steps');
+    array<string> $other = ['prog', '--verbose', 'x'];
+    DCapture $ignored = parsedArgs($other);
+    assert(!$ignored->active, 'unknown args ignored');
+}
+
+test args_inline_json_and_flags
+{
+    array<string> $argv = ['prog', '--flag', 'scene=play', '--dcapture', '{"headless":true,"frames":3,"flags":{"a":1}}', '--flag=b=2.5'];
+    DCapture $h = parsedArgs($argv);
+    assert($h->active, 'active');
+    assert($h->script->headless, 'script parsed');
+    Flags $flags = Flags();
+    $h->applyFlags($flags);
+    assert($flags->str('scene', '') == 'play', 'cli flag');
+    assert($flags->int('a', 0) == 1, 'script flag');
+    assert($flags->float('b', 0.0) == 2.5, 'cli flag with equals');
+}
+
+test args_cli_flag_overrides_script_flag
+{
+    array<string> $argv = ['prog', '--dcapture={"flags":{"a":1}}', '--flag', 'a=7'];
+    DCapture $h = parsedArgs($argv);
+    Flags $flags = Flags();
+    $h->applyFlags($flags);
+    assert($flags->int('a', 0) == 7, 'cli wins');
+}
+
+test args_script_from_file
+{
+    string::view $tmpView = env::tmp();
+    string $tmp = "{$tmpView}";
+    string $ds = env::DS;
+    string $path = "{$tmp}{$ds}visu-dcapture-args-test.json";
+    guard io::writefile($path, '{"frames":4,"steps":[{"frame":2,"dump":"scene"}]}') else ($e) {
+        die($e->message());
+    }
+    string $at = "@{$path}";
+    array<string> $argv = ['prog', '--dcapture', $at];
+    DCapture $h = parsedArgs($argv);
+    assert(($h->script->frames ?? 0) == 4, 'read from file');
+    assert($h->script->steps->count() == 1, 'steps');
+    array<string> $missing = ['prog', '--dcapture', '@/definitely/not/here.json'];
+    DCaptureError $e = failedArgs($missing);
+    assert($e->message()->starts('/definitely/not/here.json:'), 'io error names the path');
+}
+
+test args_errors
+{
+    array<string> $bare = ['prog', '--dcapture'];
+    assert(failedArgs($bare)->message() == '--dcapture needs a value', 'bare dcapture');
+    array<string> $noEq = ['prog', '--flag', 'scene'];
+    assert(failedArgs($noEq)->message() == '--flag scene: expected name=value', 'flag without equals');
+    array<string> $bad = ['prog', '--dcapture', '{"steps":[{"dump":"x"}]}'];
+    assert(failedArgs($bad)->message() == 'steps[0]: exactly one of frame, tick or after', 'script error passes through');
+}

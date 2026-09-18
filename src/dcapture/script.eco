@@ -1,0 +1,648 @@
+/**
+ * The dcapture script: JSON text to typed steps.
+ *
+ * Top level: `out`, `headless`, `window: [w, h]`, `frames`, `flags`, `list`, `steps`.
+ * A step carries exactly one timing key (`frame`, `tick`, `after`) and any of the actions
+ * `label`, `flags`, `camera`, `console`, `dump`, `list`, `log`, `stop`. Parsing is strict: a
+ * wrong shape names the JSON path it tripped on, so an agent can fix the script blind.
+ */
+
+namespace visu::dcapture;
+
+use visu::app::FlagValue;
+use visu::geo::Transform;
+use visu::math::{Mat4, Quat, Vec3, conjugate, lookAt, normalize, radians};
+
+public enum StepAt
+{
+    case frame(int32 $n);
+    case tick(int32 $n);
+    case after(int32 $n);
+
+    public const function label() : string
+    {
+        return match ($this) {
+            StepAt::frame($n) => "frame {$n}",
+            StepAt::tick($n) => "tick {$n}",
+            StepAt::after($n) => "after {$n}",
+        };
+    }
+}
+
+/**
+ * What a step does to the camera. `pose` carries the field of view in degrees; zero keeps the camera's own.
+ */
+public enum CameraSpec
+{
+    case none;
+    case clear;
+    case pose(Vec3 $position, Quat $orientation, float32 $fov);
+}
+
+public struct FlagAssign
+{
+    public string $name;
+    public FlagValue $value;
+}
+
+public class Step
+{
+    public const int32 $index;
+    public const StepAt $at;
+    public const string $label;
+    public const array<FlagAssign> $flags;
+    public const CameraSpec $camera;
+    public const array<string> $console;
+    public const array<string> $dump;
+    public const bool $list;
+    public const string $log;
+    public const bool $stop;
+
+    public constructor(
+        int32 $index,
+        StepAt $at,
+        string $label,
+        array<FlagAssign> $flags,
+        CameraSpec $camera,
+        array<string> $console,
+        array<string> $dump,
+        bool $list,
+        string $log,
+        bool $stop,
+    )
+    {
+        $this->index = $index;
+        $this->at = $at;
+        $this->label = $label;
+        $this->flags = $flags;
+        $this->camera = $camera;
+        $this->console = $console;
+        $this->dump = $dump;
+        $this->list = $list;
+        $this->log = $log;
+        $this->stop = $stop;
+    }
+
+    public const function describe() : string
+    {
+        string $when = $this->at->label();
+        return "steps[{$this->index}] at {$when}";
+    }
+}
+
+public class Script
+{
+    public string $out;
+    public bool $headless;
+    public int32? $width;
+    public int32? $height;
+    public int32? $frames;
+    public array<FlagAssign> $flags;
+    public bool $list;
+    public array<Step> $steps;
+
+    public constructor()
+    {
+        $this->out = 'var/dcapture';
+        $this->headless = false;
+        $this->width = null;
+        $this->height = null;
+        $this->frames = null;
+        $this->flags = array<FlagAssign>();
+        $this->list = false;
+        $this->steps = array<Step>();
+    }
+
+    public static function empty() : Script
+    {
+        return Script();
+    }
+
+    /**
+     * Any step submits console lines, so the host must boot the debug console.
+     */
+    public const function needsConsole() : bool
+    {
+        foreach ($this->steps as $step) {
+            if (!$step->console->empty()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public const function hasStop() : bool
+    {
+        foreach ($this->steps as $step) {
+            if ($step->stop) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Frame cap for the host: the explicit `frames`, else two past the last frame step when
+     * nothing stops the run, else null for "until the window closes".
+     */
+    public const function impliedFrames() : int32?
+    {
+        if ($this->frames != null) {
+            return $this->frames;
+        }
+
+        if ($this->steps->empty() || $this->hasStop()) {
+            return null;
+        }
+
+        array<StepAt> $resolved = resolveTiming($this->steps);
+        int32 $last = -1;
+        foreach ($resolved as $at) {
+            int32 $n = frameNumber($at);
+            if ($n > $last) {
+                $last = $n;
+            }
+        }
+
+        if ($last < 0) {
+            return null;
+        }
+
+        return $last + 2;
+    }
+
+    public static function parse(const string& $text) : result<Script, DCaptureError>
+    {
+        json::Value $root = guard json::parse($text) else ($e) {
+            return .error(.syntax($e));
+        }
+        if (!$root->isObject()) {
+            return .error(.notObject('script'));
+        }
+
+        Script $script = Script();
+        string $out = guard optStr($root, 'out', 'out', $script->out) else ($e) {
+            return .error($e);
+        }
+        $script->out = $out;
+        bool $headless = guard optBool($root, 'headless', 'headless', false) else ($e) {
+            return .error($e);
+        }
+        $script->headless = $headless;
+        bool $list = guard optBool($root, 'list', 'list', false) else ($e) {
+            return .error($e);
+        }
+        $script->list = $list;
+        int64 $frames = 0;
+        bool $hasFrames = guard intField($root, 'frames', 'frames', $frames) else ($e) {
+            return .error($e);
+        }
+        if ($hasFrames) {
+            $script->frames = $frames as int32;
+        }
+
+        json::Value? $window = $root->get('window');
+        if ($window != null) {
+            json::Value $w = guard $window;
+            array<json::Value> $size = guard $w->asArray() else {
+                return .error(.field('window', 'array of 2 integers'));
+            }
+            if ($size->count() != 2) {
+                return .error(.field('window', 'array of 2 integers'));
+            }
+            int64 $width = guard $size[0]->asInt() else {
+                return .error(.field('window[0]', 'integer'));
+            }
+            int64 $height = guard $size[1]->asInt() else {
+                return .error(.field('window[1]', 'integer'));
+            }
+            $script->width = $width as int32;
+            $script->height = $height as int32;
+        }
+
+        json::Value? $flagsValue = $root->get('flags');
+        if ($flagsValue != null) {
+            json::Value $fv = guard $flagsValue;
+            array<FlagAssign> $flags = guard parseFlags($fv, 'flags') else ($e) {
+                return .error($e);
+            }
+            $script->flags = $flags;
+        }
+
+        json::Value? $stepsValue = $root->get('steps');
+        if ($stepsValue != null) {
+            json::Value $sv = guard $stepsValue;
+            array<json::Value> $items = guard $sv->asArray() else {
+                return .error(.field('steps', 'array of step objects'));
+            }
+            int32 $i = 0;
+            foreach ($items as $item) {
+                Step $step = guard parseStep($item, $i) else ($e) {
+                    return .error($e);
+                }
+                $script->steps[] = $step;
+                $i = $i + 1;
+            }
+        }
+
+        guard validateTiming($script->steps) else ($e) {
+            return .error($e);
+        }
+        if ($script->frames == null && !$script->hasStop() && onlyTicks($script->steps)) {
+            return .error(.openEnded);
+        }
+
+        return .ok($script);
+    }
+}
+
+internal function frameNumber(StepAt $at) : int32
+{
+    return match ($at) {
+        StepAt::frame($n) => $n,
+        else => -1,
+    };
+}
+
+/**
+ * Steps exist and none is keyed by frame: nothing would ever end the run.
+ */
+internal function onlyTicks(const array<Step>& $steps) : bool
+{
+    if ($steps->empty()) {
+        return false;
+    }
+
+    foreach ($steps as $step) {
+        StepAt $at = $step->at;
+        if (frameNumber($at) >= 0) {
+            return false;
+        }
+        bool $relative = match ($at) {
+            StepAt::after($n) => true,
+            else => false,
+        };
+        if ($relative) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * `after` needs a frame to be relative to; following a tick step it has none.
+ */
+internal function validateTiming(const array<Step>& $steps) : status<DCaptureError>
+{
+    bool $haveFrame = true;
+    foreach ($steps as $step) {
+        StepAt $at = $step->at;
+        match ($at) {
+            StepAt::frame($n) => {
+                $haveFrame = true;
+            },
+            StepAt::tick($n) => {
+                $haveFrame = false;
+            },
+            StepAt::after($n) => {
+                if (!$haveFrame) {
+                    return .error(.afterNeedsFrame($step->index));
+                }
+            },
+        }
+    }
+
+    return .ok;
+}
+
+internal function optStr(
+    json::Value $obj,
+    const string& $key,
+    const string& $path,
+    const string& $fallback,
+) : result<string, DCaptureError>
+{
+    json::Value $v = guard $obj->get($key) else {
+        return .ok($fallback);
+    }
+    string $s = guard $v->asStr() else {
+        return .error(.field($path, 'string'));
+    }
+    return .ok($s);
+}
+
+internal function optBool(
+    json::Value $obj,
+    const string& $key,
+    const string& $path,
+    bool $fallback,
+) : result<bool, DCaptureError>
+{
+    json::Value $v = guard $obj->get($key) else {
+        return .ok($fallback);
+    }
+    bool $b = guard $v->asBool() else {
+        return .error(.field($path, 'boolean'));
+    }
+    return .ok($b);
+}
+
+/**
+ * Reads an integer field into `$out`. Ok(false) when the key is absent.
+ */
+internal function intField(
+    json::Value $obj,
+    const string& $key,
+    const string& $path,
+    int64& $out,
+) : result<bool, DCaptureError>
+{
+    json::Value $v = guard $obj->get($key) else {
+        return .ok(false);
+    }
+    int64 $n = guard $v->asInt() else {
+        return .error(.field($path, 'integer'));
+    }
+    $out = $n;
+    return .ok(true);
+}
+
+internal function flagFromJson(json::Value $v) : FlagValue?
+{
+    bool? $b = $v->asBool();
+    if ($b != null) {
+        bool $flag = guard $b;
+        return FlagValue::boolean($flag);
+    }
+
+    int64? $i = $v->asInt();
+    if ($i != null) {
+        int64 $n = guard $i;
+        return FlagValue::integer($n);
+    }
+
+    float64? $f = $v->asFloat();
+    if ($f != null) {
+        float64 $x = guard $f;
+        return FlagValue::floating($x);
+    }
+
+    string? $s = $v->asStr();
+    if ($s != null) {
+        string $text = guard $s;
+        return FlagValue::text($text);
+    }
+
+    return null;
+}
+
+internal function parseFlags(json::Value $v, const string& $path) : result<array<FlagAssign>, DCaptureError>
+{
+    ordered_map<string, json::Value> $fields = guard $v->asObject() else {
+        return .error(.field($path, 'object of name: value'));
+    }
+    array<FlagAssign> $out = array<FlagAssign>();
+    array<string> $names = $fields->keys();
+    foreach ($names as $name) {
+        json::Value $value = $fields->get($name);
+        FlagValue $flag = guard flagFromJson($value) else {
+            return .error(.field("{$path}.{$name}", 'boolean, number or string'));
+        }
+        $out[] = FlagAssign($name, $flag);
+    }
+
+    return .ok($out);
+}
+
+internal function parseStrings(json::Value $v, const string& $path) : result<array<string>, DCaptureError>
+{
+    array<string> $out = array<string>();
+    string? $single = $v->asStr();
+    if ($single != null) {
+        string $s = guard $single;
+        $out[] = $s;
+        return .ok($out);
+    }
+
+    array<json::Value> $items = guard $v->asArray() else {
+        return .error(.field($path, 'string or array of strings'));
+    }
+    foreach ($items as $item) {
+        string $s = guard $item->asStr() else {
+            return .error(.field($path, 'string or array of strings'));
+        }
+        $out[] = $s;
+    }
+
+    return .ok($out);
+}
+
+internal function parseVec3(json::Value $v, const string& $path) : result<Vec3, DCaptureError>
+{
+    array<json::Value> $items = guard $v->asArray() else {
+        return .error(.field($path, 'array of 3 numbers'));
+    }
+    if ($items->count() != 3) {
+        return .error(.field($path, 'array of 3 numbers'));
+    }
+    float64 $x = guard $items[0]->asFloat() else {
+        return .error(.field($path, 'array of 3 numbers'));
+    }
+    float64 $y = guard $items[1]->asFloat() else {
+        return .error(.field($path, 'array of 3 numbers'));
+    }
+    float64 $z = guard $items[2]->asFloat() else {
+        return .error(.field($path, 'array of 3 numbers'));
+    }
+    return .ok(Vec3($x as float32, $y as float32, $z as float32));
+}
+
+/**
+ * `position` plus at most one of `lookAt`, `euler` (yaw, pitch in degrees, FlyingCamera
+ * convention) or `orientation` (x, y, z, w). JSON null clears the override.
+ */
+internal function parseCamera(json::Value $v, const string& $path) : result<CameraSpec, DCaptureError>
+{
+    if ($v->isNull()) {
+        return .ok(.clear);
+    }
+    if (!$v->isObject()) {
+        return .error(.notObject($path));
+    }
+
+    json::Value $pv = guard $v->get('position') else {
+        return .error(.field("{$path}.position", 'array of 3 numbers'));
+    }
+    Vec3 $position = guard parseVec3($pv, "{$path}.position") else ($e) {
+        return .error($e);
+    }
+
+    Quat $orientation = Quat();
+    int32 $aims = 0;
+    json::Value? $look = $v->get('lookAt');
+    if ($look != null) {
+        json::Value $lv = guard $look;
+        Vec3 $target = guard parseVec3($lv, "{$path}.lookAt") else ($e) {
+            return .error($e);
+        }
+        Mat4 $view = lookAt(eye: $position, center: $target, up: Transform::worldUp());
+        $orientation = conjugate(Quat($view));
+        $aims = $aims + 1;
+    }
+
+    json::Value? $euler = $v->get('euler');
+    if ($euler != null) {
+        json::Value $ev = guard $euler;
+        array<json::Value> $angles = guard $ev->asArray() else {
+            return .error(.field("{$path}.euler", 'array of 2 numbers (yaw, pitch degrees)'));
+        }
+        if ($angles->count() != 2) {
+            return .error(.field("{$path}.euler", 'array of 2 numbers (yaw, pitch degrees)'));
+        }
+        float64 $yaw = guard $angles[0]->asFloat() else {
+            return .error(.field("{$path}.euler", 'array of 2 numbers (yaw, pitch degrees)'));
+        }
+        float64 $pitch = guard $angles[1]->asFloat() else {
+            return .error(.field("{$path}.euler", 'array of 2 numbers (yaw, pitch degrees)'));
+        }
+        Quat $yawQ = Quat(angleAxis: radians($yaw as float32), Transform::worldUp());
+        Quat $pitchQ = Quat(angleAxis: radians($pitch as float32), Transform::worldRight());
+        $orientation = $yawQ * $pitchQ;
+        $aims = $aims + 1;
+    }
+
+    json::Value? $quat = $v->get('orientation');
+    if ($quat != null) {
+        json::Value $qv = guard $quat;
+        array<json::Value> $parts = guard $qv->asArray() else {
+            return .error(.field("{$path}.orientation", 'array of 4 numbers (x, y, z, w)'));
+        }
+        if ($parts->count() != 4) {
+            return .error(.field("{$path}.orientation", 'array of 4 numbers (x, y, z, w)'));
+        }
+        float64 $qx = guard $parts[0]->asFloat() else {
+            return .error(.field("{$path}.orientation", 'array of 4 numbers (x, y, z, w)'));
+        }
+        float64 $qy = guard $parts[1]->asFloat() else {
+            return .error(.field("{$path}.orientation", 'array of 4 numbers (x, y, z, w)'));
+        }
+        float64 $qz = guard $parts[2]->asFloat() else {
+            return .error(.field("{$path}.orientation", 'array of 4 numbers (x, y, z, w)'));
+        }
+        float64 $qw = guard $parts[3]->asFloat() else {
+            return .error(.field("{$path}.orientation", 'array of 4 numbers (x, y, z, w)'));
+        }
+        $orientation = normalize(Quat($qx as float32, $qy as float32, $qz as float32, $qw as float32));
+        $aims = $aims + 1;
+    }
+
+    if ($aims > 1) {
+        return .error(.field($path, 'at most one of lookAt, euler or orientation'));
+    }
+
+    float32 $fov = 0.0f;
+    json::Value? $fovValue = $v->get('fov');
+    if ($fovValue != null) {
+        json::Value $fv = guard $fovValue;
+        float64 $degrees = guard $fv->asFloat() else {
+            return .error(.field("{$path}.fov", 'number (degrees)'));
+        }
+        $fov = $degrees as float32;
+    }
+
+    return .ok(.pose($position, $orientation, $fov));
+}
+
+internal function parseStep(json::Value $item, int32 $index) : result<Step, DCaptureError>
+{
+    string $path = "steps[{$index}]";
+    if (!$item->isObject()) {
+        return .error(.notObject($path));
+    }
+
+    int32 $timings = 0;
+    StepAt $at = .frame(0);
+    int64 $n = 0;
+    bool $hasFrame = guard intField($item, 'frame', "{$path}.frame", $n) else ($e) {
+        return .error($e);
+    }
+    if ($hasFrame) {
+        $timings = $timings + 1;
+        $at = StepAt::frame($n as int32);
+    }
+    bool $hasTick = guard intField($item, 'tick', "{$path}.tick", $n) else ($e) {
+        return .error($e);
+    }
+    if ($hasTick) {
+        $timings = $timings + 1;
+        $at = StepAt::tick($n as int32);
+    }
+    bool $hasAfter = guard intField($item, 'after', "{$path}.after", $n) else ($e) {
+        return .error($e);
+    }
+    if ($hasAfter) {
+        $timings = $timings + 1;
+        $at = StepAt::after($n as int32);
+    }
+    if ($timings != 1) {
+        return .error(.timing($index));
+    }
+
+    string $label = guard optStr($item, 'label', "{$path}.label", '') else ($e) {
+        return .error($e);
+    }
+    string $log = guard optStr($item, 'log', "{$path}.log", '') else ($e) {
+        return .error($e);
+    }
+    bool $list = guard optBool($item, 'list', "{$path}.list", false) else ($e) {
+        return .error($e);
+    }
+    bool $stop = guard optBool($item, 'stop', "{$path}.stop", false) else ($e) {
+        return .error($e);
+    }
+
+    array<FlagAssign> $flags = array<FlagAssign>();
+    json::Value? $flagsValue = $item->get('flags');
+    if ($flagsValue != null) {
+        json::Value $fv = guard $flagsValue;
+        array<FlagAssign> $parsed = guard parseFlags($fv, "{$path}.flags") else ($e) {
+            return .error($e);
+        }
+        $flags = $parsed;
+    }
+
+    CameraSpec $camera = .none;
+    json::Value? $cameraValue = $item->get('camera');
+    if ($cameraValue != null) {
+        json::Value $cv = guard $cameraValue;
+        CameraSpec $spec = guard parseCamera($cv, "{$path}.camera") else ($e) {
+            return .error($e);
+        }
+        $camera = $spec;
+    }
+
+    array<string> $console = array<string>();
+    json::Value? $consoleValue = $item->get('console');
+    if ($consoleValue != null) {
+        json::Value $cv = guard $consoleValue;
+        array<string> $lines = guard parseStrings($cv, "{$path}.console") else ($e) {
+            return .error($e);
+        }
+        $console = $lines;
+    }
+
+    array<string> $dump = array<string>();
+    json::Value? $dumpValue = $item->get('dump');
+    if ($dumpValue != null) {
+        json::Value $dv = guard $dumpValue;
+        array<string> $patterns = guard parseStrings($dv, "{$path}.dump") else ($e) {
+            return .error($e);
+        }
+        $dump = $patterns;
+    }
+
+    return .ok(Step($index, $at, $label, $flags, $camera, $console, $dump, $list, $log, $stop));
+}

@@ -1,0 +1,108 @@
+/**
+ * Which steps are due at a given frame and tick. Pure: no host, no GPU.
+ * `after` steps resolve to absolute frames up front; each step fires once, in script order.
+ */
+
+namespace visu::dcapture;
+
+/**
+ * Every `after` becomes `frame(previous frame + n)`; frame and tick steps pass through.
+ * An `after` with no frame step before it counts from frame 0.
+ */
+public function resolveTiming(const array<Step>& $steps) : array<StepAt>
+{
+    array<StepAt> $out = array<StepAt>();
+    int32 $lastFrame = 0;
+    foreach ($steps as $step) {
+        StepAt $at = $step->at;
+        match ($at) {
+            StepAt::frame($n) => {
+                $lastFrame = $n;
+                $out[] = StepAt::frame($n);
+            },
+            StepAt::tick($n) => {
+                $out[] = StepAt::tick($n);
+            },
+            StepAt::after($n) => {
+                $lastFrame = $lastFrame + $n;
+                $out[] = StepAt::frame($lastFrame);
+            },
+        }
+    }
+
+    return $out;
+}
+
+internal function stepDue(StepAt $at, int32 $frame, int32 $tick) : bool
+{
+    return match ($at) {
+        StepAt::frame($n) => $n <= $frame,
+        StepAt::tick($n) => $n <= $tick,
+        StepAt::after($n) => false,
+    };
+}
+
+public class StepQueue
+{
+    private array<Step> $steps;
+    private array<StepAt> $at;
+    private array<bool> $fired;
+    private int32 $pending;
+
+    public constructor(const array<Step>& $steps)
+    {
+        $this->steps = $steps;
+        $this->at = resolveTiming($steps);
+        $this->fired = array<bool>();
+        foreach ($steps as $step) {
+            $this->fired[] = false;
+        }
+        $this->pending = $steps->count() as int32;
+    }
+
+    /**
+     * Steps that became due, in script order, each returned exactly once.
+     * Calling again with the same frame and tick returns nothing.
+     */
+    public function advance(int32 $frame, int32 $tick) : array<Step>
+    {
+        array<Step> $due = array<Step>();
+        usize $n = $this->steps->count();
+        usize $i = 0;
+        while ($i < $n) {
+            if (!$this->fired[$i] && stepDue($this->at[$i], $frame, $tick)) {
+                $this->fired[$i] = true;
+                $this->pending = $this->pending - 1;
+                $due[] = $this->steps[$i];
+            }
+
+            $i = $i + 1;
+        }
+
+        return $due;
+    }
+
+    public const function pending() : int32
+    {
+        return $this->pending;
+    }
+
+    /**
+     * Steps that never fired, for the manifest's `skipped` list.
+     */
+    public const function remaining() : array<Step>
+    {
+        array<Step> $left = array<Step>();
+        usize $n = $this->steps->count();
+        usize $i = 0;
+        while ($i < $n) {
+            if (!$this->fired[$i]) {
+                $left[] = $this->steps[$i];
+            }
+
+            $i = $i + 1;
+        }
+
+        return $left;
+    }
+}

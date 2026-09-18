@@ -1,0 +1,280 @@
+/*
+ * A cooked model on screen: three LOD levels of one ball, drawn as static and dynamic instances
+ * through ModelSystem into the deferred GBuffer. Cooks its own source tree on first run.
+ *
+ *   echoc run -m examples --target models
+ *   echoc run -m examples --target models --define VISU_FINITE
+ *   echoc run -m examples --target models --define VISU_MODELS_DUMP --define VISU_FINITE
+ *
+ * Hold left to orbit, scroll to zoom. `model` on the console prints the LOD histogram.
+ */
+
+use std::env;
+use std::io;
+use visu::app::{Paths, Services, bootstrap, info};
+use visu::asset::Kitchen;
+use visu::components::{ActiveCamera, DynamicModel, OrbitCamera, StaticModel};
+use visu::ecs::{Entities, Entity, Schedule, System};
+use visu::geo::{AABB, Transform};
+use visu::graphics::{
+    Camera, DeferredRenderer, GBufferData, ModelBank, RenderContext, SceneTargetData, Texture,
+    TextureOptions, TextureRef
+};
+use visu::math::{Quat, Vec3, Vec4};
+use visu::quickstart::{App, Options, Quickstart};
+use visu::runtime::DebugConsole;
+use visu::system::{CameraSystem, DeferredViewSystem, ModelSystem, OrbitCameraSystem};
+
+const string BALL = 'props/ball/ball';
+const int32 GRID = 7;
+const float32 SPACING = 3.0f;
+
+/**
+ * Everything `ready` builds, so the closures can read it back off Services.
+ */
+public class ModelScene
+{
+    public DeferredRenderer $renderer;
+    public ModelBank $bank;
+    public ModelSystem $models;
+
+    public constructor(DeferredRenderer $renderer, ModelBank $bank, ModelSystem $models)
+    {
+        $this->renderer = $renderer;
+        $this->bank = $bank;
+        $this->models = $models;
+    }
+}
+
+/**
+ * Spins the one dynamic ball so the dynamic path is exercised beside the static grid.
+ */
+public class SpinSystem : System
+{
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->render = false;
+    }
+
+    public function update(Entities $entities) : void
+    {
+        foreach ($entities->view<DynamicModel>() as $id => &$model) {
+            Transform& $t = $entities->get<Transform>($id);
+            $t->storePrevious();
+            $t->orientation = Quat(angleAxis: visu::runtime::seconds(), Vec3(0.0f, 1.0f, 0.0f));
+        }
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+    }
+}
+
+Quickstart $qs = Quickstart(function(Options $opt) : void
+{
+    $opt->windowTitle = 'visu models';
+    $opt->windowWidth = 1280;
+    $opt->windowHeight = 720;
+    $opt->debugConsole = true;
+    $opt->clearColor = Vec4(0.05f, 0.06f, 0.08f, 1.0f);
+    $opt->services = bootstrap(Paths(root: modelsRoot()), function(Services $s) : void {
+    });
+
+    $opt->ready = function(App $app) : void {
+        DeferredRenderer $renderer = DeferredRenderer($app->device);
+        guard $renderer->load() else ($e) {
+            die($e->message());
+        }
+        $renderer->background = Vec4(0.05f, 0.06f, 0.08f, 1.0f);
+        ModelBank $bank = ModelBank($app->device, $app->host->assets);
+        float32 $half = (GRID as float32) * SPACING;
+        AABB $world = AABB(Vec3(-$half, -$half, -$half), Vec3($half, $half, $half));
+        ModelSystem $models = ModelSystem($bank, $renderer, $world);
+        $app->systems->bind(CameraSystem());
+        $app->systems->bind(OrbitCameraSystem($app->input));
+        $app->systems->bind(SpinSystem());
+        $app->systems->bind($models);
+        $app->systems->bind(DeferredViewSystem($renderer));
+        if ($app->host->console != null) {
+            DebugConsole $console = guard $app->host->console;
+            $app->systems->listen($console);
+        }
+
+        $app->services->set(ModelScene($renderer, $bank, $models));
+    };
+
+    $opt->render = function(App $app, RenderContext $ctx, visu::graphics::TargetRef $target) : void {
+        ModelScene $scene = $app->services->get<ModelScene>();
+        SceneTargetData $target2 = $ctx->frame->get<SceneTargetData>();
+        Entities $world = $app->entities;
+        ModelSystem $models = $scene->models;
+        $scene->renderer->render($ctx, $target2->target, function(RenderContext $pass, GBufferData $gbuffer) : void {
+            $models->fill($world, $pass, $gbuffer);
+        });
+    };
+
+    $opt->initializeScene = function(App $app) : void {
+        float32 $span = (GRID as float32) * SPACING;
+        Entity $cam = Camera::spawn($app->entities, Vec3(0.0f, 0.0f, 0.0f));
+        OrbitCamera $orbit = OrbitCamera(Vec3(0.0f, 0.0f, 0.0f), $span * 1.1f);
+        $orbit->place($app->entities->get<Transform>($cam));
+        $app->entities->attach($cam, $orbit);
+        ActiveCamera::activate($app->entities, $cam);
+
+        int32 $z = 0;
+        while ($z < GRID) {
+            int32 $x = 0;
+            while ($x < GRID) {
+                Entity $e = $app->entities->create();
+                Transform $t = Transform();
+                $t->position = Vec3(
+                    (($x - GRID / 2) as float32) * SPACING,
+                    0.0f,
+                    (($z - GRID / 2) as float32) * SPACING
+                );
+                $app->entities->attach($e, $t);
+                StaticModel $model = StaticModel(BALL);
+                $model->tint = Vec4(
+                    0.5f + 0.5f * (($x as float32) / (GRID as float32)),
+                    0.6f,
+                    0.5f + 0.5f * (($z as float32) / (GRID as float32)),
+                    1.0f
+                );
+                $app->entities->attach($e, $model);
+                $x = $x + 1;
+            }
+
+            $z = $z + 1;
+        }
+
+        Entity $spinner = $app->entities->create();
+        Transform $st = Transform();
+        $st->position = Vec3(0.0f, 2.5f, 0.0f);
+        $st->scale = Vec3(2.0f, 2.0f, 2.0f);
+        $app->entities->attach($spinner, $st);
+        $app->entities->attach($spinner, DynamicModel(BALL));
+        int32 $count = GRID * GRID;
+        info("models: {$count} static balls plus one dynamic");
+    };
+
+    #[if: VISU_MODELS_DUMP]
+    $opt->afterFrame = function(App $app) : void {
+        if (ModelDump::$done) {
+            return;
+        }
+
+        if ($app->device->frameIndex() < 4) {
+            return;
+        }
+
+        dumpModels($app);
+        ModelDump::$done = true;
+    };
+    #[end]
+
+    $opt->teardown = function(App $app) : void {
+        ModelScene $scene = $app->services->get<ModelScene>();
+        $app->device->waitIdle();
+        $scene->bank->destroy();
+        $scene->renderer->destroy();
+    };
+});
+cookModels();
+$qs->run();
+
+/**
+ * Cook `resources/source` into `var/cache/asset` so Host mounts it on initialize.
+ */
+internal function cookModels() : void
+{
+    string $root = modelsRoot();
+    Paths $paths = Paths(root: $root);
+    bool $here = guard io::exists($paths->resourcesSource) else {
+        return;
+    }
+    if (!$here) {
+        return;
+    }
+
+    string $ds = env::DS;
+    ensureDir("{$root}{$ds}var");
+    ensureDir($paths->cache);
+    string $out = $paths->cache;
+    $out->append('/asset');
+    Kitchen $kitchen = Kitchen::defaults();
+    guard $kitchen->cook($paths->resourcesSource, $out) else ($e) {
+        die($e->message());
+    }
+}
+
+internal function ensureDir(const string& $dir) : void
+{
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return;
+        }
+
+        die($e->message());
+    }
+}
+
+/**
+ * Runs from the repo root or from the example's own directory.
+ */
+internal function modelsRoot() : string
+{
+    if (modelsFileExists('resources/source/props/ball/ball.glb')) {
+        return env::cwd();
+    }
+
+    if (modelsFileExists('models/resources/source/props/ball/ball.glb')) {
+        return 'models';
+    }
+
+    return 'examples/models';
+}
+
+internal function modelsFileExists(string $path) : bool
+{
+    bool $here = guard io::exists($path) else {
+        return false;
+    }
+    return $here;
+}
+
+#[if: VISU_MODELS_DUMP]
+internal class ModelDump
+{
+    public static bool $done = false;
+}
+
+internal function dumpModels(App $app) : void
+{
+    string $root = visu::os::writableRoot();
+    dumpPool($app, 'quickstartTarget.attachment.color_quickstartColor', "{$root}/models.png");
+    dumpPool($app, 'gbuffer.attachment.color_albedo', "{$root}/models_albedo.png");
+    dumpPool($app, 'gbuffer.attachment.color_normal', "{$root}/models_normal.png");
+}
+
+internal function dumpPool(App $app, string $name, string $path) : void
+{
+    TextureRef $ref = TextureRef($name, 0, 0, TextureOptions());
+    Texture $texture = guard $app->pool->getTexture($ref) else ($e) {
+        info("models: no texture {$name}");
+        return;
+    }
+    guard $texture->dump($path) else ($e) {
+        info("models: {$path} failed");
+        return;
+    }
+    info("models: wrote {$path}");
+}
+#[end]

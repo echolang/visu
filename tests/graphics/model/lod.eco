@@ -1,0 +1,44 @@
+/**
+ * Distance LOD table lookup.
+ */
+
+use visu::asset::ModelLodDesc;
+use visu::graphics::lodIndex;
+
+internal function lodTable() : array<ModelLodDesc>
+{
+    array<ModelLodDesc> $lods = array<ModelLodDesc>();
+    ModelLodDesc $l0 = ModelLodDesc();
+    ModelLodDesc $l1 = ModelLodDesc();
+    $l1->distance = 50.0f;
+    ModelLodDesc $l2 = ModelLodDesc();
+    $l2->distance = 100.0f;
+    $lods[] = $l0;
+    $lods[] = $l1;
+    $lods[] = $l2;
+    return $lods;
+}
+
+test lod_index_walks_the_table
+{
+    array<ModelLodDesc> $lods = lodTable();
+    assert(lodIndex($lods, 0.0f, 1.0f) == 0, 'at the camera');
+    assert(lodIndex($lods, 49.9f, 1.0f) == 0, 'just before the first switch');
+    assert(lodIndex($lods, 50.0f, 1.0f) == 1, 'on the switch');
+    assert(lodIndex($lods, 99.0f, 1.0f) == 1, 'between');
+    assert(lodIndex($lods, 5000.0f, 1.0f) == 2, 'far past the last level clamps');
+}
+
+test lod_index_bias_scales_distance
+{
+    array<ModelLodDesc> $lods = lodTable();
+    assert(lodIndex($lods, 30.0f, 2.0f) == 1, 'bias 2 doubles the distance');
+    assert(lodIndex($lods, 300.0f, 0.1f) == 0, 'bias 0.1 keeps level 0 far out');
+}
+
+test lod_index_single_level
+{
+    array<ModelLodDesc> $one = array<ModelLodDesc>();
+    $one[] = ModelLodDesc();
+    assert(lodIndex($one, 99999.0f, 1.0f) == 0, 'one level is always level 0');
+}

@@ -1,0 +1,231 @@
+/**
+ * Procedural atmosphere the deferred renderer draws behind the scene and bakes into its probe.
+ * `Sky` is the artist-facing knob set; `SkyUniforms` is its GPU mirror.
+ */
+
+namespace visu::graphics;
+
+use std::math;
+use visu::math::{Vec3, Vec4, dot, normalize};
+
+// planet and atmosphere radii in metres
+internal const float32 SKY_PLANET_RADIUS = 6360000.0f;
+internal const float32 SKY_ATMOSPHERE_RADIUS = 6420000.0f;
+// rayleigh scattering per metre at sea level, red green blue
+internal const float32 SKY_RAYLEIGH_R = 0.000005802f;
+internal const float32 SKY_RAYLEIGH_G = 0.000013558f;
+internal const float32 SKY_RAYLEIGH_B = 0.0000331f;
+internal const float32 SKY_RAYLEIGH_HEIGHT = 8000.0f;
+// mie scattering and extinction per metre at sea level
+internal const float32 SKY_MIE_SCATTER = 0.000003996f;
+internal const float32 SKY_MIE_EXTINCTION = 0.00000444f;
+internal const float32 SKY_MIE_HEIGHT = 1200.0f;
+internal const int32 SKY_TRANSMITTANCE_SAMPLES = 8;
+
+/**
+ * Sky parameters. `direction` is the direction sunlight travels, like `DirectionalLight`, so straight
+ * down is (0, -1, 0). Everything else describes the atmosphere and is shared by every probe state.
+ */
+public struct Sky
+{
+    public Vec3 $direction;
+    public float32 $sunIntensity;
+    public float32 $rayleighScale;
+    public float32 $mieScale;
+    public float32 $mieAnisotropy;
+    public float32 $exposure;
+    public Vec3 $groundAlbedo;
+
+    public constructor()
+    {
+        $this->direction = Vec3(0.3f, -0.8f, -0.5f);
+        $this->sunIntensity = 6.0f;
+        $this->rayleighScale = 1.0f;
+        $this->mieScale = 1.0f;
+        $this->mieAnisotropy = 0.8f;
+        $this->exposure = 1.0f;
+        $this->groundAlbedo = Vec3(0.30f, 0.27f, 0.20f);
+    }
+
+    /**
+     * The same atmosphere under another sun. Probe states are derived this way.
+     */
+    public const function withDirection(Vec3 $direction) : Sky
+    {
+        Sky $copy = $this;
+        $copy->direction = $direction;
+        return $copy;
+    }
+
+    /**
+     * True when only the sun direction differs, so baked probes stay valid.
+     */
+    public const function sameAtmosphere(const Sky& $other) : bool
+    {
+        return $this->sunIntensity == $other->sunIntensity
+            && $this->rayleighScale == $other->rayleighScale
+            && $this->mieScale == $other->mieScale
+            && $this->mieAnisotropy == $other->mieAnisotropy
+            && $this->exposure == $other->exposure
+            && $this->groundAlbedo == $other->groundAlbedo;
+    }
+
+    /**
+     * The directional light this sky casts: sun colour is the transmittance towards the sun from
+     * `$altitude` metres, so it reddens near the horizon and goes out below it.
+     */
+    public const function sunLight(float32 $altitude = 0.0f) : DirectionalLight
+    {
+        Vec3 $toSun = normalize(-$this->direction);
+        Vec3 $tint = skyTransmittance($toSun, $altitude, $this);
+        float32 $peak = $tint->x;
+
+        if ($tint->y > $peak) {
+            $peak = $tint->y;
+        }
+
+        if ($tint->z > $peak) {
+            $peak = $tint->z;
+        }
+
+        if ($peak <= 0.0f) {
+            return DirectionalLight($this->direction, Vec3(1.0f, 1.0f, 1.0f), 0.0f);
+        }
+
+        // keep the colour normalised and move the attenuation into the intensity
+        return DirectionalLight($this->direction, $tint / $peak, $this->sunIntensity * $peak);
+    }
+}
+
+operator (Sky $a) == (Sky $b) : bool
+{
+    return $a->direction == $b->direction && $a->sameAtmosphere($b);
+}
+
+operator (Sky $a) != (Sky $b) : bool
+{
+    return !($a == $b);
+}
+
+/**
+ * Mirrors SkyUniforms in resources/shaders/include/visu/sky.glsl at uniform slot 2; std140 with vec4 members only.
+ */
+public struct SkyUniforms
+{
+
+    /**
+     * Unit vector towards the sun in xyz, sun intensity in w.
+     */
+    public Vec4 $sun;
+
+    /**
+     * Observer world position in xyz, 1 in w draws the sun disk.
+     */
+    public Vec4 $origin;
+
+    /**
+     * Rayleigh scattering in xyz, scale height in w.
+     */
+    public Vec4 $rayleigh;
+
+    /**
+     * Mie scattering in x, extinction in y, anisotropy in z, scale height in w.
+     */
+    public Vec4 $mie;
+
+    /**
+     * Ground albedo in xyz, exposure in w.
+     */
+    public Vec4 $ground;
+
+    /**
+     * View samples in x, light samples in y, planet radius in z, atmosphere radius in w.
+     */
+    public Vec4 $params;
+}
+
+/**
+ * Packs a sky for one draw. `$origin` is where the viewer stands; the disk only belongs in the visible sky.
+ */
+public function skyUniforms(
+    const Sky& $sky,
+    Vec3 $origin,
+    bool $sunDisk,
+    float32 $viewSamples,
+    float32 $lightSamples
+) : SkyUniforms
+{
+    Vec3 $toSun = normalize(-$sky->direction);
+    float32 $disk = 0.0f;
+
+    if ($sunDisk) {
+        $disk = 1.0f;
+    }
+
+    return SkyUniforms(
+        Vec4($toSun->x, $toSun->y, $toSun->z, $sky->sunIntensity),
+        Vec4($origin->x, $origin->y, $origin->z, $disk),
+        Vec4(
+            SKY_RAYLEIGH_R * $sky->rayleighScale,
+            SKY_RAYLEIGH_G * $sky->rayleighScale,
+            SKY_RAYLEIGH_B * $sky->rayleighScale,
+            SKY_RAYLEIGH_HEIGHT
+        ),
+        Vec4(
+            SKY_MIE_SCATTER * $sky->mieScale,
+            SKY_MIE_EXTINCTION * $sky->mieScale,
+            $sky->mieAnisotropy,
+            SKY_MIE_HEIGHT
+        ),
+        Vec4($sky->groundAlbedo->x, $sky->groundAlbedo->y, $sky->groundAlbedo->z, $sky->exposure),
+        Vec4($viewSamples, $lightSamples, SKY_PLANET_RADIUS, SKY_ATMOSPHERE_RADIUS)
+    );
+}
+
+/**
+ * CPU twin of `sky_transmittance` in sky.glsl: extinction from `$altitude` metres towards the sun,
+ * zero when the planet blocks the ray.
+ */
+internal function skyTransmittance(Vec3 $toSun, float32 $altitude, const Sky& $sky) : Vec3
+{
+    float32 $height = $altitude;
+
+    if ($height < 1.0f) {
+        $height = 1.0f;
+    }
+
+    Vec3 $origin = Vec3(0.0f, SKY_PLANET_RADIUS + $height, 0.0f);
+    float32 $b = dot($origin, $toSun);
+    float32 $groundDisc = $b * $b - (dot($origin, $origin) - SKY_PLANET_RADIUS * SKY_PLANET_RADIUS);
+
+    if ($groundDisc >= 0.0f && -$b - math::sqrt($groundDisc) > 0.0f) {
+        return Vec3(0.0f, 0.0f, 0.0f);
+    }
+
+    float32 $atmoDisc = $b * $b - (dot($origin, $origin) - SKY_ATMOSPHERE_RADIUS * SKY_ATMOSPHERE_RADIUS);
+    float32 $exit = -$b + math::sqrt($atmoDisc);
+    float32 $step = $exit / (SKY_TRANSMITTANCE_SAMPLES as float32);
+    float32 $depthR = 0.0f;
+    float32 $depthM = 0.0f;
+    int32 $i = 0;
+
+    while ($i < SKY_TRANSMITTANCE_SAMPLES) {
+        Vec3 $p = $origin + $toSun * ((($i as float32) + 0.5f) * $step);
+        float32 $h = math::sqrt(dot($p, $p)) - SKY_PLANET_RADIUS;
+
+        if ($h < 0.0f) {
+            $h = 0.0f;
+        }
+
+        $depthR = $depthR + math::exp(-$h / SKY_RAYLEIGH_HEIGHT) * $step;
+        $depthM = $depthM + math::exp(-$h / SKY_MIE_HEIGHT) * $step;
+        $i = $i + 1;
+    }
+
+    float32 $mie = SKY_MIE_EXTINCTION * $sky->mieScale * $depthM;
+    return Vec3(
+        math::exp(-(SKY_RAYLEIGH_R * $sky->rayleighScale * $depthR + $mie)),
+        math::exp(-(SKY_RAYLEIGH_G * $sky->rayleighScale * $depthR + $mie)),
+        math::exp(-(SKY_RAYLEIGH_B * $sky->rayleighScale * $depthR + $mie))
+    );
+}

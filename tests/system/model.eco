@@ -1,0 +1,114 @@
+/**
+ * The pure halves of `ModelSystem`: the console grammar and the overlay colour ramps.
+ * Anything that needs an octree, a bank or a device lives behind the render loop and is not here.
+ */
+
+use visu::math::Vec4;
+use visu::signal::ConsoleCommandSignal;
+use visu::system::{ModelConsoleAction, lodColor, octreeColor, parseModelConsole};
+
+internal function modelConsole(const string& $line) : ModelConsoleAction
+{
+    return parseModelConsole(ConsoleCommandSignal($line));
+}
+
+internal function isUsage(ModelConsoleAction $action) : bool
+{
+    return match ($action) {
+        ModelConsoleAction::usage => true,
+        else => false,
+    };
+}
+
+test model_console_bare_verb_is_status
+{
+    ModelConsoleAction $action = modelConsole('model');
+    bool $status = match ($action) {
+        ModelConsoleAction::status => true,
+        else => false,
+    };
+    assert($status, 'model alone prints the counts');
+    assert(isUsage(modelConsole('terrain')), 'another verb is not ours');
+    assert(isUsage(modelConsole('model nonsense')), 'an unknown argument is usage');
+}
+
+test model_console_lod_takes_a_bias
+{
+    float32 $bias = match (modelConsole('model lod 0.25')) {
+        ModelConsoleAction::lod($v) => $v,
+        else => -1.0f,
+    };
+    assert($bias > 0.24f && $bias < 0.26f, 'the bias comes through');
+    assert(isUsage(modelConsole('model lod')), 'a bias is required');
+    assert(isUsage(modelConsole('model lod wide')), 'and it has to be a number');
+}
+
+test model_console_switches_toggle_without_an_argument
+{
+    assert(modelConsoleSwitch(modelConsole('model bounds on')) == 1, 'bounds on');
+    assert(modelConsoleSwitch(modelConsole('model bounds off')) == 0, 'bounds off');
+    assert(modelConsoleSwitch(modelConsole('model bounds')) == 2, 'bare bounds toggles');
+    assert(modelConsoleSwitch(modelConsole('model octree on')) == 1, 'octree on');
+    assert(modelConsoleSwitch(modelConsole('model octree off')) == 0, 'octree off');
+    assert(modelConsoleSwitch(modelConsole('model octree')) == 2, 'bare octree toggles');
+    assert(modelConsoleSwitch(modelConsole('model wire')) == 2, 'bare wire toggles');
+    assert(isUsage(modelConsole('model bounds maybe')), 'on or off, nothing else');
+    assert(isUsage(modelConsole('model octree maybe')), 'same for the octree');
+}
+
+/**
+ * 1 for on, 0 for off, 2 for a toggle, -1 for anything else.
+ */
+internal function modelConsoleSwitch(ModelConsoleAction $action) : int32
+{
+    return match ($action) {
+        ModelConsoleAction::bounds($on) => onOff($on),
+        ModelConsoleAction::octree($on) => onOff($on),
+        ModelConsoleAction::wire($on) => onOff($on),
+        ModelConsoleAction::boundsToggle => 2,
+        ModelConsoleAction::octreeToggle => 2,
+        ModelConsoleAction::wireToggle => 2,
+        else => -1,
+    };
+}
+
+internal function onOff(bool $on) : int32
+{
+    if ($on) {
+        return 1;
+    }
+
+    return 0;
+}
+
+test model_lod_colors_are_distinct_and_clamped
+{
+    Vec4 $zero = lodColor(0);
+    assert($zero->y > $zero->x && $zero->y > $zero->z, 'lod0 is green');
+    Vec4 $imp = lodColor(4);
+    assert($imp->x > 0.9f && $imp->z > 0.8f, 'the impostor level is magenta');
+    Vec4 $under = lodColor(-3);
+    assert($under->y == $zero->y, 'a negative level reads as lod0');
+    Vec4 $over = lodColor(99);
+    assert($over->z > $over->x, 'past the ramp is the cool fallback, not a black line');
+
+    int32 $i = 0;
+    while ($i < 6) {
+        Vec4 $c = lodColor($i);
+        assert($c->x >= 0.0f && $c->x <= 1.0f, 'r in range');
+        assert($c->y >= 0.0f && $c->y <= 1.0f, 'g in range');
+        assert($c->z >= 0.0f && $c->z <= 1.0f, 'b in range');
+        assert($c->w == 1.0f, 'opaque');
+        $i = $i + 1;
+    }
+}
+
+test octree_colors_brighten_with_depth_and_stay_in_range
+{
+    Vec4 $shallow = octreeColor(0);
+    Vec4 $deep = octreeColor(8);
+    assert($deep->z > $shallow->z, 'a deeper cell reads brighter');
+    Vec4 $past = octreeColor(40);
+    assert($past->z <= 1.0f, 'the ramp clamps rather than blowing out');
+    assert($past->z == $deep->z, 'and holds at the deepest step');
+}

@@ -1,6 +1,7 @@
 /**
  * A producer Instruments.sample() asks.
  * Built-ins are LoopSource and DeviceSource; apps add their own.
+ * Tabs are create-or-get on the Sink: write into `rendering` / `graph` or declare a new id.
  */
 
 namespace visu::instrument;
@@ -14,7 +15,8 @@ public interface Source
 
 /**
  * Mailbox one sample() fills.
- * Last writer wins for loop / memory / adapter; gauges merge by name.
+ * Last writer wins for loop / memory / adapter; gauges merge by name; tab metrics merge by
+ * tab + section + name.
  */
 public class Sink
 {
@@ -22,10 +24,25 @@ public class Sink
     public MemoryStats $memory;
     public AdapterInfo $adapter;
     public map<string, Gauge> $gauges;
+    public map<string, TabMail> $tabs;
+    public array<string> $tabOrder;
+    public string $currentTab;
+    public string $currentSection;
+    public map<string, array<Metric>> $passExtras;
 
     public static function empty() : Sink
     {
-        return Sink(LoopStats(), MemoryStats(), AdapterInfo(), map<string, Gauge>());
+        return Sink(
+            LoopStats(),
+            MemoryStats(),
+            AdapterInfo(),
+            map<string, Gauge>(),
+            map<string, TabMail>(),
+            array<string>(),
+            '',
+            '',
+            map<string, array<Metric>>()
+        );
     }
 
     public function loop(LoopStats $stats) : void
@@ -47,4 +64,249 @@ public class Sink
     {
         $this->gauges[$name] = Gauge($name, $value, $unit);
     }
+
+    /**
+     * Select `$id`, creating it with title = id and order 100 when new.
+     */
+    public function tab(string $id) : void
+    {
+        $this->ensureTab($id, $id, 100, false);
+    }
+
+    /**
+     * Select `$id` and set the chip title and sort order.
+     */
+    public function tab(string $id, title: string $title, int32 $order) : void
+    {
+        $this->ensureTab($id, $title, $order, true);
+    }
+
+    public function section(string $id) : void
+    {
+        if ($this->currentTab->empty()) {
+            $this->tab('app');
+        }
+
+        $this->currentSection = $id;
+        TabMail $mail = $this->tabs[$this->currentTab];
+        $mail->ensureSection($id);
+    }
+
+    public function metric(string $name, float64 $value, Unit $unit, of: float64 $of = 0.0) : void
+    {
+        if ($this->currentTab->empty()) {
+            $this->tab('app');
+        }
+
+        if ($this->currentSection->empty()) {
+            $this->section('');
+        }
+
+        TabMail $mail = $this->tabs[$this->currentTab];
+        $mail->write($this->currentSection, Metric($name, $value, $unit, $of));
+    }
+
+    /**
+     * Append or replace a graph pass on the current tab (usually `graph`).
+     */
+    public function pass(PassTiming $timing) : void
+    {
+        if ($this->currentTab->empty()) {
+            $this->tab('graph', title: 'Graph', 10);
+        }
+
+        TabMail $mail = $this->tabs[$this->currentTab];
+        $mail->writePass($timing);
+    }
+
+    public function passExtra(string $pass, string $name, float64 $value, Unit $unit) : void
+    {
+        array<Metric> $list = array<Metric>();
+        if ($this->passExtras->has($pass)) {
+            $list = $this->passExtras[$pass];
+        }
+
+        $list = replaceMetric($list, Metric($name, $value, $unit, 0.0));
+        $this->passExtras[$pass] = $list;
+    }
+
+    /**
+     * Freeze the mailbox into Tab facts, extras merged onto matching pass names, sorted by order.
+     */
+    public function snapshotTabs() : array<Tab>
+    {
+        array<Tab> $out = array<Tab>();
+        array<string> $order = $this->tabOrder;
+        foreach ($order as $id) {
+            if (!$this->tabs->has($id)) {
+                continue;
+            }
+
+            TabMail $mail = $this->tabs[$id];
+            $out[] = $mail->freeze($this->passExtras);
+        }
+
+        return sortTabs($out);
+    }
+
+    private function ensureTab(string $id, string $title, int32 $order, bool $force) : void
+    {
+        if (!$this->tabs->has($id)) {
+            $this->tabs[$id] = TabMail($id, $title, $order);
+            $this->tabOrder[] = $id;
+        } else if ($force) {
+            TabMail $have = $this->tabs[$id];
+            $have->title = $title;
+            $have->order = $order;
+        }
+
+        $this->currentTab = $id;
+        $this->currentSection = '';
+    }
+}
+
+/**
+ * Mutable tab while a sample is collected. Overlay never sees this type.
+ */
+public class TabMail
+{
+    public string $id;
+    public string $title;
+    public int32 $order;
+    public array<string> $sectionOrder;
+    public map<string, array<Metric>> $sections;
+    public array<PassTiming> $passes;
+
+    public constructor(string $id, string $title, int32 $order)
+    {
+        $this->id = $id;
+        $this->title = $title;
+        $this->order = $order;
+        $this->sectionOrder = array<string>();
+        $this->sections = map<string, array<Metric>>();
+        $this->passes = array<PassTiming>();
+    }
+
+    public function ensureSection(string $id) : void
+    {
+        if ($this->sections->has($id)) {
+            return;
+        }
+
+        $this->sections[$id] = array<Metric>();
+        $this->sectionOrder[] = $id;
+    }
+
+    public function write(string $section, Metric $metric) : void
+    {
+        $this->ensureSection($section);
+        array<Metric> $list = $this->sections[$section];
+        $this->sections[$section] = replaceMetric($list, $metric);
+    }
+
+    public function writePass(PassTiming $timing) : void
+    {
+        array<PassTiming> $kept = array<PassTiming>();
+        bool $replaced = false;
+        array<PassTiming> $have = $this->passes;
+        foreach ($have as $p) {
+            if ($p->name == $timing->name) {
+                $kept[] = $timing;
+                $replaced = true;
+            } else {
+                $kept[] = $p;
+            }
+        }
+
+        if (!$replaced) {
+            $kept[] = $timing;
+        }
+
+        $this->passes = $kept;
+    }
+
+    public function freeze(const map<string, array<Metric>>& $extras) : Tab
+    {
+        array<Section> $sections = array<Section>();
+        array<string> $order = $this->sectionOrder;
+        foreach ($order as $id) {
+            array<Metric> $metrics = $this->sections[$id];
+            if ($metrics->empty()) {
+                continue;
+            }
+
+            $sections[] = Section($id, $metrics);
+        }
+
+        array<PassTiming> $passes = array<PassTiming>();
+        array<PassTiming> $have = $this->passes;
+        foreach ($have as $p) {
+            PassTiming $row = $p;
+            if ($extras->has($p->name)) {
+                array<Metric> $more = $extras[$p->name];
+                foreach ($more as $m) {
+                    $row->extras = replaceMetric($row->extras, $m);
+                }
+            }
+
+            $passes[] = $row;
+        }
+
+        return Tab($this->id, $this->title, $this->order, $sections, $passes);
+    }
+}
+
+internal function replaceMetric(array<Metric> $list, Metric $metric) : array<Metric>
+{
+    array<Metric> $out = array<Metric>();
+    bool $replaced = false;
+    foreach ($list as $m) {
+        if ($m->name == $metric->name) {
+            $out[] = $metric;
+            $replaced = true;
+        } else {
+            $out[] = $m;
+        }
+    }
+
+    if (!$replaced) {
+        $out[] = $metric;
+    }
+
+    return $out;
+}
+
+internal function sortTabs(array<Tab> $tabs) : array<Tab>
+{
+    array<Tab> $out = array<Tab>();
+    foreach ($tabs as $tab) {
+        $out = insertTab($out, $tab);
+    }
+
+    return $out;
+}
+
+internal function insertTab(array<Tab> $tabs, Tab $tab) : array<Tab>
+{
+    array<Tab> $out = array<Tab>();
+    bool $placed = false;
+    foreach ($tabs as $have) {
+        if (!$placed && tabBefore($tab, $have)) {
+            $out[] = $tab;
+            $placed = true;
+        }
+
+        $out[] = $have;
+    }
+
+    if (!$placed) {
+        $out[] = $tab;
+    }
+
+    return $out;
+}
+
+internal function tabBefore(const Tab& $a, const Tab& $b) : bool
+{
+    return $a->order < $b->order;
 }

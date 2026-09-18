@@ -1,0 +1,50 @@
+/**
+ * glTF 2.0 reader for the model cooker. Turns every mesh-carrying object into a `CookedModel`:
+ * world transforms baked into the vertices, LOD children (`_L1_name` .. `_L5_name`, `$L1_name`,
+ * or `name_lod1`) folded into levels, primitives grouped by material name, tangents generated
+ * when the file has none. Only what the cooker needs: float attributes, triangle lists, buffer 0.
+ */
+
+namespace visu::asset;
+
+/**
+ * One object out of a file: the node's name and the model built from it.
+ */
+public class GltfModel
+{
+    public const string $name;
+    public CookedModel $model;
+
+    public constructor(string $name, CookedModel $model)
+    {
+        $this->name = $name;
+        $this->model = $model;
+    }
+}
+
+/**
+ * Every mesh-carrying object in the default scene, each with its LOD children folded in.
+ * LOD distances, bias and cull distance come out zero; the cooker fills them from the sheet.
+ */
+public function gltfModels(GltfFile $file) : result<array<GltfModel>, GltfError>
+{
+    array<GltfParts> $objects = array<GltfParts>();
+    array<GltfPendingLod> $pending = array<GltfPendingLod>();
+    guard gltfCollect($file, $objects, $pending) else ($e) {
+        return .error($e);
+    }
+
+    if ($objects->count() == 0) {
+        return .error(.empty);
+    }
+
+    array<GltfModel> $out = array<GltfModel>();
+    foreach ($objects as $object) {
+        CookedModel $model = guard gltfBuild($file, $object) else ($e) {
+            return .error($e);
+        }
+        $out[] = GltfModel($object->name, $model);
+    }
+
+    return .ok($out);
+}

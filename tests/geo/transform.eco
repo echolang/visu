@@ -52,6 +52,27 @@ test transform_parent_world_applies_rotation
     assert(equal($wp, Vec3($expect->x, $expect->y, $expect->z), 0.01f), 'rotated parent');
 }
 
+test transform_world_interpolates_parent_chain
+{
+    Entities $world = Entities();
+    Entity $parent = $world->create();
+    Entity $child = $world->create();
+    Transform $pt = Transform();
+    $world->attach($parent, $pt);
+    Transform $ct = Transform();
+    $ct->position = Vec3(1.0f, 0.0f, 0.0f);
+    $ct->parent($world, $parent);
+    $world->attach($child, $ct);
+
+    Transform& $p = $world->get<Transform>($parent);
+    $p->storePrevious();
+    $p->position = Vec3(10.0f, 0.0f, 0.0f);
+    Transform& $c = $world->get<Transform>($child);
+    $c->storePrevious();
+    Mat4 $mid = $c->world($world, 0.5f);
+    assert(equal($mid->c3->x, 6.0f), 'parent mix plus local');
+}
+
 test transform_store_previous_mixes
 {
     Transform $t = Transform();

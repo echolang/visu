@@ -2,7 +2,7 @@
  * System binder: register / update / render.
  */
 
-use visu::ecs::{Entities, Entity, System, Systems};
+use visu::ecs::{Entities, Entity, Schedule, System, Systems};
 use visu::graphics::{Device, RenderContext, Pool, Frame, Pipeline, RenderTarget};
 
 class CountingSystem : System
@@ -29,6 +29,10 @@ class CountingSystem : System
     public function unregister(Entities $entities) : void
     {
         $this->unregisters = $this->unregisters + 1;
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
     }
 
     public function update(Entities $entities) : void
@@ -79,4 +83,121 @@ test systems_render_reaches_bound
     RenderContext $ctx = RenderContext($device, $pipeline, $frame, $pool);
     $systems->render($world, $ctx);
     assert($sys->renders == 1, 'render');
+}
+
+class TickingSystem : System
+{
+    public int32 $everyPass;
+    public int32 $spaced;
+    public int64 $lastPass;
+    public string $tag;
+    public TickOrder $order;
+
+    public constructor(string $tag, TickOrder $order)
+    {
+        $this->everyPass = 0;
+        $this->spaced = 0;
+        $this->lastPass = 0;
+        $this->tag = $tag;
+        $this->order = $order;
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->update = false;
+        $schedule->render = false;
+        TickingSystem $self = $this;
+        $schedule->every(1, function(Entities $entities, int64 $pass) : void {
+            $self->everyPass = $self->everyPass + 1;
+            $self->lastPass = $pass;
+            $self->order->names[] = $self->tag;
+        });
+        $schedule->every(5, offset: 2, function(Entities $entities, int64 $pass) : void {
+            $self->spaced = $self->spaced + 1;
+        });
+    }
+
+    public function update(Entities $entities) : void
+    {
+        $this->everyPass = -1;
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+        $this->spaced = -1;
+    }
+}
+
+class TickOrder
+{
+    public array<string> $names;
+
+    public constructor()
+    {
+        $this->names = array<string>();
+    }
+}
+
+test systems_skip_phases_the_schedule_opted_out_of
+{
+    Systems $systems = Systems();
+    CountingSystem $counting = CountingSystem();
+    TickingSystem $ticking = TickingSystem('a', TickOrder());
+    $systems->bind($counting);
+    $systems->bind($ticking);
+
+    Entities $world = Entities();
+    $systems->register($world);
+    $systems->update($world);
+
+    assert($counting->updates == 1, 'sibling still updates');
+    assert($ticking->everyPass == 0, 'opted out of update');
+    assert($ticking->spaced == 0, 'opted out of render');
+}
+
+test systems_tick_fires_by_interval_and_offset
+{
+    Systems $systems = Systems();
+    TickingSystem $ticking = TickingSystem('a', TickOrder());
+    $systems->bind($ticking);
+
+    Entities $world = Entities();
+    $systems->register($world);
+    int32 $i = 0;
+
+    while ($i < 12) {
+        $systems->tick($world);
+        $i = $i + 1;
+    }
+
+    assert($systems->passes() == 12, 'twelve passes');
+    assert($ticking->everyPass == 12, 'interval one runs every pass');
+    assert($ticking->lastPass == 12, 'handler sees the pass number');
+    assert($ticking->spaced == 3, 'offset two interval five: passes 2, 7, 12');
+}
+
+test systems_tick_keeps_bind_order
+{
+    TickOrder $order = TickOrder();
+    Systems $systems = Systems();
+    $systems->bind(TickingSystem('first', $order));
+    $systems->bind(TickingSystem('second', $order));
+
+    Entities $world = Entities();
+    $systems->tick($world);
+    $systems->tick($world);
+
+    assert($order->names->count() == 4, 'two systems, two passes');
+    assert($order->names[0] == 'first', 'bind order holds');
+    assert($order->names[1] == 'second', 'bind order holds');
+    assert($order->names[2] == 'first', 'and on the next pass');
+    assert($order->names[3] == 'second', 'and on the next pass');
 }

@@ -18,6 +18,8 @@ public class RenderEncoder : RenderEncoderProtocol
     internal SamplerHandle[16] $sampHandles;
     internal bool[16] $texSet;
     internal bool $texturesDirty;
+    private Topology $topology;
+    private int32 $patchControlPoints;
 
     public constructor(Device $device, TargetFormats $formats, int32 $width, int32 $height)
     {
@@ -30,6 +32,8 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->scissorSet = false;
         $this->pipelineSet = false;
         $this->texturesDirty = false;
+        $this->topology = .triangles;
+        $this->patchControlPoints = 0;
         TextureHandle[16] $texes;
         SamplerHandle[16] $samps;
         bool[16] $bound;
@@ -77,6 +81,9 @@ public class RenderEncoder : RenderEncoderProtocol
             $pso->pipeline
         );
         $this->pipelineSet = true;
+        $this->topology = $pass->topology;
+        $this->patchControlPoints = $pass->patchControlPoints;
+        $this->device->draws->bind();
         FrameSlot $slot = $this->device->slots[$this->device->slot];
         $slot->uniformsDirty = true;
 
@@ -205,6 +212,7 @@ public class RenderEncoder : RenderEncoderProtocol
         assert($this->pipelineSet, 'draw before setGpuPass');
         vkFlushUniforms($this->device);
         vkFlushTextures($this->device, $this);
+        $this->device->draws->draw($this->topology, $count, $instances, $this->patchControlPoints);
         vk::CmdDraw($this->device->currentCmd(), $count as uint32, $instances as uint32, $first as uint32, 0);
     }
 
@@ -214,6 +222,7 @@ public class RenderEncoder : RenderEncoderProtocol
         assert($this->pipelineSet, 'drawIndexed before setGpuPass');
         vkFlushUniforms($this->device);
         vkFlushTextures($this->device, $this);
+        $this->device->draws->drawIndexed($this->topology, $count, $instances, $this->patchControlPoints);
         vk::CmdDrawIndexed(
             $this->device->currentCmd(),
             $count as uint32,

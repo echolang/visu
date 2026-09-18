@@ -1,0 +1,191 @@
+/**
+ * Dump-after-present queue. Always on so console `dump` works without a script. The script driver
+ * queues onto the same object; stop-only steps do not stall the GPU.
+ */
+
+namespace visu::dcapture;
+
+use std::env;
+use visu::app::{flags, info};
+use visu::graphics::{Frame, Pool};
+use visu::os::Window;
+
+internal struct QueuedDump
+{
+    public string $pattern;
+    public string $label;
+}
+
+public class DumpQueue
+{
+    public const string $out;
+    private Dumper $dumper;
+    private Manifest $manifest;
+    private array<DumpProvider> $providers;
+    private array<QueuedDump> $queue;
+    private bool $listQueued;
+    private bool $stopQueued;
+    private bool $wroteAnything;
+    private int32 $tick;
+
+    public constructor(string $out)
+    {
+        $this->out = $out;
+        $this->dumper = Dumper($out);
+        $this->manifest = Manifest();
+        $this->providers = builtinProviders();
+        $this->queue = array<QueuedDump>();
+        $this->listQueued = false;
+        $this->stopQueued = false;
+        $this->wroteAnything = false;
+        $this->tick = 0;
+    }
+
+    public function addProvider(DumpProvider $provider) : void
+    {
+        $this->providers[] = $provider;
+    }
+
+    public function queue(const string& $pattern) : void
+    {
+        string $empty = '';
+        $this->queue($pattern, $empty);
+    }
+
+    public function queue(const string& $pattern, const string& $label) : void
+    {
+        $this->queue[] = QueuedDump($pattern, $label);
+    }
+
+    public function queueList() : void
+    {
+        $this->listQueued = true;
+    }
+
+    public function queueStop() : void
+    {
+        $this->stopQueued = true;
+    }
+
+    public const function queued() : int32
+    {
+        return $this->queue->count() as int32;
+    }
+
+    public const function pendingWork() : bool
+    {
+        return !$this->queue->empty() || $this->listQueued || $this->stopQueued;
+    }
+
+    /**
+     * Write queued dumps, list the catalog, then stop. Outside a frame; stalls only when a dump
+     * or list needs GPU readback.
+     */
+    public function afterPresent(Frame $frame, Pool $pool, Window $window, int32 $presented, int32 $tick) : void
+    {
+        $this->tick = $tick;
+        bool $needCatalog = !$this->queue->empty() || $this->listQueued;
+        if (!$needCatalog && !$this->stopQueued) {
+            return;
+        }
+
+        DumpCatalog $catalog = DumpCatalog();
+        if ($needCatalog) {
+            $pool->device->waitIdle();
+            foreach ($this->providers as $provider) {
+                $provider->describe($frame, $pool, $catalog);
+            }
+        }
+
+        array<QueuedDump> $batch = $this->queue;
+        $this->queue = array<QueuedDump>();
+        foreach ($batch as $request) {
+            $this->writeMatches($catalog, $pool, $request, $presented);
+        }
+
+        if ($this->listQueued) {
+            $this->listQueued = false;
+            array<string> $names = $catalog->names();
+            $this->manifest->catalog = $names;
+            int32 $count = $names->count() as int32;
+            info("dcapture: {$count} dumpable names at frame {$presented}, see manifest.json");
+            $this->wroteAnything = true;
+        }
+
+        if ($this->stopQueued) {
+            $this->stopQueued = false;
+            $this->note("frame {$presented}: stop");
+            $window->setShouldClose(true);
+        }
+
+        $this->manifest->frames = $presented + 1;
+        $this->manifest->ticks = $tick;
+        $this->writeManifest();
+    }
+
+    public function skip(const array<Step>& $left) : void
+    {
+        foreach ($left as $step) {
+            $this->manifest->skipped[] = $step->describe();
+        }
+    }
+
+    public function finish(int32 $framesRun, int32 $tick, bool $force) : void
+    {
+        $this->tick = $tick;
+        $this->manifest->frames = $framesRun;
+        $this->manifest->ticks = $tick;
+        if (!$force && !$this->wroteAnything) {
+            return;
+        }
+
+        $this->writeManifest();
+    }
+
+    public function note(string $text) : void
+    {
+        $this->manifest->events[] = $text;
+    }
+
+    public function fail(string $text) : void
+    {
+        info("dcapture: {$text}");
+        $this->manifest->errors[] = $text;
+    }
+
+    private function writeMatches(DumpCatalog $catalog, Pool $pool, QueuedDump $request, int32 $presented) : void
+    {
+        array<DumpEntry> $entries = $catalog->resolve($request->pattern);
+        if ($entries->empty()) {
+            DumpFailure $miss = .unknown($request->pattern);
+            $this->fail($miss->message());
+            return;
+        }
+
+        foreach ($entries as $entry) {
+            array<DumpRecord> $records = guard $this->dumper->write($pool, $entry, $presented, $request->label) else ($e) {
+                $this->fail($e->message());
+                continue;
+            }
+            foreach ($records as $record) {
+                $this->manifest->dumps[] = $record;
+                info("dcapture: wrote {$record->path}");
+            }
+            $this->wroteAnything = true;
+        }
+    }
+
+    private function writeManifest() : void
+    {
+        guard ensureDir($this->out) else ($e) {
+            info("dcapture: {$e->message()}");
+            return;
+        }
+        string $ds = env::DS;
+        string $path = "{$this->out}{$ds}manifest.json";
+        guard $this->manifest->write($path, flags()) else ($e) {
+            info("dcapture: {$e->message()}");
+            return;
+        }
+    }
+}

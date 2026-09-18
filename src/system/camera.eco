@@ -2,6 +2,7 @@
  * Snapshots every `Camera` + `Transform` and publishes `CameraData` from the `ActiveCamera`.
  * Controllers (`FlyingCamera`, `OrbitCamera`) are separate systems that join on the same marker.
  * An entity with only `Camera` + `Transform` is static or scripted; this system still publishes it, and does not move it.
+ * A `CameraOverrideData` frame fact (DCapture) replaces the pose and optionally the fov for that frame; the Transform stays untouched.
  *
  * Bind this before any system that reads `CameraData`, and before the controllers so the snapshot lands before they move.
  */
@@ -9,11 +10,12 @@
 namespace visu::system;
 
 use visu::components::ActiveCamera;
-use visu::ecs::{Entities, Entity, System};
+use visu::ecs::{Entities, Entity, Schedule, System};
 use visu::geo::{Pose, Transform};
 use visu::graphics::{
-    BackbufferData, Camera, CameraData, RenderContext, SceneTargetData, TargetRef
+    BackbufferData, Camera, CameraData, CameraOverrideData, RenderContext, SceneTargetData, TargetRef
 };
+use visu::math::Vec3;
 
 public class CameraSystem : System
 {
@@ -26,6 +28,10 @@ public class CameraSystem : System
     }
 
     public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function schedule(Schedule& $schedule) : void
     {
     }
 
@@ -54,8 +60,19 @@ public class CameraSystem : System
         TargetRef $target = $this->target($ctx);
         Camera& $camera = $entities->get<Camera>($active);
         Transform& $transform = $entities->get<Transform>($active);
+        // copy the lens so a scripted fov never writes back into the entity
+        Camera $lens = $camera;
         Pose $pose = $transform->mix($ctx->compensation);
-        $ctx->frame->set($camera->data(
+        CameraOverrideData? $maybeOverride = $ctx->frame->find<CameraOverrideData>();
+        if ($maybeOverride != null) {
+            CameraOverrideData $over = guard $maybeOverride;
+            $pose = Pose($over->position, $over->orientation, Vec3(1.0f, 1.0f, 1.0f));
+            if ($over->fov > 0.0f) {
+                $lens->fov = $over->fov;
+            }
+        }
+
+        $ctx->frame->set($lens->data(
             $pose,
             $target->width,
             $target->height,

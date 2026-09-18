@@ -1,0 +1,374 @@
+/**
+ * Named GPU images an agent can ask for by string: the catalog of what this frame produced,
+ * the providers that fill it, and the writer that turns an entry into PNG files.
+ * Providers describe from Frame facts and the Pool, so the catalog only lists what exists
+ * right now; `pool:<name>` covers everything else without registration.
+ */
+
+namespace visu::dcapture;
+
+use std::env;
+use std::io;
+use visu::graphics::{Frame, PixelDump, Pool, Texture, TextureRef};
+
+/**
+ * What one catalog name points at. `raw` is a pool texture by its pool name; a cube writes six faces.
+ */
+public enum DumpSource
+{
+    case texture(TextureRef $ref, PixelDump $dump);
+    case cube(TextureRef $ref);
+    case raw(string $poolName);
+}
+
+public class DumpEntry
+{
+    public const string $name;
+    public const DumpSource $source;
+
+    public constructor(string $name, DumpSource $source)
+    {
+        $this->name = $name;
+        $this->source = $source;
+    }
+}
+
+/**
+ * Fills the catalog from the frame that was just presented. Implement to expose game images.
+ */
+public interface DumpProvider
+{
+    function describe(Frame $frame, Pool $pool, DumpCatalog $out) : void;
+}
+
+public class DumpCatalog
+{
+    private array<DumpEntry> $entries;
+    private map<string, usize> $index;
+
+    public constructor()
+    {
+        $this->entries = array<DumpEntry>();
+        $this->index = map<string, usize>();
+    }
+
+    /**
+     * Register a name. A later add under the same name replaces the earlier one.
+     */
+    public function add(string $name, DumpSource $source) : void
+    {
+        DumpEntry $entry = DumpEntry($name, $source);
+        if ($this->index->has($name)) {
+            usize $at = $this->index->get($name);
+            $this->entries[$at] = $entry;
+            return;
+        }
+
+        $this->index->set($name, $this->entries->count());
+        $this->entries[] = $entry;
+    }
+
+    public const function count() : usize
+    {
+        return $this->entries->count();
+    }
+
+    public const function names() : array<string>
+    {
+        array<string> $out = array<string>();
+        foreach ($this->entries as $entry) {
+            $out[] = $entry->name;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Entries matching `$pattern`: an exact name, or a glob where `*` spans any run of
+     * characters (`pbr.gbuffer.*`, `pool:*`, `*ssao*`).
+     */
+    public const function resolve(const string& $pattern) : array<DumpEntry>
+    {
+        array<DumpEntry> $out = array<DumpEntry>();
+        if (!$pattern->contains('*')) {
+            if ($this->index->has($pattern)) {
+                usize $at = $this->index->get($pattern);
+                $out[] = $this->entries[$at];
+            }
+
+            return $out;
+        }
+
+        foreach ($this->entries as $entry) {
+            if (wildcard($pattern, $entry->name)) {
+                $out[] = $entry;
+            }
+        }
+
+        return $out;
+    }
+}
+
+/**
+ * Glob match where `*` spans any run of bytes; everything else is literal.
+ */
+public function wildcard(const string& $pattern, const string& $name) : bool
+{
+    usize $plen = $pattern->size();
+    usize $nlen = $name->size();
+    usize $p = 0;
+    usize $n = 0;
+    // $plen doubles as "no star seen yet"
+    usize $starP = $plen;
+    usize $starN = 0;
+
+    while ($n < $nlen) {
+        if ($p < $plen && $pattern->byte($p) == 42) {
+            $starP = $p;
+            $starN = $n;
+            $p = $p + 1;
+            continue;
+        }
+
+        if ($p < $plen && $pattern->byte($p) == $name->byte($n)) {
+            $p = $p + 1;
+            $n = $n + 1;
+            continue;
+        }
+
+        if ($starP != $plen) {
+            $starN = $starN + 1;
+            $n = $starN;
+            $p = $starP + 1;
+            continue;
+        }
+
+        return false;
+    }
+
+    while ($p < $plen && $pattern->byte($p) == 42) {
+        $p = $p + 1;
+    }
+
+    return $p == $plen;
+}
+
+/**
+ * One PNG that was written, for the manifest.
+ */
+public class DumpRecord
+{
+    public const string $name;
+    public const string $path;
+    public const int32 $frame;
+    public const string $label;
+
+    public constructor(string $name, string $path, int32 $frame, string $label)
+    {
+        $this->name = $name;
+        $this->path = $path;
+        $this->frame = $frame;
+        $this->label = $label;
+    }
+}
+
+/**
+ * Only `[A-Za-z0-9_-]` survive; dots, colons, slashes and spaces become `_` so a name is one file stem.
+ */
+public function sanitizeName(const string& $name) : string
+{
+    string $out = '';
+    usize $n = $name->size();
+    usize $i = 0;
+    while ($i < $n) {
+        uint8 $b = $name->byte($i);
+        bool $digit = $b >= 48 && $b <= 57;
+        bool $upper = $b >= 65 && $b <= 90;
+        bool $lower = $b >= 97 && $b <= 122;
+        bool $keep = $digit || $upper || $lower || $b == 45 || $b == 95;
+        if ($keep) {
+            $out->push($b);
+        } else {
+            $out->push(95);
+        }
+
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+/**
+ * `{out}/{frame, four digits}_{label_}{name}{suffix}.png`, so a directory listing sorts by frame.
+ */
+public function dumpPath(
+    const string& $out,
+    int32 $frame,
+    const string& $label,
+    const string& $name,
+    const string& $suffix,
+) : string
+{
+    string $ds = env::DS;
+    string $digits = str::lpad(str::from($frame), 4, 48);
+    string $safe = sanitizeName($name);
+    string $tag = '';
+    if (!$label->empty()) {
+        string $safeLabel = sanitizeName($label);
+        $tag = "{$safeLabel}_";
+    }
+
+    return "{$out}{$ds}{$digits}_{$tag}{$safe}{$suffix}.png";
+}
+
+/**
+ * Create `$dir` and every missing parent. `io::mkdir` is one level, so walk the separators.
+ */
+public function ensureDir(const string& $dir) : status<DCaptureError>
+{
+    usize $n = $dir->size();
+    usize $i = 1;
+    while ($i <= $n) {
+        bool $boundary = $i == $n || $dir->byte($i) == 47 || $dir->byte($i) == 92;
+        if ($boundary) {
+            string $prefix = $dir->sub(0, $i)->clone();
+            $made = io::mkdir($prefix);
+            if ($made->failed() && !$made->failure()->exists()) {
+                return .error(.io($prefix, $made->failure()->message()));
+            }
+        }
+
+        $i = $i + 1;
+    }
+
+    return .ok;
+}
+
+/**
+ * File suffix per cube face, +X -X +Y -Y +Z -Z.
+ */
+internal function cubeFaceSuffix(int32 $face) : string
+{
+    if ($face == 0) {
+        return '_px';
+    }
+    if ($face == 1) {
+        return '_nx';
+    }
+    if ($face == 2) {
+        return '_py';
+    }
+    if ($face == 3) {
+        return '_ny';
+    }
+    if ($face == 4) {
+        return '_pz';
+    }
+
+    return '_nz';
+}
+
+/**
+ * Writes catalog entries as PNGs under one output directory. After present only; stalls.
+ */
+public class Dumper
+{
+    public const string $out;
+    private bool $ready;
+
+    public constructor(string $out)
+    {
+        $this->out = $out;
+        $this->ready = false;
+    }
+
+    public function write(
+        Pool $pool,
+        DumpEntry $entry,
+        int32 $frame,
+        const string& $label,
+    ) : result<array<DumpRecord>, DumpFailure>
+    {
+        if (!$this->ready) {
+            guard ensureDir($this->out) else ($e) {
+                return .error(.write($entry->name, .io($this->out, $e->message())));
+            }
+            $this->ready = true;
+        }
+
+        DumpSource $source = $entry->source;
+        return match ($source) {
+            DumpSource::texture($ref, $dump) => $this->writeRef($pool, $ref, $entry->name, $dump, $frame, $label),
+            DumpSource::cube($ref) => $this->writeRef($pool, $ref, $entry->name, .color, $frame, $label),
+            DumpSource::raw($poolName) => $this->writeRaw($pool, $poolName, $entry->name, $frame, $label),
+        };
+    }
+
+    private function writeRef(
+        Pool $pool,
+        TextureRef $ref,
+        const string& $name,
+        PixelDump $dump,
+        int32 $frame,
+        const string& $label,
+    ) : result<array<DumpRecord>, DumpFailure>
+    {
+        Texture $tex = guard $pool->getTexture($ref) else ($e) {
+            return .error(.missing($name));
+        }
+        return $this->writeTexture($tex, $name, $dump, $frame, $label);
+    }
+
+    private function writeRaw(
+        Pool $pool,
+        string $poolName,
+        const string& $name,
+        int32 $frame,
+        const string& $label,
+    ) : result<array<DumpRecord>, DumpFailure>
+    {
+        Texture $tex = guard $pool->findTexture($poolName) else {
+            return .error(.missing($name));
+        }
+        return $this->writeTexture($tex, $name, .color, $frame, $label);
+    }
+
+    /**
+     * A cube writes six files; anything else one. Depth formats fail before the readback.
+     */
+    private function writeTexture(
+        Texture $tex,
+        const string& $name,
+        PixelDump $dump,
+        int32 $frame,
+        const string& $label,
+    ) : result<array<DumpRecord>, DumpFailure>
+    {
+        array<DumpRecord> $records = array<DumpRecord>();
+        if ($tex->desc->isDepth()) {
+            return .error(.depth($name));
+        }
+
+        if (!$tex->cube()) {
+            string $path = dumpPath($this->out, $frame, $label, $name, '');
+            guard $tex->dump($path, face: 0, 0, dump: $dump) else ($e) {
+                return .error(.write($name, $e));
+            }
+            $records[] = DumpRecord($name, $path, $frame, $label);
+            return .ok($records);
+        }
+
+        int32 $face = 0;
+        while ($face < 6) {
+            string $suffix = cubeFaceSuffix($face);
+            string $path = dumpPath($this->out, $frame, $label, $name, $suffix);
+            guard $tex->dump($path, face: $face, 0, dump: $dump) else ($e) {
+                return .error(.write($name, $e));
+            }
+            $records[] = DumpRecord($name, $path, $frame, $label);
+            $face = $face + 1;
+        }
+
+        return .ok($records);
+    }
+}

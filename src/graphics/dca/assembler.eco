@@ -70,7 +70,27 @@ public class DrawCallAssembler<P>
     {
         assert($first >= 0 && $count > 0, 'dca: mesh range');
         int32 $index = $this->meshes->count() as int32;
-        $this->meshes[] = RegisteredMesh($mesh, $first, $count, $bounds);
+        $this->meshes[] = RegisteredMesh($mesh, $first, $count, false, 0, $bounds);
+        return MeshHandle($index);
+    }
+
+    /**
+     * Register an index range of an indexed mesh. `material:` is the batch key the `execute` callback
+     * receives; instances of one material draw adjacently, whatever mesh they use.
+     */
+    public function register(
+        Mesh $mesh,
+        const AABB& $bounds,
+        firstIndex: int32 $first,
+        indexCount: int32 $count,
+        material: int32 $material = 0
+    ) : MeshHandle
+    {
+        assert($first >= 0 && $count > 0, 'dca: index range');
+        assert($mesh->indices != null, 'dca: indexed range needs an index buffer');
+        assert($material >= 0 && $material < 65536, 'dca: material key');
+        int32 $index = $this->meshes->count() as int32;
+        $this->meshes[] = RegisteredMesh($mesh, $first, $count, true, $material, $bounds);
         return MeshHandle($index);
     }
 
@@ -130,7 +150,7 @@ public class DrawCallAssembler<P>
             RegisteredMesh $mesh = $this->meshes[$sub->mesh as usize];
             Vec3 $centre = worldPoint($sub->model, $mesh->centre);
             // one key per submission, culled included: sortByKey looks them up by submission index, not by position in $visible
-            $this->keys[] = sortKey($sub->mesh, $this->depthBucket($centre, $cameraPosition, $sub->sortBias));
+            $this->keys[] = sortKey($mesh->material, $sub->mesh, $this->depthBucket($centre, $cameraPosition, $sub->sortBias));
 
             if ($this->cull && !$sub->ignoreCull) {
                 float32 $radius = $mesh->radius * maxAxisScale($sub->model);
@@ -166,14 +186,40 @@ public class DrawCallAssembler<P>
         }
 
         $pass->bind($enc);
+        $this->record($enc, null);
+    }
+
+    /**
+     * Same, but the caller binds per material: `$bind` runs before the first command of every material
+     * change (in sort order) and must set the GpuPass and whatever textures and uniforms that material needs.
+     */
+    public function execute(RenderEncoder $enc, function<void(RenderEncoder, int32)> $bind) : void
+    {
+        if ($this->commands->count() == 0) {
+            return;
+        }
+
+        $this->record($enc, $bind);
+    }
+
+    private function record(RenderEncoder $enc, function<void(RenderEncoder, int32)>? $bind) : void
+    {
         uint64 $stride = mem::size<Instance<P>>() as uint64;
         uint64 $bytes = ($this->stream->count() as uint64) * $stride;
         TransientSlice $slice = $this->device->allocTransient($bytes, 16);
         ptr<const uint8> $src = ptr<const uint8>(&$this->stream[0]);
         mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $bytes);
+        int32 $material = -1;
 
         foreach ($this->commands as $command) {
             RegisteredMesh $mesh = $this->meshes[$command->mesh as usize];
+
+            if ($bind != null && $command->material != $material) {
+                function<void(RenderEncoder, int32)> $fn = guard $bind;
+                $fn($enc, $command->material);
+                $material = $command->material;
+            }
+
             uint64 $offset = ($command->instanceOffset as uint64) * $stride;
             TransientSlice $sub = $slice;
             $sub->data:$ = $slice->data:$ + $offset;
@@ -181,6 +227,14 @@ public class DrawCallAssembler<P>
             $sub->bytes = ($command->instanceCount as uint64) * $stride;
             $enc->setVertexBuffer(VERTEX_BINDING, $mesh->mesh->vertices);
             $enc->setVertexTransient(INSTANCE_BINDING, $sub);
+
+            if ($mesh->indexed) {
+                Buffer $indices = guard $mesh->mesh->indices;
+                $enc->setIndexBuffer($indices, $mesh->mesh->indexType);
+                $enc->drawIndexed($command->first, $command->count, $command->instanceCount);
+                continue;
+            }
+
             $enc->draw($command->first, $command->count, $command->instanceCount);
         }
     }
@@ -247,6 +301,7 @@ public class DrawCallAssembler<P>
             RegisteredMesh $mesh = $this->meshes[$base->mesh as usize];
             $this->commands[] = DrawCommand(
                 $base->mesh,
+                $mesh->material,
                 $mesh->first,
                 $mesh->count,
                 $start as int32,
@@ -278,11 +333,12 @@ public class DrawCallAssembler<P>
 }
 
 /**
- * Pack mesh index in the high bits so instances of one mesh stay adjacent.
+ * Material above mesh above depth: one material's draws stay adjacent so a bind callback runs once
+ * per material, and inside it one mesh's instances stay adjacent so they merge into one command.
  */
-internal function sortKey(int32 $mesh, uint64 $depth) : uint64
+internal function sortKey(int32 $material, int32 $mesh, uint64 $depth) : uint64
 {
-    return (($mesh as uint64) << 32) | $depth;
+    return (($material as uint64) << 36) | (($mesh as uint64) << 20) | $depth;
 }
 
 internal function worldPoint(const Mat4& $model, Vec3 $point) : Vec3

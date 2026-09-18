@@ -1,0 +1,89 @@
+/**
+ * Sky parameters, their GPU mirror, the sun light they cast, and the probe face cameras.
+ */
+
+use visu::graphics::{DirectionalLight, IblBlend, Sky, SkyUniforms, probeCamera, skyUniforms};
+use visu::math::{Mat4, Vec3, Vec4, normalize};
+
+test sky_equality
+{
+    Sky $a = Sky();
+    Sky $b = Sky();
+    assert($a == $b, 'defaults equal');
+    $b->mieScale = 2.0f;
+    assert($a != $b, 'mie differs');
+}
+
+test sky_same_atmosphere_ignores_direction
+{
+    Sky $a = Sky();
+    Sky $b = $a->withDirection(Vec3(0.0f, -1.0f, 0.0f));
+    assert($a != $b, 'direction differs');
+    assert($a->sameAtmosphere($b), 'same atmosphere');
+    $b->exposure = 0.5f;
+    assert(!$a->sameAtmosphere($b), 'exposure differs');
+}
+
+test sky_uniforms_pack
+{
+    assert(mem::size<SkyUniforms>() == 96, 'std140 size');
+    Sky $sky = Sky();
+    $sky->direction = Vec3(0.0f, -2.0f, 0.0f);
+    $sky->sunIntensity = 4.0f;
+    SkyUniforms $u = skyUniforms($sky, Vec3(1.0f, 300.0f, 2.0f), true, 16.0f, 8.0f);
+    assert($u->sun->y > 0.999f, 'towards the sun');
+    assert($u->sun->w == 4.0f, 'intensity');
+    assert($u->origin->y == 300.0f, 'origin');
+    assert($u->origin->w == 1.0f, 'disk on');
+    assert($u->params->x == 16.0f, 'view samples');
+    SkyUniforms $bake = skyUniforms($sky, Vec3(0.0f, 0.0f, 0.0f), false, 32.0f, 8.0f);
+    assert($bake->origin->w == 0.0f, 'disk off');
+}
+
+test sun_light_reddens_low
+{
+    Sky $sky = Sky();
+    // five degrees above the horizon, travelling west to east
+    float32 $elevation = 0.0872665f;
+    Vec3 $toSun = Vec3(std::math::cos($elevation), std::math::sin($elevation), 0.0f);
+    $sky->direction = -$toSun;
+    DirectionalLight $low = $sky->sunLight(300.0f);
+    assert($low->intensity > 0.0f, 'still lit');
+    assert($low->color->x > $low->color->z, 'red survives longer than blue');
+    $sky->direction = Vec3(0.0f, -1.0f, 0.0f);
+    DirectionalLight $noon = $sky->sunLight(300.0f);
+    assert($noon->color->z > 0.7f, 'noon stays close to white');
+    assert($noon->intensity > $low->intensity, 'noon is brighter');
+}
+
+test sun_light_zero_below_horizon
+{
+    Sky $sky = Sky();
+    $sky->direction = Vec3(0.0f, 1.0f, 0.0f);
+    DirectionalLight $night = $sky->sunLight(300.0f);
+    assert($night->intensity == 0.0f, 'no sun at night');
+}
+
+test ibl_blend_defaults
+{
+    IblBlend $b = IblBlend();
+    assert($b->from == 0 && $b->to == 0 && $b->weight == 0.0f, 'zero blend');
+    IblBlend $c = IblBlend(3, 4, 0.25f);
+    assert($c->to == 4, 'to');
+}
+
+test probe_camera_faces
+{
+    Vec3 $eye = Vec3(10.0f, 20.0f, 30.0f);
+    $cam = probeCamera(0, $eye, 256, 0.5f, 1000.0f);
+    assert($cam->position == $eye, 'position');
+    assert($cam->resolutionX == 256, 'resolution');
+    // a point ahead along +x lands in front of the camera (negative view z)
+    Vec4 $ahead = $cam->view * Vec4(11.0f, 20.0f, 30.0f, 1.0f);
+    assert($ahead->z < 0.0f, 'face 0 looks down +x');
+    Vec4 $clip = $cam->projectionView * Vec4(11.0f, 20.0f, 30.0f, 1.0f);
+    assert($clip->w > 0.0f, 'in front');
+    $up = probeCamera(2, $eye, 256, 0.5f, 1000.0f);
+    Vec4 $above = $up->view * Vec4(10.0f, 21.0f, 30.0f, 1.0f);
+    assert($above->z < 0.0f, 'face 2 looks up');
+}

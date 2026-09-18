@@ -7,10 +7,10 @@ use visu::components::{ActiveCamera, FlyingCamera};
 use visu::ecs::{Entities, Entity};
 use visu::geo::{Pose, Transform};
 use visu::graphics::{
-    Camera, CameraData, RenderContext, Device, Frame, Pipeline, Pool,
+    Camera, CameraData, CameraOverrideData, RenderContext, Device, Frame, Pipeline, Pool,
     Projection, RenderTarget, SceneTargetData, TargetRef
 };
-use visu::math::Vec3;
+use visu::math::{Quat, Vec3};
 use visu::system::CameraSystem;
 
 internal function headlessFrame(int32 $width, int32 $height) : RenderContext
@@ -122,6 +122,28 @@ test camera_system_without_a_marker_publishes_nothing
     RenderContext $ctx = headlessFrame(64, 64);
     $system->render($world, $ctx);
     assert(!$ctx->frame->has<CameraData>(), 'nothing published');
+}
+
+test camera_system_honours_override_data
+{
+    Entities $world = Entities();
+    CameraSystem $system = CameraSystem();
+    Entity $entity = Camera::spawn($world, Vec3(0.0f, 0.0f, 4.0f));
+    ActiveCamera::activate($world, $entity);
+    RenderContext $ctx = headlessFrame(64, 64);
+    $ctx->frame->set(CameraOverrideData(Vec3(1.0f, 2.0f, 3.0f), Quat(), 90.0f));
+    $system->render($world, $ctx);
+    CameraData $data = $ctx->frame->get<CameraData>();
+    assert($data->position->x == 1.0f, 'override x');
+    assert($data->position->z == 3.0f, 'override z');
+    Transform& $transform = $world->get<Transform>($entity);
+    assert($transform->position->z == 4.0f, 'entity untouched');
+    Camera& $camera = $world->get<Camera>($entity);
+    assert($camera->fov == 45.0f, 'entity fov untouched');
+    RenderContext $plain = headlessFrame(64, 64);
+    $system->render($world, $plain);
+    CameraData $back = $plain->frame->get<CameraData>();
+    assert($back->position->z == 4.0f, 'no override, entity pose again');
 }
 
 test camera_system_snapshots_every_camera

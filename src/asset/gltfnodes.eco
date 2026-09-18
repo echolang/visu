@@ -1,0 +1,259 @@
+/**
+ * Scene grouping: a mesh-carrying node starts an object and its descendants join it. LOD-named
+ * siblings (`_L1_name`, `$L1_name`, `name_lod1`) attach to that object after the walk, so listing
+ * the LOD node before the base is not a silent drop. Physics proxies (`_PP_` / `$PP_`) are skipped.
+ */
+
+namespace visu::asset;
+
+use visu::math::Mat4;
+
+/**
+ * A mesh instance that belongs to one object: which glTF mesh, its baked world matrix, its LOD level.
+ */
+internal struct GltfPart
+{
+    public int32 $mesh;
+    public Mat4 $world;
+    public int32 $level;
+}
+
+internal class GltfParts
+{
+    public string $name;
+    public array<GltfPart> $parts;
+
+    public constructor(string $name)
+    {
+        $this->name = $name;
+        $this->parts = array<GltfPart>();
+    }
+}
+
+internal struct GltfPendingLod
+{
+    public int32 $index;
+    public Mat4 $parent;
+    public int32 $level;
+    public int32 $depth;
+
+    public constructor()
+    {
+        $this->index = 0;
+        $this->parent = Mat4();
+        $this->level = 0;
+        $this->depth = 0;
+    }
+}
+
+/**
+ * `_L3_name`, `$L3_name` or `name_lod3` give 3; `_PP_name` / `$PP_name` give -2; anything else -1.
+ */
+public function gltfLodLevel(const string& $name) : int32
+{
+    if ($name->size() >= 4) {
+        uint8 $c0 = $name->byte(0);
+        uint8 $c1 = $name->byte(1);
+        uint8 $c2 = $name->byte(2);
+        uint8 $c3 = $name->byte(3);
+        // '_' or '$', then 'L', a digit 1-5, '_'
+        if (($c0 == 95 || $c0 == 36) && $c1 == 76 && $c2 >= 49 && $c2 <= 53 && $c3 == 95) {
+            return ($c2 - 48) as int32;
+        }
+
+        if (($c0 == 95 || $c0 == 36) && $c1 == 80 && $c2 == 80 && $c3 == 95) {
+            return -2;
+        }
+    }
+
+    usize $n = $name->size();
+    if ($n >= 5) {
+        uint8 $d = $name->byte($n - 1);
+        if ($d >= 49 && $d <= 53 && $name->sub($n - 5, 4)->equals('_lod')) {
+            return ($d - 48) as int32;
+        }
+    }
+
+    return -1;
+}
+
+/**
+ * The object an LOD node belongs to: the name with its LOD marker removed.
+ */
+public function gltfLodBase(const string& $name) : string
+{
+    int32 $level = gltfLodLevel($name);
+    if ($level < 1) {
+        return $name;
+    }
+
+    usize $n = $name->size();
+    if ($n >= 5 && $name->sub($n - 5, 4)->equals('_lod')) {
+        return $name->sub(0, $n - 5)->clone();
+    }
+
+    return $name->sub(4, $n - 4)->clone();
+}
+
+internal function gltfCollect(
+    GltfFile $file,
+    array<GltfParts>& $objects,
+    array<GltfPendingLod>& $pending
+) : status<GltfError>
+{
+    foreach ($file->roots as $root) {
+        guard gltfVisit($file, $root, Mat4(), $objects, $pending, 0) else ($e) {
+            return .error($e);
+        }
+    }
+
+    foreach ($pending as $lod) {
+        GltfNode $node = $file->nodes[$lod->index as usize];
+        string $base = gltfLodBase($node->name);
+        GltfParts? $found = gltfFindObject($objects, $base);
+        GltfParts $object = guard $found else {
+            return .error(.unsupported("lod node '{$node->name}' has no object '{$base}'"));
+        }
+        guard gltfAddSubtree($file, $lod->index, $lod->parent, $object, $lod->level, $lod->depth) else ($e) {
+            return .error($e);
+        }
+    }
+
+    return .ok;
+}
+
+internal function gltfFindObject(const array<GltfParts>& $objects, const string& $name) : GltfParts?
+{
+    foreach ($objects as $object) {
+        if ($object->name->equals($name)) {
+            return $object;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Top-level walk: a node with a mesh starts an object; a node without one is transparent.
+ * An LOD-named mesh met here is remembered and joined after every object exists.
+ */
+internal function gltfVisit(
+    GltfFile $file,
+    int32 $index,
+    const Mat4& $parent,
+    array<GltfParts>& $objects,
+    array<GltfPendingLod>& $pending,
+    int32 $depth
+) : status<GltfError>
+{
+    if ($index < 0 || ($index as usize) >= $file->nodes->count()) {
+        return .error(.json("node {$index} does not exist"));
+    }
+
+    if ($depth > 64) {
+        return .error(.unsupported('node tree deeper than 64'));
+    }
+
+    GltfNode $node = $file->nodes[$index as usize];
+    Mat4 $world = $parent * $node->local;
+    int32 $level = gltfLodLevel($node->name);
+    if ($level == -2) {
+        return .ok;
+    }
+
+    if ($node->mesh >= 0 && $level > 0) {
+        GltfPendingLod $hold = GltfPendingLod();
+        $hold->index = $index;
+        $hold->parent = $parent;
+        $hold->level = $level;
+        $hold->depth = $depth;
+        $pending[] = $hold;
+        return .ok;
+    }
+
+    if ($node->mesh >= 0) {
+        GltfParts? $dup = gltfFindObject($objects, $node->name);
+        if ($dup != null) {
+            return .error(.unsupported("two objects named '{$node->name}'"));
+        }
+
+        GltfParts $object = GltfParts($node->name);
+        $object->parts[] = GltfPart($node->mesh, $world, 0);
+        foreach ($node->children as $child) {
+            guard gltfAddChild($file, $child, $world, $object, $depth + 1) else ($e) {
+                return .error($e);
+            }
+        }
+
+        $objects[] = $object;
+        return .ok;
+    }
+
+    foreach ($node->children as $child) {
+        guard gltfVisit($file, $child, $world, $objects, $pending, $depth + 1) else ($e) {
+            return .error($e);
+        }
+    }
+
+    return .ok;
+}
+
+internal function gltfAddChild(
+    GltfFile $file,
+    int32 $index,
+    const Mat4& $parent,
+    GltfParts $object,
+    int32 $depth
+) : status<GltfError>
+{
+    if ($index < 0 || ($index as usize) >= $file->nodes->count()) {
+        return .error(.json("node {$index} does not exist"));
+    }
+
+    GltfNode $node = $file->nodes[$index as usize];
+    int32 $level = gltfLodLevel($node->name);
+    if ($level == -2) {
+        return .ok;
+    }
+
+    if ($level < 0) {
+        $level = 0;
+    }
+
+    return gltfAddSubtree($file, $index, $parent, $object, $level, $depth);
+}
+
+/**
+ * Everything under `$index` (itself included) joins `$object` at `$level`.
+ */
+internal function gltfAddSubtree(
+    GltfFile $file,
+    int32 $index,
+    const Mat4& $parent,
+    GltfParts $object,
+    int32 $level,
+    int32 $depth
+) : status<GltfError>
+{
+    if ($index < 0 || ($index as usize) >= $file->nodes->count()) {
+        return .error(.json("node {$index} does not exist"));
+    }
+
+    if ($depth > 64) {
+        return .error(.unsupported('node tree deeper than 64'));
+    }
+
+    GltfNode $node = $file->nodes[$index as usize];
+    Mat4 $world = $parent * $node->local;
+    if ($node->mesh >= 0) {
+        $object->parts[] = GltfPart($node->mesh, $world, $level);
+    }
+
+    foreach ($node->children as $child) {
+        guard gltfAddSubtree($file, $child, $world, $object, $level, $depth + 1) else ($e) {
+            return .error($e);
+        }
+    }
+
+    return .ok;
+}

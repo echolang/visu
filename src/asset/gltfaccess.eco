@@ -1,0 +1,291 @@
+/**
+ * glTF accessor reads and the JSON / little-endian helpers the rest of the reader shares.
+ * Accessors are parsed once with the file; later stages index `$file->accessors`.
+ */
+
+namespace visu::asset;
+
+use json;
+
+internal const uint32 GLB_MAGIC = 0x46546C67;
+internal const uint32 GLB_CHUNK_JSON = 0x4E4F534A;
+internal const uint32 GLB_CHUNK_BIN = 0x004E4942;
+internal const int32 GLTF_FLOAT = 5126;
+internal const int32 GLTF_UBYTE = 5121;
+internal const int32 GLTF_USHORT = 5123;
+internal const int32 GLTF_UINT = 5125;
+internal const int32 GLTF_TRIANGLES = 4;
+
+/**
+ * Accessor reads. Attributes must be float; indices may be unsigned byte, short or int.
+ */
+internal struct GltfAccessor
+{
+    public int32 $componentType = 0;
+    public int32 $components = 0;
+    public int32 $count = 0;
+    public usize $offset = 0;
+    public int32 $stride = 0;
+}
+
+internal function gltfParseAccessors(json::Value $root, const string& $bin) : result<array<GltfAccessor>, GltfError>
+{
+    array<json::Value> $items = gltfArray($root, 'accessors');
+    array<json::Value> $views = gltfArray($root, 'bufferViews');
+    array<GltfAccessor> $out = array<GltfAccessor>();
+    int32 $i = 0;
+    while (($i as usize) < $items->count()) {
+        GltfAccessor $acc = guard gltfParseAccessor($items[$i as usize], $views, $bin, $i) else ($e) {
+            return .error($e);
+        }
+        $out[] = $acc;
+        $i = $i + 1;
+    }
+
+    return .ok($out);
+}
+
+internal function gltfParseAccessor(
+    json::Value $acc,
+    const array<json::Value>& $views,
+    const string& $bin,
+    int32 $index
+) : result<GltfAccessor, GltfError>
+{
+    if ($acc->get('sparse') != null) {
+        return .error(.accessor($index, 'sparse accessors are not supported'));
+    }
+
+    GltfAccessor $out = GltfAccessor();
+    $out->componentType = (gltfInt($acc, 'componentType') ?? 0) as int32;
+    $out->count = (gltfInt($acc, 'count') ?? 0) as int32;
+    string $type = gltfStr($acc, 'type', '');
+    $out->components = gltfComponents($type);
+    if ($out->components == 0) {
+        return .error(.accessor($index, "type '{$type}'"));
+    }
+
+    int32 $size = gltfComponentSize($out->componentType);
+    if ($size == 0) {
+        return .error(.accessor($index, "component type {$out->componentType}"));
+    }
+
+    int64 $bvIndex = guard gltfInt($acc, 'bufferView') else {
+        return .error(.accessor($index, 'no bufferView'));
+    }
+    int32 $viewIndex = $bvIndex as int32;
+    if ($viewIndex < 0 || ($viewIndex as usize) >= $views->count()) {
+        return .error(.accessor($index, 'bufferView does not exist'));
+    }
+
+    json::Value $view = $views[$viewIndex as usize];
+    if ((gltfInt($view, 'buffer') ?? 0) != 0) {
+        return .error(.unsupported('more than one buffer'));
+    }
+
+    int32 $tight = $out->components * $size;
+    $out->stride = (gltfInt($view, 'byteStride') ?? ($tight as int64)) as int32;
+    if ($out->stride < $tight) {
+        $out->stride = $tight;
+    }
+
+    $out->offset = ((gltfInt($view, 'byteOffset') ?? 0) + (gltfInt($acc, 'byteOffset') ?? 0)) as usize;
+    if ($out->count < 0) {
+        return .error(.accessor($index, 'negative count'));
+    }
+
+    if ($out->count > 0) {
+        usize $last = $out->offset + (($out->count - 1) as usize) * ($out->stride as usize) + ($tight as usize);
+        if ($last > $bin->size()) {
+            return .error(.accessor($index, 'reads past the buffer'));
+        }
+    }
+
+    return .ok($out);
+}
+
+internal function gltfGetAccessor(GltfFile $file, int32 $index) : result<GltfAccessor, GltfError>
+{
+    if ($index < 0 || ($index as usize) >= $file->accessors->count()) {
+        return .error(.accessor($index, 'does not exist'));
+    }
+
+    return .ok($file->accessors[$index as usize]);
+}
+
+internal function gltfReadFloats(GltfFile $file, int32 $index, int32 $components) : result<array<float32>, GltfError>
+{
+    GltfAccessor $acc = guard gltfGetAccessor($file, $index) else ($e) {
+        return .error($e);
+    }
+    if ($acc->componentType != GLTF_FLOAT) {
+        return .error(.accessor($index, 'attribute is not float'));
+    }
+
+    if ($acc->components != $components) {
+        return .error(.accessor($index, "expected {$components} components"));
+    }
+
+    array<float32> $out = arr::room<float32>(($acc->count * $components) as usize);
+    int32 $i = 0;
+    while ($i < $acc->count) {
+        usize $at = $acc->offset + ($i as usize) * ($acc->stride as usize);
+        int32 $c = 0;
+        while ($c < $components) {
+            $out[] = gltfF32($file->bin, $at + (($c * 4) as usize));
+            $c = $c + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    return .ok($out);
+}
+
+internal function gltfReadIndices(GltfFile $file, int32 $index) : result<array<uint32>, GltfError>
+{
+    GltfAccessor $acc = guard gltfGetAccessor($file, $index) else ($e) {
+        return .error($e);
+    }
+    if ($acc->components != 1) {
+        return .error(.accessor($index, 'indices are not scalar'));
+    }
+
+    array<uint32> $out = arr::room<uint32>($acc->count as usize);
+    int32 $i = 0;
+    while ($i < $acc->count) {
+        usize $at = $acc->offset + ($i as usize) * ($acc->stride as usize);
+        if ($acc->componentType == GLTF_UBYTE) {
+            $out[] = $file->bin->byte($at) as uint32;
+        } else if ($acc->componentType == GLTF_USHORT) {
+            $out[] = gltfU16($file->bin, $at) as uint32;
+        } else if ($acc->componentType == GLTF_UINT) {
+            $out[] = gltfU32($file->bin, $at);
+        } else {
+            return .error(.accessor($index, 'index component type'));
+        }
+
+        $i = $i + 1;
+    }
+
+    return .ok($out);
+}
+
+internal function gltfComponents(const string& $type) : int32
+{
+    if ($type->equals('SCALAR')) {
+        return 1;
+    }
+
+    if ($type->equals('VEC2')) {
+        return 2;
+    }
+
+    if ($type->equals('VEC3')) {
+        return 3;
+    }
+
+    if ($type->equals('VEC4')) {
+        return 4;
+    }
+
+    return 0;
+}
+
+internal function gltfComponentSize(int32 $componentType) : int32
+{
+    if ($componentType == 5120 || $componentType == GLTF_UBYTE) {
+        return 1;
+    }
+
+    if ($componentType == 5122 || $componentType == GLTF_USHORT) {
+        return 2;
+    }
+
+    if ($componentType == GLTF_UINT || $componentType == GLTF_FLOAT) {
+        return 4;
+    }
+
+    return 0;
+}
+
+internal function gltfArray(json::Value $v, const string& $key) : array<json::Value>
+{
+    json::Value? $got = $v->get($key);
+    json::Value $node = guard $got else {
+        return array<json::Value>();
+    }
+    array<json::Value>? $arr = $node->asArray();
+    array<json::Value> $items = guard $arr else {
+        return array<json::Value>();
+    }
+    return $items;
+}
+
+internal function gltfInt(json::Value $v, const string& $key) : int64?
+{
+    json::Value? $got = $v->get($key);
+    json::Value $node = guard $got else {
+        return null;
+    }
+    int64? $n = $node->asInt();
+    if ($n != null) {
+        return $n;
+    }
+
+    float64? $f = $node->asFloat();
+    float64 $value = guard $f else {
+        return null;
+    }
+    return $value as int64;
+}
+
+internal function gltfStr(json::Value $v, const string& $key, string $fallback) : string
+{
+    json::Value? $got = $v->get($key);
+    json::Value $node = guard $got else {
+        return $fallback;
+    }
+    string? $s = $node->asStr();
+    string $text = guard $s else {
+        return $fallback;
+    }
+    return $text;
+}
+
+internal function gltfFloats(json::Value $v, const string& $key) : array<float32>?
+{
+    array<json::Value> $items = gltfArray($v, $key);
+    if ($items->count() == 0) {
+        return null;
+    }
+
+    array<float32> $out = array<float32>();
+    foreach ($items as $item) {
+        float64? $f = $item->asFloat();
+        float64 $value = guard $f else {
+            return null;
+        }
+        $out[] = $value as float32;
+    }
+
+    return $out;
+}
+
+internal function gltfU16(const string& $s, usize $off) : uint16
+{
+    return ($s->byte($off) as uint16) | (($s->byte($off + 1) as uint16) << 8);
+}
+
+internal function gltfU32(const string& $s, usize $off) : uint32
+{
+    return ($s->byte($off) as uint32)
+        | (($s->byte($off + 1) as uint32) << 8)
+        | (($s->byte($off + 2) as uint32) << 16)
+        | (($s->byte($off + 3) as uint32) << 24);
+}
+
+internal function gltfF32(const string& $s, usize $off) : float32
+{
+    return mem::bit_cast<float32, uint32>(gltfU32($s, $off));
+}

@@ -1,0 +1,38 @@
+/**
+ * Last-frame DrawStats as the `rendering` tab.
+ */
+
+namespace visu::instrument;
+
+use visu::graphics::Device;
+
+public class DrawSource : Source
+{
+    private Device $device;
+
+    public constructor(Device $device)
+    {
+        $this->device = $device;
+    }
+
+    public function collect(Sink $sink) : void
+    {
+        $sink->tab('rendering', title: 'Rendering', 0);
+        visu::graphics::DrawStats $d = $this->device->draws->last;
+        $sink->section('draw');
+        $sink->metric('calls', $d->draws as float64, .count);
+        $sink->metric('indexed', $d->indexed as float64, .count);
+        $sink->metric('pipeline', $d->pipelineBinds as float64, .count);
+        $sink->section('geom');
+        $sink->metric('triangles', $d->triangles as float64, .count);
+        $sink->metric('vertices', $d->vertices as float64, .count);
+        $sink->metric('patches', $d->patches as float64, .count);
+        visu::graphics::MemoryStats $mem = $this->device->memoryStats();
+        $sink->section('device');
+        if ($mem->budget > 0) {
+            $sink->metric('vram', $mem->used as float64, .bytes, of: $mem->budget as float64);
+        } else {
+            $sink->metric('vram', $mem->used as float64, .bytes);
+        }
+    }
+}

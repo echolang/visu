@@ -15,11 +15,15 @@ layout(location = 0) out vec4 fragment_color;
 #include "visu/pbr/surface.glsl"
 #include "visu/pbr/shade.glsl"
 
+// the light pass has no per-draw payload at slot 0 and slot 2 is LightUniforms
+#define VISU_SKY_SLOT 0
+#include "visu/fog.glsl"
+
 layout(std140, set = 0, binding = 2) uniform LightUniforms {
     // xyz direction the sun travels, w intensity
     vec4 u_sun_direction;
     vec4 u_sun_color;
-    // x prefiltered mip count, y environment mip count
+    // x prefiltered mip count, y environment mip count, z blend towards the second IBL state
     vec4 u_ibl;
 };
 
@@ -31,6 +35,8 @@ layout(set = 1, binding = 6) uniform samplerCube environment_cubemap;
 layout(set = 1, binding = 6) uniform samplerCube ibl_irradiance_map;
 layout(set = 1, binding = 7) uniform samplerCube ibl_prefilter_map;
 layout(set = 1, binding = 8) uniform sampler2D ibl_brdf_lut;
+layout(set = 1, binding = 9) uniform samplerCube ibl_irradiance_map_b;
+layout(set = 1, binding = 10) uniform samplerCube ibl_prefilter_map_b;
 #endif
 
 void main()
@@ -64,7 +70,11 @@ void main()
 #ifdef USE_IBL
         // lod 0: screen-space derivatives of N across a sphere are
         // meaningless, and a 1-mip cube reads black on iOS at high lod
-        vec3 irradiance = textureLod(ibl_irradiance_map, s.N, 0.0).rgb;
+        vec3 irradiance = mix(
+            textureLod(ibl_irradiance_map, s.N, 0.0).rgb,
+            textureLod(ibl_irradiance_map_b, s.N, 0.0).rgb,
+            u_ibl.z
+        );
         diffuseIBL = irradiance * s.albedo / PI;
 #else
         diffuseIBL = vec3(0.03) * s.albedo;
@@ -73,7 +83,11 @@ void main()
         vec3 specIBL = vec3(0.0);
 #ifdef USE_IBL
         float maxLod = max(u_ibl.x - 1.0, 0.0);
-        vec3 prefiltered = textureLod(ibl_prefilter_map, R, s.roughness * maxLod).rgb;
+        vec3 prefiltered = mix(
+            textureLod(ibl_prefilter_map, R, s.roughness * maxLod).rgb,
+            textureLod(ibl_prefilter_map_b, R, s.roughness * maxLod).rgb,
+            u_ibl.z
+        );
         vec2 brdf = texture(ibl_brdf_lut, vec2(NdotV, s.roughness)).rg;
         specIBL = prefiltered * (s.F0 * brdf.x + brdf.y);
 #elif defined(USE_ENV_CUBEMAP)
@@ -88,6 +102,7 @@ void main()
     }
 
     vec3 color = Lo + ambient + s.emissive;
+    color = fog_apply(color, gbuffer.relative);
     color = apply_tonemap(color);
     color = gamma_correct(color);
     fragment_color = vec4(color, 1.0);

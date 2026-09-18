@@ -1,0 +1,138 @@
+/**
+ * Height fog defaults, GPU packing, and the CPU twin of shader transmittance.
+ */
+
+use std::math;
+use visu::graphics::{
+    DirectionalLight, FogUniforms, HeightFog, Sky, fogSunTint, fogTransmittance, fogUniforms
+};
+use visu::math::Vec3;
+
+test fog_defaults_off_and_equal
+{
+    HeightFog $a = HeightFog();
+    HeightFog $b = HeightFog();
+    assert($a == $b, 'defaults equal');
+    assert(!$a->enabled, 'off');
+    assert(!$a->fromSky, 'constant colour until an atmosphere is bound');
+    assert($a->density == 0.00012f, 'density');
+    assert($a->heightFalloff == 0.008f, 'falloff');
+    $b->density = 0.001f;
+    assert($a != $b, 'density differs');
+}
+
+test fog_uniforms_pack
+{
+    assert(mem::size<FogUniforms>() == 80, 'std140 size');
+    HeightFog $fog = HeightFog();
+    $fog->enabled = true;
+    $fog->fromSky = false;
+    $fog->density = 0.00012f;
+    $fog->heightFalloff = 0.008f;
+    $fog->height = 0.0f;
+    Vec3 $camera = Vec3(0.0f, 50.0f, 0.0f);
+    FogUniforms $u = fogUniforms($fog, $camera, Vec3(1.0f, 1.0f, 1.0f), 8.0f, 4.0f);
+    assert($u->density->w == 1.0f, 'enabled');
+    assert($u->color->w == 0.0f, 'fromSky off');
+    float32 $d0 = 0.00012f * math::exp(-0.4f);
+    float32 $delta = $u->density->x - $d0;
+
+    if ($delta < 0.0f) {
+        $delta = -$delta;
+    }
+
+    assert($delta < 0.0000001f, 'D0 at camera');
+    assert($u->samples->x == 8.0f, 'view samples');
+    assert($u->samples->y == 4.0f, 'light samples');
+    assert($u->sun->x == 0.4f, 'sun tint');
+    assert($u->sun->w == 8.0f, 'exponent');
+}
+
+test fog_transmittance_one_when_disabled
+{
+    HeightFog $fog = HeightFog();
+    float32 $t = fogTransmittance($fog, Vec3(0.0f, 0.0f, 0.0f), Vec3(1000.0f, 0.0f, 0.0f));
+    assert($t == 1.0f, 'disabled');
+}
+
+test fog_horizontal_matches_exp
+{
+    HeightFog $fog = HeightFog();
+    $fog->enabled = true;
+    $fog->height = 0.0f;
+    float32 $len = 1000.0f;
+    float32 $t = fogTransmittance($fog, Vec3(0.0f, 0.0f, 0.0f), Vec3($len, 0.0f, 0.0f));
+    float32 $expect = math::exp(-$fog->density * $len);
+    float32 $delta = $t - $expect;
+
+    if ($delta < 0.0f) {
+        $delta = -$delta;
+    }
+
+    assert($delta < 0.0001f, 'exp(-D0 len)');
+}
+
+test fog_upward_tends_to_column
+{
+    HeightFog $fog = HeightFog();
+    $fog->enabled = true;
+    $fog->height = 0.0f;
+    float32 $t = fogTransmittance($fog, Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 100000.0f, 0.0f));
+    float32 $expect = math::exp(-$fog->density / $fog->heightFalloff);
+    float32 $delta = $t - $expect;
+
+    if ($delta < 0.0f) {
+        $delta = -$delta;
+    }
+
+    assert($delta < 0.0001f, 'exp(-D0/k)');
+}
+
+test fog_start_distance_excludes_near
+{
+    HeightFog $fog = HeightFog();
+    $fog->enabled = true;
+    $fog->startDistance = 100.0f;
+    float32 $t = fogTransmittance($fog, Vec3(0.0f, 0.0f, 0.0f), Vec3(50.0f, 0.0f, 0.0f));
+    assert($t == 1.0f, 'inside start');
+}
+
+test fog_max_opacity_floor
+{
+    HeightFog $fog = HeightFog();
+    $fog->enabled = true;
+    $fog->density = 1.0f;
+    $fog->maxOpacity = 0.25f;
+    float32 $t = fogTransmittance($fog, Vec3(0.0f, 0.0f, 0.0f), Vec3(10000.0f, 0.0f, 0.0f));
+    assert($t == 0.75f, 'opacity floor');
+}
+
+test fog_cutoff_untouched
+{
+    HeightFog $fog = HeightFog();
+    $fog->enabled = true;
+    $fog->cutoffDistance = 100.0f;
+    float32 $t = fogTransmittance($fog, Vec3(0.0f, 0.0f, 0.0f), Vec3(200.0f, 0.0f, 0.0f));
+    assert($t == 1.0f, 'past cutoff');
+}
+
+test fog_camera_below_height_finite
+{
+    HeightFog $fog = HeightFog();
+    $fog->enabled = true;
+    $fog->heightFalloff = 1.0f;
+    $fog->height = 0.0f;
+    float32 $t = fogTransmittance($fog, Vec3(0.0f, -100.0f, 0.0f), Vec3(1000.0f, 0.0f, 0.0f));
+    assert($t >= 0.0f && $t <= 1.0f, 'finite');
+    assert($t == $t, 'not nan');
+}
+
+test fog_sun_tint_vanishes_below_horizon
+{
+    Sky $sky = Sky();
+    $sky->direction = Vec3(0.0f, 1.0f, 0.0f);
+    DirectionalLight $night = $sky->sunLight(300.0f);
+    assert($night->intensity == 0.0f, 'no sun');
+    Vec3 $tint = fogSunTint($night, $sky);
+    assert($tint->x == 0.0f && $tint->y == 0.0f && $tint->z == 0.0f, 'tint gone');
+}

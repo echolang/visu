@@ -1,0 +1,268 @@
+/**
+ * glTF reader: a hand-written .gltf + .bin with two objects, an LOD child and two materials.
+ */
+
+use std::env;
+use std::io;
+use visu::asset::{CookedModel, GltfFile, GltfModel, MODEL_VERTEX_BYTES, gltfLodBase, gltfLodLevel, gltfModels};
+use visu::graphics::IndexType;
+use visu::math::equal;
+
+internal function gltfTmp(string $tag) : string
+{
+    $tmp = env::tmp();
+    string $ds = env::DS;
+    return "{$tmp}{$ds}visu-gltf-{$tag}";
+}
+
+internal function gltfMkdir(string $dir) : void
+{
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return;
+        }
+
+        die($e->message());
+    }
+}
+
+internal function gltfPushF32(string& $out, float32 $v) : void
+{
+    uint32 $bits = mem::bit_cast<uint32, float32>($v);
+    $out->push(($bits & 0xff) as uint8);
+    $out->push((($bits >> 8) & 0xff) as uint8);
+    $out->push((($bits >> 16) & 0xff) as uint8);
+    $out->push((($bits >> 24) & 0xff) as uint8);
+}
+
+internal function gltfPushU16(string& $out, uint16 $v) : void
+{
+    $out->push(($v & 0xff) as uint8);
+    $out->push((($v >> 8) & 0xff) as uint8);
+}
+
+/**
+ * bin layout: quad positions (4 x vec3, 48 B), quad uvs (4 x vec2, 32 B), quad indices (6 x u16, 12 B),
+ * triangle positions (3 x vec3, 36 B), triangle indices (3 x u16, 6 B).
+ */
+internal function gltfWriteFixture(const string& $dir) : string
+{
+    string $ds = env::DS;
+    string $bin = '';
+    // a unit quad in the xz plane at y = 0, ccw seen from +y
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 1.0f);
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 1.0f);
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f); gltfPushF32($bin, 1.0f);
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 1.0f);
+    gltfPushU16($bin, 0); gltfPushU16($bin, 2); gltfPushU16($bin, 1);
+    gltfPushU16($bin, 0); gltfPushU16($bin, 3); gltfPushU16($bin, 2);
+    // the LOD 1 triangle
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 1.0f);
+    gltfPushU16($bin, 0); gltfPushU16($bin, 2); gltfPushU16($bin, 1);
+    guard io::writefile("{$dir}{$ds}fixture.bin", $bin) else ($e) {
+        die($e->message());
+    }
+
+    string $json = '';
+    $json->append('{"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],');
+    $json->append('"nodes":[');
+    $json->append('{"name":"Scene","matrix":[1,0,0,0, 0,0,-1,0, 0,1,0,0, 0,0,0,1],"children":[1,3,4]},');
+    $json->append('{"name":"crate","mesh":0,"translation":[10,0,0],"children":[2]},');
+    $json->append('{"name":"_L1_crate","mesh":1},');
+    $json->append('{"name":"pot","mesh":1,"scale":[2,2,2]},');
+    $json->append('{"name":"Camera"}');
+    $json->append('],');
+    $json->append('"meshes":[');
+    $json->append('{"name":"quad","primitives":[{"attributes":{"POSITION":0,"TEXCOORD_0":1},"indices":2,"material":0},');
+    $json->append('{"attributes":{"POSITION":0,"TEXCOORD_0":1},"indices":2,"material":1}]},');
+    $json->append('{"name":"tri","primitives":[{"attributes":{"POSITION":3},"indices":4,"material":1}]}');
+    $json->append('],');
+    $json->append('"materials":[{"name":"model.wood"},{"name":"model.metal"}],');
+    $json->append('"accessors":[');
+    $json->append('{"bufferView":0,"componentType":5126,"count":4,"type":"VEC3"},');
+    $json->append('{"bufferView":1,"componentType":5126,"count":4,"type":"VEC2"},');
+    $json->append('{"bufferView":2,"componentType":5123,"count":6,"type":"SCALAR"},');
+    $json->append('{"bufferView":3,"componentType":5126,"count":3,"type":"VEC3"},');
+    $json->append('{"bufferView":4,"componentType":5123,"count":3,"type":"SCALAR"}');
+    $json->append('],');
+    $json->append('"bufferViews":[');
+    $json->append('{"buffer":0,"byteOffset":0,"byteLength":48},');
+    $json->append('{"buffer":0,"byteOffset":48,"byteLength":32},');
+    $json->append('{"buffer":0,"byteOffset":80,"byteLength":12},');
+    $json->append('{"buffer":0,"byteOffset":92,"byteLength":36},');
+    $json->append('{"buffer":0,"byteOffset":128,"byteLength":6}');
+    $json->append('],');
+    $json->append('"buffers":[{"byteLength":134,"uri":"fixture.bin"}]}');
+    string $path = "{$dir}{$ds}fixture.gltf";
+    guard io::writefile($path, $json) else ($e) {
+        die($e->message());
+    }
+    return $path;
+}
+
+internal function gltfFind(const array<GltfModel>& $models, string $name) : CookedModel
+{
+    foreach ($models as $m) {
+        if ($m->name->equals($name)) {
+            return $m->model;
+        }
+    }
+
+    die('model missing');
+}
+
+internal function gltfReadF32(const string& $s, usize $off) : float32
+{
+    uint32 $bits = ($s->byte($off) as uint32)
+        | (($s->byte($off + 1) as uint32) << 8)
+        | (($s->byte($off + 2) as uint32) << 16)
+        | (($s->byte($off + 3) as uint32) << 24);
+    return mem::bit_cast<float32, uint32>($bits);
+}
+
+test gltf_lod_names
+{
+    assert(gltfLodLevel('bush_01') == -1, 'plain');
+    assert(gltfLodLevel('_L1_bush_01') == 1, 'underscore prefix');
+    assert(gltfLodLevel('$L4_bush_01') == 4, 'dollar prefix');
+    assert(gltfLodLevel('bush_01_lod2') == 2, 'suffix');
+    assert(gltfLodLevel('_PP_bush_01') == -2, 'physics proxy');
+    assert(gltfLodLevel('_L9_x') == -1, 'level past five is a plain name');
+    assert(gltfLodBase('_L3_bush_01')->equals('bush_01'), 'prefix base');
+    assert(gltfLodBase('bush_01_lod2')->equals('bush_01'), 'suffix base');
+    assert(gltfLodBase('bush_01')->equals('bush_01'), 'plain base');
+}
+
+test gltf_objects_levels_slots_and_transforms
+{
+    string $dir = gltfTmp('fixture');
+    gltfMkdir($dir);
+    string $path = gltfWriteFixture($dir);
+    GltfFile $file = guard GltfFile::load($path) else ($e) {
+        die($e->message());
+    }
+    array<GltfModel> $models = guard gltfModels($file) else ($e) {
+        die($e->message());
+    }
+    assert($models->count() == 2, 'two mesh objects, the camera is skipped');
+    CookedModel $crate = gltfFind($models, 'crate');
+    assert($crate->slots->count() == 2, 'two material slots');
+    assert($crate->slots[0]->equals('model.wood'), 'first slot');
+    assert($crate->slots[1]->equals('model.metal'), 'second slot');
+    assert($crate->lods->count() == 2, 'lod 0 and the _L1_ child');
+    assert($crate->lods[0]->primitives->count() == 2, 'lod 0 draws both materials');
+    assert($crate->lods[1]->primitives->count() == 1, 'lod 1 is the single triangle');
+    assert($crate->lods[1]->primitives[0]->slot == 1, 'lod 1 uses metal');
+    assert($crate->lods[1]->primitives[0]->indexCount == 3, 'lod 1 triangle');
+    assert($crate->lods[0]->primitives[0]->firstIndex == 0 && $crate->lods[0]->primitives[0]->indexCount == 6, 'lod 0 wood range');
+    assert($crate->lods[0]->primitives[1]->firstIndex == 6, 'lod 0 metal range follows');
+    assert($crate->vertexCount() == 4 + 4 + 3, 'quad twice (two materials) plus the triangle');
+    assert($crate->indexType == IndexType::uint16, 'small model uses 16 bit indices');
+    assert(equal($crate->lodBias, 1.0f) && equal($crate->cullDistance, 0.0f), 'sheet values left for the cooker');
+    // Scene rotates z up to y up, crate is translated by x 10: the quad's y = 0 plane stays y = 0
+    // and its z extent 0..1 becomes y 0..1? no: (x, y, z) -> (x, z, -y), so z 0..1 becomes y 0..1
+    assert(equal($crate->bounds->min->x, 10.0f) && equal($crate->bounds->max->x, 11.0f), 'translated x');
+    assert(equal($crate->bounds->min->y, 0.0f) && equal($crate->bounds->max->y, 1.0f), 'z became y');
+    assert(equal($crate->bounds->min->z, 0.0f) && equal($crate->bounds->max->z, 0.0f), 'flat in z');
+    // first vertex: position (10, 0, 0), a generated normal and tangent, uv (0, 0)
+    assert(equal(gltfReadF32($crate->vertices, 0), 10.0f), 'vertex 0 x');
+    float32 $nx = gltfReadF32($crate->vertices, 12);
+    float32 $ny = gltfReadF32($crate->vertices, 16);
+    float32 $nz = gltfReadF32($crate->vertices, 20);
+    assert(equal($nx * $nx + $ny * $ny + $nz * $nz, 1.0f), 'generated normal is unit');
+    float32 $tw = gltfReadF32($crate->vertices, 36);
+    assert(equal($tw, 1.0f) || equal($tw, -1.0f), 'tangent handedness');
+    assert(equal(gltfReadF32($crate->vertices, (MODEL_VERTEX_BYTES + 40) as usize), 1.0f), 'vertex 1 u');
+
+    CookedModel $pot = gltfFind($models, 'pot');
+    assert($pot->lods->count() == 1, 'pot has one level');
+    assert($pot->slots->count() == 1 && $pot->slots[0]->equals('model.metal'), 'pot slot');
+    assert(equal($pot->bounds->max->x, 2.0f), 'pot is scaled by two');
+}
+
+test gltf_rejects_missing_file_and_garbage
+{
+    assert(GltfFile::load('/nonexistent/x.glb')->failed(), 'missing');
+    assert(GltfFile::parseGlb('glTFxx')->failed(), 'short glb');
+    assert(GltfFile::parseText('not json', '')->failed(), 'garbage json');
+}
+
+test gltf_lod_sibling_listed_before_base_still_joins
+{
+    string $dir = gltfTmp('lod-order');
+    gltfMkdir($dir);
+    string $ds = env::DS;
+    string $bin = '';
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 1.0f);
+    gltfPushU16($bin, 0); gltfPushU16($bin, 2); gltfPushU16($bin, 1);
+    guard io::writefile("{$dir}{$ds}order.bin", $bin) else ($e) {
+        die($e->message());
+    }
+
+    string $json = '';
+    $json->append('{"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0,1]}],');
+    $json->append('"nodes":[{"name":"_L1_crate","mesh":0},{"name":"crate","mesh":0}],');
+    $json->append('"meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1}]}],');
+    $json->append('"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},');
+    $json->append('{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}],');
+    $json->append('"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},');
+    $json->append('{"buffer":0,"byteOffset":36,"byteLength":6}],');
+    $json->append('"buffers":[{"byteLength":42,"uri":"order.bin"}]}');
+    string $path = "{$dir}{$ds}order.gltf";
+    guard io::writefile($path, $json) else ($e) {
+        die($e->message());
+    }
+    GltfFile $file = guard GltfFile::load($path) else ($e) {
+        die($e->message());
+    }
+    array<GltfModel> $models = guard gltfModels($file) else ($e) {
+        die($e->message());
+    }
+    assert($models->count() == 1, 'one object');
+    CookedModel $crate = gltfFind($models, 'crate');
+    assert($crate->lods->count() == 2, 'lod sibling joined after the base existed');
+}
+
+test gltf_rejects_normal_count_mismatch
+{
+    string $dir = gltfTmp('mismatch');
+    gltfMkdir($dir);
+    string $ds = env::DS;
+    string $bin = '';
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 1.0f);
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 1.0f); gltfPushF32($bin, 0.0f);
+    gltfPushU16($bin, 0); gltfPushU16($bin, 2); gltfPushU16($bin, 1);
+    guard io::writefile("{$dir}{$ds}bad.bin", $bin) else ($e) {
+        die($e->message());
+    }
+
+    string $json = '';
+    $json->append('{"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],');
+    $json->append('"nodes":[{"name":"crate","mesh":0}],');
+    $json->append('"meshes":[{"primitives":[{"attributes":{"POSITION":0,"NORMAL":1},"indices":2}]}],');
+    $json->append('"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},');
+    $json->append('{"bufferView":1,"componentType":5126,"count":1,"type":"VEC3"},');
+    $json->append('{"bufferView":2,"componentType":5123,"count":3,"type":"SCALAR"}],');
+    $json->append('"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},');
+    $json->append('{"buffer":0,"byteOffset":36,"byteLength":12},');
+    $json->append('{"buffer":0,"byteOffset":48,"byteLength":6}],');
+    $json->append('"buffers":[{"byteLength":54,"uri":"bad.bin"}]}');
+    string $path = "{$dir}{$ds}bad.gltf";
+    guard io::writefile($path, $json) else ($e) {
+        die($e->message());
+    }
+    GltfFile $file = guard GltfFile::load($path) else ($e) {
+        die($e->message());
+    }
+    assert(gltfModels($file)->failed(), 'mismatched NORMAL is an error, not a generated normal');
+}

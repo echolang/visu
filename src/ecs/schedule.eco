@@ -1,0 +1,74 @@
+/**
+ * What a system tells the binder about itself: which phases it takes part in, and the tick
+ * handlers it owns. Filled once at bind time, never read again, so a system pays nothing per
+ * frame for a phase it opted out of.
+ */
+
+namespace visu::ecs;
+
+/**
+ * One tick handler and its cadence. The handler receives the pass number so a slow ticker can
+ * tell how far the simulation has come without keeping a counter of its own.
+ */
+public struct Ticker
+{
+    /**
+     * Passes between two runs. One is every pass.
+     */
+    public int32 $interval;
+
+    /**
+     * First pass this handler runs on. Two handlers on the same interval with different offsets
+     * never land on the same pass, which is how expensive work is spread out.
+     */
+    public int32 $offset;
+
+    public function<void(Entities, int64)> $fn;
+}
+
+public struct Schedule
+{
+    /**
+     * Run this system in the per-frame update phase.
+     */
+    public bool $update;
+
+    /**
+     * Run this system in the render phase.
+     */
+    public bool $render;
+
+    internal array<Ticker> $tickers;
+
+    public constructor()
+    {
+        $this->update = true;
+        $this->render = true;
+        $this->tickers = array<Ticker>();
+    }
+
+    /**
+     * Run this handler every `interval` passes, starting with the first pass.
+     */
+    public function every(int32 $interval, function<void(Entities, int64)> $fn) : void
+    {
+        $this->every($interval, offset: $interval, $fn);
+    }
+
+    /**
+     * Run this handler every `interval` passes, first on pass `offset`. An offset of zero is
+     * lifted to the interval: pass numbering starts at one, so pass zero never arrives.
+     */
+    public function every(int32 $interval, offset: int32 $offset, function<void(Entities, int64)> $fn) : void
+    {
+        assert($interval >= 1, 'schedule: interval must be at least one pass');
+        assert($offset >= 0, 'schedule: offset cannot be negative');
+        int32 $first = $offset;
+
+        if ($first < 1) {
+            $first = $interval;
+        }
+
+        $this->tickers[] = Ticker($interval, $first, $fn);
+    }
+}

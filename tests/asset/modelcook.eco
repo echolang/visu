@@ -1,0 +1,160 @@
+/**
+ * Kitchen with the model cooker: a model folder cooks to one item per object, the sheet's per-object
+ * LOD record lands in the blob, and per-material records get their binds rewritten to catalog ids.
+ */
+
+use std::env;
+use std::io;
+use json;
+use visu::asset::{
+    Assets, CookedModel, KIND_MODEL, Kitchen, PackItem, Vmat, decodeCookedModel, vmatMap, vmatResolve
+};
+use visu::graphics::{Device, Material, Pixels};
+use visu::math::equal;
+
+internal function cookTmp(string $tag) : string
+{
+    $tmp = env::tmp();
+    string $ds = env::DS;
+    return "{$tmp}{$ds}visu-modelcook-{$tag}";
+}
+
+internal function cookMkdir(string $dir) : void
+{
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return;
+        }
+
+        die($e->message());
+    }
+}
+
+internal function cookDot(const string& $path) : void
+{
+    array<uint8> $rgba = array<uint8>();
+    $rgba[] = 200;
+    $rgba[] = 100;
+    $rgba[] = 50;
+    $rgba[] = 255;
+    Pixels $px = Pixels(1, 1, $rgba);
+    guard $px->write($path) else ($e) {
+        die($e->message());
+    }
+}
+
+internal function cookFind(const array<PackItem>& $items, string $id) : PackItem?
+{
+    foreach ($items as $item) {
+        if ($item->id->equals($id)) {
+            return $item;
+        }
+    }
+
+    return null;
+}
+
+test kitchen_cooks_gltf_objects_with_sheet_lods_and_binds
+{
+    string $src = cookTmp('src');
+    cookMkdir($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}props";
+    cookMkdir($folder);
+    string $inner = "{$folder}{$ds}crate_01";
+    cookMkdir($inner);
+    // the glTF fixture from tests/asset/gltf.eco, written next to its textures
+    gltfWriteFixture($inner);
+    cookDot("{$inner}{$ds}wood.png");
+    cookDot("{$inner}{$ds}wood_n.png");
+    string $sheet = '';
+    $sheet->append('{"wood_n": {"srgb": false},');
+    $sheet->append(' "model.wood": {"albedo": "wood", "normal": "wood_n", "roughnessFactor": 0.4},');
+    $sheet->append(' "model.metal": {"alpha": "wood", "backfaceCull": false},');
+    $sheet->append(' "crate": {"lod": [12.5], "lodBias": 2.0, "cullDistance": 300}}');
+    guard io::writefile("{$inner}{$ds}crate_01.vmat", $sheet) else ($e) {
+        die($e->message());
+    }
+
+    string $out = cookTmp('out');
+    cookMkdir($out);
+    Kitchen $k = Kitchen::defaults();
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+    PackItem $crate = guard cookFind($items, 'props/crate_01/crate') else {
+        die('crate item missing');
+    }
+    PackItem $pot = guard cookFind($items, 'props/crate_01/pot') else {
+        die('pot item missing');
+    }
+    assert($crate->kind->equals(KIND_MODEL), 'crate kind');
+    assert($pot->kind->equals(KIND_MODEL), 'pot kind');
+    assert(cookFind($items, 'props/crate_01/wood') != null, 'texture cooked beside the model');
+    assert(cookFind($items, 'props/crate_01') != null, 'folder sheet cooked');
+
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    CookedModel $model = guard decodeCookedModel($assets, $crate->blob) else ($e) {
+        die($e->message());
+    }
+    assert($model->lods->count() == 2, 'two levels');
+    assert(equal($model->lods[1]->distance, 12.5f), 'lod distance from the object record');
+    assert(equal($model->lodBias, 2.0f), 'lod bias from the record');
+    assert(equal($model->cullDistance, 300.0f), 'cull distance from the record');
+    CookedModel $potModel = guard decodeCookedModel($assets, $pot->blob) else ($e) {
+        die($e->message());
+    }
+    assert(equal($potModel->lodBias, 1.0f) && equal($potModel->cullDistance, 0.0f), 'pot has no record, defaults');
+}
+
+/**
+ * The record view a model's materials read, and how a record's bind names resolve to catalog ids.
+ */
+test model_sheet_records_resolve_and_bind
+{
+    string $text = '';
+    $text->append('{"wood_n": {"srgb": false},');
+    $text->append(' "model.wood": {"albedo": "wood", "normal": "wood_n", "roughnessFactor": 0.4},');
+    $text->append(' "model.metal": {"alpha": "wood", "backfaceCull": false},');
+    $text->append(' "crate": {"lod": [12.5], "lodBias": 2.0, "cullDistance": 300}}');
+    json::Value $root = guard json::parse($text) else ($e) {
+        die($e->message());
+    }
+    array<string> $stems = array<string>();
+    $stems[] = 'wood';
+    $stems[] = 'wood_n';
+    json::Value $resolved = $root->clone();
+    vmatResolve($resolved, 'props/crate_01', $stems);
+    Vmat $vmat = Vmat('props/crate_01', $resolved);
+
+    json::Value $wood = $vmat->view('model.wood');
+    assert((vmatMap($wood, 'albedo') ?? '')->equals('wood'), 'record keeps the name its author wrote');
+    Material $woodMat = Material($vmat, view: 'model.wood');
+    assert($woodMat->mapId('wood')->equals('props/crate_01/wood'), 'a bare stem resolves against the folder');
+    assert($woodMat->mapId('other/thing')->equals('other/thing'), 'a full id is left alone');
+    assert(equal($woodMat->roughnessFactor, 0.4f), 'record scalar');
+    assert(!$woodMat->cutout(), 'wood is opaque');
+    assert($woodMat->backfaceCull, 'wood culls');
+    assert($woodMat->id->equals('props/crate_01:model.wood'), 'record material id');
+    Material $metalMat = Material($vmat, view: 'model.metal');
+    assert($metalMat->cutout(), 'alpha map implies a cutoff');
+    assert(equal($metalMat->alphaCutoff, 0.5f), 'default cutoff');
+    assert(!$metalMat->backfaceCull, 'metal record is double sided');
+}
+
+test kitchen_refuses_two_sources_for_one_id
+{
+    string $src = cookTmp('dup-src');
+    cookMkdir($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}dup";
+    cookMkdir($folder);
+    gltfWriteFixture($folder);
+    // a texture named like one of the glTF objects collides with it
+    cookDot("{$folder}{$ds}crate.png");
+    string $out = cookTmp('dup-out');
+    cookMkdir($out);
+    Kitchen $k = Kitchen::defaults();
+    assert($k->cook($src, $out)->failed(), 'duplicate id is refused');
+}

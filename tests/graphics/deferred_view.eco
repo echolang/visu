@@ -2,7 +2,7 @@
  * DeferredView parse / label / needsSsao. No GPU.
  */
 
-use visu::graphics::{DeferredView, DeferredViewError};
+use visu::graphics::{DeferredView, DeferredViewError, PixelDump};
 
 test deferred_view_parse_and_label
 {
@@ -45,4 +45,38 @@ test deferred_view_scene_and_ssao
     DeferredView $albedo = .albedo;
     assert(!$albedo->isScene(), 'albedo scene');
     assert(!$albedo->needsSsao(), 'albedo ssao');
+}
+
+test deferred_view_pixel_dump
+{
+    assert(dumpIsNormal(.normal), 'normal');
+    assert(dumpIsGray(.roughness, 0), 'rough');
+    assert(dumpIsGray(.metallic, 1), 'metal');
+    assert(dumpIsGray(.ao, 2), 'ao');
+    assert(dumpIsColor(.albedo), 'albedo');
+    assert(dumpIsColor(.ssao), 'ssao');
+}
+
+internal function dumpIsNormal(DeferredView $view) : bool
+{
+    return match ($view->pixelDump()) {
+        PixelDump::normal => true,
+        else => false,
+    };
+}
+
+internal function dumpIsGray(DeferredView $view, int32 $channel) : bool
+{
+    return match ($view->pixelDump()) {
+        PixelDump::gray($c) => $c == $channel,
+        else => false,
+    };
+}
+
+internal function dumpIsColor(DeferredView $view) : bool
+{
+    return match ($view->pixelDump()) {
+        PixelDump::color => true,
+        else => false,
+    };
 }

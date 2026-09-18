@@ -12,19 +12,27 @@ public class Kitchen
 {
     private array<Cooker> $cookers;
 
+    /**
+     * Ids written by the current `cook`. Two sources cooking to one id is a layout error, not a
+     * silent first-hit-wins at mount time.
+     */
+    private map<string, bool> $seen;
+
     public constructor()
     {
         $this->cookers = array<Cooker>();
+        $this->seen = map<string, bool>();
     }
 
     /**
-     * Texture png + sound wav/flac/mp3. Games add more with `add`.
+     * Texture png, sound wav/flac/mp3, model glb/gltf. Games add more with `add`.
      */
     public static function defaults() : Kitchen
     {
         Kitchen $k = Kitchen();
         $k->add(TextureCooker());
         $k->add(SoundCooker());
+        $k->add(ModelCooker());
         return $k;
     }
 
@@ -39,6 +47,7 @@ public class Kitchen
     public function cook(const string& $sourceRoot, const string& $outRoot) : result<array<PackItem>, AssetError>
     {
         array<PackItem> $items = array<PackItem>();
+        $this->seen->clear();
         string $root = slashDir($sourceRoot);
         guard $this->walk($root, '', json::object(), $items) else ($e) {
             return .error($e);
@@ -117,6 +126,9 @@ public class Kitchen
         if ($vmats->count() == 1 && !$prefix->empty()) {
             json::Value $resolved = $sheet->clone();
             vmatResolve($resolved, $prefix, $stems);
+            guard $this->claim($prefix, $dir) else ($e) {
+                return .error($e);
+            }
             $items[] = PackItem($prefix, KIND_VMAT, Blob(json::pretty($resolved)));
         }
 
@@ -130,10 +142,15 @@ public class Kitchen
             $src->path = $path;
             $src->id = sourceId($prefix, $name);
             $src->meta = vmatView($sheet, stripExt($name));
-            PackItem $item = guard $c->cook($src) else ($e) {
+            array<PackItem> $cooked = guard $c->cook($src) else ($e) {
                 return .error($e);
             }
-            $items[] = $item;
+            foreach ($cooked as $item) {
+                guard $this->claim($item->id, $path) else ($e) {
+                    return .error($e);
+                }
+                $items[] = $item;
+            }
         }
 
         foreach ($subs as $sub) {
@@ -147,6 +164,19 @@ public class Kitchen
             }
         }
 
+        return .ok;
+    }
+
+    /**
+     * Reserve an id for this cook. A second source wanting it is `corrupt`.
+     */
+    private function claim(const string& $id, const string& $path) : status<AssetError>
+    {
+        if ($this->seen->has($id)) {
+            return .error(.corrupt($path, "cooks to '{$id}', which another source already wrote"));
+        }
+
+        $this->seen[$id] = true;
         return .ok;
     }
 
@@ -198,6 +228,23 @@ internal function stripExt(const string& $name) : string
     }
 
     return $name->sub(0, $dot)->clone();
+}
+
+/**
+ * `foliage/bush_01/bush` → `foliage/bush_01`; a bare stem gives an empty folder.
+ */
+internal function parentId(const string& $id) : string
+{
+    usize $n = $id->size();
+    usize $i = $n;
+    while ($i > 0) {
+        $i = $i - 1;
+        if ($id->byte($i) == 47) {
+            return $id->sub(0, $i)->clone();
+        }
+    }
+
+    return '';
 }
 
 internal function dirBase(const string& $path) : string

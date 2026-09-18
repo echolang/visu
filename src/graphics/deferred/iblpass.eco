@@ -1,8 +1,9 @@
 /**
- * Bakes the three image-based-lighting maps from the environment cube, once:
- * a diffuse irradiance cube, a specular cube prefiltered per roughness across its mips, and the split-sum BRDF lookup.
+ * Convolves the environment cube into one lighting state: a diffuse irradiance cube and a specular
+ * cube prefiltered per roughness across its mips, plus the split-sum BRDF lookup once.
  *
- * Like the environment bake this runs inside a frame, because a render pass needs one, and then only imports what it made.
+ * Like the environment render this runs inside a frame, because a render pass needs one. A state
+ * spreads over frames by `IblQuality.mipsPerFrame`; the maps it replaces stay bound meanwhile.
  */
 
 namespace visu::graphics;
@@ -10,8 +11,8 @@ namespace visu::graphics;
 use visu::math::{Mat4, Vec4};
 
 /**
- * Convolution budget for the three IBL maps. Snapshotted when the environment is constructed.
- * `mobile()` is the phone-safe preset.
+ * Convolution budget for the IBL maps. Snapshotted when the environment is constructed.
+ * `mobile()` is the phone-safe preset, `sky()` the cheap one a probe re-bakes often.
  */
 public struct IblQuality
 {
@@ -26,6 +27,12 @@ public struct IblQuality
     public float32 $sampleCount = 4096.0f;
     public float32 $irradianceSamples = 2048.0f;
 
+    /**
+     * Prefilter mips convolved per frame. One spreads a heavy HDRI bake; all of them finish a cheap
+     * probe state in a single frame.
+     */
+    public int32 $mipsPerFrame = 1;
+
     public static function mobile() : IblQuality
     {
         IblQuality $q = IblQuality();
@@ -34,6 +41,26 @@ public struct IblQuality
         $q->irradianceSamples = 1024.0f;
         return $q;
     }
+
+    public static function sky() : IblQuality
+    {
+        IblQuality $q = IblQuality();
+        $q->irradianceSize = 32;
+        $q->prefilterSize = 128;
+        $q->sampleCount = 512.0f;
+        $q->irradianceSamples = 512.0f;
+        $q->mipsPerFrame = $q->prefilterMips;
+        return $q;
+    }
+}
+
+/**
+ * Graph refs of one state's two maps.
+ */
+internal struct IblStateRefs
+{
+    public TextureRef $irradiance;
+    public TextureRef $prefilter;
 }
 
 public class IblPass : Pass
@@ -54,79 +81,128 @@ public class IblPass : Pass
 
     public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
     {
-        TextureRef $irradiance = $pipeline->importTexture('ibl.irradiance', $this->environment->irradiance);
-        TextureRef $prefilter = $pipeline->importTexture('ibl.prefilter', $this->environment->prefilter);
-        TextureRef $brdf = $pipeline->importTexture('ibl.brdf', $this->environment->brdf);
-        $frame->set(IblData($irradiance, $prefilter, $brdf, $this->environment->ibl->prefilterMips));
+        Environment $env = $this->environment;
+        int32 $from = $env->clampState($env->blend->from);
+        int32 $to = $env->clampState($env->blend->to);
+        int32 $pending = $env->pendingState();
+        IblStateRefs $a = importState($pipeline, $env, $from);
+        IblStateRefs $b = $a;
 
-        if (!$this->environment->iblReady) {
-            EnvironmentData $environment = $frame->get<EnvironmentData>();
-            $io->reads($environment->cubemap);
-            $io->writes($irradiance);
-            $io->writes($prefilter);
+        if ($to != $from) {
+            $b = importState($pipeline, $env, $to);
+        }
+
+        TextureRef $brdf = $pipeline->importTexture('ibl.brdf', $env->brdf);
+        $frame->set(IblData(
+            $a->irradiance,
+            $a->prefilter,
+            $b->irradiance,
+            $b->prefilter,
+            $brdf,
+            $env->ibl->prefilterMips,
+            $env->blend->weight
+        ));
+
+        if ($pending < 0) {
+            return;
+        }
+
+        IblStateRefs $target = $a;
+
+        if ($pending == $to) {
+            $target = $b;
+        } else if ($pending != $from) {
+            $target = importState($pipeline, $env, $pending);
+        }
+
+        EnvironmentData $environment = $frame->get<EnvironmentData>();
+        $io->reads($environment->cubemap);
+        $io->writes($target->irradiance);
+        $io->writes($target->prefilter);
+
+        if (!$env->brdfReady) {
             $io->writes($brdf);
         }
     }
 
     public function execute(RenderContext $ctx) : status<PipelineError>
     {
-        if ($this->environment->iblReady) {
+        Environment $env = $this->environment;
+        int32 $pending = $env->pendingState();
+
+        if ($pending < 0) {
             return .ok;
         }
 
         Device $device = $ctx->device;
-        Texture $environment = $this->environment->cube;
+        Texture $cube = $env->cube;
 
-        if ($environment->state != ResourceState::shaderRead) {
-            // the environment bake has not run yet; try again next frame
+        if ($cube->state != ResourceState::shaderRead) {
+            // the environment render has not run yet; try again next frame
             return .ok;
         }
 
-        if ($this->environment->cubeJustBaked($device->frameIndex())) {
+        if ($env->cubeJustBaked($device->frameIndex())) {
             return .ok;
         }
 
-        Mesh $cube = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
+        IblState $state = $env->states[$pending as usize];
+        Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
             return .cube($device);
-        });
-        Mesh $quad = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
-            return .quad($device);
         });
         Sampler $sampler = $this->gpu->cube;
         Mat4 $projection = captureProjection();
-        int32 $step = $this->environment->iblStep;
-        int32 $mips = $this->environment->ibl->prefilterMips;
+        int32 $mips = $env->ibl->prefilterMips;
+        int32 $step = $env->iblStep;
 
         if ($step == 0) {
-            guard $this->bakeIrradiance($ctx, $cube, $environment, $sampler, $projection) else ($e) {
+            guard $this->bakeIrradiance($ctx, $mesh, $cube, $sampler, $projection, $state->irradiance) else ($e) {
                 return .error($e);
             }
-            $this->environment->iblStep = 1;
+            $device->transitionTexture($state->irradiance, ResourceState::shaderRead);
+        }
+
+        int32 $batch = $env->ibl->mipsPerFrame;
+
+        if ($batch < 1) {
+            $batch = 1;
+        }
+
+        int32 $end = $step + $batch;
+
+        if ($end > $mips) {
+            $end = $mips;
+        }
+
+        int32 $mip = $step;
+
+        while ($mip < $end) {
+            guard $this->bakePrefilter($ctx, $mesh, $cube, $sampler, $projection, $state->prefilter, $mip) else ($e) {
+                return .error($e);
+            }
+            $mip = $mip + 1;
+        }
+
+        $env->iblStep = $end;
+
+        if ($end < $mips) {
             return .ok;
         }
 
-        if ($step >= 1 && $step <= $mips) {
-            guard $this->bakePrefilter(
-                $ctx,
-                $cube,
-                $environment,
-                $sampler,
-                $projection,
-                $step - 1
-            ) else ($e) {
+        $device->transitionTexture($state->prefilter, ResourceState::shaderRead);
+
+        if (!$env->brdfReady) {
+            Mesh $quad = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+                return .quad($device);
+            });
+            guard $this->bakeBrdf($ctx, $quad) else ($e) {
                 return .error($e);
             }
-            $this->environment->iblStep = $step + 1;
-            return .ok;
+            $device->transitionTexture($env->brdf, ResourceState::shaderRead);
+            $env->brdfReady = true;
         }
 
-        guard $this->bakeBrdf($ctx, $quad) else ($e) {
-            return .error($e);
-        }
-        $device->transitionTexture($this->environment->irradiance, ResourceState::shaderRead);
-        $device->transitionTexture($this->environment->prefilter, ResourceState::shaderRead);
-        $device->transitionTexture($this->environment->brdf, ResourceState::shaderRead);
-        $this->environment->iblDone();
+        $env->stateDone($pending);
         return .ok;
     }
 
@@ -135,7 +211,8 @@ public class IblPass : Pass
         Mesh $cube,
         Texture $environment,
         Sampler $sampler,
-        const Mat4& $projection
+        const Mat4& $projection,
+        Texture $target
     ) : status<PipelineError>
     {
         ShaderProgram $program = guard $this->gpu->shaders->program('bake_irradiance') else ($e) {
@@ -149,7 +226,7 @@ public class IblPass : Pass
             $cube,
             $environment,
             $sampler,
-            $this->environment->irradiance,
+            $target,
             0,
             CaptureUniforms($projection, Mat4(), Vec4(0.0f, 0.0f, $samples, 0.0f))
         );
@@ -162,6 +239,7 @@ public class IblPass : Pass
         Texture $environment,
         Sampler $sampler,
         const Mat4& $projection,
+        Texture $target,
         int32 $mip
     ) : status<PipelineError>
     {
@@ -179,7 +257,7 @@ public class IblPass : Pass
             $cube,
             $environment,
             $sampler,
-            $this->environment->prefilter,
+            $target,
             $mip,
             CaptureUniforms($projection, Mat4(), Vec4($roughness, $source, $ibl->sampleCount, 0.0f))
         );
@@ -205,4 +283,15 @@ public class IblPass : Pass
         $enc->endRender();
         return .ok;
     }
+}
+
+internal function importState(Pipeline $pipeline, Environment $env, int32 $index) : IblStateRefs
+{
+    IblState $state = $env->states[$index as usize];
+    string $irradiance = "ibl.irradiance.{$index}";
+    string $prefilter = "ibl.prefilter.{$index}";
+    return IblStateRefs(
+        $pipeline->importTexture($irradiance, $state->irradiance),
+        $pipeline->importTexture($prefilter, $state->prefilter)
+    );
 }

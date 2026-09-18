@@ -1,0 +1,57 @@
+/**
+ * Failures of the debug dcapture: a script that does not parse or does not fit the shape,
+ * a bad command-line flag, and file trouble around the output directory.
+ */
+
+namespace visu::dcapture;
+
+use visu::graphics::DumpError;
+
+public enum DCaptureError
+{
+    case syntax(json::Error $inner);
+    case notObject(string $path);
+    case field(string $path, string $expected);
+    case timing(int32 $step);
+    case afterNeedsFrame(int32 $step);
+    case openEnded;
+    case flag(string $arg);
+    case missingArgument(string $option);
+    case io(string $path, string $message);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            DCaptureError::syntax($inner) => "script is not JSON: {$inner->message()}",
+            DCaptureError::notObject($path) => "{$path}: expected an object",
+            DCaptureError::field($path, $expected) => "{$path}: expected {$expected}",
+            DCaptureError::timing($step) => "steps[{$step}]: exactly one of frame, tick or after",
+            DCaptureError::afterNeedsFrame($step) => "steps[{$step}]: after must follow a frame step",
+            DCaptureError::openEnded => 'tick steps need a top-level frames cap or a stop step',
+            DCaptureError::flag($arg) => "--flag {$arg}: expected name=value",
+            DCaptureError::missingArgument($option) => "{$option} needs a value",
+            DCaptureError::io($path, $message) => "{$path}: {$message}",
+        };
+    }
+}
+
+/**
+ * Why one requested dump produced no file.
+ */
+public enum DumpFailure
+{
+    case unknown(string $pattern);
+    case depth(string $name);
+    case missing(string $name);
+    case write(string $name, DumpError $inner);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            DumpFailure::unknown($pattern) => "{$pattern}: matches nothing this frame (try dump list)",
+            DumpFailure::depth($name) => "{$name}: depth attachments cannot be read back",
+            DumpFailure::missing($name) => "{$name}: not in the pool this frame",
+            DumpFailure::write($name, $inner) => "{$name}: {$inner->message()}",
+        };
+    }
+}

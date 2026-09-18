@@ -64,6 +64,31 @@ public class Mesh : GpuObject
         $this->dead = false;
     }
 
+    /**
+     * Vertices from cooked bytes, e.g. a model blob. `$stride` is bytes per vertex and must divide the size.
+     */
+    public constructor(Device $device, bytes: const string& $vertices, stride: int32 $stride)
+    {
+        assert($stride > 0, 'mesh stride');
+        usize $size = $vertices->size();
+        assert($size > 0, 'mesh bytes empty');
+        assert(($size as int32) % $stride == 0, 'upload size');
+        ptr<const uint8> $src = $vertices->data();
+        $this->device = $device;
+        $this->vertices = Buffer($device, .vertex, $src, $size as uint64);
+        $this->instanceBuffer = null;
+        $this->indices = null;
+        $this->indexType = .uint16;
+        $this->vertexCount = ($size as int32) / $stride;
+        $this->vertexCapacity = $this->vertexCount;
+        $this->instanceCount = 0;
+        $this->indexCount = 0;
+        $this->topology = .triangles;
+        $this->vertexStride = $stride;
+        $this->instanceStride = 0;
+        $this->dead = false;
+    }
+
     public static function quad(Device $device) : Mesh
     {
         array<float32> $verts = [
@@ -171,6 +196,27 @@ public class Mesh : GpuObject
     }
 
     /**
+     * Index buffer from cooked bytes: `$type` says whether they are 16 or 32 bit. Call once after construct.
+     */
+    public function index(bytes: const string& $data, IndexType $type) : void
+    {
+        usize $n = $data->size();
+        assert($n > 0, 'mesh index empty');
+        int32 $width = indexWidth($type);
+        assert(($n as int32) % $width == 0, 'mesh index size');
+        ptr<const uint8> $src = $data->data();
+        Buffer? $old = $this->indices;
+        if ($old != null) {
+            Buffer $prev = guard $old;
+            $prev->destroy();
+        }
+
+        $this->indices = Buffer($this->device, .index, $src, $n as uint64);
+        $this->indexType = $type;
+        $this->indexCount = ($n as int32) / $width;
+    }
+
+    /**
      * Per-instance packed floats. Binding 1; stride is bytes.
      */
     public function instances(const array<float32>& $data, stride: int32 $stride) : void
@@ -204,6 +250,17 @@ public class Mesh : GpuObject
             }
         }
     }
+}
+
+/**
+ * Bytes per index for a type.
+ */
+public function indexWidth(IndexType $type) : int32
+{
+    return match ($type) {
+        IndexType::uint16 => 2,
+        IndexType::uint32 => 4,
+    };
 }
 
 internal function cubePositions() : array<float32>

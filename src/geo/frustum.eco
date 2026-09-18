@@ -7,6 +7,16 @@ namespace visu::geo;
 
 use visu::math::{Mat4, Vec3, dot};
 
+/**
+ * How a box sits against a frustum. `inside` lets a spatial index accept a whole subtree untested.
+ */
+public enum Containment
+{
+    case outside;
+    case intersects;
+    case inside;
+}
+
 public struct Frustum
 {
     public Plane $left;
@@ -133,6 +143,55 @@ public struct Frustum
 
         return true;
     }
+
+    /**
+     * Outside when any plane has the whole box behind it, inside when every plane has the whole box
+     * in front, intersects otherwise. Same p-vertex test as `contains`, plus the n-vertex for inside.
+     */
+    public const function classify(const AABB& $box) : Containment
+    {
+        bool $straddles = false;
+        array<Plane> $planes = [$this->left, $this->right, $this->top, $this->bottom, $this->near, $this->far];
+
+        foreach ($planes as $plane) {
+            if (boxOutside($plane, $box)) {
+                return .outside;
+            }
+
+            if (!boxInside($plane, $box)) {
+                $straddles = true;
+            }
+        }
+
+        if ($straddles) {
+            return .intersects;
+        }
+
+        return .inside;
+    }
+}
+
+/**
+ * The n-vertex (the corner furthest behind the plane) is still in front: the box is wholly inside.
+ */
+internal function boxInside(const Plane& $plane, const AABB& $box) : bool
+{
+    float32 $x = $box->max->x;
+    if ($plane->normal->x >= 0.0f) {
+        $x = $box->min->x;
+    }
+
+    float32 $y = $box->max->y;
+    if ($plane->normal->y >= 0.0f) {
+        $y = $box->min->y;
+    }
+
+    float32 $z = $box->max->z;
+    if ($plane->normal->z >= 0.0f) {
+        $z = $box->min->z;
+    }
+
+    return dot($plane->normal, Vec3($x, $y, $z)) + $plane->distance >= 0.0f;
 }
 
 internal function boxOutside(const Plane& $plane, const AABB& $box) : bool

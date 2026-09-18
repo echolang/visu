@@ -2,7 +2,7 @@
  * ConsoleCommandRegistry routing and Systems ConsoleCommandHandler walk.
  */
 
-use visu::ecs::{Entities, System, Systems};
+use visu::ecs::{Entities, Schedule, System, Systems};
 use visu::graphics::RenderContext;
 use visu::os::{Window, WindowHints};
 use visu::os::input::InputHub;
@@ -28,6 +28,10 @@ class PingSystem : System, ConsoleCommandHandler
     {
     }
 
+    public function schedule(Schedule& $schedule) : void
+    {
+    }
+
     public function update(Entities $entities) : void
     {
     }
@@ -36,9 +40,12 @@ class PingSystem : System, ConsoleCommandHandler
     {
     }
 
-    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : void
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
     {
         $registry->add('ping', $this);
+        array<string> $names = array<string>();
+        $names[] = 'ping';
+        return $names;
     }
 
     public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
@@ -113,6 +120,28 @@ test systems_register_routes_handler
     $systems->unregister($world);
     $c->submit('ping');
     assert($ping->hits == 1, 'unregistered');
+}
+
+test systems_register_keeps_foreign_verbs
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d, InputHub(Window('commands', 64, 64, WindowHints()), $d));
+    PingSystem $host = PingSystem();
+    $c->registry->add('dcapture', $host);
+    PingSystem $ping = PingSystem();
+    Systems $systems = Systems();
+    $systems->listen($c);
+    $systems->bind($ping);
+    Entities $world = Entities();
+    $systems->register($world);
+    array<string> $names = $c->registry->names();
+    assert($names->count() == 2, 'host verb kept beside ping');
+    assert($c->registry->find('dcapture') != null, 'dcapture survives register');
+    $systems->register($world);
+    assert($c->registry->names()->count() == 2, 'second register does not duplicate');
+    $systems->unregister($world);
+    assert($c->registry->find('ping') == null, 'ping removed');
+    assert($c->registry->find('dcapture') != null, 'dcapture survives unregister');
 }
 
 test console_help_and_clear_builtins

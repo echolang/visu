@@ -1,0 +1,71 @@
+/**
+ * GPU-side shapes of the model path: the cooked vertex, the per-instance payload behind the model
+ * matrix, and the per-material uniform at slot 0. The `model` program reads exactly these.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Vec2, Vec3, Vec4};
+
+/**
+ * One cooked vertex, `MODEL_VERTEX_BYTES` wide. Locations 0..3.
+ */
+public struct ModelVertex
+{
+    public Vec3 $position;
+    public Vec3 $normal;
+    public Vec4 $tangent;
+    public Vec2 $uv;
+}
+
+/**
+ * What rides the instance stream after the four matrix columns (locations 4..7): location 8.
+ * rgb tints the albedo, a is reserved for a LOD fade.
+ */
+public struct ModelInstanceData
+{
+    public Vec4 $tint;
+}
+
+/**
+ * Slot 0 of the `model` program, one upload per material batch.
+ * `baseColor` rgb is the albedo fallback, a the alpha cutoff (0 = opaque).
+ * `factors` is roughness, metallic, the presence flags as a float, unused.
+ * `uvScale` xy scales the uv.
+ */
+public struct ModelMaterialData
+{
+    public Vec4 $baseColor;
+    public Vec4 $factors;
+    public Vec4 $uvScale;
+}
+
+public const int32 MODEL_MAP_ALBEDO = 1;
+public const int32 MODEL_MAP_NORMAL = 2;
+public const int32 MODEL_MAP_ROUGHNESS = 4;
+public const int32 MODEL_MAP_METALLIC = 8;
+public const int32 MODEL_MAP_AO = 16;
+public const int32 MODEL_MAP_ALPHA = 32;
+
+public function modelVertexLayout() : VertexLayout
+{
+    return VertexLayout::of<ModelVertex>(function(VertexBuilder $b) : void {
+        ptr<ModelVertex> $v = $b->vertex<ModelVertex>();
+        $b->attr(0, &$v->position);
+        $b->attr(1, &$v->normal);
+        $b->attr(2, &$v->tangent);
+        $b->attr(3, &$v->uv);
+    });
+}
+
+/**
+ * Vertex stream plus the `Instance<ModelInstanceData>` stream: nine attributes.
+ */
+public function modelLayout() : VertexLayout
+{
+    return modelVertexLayout()->join(
+        instanceLayout<ModelInstanceData>(4, function(VertexBuilder $b, ptr<const ModelInstanceData> $p) : void {
+            $b->attr(8, &$p->tint);
+        })
+    );
+}
