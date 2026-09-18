@@ -1,0 +1,63 @@
+/**
+ * Console verb `flag`: list, read, and set process flags. Host registers this on the console
+ * so it is available without a dcapture script.
+ */
+
+namespace visu::app;
+
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+public class FlagConsole : ConsoleCommandHandler
+{
+    public constructor()
+    {
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('flag', $this);
+        array<string> $names = array<string>();
+        $names[] = 'flag';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if (!$cmd->isAction('flag')) {
+            return;
+        }
+
+        Flags $bag = flags();
+        if ($cmd->parts->count() < 2) {
+            array<string> $names = $bag->names();
+            if ($names->empty()) {
+                $console->writeLine('flag: none set');
+                return;
+            }
+
+            foreach ($names as $name) {
+                string $shown = $bag->str($name, '');
+                $console->writeLine("{$name} = {$shown}");
+            }
+
+            return;
+        }
+
+        string $name = $cmd->parts[1];
+        if ($cmd->parts->count() < 3) {
+            FlagValue $v = guard $bag->get($name) else {
+                $console->writeLine("{$name} is not set");
+                return;
+            }
+            string $shown = $v->label();
+            $console->writeLine("{$name} = {$shown}");
+            return;
+        }
+
+        string $raw = $cmd->parts[2];
+        $bag->parse($name, $raw);
+        string $now = $bag->str($name, '');
+        $console->writeLine("{$name} = {$now}");
+    }
+}

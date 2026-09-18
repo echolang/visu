@@ -4,31 +4,27 @@
  * and are culled per instance by the draw-call assembler. Both pick a LOD by distance and batch by
  * material through one `DrawCallAssembler`. Models and textures come from the `ModelBank`, which
  * outlives the scene; the assembler's mesh handles are this system's and die with it.
- * GPU acquisition happens in `render`, never inside the pass: an open encoder allows no uploads.
+ * GPU acquisition happens in `fill`, never inside the pass: an open encoder allows no uploads.
+ * `fill` is the only graph entry: Quickstart runs `$opt->render` before `Systems.render`, so this
+ * system opts out of the render phase.
  */
 
 namespace visu::system;
 
-use visu::app::{Flags, flags, info};
+use visu::app::{FlagValue, Flags, flags, info};
 use visu::asset::MODEL_MAX_LODS;
 use visu::components::{DynamicModel, StaticModel};
 use visu::ecs::{Entities, Entity, Schedule, System};
-use visu::geo::{AABB, Octree, OctreeHandle, OctreeNodeInfo, Transform, octreeDepthFor};
+use visu::geo::{AABB, Transform};
 use visu::graphics::{
     CallbackPass, CameraData, DebugLines, DeferredRenderer, DrawCallAssembler, Frame, GBufferData,
-    GBufferGeometry, GpuPass, IoSink, MaterialGpu, MeshHandle, Model, ModelBank, ModelInstanceData,
-    Pipeline, PipelineError, Raster, RenderContext, RenderEncoder, ShaderProgram, VertexLayout,
+    GpuPass, IoSink, MaterialGpu, MeshHandle, Model, ModelBank, ModelInstanceData, Pipeline,
+    PipelineError, Raster, RenderContext, RenderEncoder, ShaderProgram, VertexLayout,
     debugLinePass, lodIndex, modelLayout
 };
 use visu::math::{Mat4, Vec3, Vec4, length};
 use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
 use visu::signal::ConsoleCommandSignal;
-
-/**
- * Metres the finest octree cell aims for. The tree's depth is derived from this and the world box
- * rather than fixed: a depth that indexes a 4 km estate finely leaves a 40 km one barely sorted.
- */
-internal const float32 MODEL_OCTREE_LEAF = 32.0f;
 
 /**
  * One model's assembler handles, lod-major: level `l` is `$handles[$lodStart[l] .. $lodStart[l + 1])`.
@@ -47,34 +43,7 @@ internal class ModelHandles
     }
 }
 
-/**
- * A placed static: what the octree item id points at.
- */
-internal struct StaticInstance
-{
-    public Entity $entity;
-    public int32 $handles;
-    public Mat4 $world;
-    public AABB $bounds;
-    public Vec4 $tint;
-    public float32 $lodBias;
-    public OctreeHandle $octree;
-    public bool $live;
-
-    public constructor()
-    {
-        $this->entity = Entity::none();
-        $this->handles = -1;
-        $this->world = Mat4();
-        $this->bounds = AABB(Vec3(0.0f), Vec3(0.0f));
-        $this->tint = Vec4(1.0f);
-        $this->lodBias = 1.0f;
-        $this->octree = OctreeHandle::none();
-        $this->live = false;
-    }
-}
-
-public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
+public class ModelSystem : System, ConsoleCommandHandler
 {
     public ModelBank $bank;
     public DeferredRenderer $renderer;
@@ -106,32 +75,23 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
     /**
      * Counts from the last draw, for the console and tests.
      */
-    public int32 $staticCount;
     public int32 $dynamicCount;
     public int32 $submitted;
     public int32 $distanceCulled;
     public array<int32> $lodHistogram;
-    private Octree $octree;
+    private StaticSet $statics;
     private DrawCallAssembler<ModelInstanceData> $dca;
     private VertexLayout $layout;
     private GpuPass? $opaque;
     private GpuPass? $doubleSided;
     private map<string, int32> $modelIndex;
     private array<ModelHandles> $models;
-    private array<StaticInstance> $statics;
-    private array<int32> $freeStatics;
-    private map<Entity, int32> $staticOf;
     private map<Entity, int32> $dynamicOf;
-    private array<uint32> $visible;
     private DebugLines $lines;
     private GpuPass? $linePass;
-    private array<OctreeNodeInfo> $cells;
     private int32 $detachStatic;
     private int32 $detachDynamic;
 
-    /**
-     * `$world` bounds the octree; statics outside it still draw, from the root node.
-     */
     public constructor(ModelBank $bank, DeferredRenderer $renderer, const AABB& $world)
     {
         $this->bank = $bank;
@@ -141,7 +101,6 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
         $this->showBounds = flags()->bool('model.bounds', false);
         $this->showOctree = flags()->bool('model.octree', false);
         $this->flagsSeen = flags()->version;
-        $this->staticCount = 0;
         $this->dynamicCount = 0;
         $this->submitted = 0;
         $this->distanceCulled = 0;
@@ -152,23 +111,26 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
             $i = $i + 1;
         }
 
-        $this->octree = Octree($world, octreeDepthFor($world, MODEL_OCTREE_LEAF));
+        $this->statics = StaticSet($world);
         $this->dca = DrawCallAssembler<ModelInstanceData>($bank->device);
         $this->layout = modelLayout();
         $this->opaque = null;
         $this->doubleSided = null;
         $this->modelIndex = map<string, int32>();
         $this->models = array<ModelHandles>();
-        $this->statics = array<StaticInstance>();
-        $this->freeStatics = array<int32>();
-        $this->staticOf = map<Entity, int32>();
         $this->dynamicOf = map<Entity, int32>();
-        $this->visible = array<uint32>();
         $this->lines = DebugLines($bank->device);
         $this->linePass = null;
-        $this->cells = array<OctreeNodeInfo>();
         $this->detachStatic = -1;
         $this->detachDynamic = -1;
+    }
+
+    /**
+     * Live static records this frame.
+     */
+    public const function staticCount() : int32
+    {
+        return $this->statics->count;
     }
 
     /**
@@ -203,17 +165,14 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
         $this->dca->clearMeshes();
         $this->models->clear();
         $this->modelIndex->clear();
-        $this->octree->clear();
         $this->statics->clear();
-        $this->freeStatics->clear();
-        $this->staticOf->clear();
         $this->dynamicOf->clear();
         $this->lines->clear();
-        $this->cells->clear();
     }
 
     public function schedule(Schedule& $schedule) : void
     {
+        $schedule->render = false;
     }
 
     public function update(Entities $entities) : void
@@ -246,42 +205,12 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
         }
     }
 
-    /**
-     * Acquire models for new components and place new statics. Runs before any pass executes.
-     */
     public function render(Entities $entities, RenderContext $ctx) : void
     {
-        $this->ensurePasses();
-        foreach ($entities->view<StaticModel>() as $id => &$static) {
-            if ($this->staticOf->has($id)) {
-                continue;
-            }
-
-            int32 $handles = $this->acquire($static->model);
-            if ($handles < 0) {
-                continue;
-            }
-
-            Transform& $t = $entities->get<Transform>($id);
-            $this->staticOf[$id] = $this->place($id, $handles, $t->world($entities), $static->tint, $static->lodBias);
-        }
-
-        foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
-            if ($this->dynamicOf->has($id)) {
-                continue;
-            }
-
-            int32 $handles = $this->acquire($dynamic->model);
-            if ($handles < 0) {
-                continue;
-            }
-
-            $this->dynamicOf[$id] = $handles;
-        }
     }
 
     /**
-     * Re-place a static whose Transform moved. It rejoins the octree on the next render.
+     * Re-place a static whose Transform moved. It rejoins the octree on the next fill.
      */
     public function restatic(Entities $entities, Entity $e) : void
     {
@@ -289,10 +218,12 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
     }
 
     /**
-     * One pass that writes the GBuffer with every visible instance.
+     * Acquire new components, then one pass that writes the GBuffer with every visible instance.
      */
     public function fill(Entities $entities, RenderContext $ctx, GBufferData $gbuffer) : void
     {
+        $this->ensurePasses();
+        $this->acquireAll($entities);
         ModelSystem $sys = $this;
         Entities $world = $entities;
         $ctx->pipeline->add(CallbackPass(
@@ -428,7 +359,8 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
         int32 $commands = $this->dca->commandCount();
         int32 $culled = $this->dca->culledCount();
         int32 $models = $this->models->count() as int32;
-        $console->writeLine("model: {$models} models, {$this->staticCount} static, {$this->dynamicCount} dynamic");
+        int32 $statics = $this->statics->count;
+        $console->writeLine("model: {$models} models, {$statics} static, {$this->dynamicCount} dynamic");
         $console->writeLine("model: {$this->submitted} submitted, {$this->distanceCulled} past cull distance, {$culled} frustum culled, {$commands} draws");
         string $hist = '';
         int32 $i = 0;
@@ -440,13 +372,15 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
 
         $console->writeLine("model: bias {$this->lodBias}{$hist}");
         int32 $segments = $this->lines->count();
-        int32 $cells = $this->octree->nodeCount();
+        int32 $cells = $this->statics->nodeCount();
         $console->writeLine("model: octree {$cells} cells, overlay {$segments} segments");
     }
 
     private function setBounds(DebugConsole $console, bool $on) : void
     {
         $this->showBounds = $on;
+        flags()->set('model.bounds', FlagValue::boolean($on));
+        $this->flagsSeen = flags()->version;
         if ($on) {
             $console->writeLine('model: bounds on, green lod0 through magenta lod4');
             return;
@@ -458,6 +392,8 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
     private function setOctree(DebugConsole $console, bool $on) : void
     {
         $this->showOctree = $on;
+        flags()->set('model.octree', FlagValue::boolean($on));
+        $this->flagsSeen = flags()->version;
         if ($on) {
             $console->writeLine('model: octree on');
             return;
@@ -474,6 +410,8 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
         }
 
         $this->lodBias = $bias;
+        flags()->set('model.lod', FlagValue::floating($bias as float64));
+        $this->flagsSeen = flags()->version;
         $console->writeLine("model: lod bias {$bias}");
     }
 
@@ -482,12 +420,56 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
         $this->wireframe = $on;
         $this->opaque = null;
         $this->doubleSided = null;
+        flags()->set('model.wire', FlagValue::boolean($on));
+        $this->flagsSeen = flags()->version;
         if ($on) {
             $console->writeLine('model: wire');
             return;
         }
 
         $console->writeLine('model: fill');
+    }
+
+    /**
+     * Load models for components that arrived since last fill, and place new statics.
+     */
+    private function acquireAll(Entities $entities) : void
+    {
+        foreach ($entities->view<StaticModel>() as $id => &$static) {
+            if ($this->statics->has($id)) {
+                continue;
+            }
+
+            int32 $handles = $this->acquire($static->model);
+            if ($handles < 0) {
+                continue;
+            }
+
+            Transform& $t = $entities->get<Transform>($id);
+            ModelHandles $h = $this->models[$handles as usize];
+            Mat4 $world = $t->world($entities);
+            $this->statics->place(
+                $id,
+                $handles,
+                $world,
+                $h->model->bounds->transformed($world),
+                $static->tint,
+                $static->lodBias
+            );
+        }
+
+        foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
+            if ($this->dynamicOf->has($id)) {
+                continue;
+            }
+
+            int32 $handles = $this->acquire($dynamic->model);
+            if ($handles < 0) {
+                continue;
+            }
+
+            $this->dynamicOf[$id] = $handles;
+        }
     }
 
     /**
@@ -507,20 +489,20 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
 
         $this->lines->clear();
         if ($this->showOctree) {
-            $this->drawOctree();
+            $this->statics->draw($this->lines);
         }
 
         Vec3 $eye = $camera->position;
-        $this->visible->clear();
-        $this->octree->query($camera->frustum, $this->visible);
-        foreach ($this->visible as $id) {
-            StaticInstance $inst = $this->statics[$id as usize];
+        $this->statics->query($camera->frustum);
+        array<uint32> $ids = $this->statics->visible();
+        foreach ($ids as $id) {
+            StaticInstance $inst = $this->statics->get($id);
             if (!$inst->live) {
                 continue;
             }
 
             ModelHandles $h = $this->models[$inst->handles as usize];
-            $this->submitInstance($h, $inst->world, $inst->bounds, $inst->tint, $inst->lodBias, $eye, true);
+            $this->submitInstance($h, $inst->world, $inst->bounds, $inst->tint, $inst->lodBias, $eye);
         }
 
         foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
@@ -533,7 +515,7 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
             Transform& $t = $entities->get<Transform>($id);
             Mat4 $world = $t->world($entities, $alpha);
             AABB $bounds = $h->model->bounds->transformed($world);
-            $this->submitInstance($h, $world, $bounds, $dynamic->tint, $dynamic->lodBias, $eye, false);
+            $this->submitInstance($h, $world, $bounds, $dynamic->tint, $dynamic->lodBias, $eye);
         }
     }
 
@@ -543,8 +525,7 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
         const AABB& $bounds,
         Vec4 $tint,
         float32 $lodBias,
-        Vec3 $eye,
-        bool $ignoreCull
+        Vec3 $eye
     ) : void
     {
         float32 $dist = length($bounds->closest($eye) - $eye);
@@ -558,45 +539,32 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
             $this->lines->box($bounds, lodColor($lod));
         }
 
-        $this->submitLod($h, $lod, $world, $tint, $ignoreCull);
+        $this->submitLod($h, $lod, $world, $tint);
     }
 
-    /**
-     * The cells statics actually sit in, brighter the deeper they sit. Only cells holding items of
-     * their own are drawn: the ancestors are implied, and a tree spanning the whole map would
-     * otherwise bury the interesting cells under a handful of kilometre-wide boxes.
-     */
-    private function drawOctree() : void
+    private function submitLod(ModelHandles $h, int32 $lod, const Mat4& $world, Vec4 $tint) : void
     {
-        $this->cells->clear();
-        $this->octree->nodes($this->cells);
-        foreach ($this->cells as $cell) {
-            if ($cell->items == 0) {
-                continue;
-            }
-
-            $this->lines->box($cell->bounds, octreeColor($cell->depth));
+        int32 $last = ($h->lodStart->count() as int32) - 2;
+        if ($last < 0) {
+            return;
         }
-    }
 
-    private function submitLod(ModelHandles $h, int32 $lod, const Mat4& $world, Vec4 $tint, bool $ignoreCull) : void
-    {
         int32 $level = $lod;
         if ($level < 0) {
             $level = 0;
         }
 
-        if ($level >= MODEL_MAX_LODS) {
-            $level = MODEL_MAX_LODS - 1;
+        if ($level > $last) {
+            $level = $last;
         }
 
         $this->lodHistogram[$level as usize] = $this->lodHistogram[$level as usize] + 1;
         $this->submitted = $this->submitted + 1;
-        int32 $start = $h->lodStart[$lod as usize];
-        int32 $end = $h->lodStart[($lod + 1) as usize];
+        int32 $start = $h->lodStart[$level as usize];
+        int32 $end = $h->lodStart[($level + 1) as usize];
         int32 $i = $start;
         while ($i < $end) {
-            $this->dca->submit($h->handles[$i as usize], $world, ModelInstanceData($tint), 0.0f, $ignoreCull);
+            $this->dca->submit($h->handles[$i as usize], $world, ModelInstanceData($tint), 0.0f);
             $i = $i + 1;
         }
     }
@@ -639,62 +607,9 @@ public class ModelSystem : System, GBufferGeometry, ConsoleCommandHandler
         return $index;
     }
 
-    /**
-     * Record a static and insert it into the octree. The record index is the octree item id.
-     */
-    private function place(Entity $e, int32 $handles, const Mat4& $world, Vec4 $tint, float32 $lodBias) : int32
-    {
-        ModelHandles $h = $this->models[$handles as usize];
-        StaticInstance $inst = StaticInstance();
-        $inst->entity = $e;
-        $inst->handles = $handles;
-        $inst->world = $world;
-        $inst->bounds = $h->model->bounds->transformed($world);
-        $inst->tint = $tint;
-        $inst->lodBias = $lodBias;
-        $inst->live = true;
-        int32 $slot = -1;
-        if ($this->freeStatics->count() > 0) {
-            usize $last = $this->freeStatics->count() - 1;
-            $slot = $this->freeStatics[$last];
-            $this->freeStatics->pop();
-        } else {
-            $slot = $this->statics->count() as int32;
-            $this->statics[] = $inst;
-        }
-
-        $inst->octree = $this->octree->insert($inst->bounds, $slot as uint32);
-        $this->statics[$slot as usize] = $inst;
-        $this->staticCount = $this->staticCount + 1;
-        return $slot;
-    }
-
-    /**
-     * Take a static out of the octree and free its record.
-     */
     internal function release(Entity $e) : void
     {
-        if (!$this->staticOf->has($e)) {
-            return;
-        }
-
-        int32 $slot = $this->staticOf[$e];
-        $this->staticOf->remove($e);
-        if ($slot < 0 || ($slot as usize) >= $this->statics->count()) {
-            return;
-        }
-
-        StaticInstance $inst = $this->statics[$slot as usize];
-        if (!$inst->live) {
-            return;
-        }
-
-        $this->octree->remove($inst->octree);
-        $inst->live = false;
-        $inst->octree = OctreeHandle::none();
-        $this->statics[$slot as usize] = $inst;
-        $this->freeStatics[] = $slot;
-        $this->staticCount = $this->staticCount - 1;
+        $this->statics->release($e);
     }
 
     internal function forgetDynamic(Entity $e) : void

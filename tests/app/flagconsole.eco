@@ -1,0 +1,26 @@
+/**
+ * Flag console verb: list, read, set. No GPU.
+ */
+
+use visu::app::{FlagConsole, Flags, flags, installFlags};
+use visu::os::{Window, WindowHints};
+use visu::os::input::InputHub;
+use visu::runtime::{ConsoleCommandRegistry, DebugConsole};
+use visu::signal::Dispatcher;
+
+test flag_console_lists_and_sets
+{
+    installFlags(Flags());
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d, InputHub(Window('flagconsole', 64, 64, WindowHints()), $d));
+    FlagConsole $verbs = FlagConsole();
+    $verbs->registerConsoleCommands($c->registry);
+    $c->submit('flag');
+    array<string> $empty = $c->history();
+    assert($empty[$empty->count() - 1] == 'flag: none set', 'empty');
+    $c->submit('flag scene play');
+    assert(flags()->str('scene', '') == 'play', 'set');
+    $c->submit('flag scene');
+    array<string> $read = $c->history();
+    assert($read[$read->count() - 1] == 'scene = play', 'read');
+}

@@ -1,0 +1,149 @@
+/**
+ * Dump file names and glob matching. Catalog resolve uses `wildcard`; the writer uses
+ * `dumpPath` / `ensureDir`.
+ */
+
+namespace visu::dcapture;
+
+use std::env;
+use std::io;
+
+/**
+ * Glob match where `*` spans any run of bytes; everything else is literal.
+ */
+public function wildcard(const string& $pattern, const string& $name) : bool
+{
+    usize $plen = $pattern->size();
+    usize $nlen = $name->size();
+    usize $p = 0;
+    usize $n = 0;
+    // $plen doubles as "no star seen yet"
+    usize $starP = $plen;
+    usize $starN = 0;
+
+    while ($n < $nlen) {
+        if ($p < $plen && $pattern->byte($p) == 42) {
+            $starP = $p;
+            $starN = $n;
+            $p = $p + 1;
+            continue;
+        }
+
+        if ($p < $plen && $pattern->byte($p) == $name->byte($n)) {
+            $p = $p + 1;
+            $n = $n + 1;
+            continue;
+        }
+
+        if ($starP != $plen) {
+            $starN = $starN + 1;
+            $n = $starN;
+            $p = $starP + 1;
+            continue;
+        }
+
+        return false;
+    }
+
+    while ($p < $plen && $pattern->byte($p) == 42) {
+        $p = $p + 1;
+    }
+
+    return $p == $plen;
+}
+
+/**
+ * Only `[A-Za-z0-9_-]` survive; dots, colons, slashes and spaces become `_` so a name is one file stem.
+ */
+public function sanitizeName(const string& $name) : string
+{
+    string $out = '';
+    usize $n = $name->size();
+    usize $i = 0;
+    while ($i < $n) {
+        uint8 $b = $name->byte($i);
+        bool $digit = $b >= 48 && $b <= 57;
+        bool $upper = $b >= 65 && $b <= 90;
+        bool $lower = $b >= 97 && $b <= 122;
+        bool $keep = $digit || $upper || $lower || $b == 45 || $b == 95;
+        if ($keep) {
+            $out->push($b);
+        } else {
+            $out->push(95);
+        }
+
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+/**
+ * `{out}/{frame, four digits}_{label_}{name}{suffix}.png`, so a directory listing sorts by frame.
+ */
+public function dumpPath(
+    const string& $out,
+    int32 $frame,
+    const string& $label,
+    const string& $name,
+    const string& $suffix,
+) : string
+{
+    string $ds = env::DS;
+    string $digits = str::lpad(str::from($frame), 4, 48);
+    string $safe = sanitizeName($name);
+    string $tag = '';
+    if (!$label->empty()) {
+        string $safeLabel = sanitizeName($label);
+        $tag = "{$safeLabel}_";
+    }
+
+    return "{$out}{$ds}{$digits}_{$tag}{$safe}{$suffix}.png";
+}
+
+/**
+ * Create `$dir` and every missing parent. `io::mkdir` is one level, so walk the separators.
+ */
+public function ensureDir(const string& $dir) : status<DCaptureError>
+{
+    usize $n = $dir->size();
+    usize $i = 1;
+    while ($i <= $n) {
+        bool $boundary = $i == $n || $dir->byte($i) == 47 || $dir->byte($i) == 92;
+        if ($boundary) {
+            string $prefix = $dir->sub(0, $i)->clone();
+            $made = io::mkdir($prefix);
+            if ($made->failed() && !$made->failure()->exists()) {
+                return .error(.io($prefix, $made->failure()->message()));
+            }
+        }
+
+        $i = $i + 1;
+    }
+
+    return .ok;
+}
+
+/**
+ * File suffix per cube face, +X -X +Y -Y +Z -Z.
+ */
+internal function cubeFaceSuffix(int32 $face) : string
+{
+    if ($face == 0) {
+        return '_px';
+    }
+    if ($face == 1) {
+        return '_nx';
+    }
+    if ($face == 2) {
+        return '_py';
+    }
+    if ($face == 3) {
+        return '_ny';
+    }
+    if ($face == 4) {
+        return '_pz';
+    }
+
+    return '_nz';
+}

@@ -181,7 +181,7 @@ public class DeferredRenderer
         }
         $held->releaseEquirect();
 
-        if ($held->procedural) {
+        if ($held->isProbe()) {
             $held->updateSky($this->sky);
             $held->blend = $this->iblBlend;
         }
@@ -222,7 +222,11 @@ public class DeferredRenderer
 
             if ($this->renderSkybox && $env != null) {
                 Environment $environment = guard $env;
-                $pipeline->add(SkyboxPass($gpu, $environment, $this->sky, $this->fog, $this->sun));
+                if ($environment->isProbe()) {
+                    $pipeline->add(SkyPass($gpu, $this->sky, $this->fog, $this->sun));
+                } else {
+                    $pipeline->add(SkyboxPass($gpu, $this->sky, $this->fog, $this->sun));
+                }
             }
 
             LightPassData $light = $ctx->frame->get<LightPassData>();

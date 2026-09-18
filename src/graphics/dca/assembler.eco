@@ -4,8 +4,9 @@
  * `build` culls, sorts, and merges; `execute` records the draws.
  * The instance stream goes through this frame's ring, so nothing is uploaded twice.
  *
- * The PHP predecessor was php-glfw's C `DrawCallAssembler`. Dropped on the way over:
- * the octree culler (linear only here), LOD tables, material and program ids in the sort key, the transparent back-to-front pass, and the per-command callback.
+ * The PHP predecessor was php-glfw's C `DrawCallAssembler`. Octree culling and LOD stay
+ * with the caller (`ModelSystem`); this assembler frustum-culls, sorts by material then
+ * mesh then depth, and merges. `execute` takes an optional per-material bind callback.
  * The caller sets its own uniforms before `execute`.
  */
 
@@ -98,13 +99,12 @@ public class DrawCallAssembler<P>
         MeshHandle $mesh,
         const Mat4& $model,
         P $payload,
-        float32 $sortBias = 0.0f,
-        bool $ignoreCull = false
+        float32 $sortBias = 0.0f
     ) : void
     {
         assert($mesh->valid(), 'dca: submit needs a registered mesh');
         assert(($mesh->index as usize) < $this->meshes->count(), 'dca: mesh handle');
-        $this->pending[] = Submission<P>($mesh->index, $model, $payload, $sortBias, $ignoreCull);
+        $this->pending[] = Submission<P>($mesh->index, $model, $payload, $sortBias);
     }
 
     /**
@@ -152,7 +152,7 @@ public class DrawCallAssembler<P>
             // one key per submission, culled included: sortByKey looks them up by submission index, not by position in $visible
             $this->keys[] = sortKey($mesh->material, $sub->mesh, $this->depthBucket($centre, $cameraPosition, $sub->sortBias));
 
-            if ($this->cull && !$sub->ignoreCull) {
+            if ($this->cull) {
                 float32 $radius = $mesh->radius * maxAxisScale($sub->model);
 
                 if (!$frustum->contains($centre, $radius)) {

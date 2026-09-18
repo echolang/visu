@@ -2,7 +2,7 @@
  * Flags: autotyping, typed fallbacks, version, process accessor. No GPU.
  */
 
-use visu::app::{FlagValue, Flags, flags, hasFlags, installFlags};
+use visu::app::{FlagError, FlagValue, Flags, applyArgvFlags, flags, hasFlags, installFlags};
 
 test flags_parse_autotypes
 {
@@ -57,4 +57,33 @@ test flags_process_accessor_is_fill_if_absent
     assert(flags()->int('x', 0) == 1, 'same bag');
     installFlags(Flags());
     assert(!flags()->has('x'), 'replaced');
+}
+
+test argv_flags_parse_and_override
+{
+    Flags $f = Flags();
+    array<string> $argv = ['prog', '--flag', 'scene=play', '--other', '--flag=b=2.5'];
+    guard applyArgvFlags($f, $argv) else ($e) {
+        die($e->message());
+    }
+    assert($f->str('scene', '') == 'play', 'space form');
+    assert($f->float('b', 0.0) == 2.5, 'equals form');
+    array<string> $again = ['prog', '--flag', 'scene=edit'];
+    guard applyArgvFlags($f, $again) else ($e) {
+        die($e->message());
+    }
+    assert($f->str('scene', '') == 'edit', 'later wins');
+}
+
+test argv_flags_errors
+{
+    Flags $f = Flags();
+    array<string> $bare = ['prog', '--flag'];
+    status<FlagError> $missing = applyArgvFlags($f, $bare);
+    assert($missing->failed(), 'bare --flag fails');
+    assert($missing->failure()->message() == '--flag needs a value', 'bare message');
+    array<string> $noEq = ['prog', '--flag', 'scene'];
+    status<FlagError> $shape = applyArgvFlags($f, $noEq);
+    assert($shape->failed(), 'name without value fails');
+    assert($shape->failure()->message() == '--flag scene: expected name=value', 'shape message');
 }

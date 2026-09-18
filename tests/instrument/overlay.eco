@@ -1,8 +1,13 @@
 /**
  * Graph bar stack height: measure and paint must agree so bars stay inside the panel.
+ * Metrics console grammar.
  */
 
-use visu::instrument::{PassTiming, passBarStack};
+use visu::instrument::{
+    MetricsAction, PassTiming, Section, Tab, TabBodyItem, parseMetricsConsole, passBarStack,
+    tabBodyItems
+};
+use visu::signal::ConsoleCommandSignal;
 
 test pass_bar_stack_cpu_only
 {
@@ -17,4 +22,53 @@ test pass_bar_stack_cpu_and_gpu
     $p->cpuNs = 1000000.0;
     $p->gpuNs = 2000000.0;
     assert(passBarStack($p) == 10.0f, 'cpu+gap+gpu');
+}
+
+test tab_body_items_are_one_walk
+{
+    PassTiming $p = PassTiming();
+    $p->name = 'gbuffer';
+    $p->cpuNs = 1000000.0;
+    array<PassTiming> $passes = array<PassTiming>();
+    $passes[] = $p;
+    array<Section> $sections = array<Section>();
+    Tab $tab = Tab('graph', 'Graph', 0, $sections, $passes);
+    array<TabBodyItem> $none = tabBodyItems($tab, $passes, 0.0);
+    assert($none->count() == 1, 'pass line, no bars when max is 0');
+    array<TabBodyItem> $withBars = tabBodyItems($tab, $passes, 1000000.0);
+    assert($withBars->count() == 2, 'pass line plus bars');
+}
+
+internal function metricsLine(const string& $line) : MetricsAction
+{
+    return parseMetricsConsole(ConsoleCommandSignal($line));
+}
+
+test metrics_console_grammar
+{
+    bool $status = match (metricsLine('metrics')) {
+        MetricsAction::status => true,
+        else => false,
+    };
+    assert($status, 'bare metrics is status');
+    bool $on = match (metricsLine('metrics on')) {
+        MetricsAction::on => true,
+        else => false,
+    };
+    assert($on, 'on');
+    bool $expandOff = match (metricsLine('metrics expand off')) {
+        MetricsAction::expand($v) => !$v,
+        else => false,
+    };
+    assert($expandOff, 'expand off');
+    string $tabId = match (metricsLine('metrics tab graph')) {
+        MetricsAction::tab($id) => $id,
+        else => '',
+    };
+    assert($tabId == 'graph', 'tab id');
+    bool $usage = match (metricsLine('metrics expand maybe')) {
+        MetricsAction::usage => true,
+        else => false,
+    };
+    assert($usage, 'bad expand is usage');
 }

@@ -57,6 +57,20 @@ public enum FlagValue
     }
 }
 
+public enum FlagError
+{
+    case missingArgument;
+    case expectedNameValue(string $arg);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            FlagError::missingArgument => '--flag needs a value',
+            FlagError::expectedNameValue($arg) => "--flag {$arg}: expected name=value",
+        };
+    }
+}
+
 internal function truncate(float64 $f) : int64
 {
     return $f as int64;
@@ -210,4 +224,53 @@ public function flags() : Flags
     Flags $fresh = Flags();
     installFlags($fresh);
     return $fresh;
+}
+
+/**
+ * Apply `--flag name=value` and `--flag=name=value` from argv. Other arguments are ignored.
+ */
+public function applyArgvFlags(Flags $flags, const array<string>& $argv) : status<FlagError>
+{
+    usize $n = $argv->count();
+    usize $i = 1;
+    while ($i < $n) {
+        string $arg = $argv[$i];
+        if ($arg == '--flag') {
+            if ($i + 1 >= $n) {
+                return .error(.missingArgument);
+            }
+
+            guard applyFlagSpec($flags, $argv[$i + 1]) else ($e) {
+                return .error($e);
+            }
+            $i = $i + 2;
+            continue;
+        }
+
+        if ($arg->starts('--flag=')) {
+            string $spec = $arg->sub(7, $arg->size() - 7)->clone();
+            guard applyFlagSpec($flags, $spec) else ($e) {
+                return .error($e);
+            }
+            $i = $i + 1;
+            continue;
+        }
+
+        $i = $i + 1;
+    }
+
+    return .ok;
+}
+
+internal function applyFlagSpec(Flags $flags, const string& $spec) : status<FlagError>
+{
+    usize $eq = $spec->find('=');
+    if ($eq == $spec->size() || $eq == 0) {
+        return .error(.expectedNameValue($spec));
+    }
+
+    string $name = $spec->sub(0, $eq)->clone();
+    string $raw = $spec->sub($eq + 1, $spec->size() - $eq - 1)->clone();
+    $flags->parse($name, $raw);
+    return .ok;
 }

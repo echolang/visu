@@ -1,20 +1,19 @@
 /**
  * Scripted debug run: `--dcapture '<json>'` or `--dcapture @file` drives the app without a hand
  * on the keyboard. Steps apply flags, pin the camera, submit console lines, dump named GPU
- * images at frames or ticks, and stop; `--flag k=v` sets a process flag on its own.
+ * images at frames or ticks, and stop. `--flag k=v` is applied by bootstrap after the script
+ * flags, and works without a script.
  *
- * Dump-after-present lives on `DumpQueue` so console `dump` works without a script. Host holds
- * that queue always; this type is the script driver and is only put on Services when `--dcapture`
- * was given.
+ * Dump-after-present lives on `DumpQueue` (always on Services) so console `dump` works without a
+ * script. This type is the script driver and is only put on Services when `--dcapture` was given.
  */
 
 namespace visu::dcapture;
 
 use std::io;
-use visu::app::{FlagValue, Flags, HostConfig, flags, info};
-use visu::graphics::{CameraOverrideData, Frame, Pool};
+use visu::app::{Flags, HostConfig, flags, info};
+use visu::graphics::CameraOverrideData;
 use visu::math::{Quat, Vec3};
-use visu::os::Window;
 use visu::runtime::DebugConsole;
 
 internal const ARG_NAME = '--dcapture';
@@ -23,25 +22,16 @@ internal const ARG_INLINE = '--dcapture=';
 public class DCapture
 {
     public const Script $script;
-
-    /**
-     * False when no `--dcapture` was passed: nothing is scheduled, no cap applies, and the
-     * manifest is only written if a console verb dumped something.
-     */
-    public const bool $active;
     public DumpQueue $dumps;
-    private array<FlagAssign> $cliFlags;
     private StepQueue $steps;
     private CameraOverrideData? $camera;
     private int32 $frame;
     private int32 $tick;
 
-    public constructor(Script $script, bool $active, array<FlagAssign> $cliFlags)
+    public constructor(Script $script)
     {
         $this->script = $script;
-        $this->active = $active;
         $this->dumps = DumpQueue($script->out);
-        $this->cliFlags = $cliFlags;
         $this->steps = StepQueue($script->steps);
         $this->camera = null;
         $this->frame = 0;
@@ -52,14 +42,13 @@ public class DCapture
     }
 
     /**
-     * Parse the program arguments. No `--dcapture` yields an idle dcapture that still carries `--flag`s.
-     * Argument zero is the program and is skipped.
+     * Parse `--dcapture` from the program arguments. Null when the option was not given.
+     * `--flag` is applied separately by bootstrap. Argument zero is the program and is skipped.
      */
-    public static function fromArgs(const array<string>& $argv) : result<DCapture, DCaptureError>
+    public static function fromArgs(const array<string>& $argv) : result<DCapture?, DCaptureError>
     {
         string $text = '';
         bool $given = false;
-        array<FlagAssign> $cli = array<FlagAssign>();
         usize $n = $argv->count();
         usize $i = 1;
         while ($i < $n) {
@@ -82,33 +71,11 @@ public class DCapture
                 continue;
             }
 
-            if ($arg == '--flag') {
-                if ($i + 1 >= $n) {
-                    return .error(.missingArgument('--flag'));
-                }
-                FlagAssign $assign = guard parseFlagArg($argv[$i + 1]) else ($e) {
-                    return .error($e);
-                }
-                $cli[] = $assign;
-                $i = $i + 2;
-                continue;
-            }
-
-            if ($arg->starts('--flag=')) {
-                string $spec = $arg->sub(7, $arg->size() - 7)->clone();
-                FlagAssign $assign = guard parseFlagArg($spec) else ($e) {
-                    return .error($e);
-                }
-                $cli[] = $assign;
-                $i = $i + 1;
-                continue;
-            }
-
             $i = $i + 1;
         }
 
         if (!$given) {
-            return .ok(DCapture(Script::empty(), false, $cli));
+            return .ok(null);
         }
 
         if ($text->starts('@')) {
@@ -122,19 +89,15 @@ public class DCapture
         Script $script = guard Script::parse($text) else ($e) {
             return .error($e);
         }
-        return .ok(DCapture($script, true, $cli));
+        return .ok(DCapture($script));
     }
 
     /**
-     * Script flags first, then `--flag` overrides.
+     * Script flags. CLI `--flag` is applied afterwards by bootstrap so it overrides.
      */
     public function applyFlags(Flags $flags) : void
     {
         foreach ($this->script->flags as $assign) {
-            $flags->set($assign->name, $assign->value);
-        }
-
-        foreach ($this->cliFlags as $assign) {
             $flags->set($assign->name, $assign->value);
         }
     }
@@ -144,10 +107,6 @@ public class DCapture
      */
     public function configure(HostConfig $config) : void
     {
-        if (!$this->active) {
-            return;
-        }
-
         if ($this->script->headless) {
             $config->headless = true;
         }
@@ -175,11 +134,6 @@ public class DCapture
         }
     }
 
-    public function addProvider(DumpProvider $provider) : void
-    {
-        $this->dumps->addProvider($provider);
-    }
-
     /**
      * Fire every step due at this frame and tick. Idempotent; the Host calls it from poll
      * and again at the top of renderFrame so a step lands even when no tick ran in between.
@@ -199,37 +153,11 @@ public class DCapture
         return $this->camera;
     }
 
-    /**
-     * Ask for a dump after the next present (the `dump` console verb).
-     */
-    public function queue(const string& $pattern) : void
-    {
-        $this->dumps->queue($pattern);
-    }
-
-    public function queueList() : void
-    {
-        $this->dumps->queueList();
-    }
-
     public const function status() : string
     {
         int32 $pending = $this->steps->pending();
         int32 $queued = $this->dumps->queued();
-        string $state = 'idle';
-        if ($this->active) {
-            $state = 'active';
-        }
-        return "dcapture {$state}: frame {$this->frame} tick {$this->tick}, {$pending} steps pending, {$queued} dumps queued, out {$this->script->out}";
-    }
-
-    /**
-     * Write the queued dumps, list the catalog, then stop. The Host calls this before the app's
-     * own afterPresent closure so a scene switch cannot destroy the textures first.
-     */
-    public function afterPresent(Frame $frame, Pool $pool, Window $window, int32 $presented) : void
-    {
-        $this->dumps->afterPresent($frame, $pool, $window, $presented, $this->tick);
+        return "dcapture active: frame {$this->frame} tick {$this->tick}, {$pending} steps pending, {$queued} dumps queued, out {$this->script->out}";
     }
 
     /**
@@ -238,7 +166,7 @@ public class DCapture
     public function finish(int32 $framesRun) : void
     {
         $this->dumps->skip($this->steps->remaining());
-        $this->dumps->finish($framesRun, $this->tick, $this->active);
+        $this->dumps->finish($framesRun, $this->tick, true);
     }
 
     private function apply(Step $step, DebugConsole? $console) : void
@@ -300,19 +228,4 @@ public class DCapture
         float32 $z = $position->z;
         $this->dumps->note("camera at {$x:.2f} {$y:.2f} {$z:.2f}");
     }
-}
-
-/**
- * `name=value` from `--flag`. The value is autotyped like a console `flag` line.
- */
-internal function parseFlagArg(const string& $spec) : result<FlagAssign, DCaptureError>
-{
-    usize $eq = $spec->find('=');
-    if ($eq == $spec->size() || $eq == 0) {
-        return .error(.flag($spec));
-    }
-
-    string $name = $spec->sub(0, $eq)->clone();
-    string $raw = $spec->sub($eq + 1, $spec->size() - $eq - 1)->clone();
-    return .ok(FlagAssign($name, FlagValue::parse($raw)));
 }

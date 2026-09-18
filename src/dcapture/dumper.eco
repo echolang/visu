@@ -1,0 +1,108 @@
+/**
+ * Writes catalog entries as PNGs under one output directory. After present only; stalls.
+ */
+
+namespace visu::dcapture;
+
+use visu::graphics::{PixelDump, Pool, Texture, TextureRef};
+
+public class Dumper
+{
+    public const string $out;
+    private bool $ready;
+
+    public constructor(string $out)
+    {
+        $this->out = $out;
+        $this->ready = false;
+    }
+
+    public function write(
+        Pool $pool,
+        DumpEntry $entry,
+        int32 $frame,
+        const string& $label,
+    ) : result<array<DumpRecord>, DumpFailure>
+    {
+        if (!$this->ready) {
+            guard ensureDir($this->out) else ($e) {
+                return .error(.write($entry->name, .io($this->out, $e->message())));
+            }
+            $this->ready = true;
+        }
+
+        DumpSource $source = $entry->source;
+        return match ($source) {
+            DumpSource::texture($ref, $dump) => $this->writeRef($pool, $ref, $entry->name, $dump, $frame, $label),
+            DumpSource::raw($poolName) => $this->writeRaw($pool, $poolName, $entry->name, $frame, $label),
+        };
+    }
+
+    private function writeRef(
+        Pool $pool,
+        TextureRef $ref,
+        const string& $name,
+        PixelDump $dump,
+        int32 $frame,
+        const string& $label,
+    ) : result<array<DumpRecord>, DumpFailure>
+    {
+        Texture $tex = guard $pool->getTexture($ref) else ($e) {
+            return .error(.missing($name));
+        }
+        return $this->writeTexture($tex, $name, $dump, $frame, $label);
+    }
+
+    private function writeRaw(
+        Pool $pool,
+        string $poolName,
+        const string& $name,
+        int32 $frame,
+        const string& $label,
+    ) : result<array<DumpRecord>, DumpFailure>
+    {
+        Texture $tex = guard $pool->findTexture($poolName) else {
+            return .error(.missing($name));
+        }
+        return $this->writeTexture($tex, $name, .color, $frame, $label);
+    }
+
+    /**
+     * A cube writes six files; anything else one. Depth formats fail before the readback.
+     */
+    private function writeTexture(
+        Texture $tex,
+        const string& $name,
+        PixelDump $dump,
+        int32 $frame,
+        const string& $label,
+    ) : result<array<DumpRecord>, DumpFailure>
+    {
+        array<DumpRecord> $records = array<DumpRecord>();
+        if ($tex->desc->isDepth()) {
+            return .error(.depth($name));
+        }
+
+        if (!$tex->cube()) {
+            string $path = dumpPath($this->out, $frame, $label, $name, '');
+            guard $tex->dump($path, face: 0, 0, dump: $dump) else ($e) {
+                return .error(.write($name, $e));
+            }
+            $records[] = DumpRecord($name, $path, $frame, $label);
+            return .ok($records);
+        }
+
+        int32 $face = 0;
+        while ($face < 6) {
+            string $suffix = cubeFaceSuffix($face);
+            string $path = dumpPath($this->out, $frame, $label, $name, $suffix);
+            guard $tex->dump($path, face: $face, 0, dump: $dump) else ($e) {
+                return .error(.write($name, $e));
+            }
+            $records[] = DumpRecord($name, $path, $frame, $label);
+            $face = $face + 1;
+        }
+
+        return .ok($records);
+    }
+}

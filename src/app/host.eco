@@ -3,8 +3,8 @@
  * The app constructs one; Device stays off Services.
  * Construct fills the bag; initialize brings the window up; destroy tears it down.
  * Quickstart and a class-based app each own a Host and stay GameLoopDelegate.
- * Dump-after-present is always on (`DumpQueue`). A `DCapture` on Services (only when `--dcapture`
- * was given) is the script driver: advance, camera override, skipped-step finish.
+ * Dump-after-present is always on (`DumpQueue` on Services). A `DCapture` on Services (only when
+ * `--dcapture` was given) is the script driver: advance, camera override, skipped-step finish.
  */
 
 namespace visu::app;
@@ -58,13 +58,20 @@ public class Host
     private DCapture? $script;
     private FullscreenTextureRenderer $blit;
     private Overlay? $overlay;
-    private DCaptureConsole? $dcaptureConsole;
 
     public constructor(HostConfig $config, Services $services)
     {
-        $this->dumps = hostDumps($services, $config);
         $this->script = $services->find<DCapture>();
-        $this->dcaptureConsole = null;
+        DCapture? $maybeScript = $this->script;
+        if ($maybeScript != null) {
+            DCapture $dcapture = guard $maybeScript;
+            $dcapture->configure($config);
+        }
+
+        $services->once(function(Services $s) : DumpQueue {
+            return DumpQueue('var/dcapture');
+        });
+        $this->dumps = $services->get<DumpQueue>();
         $this->tickIndex = 0;
         $this->config = $config;
         $this->services = $services;
@@ -409,6 +416,8 @@ public class Host
             loadConsoleOverlay($console, $this->device);
         }
 
+        FlagConsole $flagVerbs = FlagConsole();
+        $flagVerbs->registerConsoleCommands($console->registry);
         DCaptureConsole $verbs = DCaptureConsole($this->dumps, $this->script);
         $verbs->registerConsoleCommands($console->registry);
         Overlay? $maybeOverlay = $this->overlay;
@@ -417,7 +426,6 @@ public class Host
             $hud->registerConsoleCommands($console->registry);
         }
 
-        $this->dcaptureConsole = $verbs;
         $this->console = $console;
     }
 
@@ -531,19 +539,6 @@ internal function loadConsoleOverlay(DebugConsole $console, Device $device) : vo
         info("debug console overlay: {$e->message()}");
         return;
     }
-}
-
-/**
- * Script dumps share the driver's queue so a `--dcapture` out dir is honoured; otherwise a
- * process-lifetime queue so console `dump` still works.
- */
-internal function hostDumps(Services $services, HostConfig $config) : DumpQueue
-{
-    DCapture $script = guard $services->find<DCapture>() else {
-        return DumpQueue('var/dcapture');
-    }
-    $script->configure($config);
-    return $script->dumps;
 }
 
 internal function hostHints(HostConfig $config) : WindowHints

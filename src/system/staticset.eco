@@ -1,0 +1,195 @@
+/**
+ * Placed static models: a free-list of records and the octree that culls them.
+ * ModelSystem owns one; a detached static leaves here before its entity is reused.
+ */
+
+namespace visu::system;
+
+use visu::ecs::Entity;
+use visu::geo::{AABB, Frustum, Octree, OctreeHandle, OctreeNodeInfo, octreeDepthFor};
+use visu::graphics::DebugLines;
+use visu::math::{Mat4, Vec3, Vec4};
+
+/**
+ * Metres the finest octree cell aims for. The tree's depth is derived from this and the world box
+ * rather than fixed: a depth that indexes a 4 km estate finely leaves a 40 km one barely sorted.
+ */
+internal const float32 MODEL_OCTREE_LEAF = 32.0f;
+
+/**
+ * A placed static: what the octree item id points at.
+ */
+internal struct StaticInstance
+{
+    public Entity $entity;
+    public int32 $handles;
+    public Mat4 $world;
+    public AABB $bounds;
+    public Vec4 $tint;
+    public float32 $lodBias;
+    public OctreeHandle $octree;
+    public bool $live;
+
+    public constructor()
+    {
+        $this->entity = Entity::none();
+        $this->handles = -1;
+        $this->world = Mat4();
+        $this->bounds = AABB(Vec3(0.0f), Vec3(0.0f));
+        $this->tint = Vec4(1.0f);
+        $this->lodBias = 1.0f;
+        $this->octree = OctreeHandle::none();
+        $this->live = false;
+    }
+}
+
+internal class StaticSet
+{
+    /**
+     * Live records, not the free-list length.
+     */
+    public int32 $count;
+    private Octree $octree;
+    private array<StaticInstance> $items;
+    private array<int32> $free;
+    private map<Entity, int32> $of;
+    private array<uint32> $visible;
+    private array<OctreeNodeInfo> $cells;
+
+    /**
+     * `$world` bounds the octree; statics outside it still draw, from the root node.
+     */
+    public constructor(const AABB& $world)
+    {
+        $this->count = 0;
+        $this->octree = Octree($world, octreeDepthFor($world, MODEL_OCTREE_LEAF));
+        $this->items = array<StaticInstance>();
+        $this->free = array<int32>();
+        $this->of = map<Entity, int32>();
+        $this->visible = array<uint32>();
+        $this->cells = array<OctreeNodeInfo>();
+    }
+
+    public const function has(Entity $e) : bool
+    {
+        return $this->of->has($e);
+    }
+
+    /**
+     * Record a static and insert it into the octree. The record index is the octree item id.
+     */
+    public function place(
+        Entity $e,
+        int32 $handles,
+        const Mat4& $world,
+        const AABB& $bounds,
+        Vec4 $tint,
+        float32 $lodBias
+    ) : int32
+    {
+        StaticInstance $inst = StaticInstance();
+        $inst->entity = $e;
+        $inst->handles = $handles;
+        $inst->world = $world;
+        $inst->bounds = $bounds;
+        $inst->tint = $tint;
+        $inst->lodBias = $lodBias;
+        $inst->live = true;
+        int32 $slot = -1;
+        if ($this->free->count() > 0) {
+            usize $last = $this->free->count() - 1;
+            $slot = $this->free[$last];
+            $this->free->pop();
+        } else {
+            $slot = $this->items->count() as int32;
+            $this->items[] = $inst;
+        }
+
+        $inst->octree = $this->octree->insert($inst->bounds, $slot as uint32);
+        $this->items[$slot as usize] = $inst;
+        $this->of[$e] = $slot;
+        $this->count = $this->count + 1;
+        return $slot;
+    }
+
+    /**
+     * Take a static out of the octree and free its record.
+     */
+    public function release(Entity $e) : void
+    {
+        if (!$this->of->has($e)) {
+            return;
+        }
+
+        int32 $slot = $this->of[$e];
+        $this->of->remove($e);
+        if ($slot < 0 || ($slot as usize) >= $this->items->count()) {
+            return;
+        }
+
+        StaticInstance $inst = $this->items[$slot as usize];
+        if (!$inst->live) {
+            return;
+        }
+
+        $this->octree->remove($inst->octree);
+        $inst->live = false;
+        $inst->octree = OctreeHandle::none();
+        $this->items[$slot as usize] = $inst;
+        $this->free[] = $slot;
+        $this->count = $this->count - 1;
+    }
+
+    /**
+     * Frustum query into this frame's scratch. Read with `visible` / `get`.
+     */
+    public function query(const Frustum& $frustum) : void
+    {
+        $this->visible->clear();
+        $this->octree->query($frustum, $this->visible);
+    }
+
+    public const function visible() : array<uint32>
+    {
+        return $this->visible;
+    }
+
+    public const function get(uint32 $id) : StaticInstance
+    {
+        return $this->items[$id as usize];
+    }
+
+    /**
+     * The cells statics actually sit in, brighter the deeper they sit. Only cells holding items of
+     * their own are drawn: the ancestors are implied, and a tree spanning the whole map would
+     * otherwise bury the interesting cells under a handful of kilometre-wide boxes.
+     */
+    public function draw(DebugLines $lines) : void
+    {
+        $this->cells->clear();
+        $this->octree->nodes($this->cells);
+        foreach ($this->cells as $cell) {
+            if ($cell->items == 0) {
+                continue;
+            }
+
+            $lines->box($cell->bounds, octreeColor($cell->depth));
+        }
+    }
+
+    public const function nodeCount() : int32
+    {
+        return $this->octree->nodeCount();
+    }
+
+    public function clear() : void
+    {
+        $this->octree->clear();
+        $this->items->clear();
+        $this->free->clear();
+        $this->of->clear();
+        $this->visible->clear();
+        $this->cells->clear();
+        $this->count = 0;
+    }
+}

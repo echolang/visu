@@ -38,12 +38,13 @@ internal function programArguments() : array<string>
 }
 
 /**
- * Parse the dcapture arguments onto Services and apply their flags. A bad script is a user error
+ * Parse `--dcapture` onto Services and apply `--flag`. A bad script or flag is a user error
  * at the process edge: log it and exit 2 so the agent that launched the run sees a clear failure.
+ * DumpQueue is left unset when there is no script; Host once()s a default.
  */
 public function installDCapture(Services $s, const array<string>& $argv) : void
 {
-    result<DCapture, DCaptureError> $parsed = DCapture::fromArgs($argv);
+    result<DCapture?, DCaptureError> $parsed = DCapture::fromArgs($argv);
     if ($parsed->failed()) {
         DCaptureError $e = $parsed->failure();
         error("dcapture: {$e->message()}");
@@ -51,10 +52,18 @@ public function installDCapture(Services $s, const array<string>& $argv) : void
         return;
     }
 
-    DCapture $dcapture = $parsed->unwrap();
-    $dcapture->applyFlags(flags());
-    if ($dcapture->active) {
+    DCapture? $maybe = $parsed->unwrap();
+    if ($maybe != null) {
+        DCapture $dcapture = guard $maybe;
+        $dcapture->applyFlags(flags());
+        $s->set($dcapture->dumps);
         $s->set($dcapture);
+    }
+
+    guard applyArgvFlags(flags(), $argv) else ($e) {
+        error("flag: {$e->message()}");
+        env::exit(2);
+        return;
     }
 }
 

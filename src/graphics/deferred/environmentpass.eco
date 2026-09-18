@@ -7,7 +7,7 @@
 
 namespace visu::graphics;
 
-use visu::math::{Mat4, Vec4};
+use visu::math::{Mat4, Vec3, Vec4};
 
 // probe depth range in metres: a few decimetres to well past any terrain
 internal const float32 PROBE_NEAR = 0.5f;
@@ -59,14 +59,12 @@ public class EnvironmentPass : Pass
             return .ok;
         }
 
-        if ($this->environment->procedural) {
-            guard $this->bakeSky($ctx) else ($e) {
-                return .error($e);
-            }
-        } else {
-            guard $this->bakeHdri($ctx) else ($e) {
-                return .error($e);
-            }
+        EnvironmentSource $src = $this->environment->source;
+        guard match ($src) {
+            .probe($position, $depth, $capture) => $this->bakeSky($ctx, $position, $depth, $capture),
+            else => $this->bakeHdri($ctx),
+        } else ($e) {
+            return .error($e);
         }
 
         $ctx->device->generateMipmaps($this->environment->cube);
@@ -104,7 +102,12 @@ public class EnvironmentPass : Pass
      * Six faces from the probe: the sky without its disk first, then whatever the app draws over it
      * with the face camera at slot 1 and the sky still bound at slot 2.
      */
-    private function bakeSky(RenderContext $ctx) : status<PipelineError>
+    private function bakeSky(
+        RenderContext $ctx,
+        Vec3 $position,
+        Texture $depth,
+        function<void(RenderContext, RenderEncoder, ProbeCapture)> $capture
+    ) : status<PipelineError>
     {
         Environment $env = $this->environment;
         ShaderProgram $program = guard $this->gpu->shaders->program('bake_sky') else ($e) {
@@ -114,12 +117,10 @@ public class EnvironmentPass : Pass
         Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
             return .cube($device);
         });
-        Texture $depth = guard $env->probeDepth;
         IblState $state = $env->states[$this->state as usize];
         Sky $sky = $env->sky->withDirection($state->direction);
-        SkyUniforms $skyUniforms = skyUniforms($sky, $env->probe, false, PROBE_VIEW_SAMPLES, PROBE_LIGHT_SAMPLES);
+        SkyUniforms $skyUniforms = skyUniforms($sky, $position, false, PROBE_VIEW_SAMPLES, PROBE_LIGHT_SAMPLES);
         GpuPass $pass = GpuPass($program, VertexLayout::pos3(), captureRaster());
-        function<void(RenderContext, RenderEncoder, ProbeCapture)> $capture = $env->capture;
         int32 $size = $env->cube->desc->width;
         Mat4 $projection = captureProjection();
         int32 $face = 0;
@@ -143,7 +144,7 @@ public class EnvironmentPass : Pass
             $enc->upload($skyUniforms, slot: 2);
             $mesh->draw($enc);
             ProbeCapture $view = ProbeCapture(
-                probeCamera($face, $env->probe, $size, PROBE_NEAR, PROBE_FAR),
+                probeCamera($face, $position, $size, PROBE_NEAR, PROBE_FAR),
                 $skyUniforms,
                 $face
             );

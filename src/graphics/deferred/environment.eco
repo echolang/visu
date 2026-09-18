@@ -10,6 +10,21 @@ namespace visu::graphics;
 use visu::math::Vec3;
 
 /**
+ * How the environment cube is produced. HDRI unwraps once then becomes `cube` after the
+ * source texture is released; a probe re-renders the cube per sun state.
+ */
+internal enum EnvironmentSource
+{
+    case hdri(Texture $equirect);
+    case cube;
+    case probe(
+        Vec3 $position,
+        Texture $depth,
+        function<void(RenderContext, RenderEncoder, ProbeCapture)> $capture
+    );
+}
+
+/**
  * One baked lighting state: the sun it was captured under and its two convolved cubes.
  */
 internal class IblState
@@ -92,16 +107,9 @@ internal class Environment
     public int32 $iblStep;
     public IblQuality $ibl;
 
-    /**
-     * The cube is rendered from `$sky` and `$capture` instead of an HDRI.
-     */
-    public bool $procedural;
+    public EnvironmentSource $source;
     public Sky $sky;
-    public Vec3 $probe;
-    public Texture? $probeDepth;
-    public function<void(RenderContext, RenderEncoder, ProbeCapture)> $capture;
     public IblBlend $blend;
-    private Texture? $equirect;
     private uint64 $cubeFrame;
 
     /**
@@ -119,13 +127,9 @@ internal class Environment
         $this->brdfReady = false;
         $this->iblStep = 0;
         $this->ibl = $ibl;
-        $this->procedural = false;
+        $this->source = .hdri($equirect);
         $this->sky = Sky();
-        $this->probe = Vec3(0.0f, 0.0f, 0.0f);
-        $this->probeDepth = null;
-        $this->capture = noCapture();
         $this->blend = IblBlend();
-        $this->equirect = $equirect;
         $this->cubeFrame = 0;
     }
 
@@ -143,19 +147,15 @@ internal class Environment
         $this->brdfReady = false;
         $this->iblStep = 0;
         $this->ibl = $ibl;
-        $this->procedural = false;
+        $this->source = .cube;
         $this->sky = Sky();
-        $this->probe = Vec3(0.0f, 0.0f, 0.0f);
-        $this->probeDepth = null;
-        $this->capture = noCapture();
         $this->blend = IblBlend();
-        $this->equirect = null;
         $this->cubeFrame = 0;
     }
 
     /**
-     * Procedural probe at `$position`: one state per sun travel direction in `$suns`, each rendered
-     * from the sky plus whatever `$capture` draws, then convolved. The cube is scratch shared by all.
+     * Probe at `$position`: one state per sun travel direction in `$suns`, each rendered from the
+     * sky plus whatever `$capture` draws, then convolved. The cube is scratch shared by all.
      */
     public constructor(
         probe: Device $device,
@@ -186,14 +186,18 @@ internal class Environment
         $this->brdfReady = false;
         $this->iblStep = 0;
         $this->ibl = $ibl;
-        $this->procedural = true;
+        $this->source = .probe($position, makeProbeDepth($device, $size), $capture);
         $this->sky = $sky;
-        $this->probe = $position;
-        $this->probeDepth = probeDepth($device, $size);
-        $this->capture = $capture;
         $this->blend = IblBlend();
-        $this->equirect = null;
         $this->cubeFrame = 0;
+    }
+
+    internal const function isProbe() : bool
+    {
+        return match ($this->source) {
+            EnvironmentSource::probe($position, $depth, $capture) => true,
+            else => false,
+        };
     }
 
     internal const function count() : int32
@@ -228,7 +232,7 @@ internal class Environment
             return .ibl;
         }
 
-        if (!$this->procedural && $this->ready) {
+        if (!$this->isProbe() && $this->ready) {
             return .environment;
         }
 
@@ -272,7 +276,7 @@ internal class Environment
      */
     internal const function wantsCubeBake() : bool
     {
-        if (!$this->procedural) {
+        if (!$this->isProbe()) {
             return !$this->ready;
         }
 
@@ -303,8 +307,16 @@ internal class Environment
 
     internal function equirect() : Texture
     {
-        Texture $source = guard $this->equirect;
-        return $source;
+        EnvironmentSource $src = $this->source;
+        match ($src) {
+            EnvironmentSource::hdri($tex) => {
+                return $tex;
+            },
+            else => {
+                assert(false, 'environment: equirect only on an HDRI source');
+                return $this->cube;
+            },
+        };
     }
 
     internal function cubeDone(int32 $state) : void
@@ -354,7 +366,7 @@ internal class Environment
      */
     internal function updateSuns(const array<Vec3>& $suns) : bool
     {
-        if (!$this->procedural || $suns->count() != $this->states->count()) {
+        if (!$this->isProbe() || $suns->count() != $this->states->count()) {
             return false;
         }
 
@@ -381,7 +393,7 @@ internal class Environment
             $state->dirty = true;
         }
 
-        if ($this->procedural) {
+        if ($this->isProbe()) {
             $this->ready = false;
         }
 
@@ -394,10 +406,6 @@ internal class Environment
      */
     internal function releaseEquirect() : void
     {
-        Texture $source = guard $this->equirect else {
-            return;
-        }
-
         if (!$this->ready) {
             return;
         }
@@ -406,7 +414,15 @@ internal class Environment
             return;
         }
 
-        $this->equirect = dropTexture($source);
+        EnvironmentSource $src = $this->source;
+        match ($src) {
+            EnvironmentSource::hdri($tex) => {
+                dropTexture($tex);
+                $this->source = .cube;
+            },
+            else => {
+            },
+        };
     }
 
     internal function destroy() : void
@@ -418,8 +434,17 @@ internal class Environment
         }
 
         $this->brdf->destroy();
-        $this->probeDepth = dropTexture($this->probeDepth);
-        $this->equirect = dropTexture($this->equirect);
+        match ($this->source) {
+            EnvironmentSource::hdri($tex) => {
+                dropTexture($tex);
+            },
+            EnvironmentSource::probe($position, $depth, $capture) => {
+                $depth->destroy();
+            },
+            EnvironmentSource::cube => {
+            },
+        };
+        $this->source = .cube;
         $this->ready = false;
         $this->brdfReady = false;
         $this->iblStep = 0;
@@ -439,7 +464,7 @@ internal function environmentCube(Device $device, int32 $size) : Texture
 /**
  * Depth the probe faces render with, so geometry occludes itself inside the cube.
  */
-internal function probeDepth(Device $device, int32 $size) : Texture
+internal function makeProbeDepth(Device $device, int32 $size) : Texture
 {
     TextureDesc $desc = TextureDesc($format: .depth32f, $width: $size, $height: $size);
     $desc->usage = TEXTURE_RENDER_TARGET | TEXTURE_SAMPLED;
@@ -465,8 +490,4 @@ internal function singleState(Device $device, const IblQuality& $ibl) : array<Ib
     return $states;
 }
 
-internal function noCapture() : function<void(RenderContext, RenderEncoder, ProbeCapture)>
-{
-    return function(RenderContext $ctx, RenderEncoder $enc, ProbeCapture $view) : void {
-    };
-}
+

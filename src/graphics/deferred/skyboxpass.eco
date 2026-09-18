@@ -1,6 +1,5 @@
 /**
- * Draws the sky behind the shaded scene: the environment cube, or the procedural atmosphere per
- * pixel with its sun disk when the environment is a probe.
+ * Draws the environment cube behind the shaded scene.
  * It borrows the GBuffer depth so geometry still occludes it, which means its own render pass
  * description rather than the light target's. The pool has no way to share one depth texture
  * between two targets.
@@ -8,27 +7,21 @@
 
 namespace visu::graphics;
 
-internal const float32 SKY_VIEW_SAMPLES = 16.0f;
-internal const float32 SKY_LIGHT_SAMPLES = 8.0f;
-
 public class SkyboxPass : Pass
 {
     private DeferredGpu $gpu;
-    private Environment $environment;
     private Sky $sky;
     private HeightFog $fog;
     private DirectionalLight $sun;
 
     public constructor(
         DeferredGpu $gpu,
-        Environment $environment,
         Sky $sky,
         HeightFog $fog,
         DirectionalLight $sun
     )
     {
         $this->gpu = $gpu;
-        $this->environment = $environment;
         $this->sky = $sky;
         $this->fog = $fog;
         $this->sun = $sun;
@@ -43,11 +36,8 @@ public class SkyboxPass : Pass
     {
         LightPassData $light = $frame->get<LightPassData>();
         GBufferData $gbuffer = $frame->get<GBufferData>();
-        if (!$this->environment->procedural) {
-            EnvironmentData $environment = $frame->get<EnvironmentData>();
-            $io->reads($environment->cubemap);
-        }
-
+        EnvironmentData $environment = $frame->get<EnvironmentData>();
+        $io->reads($environment->cubemap);
         // ordering only: the depth is an attachment here, not a sampler
         $io->reads($gbuffer->depth);
         $io->writes($light->target);
@@ -55,16 +45,10 @@ public class SkyboxPass : Pass
 
     public function execute(RenderContext $ctx) : status<PipelineError>
     {
-        string $name = 'skybox';
-
-        if ($this->environment->procedural) {
-            $name = 'sky';
-        }
-
-        ShaderProgram $program = guard $this->gpu->shaders->program($name) else ($e) {
+        ShaderProgram $program = guard $this->gpu->shaders->program('skybox') else ($e) {
             return .error(.shader($e));
         }
-        RenderEncoder $enc = guard $this->beginSky($ctx) else ($e) {
+        RenderEncoder $enc = guard beginSkyPass($ctx) else ($e) {
             return .error($e);
         }
         Device $device = $ctx->device;
@@ -82,58 +66,44 @@ public class SkyboxPass : Pass
             FOG_VIEW_SAMPLES,
             FOG_LIGHT_SAMPLES
         );
-
-        if ($this->environment->procedural) {
-            SkyUniforms $sky = skyUniforms(
-                $this->sky,
-                $camera->position,
-                true,
-                SKY_VIEW_SAMPLES,
-                SKY_LIGHT_SAMPLES
-            );
-            $enc->upload($sky, slot: 2);
-            $enc->upload($fog, slot: 3);
-        } else {
-            // bound only because fog.glsl declares the SkyUniforms block
-            $enc->upload(skyUniforms($this->sky, $camera->position, false, FOG_VIEW_SAMPLES, FOG_LIGHT_SAMPLES), slot: 2);
-            $enc->upload($fog, slot: 3);
-            EnvironmentData $environment = $ctx->frame->get<EnvironmentData>();
-            Texture $cube = guard $ctx->pool->getTexture($environment->cubemap) else ($e) {
-                $enc->endRender();
-                return .error(.pool($e));
-            }
-            $enc->bindTexture(0, $cube, $this->gpu->cube);
+        // fog.glsl includes sky.glsl, so the SkyUniforms block is in the layout
+        $enc->upload(skyUniforms($this->sky, $camera->position, false, FOG_VIEW_SAMPLES, FOG_LIGHT_SAMPLES), slot: 2);
+        $enc->upload($fog, slot: 3);
+        EnvironmentData $environment = $ctx->frame->get<EnvironmentData>();
+        Texture $cube = guard $ctx->pool->getTexture($environment->cubemap) else ($e) {
+            $enc->endRender();
+            return .error(.pool($e));
         }
-
+        $enc->bindTexture(0, $cube, $this->gpu->cube);
         $mesh->draw($enc);
         $enc->endRender();
         return .ok;
     }
+}
 
-    /**
-     * Opens the light target for load with the GBuffer depth attached.
-     */
-    private function beginSky(RenderContext $ctx) : result<RenderEncoder, PipelineError>
-    {
-        LightPassData $light = $ctx->frame->get<LightPassData>();
-        GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
-        Texture $color = guard $ctx->pool->getTexture($light->output) else ($e) {
-            return .error(.pool($e));
-        }
-        Texture $depth = guard $ctx->pool->getTexture($gbuffer->depth) else ($e) {
-            return .error(.pool($e));
-        }
-        ColorTarget $target = ColorTarget($color);
-        $target->load = .load;
-        $target->store = .store;
-        DepthTarget $depthTarget = DepthTarget($depth);
-        $depthTarget->load = .load;
-        $depthTarget->store = .dontCare;
-        RenderPassDesc $desc = RenderPassDesc();
-        $desc->colors[] = $target;
-        $desc->depth = $depthTarget;
-        return .ok($ctx->device->beginRender($desc));
+/**
+ * Opens the light target for load with the GBuffer depth attached.
+ */
+internal function beginSkyPass(RenderContext $ctx) : result<RenderEncoder, PipelineError>
+{
+    LightPassData $light = $ctx->frame->get<LightPassData>();
+    GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
+    Texture $color = guard $ctx->pool->getTexture($light->output) else ($e) {
+        return .error(.pool($e));
     }
+    Texture $depth = guard $ctx->pool->getTexture($gbuffer->depth) else ($e) {
+        return .error(.pool($e));
+    }
+    ColorTarget $target = ColorTarget($color);
+    $target->load = .load;
+    $target->store = .store;
+    DepthTarget $depthTarget = DepthTarget($depth);
+    $depthTarget->load = .load;
+    $depthTarget->store = .dontCare;
+    RenderPassDesc $desc = RenderPassDesc();
+    $desc->colors[] = $target;
+    $desc->depth = $depthTarget;
+    return .ok($ctx->device->beginRender($desc));
 }
 
 internal function skyRaster() : Raster

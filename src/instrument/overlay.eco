@@ -8,7 +8,6 @@
 
 namespace visu::instrument;
 
-use visu::geo::AABB2D;
 use visu::graphics::{
     Device, Filter, FullscreenTextureRenderer, Pipeline, Sampler, SamplerDesc,
     Texture, TextureDesc, TargetRef
@@ -18,7 +17,7 @@ use visu::os::input;
 use visu::os::input::KeyPhase;
 use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
 use visu::signal::{ConsoleCommandSignal, Dispatcher, Flow, KeySignal};
-use visu::vg::{Canvas, Color, TextAlign, VgError, VgRenderer};
+use visu::vg::{Canvas, VgError, VgRenderer};
 
 public class Overlay : ConsoleCommandHandler
 {
@@ -135,66 +134,40 @@ public class Overlay : ConsoleCommandHandler
 
     public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
     {
-        if (!$cmd->isAction('metrics')) {
-            return;
-        }
-
-        if ($cmd->parts->count() < 2) {
-            $this->writeStatus($console);
-            return;
-        }
-
-        string $arg = $cmd->parts[1];
-        if ($arg == 'on') {
-            $this->enabled = true;
-            $console->writeLine('metrics: on');
-            return;
-        }
-
-        if ($arg == 'off') {
-            $this->enabled = false;
-            $console->writeLine('metrics: off');
-            return;
-        }
-
-        if ($arg == 'toggle') {
-            $this->enabled = !$this->enabled;
-            $this->writeStatus($console);
-            return;
-        }
-
-        if ($arg == 'expand') {
-            if ($cmd->parts->count() >= 3) {
-                string $on = $cmd->parts[2];
-                if ($on == 'on') {
-                    $this->expanded = true;
-                } else if ($on == 'off') {
-                    $this->expanded = false;
-                } else {
-                    $console->writeLine('usage: metrics expand [on|off]');
-                    return;
-                }
-            } else {
+        MetricsAction $action = parseMetricsConsole($cmd);
+        match ($action) {
+            MetricsAction::status => {
+                $this->writeStatus($console);
+            },
+            MetricsAction::usage => {
+                $console->writeLine('usage: metrics [on|off|toggle|expand|tab <id>]');
+            },
+            MetricsAction::on => {
+                $this->enabled = true;
+                $console->writeLine('metrics: on');
+            },
+            MetricsAction::off => {
+                $this->enabled = false;
+                $console->writeLine('metrics: off');
+            },
+            MetricsAction::toggle => {
+                $this->enabled = !$this->enabled;
+                $this->writeStatus($console);
+            },
+            MetricsAction::expand($on) => {
+                $this->expanded = $on;
+                $this->writeStatus($console);
+            },
+            MetricsAction::expandToggle => {
                 $this->expanded = !$this->expanded;
-            }
-
-            $this->writeStatus($console);
-            return;
-        }
-
-        if ($arg == 'tab') {
-            if ($cmd->parts->count() < 3) {
-                $console->writeLine('usage: metrics tab <id>');
-                return;
-            }
-
-            $this->selected = $cmd->parts[2];
-            $this->expanded = true;
-            $this->writeStatus($console);
-            return;
-        }
-
-        $console->writeLine('usage: metrics [on|off|toggle|expand|tab <id>]');
+                $this->writeStatus($console);
+            },
+            MetricsAction::tab($id) => {
+                $this->selected = $id;
+                $this->expanded = true;
+                $this->writeStatus($console);
+            },
+        };
     }
 
     private function writeStatus(DebugConsole $console) : void
@@ -286,7 +259,7 @@ public class Overlay : ConsoleCommandHandler
 
         array<HudRow> $drawn = $hud;
         array<string> $below = $extra;
-        array<SparkSlot> $slots = $this->measureSlots($target, $drawn);
+        array<SparkSlot> $slots = measureSparkSlots($this->vg->canvas, $target, $drawn);
         bool $expanded = $this->expanded;
         string $selected = $this->selected;
         array<Tab> $tabs = $sample->tabs;
@@ -329,51 +302,6 @@ public class Overlay : ConsoleCommandHandler
             array<float32>& $ring = $this->rings->at($key);
             pushSpark($ring, $row->value, SPARK_W);
         }
-    }
-
-    private function measureSlots(TargetRef $target, const array<HudRow>& $hud) : array<SparkSlot>
-    {
-        array<SparkSlot> $slots = array<SparkSlot>();
-        Canvas $vg = $this->vg->canvas;
-        float32 $scale = $target->contentScaleX;
-
-        if ($scale < 0.0001f) {
-            $scale = 1.0f;
-        }
-
-        float32 $pw = ($target->width as float32) / $scale;
-        float32 $ph = ($target->height as float32) / $scale;
-        $vg->begin($pw, $ph, $scale);
-        guard $vg->fontFace('debug') else {
-            $vg->cancel();
-            return $slots;
-        }
-        $vg->fontSize(14.0f);
-        $vg->textAlign(TextAlign(.left, .top));
-        float32 $sepW = $vg->textAdvance(Vec2(HUD_X, HUD_Y), HUD_SEP);
-        float32 $x = HUD_X;
-        usize $i = 0;
-        usize $n = $hud->count();
-
-        while ($i < $n) {
-            HudRow $row = $hud[$i];
-            float32 $tw = $vg->textAdvance(Vec2(HUD_X, HUD_Y), $row->text);
-
-            if ($row->spark) {
-                $slots[] = SparkSlot($row->key, $x, $tw, $tw, $row->higherWorse);
-            }
-
-            $x = $x + $tw;
-
-            if ($i + 1 < $n) {
-                $x = $x + $sepW;
-            }
-
-            $i = $i + 1;
-        }
-
-        $vg->cancel();
-        return $slots;
     }
 
     private function stampSpark(
@@ -511,384 +439,3 @@ public class Overlay : ConsoleCommandHandler
     }
 }
 
-internal function makeSparkAtlas(Device $device, string $name) : Texture
-{
-    TextureDesc $desc = TextureDesc($format: .rgba8, $width: SPARK_ATLAS_W, $height: SPARK_H);
-    $desc->label = $name;
-    return Texture($device, $name, $desc);
-}
-
-internal function sparkStripWidth(const array<SparkSlot>& $slots) : int32
-{
-    float32 $right = HUD_X;
-
-    foreach ($slots as $slot) {
-        float32 $end = $slot->x + $slot->colW;
-
-        if ($end > $right) {
-            $right = $end;
-        }
-    }
-
-    int32 $w = sparkRound($right - HUD_X);
-
-    if ($w < 1) {
-        return 0;
-    }
-
-    return $w;
-}
-
-internal function paintHud(
-    Canvas $vg,
-    const array<HudRow>& $lines,
-    const array<string>& $extra,
-    const array<SparkSlot>& $slots
-) : float32
-{
-    guard $vg->fontFace('debug') else {
-        return 0.0f;
-    }
-    $vg->fontSize(14.0f);
-    $vg->textAlign(TextAlign(.left, .top));
-    float32 $x = HUD_X;
-    float32 $y = HUD_Y;
-    float32 $lh = HUD_LH;
-    float32 $pad = HUD_PAD;
-    AABB2D $box = AABB2D(Vec2($x, $y), Vec2($x, $y));
-    bool $any = false;
-    string $line = hudJoin($lines);
-    float32 $lineW = $vg->textAdvance(Vec2($x, $y), $line);
-    AABB2D $cell = AABB2D(Vec2($x, $y), Vec2($x + $lineW, $y + $lh));
-    $box = hudExtend($box, $cell, $any);
-    $any = true;
-
-    int32 $atlasW = sparkStripWidth($slots);
-
-    if ($atlasW > 0) {
-        Vec2 $sparkPos = sparkStripOrigin();
-        AABB2D $chart = AABB2D(
-            $sparkPos,
-            $sparkPos + Vec2($atlasW as float32, SPARK_H as float32),
-        );
-        $box = hudExtend($box, $chart, $any);
-        $any = true;
-    }
-
-    float32 $ey = $y + $lh;
-
-    if ($atlasW > 0) {
-        $ey = $ey + SPARK_GAP + (SPARK_H as float32) + SPARK_GAP;
-    }
-
-    foreach ($extra as $more) {
-        $eb = $vg->textBounds(Vec2($x, $ey), $more);
-        $box = hudExtend($box, $eb, $any);
-        $any = true;
-        $ey = $ey + $lh;
-    }
-
-    if ($any && $box->width() > 0.0f && $box->height() > 0.0f) {
-        Vec2 $padV = Vec2($pad, $pad);
-        $vg->fillColor(Color(0.08f, 0.08f, 0.10f, 0.78f));
-        $vg->fillRounded(
-            $box->min - $padV,
-            Vec2($box->width(), $box->height()) + $padV * 2.0f,
-            4.0f,
-        );
-    }
-
-    $vg->fillColor(Color::white());
-    $vg->text(Vec2($x, $y), $line);
-
-    $ey = $y + $lh;
-
-    if ($atlasW > 0) {
-        $ey = $ey + SPARK_GAP + (SPARK_H as float32) + SPARK_GAP;
-    }
-
-    foreach ($extra as $more) {
-        $vg->text(Vec2($x, $ey), $more);
-        $ey = $ey + $lh;
-    }
-
-    if (!$any) {
-        return $y;
-    }
-
-    return $box->max->y + $pad;
-}
-
-internal function hudJoin(const array<HudRow>& $rows) : string
-{
-    string $out = '';
-    bool $first = true;
-
-    foreach ($rows as $row) {
-        if ($first) {
-            $out = $row->text;
-            $first = false;
-        } else {
-            $out->append(HUD_SEP);
-            $out->append($row->text);
-        }
-    }
-
-    return $out;
-}
-
-internal function hudExtend(AABB2D $box, const AABB2D& $b, bool $any) : AABB2D
-{
-    if (!$any) {
-        return $b;
-    }
-
-    $box->extend($b);
-    return $box;
-}
-
-internal function paintTabs(
-    Canvas $vg,
-    const array<Tab>& $tabs,
-    string $selected,
-    float32 $top
-) : void
-{
-    if ($tabs->empty()) {
-        return;
-    }
-
-    guard $vg->fontFace('debug') else {
-        return;
-    }
-    $vg->fontSize(14.0f);
-    $vg->textAlign(TextAlign(.left, .top));
-    float32 $x = HUD_X;
-    float32 $y = $top + TAB_GAP;
-    float32 $lh = HUD_LH;
-    float32 $pad = HUD_PAD;
-    AABB2D $box = AABB2D(Vec2($x, $y), Vec2($x, $y));
-    bool $any = false;
-    float32 $chipY = $y;
-    float32 $chipH = $lh + CHIP_PAD_Y * 2.0f;
-    float32 $cx = $x;
-    foreach ($tabs as $tab) {
-        float32 $tw = $vg->textAdvance(Vec2($cx, $chipY), $tab->title);
-        float32 $cw = $tw + CHIP_PAD_X * 2.0f;
-        AABB2D $chip = AABB2D(Vec2($cx, $chipY), Vec2($cx + $cw, $chipY + $chipH));
-        $box = hudExtend($box, $chip, $any);
-        $any = true;
-        $cx = $cx + $cw + CHIP_GAP;
-    }
-
-    Tab $body = $tabs[0];
-    bool $haveBody = false;
-    foreach ($tabs as $tab) {
-        if ($tab->id == $selected) {
-            $body = $tab;
-            $haveBody = true;
-        }
-    }
-
-    if (!$haveBody) {
-        $body = $tabs[0];
-    }
-
-    array<PassTiming> $passes = sortPasses($body->passes);
-    float64 $maxNs = passBarMax($passes);
-    float32 $by = $chipY + $chipH + SPARK_GAP;
-    $box = measureTabBody($vg, $box, $any, $x, $by, $lh, $body, $passes, $maxNs);
-    $any = true;
-
-    if ($any && $box->width() > 0.0f && $box->height() > 0.0f) {
-        Vec2 $padV = Vec2($pad, $pad);
-        $vg->fillColor(Color(0.08f, 0.08f, 0.10f, 0.78f));
-        $vg->fillRounded(
-            $box->min - $padV,
-            Vec2($box->width(), $box->height()) + $padV * 2.0f,
-            4.0f,
-        );
-    }
-
-    $cx = $x;
-    foreach ($tabs as $tab) {
-        float32 $tw = $vg->textAdvance(Vec2($cx, $chipY), $tab->title);
-        float32 $cw = $tw + CHIP_PAD_X * 2.0f;
-        if ($tab->id == $body->id) {
-            $vg->fillColor(Color(0.22f, 0.24f, 0.30f, 0.95f));
-            $vg->fillRounded(Vec2($cx, $chipY), Vec2($cw, $chipH), 3.0f);
-            $vg->fillColor(Color::white());
-        } else {
-            $vg->fillColor(Color(0.65f, 0.66f, 0.70f, 1.0f));
-        }
-
-        $vg->text(Vec2($cx + CHIP_PAD_X, $chipY + CHIP_PAD_Y), $tab->title);
-        $cx = $cx + $cw + CHIP_GAP;
-    }
-
-    paintTabBody($vg, $x, $by, $lh, $body, $passes, $maxNs);
-}
-
-internal function measureTabBody(
-    Canvas $vg,
-    AABB2D $box,
-    bool $any,
-    float32 $x,
-    float32 $y,
-    float32 $lh,
-    const Tab& $body,
-    const array<PassTiming>& $passes,
-    float64 $maxNs
-) : AABB2D
-{
-    float32 $cy = $y;
-    array<Section> $sections = $body->sections;
-    foreach ($sections as $sec) {
-        if (!$sec->id->empty()) {
-            $box = hudExtend($box, $vg->textBounds(Vec2($x, $cy), $sec->id), $any);
-            $any = true;
-            $cy = $cy + $lh;
-        }
-
-        array<Metric> $metrics = $sec->metrics;
-        foreach ($metrics as $m) {
-            string $line = formatMetric($m);
-            if (!$sec->id->empty()) {
-                $line = "  {$line}";
-            }
-
-            $box = hudExtend($box, $vg->textBounds(Vec2($x, $cy), $line), $any);
-            $any = true;
-            $cy = $cy + $lh;
-        }
-    }
-
-    foreach ($passes as $p) {
-        string $line = formatPass($p);
-        $box = hudExtend($box, $vg->textBounds(Vec2($x, $cy), $line), $any);
-        $any = true;
-        $cy = $cy + $lh;
-        array<Metric> $extras = $p->extras;
-        foreach ($extras as $m) {
-            string $extra = formatMetric($m);
-            $extra = "    {$extra}";
-            $box = hudExtend($box, $vg->textBounds(Vec2($x, $cy), $extra), $any);
-            $any = true;
-            $cy = $cy + $lh;
-        }
-
-        if ($maxNs > 0.0) {
-            float32 $stack = passBarStack($p);
-            AABB2D $bars = AABB2D(Vec2($x, $cy), Vec2($x + BAR_W, $cy + $stack));
-            $box = hudExtend($box, $bars, $any);
-            $any = true;
-            $cy = $cy + $stack + SPARK_GAP;
-        }
-    }
-
-    return $box;
-}
-
-internal function paintTabBody(
-    Canvas $vg,
-    float32 $x,
-    float32 $y,
-    float32 $lh,
-    const Tab& $body,
-    const array<PassTiming>& $passes,
-    float64 $maxNs
-) : void
-{
-    float32 $cy = $y;
-    array<Section> $sections = $body->sections;
-    foreach ($sections as $sec) {
-        $vg->fillColor(Color::white());
-        if (!$sec->id->empty()) {
-            $vg->text(Vec2($x, $cy), $sec->id);
-            $cy = $cy + $lh;
-        }
-
-        array<Metric> $metrics = $sec->metrics;
-        foreach ($metrics as $m) {
-            string $line = formatMetric($m);
-            if (!$sec->id->empty()) {
-                $line = "  {$line}";
-            }
-
-            $vg->text(Vec2($x, $cy), $line);
-            $cy = $cy + $lh;
-        }
-    }
-
-    foreach ($passes as $p) {
-        $vg->fillColor(Color::white());
-        $vg->text(Vec2($x, $cy), formatPass($p));
-        $cy = $cy + $lh;
-        array<Metric> $extras = $p->extras;
-        foreach ($extras as $m) {
-            string $extra = formatMetric($m);
-            $vg->text(Vec2($x, $cy), "    {$extra}");
-            $cy = $cy + $lh;
-        }
-
-        if ($maxNs > 0.0) {
-            $cy = paintPassBars($vg, $x, $cy, $p, $maxNs);
-            $cy = $cy + SPARK_GAP;
-        }
-    }
-}
-
-internal function paintPassBars(
-    Canvas $vg,
-    float32 $x,
-    float32 $y,
-    const PassTiming& $p,
-    float64 $maxNs
-) : float32
-{
-    float32 $cy = $y;
-    float32 $cpuW = ((($p->cpuNs / $maxNs) as float32) * BAR_W);
-    $vg->fillColor(Color(0.35f, 0.85f, 0.45f, 0.85f));
-    if ($cpuW > 1.0f) {
-        $vg->fillRect(Vec2($x, $cy), Vec2($cpuW, BAR_H));
-    }
-
-    $cy = $cy + BAR_H;
-    if ($p->gpuNs > 0.0) {
-        $cy = $cy + BAR_GAP;
-        float32 $gpuW = ((($p->gpuNs / $maxNs) as float32) * BAR_W);
-        $vg->fillColor(Color(0.40f, 0.65f, 0.95f, 0.85f));
-        if ($gpuW > 1.0f) {
-            $vg->fillRect(Vec2($x, $cy), Vec2($gpuW, BAR_H));
-        }
-
-        $cy = $cy + BAR_H;
-    }
-
-    return $cy;
-}
-
-internal function passBarMax(const array<PassTiming>& $passes) : float64
-{
-    float64 $maxNs = 0.0;
-    foreach ($passes as $p) {
-        if ($p->cpuNs > $maxNs) {
-            $maxNs = $p->cpuNs;
-        }
-
-        if ($p->gpuNs > $maxNs) {
-            $maxNs = $p->gpuNs;
-        }
-    }
-
-    return $maxNs;
-}
-
-internal function passBarStack(const PassTiming& $p) : float32
-{
-    if ($p->gpuNs > 0.0) {
-        return BAR_H + BAR_GAP + BAR_H;
-    }
-
-    return BAR_H;
-}

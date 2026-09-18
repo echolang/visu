@@ -1,16 +1,15 @@
 /**
- * Console verbs of the debug capture: `dump`, `flag`, `dcapture`.
+ * Console verbs of the debug capture: `dump` and `dcapture`.
  * The Host registers this directly on the console registry so scene loads do not drop the names.
+ * Process `flag` lives on `FlagConsole` in `visu::app`.
  */
 
 namespace visu::dcapture;
 
-use visu::app::{FlagValue, Flags, flags};
 use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
 use visu::signal::ConsoleCommandSignal;
 
 internal const DUMP_USAGE = 'usage: dump list | dump <name or glob> [...]   (after this frame)';
-internal const FLAG_USAGE = 'usage: flag | flag <name> | flag <name> <value>';
 
 public class DCaptureConsole : ConsoleCommandHandler
 {
@@ -26,10 +25,8 @@ public class DCaptureConsole : ConsoleCommandHandler
     public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
     {
         $registry->add('dump', $this);
-        $registry->add('flag', $this);
         array<string> $names = array<string>();
         $names[] = 'dump';
-        $names[] = 'flag';
         if ($this->script != null) {
             $registry->add('dcapture', $this);
             $names[] = 'dcapture';
@@ -42,11 +39,6 @@ public class DCaptureConsole : ConsoleCommandHandler
     {
         if ($cmd->isAction('dump')) {
             $this->dump($cmd, $console);
-            return;
-        }
-
-        if ($cmd->isAction('flag')) {
-            $this->flag($cmd, $console);
             return;
         }
 
@@ -83,40 +75,5 @@ public class DCaptureConsole : ConsoleCommandHandler
 
         int32 $count = ($n - 1) as int32;
         $console->writeLine("dump: {$count} pattern(s) after this frame");
-    }
-
-    private function flag(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
-    {
-        Flags $bag = flags();
-        if ($cmd->parts->count() < 2) {
-            array<string> $names = $bag->names();
-            if ($names->empty()) {
-                $console->writeLine('flag: none set');
-                return;
-            }
-
-            foreach ($names as $name) {
-                string $shown = $bag->str($name, '');
-                $console->writeLine("{$name} = {$shown}");
-            }
-
-            return;
-        }
-
-        string $name = $cmd->parts[1];
-        if ($cmd->parts->count() < 3) {
-            FlagValue $v = guard $bag->get($name) else {
-                $console->writeLine("{$name} is not set");
-                return;
-            }
-            string $shown = $v->label();
-            $console->writeLine("{$name} = {$shown}");
-            return;
-        }
-
-        string $raw = $cmd->parts[2];
-        $bag->parse($name, $raw);
-        string $now = $bag->str($name, '');
-        $console->writeLine("{$name} = {$now}");
     }
 }

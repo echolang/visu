@@ -1,0 +1,492 @@
+/**
+ * VG drawing for the instrument overlay HUD: compact line, tab chips, pass bars.
+ * Overlay owns GPU state and sampling; this file paints.
+ */
+
+namespace visu::instrument;
+
+use visu::geo::AABB2D;
+use visu::graphics::{Device, TargetRef, Texture, TextureDesc};
+use visu::math::Vec2;
+use visu::vg::{Canvas, Color, TextAlign};
+
+internal function makeSparkAtlas(Device $device, string $name) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .rgba8, $width: SPARK_ATLAS_W, $height: SPARK_H);
+    $desc->label = $name;
+    return Texture($device, $name, $desc);
+}
+
+internal function measureSparkSlots(
+    Canvas $vg,
+    TargetRef $target,
+    const array<HudRow>& $hud
+) : array<SparkSlot>
+{
+    array<SparkSlot> $slots = array<SparkSlot>();
+    float32 $scale = $target->contentScaleX;
+
+    if ($scale < 0.0001f) {
+        $scale = 1.0f;
+    }
+
+    float32 $pw = ($target->width as float32) / $scale;
+    float32 $ph = ($target->height as float32) / $scale;
+    $vg->begin($pw, $ph, $scale);
+    guard $vg->fontFace('debug') else {
+        $vg->cancel();
+        return $slots;
+    }
+    $vg->fontSize(14.0f);
+    $vg->textAlign(TextAlign(.left, .top));
+    float32 $sepW = $vg->textAdvance(Vec2(HUD_X, HUD_Y), HUD_SEP);
+    float32 $x = HUD_X;
+    usize $i = 0;
+    usize $n = $hud->count();
+
+    while ($i < $n) {
+        HudRow $row = $hud[$i];
+        float32 $tw = $vg->textAdvance(Vec2(HUD_X, HUD_Y), $row->text);
+
+        if ($row->spark) {
+            $slots[] = SparkSlot($row->key, $x, $tw, $tw, $row->higherWorse);
+        }
+
+        $x = $x + $tw;
+
+        if ($i + 1 < $n) {
+            $x = $x + $sepW;
+        }
+
+        $i = $i + 1;
+    }
+
+    $vg->cancel();
+    return $slots;
+}
+
+internal function sparkStripWidth(const array<SparkSlot>& $slots) : int32
+{
+    float32 $right = HUD_X;
+
+    foreach ($slots as $slot) {
+        float32 $end = $slot->x + $slot->colW;
+
+        if ($end > $right) {
+            $right = $end;
+        }
+    }
+
+    int32 $w = sparkRound($right - HUD_X);
+
+    if ($w < 1) {
+        return 0;
+    }
+
+    return $w;
+}
+
+internal function paintHud(
+    Canvas $vg,
+    const array<HudRow>& $lines,
+    const array<string>& $extra,
+    const array<SparkSlot>& $slots
+) : float32
+{
+    guard $vg->fontFace('debug') else {
+        return 0.0f;
+    }
+    $vg->fontSize(14.0f);
+    $vg->textAlign(TextAlign(.left, .top));
+    float32 $x = HUD_X;
+    float32 $y = HUD_Y;
+    float32 $lh = HUD_LH;
+    float32 $pad = HUD_PAD;
+    AABB2D $box = AABB2D(Vec2($x, $y), Vec2($x, $y));
+    bool $any = false;
+    string $line = hudJoin($lines);
+    float32 $lineW = $vg->textAdvance(Vec2($x, $y), $line);
+    AABB2D $cell = AABB2D(Vec2($x, $y), Vec2($x + $lineW, $y + $lh));
+    $box = hudExtend($box, $cell, $any);
+    $any = true;
+
+    int32 $atlasW = sparkStripWidth($slots);
+
+    if ($atlasW > 0) {
+        Vec2 $sparkPos = sparkStripOrigin();
+        AABB2D $chart = AABB2D(
+            $sparkPos,
+            $sparkPos + Vec2($atlasW as float32, SPARK_H as float32),
+        );
+        $box = hudExtend($box, $chart, $any);
+        $any = true;
+    }
+
+    float32 $ey = $y + $lh;
+
+    if ($atlasW > 0) {
+        $ey = $ey + SPARK_GAP + (SPARK_H as float32) + SPARK_GAP;
+    }
+
+    foreach ($extra as $more) {
+        $eb = $vg->textBounds(Vec2($x, $ey), $more);
+        $box = hudExtend($box, $eb, $any);
+        $any = true;
+        $ey = $ey + $lh;
+    }
+
+    if ($any && $box->width() > 0.0f && $box->height() > 0.0f) {
+        Vec2 $padV = Vec2($pad, $pad);
+        $vg->fillColor(Color(0.08f, 0.08f, 0.10f, 0.78f));
+        $vg->fillRounded(
+            $box->min - $padV,
+            Vec2($box->width(), $box->height()) + $padV * 2.0f,
+            4.0f,
+        );
+    }
+
+    $vg->fillColor(Color::white());
+    $vg->text(Vec2($x, $y), $line);
+
+    $ey = $y + $lh;
+
+    if ($atlasW > 0) {
+        $ey = $ey + SPARK_GAP + (SPARK_H as float32) + SPARK_GAP;
+    }
+
+    foreach ($extra as $more) {
+        $vg->text(Vec2($x, $ey), $more);
+        $ey = $ey + $lh;
+    }
+
+    if (!$any) {
+        return $y;
+    }
+
+    return $box->max->y + $pad;
+}
+
+internal function hudJoin(const array<HudRow>& $rows) : string
+{
+    string $out = '';
+    bool $first = true;
+
+    foreach ($rows as $row) {
+        if ($first) {
+            $out = $row->text;
+            $first = false;
+        } else {
+            $out->append(HUD_SEP);
+            $out->append($row->text);
+        }
+    }
+
+    return $out;
+}
+
+internal function hudExtend(AABB2D $box, const AABB2D& $b, bool $any) : AABB2D
+{
+    if (!$any) {
+        return $b;
+    }
+
+    $box->extend($b);
+    return $box;
+}
+
+internal function paintTabs(
+    Canvas $vg,
+    const array<Tab>& $tabs,
+    string $selected,
+    float32 $top
+) : void
+{
+    if ($tabs->empty()) {
+        return;
+    }
+
+    guard $vg->fontFace('debug') else {
+        return;
+    }
+    $vg->fontSize(14.0f);
+    $vg->textAlign(TextAlign(.left, .top));
+    float32 $x = HUD_X;
+    float32 $y = $top + TAB_GAP;
+    float32 $lh = HUD_LH;
+    float32 $pad = HUD_PAD;
+    AABB2D $box = AABB2D(Vec2($x, $y), Vec2($x, $y));
+    bool $any = false;
+    float32 $chipY = $y;
+    float32 $chipH = $lh + CHIP_PAD_Y * 2.0f;
+    float32 $cx = $x;
+    foreach ($tabs as $tab) {
+        float32 $tw = $vg->textAdvance(Vec2($cx, $chipY), $tab->title);
+        float32 $cw = $tw + CHIP_PAD_X * 2.0f;
+        AABB2D $chip = AABB2D(Vec2($cx, $chipY), Vec2($cx + $cw, $chipY + $chipH));
+        $box = hudExtend($box, $chip, $any);
+        $any = true;
+        $cx = $cx + $cw + CHIP_GAP;
+    }
+
+    Tab $body = $tabs[0];
+    bool $haveBody = false;
+    foreach ($tabs as $tab) {
+        if ($tab->id == $selected) {
+            $body = $tab;
+            $haveBody = true;
+        }
+    }
+
+    if (!$haveBody) {
+        $body = $tabs[0];
+    }
+
+    array<PassTiming> $passes = sortPasses($body->passes);
+    float64 $maxNs = passBarMax($passes);
+    array<TabBodyItem> $items = tabBodyItems($body, $passes, $maxNs);
+    float32 $by = $chipY + $chipH + SPARK_GAP;
+    $box = measureTabBody($vg, $box, $any, $x, $by, $lh, $items);
+    $any = true;
+
+    if ($any && $box->width() > 0.0f && $box->height() > 0.0f) {
+        Vec2 $padV = Vec2($pad, $pad);
+        $vg->fillColor(Color(0.08f, 0.08f, 0.10f, 0.78f));
+        $vg->fillRounded(
+            $box->min - $padV,
+            Vec2($box->width(), $box->height()) + $padV * 2.0f,
+            4.0f,
+        );
+    }
+
+    $cx = $x;
+    foreach ($tabs as $tab) {
+        float32 $tw = $vg->textAdvance(Vec2($cx, $chipY), $tab->title);
+        float32 $cw = $tw + CHIP_PAD_X * 2.0f;
+        if ($tab->id == $body->id) {
+            $vg->fillColor(Color(0.22f, 0.24f, 0.30f, 0.95f));
+            $vg->fillRounded(Vec2($cx, $chipY), Vec2($cw, $chipH), 3.0f);
+            $vg->fillColor(Color::white());
+        } else {
+            $vg->fillColor(Color(0.65f, 0.66f, 0.70f, 1.0f));
+        }
+
+        $vg->text(Vec2($cx + CHIP_PAD_X, $chipY + CHIP_PAD_Y), $tab->title);
+        $cx = $cx + $cw + CHIP_GAP;
+    }
+
+    paintTabBody($vg, $x, $by, $lh, $items, $maxNs);
+}
+
+internal enum TabBodyItem
+{
+    case line(string $text);
+    case bars(PassTiming $p);
+}
+
+internal function tabBodyItems(
+    const Tab& $body,
+    const array<PassTiming>& $passes,
+    float64 $maxNs
+) : array<TabBodyItem>
+{
+    array<TabBodyItem> $items = array<TabBodyItem>();
+    array<Section> $sections = $body->sections;
+    foreach ($sections as $sec) {
+        if (!$sec->id->empty()) {
+            TabBodyItem $heading = .line($sec->id);
+            $items[] = $heading;
+        }
+
+        array<Metric> $metrics = $sec->metrics;
+        foreach ($metrics as $m) {
+            string $line = formatMetric($m);
+            if (!$sec->id->empty()) {
+                $line = "  {$line}";
+            }
+
+            TabBodyItem $row = .line($line);
+            $items[] = $row;
+        }
+    }
+
+    foreach ($passes as $p) {
+        TabBodyItem $passLine = .line(formatPass($p));
+        $items[] = $passLine;
+        array<Metric> $extras = $p->extras;
+        foreach ($extras as $m) {
+            string $extra = formatMetric($m);
+            TabBodyItem $extraLine = .line("    {$extra}");
+            $items[] = $extraLine;
+        }
+
+        if ($maxNs > 0.0) {
+            TabBodyItem $bar = .bars($p);
+            $items[] = $bar;
+        }
+    }
+
+    return $items;
+}
+
+internal function measureTabBody(
+    Canvas $vg,
+    AABB2D $box,
+    bool $any,
+    float32 $x,
+    float32 $y,
+    float32 $lh,
+    const array<TabBodyItem>& $items
+) : AABB2D
+{
+    float32 $cy = $y;
+    foreach ($items as $item) {
+        $box = extendTabBodyItem($vg, $box, $any, $x, $cy, $item);
+        $any = true;
+        $cy = $cy + tabBodyItemHeight($item, $lh);
+    }
+
+    return $box;
+}
+
+internal function paintTabBody(
+    Canvas $vg,
+    float32 $x,
+    float32 $y,
+    float32 $lh,
+    const array<TabBodyItem>& $items,
+    float64 $maxNs
+) : void
+{
+    float32 $cy = $y;
+    foreach ($items as $item) {
+        paintTabBodyItem($vg, $x, $cy, $item, $maxNs);
+        $cy = $cy + tabBodyItemHeight($item, $lh);
+    }
+}
+
+internal function tabBodyItemHeight(TabBodyItem $item, float32 $lh) : float32
+{
+    return match ($item) {
+        TabBodyItem::line($text) => $lh,
+        TabBodyItem::bars($p) => barStack($p) + SPARK_GAP,
+    };
+}
+
+internal function extendTabBodyItem(
+    Canvas $vg,
+    AABB2D $box,
+    bool $any,
+    float32 $x,
+    float32 $y,
+    TabBodyItem $item
+) : AABB2D
+{
+    return match ($item) {
+        TabBodyItem::line($text) => hudExtend($box, lineBox($vg, $x, $y, $text), $any),
+        TabBodyItem::bars($p) => hudExtend(
+            $box,
+            AABB2D(Vec2($x, $y), Vec2($x + BAR_W, $y + barStack($p))),
+            $any
+        ),
+    };
+}
+
+internal function paintTabBodyItem(
+    Canvas $vg,
+    float32 $x,
+    float32 $y,
+    TabBodyItem $item,
+    float64 $maxNs
+) : void
+{
+    match ($item) {
+        TabBodyItem::line($text) => {
+            paintBodyLine($vg, $x, $y, $text);
+        },
+        TabBodyItem::bars($p) => {
+            paintBodyBars($vg, $x, $y, $p, $maxNs);
+        },
+    }
+}
+
+internal function barStack(PassTiming $p) : float32
+{
+    return passBarStack($p);
+}
+
+internal function lineBox(Canvas $vg, float32 $x, float32 $y, string $text) : AABB2D
+{
+    return $vg->textBounds(Vec2($x, $y), $text);
+}
+
+internal function paintBodyLine(Canvas $vg, float32 $x, float32 $y, string $text) : void
+{
+    $vg->fillColor(Color::white());
+    $vg->text(Vec2($x, $y), $text);
+}
+
+internal function paintBodyBars(
+    Canvas $vg,
+    float32 $x,
+    float32 $y,
+    PassTiming $p,
+    float64 $maxNs
+) : void
+{
+    paintPassBars($vg, $x, $y, $p, $maxNs);
+}
+
+internal function paintPassBars(
+    Canvas $vg,
+    float32 $x,
+    float32 $y,
+    const PassTiming& $p,
+    float64 $maxNs
+) : float32
+{
+    float32 $cy = $y;
+    float32 $cpuW = ((($p->cpuNs / $maxNs) as float32) * BAR_W);
+    $vg->fillColor(Color(0.35f, 0.85f, 0.45f, 0.85f));
+    if ($cpuW > 1.0f) {
+        $vg->fillRect(Vec2($x, $cy), Vec2($cpuW, BAR_H));
+    }
+
+    $cy = $cy + BAR_H;
+    if ($p->gpuNs > 0.0) {
+        $cy = $cy + BAR_GAP;
+        float32 $gpuW = ((($p->gpuNs / $maxNs) as float32) * BAR_W);
+        $vg->fillColor(Color(0.40f, 0.65f, 0.95f, 0.85f));
+        if ($gpuW > 1.0f) {
+            $vg->fillRect(Vec2($x, $cy), Vec2($gpuW, BAR_H));
+        }
+
+        $cy = $cy + BAR_H;
+    }
+
+    return $cy;
+}
+
+internal function passBarMax(const array<PassTiming>& $passes) : float64
+{
+    float64 $maxNs = 0.0;
+    foreach ($passes as $p) {
+        if ($p->cpuNs > $maxNs) {
+            $maxNs = $p->cpuNs;
+        }
+
+        if ($p->gpuNs > $maxNs) {
+            $maxNs = $p->gpuNs;
+        }
+    }
+
+    return $maxNs;
+}
+
+internal function passBarStack(const PassTiming& $p) : float32
+{
+    if ($p->gpuNs > 0.0) {
+        return BAR_H + BAR_GAP + BAR_H;
+    }
+
+    return BAR_H;
+}
