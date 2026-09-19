@@ -1,16 +1,16 @@
 /**
- * Console verbs `view` (which deferred buffer the renderer blits) and `ssao` (on/off).
- * Holds the renderer; does not draw.
+ * Console verbs `view` (which deferred buffer the renderer blits) and `ssao`
+ * (on/off, quality, strength). Holds the renderer; does not draw.
  */
 
 namespace visu::console;
 
-use visu::graphics::{DeferredRenderer, DeferredView, SsaoQuality};
+use visu::graphics::{DeferredRenderer, DeferredView, SsaoLevel, SsaoQuality};
 use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
 use visu::signal::ConsoleCommandSignal;
 
 internal const VIEW_USAGE = 'usage: view [scene|albedo|normal|roughness|metallic|ao|emissive|position|ssao]';
-internal const SSAO_USAGE = 'usage: ssao [on|off|toggle]';
+internal const SSAO_USAGE = 'usage: ssao [on|off|toggle|quality <low|medium|high|ultra>|strength <x>]';
 
 public class DeferredViewConsole : ConsoleCommandHandler
 {
@@ -30,7 +30,7 @@ public class DeferredViewConsole : ConsoleCommandHandler
     public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
     {
         $registry->add('view', $this, 'scene|albedo|normal|roughness|metallic|ao|emissive|position|ssao');
-        $registry->add('ssao', $this, 'on|off|toggle');
+        $registry->add('ssao', $this, 'on|off|toggle|quality <low|medium|high|ultra>|strength <x>');
         array<string> $names = array<string>();
         $names[] = 'view';
         $names[] = 'ssao';
@@ -90,6 +90,12 @@ public class DeferredViewConsole : ConsoleCommandHandler
             SsaoConsoleAction::toggle => {
                 $this->toggleSsao($console);
             },
+            SsaoConsoleAction::strength($value) => {
+                $this->setStrength($value, $console);
+            },
+            SsaoConsoleAction::quality($level) => {
+                $this->setQuality($level, $console);
+            },
         };
     }
 
@@ -134,15 +140,54 @@ public class DeferredViewConsole : ConsoleCommandHandler
         }
     }
 
-    private function ssaoStatus() : string
+    private function setStrength(float32 $value, DebugConsole $console) : void
+    {
+        SsaoQuality $quality = $this->current();
+        $quality->strength = $value;
+        $console->writeLine($this->ssaoStatus());
+    }
+
+    private function setQuality(SsaoLevel $level, DebugConsole $console) : void
+    {
+        $this->current()->apply($level);
+        $console->writeLine($this->ssaoStatus());
+    }
+
+    /**
+     * Live settings when SSAO is on, otherwise the stashed ones (ultra if nothing was held).
+     */
+    private function current() : SsaoQuality
     {
         SsaoQuality? $ssao = $this->renderer->ssao;
+        if ($ssao != null) {
+            SsaoQuality $live = guard $ssao;
+            return $live;
+        }
+
+        SsaoQuality $held = $this->held ?? SsaoQuality::ultra();
+        $this->held = $held;
+        return $held;
+    }
+
+    private function ssaoStatus() : string
+    {
+        string $state = 'off';
+        if ($this->renderer->ssao != null) {
+            $state = 'on';
+        }
+
+        SsaoQuality? $ssao = $this->renderer->ssao;
         if ($ssao == null) {
-            return 'ssao: off';
+            $ssao = $this->held;
+        }
+
+        if ($ssao == null) {
+            return "ssao: {$state}";
         }
 
         SsaoQuality $quality = guard $ssao;
-        return "ssao: on, radius {$quality->radius}, samples {$quality->samples}";
+        string $level = $quality->level->label();
+        return "ssao: {$state}, quality {$level}, strength {$quality->strength}, radius {$quality->radius}";
     }
 }
 
@@ -151,11 +196,14 @@ internal enum SsaoConsoleAction
     case status;
     case enable(bool $on);
     case toggle;
+    case strength(float32 $value);
+    case quality(SsaoLevel $level);
     case usage;
 }
 
 /**
- * `ssao` alone is status; `ssao on|off|toggle` flips the renderer field.
+ * `ssao` alone is status; `ssao on|off|toggle` flips the renderer field;
+ * `ssao quality` is the cost preset; `ssao strength` is the occlusion exponent.
  */
 internal function parseSsaoConsole(const ConsoleCommandSignal& $cmd) : SsaoConsoleAction
 {
@@ -163,25 +211,56 @@ internal function parseSsaoConsole(const ConsoleCommandSignal& $cmd) : SsaoConso
         return .usage;
     }
 
-    if ($cmd->parts->count() == 1) {
+    usize $n = $cmd->parts->count();
+    if ($n == 1) {
         return .status;
-    }
-
-    if ($cmd->parts->count() != 2) {
-        return .usage;
     }
 
     string $verb = $cmd->parts[1];
     if ($verb == 'on') {
+        if ($n != 2) {
+            return .usage;
+        }
+
         return .enable(true);
     }
 
     if ($verb == 'off') {
+        if ($n != 2) {
+            return .usage;
+        }
+
         return .enable(false);
     }
 
     if ($verb == 'toggle') {
+        if ($n != 2) {
+            return .usage;
+        }
+
         return .toggle;
+    }
+
+    if ($verb == 'strength') {
+        if ($n != 3) {
+            return .usage;
+        }
+
+        float64 $value = guard str::float($cmd->parts[2]) else {
+            return .usage;
+        }
+        return .strength($value as float32);
+    }
+
+    if ($verb == 'quality') {
+        if ($n != 3) {
+            return .usage;
+        }
+
+        SsaoLevel $level = guard SsaoLevel::parse($cmd->parts[2]) else {
+            return .usage;
+        }
+        return .quality($level);
     }
 
     return .usage;

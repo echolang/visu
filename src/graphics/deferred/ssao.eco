@@ -10,10 +10,57 @@ public const int32 SSAO_MAX_SAMPLES = 64;
 public const int32 SSAO_NOISE_SIZE = 4;
 
 /**
+ * Cost preset: sample count, buffer scale, and bias. Strength and radius are separate.
+ */
+public enum SsaoLevel
+{
+    case low;
+    case medium;
+    case high;
+    case ultra;
+
+    public const function label() : string
+    {
+        return match ($this) {
+            SsaoLevel::low => 'low',
+            SsaoLevel::medium => 'medium',
+            SsaoLevel::high => 'high',
+            SsaoLevel::ultra => 'ultra',
+        };
+    }
+
+    public static function parse(const string& $name) : SsaoLevel?
+    {
+        if ($name == 'low') {
+            return .low;
+        }
+
+        if ($name == 'medium') {
+            return .medium;
+        }
+
+        if ($name == 'high') {
+            return .high;
+        }
+
+        if ($name == 'ultra') {
+            return .ultra;
+        }
+
+        return null;
+    }
+}
+
+/**
  * Class so `SsaoQuality?` can be a renderer field; Echo crashes on optional structs.
  */
 public class SsaoQuality
 {
+
+    /**
+     * Which cost preset last wrote sample count, buffer scale, and bias.
+     */
+    public SsaoLevel $level;
 
     /**
      * Hemisphere radius in world units.
@@ -38,6 +85,7 @@ public class SsaoQuality
 
     public constructor()
     {
+        $this->level = .ultra;
         $this->radius = 0.25f;
         $this->biasRatio = 0.08f;
         $this->strength = 2.0f;
@@ -48,6 +96,7 @@ public class SsaoQuality
     public static function low() : SsaoQuality
     {
         SsaoQuality $q = SsaoQuality();
+        $q->level = .low;
         $q->radius = 0.12f;
         $q->biasRatio = 0.2917f;
         $q->strength = 1.4f;
@@ -59,6 +108,7 @@ public class SsaoQuality
     public static function medium() : SsaoQuality
     {
         SsaoQuality $q = SsaoQuality();
+        $q->level = .medium;
         $q->radius = 0.16f;
         $q->biasRatio = 0.1875f;
         $q->strength = 1.6f;
@@ -70,6 +120,7 @@ public class SsaoQuality
     public static function high() : SsaoQuality
     {
         SsaoQuality $q = SsaoQuality();
+        $q->level = .high;
         $q->radius = 0.20f;
         $q->biasRatio = 0.125f;
         $q->strength = 1.8f;
@@ -80,6 +131,23 @@ public class SsaoQuality
     public static function ultra() : SsaoQuality
     {
         return SsaoQuality();
+    }
+
+    /**
+     * Sample count, buffer scale, and bias from `$level`. Radius and strength stay.
+     */
+    public function apply(SsaoLevel $level) : void
+    {
+        SsaoQuality $preset = match ($level) {
+            SsaoLevel::low => SsaoQuality::low(),
+            SsaoLevel::medium => SsaoQuality::medium(),
+            SsaoLevel::high => SsaoQuality::high(),
+            SsaoLevel::ultra => SsaoQuality::ultra(),
+        };
+        $this->biasRatio = $preset->biasRatio;
+        $this->scale = $preset->scale;
+        $this->samples = $preset->samples;
+        $this->level = $level;
     }
 }
 

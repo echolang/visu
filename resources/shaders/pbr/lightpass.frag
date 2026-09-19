@@ -98,10 +98,10 @@ void main()
         specIBL = env * F;
 #endif
 
-        ambient = kD * diffuseIBL * s.ao + specIBL * s.ao;
+        ambient = kD * diffuseIBL + specIBL;
     }
 
-    vec3 color = Lo + ambient + s.emissive;
+    vec3 color = (Lo + ambient) * s.ao + s.emissive;
     color = fog_apply(color, gbuffer.relative);
     color = apply_tonemap(color);
     color = gamma_correct(color);

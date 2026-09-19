@@ -465,8 +465,8 @@ fragment fs_out fs(fs_in in [[stage_in]], constant SkyUniforms& _611 [[buffer(2)
     float3 prefiltered = mix(ibl_prefilter_map.sample(ibl_prefilter_mapSmplr, R, level(s.roughness * maxLod)).xyz, ibl_prefilter_map_b.sample(ibl_prefilter_map_bSmplr, R, level(s.roughness * maxLod)).xyz, float3(_1158.u_ibl.z));
     float2 brdf = ibl_brdf_lut.sample(ibl_brdf_lutSmplr, float2(NdotV, s.roughness)).xy;
     specIBL = prefiltered * ((s.F0 * brdf.x) + float3(brdf.y));
-    ambient = ((kD * diffuseIBL) * s.ao) + (specIBL * s.ao);
-    float3 color = (Lo + ambient) + s.emissive;
+    ambient = (kD * diffuseIBL) + specIBL;
+    float3 color = ((Lo + ambient) * s.ao) + s.emissive;
     float3 param_9 = color;
     float3 param_10 = gbuffer.relative;
     color = fog_apply(param_9, param_10, _611, _908);
