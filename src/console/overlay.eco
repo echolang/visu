@@ -1,0 +1,159 @@
+/**
+ * Console grammar and handler for the instrument overlay. The overlay remains the HUD; this type
+ * owns the `metrics` verb.
+ */
+
+namespace visu::console;
+
+use visu::instrument::{Overlay, Sample, Tab, findTab, formatLine, formatTab};
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal enum MetricsAction
+{
+    case status;
+    case usage;
+    case on;
+    case off;
+    case toggle;
+    case expand(bool $on);
+    case expandToggle;
+    case tab(string $id);
+}
+
+/**
+ * `metrics` alone is status; `metrics on|off|toggle`; `metrics expand [on|off]`; `metrics tab <id>`.
+ */
+internal function parseMetricsConsole(const ConsoleCommandSignal& $cmd) : MetricsAction
+{
+    if (!$cmd->isAction('metrics')) {
+        return .usage;
+    }
+
+    if ($cmd->parts->count() < 2) {
+        return .status;
+    }
+
+    string $arg = $cmd->parts[1];
+    if ($arg == 'on') {
+        return .on;
+    }
+
+    if ($arg == 'off') {
+        return .off;
+    }
+
+    if ($arg == 'toggle') {
+        return .toggle;
+    }
+
+    if ($arg == 'expand') {
+        if ($cmd->parts->count() >= 3) {
+            string $on = $cmd->parts[2];
+            if ($on == 'on') {
+                return .expand(true);
+            }
+
+            if ($on == 'off') {
+                return .expand(false);
+            }
+
+            return .usage;
+        }
+
+        return .expandToggle;
+    }
+
+    if ($arg == 'tab') {
+        if ($cmd->parts->count() < 3) {
+            return .usage;
+        }
+
+        return .tab($cmd->parts[2]);
+    }
+
+    return .usage;
+}
+
+public class OverlayConsole : ConsoleCommandHandler
+{
+    private Overlay $overlay;
+
+    public constructor(Overlay $overlay)
+    {
+        $this->overlay = $overlay;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('metrics', $this, 'on|off|toggle|expand|tab <id>');
+        array<string> $names = array<string>();
+        $names[] = 'metrics';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        MetricsAction $action = parseMetricsConsole($cmd);
+        match ($action) {
+            MetricsAction::status => {
+                $this->writeStatus($console);
+            },
+            MetricsAction::usage => {
+                $console->writeLine('usage: metrics [on|off|toggle|expand|tab <id>]');
+            },
+            MetricsAction::on => {
+                $this->overlay->enabled = true;
+                $console->writeLine('metrics: on');
+            },
+            MetricsAction::off => {
+                $this->overlay->enabled = false;
+                $console->writeLine('metrics: off');
+            },
+            MetricsAction::toggle => {
+                $this->overlay->enabled = !$this->overlay->enabled;
+                $this->writeStatus($console);
+            },
+            MetricsAction::expand($on) => {
+                $this->overlay->expanded = $on;
+                $this->writeStatus($console);
+            },
+            MetricsAction::expandToggle => {
+                $this->overlay->expanded = !$this->overlay->expanded;
+                $this->writeStatus($console);
+            },
+            MetricsAction::tab($id) => {
+                $this->overlay->selected = $id;
+                $this->overlay->expanded = true;
+                $this->writeStatus($console);
+            },
+        };
+    }
+
+    private function writeStatus(DebugConsole $console) : void
+    {
+        Overlay $overlay = $this->overlay;
+        string $vis = 'off';
+        if ($overlay->enabled) {
+            $vis = 'on';
+        }
+
+        string $exp = 'compact';
+        if ($overlay->expanded) {
+            $exp = 'expanded';
+        }
+
+        $console->writeLine("metrics: {$vis} {$exp} tab {$overlay->selected}");
+        Sample $sample = guard $overlay->lastSample else {
+            return;
+        }
+        $console->writeLine(formatLine($sample));
+        Tab $tab = guard findTab($sample, $overlay->selected) else {
+            return;
+        }
+        array<string> $lines = formatTab($tab);
+        foreach ($lines as $line) {
+            $console->writeLine($line);
+        }
+    }
+}

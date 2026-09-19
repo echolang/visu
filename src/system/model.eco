@@ -22,9 +22,9 @@ use visu::graphics::{
     PipelineError, Raster, RenderContext, RenderEncoder, ShaderProgram, VertexLayout,
     debugLinePass, lodIndex, modelLayout
 };
+use visu::console::lodColor;
 use visu::math::{Mat4, Vec3, Vec4, length};
-use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
-use visu::signal::ConsoleCommandSignal;
+use visu::runtime::DebugConsole;
 
 /**
  * One model's assembler handles, lod-major: level `l` is `$handles[$lodStart[l] .. $lodStart[l + 1])`.
@@ -43,7 +43,7 @@ internal class ModelHandles
     }
 }
 
-public class ModelSystem : System, ConsoleCommandHandler
+public class ModelSystem : System
 {
     public ModelBank $bank;
     public DeferredRenderer $renderer;
@@ -308,53 +308,10 @@ public class ModelSystem : System, ConsoleCommandHandler
         return $this->dca->culledCount();
     }
 
-    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
-    {
-        $registry->add('model', $this, 'lod <bias>|wire [on|off]|bounds [on|off]|octree [on|off]');
-        array<string> $names = array<string>();
-        $names[] = 'model';
-        return $names;
-    }
-
     /**
-     * `model` prints the last frame's counts; `model lod <bias>`, `model wire`, `model bounds` and
-     * `model octree` tune what is drawn.
+     * Last frame's counts for the `model` verb.
      */
-    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
-    {
-        ModelConsoleAction $action = parseModelConsole($cmd);
-        match ($action) {
-            ModelConsoleAction::status => {
-                $this->printStatus($console);
-            },
-            ModelConsoleAction::usage => {
-                $console->writeLine('usage: model [lod <bias>|wire [on|off]|bounds [on|off]|octree [on|off]]');
-            },
-            ModelConsoleAction::lod($bias) => {
-                $this->setLodBias($console, $bias);
-            },
-            ModelConsoleAction::wire($on) => {
-                $this->setWireframe($console, $on);
-            },
-            ModelConsoleAction::wireToggle => {
-                $this->setWireframe($console, !$this->wireframe);
-            },
-            ModelConsoleAction::bounds($on) => {
-                $this->setBounds($console, $on);
-            },
-            ModelConsoleAction::boundsToggle => {
-                $this->setBounds($console, !$this->showBounds);
-            },
-            ModelConsoleAction::octree($on) => {
-                $this->setOctree($console, $on);
-            },
-            ModelConsoleAction::octreeToggle => {
-                $this->setOctree($console, !$this->showOctree);
-            },
-        };
-    }
-
-    private function printStatus(DebugConsole $console) : void
+    internal function printStatus(DebugConsole $console) : void
     {
         int32 $commands = $this->dca->commandCount();
         int32 $culled = $this->dca->culledCount();
@@ -376,7 +333,7 @@ public class ModelSystem : System, ConsoleCommandHandler
         $console->writeLine("model: octree {$cells} cells, overlay {$segments} segments");
     }
 
-    private function setBounds(DebugConsole $console, bool $on) : void
+    internal function setBounds(DebugConsole $console, bool $on) : void
     {
         $this->showBounds = $on;
         flags()->set('model.bounds', FlagValue::boolean($on));
@@ -389,7 +346,7 @@ public class ModelSystem : System, ConsoleCommandHandler
         $console->writeLine('model: bounds off');
     }
 
-    private function setOctree(DebugConsole $console, bool $on) : void
+    internal function setOctree(DebugConsole $console, bool $on) : void
     {
         $this->showOctree = $on;
         flags()->set('model.octree', FlagValue::boolean($on));
@@ -402,7 +359,7 @@ public class ModelSystem : System, ConsoleCommandHandler
         $console->writeLine('model: octree off');
     }
 
-    private function setLodBias(DebugConsole $console, float32 $bias) : void
+    internal function setLodBias(DebugConsole $console, float32 $bias) : void
     {
         if ($bias <= 0.0f) {
             $console->writeLine('model: lod bias must be positive');
@@ -415,7 +372,7 @@ public class ModelSystem : System, ConsoleCommandHandler
         $console->writeLine("model: lod bias {$bias}");
     }
 
-    private function setWireframe(DebugConsole $console, bool $on) : void
+    internal function setWireframe(DebugConsole $console, bool $on) : void
     {
         $this->wireframe = $on;
         $this->opaque = null;

@@ -1,0 +1,40 @@
+/**
+ * Metrics console grammar.
+ */
+
+use visu::console::{MetricsAction, parseMetricsConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal function metricsLine(const string& $line) : MetricsAction
+{
+    return parseMetricsConsole(ConsoleCommandSignal($line));
+}
+
+test metrics_console_grammar
+{
+    bool $status = match (metricsLine('metrics')) {
+        MetricsAction::status => true,
+        else => false,
+    };
+    assert($status, 'bare metrics is status');
+    bool $on = match (metricsLine('metrics on')) {
+        MetricsAction::on => true,
+        else => false,
+    };
+    assert($on, 'on');
+    bool $expandOff = match (metricsLine('metrics expand off')) {
+        MetricsAction::expand($v) => !$v,
+        else => false,
+    };
+    assert($expandOff, 'expand off');
+    string $tabId = match (metricsLine('metrics tab graph')) {
+        MetricsAction::tab($id) => $id,
+        else => '',
+    };
+    assert($tabId == 'graph', 'tab id');
+    bool $usage = match (metricsLine('metrics expand maybe')) {
+        MetricsAction::usage => true,
+        else => false,
+    };
+    assert($usage, 'bad expand is usage');
+}

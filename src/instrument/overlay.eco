@@ -15,11 +15,10 @@ use visu::graphics::{
 use visu::math::Vec2;
 use visu::os::input;
 use visu::os::input::KeyPhase;
-use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
-use visu::signal::{ConsoleCommandSignal, Dispatcher, Flow, KeySignal};
+use visu::signal::{Dispatcher, Flow, KeySignal};
 use visu::vg::{Canvas, VgError, VgRenderer};
 
-public class Overlay : ConsoleCommandHandler
+public class Overlay
 {
     public bool $enabled = true;
     public bool $expanded = false;
@@ -35,7 +34,10 @@ public class Overlay : ConsoleCommandHandler
     private array<string> $rows;
     private bool $loaded;
     private bool $dead;
-    private Sample? $lastSample;
+    /**
+     * Last HUD sample, read by OverlayConsole for `metrics` status.
+     */
+    internal Sample? $lastSample;
 
     public constructor(Device $device)
     {
@@ -122,78 +124,6 @@ public class Overlay : ConsoleCommandHandler
 
             return .proceed;
         });
-    }
-
-    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
-    {
-        $registry->add('metrics', $this, 'on|off|toggle|expand|tab <id>');
-        array<string> $names = array<string>();
-        $names[] = 'metrics';
-        return $names;
-    }
-
-    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
-    {
-        MetricsAction $action = parseMetricsConsole($cmd);
-        match ($action) {
-            MetricsAction::status => {
-                $this->writeStatus($console);
-            },
-            MetricsAction::usage => {
-                $console->writeLine('usage: metrics [on|off|toggle|expand|tab <id>]');
-            },
-            MetricsAction::on => {
-                $this->enabled = true;
-                $console->writeLine('metrics: on');
-            },
-            MetricsAction::off => {
-                $this->enabled = false;
-                $console->writeLine('metrics: off');
-            },
-            MetricsAction::toggle => {
-                $this->enabled = !$this->enabled;
-                $this->writeStatus($console);
-            },
-            MetricsAction::expand($on) => {
-                $this->expanded = $on;
-                $this->writeStatus($console);
-            },
-            MetricsAction::expandToggle => {
-                $this->expanded = !$this->expanded;
-                $this->writeStatus($console);
-            },
-            MetricsAction::tab($id) => {
-                $this->selected = $id;
-                $this->expanded = true;
-                $this->writeStatus($console);
-            },
-        };
-    }
-
-    private function writeStatus(DebugConsole $console) : void
-    {
-        string $vis = 'off';
-        if ($this->enabled) {
-            $vis = 'on';
-        }
-
-        string $exp = 'compact';
-        if ($this->expanded) {
-            $exp = 'expanded';
-        }
-
-        $console->writeLine("metrics: {$vis} {$exp} tab {$this->selected}");
-        Sample $sample = guard $this->lastSample else {
-            return;
-        }
-        $console->writeLine(formatLine($sample));
-        Tab $tab = guard findTab($sample, $this->selected) else {
-            return;
-        }
-        array<string> $lines = formatTab($tab);
-        foreach ($lines as $line) {
-            $console->writeLine($line);
-        }
     }
 
     public function cycle(int32 $delta) : void

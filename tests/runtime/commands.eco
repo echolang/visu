@@ -1,15 +1,14 @@
 /**
- * ConsoleCommandRegistry routing and Systems ConsoleCommandHandler walk.
+ * ConsoleCommandRegistry routing and Systems.bindConsole walk.
  */
 
-use visu::ecs::{Entities, Schedule, System, Systems};
-use visu::graphics::RenderContext;
+use visu::ecs::{Entities, Systems};
 use visu::os::{Window, WindowHints};
 use visu::os::input::InputHub;
 use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
 use visu::signal::{ConsoleCommandSignal, Dispatcher};
 
-class PingSystem : System, ConsoleCommandHandler
+class PingConsole : ConsoleCommandHandler
 {
     public int32 $hits;
     public string $last;
@@ -18,26 +17,6 @@ class PingSystem : System, ConsoleCommandHandler
     {
         $this->hits = 0;
         $this->last = '';
-    }
-
-    public function register(Entities $entities) : void
-    {
-    }
-
-    public function unregister(Entities $entities) : void
-    {
-    }
-
-    public function schedule(Schedule& $schedule) : void
-    {
-    }
-
-    public function update(Entities $entities) : void
-    {
-    }
-
-    public function render(Entities $entities, RenderContext $ctx) : void
-    {
     }
 
     public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
@@ -58,7 +37,7 @@ class PingSystem : System, ConsoleCommandHandler
 
 test registry_add_and_find
 {
-    PingSystem $ping = PingSystem();
+    PingConsole $ping = PingConsole();
     ConsoleCommandRegistry $reg = ConsoleCommandRegistry();
     $reg->add('ping', $ping, 'pong');
     assert($reg->usage('ping') == 'pong', 'usage');
@@ -70,14 +49,14 @@ test registry_add_and_find
         assert(false, 'missing');
         return;
     }
-    assert($found instanceof PingSystem, 'same');
+    assert($found instanceof PingConsole, 'same');
     assert($reg->find('nope') == null, 'absent');
 }
 
 #[tests: expects death]
 test registry_duplicate_add_dies
 {
-    PingSystem $ping = PingSystem();
+    PingConsole $ping = PingConsole();
     ConsoleCommandRegistry $reg = ConsoleCommandRegistry();
     $reg->add('ping', $ping);
     $reg->add('ping', $ping);
@@ -87,12 +66,12 @@ test systems_register_routes_handler
 {
     Dispatcher $d = Dispatcher();
     DebugConsole $c = DebugConsole($d, InputHub(Window('commands', 64, 64, WindowHints()), $d));
-    PingSystem $ping = PingSystem();
+    PingConsole $ping = PingConsole();
     CountingSystem $other = CountingSystem();
     Systems $systems = Systems();
     $systems->listen($c);
     $systems->bind($other);
-    $systems->bind($ping);
+    $systems->bindConsole($ping);
 
     Entities $world = Entities();
     $systems->register($world);
@@ -129,12 +108,12 @@ test systems_register_keeps_foreign_verbs
 {
     Dispatcher $d = Dispatcher();
     DebugConsole $c = DebugConsole($d, InputHub(Window('commands', 64, 64, WindowHints()), $d));
-    PingSystem $host = PingSystem();
+    PingConsole $host = PingConsole();
     $c->registry->add('dcapture', $host);
-    PingSystem $ping = PingSystem();
+    PingConsole $ping = PingConsole();
     Systems $systems = Systems();
     $systems->listen($c);
-    $systems->bind($ping);
+    $systems->bindConsole($ping);
     Entities $world = Entities();
     $systems->register($world);
     array<string> $names = $c->registry->names();

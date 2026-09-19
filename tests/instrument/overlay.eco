@@ -1,13 +1,10 @@
 /**
  * Graph bar stack height: measure and paint must agree so bars stay inside the panel.
- * Metrics console grammar.
  */
 
 use visu::instrument::{
-    MetricsAction, PassTiming, Section, Tab, TabBodyItem, parseMetricsConsole, passBarStack,
-    tabBodyItems
+    PassTiming, Section, Tab, TabBodyItem, passBarStack, tabBodyItems
 };
-use visu::signal::ConsoleCommandSignal;
 
 test pass_bar_stack_cpu_only
 {
@@ -37,38 +34,4 @@ test tab_body_items_are_one_walk
     assert($none->count() == 1, 'pass line, no bars when max is 0');
     array<TabBodyItem> $withBars = tabBodyItems($tab, $passes, 1000000.0);
     assert($withBars->count() == 2, 'pass line plus bars');
-}
-
-internal function metricsLine(const string& $line) : MetricsAction
-{
-    return parseMetricsConsole(ConsoleCommandSignal($line));
-}
-
-test metrics_console_grammar
-{
-    bool $status = match (metricsLine('metrics')) {
-        MetricsAction::status => true,
-        else => false,
-    };
-    assert($status, 'bare metrics is status');
-    bool $on = match (metricsLine('metrics on')) {
-        MetricsAction::on => true,
-        else => false,
-    };
-    assert($on, 'on');
-    bool $expandOff = match (metricsLine('metrics expand off')) {
-        MetricsAction::expand($v) => !$v,
-        else => false,
-    };
-    assert($expandOff, 'expand off');
-    string $tabId = match (metricsLine('metrics tab graph')) {
-        MetricsAction::tab($id) => $id,
-        else => '',
-    };
-    assert($tabId == 'graph', 'tab id');
-    bool $usage = match (metricsLine('metrics expand maybe')) {
-        MetricsAction::usage => true,
-        else => false,
-    };
-    assert($usage, 'bad expand is usage');
 }

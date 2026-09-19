@@ -1,12 +1,14 @@
 /**
- * Console grammar and overlay ramps for `ModelSystem`. The system remains the handler; this file
- * is the parser and the colours so the draw path does not carry them.
+ * Console grammar, handler, and overlay ramps for `ModelSystem`. The system draws; this type owns
+ * the `model` verb.
  */
 
-namespace visu::system;
+namespace visu::console;
 
 use visu::math::Vec4;
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
 use visu::signal::ConsoleCommandSignal;
+use visu::system::ModelSystem;
 
 internal enum ModelConsoleAction
 {
@@ -137,4 +139,60 @@ public function octreeColor(int32 $depth) : Vec4
     }
 
     return Vec4(0.04f + 0.10f * $t, 0.12f + 0.26f * $t, 0.40f + 0.60f * $t, 1.0f);
+}
+
+public class ModelConsole : ConsoleCommandHandler
+{
+    private ModelSystem $models;
+
+    public constructor(ModelSystem $models)
+    {
+        $this->models = $models;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('model', $this, 'lod <bias>|wire [on|off]|bounds [on|off]|octree [on|off]');
+        array<string> $names = array<string>();
+        $names[] = 'model';
+        return $names;
+    }
+
+    /**
+     * `model` prints the last frame's counts; `model lod <bias>`, `model wire`, `model bounds` and
+     * `model octree` tune what is drawn.
+     */
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        ModelConsoleAction $action = parseModelConsole($cmd);
+        match ($action) {
+            ModelConsoleAction::status => {
+                $this->models->printStatus($console);
+            },
+            ModelConsoleAction::usage => {
+                $console->writeLine('usage: model [lod <bias>|wire [on|off]|bounds [on|off]|octree [on|off]]');
+            },
+            ModelConsoleAction::lod($bias) => {
+                $this->models->setLodBias($console, $bias);
+            },
+            ModelConsoleAction::wire($on) => {
+                $this->models->setWireframe($console, $on);
+            },
+            ModelConsoleAction::wireToggle => {
+                $this->models->setWireframe($console, !$this->models->wireframe);
+            },
+            ModelConsoleAction::bounds($on) => {
+                $this->models->setBounds($console, $on);
+            },
+            ModelConsoleAction::boundsToggle => {
+                $this->models->setBounds($console, !$this->models->showBounds);
+            },
+            ModelConsoleAction::octree($on) => {
+                $this->models->setOctree($console, $on);
+            },
+            ModelConsoleAction::octreeToggle => {
+                $this->models->setOctree($console, !$this->models->showOctree);
+            },
+        };
+    }
 }

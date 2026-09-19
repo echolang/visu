@@ -83,19 +83,16 @@ public class Systems
     }
 
     /**
-     * Bind a system that also owns debug-console verbs.
-     * Selected when the argument conforms, so `register()` can ask it for names.
-     * A stored `System` cannot be recast; the widening happens here while the class is known.
+     * Scene-scoped debug-console verbs. Installed in register(), dropped in unregister().
+     * Process-scoped verbs (flag, dump, metrics) register on Host, not here.
      */
-    public function bind<T : ConsoleCommandHandler>(T $system) : void
+    public function bindConsole(ConsoleCommandHandler $handler) : void
     {
-        System $asSystem = $system;
-        $this->bind($asSystem);
-        $this->handlers[] = $system;
+        $this->handlers[] = $handler;
     }
 
     /**
-     * Bind already-erased systems. Console verbs on those values are not registered; bind the concrete class instead.
+     * Bind already-erased systems. Console verbs are not inferred from these values; call bindConsole.
      */
     public function bindAll(const array<System>& $systems) : void
     {
@@ -105,7 +102,7 @@ public class Systems
     }
 
     /**
-     * Scene load attaches the host console so register() can walk ConsoleCommandHandler systems.
+     * Scene load attaches the host console so register() can install bound handlers.
      */
     public function listen(DebugConsole $console) : void
     {
