@@ -21,7 +21,7 @@ class ConsoleCaught
 
 function consoleToggle(Dispatcher $d) : void
 {
-    $d->dispatch(KeySignal(.c, 0, .press, MOD_CONTROL));
+    $d->dispatch(KeySignal(.graveAccent, 0, .press, 0));
 }
 
 function consolePair(Dispatcher $d) : DebugConsole
@@ -29,7 +29,7 @@ function consolePair(Dispatcher $d) : DebugConsole
     return DebugConsole($d, InputHub(Window('console', 64, 64, WindowHints()), $d));
 }
 
-test console_ctrl_c_toggles
+test console_grave_toggles
 {
     Dispatcher $d = Dispatcher();
     DebugConsole $c = consolePair($d);
@@ -38,6 +38,45 @@ test console_ctrl_c_toggles
     assert($c->enabled(), 'on');
     consoleToggle($d);
     assert(!$c->enabled(), 'off again');
+}
+
+test console_escape_closes
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    consoleToggle($d);
+    assert($c->enabled(), 'on');
+    $d->dispatch(KeySignal(.escape, 0, .press, 0));
+    assert(!$c->enabled(), 'closed');
+    $d->dispatch(KeySignal(.escape, 0, .press, 0));
+    assert(!$c->enabled(), 'escape does not open');
+}
+
+test console_ctrl_c_does_not_toggle
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    $d->dispatch(KeySignal(.c, 0, .press, MOD_CONTROL));
+    assert(!$c->enabled(), 'ctrl+c is not a toggle');
+}
+
+test console_ctrl_b_toggles
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    assert(!$c->enabled(), 'off');
+    $d->dispatch(KeySignal(.b, 0, .press, MOD_CONTROL));
+    assert($c->enabled(), 'on');
+    $d->dispatch(KeySignal(.b, 0, .press, MOD_CONTROL));
+    assert(!$c->enabled(), 'off again');
+}
+
+test console_plain_b_does_not_toggle
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    $d->dispatch(KeySignal(.b, 0, .press, 0));
+    assert(!$c->enabled(), 'b alone stays closed');
 }
 
 test console_char_appends_when_enabled
@@ -65,10 +104,25 @@ test console_enter_dispatches_command
     consoleToggle($d);
     $d->dispatch(CharSignal(104));
     $d->dispatch(CharSignal(105));
-    $d->dispatch(KeySignal(.enter, 0, .release, 0));
+    $d->dispatch(KeySignal(.enter, 0, .press, 0));
     assert($caught->n == 1, 'once');
     assert($caught->raw == 'hi', 'raw');
     assert($c->line() == '', 'cleared');
+}
+
+test console_empty_enter_is_noop
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    ConsoleCaught $caught = ConsoleCaught();
+    $d->register<ConsoleCommandSignal>(function(const ConsoleCommandSignal& $cmd) : Flow {
+        $caught->n = $caught->n + 1;
+        return .proceed;
+    });
+    consoleToggle($d);
+    $d->dispatch(KeySignal(.enter, 0, .press, 0));
+    assert($caught->n == 0, 'no dispatch');
+    assert($c->history()->count() == 0, 'no log');
 }
 
 test console_backspace_trims
@@ -82,6 +136,20 @@ test console_backspace_trims
     assert($c->line() == 'A', 'trimmed');
 }
 
+test console_caret_left_insert
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    consoleToggle($d);
+    $d->dispatch(CharSignal(65));
+    $d->dispatch(CharSignal(67));
+    $d->dispatch(KeySignal(.left, 0, .press, 0));
+    assert($c->caret() == 1, 'between');
+    $d->dispatch(CharSignal(66));
+    assert($c->line() == 'ABC', 'inserted');
+    assert($c->caret() == 2, 'after B');
+}
+
 test console_history_up_down
 {
     Dispatcher $d = Dispatcher();
@@ -89,14 +157,29 @@ test console_history_up_down
     consoleToggle($d);
     $c->submit('one');
     $c->submit('two');
-    $d->dispatch(KeySignal(.up, 0, .release, 0));
-    assert($c->line() == 'unknown command: two. type help', 'last');
-    $d->dispatch(KeySignal(.up, 0, .release, 0));
-    assert($c->line() == 'two', 'cmd');
-    $d->dispatch(KeySignal(.down, 0, .release, 0));
-    assert($c->line() == 'unknown command: two. type help', 'next');
-    $d->dispatch(KeySignal(.down, 0, .release, 0));
-    assert($c->line() == '', 'past end');
+    $d->dispatch(KeySignal(.up, 0, .press, 0));
+    assert($c->line() == 'two', 'last command');
+    $d->dispatch(KeySignal(.up, 0, .press, 0));
+    assert($c->line() == 'one', 'older');
+    $d->dispatch(KeySignal(.down, 0, .press, 0));
+    assert($c->line() == 'two', 'newer');
+    $d->dispatch(KeySignal(.down, 0, .press, 0));
+    assert($c->line() == '', 'past end is draft');
+}
+
+test console_history_stashes_draft
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    consoleToggle($d);
+    $c->submit('one');
+    $d->dispatch(CharSignal(120));
+    $d->dispatch(CharSignal(121));
+    assert($c->line() == 'xy', 'draft');
+    $d->dispatch(KeySignal(.up, 0, .press, 0));
+    assert($c->line() == 'one', 'command');
+    $d->dispatch(KeySignal(.down, 0, .press, 0));
+    assert($c->line() == 'xy', 'draft restored');
 }
 
 test console_history_copy
@@ -106,15 +189,15 @@ test console_history_copy
     $c->submit('one');
     $c->writeLine('reply');
     array<string> $h = $c->history();
-    assert($h->count() == 3, 'cmd, miss, reply');
-    assert($h[0] == 'one', 'cmd');
+    assert($h->count() == 3, 'echo, miss, reply');
+    assert($h[0] == '> one', 'echo');
     assert($h[1] == 'unknown command: one. type help', 'miss');
     assert($h[2] == 'reply', 'out');
     $c->clearHistory();
     assert($c->history()->count() == 0, 'cleared');
 }
 
-test console_ctrl_c_stops_other_key_handlers
+test console_grave_stops_other_key_handlers
 {
     Dispatcher $d = Dispatcher();
     DebugConsole $c = consolePair($d);
@@ -124,7 +207,21 @@ test console_ctrl_c_stops_other_key_handlers
         return .proceed;
     }, 0);
     consoleToggle($d);
-    assert($caught->n == 0, 'console swallowed ctrl+c');
+    assert($caught->n == 0, 'console swallowed grave');
+}
+
+test console_ctrl_b_stops_other_key_handlers
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    ConsoleCaught $caught = ConsoleCaught();
+    $d->register<KeySignal>(function(const KeySignal& $k) : Flow {
+        $caught->n = $caught->n + 1;
+        return .proceed;
+    }, 0);
+    $d->dispatch(KeySignal(.b, 0, .press, MOD_CONTROL));
+    assert($c->enabled(), 'opened');
+    assert($caught->n == 0, 'console swallowed ctrl+b');
 }
 
 test console_toggle_claims_and_releases_input
@@ -142,7 +239,7 @@ test console_toggle_claims_and_releases_input
     assert($in->unclaimed(), 'released');
 }
 
-test console_toggle_stays_off_when_claim_is_taken
+test console_toggle_steals_claim
 {
     Dispatcher $d = Dispatcher();
     Window $w = Window('console', 64, 64, WindowHints());
@@ -152,14 +249,30 @@ test console_toggle_stays_off_when_claim_is_taken
     }
     DebugConsole $c = DebugConsole($d, $in);
     consoleToggle($d);
-    assert(!$c->enabled(), 'stays off');
-    assert($in->holds('camera'), 'still camera');
-    $d->dispatch(CharSignal(65));
-    assert($c->line() == '', 'no char listener');
-    guard $in->release('camera') else ($e) {
-        die($e->message());
-    }
+    assert($c->enabled(), 'opens over camera');
+    assert($in->holds('visu/dev/console'), 'stolen');
     consoleToggle($d);
-    assert($c->enabled(), 'on after free');
-    assert($in->holds('visu/dev/console'), 'claimed');
+    assert(!$c->enabled(), 'off');
+    assert($in->unclaimed(), 'released, camera does not return');
+}
+
+test console_tab_completes_unique
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    consoleToggle($d);
+    $d->dispatch(CharSignal(104));
+    $d->dispatch(CharSignal(101));
+    $d->dispatch(CharSignal(108));
+    $d->dispatch(KeySignal(.tab, 0, .press, 0));
+    assert($c->line() == 'help', 'unique help');
+}
+
+test console_unknown_guesses
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    $c->submit('hepl');
+    array<string> $h = $c->history();
+    assert($h[$h->count() - 1] == 'unknown command: hepl. did you mean help?', 'guess');
 }

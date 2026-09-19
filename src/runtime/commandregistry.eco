@@ -8,18 +8,21 @@ namespace visu::runtime;
 public class ConsoleCommandRegistry
 {
     private map<string, ConsoleCommandHandler> $handlers;
+    private map<string, string> $usages;
     private array<string> $names;
 
     public constructor()
     {
         $this->handlers = map<string, ConsoleCommandHandler>();
+        $this->usages = map<string, string>();
         $this->names = array<string>();
     }
 
-    public function add(string $name, ConsoleCommandHandler $handler) : void
+    public function add(string $name, ConsoleCommandHandler $handler, string $usage = '') : void
     {
         assert(!$this->handlers->has($name), 'console: command already registered');
         $this->handlers[$name] = $handler;
+        $this->usages[$name] = $usage;
         $this->names[] = $name;
     }
 
@@ -30,6 +33,18 @@ public class ConsoleCommandRegistry
         }
 
         return $this->handlers->get($name);
+    }
+
+    /**
+     * Synopsis passed to add, or empty when the handler did not give one.
+     */
+    public function usage(string $name) : string
+    {
+        if (!$this->usages->has($name)) {
+            return '';
+        }
+
+        return $this->usages->get($name);
     }
 
     /**
@@ -50,6 +65,10 @@ public class ConsoleCommandRegistry
         }
 
         $this->handlers->remove($name);
+        if ($this->usages->has($name)) {
+            $this->usages->remove($name);
+        }
+
         array<string> $kept = array<string>();
         foreach ($this->names as $held) {
             if ($held != $name) {
@@ -63,6 +82,7 @@ public class ConsoleCommandRegistry
     public function clear() : void
     {
         $this->handlers->clear();
+        $this->usages->clear();
         $this->names->clear();
     }
 }

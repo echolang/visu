@@ -396,6 +396,24 @@ public class InputHub : WindowEventHandler
         return .error(.claimed($by));
     }
 
+    /**
+     * Take the mutex from whoever holds it. Null when it was free or already ours.
+     * FlyUI re-claims on the next hover once we release.
+     */
+    public function steal(string $name) : string?
+    {
+        string? $prev = $this->context;
+        $this->context = $name;
+        string $held = guard $prev else {
+            return null;
+        }
+        if ($held == $name) {
+            return null;
+        }
+
+        return $held;
+    }
+
     public function release(string $name) : status<InputError>
     {
         string $held = guard $this->context else {

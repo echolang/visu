@@ -3,7 +3,7 @@
  */
 
 use visu::ecs::{Entities, Systems};
-use visu::graphics::{DeferredRenderer, DeferredView, Device};
+use visu::graphics::{DeferredRenderer, DeferredView, Device, SsaoQuality};
 use visu::os::{Window, WindowHints};
 use visu::os::input::InputHub;
 use visu::runtime::DebugConsole;
@@ -52,6 +52,59 @@ test deferred_view_console_sets_renderer
     assert($renderer->view == DeferredView::ssao, 'ssao off kept');
     array<string> $h3 = $c->history();
     assert($h3[$h3->count() - 1] == 'view: ssao (ssao is off)', 'ssao off line');
+
+    $systems->unregister($world);
+}
+
+test deferred_view_console_ssao_toggle
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d, InputHub(Window('ssao', 64, 64, WindowHints()), $d));
+    DeferredRenderer $renderer = DeferredRenderer(Device());
+    DeferredViewSystem $sys = DeferredViewSystem($renderer);
+    Systems $systems = Systems();
+    $systems->listen($c);
+    $systems->bind($sys);
+
+    Entities $world = Entities();
+    $systems->register($world);
+
+    $c->submit('ssao');
+    SsaoQuality $q0 = guard $renderer->ssao;
+    array<string> $h0 = $c->history();
+    assert(
+        $h0[$h0->count() - 1] == "ssao: on, radius {$q0->radius}, samples {$q0->samples}",
+        'default'
+    );
+
+    $q0->radius = 2.5f;
+    $c->submit('ssao off');
+    assert($renderer->ssao == null, 'off');
+    array<string> $h1 = $c->history();
+    assert($h1[$h1->count() - 1] == 'ssao: off', 'off line');
+
+    $c->submit('view ssao');
+    array<string> $hView = $c->history();
+    assert($hView[$hView->count() - 1] == 'view: ssao (ssao is off)', 'view while off');
+
+    $c->submit('ssao on');
+    SsaoQuality $q1 = guard $renderer->ssao;
+    assert($q1->radius == 2.5f, 'radius kept');
+    array<string> $h2 = $c->history();
+    assert(
+        $h2[$h2->count() - 1] == "ssao: on, radius {$q1->radius}, samples {$q1->samples}",
+        'on line'
+    );
+
+    $c->submit('ssao toggle');
+    assert($renderer->ssao == null, 'toggle off');
+    $c->submit('ssao toggle');
+    SsaoQuality $q2 = guard $renderer->ssao;
+    assert($q2->radius == 2.5f, 'toggle on');
+
+    $c->submit('ssao nope');
+    array<string> $h3 = $c->history();
+    assert($h3[$h3->count() - 1] == 'usage: ssao [on|off|toggle]', 'usage');
 
     $systems->unregister($world);
 }

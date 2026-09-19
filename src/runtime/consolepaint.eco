@@ -1,0 +1,201 @@
+/**
+ * VG overlay for the debug console: dim panel, wrapped log, prompt, blinking caret.
+ */
+
+namespace visu::runtime;
+
+use visu::math::Vec2;
+use visu::vg::{Canvas, Color, TextAlign};
+
+internal const float32 CONSOLE_FONT_SIZE = 14.0f;
+internal const float32 CONSOLE_LINE_HEIGHT = 18.0f;
+internal const float32 CONSOLE_PAD = 12.0f;
+internal const float32 CONSOLE_MIN_HEIGHT = 48.0f;
+internal const int32 CONSOLE_MIN_ROWS = 8;
+internal const int32 CONSOLE_MAX_ROWS = 20;
+internal const string CONSOLE_PROMPT = '> ';
+
+internal enum ConsoleLogKind
+{
+    case input;
+    case output;
+    case error;
+}
+
+internal struct ConsoleLogLine
+{
+    public string $text;
+    public ConsoleLogKind $kind;
+}
+
+internal struct ConsolePaint
+{
+    public array<ConsoleLogLine> $log;
+    public string $line;
+    public usize $caret;
+    public bool $caretOn;
+    public int32 $offset;
+}
+
+internal function consoleAccent() : Color
+{
+    return Color(1.0f, 0.494f, 0.459f, 1.0f);
+}
+
+internal function consoleInputColor() : Color
+{
+    return Color(0.72f, 0.72f, 0.72f, 1.0f);
+}
+
+internal function consoleKindColor(ConsoleLogKind $kind) : Color
+{
+    return match ($kind) {
+        ConsoleLogKind::input => consoleInputColor(),
+        ConsoleLogKind::output => Color::white(),
+        ConsoleLogKind::error => consoleAccent(),
+    };
+}
+
+internal function consoleRowBudget(float32 $h) : int32
+{
+    float32 $budget = $h / 3.0f;
+    float32 $inner = $budget - CONSOLE_PAD * 2.0f - CONSOLE_LINE_HEIGHT;
+    int32 $rows = ($inner / CONSOLE_LINE_HEIGHT) as int32;
+    if ($rows < CONSOLE_MIN_ROWS) {
+        $rows = CONSOLE_MIN_ROWS;
+    }
+
+    if ($rows > CONSOLE_MAX_ROWS) {
+        $rows = CONSOLE_MAX_ROWS;
+    }
+
+    if ($rows < 1) {
+        $rows = 1;
+    }
+
+    return $rows;
+}
+
+internal function consoleCols(Canvas $vg, float32 $w) : int32
+{
+    float32 $em = $vg->textAdvance(Vec2(0.0f, 0.0f), 'M');
+    float32 $inner = $w - CONSOLE_PAD * 2.0f;
+    if ($em < 0.1f) {
+        return 80;
+    }
+
+    int32 $cols = ($inner / $em) as int32;
+    if ($cols < 8) {
+        return 8;
+    }
+
+    return $cols;
+}
+
+internal function paintConsole(Canvas $vg, const ConsolePaint& $paint) : void
+{
+    guard $vg->fontFace('debug') else {
+        return;
+    }
+    $vg->fontSize(CONSOLE_FONT_SIZE);
+    $vg->textAlign(TextAlign(.left, .top));
+    float32 $w = $vg->width;
+    float32 $h = $vg->height;
+    int32 $cols = consoleCols($vg, $w);
+    int32 $budget = consoleRowBudget($h);
+    array<ConsoleLogLine> $visual = array<ConsoleLogLine>();
+    foreach ($paint->log as $entry) {
+        array<string> $rows = wrapPlain($entry->text, $cols);
+        foreach ($rows as $row) {
+            ConsoleLogLine $piece = ConsoleLogLine($row, $entry->kind);
+            $visual[] = $piece;
+        }
+    }
+
+    int32 $n = $visual->count() as int32;
+    int32 $offset = $paint->offset;
+    int32 $maxOff = $n - $budget;
+    if ($maxOff < 0) {
+        $maxOff = 0;
+    }
+
+    if ($offset > $maxOff) {
+        $offset = $maxOff;
+    }
+
+    if ($offset < 0) {
+        $offset = 0;
+    }
+
+    int32 $hint = 0;
+    if ($offset > 0) {
+        $hint = 1;
+    }
+
+    int32 $take = $budget;
+    if ($take > $n) {
+        $take = $n;
+    }
+
+    int32 $start = $n - $take - $offset;
+    if ($start < 0) {
+        $start = 0;
+    }
+
+    int32 $shown = $take;
+    if ($start + $shown > $n) {
+        $shown = $n - $start;
+    }
+
+    float32 $block = CONSOLE_PAD * 2.0f + CONSOLE_LINE_HEIGHT * (($shown + $hint + 1) as float32);
+    if ($block < CONSOLE_MIN_HEIGHT) {
+        $block = CONSOLE_MIN_HEIGHT;
+    }
+
+    float32 $top = $h - $block;
+    if ($top < 0.0f) {
+        $top = 0.0f;
+    }
+
+    $vg->fillColor(Color(0.0f, 0.0f, 0.0f, 0.72f));
+    $vg->fillRect(Vec2(0.0f, $top), Vec2($w, $h - $top));
+    $vg->fillColor(consoleAccent());
+    $vg->fillRect(Vec2(0.0f, $top), Vec2($w, 1.0f));
+    $vg->scissor(Vec2(0.0f, $top), Vec2($w, $h - $top));
+    float32 $y = $top + CONSOLE_PAD;
+    if ($hint == 1) {
+        $vg->fillColor(consoleInputColor());
+        $vg->text(Vec2(CONSOLE_PAD, $y), "^{$offset} more");
+        $y = $y + CONSOLE_LINE_HEIGHT;
+    }
+
+    int32 $i = $start;
+    int32 $end = $start + $shown;
+    while ($i < $end) {
+        ConsoleLogLine $row = $visual[$i as usize];
+        $vg->fillColor(consoleKindColor($row->kind));
+        $vg->text(Vec2(CONSOLE_PAD, $y), $row->text);
+        $y = $y + CONSOLE_LINE_HEIGHT;
+        $i = $i + 1;
+    }
+
+    string $prompt = CONSOLE_PROMPT;
+    $prompt->append($paint->line);
+    $vg->fillColor(consoleAccent());
+    $vg->text(Vec2(CONSOLE_PAD, $y), $prompt);
+    if ($paint->caretOn) {
+        string $left = CONSOLE_PROMPT;
+        usize $nLine = $paint->line->size();
+        usize $caret = $paint->caret;
+        if ($caret > $nLine) {
+            $caret = $nLine;
+        }
+
+        $left->append($paint->line->sub(0, $caret));
+        float32 $cx = CONSOLE_PAD + $vg->textAdvance(Vec2(CONSOLE_PAD, $y), $left);
+        $vg->fillColor(consoleAccent());
+        $vg->fillRect(Vec2($cx, $y + 1.0f), Vec2(1.0f, CONSOLE_LINE_HEIGHT - 3.0f));
+    }
+
+    $vg->resetScissor();
+}

@@ -1,24 +1,31 @@
 /**
- * Console verb `view` that picks which deferred buffer the renderer blits.
+ * Console verbs `view` (which deferred buffer the renderer blits) and `ssao` (on/off).
  * Holds the renderer; does not draw.
  */
 
 namespace visu::system;
 
 use visu::ecs::{Entities, Schedule, System};
-use visu::graphics::{DeferredRenderer, DeferredView, RenderContext};
+use visu::graphics::{DeferredRenderer, DeferredView, RenderContext, SsaoQuality};
 use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
 use visu::signal::ConsoleCommandSignal;
 
 internal const VIEW_USAGE = 'usage: view [scene|albedo|normal|roughness|metallic|ao|emissive|position|ssao]';
+internal const SSAO_USAGE = 'usage: ssao [on|off|toggle]';
 
 public class DeferredViewSystem : System, ConsoleCommandHandler
 {
     public DeferredRenderer $renderer;
 
+    /**
+     * Last quality while SSAO is off, so `ssao on` restores radius and sample count.
+     */
+    private SsaoQuality? $held;
+
     public constructor(DeferredRenderer $renderer)
     {
         $this->renderer = $renderer;
+        $this->held = null;
     }
 
     public function register(Entities $entities) : void
@@ -45,13 +52,29 @@ public class DeferredViewSystem : System, ConsoleCommandHandler
 
     public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
     {
-        $registry->add('view', $this);
+        $registry->add('view', $this, 'scene|albedo|normal|roughness|metallic|ao|emissive|position|ssao');
+        $registry->add('ssao', $this, 'on|off|toggle');
         array<string> $names = array<string>();
         $names[] = 'view';
+        $names[] = 'ssao';
         return $names;
     }
 
     public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if ($cmd->isAction('ssao')) {
+            $this->onSsaoCommand($cmd, $console);
+            return;
+        }
+
+        if (!$cmd->isAction('view')) {
+            return;
+        }
+
+        $this->onViewCommand($cmd, $console);
+    }
+
+    private function onViewCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
     {
         if ($cmd->parts->count() < 2) {
             string $name = $this->renderer->view->label();
@@ -73,4 +96,116 @@ public class DeferredViewSystem : System, ConsoleCommandHandler
 
         $console->writeLine("view: {$name}");
     }
+
+    private function onSsaoCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        SsaoConsoleAction $action = parseSsaoConsole($cmd);
+        match ($action) {
+            SsaoConsoleAction::usage => {
+                $console->writeLine(SSAO_USAGE);
+            },
+            SsaoConsoleAction::status => {
+                $console->writeLine($this->ssaoStatus());
+            },
+            SsaoConsoleAction::enable($on) => {
+                $this->setSsao($on, $console);
+            },
+            SsaoConsoleAction::toggle => {
+                $this->toggleSsao($console);
+            },
+        };
+    }
+
+    private function setSsao(bool $on, DebugConsole $console) : void
+    {
+        if ($on) {
+            $this->enableSsao();
+        } else {
+            $this->disableSsao();
+        }
+
+        $console->writeLine($this->ssaoStatus());
+    }
+
+    private function toggleSsao(DebugConsole $console) : void
+    {
+        if ($this->renderer->ssao != null) {
+            $this->disableSsao();
+        } else {
+            $this->enableSsao();
+        }
+
+        $console->writeLine($this->ssaoStatus());
+    }
+
+    private function enableSsao() : void
+    {
+        if ($this->renderer->ssao != null) {
+            return;
+        }
+
+        $this->renderer->ssao = $this->held ?? SsaoQuality::ultra();
+    }
+
+    private function disableSsao() : void
+    {
+        SsaoQuality? $current = $this->renderer->ssao;
+        if ($current != null) {
+            SsaoQuality $quality = guard $current;
+            $this->held = $quality;
+            $this->renderer->ssao = null;
+        }
+    }
+
+    private function ssaoStatus() : string
+    {
+        SsaoQuality? $ssao = $this->renderer->ssao;
+        if ($ssao == null) {
+            return 'ssao: off';
+        }
+
+        SsaoQuality $quality = guard $ssao;
+        return "ssao: on, radius {$quality->radius}, samples {$quality->samples}";
+    }
+}
+
+internal enum SsaoConsoleAction
+{
+    case status;
+    case enable(bool $on);
+    case toggle;
+    case usage;
+}
+
+/**
+ * `ssao` alone is status; `ssao on|off|toggle` flips the renderer field.
+ */
+internal function parseSsaoConsole(const ConsoleCommandSignal& $cmd) : SsaoConsoleAction
+{
+    if (!$cmd->isAction('ssao')) {
+        return .usage;
+    }
+
+    if ($cmd->parts->count() == 1) {
+        return .status;
+    }
+
+    if ($cmd->parts->count() != 2) {
+        return .usage;
+    }
+
+    string $verb = $cmd->parts[1];
+    if ($verb == 'on') {
+        return .enable(true);
+    }
+
+    if ($verb == 'off') {
+        return .enable(false);
+    }
+
+    if ($verb == 'toggle') {
+        return .toggle;
+    }
+
+    return .usage;
 }

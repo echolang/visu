@@ -60,7 +60,9 @@ test registry_add_and_find
 {
     PingSystem $ping = PingSystem();
     ConsoleCommandRegistry $reg = ConsoleCommandRegistry();
-    $reg->add('ping', $ping);
+    $reg->add('ping', $ping, 'pong');
+    assert($reg->usage('ping') == 'pong', 'usage');
+    assert($reg->usage('nope') == '', 'missing usage');
     array<string> $names = $reg->names();
     assert($names->count() == 1, 'one');
     assert($names[0] == 'ping', 'name');
@@ -100,7 +102,8 @@ test systems_register_routes_handler
     assert($other->registers == 1, 'sibling register');
 
     array<string> $h = $c->history();
-    assert($h->count() == 2, 'cmd plus pong');
+    assert($h->count() == 2, 'echo plus pong');
+    assert($h[0] == '> ping extra', 'echo');
     assert($h[1] == 'pong', 'reply');
 
     array<string> $regNames = $c->registry->names();
@@ -111,7 +114,7 @@ test systems_register_routes_handler
     array<string> $help = $c->history();
     bool $listed = false;
     foreach ($help as $line) {
-        if ($line == 'ping') {
+        if ($line->starts('ping')) {
             $listed = true;
         }
     }
@@ -163,6 +166,6 @@ test console_unknown_command
     DebugConsole $c = DebugConsole($d, InputHub(Window('commands', 64, 64, WindowHints()), $d));
     $c->submit('spawn box');
     array<string> $h = $c->history();
-    assert($h->count() == 2, 'cmd plus miss');
+    assert($h->count() == 2, 'echo plus miss');
     assert($h[1] == 'unknown command: spawn. type help', 'miss');
 }

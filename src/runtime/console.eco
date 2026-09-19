@@ -1,27 +1,23 @@
 /**
- * Tilde / Ctrl+C command line.
- * Types into a buffer, dispatches ConsoleCommandSignal on enter.
+ * Grave or Ctrl+B toggle command line, Escape to close.
+ * Types into a buffer with a caret, dispatches ConsoleCommandSignal on enter.
  * Overlay is VG on the backbuffer (Host.attachPass after the instrument HUD).
- * Toggle claims the input-context mutex.
+ * Toggle steals the input-context mutex so FlyUI cannot trap it.
  * ContextMap then skips action handle so bound keys are not stolen while the line is open (`track` still updates down()).
  */
 
 namespace visu::runtime;
 
 use visu::graphics::{Device, Pipeline, TargetRef};
-use visu::math::Vec2;
 use visu::os::input;
 use visu::os::input::{InputHub, KeyPhase};
 use visu::signal::{CharSignal, ConsoleCommandSignal, Dispatcher, Flow, KeySignal};
-use visu::vg::{Canvas, Color, TextAlign, VgError, VgRenderer};
+use visu::vg::{Canvas, VgError, VgRenderer};
 
 internal const HISTORY_LIMIT = 100;
 internal const CONSOLE_CONTEXT = 'visu/dev/console';
-internal const int32 CONSOLE_RENDER_LIMIT = 10;
-internal const float32 CONSOLE_FONT_SIZE = 14.0f;
-internal const float32 CONSOLE_LINE_HEIGHT = 18.0f;
-internal const float32 CONSOLE_PAD = 10.0f;
-internal const float32 CONSOLE_MIN_HEIGHT = 40.0f;
+internal const int32 GRAVE_CODEPOINT = 96;
+internal const int32 TILDE_CODEPOINT = 126;
 
 public class DebugConsole
 {
@@ -30,8 +26,14 @@ public class DebugConsole
     private InputHub $input;
     private bool $enabled;
     private string $line;
-    private array<string> $history;
-    private int32 $historyIndex;
+    private usize $caret;
+    private array<ConsoleLogLine> $log;
+    private array<string> $commands;
+    private int32 $commandIndex;
+    private string $draft;
+    private int32 $logOffset;
+    private array<string> $completions;
+    private int32 $completionAt;
     private int32 $keyId;
     private int32? $charListener;
     private VgRenderer? $vg;
@@ -45,8 +47,14 @@ public class DebugConsole
         $this->input = $input;
         $this->enabled = false;
         $this->line = '';
-        $this->history = array<string>();
-        $this->historyIndex = 0;
+        $this->caret = 0;
+        $this->log = array<ConsoleLogLine>();
+        $this->commands = array<string>();
+        $this->commandIndex = 0;
+        $this->draft = '';
+        $this->logOffset = 0;
+        $this->completions = array<string>();
+        $this->completionAt = -1;
         $this->charListener = null;
         $this->vg = null;
         $this->loaded = false;
@@ -85,28 +93,43 @@ public class DebugConsole
         return $this->line;
     }
 
+    public const function caret() : usize
+    {
+        return $this->caret;
+    }
+
     /**
-     * Copy of the history ring. Overlay and tests read this; writeLine is the mutator.
+     * Copy of the log texts. Overlay and tests read this; writeLine is the mutator.
      */
     public function history() : array<string>
     {
-        return $this->history->clone();
+        array<string> $out = array<string>();
+        foreach ($this->log as $row) {
+            $out[] = $row->text;
+        }
+
+        return $out;
     }
 
     public function writeLine(string $text) : void
     {
-        $this->history->push($text);
-        if (($this->history->count() as int32) > (HISTORY_LIMIT as int32)) {
-            $this->history->remove(0);
+        ConsoleLogKind $kind = ConsoleLogKind::output;
+        if ($text->starts('usage:') || $text->starts('unknown command:')) {
+            $kind = ConsoleLogKind::error;
         }
 
-        $this->historyIndex = $this->history->count() as int32;
+        $this->pushLog($text, $kind);
+    }
+
+    public function writeError(string $text) : void
+    {
+        $this->pushLog($text, ConsoleLogKind::error);
     }
 
     public function clearHistory() : void
     {
-        $this->history->clear();
-        $this->historyIndex = 0;
+        $this->log->clear();
+        $this->logOffset = 0;
     }
 
     /**
@@ -145,10 +168,15 @@ public class DebugConsole
         VgRenderer $vg = guard $this->vg else {
             return;
         }
-        array<string> $lines = $this->recentLines();
-        string $prompt = $this->promptText();
+        ConsolePaint $paint = ConsolePaint(
+            $this->log->clone(),
+            $this->line,
+            $this->caret,
+            consoleCaretOn(),
+            $this->logOffset
+        );
         $vg->pass($pipeline, $target, function(Canvas $canvas) : void {
-            paintConsole($canvas, $lines, $prompt);
+            paintConsole($canvas, $paint);
         });
     }
 
@@ -174,12 +202,24 @@ public class DebugConsole
 
     /**
      * Submit `$raw` as if enter was pressed (tests, and later a typed line).
-     * Dispatches ConsoleCommandSignal first, then routes help / clear / registered names.
+     * Empty is a no-op. Dispatches ConsoleCommandSignal first, then routes help / clear / registered names.
      */
     public function submit(string $raw) : void
     {
-        $this->writeLine($raw);
+        if ($raw->empty()) {
+            $this->line = '';
+            $this->caret = 0;
+            return;
+        }
+
+        $this->remember($raw);
+        $this->pushLog("> {$raw}", ConsoleLogKind::input);
         $this->line = '';
+        $this->caret = 0;
+        $this->draft = '';
+        $this->commandIndex = $this->commands->count() as int32;
+        $this->logOffset = 0;
+        $this->dropCompletions();
         ConsoleCommandSignal $cmd = ConsoleCommandSignal($raw);
         $this->dispatcher->dispatch($cmd);
         $this->route($cmd);
@@ -187,54 +227,147 @@ public class DebugConsole
 
     internal function handleKey(const KeySignal& $signal) : Flow
     {
-        if ($this->enabled) {
-            if ($signal->key == input::Key::enter && $signal->phase == KeyPhase::release) {
-                string $raw = $this->line;
-                $this->submit($raw);
-            }
-
-            if ($signal->key == input::Key::up && $signal->phase == KeyPhase::release) {
-                $this->historyIndex = $this->historyIndex - 1;
-                if ($this->historyIndex < 0) {
-                    $this->historyIndex = 0;
-                }
-
-                $this->line = $this->historyLine($this->historyIndex);
-            }
-
-            if ($signal->key == input::Key::down && $signal->phase == KeyPhase::release) {
-                int32 $end = $this->history->count() as int32;
-                $this->historyIndex = $this->historyIndex + 1;
-                if ($this->historyIndex > $end) {
-                    $this->historyIndex = $end;
-                }
-
-                $this->line = $this->historyLine($this->historyIndex);
-            }
-
-            if ($signal->key == input::Key::backspace && $signal->phase->down()) {
-                usize $n = $this->line->size();
-                if ($n > 0) {
-                    $this->line = $this->line->sub(0, $n - 1);
-                }
-            }
-        }
-
-        if ($signal->key == input::Key::c && $signal->isControl() && $signal->phase == KeyPhase::press) {
+        if ($signal->key == input::Key::graveAccent && $signal->phase == KeyPhase::press) {
             $this->setEnabled(!$this->enabled);
             return .stop;
         }
 
-        return .proceed;
+        if ($signal->isControl() && $signal->key == input::Key::b && $signal->phase == KeyPhase::press) {
+            $this->setEnabled(!$this->enabled);
+            return .stop;
+        }
+
+        if (!$this->enabled) {
+            return .proceed;
+        }
+
+        if ($signal->phase == KeyPhase::release) {
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::escape && $signal->phase == KeyPhase::press) {
+            $this->setEnabled(false);
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::enter && $signal->phase == KeyPhase::press) {
+            $this->submit($this->line);
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::tab && $signal->phase->down()) {
+            $this->complete();
+            return .stop;
+        }
+
+        if ($signal->isControl() && $signal->key == input::Key::w && $signal->phase->down()) {
+            $this->deleteBack(wordPrev($this->line, $this->caret));
+            return .stop;
+        }
+
+        if ($signal->isAlt() && $signal->key == input::Key::backspace && $signal->phase->down()) {
+            $this->deleteBack(wordPrev($this->line, $this->caret));
+            return .stop;
+        }
+
+        if ($signal->isControl() && $signal->key == input::Key::u && $signal->phase->down()) {
+            $this->deleteBack(0);
+            return .stop;
+        }
+
+        if ($signal->isControl() && $signal->key == input::Key::k && $signal->phase->down()) {
+            $this->line = splice($this->line, $this->caret, $this->line->size() - $this->caret, '');
+            $this->dropCompletions();
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::up && $signal->phase->down()) {
+            $this->historyUp();
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::down && $signal->phase->down()) {
+            $this->historyDown();
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::left && $signal->phase->down()) {
+            $this->caret = utf8Prev($this->line, $this->caret);
+            $this->dropCompletions();
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::right && $signal->phase->down()) {
+            $this->caret = utf8Next($this->line, $this->caret);
+            $this->dropCompletions();
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::home && $signal->phase->down()) {
+            $this->caret = 0;
+            $this->dropCompletions();
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::end && $signal->phase->down()) {
+            $this->caret = $this->line->size();
+            $this->dropCompletions();
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::backspace && $signal->phase->down()) {
+            $this->deleteBack(utf8Prev($this->line, $this->caret));
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::delete && $signal->phase->down()) {
+            usize $next = utf8Next($this->line, $this->caret);
+            if ($next > $this->caret) {
+                $this->line = splice($this->line, $this->caret, $next - $this->caret, '');
+                $this->dropCompletions();
+            }
+
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::pageUp && $signal->phase->down()) {
+            $this->logOffset = $this->logOffset + 8;
+            return .stop;
+        }
+
+        if ($signal->key == input::Key::pageDown && $signal->phase->down()) {
+            $this->logOffset = $this->logOffset - 8;
+            if ($this->logOffset < 0) {
+                $this->logOffset = 0;
+            }
+
+            return .stop;
+        }
+
+        return .stop;
     }
 
     internal function handleChar(const CharSignal& $signal) : Flow
     {
-        string $ch = guard $signal->text() else {
-            return .proceed;
+        if ($signal->codepoint < 32) {
+            return .stop;
         }
-        $this->line->append($ch);
-        return .proceed;
+
+        if ($signal->codepoint == GRAVE_CODEPOINT || $signal->codepoint == TILDE_CODEPOINT) {
+            return .stop;
+        }
+
+        if ($signal->codepoint == 127) {
+            return .stop;
+        }
+
+        string $ch = guard $signal->text() else {
+            return .stop;
+        }
+        $this->line = splice($this->line, $this->caret, 0, $ch);
+        $this->caret = $this->caret + $ch->size();
+        $this->dropCompletions();
+        return .stop;
     }
 
     private function route(const ConsoleCommandSignal& $cmd) : void
@@ -244,7 +377,12 @@ public class DebugConsole
         }
 
         if ($cmd->isAction('help')) {
-            $this->writeHelp();
+            string $focus = '';
+            if ($cmd->parts->count() >= 2) {
+                $focus = $cmd->parts[1];
+            }
+
+            $this->writeHelp($focus);
             return;
         }
 
@@ -255,19 +393,125 @@ public class DebugConsole
         }
 
         ConsoleCommandHandler $handler = guard $this->registry->find($cmd->parts[0]) else {
-            string $name = $cmd->parts[0];
-            $this->writeLine("unknown command: {$name}. type help");
+            $this->writeUnknown($cmd->parts[0]);
             return;
         }
         $handler->onConsoleCommand($cmd, $this);
     }
 
-    private function writeHelp() : void
+    private function writeHelp(const string& $focus) : void
     {
+        if ($focus != '') {
+            $this->writeHelpOne($focus);
+            return;
+        }
+
         $this->writeLine('help - list commands');
-        $this->writeLine('clear - clear console history');
+        $this->writeLine('clear - clear the log');
         array<string> $names = $this->registry->names();
         foreach ($names as $name) {
+            $this->writeHelpOne($name);
+        }
+    }
+
+    private function writeHelpOne(const string& $name) : void
+    {
+        if ($name == 'help') {
+            $this->writeLine('help - list commands');
+            return;
+        }
+
+        if ($name == 'clear') {
+            $this->writeLine('clear - clear the log');
+            return;
+        }
+
+        if ($this->registry->find($name) == null) {
+            $this->writeUnknown($name);
+            return;
+        }
+
+        string $usage = $this->registry->usage($name);
+        if ($usage->empty()) {
+            $this->writeLine($name);
+            return;
+        }
+
+        $this->writeLine("{$name} - {$usage}");
+    }
+
+    private function writeUnknown(const string& $name) : void
+    {
+        array<string> $names = $this->verbNames();
+        string $guess = guard guessCommand($name, $names) else {
+            $this->writeError("unknown command: {$name}. type help");
+            return;
+        }
+        $this->writeError("unknown command: {$name}. did you mean {$guess}?");
+    }
+
+    private function verbNames() : array<string>
+    {
+        array<string> $names = array<string>();
+        $names[] = 'help';
+        $names[] = 'clear';
+        array<string> $reg = $this->registry->names();
+        foreach ($reg as $name) {
+            $names[] = $name;
+        }
+
+        return $names;
+    }
+
+    private function complete() : void
+    {
+        if ($this->line->contains(' ')) {
+            return;
+        }
+
+        if (!$this->completions->empty()) {
+            int32 $n = $this->completions->count() as int32;
+            if ($this->completionAt < 0) {
+                $this->completionAt = 0;
+            } else {
+                $this->completionAt = $this->completionAt + 1;
+                if ($this->completionAt >= $n) {
+                    $this->completionAt = 0;
+                }
+            }
+
+            string $pick = $this->completions[$this->completionAt as usize];
+            $this->setLine($pick);
+            return;
+        }
+
+        string $stem = $this->line;
+        array<string> $matches = array<string>();
+        array<string> $names = $this->verbNames();
+        foreach ($names as $name) {
+            if ($stem->empty() || $name->starts($stem)) {
+                $matches[] = $name;
+            }
+        }
+
+        if ($matches->empty()) {
+            return;
+        }
+
+        if ($matches->count() == 1) {
+            $this->setLine($matches[0]);
+            $this->dropCompletions();
+            return;
+        }
+
+        string $prefix = commonPrefix($matches);
+        if ($prefix->size() > $stem->size()) {
+            $this->setLine($prefix);
+        }
+
+        $this->completions = $matches;
+        $this->completionAt = -1;
+        foreach ($matches as $name) {
             $this->writeLine($name);
         }
     }
@@ -275,9 +519,7 @@ public class DebugConsole
     private function setEnabled(bool $on) : void
     {
         if ($on) {
-            guard $this->input->claim(CONSOLE_CONTEXT) else {
-                return;
-            }
+            $this->input->steal(CONSOLE_CONTEXT);
             $this->enabled = true;
             if ($this->charListener != null) {
                 return;
@@ -304,75 +546,98 @@ public class DebugConsole
         $this->charListener = null;
     }
 
-    private const function historyLine(int32 $index) : string
+    private function historyUp() : void
     {
-        if ($index < 0) {
-            return '';
+        int32 $n = $this->commands->count() as int32;
+        if ($n == 0) {
+            return;
         }
 
-        if ($index >= ($this->history->count() as int32)) {
-            return '';
+        if ($this->commandIndex == $n) {
+            $this->draft = $this->line;
         }
 
-        return $this->history[$index as usize];
+        if ($this->commandIndex > 0) {
+            $this->commandIndex = $this->commandIndex - 1;
+        }
+
+        string $older = $this->commands[$this->commandIndex as usize];
+        $this->setLine($older);
+        $this->dropCompletions();
     }
 
-    private function recentLines() : array<string>
+    private function historyDown() : void
     {
-        int32 $n = $this->history->count() as int32;
-        int32 $start = $n - CONSOLE_RENDER_LIMIT;
-        if ($start < 0) {
-            $start = 0;
+        int32 $n = $this->commands->count() as int32;
+        if ($this->commandIndex >= $n) {
+            return;
         }
 
-        array<string> $out = array<string>();
-        for (int32 $i = $start; $i < $n; $i = $i + 1) {
-            $out[] = $this->history[$i as usize];
+        $this->commandIndex = $this->commandIndex + 1;
+        if ($this->commandIndex >= $n) {
+            string $draft = $this->draft;
+            $this->setLine($draft);
+            $this->dropCompletions();
+            return;
         }
 
-        return $out;
+        string $newer = $this->commands[$this->commandIndex as usize];
+        $this->setLine($newer);
+        $this->dropCompletions();
     }
 
-    private function promptText() : string
+    private function remember(const string& $raw) : void
     {
-        string $text = "CONSOLE: {$this->line}";
-        int32 $tick = seconds() as int32;
-        if ($tick % 2 == 0) {
-            $text->append('_');
+        if (!$this->commands->empty()) {
+            int32 $last = ($this->commands->count() as int32) - 1;
+            if ($this->commands[$last as usize] == $raw) {
+                return;
+            }
         }
 
-        return $text;
+        $this->commands[] = $raw;
+        if (($this->commands->count() as int32) > (HISTORY_LIMIT as int32)) {
+            $this->commands->remove(0);
+        }
+    }
+
+    private function pushLog(const string& $text, ConsoleLogKind $kind) : void
+    {
+        ConsoleLogLine $row = ConsoleLogLine($text, $kind);
+        $this->log[] = $row;
+        if (($this->log->count() as int32) > (HISTORY_LIMIT as int32)) {
+            $this->log->remove(0);
+        }
+
+        $this->logOffset = 0;
+    }
+
+    private function setLine(const string& $text) : void
+    {
+        $this->line = $text;
+        $this->caret = $text->size();
+    }
+
+    private function deleteBack(usize $to) : void
+    {
+        if ($to >= $this->caret) {
+            return;
+        }
+
+        $this->line = splice($this->line, $to, $this->caret - $to, '');
+        $this->caret = $to;
+        $this->dropCompletions();
+    }
+
+    private function dropCompletions() : void
+    {
+        $this->completions->clear();
+        $this->completionAt = -1;
     }
 }
 
-internal function paintConsole(Canvas $vg, const array<string>& $lines, const string& $prompt) : void
+internal function consoleCaretOn() : bool
 {
-    guard $vg->fontFace('debug') else {
-        return;
-    }
-    $vg->fontSize(CONSOLE_FONT_SIZE);
-    $vg->textAlign(TextAlign(.left, .top));
-    float32 $w = $vg->width;
-    float32 $h = $vg->height;
-    float32 $block = CONSOLE_PAD * 2.0f + CONSOLE_LINE_HEIGHT * (($lines->count() as float32) + 1.0f);
-    if ($block < CONSOLE_MIN_HEIGHT) {
-        $block = CONSOLE_MIN_HEIGHT;
-    }
-
-    float32 $top = $h - $block;
-    if ($top < 0.0f) {
-        $top = 0.0f;
-    }
-
-    $vg->fillColor(Color(0.0f, 0.0f, 0.0f, 0.5f));
-    $vg->fillRect(Vec2(0.0f, $top), Vec2($w, $h - $top));
-    $vg->fillColor(Color::white());
-    float32 $y = $top + CONSOLE_PAD;
-    foreach ($lines as $line) {
-        $vg->text(Vec2(CONSOLE_PAD, $y), $line);
-        $y = $y + CONSOLE_LINE_HEIGHT;
-    }
-
-    $vg->fillColor(Color(1.0f, 0.494f, 0.459f, 1.0f));
-    $vg->text(Vec2(CONSOLE_PAD, $y), $prompt);
+    int32 $tick = (seconds() * 2.0) as int32;
+    return ($tick % 2) == 0;
 }

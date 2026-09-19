@@ -507,6 +507,21 @@ test input_claim_and_release
     assert($in->unclaimed(), 'released');
 }
 
+test input_steal_takes_mutex
+{
+    InputHub $in = harness();
+    guard $in->claim('camera') else ($e) {
+        die($e->message());
+    }
+    string $prev = guard $in->steal('console') else {
+        die('expected previous holder');
+    }
+    assert($prev == 'camera', 'previous');
+    assert($in->holds('console'), 'stolen');
+    string? $again = $in->steal('console');
+    assert($again == null, 'already ours');
+}
+
 test input_double_claim_is_error
 {
     InputHub $in = harness();

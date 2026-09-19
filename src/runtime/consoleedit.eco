@@ -1,0 +1,251 @@
+/**
+ * Byte-index caret helpers, wrap, prefix, and a tiny edit distance for the debug console.
+ * Command names are ASCII; wrapping counts bytes as columns of the debug font.
+ */
+
+namespace visu::runtime;
+
+internal function utf8Prev(const string& $s, usize $at) : usize
+{
+    if ($at == 0) {
+        return 0;
+    }
+
+    usize $i = $at - 1;
+    while ($i > 0 && ($s->byte($i) & 192) == 128) {
+        $i = $i - 1;
+    }
+
+    return $i;
+}
+
+internal function utf8Next(const string& $s, usize $at) : usize
+{
+    usize $n = $s->size();
+    if ($at >= $n) {
+        return $n;
+    }
+
+    usize $i = $at + 1;
+    while ($i < $n && ($s->byte($i) & 192) == 128) {
+        $i = $i + 1;
+    }
+
+    return $i;
+}
+
+internal function splice(const string& $s, usize $at, usize $drop, const string& $ins) : string
+{
+    usize $n = $s->size();
+    if ($at > $n) {
+        $at = $n;
+    }
+
+    usize $rest = $n - $at;
+    if ($drop > $rest) {
+        $drop = $rest;
+    }
+
+    string $left = $s->sub(0, $at);
+    string $right = $s->sub($at + $drop, $rest - $drop);
+    $left->append($ins);
+    $left->append($right);
+    return $left;
+}
+
+internal function wordPrev(const string& $s, usize $at) : usize
+{
+    usize $i = $at;
+    while ($i > 0) {
+        usize $p = utf8Prev($s, $i);
+        if ($s->byte($p) != 32) {
+            break;
+        }
+
+        $i = $p;
+    }
+
+    while ($i > 0) {
+        usize $p = utf8Prev($s, $i);
+        if ($s->byte($p) == 32) {
+            break;
+        }
+
+        $i = $p;
+    }
+
+    return $i;
+}
+
+internal function wrapChunks(const string& $word, int32 $maxCols) : array<string>
+{
+    array<string> $out = array<string>();
+    usize $max = $maxCols as usize;
+    usize $n = $word->size();
+    if ($max < 1 || $n <= $max) {
+        $out[] = $word;
+        return $out;
+    }
+
+    usize $i = 0;
+    while ($i < $n) {
+        usize $take = $max;
+        if ($i + $take > $n) {
+            $take = $n - $i;
+        }
+
+        $out[] = $word->sub($i, $take);
+        $i = $i + $take;
+    }
+
+    return $out;
+}
+
+internal function wrapPlain(const string& $line, int32 $maxCols) : array<string>
+{
+    array<string> $rows = array<string>();
+    if ($maxCols < 1 || $line->empty()) {
+        $rows[] = $line;
+        return $rows;
+    }
+
+    str::parts $parts = str::split($line, ' ');
+    array<string> $words = $parts->owned();
+    string $row = '';
+    foreach ($words as $word) {
+        array<string> $chunks = wrapChunks($word, $maxCols);
+        foreach ($chunks as $chunk) {
+            if ($row->empty()) {
+                $row = $chunk;
+            } else {
+                usize $need = $row->size() + 1 + $chunk->size();
+                if ($need <= ($maxCols as usize)) {
+                    $row->append(' ');
+                    $row->append($chunk);
+                } else {
+                    $rows[] = $row;
+                    $row = $chunk;
+                }
+            }
+        }
+    }
+
+    $rows[] = $row;
+    return $rows;
+}
+
+internal function commonPrefix(const array<string>& $names) : string
+{
+    if ($names->empty()) {
+        return '';
+    }
+
+    string $p = $names[0];
+    foreach ($names as $n) {
+        usize $i = 0;
+        usize $lim = $p->size();
+        if ($n->size() < $lim) {
+            $lim = $n->size();
+        }
+
+        while ($i < $lim && $p->byte($i) == $n->byte($i)) {
+            $i = $i + 1;
+        }
+
+        $p = $p->sub(0, $i);
+        if ($p->empty()) {
+            return '';
+        }
+    }
+
+    return $p;
+}
+
+internal function editDistance(const string& $a, const string& $b) : int32
+{
+    int32 $m = $a->size() as int32;
+    int32 $n = $b->size() as int32;
+    if ($m == 0) {
+        return $n;
+    }
+
+    if ($n == 0) {
+        return $m;
+    }
+
+    array<int32> $prev = array<int32>();
+    array<int32> $cur = array<int32>();
+    for (int32 $j = 0; $j <= $n; $j = $j + 1) {
+        $prev[] = $j;
+        $cur[] = 0;
+    }
+
+    for (int32 $i = 1; $i <= $m; $i = $i + 1) {
+        $cur[0] = $i;
+        for (int32 $j = 1; $j <= $n; $j = $j + 1) {
+            int32 $cost = 1;
+            if ($a->byte(($i - 1) as usize) == $b->byte(($j - 1) as usize)) {
+                $cost = 0;
+            }
+
+            int32 $del = $prev[$j as usize] + 1;
+            int32 $ins = $cur[($j - 1) as usize] + 1;
+            int32 $sub = $prev[($j - 1) as usize] + $cost;
+            int32 $best = $del;
+            if ($ins < $best) {
+                $best = $ins;
+            }
+
+            if ($sub < $best) {
+                $best = $sub;
+            }
+
+            $cur[$j as usize] = $best;
+        }
+
+        for (int32 $j = 0; $j <= $n; $j = $j + 1) {
+            $prev[$j as usize] = $cur[$j as usize];
+        }
+    }
+
+    return $prev[$n as usize];
+}
+
+internal function guessCommand(const string& $name, const array<string>& $names) : string?
+{
+    int32 $best = 1000;
+    string? $hit = null;
+    int32 $ties = 0;
+    foreach ($names as $cand) {
+        int32 $d = editDistance($name, $cand);
+        if ($d == 0) {
+            return $cand;
+        }
+
+        if ($d < $best) {
+            $best = $d;
+            $hit = $cand;
+            $ties = 1;
+        } else if ($d == $best) {
+            $ties = $ties + 1;
+        }
+    }
+
+    if ($ties != 1) {
+        return null;
+    }
+
+    string $g = guard $hit else {
+        return null;
+    }
+    int32 $limit = 1;
+    if (($g->size() as int32) > 3) {
+        $limit = 2;
+    }
+
+    if ($best > $limit) {
+        return null;
+    }
+
+    return $g;
+}
