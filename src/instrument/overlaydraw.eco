@@ -1,6 +1,6 @@
 /**
- * VG drawing for the instrument overlay HUD: compact line, tab chips, pass bars.
- * Overlay owns GPU state and sampling; this file paints.
+ * VG drawing for the instrument overlay HUD: compact line, tab chips, scroll.
+ * Graph body paint lives in overlaygraph.eco. Overlay owns GPU state and sampling.
  */
 
 namespace visu::instrument;
@@ -24,15 +24,8 @@ internal function measureSparkSlots(
 ) : array<SparkSlot>
 {
     array<SparkSlot> $slots = array<SparkSlot>();
-    float32 $scale = $target->contentScaleX;
-
-    if ($scale < 0.0001f) {
-        $scale = 1.0f;
-    }
-
-    float32 $pw = ($target->width as float32) / $scale;
-    float32 $ph = ($target->height as float32) / $scale;
-    $vg->begin($pw, $ph, $scale);
+    Vec2 $size = hudSize($target);
+    $vg->begin($size->x, $size->y, hudScale($target->contentScaleX));
     guard $vg->fontFace('debug') else {
         $vg->cancel();
         return $slots;
@@ -194,19 +187,32 @@ internal function hudExtend(AABB2D $box, const AABB2D& $b, bool $any) : AABB2D
     return $box;
 }
 
+internal function lineBox(Canvas $vg, float32 $x, float32 $y, string $text) : AABB2D
+{
+    return $vg->textBounds(Vec2($x, $y), $text);
+}
+
+/**
+ * Chips plus the selected tab's body under the HUD. `$scroll` is the first body item drawn; the
+ * body is cut to what fits above `$viewH` and the clamped scroll comes back so the wheel cannot run
+ * past the last row.
+ */
 internal function paintTabs(
     Canvas $vg,
     const array<Tab>& $tabs,
     string $selected,
-    float32 $top
-) : void
+    int32 $graphDepth,
+    int32 $scroll,
+    float32 $top,
+    float32 $viewH
+) : int32
 {
     if ($tabs->empty()) {
-        return;
+        return 0;
     }
 
     guard $vg->fontFace('debug') else {
-        return;
+        return $scroll;
     }
     $vg->fontSize(14.0f);
     $vg->textAlign(TextAlign(.left, .top));
@@ -241,10 +247,13 @@ internal function paintTabs(
         $body = $tabs[0];
     }
 
-    array<PassTiming> $passes = sortPasses($body->passes);
+    array<PassTiming> $passes = $body->passes;
     float64 $maxNs = passBarMax($passes);
-    array<TabBodyItem> $items = tabBodyItems($body, $passes, $maxNs);
+    array<TabBodyItem> $all = tabBodyItems($body, $passes, $maxNs, $graphDepth);
     float32 $by = $chipY + $chipH + SPARK_GAP;
+    float32 $room = $viewH - $by - $pad;
+    int32 $first = clampTabScroll($all, $scroll, $room, $lh);
+    array<TabBodyItem> $items = visibleTabItems($all, $first, $room, $lh);
     $box = measureTabBody($vg, $box, $any, $x, $by, $lh, $items);
     $any = true;
 
@@ -275,218 +284,156 @@ internal function paintTabs(
     }
 
     paintTabBody($vg, $x, $by, $lh, $items, $maxNs);
+    return $first;
 }
 
-internal enum TabBodyItem
+/**
+ * Clamp the first drawn item so the body never scrolls past its last row: 0 when everything fits,
+ * else at most the first index from which the rest still fills the room.
+ */
+internal function clampTabScroll(
+    const array<TabBodyItem>& $items,
+    int32 $scroll,
+    float32 $room,
+    float32 $lh
+) : int32
 {
-    case line(string $text);
-    case bars(PassTiming $p);
+    if ($scroll <= 0) {
+        return 0;
+    }
+
+    int32 $max = maxTabScroll($items, $room, $lh);
+
+    if ($scroll > $max) {
+        return $max;
+    }
+
+    return $scroll;
 }
 
-internal function tabBodyItems(
-    const Tab& $body,
-    const array<PassTiming>& $passes,
-    float64 $maxNs
+internal function maxTabScroll(const array<TabBodyItem>& $items, float32 $room, float32 $lh) : int32
+{
+    float32 $total = 0.0f;
+    foreach ($items as $item) {
+        $total = $total + tabBodyItemHeight($item, $lh);
+    }
+
+    if ($total <= $room) {
+        return 0;
+    }
+
+    // a scrolled body spends one line on the "above" marker
+    float32 $left = $room - $lh;
+    float32 $used = 0.0f;
+    usize $i = $items->count();
+
+    while ($i > 0) {
+        float32 $h = tabBodyItemHeight($items[$i - 1], $lh);
+
+        if ($used + $h > $left) {
+            return $i as int32;
+        }
+
+        $used = $used + $h;
+        $i = $i - 1;
+    }
+
+    return 0;
+}
+
+/**
+ * The slice of `$items` from `$first` that fits in `$room`, with a marker line for the rows
+ * hidden above and one for those hidden below.
+ */
+internal function visibleTabItems(
+    const array<TabBodyItem>& $items,
+    int32 $first,
+    float32 $room,
+    float32 $lh
 ) : array<TabBodyItem>
 {
-    array<TabBodyItem> $items = array<TabBodyItem>();
-    array<Section> $sections = $body->sections;
-    foreach ($sections as $sec) {
-        if (!$sec->id->empty()) {
-            TabBodyItem $heading = .line($sec->id);
-            $items[] = $heading;
-        }
+    // `$first` comes from clampTabScroll, so it already lies in [0, count]
+    array<TabBodyItem> $out = array<TabBodyItem>();
+    usize $n = $items->count();
+    usize $start = $first as usize;
+    float32 $left = $room;
 
-        array<Metric> $metrics = $sec->metrics;
-        foreach ($metrics as $m) {
-            string $line = formatMetric($m);
-            if (!$sec->id->empty()) {
-                $line = "  {$line}";
-            }
-
-            TabBodyItem $row = .line($line);
-            $items[] = $row;
-        }
+    if ($start > 0) {
+        TabBodyItem $above = .line("^ {$start} more");
+        $out[] = $above;
+        $left = $left - $lh;
     }
 
-    foreach ($passes as $p) {
-        TabBodyItem $passLine = .line(formatPass($p));
-        $items[] = $passLine;
-        array<Metric> $extras = $p->extras;
-        foreach ($extras as $m) {
-            string $extra = formatMetric($m);
-            TabBodyItem $extraLine = .line("    {$extra}");
-            $items[] = $extraLine;
-        }
+    usize $end = fitTabItems($items, $start, $left, $lh);
 
-        if ($maxNs > 0.0) {
-            TabBodyItem $bar = .bars($p);
-            $items[] = $bar;
-        }
+    if ($end < $n) {
+        // make room for the "below" marker and refit
+        $end = fitTabItems($items, $start, $left - $lh, $lh);
     }
 
-    return $items;
+    usize $i = $start;
+
+    while ($i < $end) {
+        $out[] = $items[$i];
+        $i = $i + 1;
+    }
+
+    if ($end < $n) {
+        usize $hidden = $n - $end;
+        TabBodyItem $below = .line("v {$hidden} more");
+        $out[] = $below;
+    }
+
+    return $out;
 }
 
-internal function measureTabBody(
-    Canvas $vg,
-    AABB2D $box,
-    bool $any,
-    float32 $x,
-    float32 $y,
-    float32 $lh,
-    const array<TabBodyItem>& $items
-) : AABB2D
-{
-    float32 $cy = $y;
-    foreach ($items as $item) {
-        $box = extendTabBodyItem($vg, $box, $any, $x, $cy, $item);
-        $any = true;
-        $cy = $cy + tabBodyItemHeight($item, $lh);
-    }
-
-    return $box;
-}
-
-internal function paintTabBody(
-    Canvas $vg,
-    float32 $x,
-    float32 $y,
-    float32 $lh,
+/**
+ * Index one past the last item from `$start` that fits in `$room`.
+ */
+internal function fitTabItems(
     const array<TabBodyItem>& $items,
-    float64 $maxNs
-) : void
+    usize $start,
+    float32 $room,
+    float32 $lh
+) : usize
 {
-    float32 $cy = $y;
-    foreach ($items as $item) {
-        paintTabBodyItem($vg, $x, $cy, $item, $maxNs);
-        $cy = $cy + tabBodyItemHeight($item, $lh);
-    }
-}
+    float32 $used = 0.0f;
+    usize $i = $start;
+    usize $n = $items->count();
 
-internal function tabBodyItemHeight(TabBodyItem $item, float32 $lh) : float32
-{
-    return match ($item) {
-        TabBodyItem::line($text) => $lh,
-        TabBodyItem::bars($p) => barStack($p) + SPARK_GAP,
-    };
-}
+    while ($i < $n) {
+        float32 $h = tabBodyItemHeight($items[$i], $lh);
 
-internal function extendTabBodyItem(
-    Canvas $vg,
-    AABB2D $box,
-    bool $any,
-    float32 $x,
-    float32 $y,
-    TabBodyItem $item
-) : AABB2D
-{
-    return match ($item) {
-        TabBodyItem::line($text) => hudExtend($box, lineBox($vg, $x, $y, $text), $any),
-        TabBodyItem::bars($p) => hudExtend(
-            $box,
-            AABB2D(Vec2($x, $y), Vec2($x + BAR_W, $y + barStack($p))),
-            $any
-        ),
-    };
-}
-
-internal function paintTabBodyItem(
-    Canvas $vg,
-    float32 $x,
-    float32 $y,
-    TabBodyItem $item,
-    float64 $maxNs
-) : void
-{
-    match ($item) {
-        TabBodyItem::line($text) => {
-            paintBodyLine($vg, $x, $y, $text);
-        },
-        TabBodyItem::bars($p) => {
-            paintBodyBars($vg, $x, $y, $p, $maxNs);
-        },
-    }
-}
-
-internal function barStack(PassTiming $p) : float32
-{
-    return passBarStack($p);
-}
-
-internal function lineBox(Canvas $vg, float32 $x, float32 $y, string $text) : AABB2D
-{
-    return $vg->textBounds(Vec2($x, $y), $text);
-}
-
-internal function paintBodyLine(Canvas $vg, float32 $x, float32 $y, string $text) : void
-{
-    $vg->fillColor(Color::white());
-    $vg->text(Vec2($x, $y), $text);
-}
-
-internal function paintBodyBars(
-    Canvas $vg,
-    float32 $x,
-    float32 $y,
-    PassTiming $p,
-    float64 $maxNs
-) : void
-{
-    paintPassBars($vg, $x, $y, $p, $maxNs);
-}
-
-internal function paintPassBars(
-    Canvas $vg,
-    float32 $x,
-    float32 $y,
-    const PassTiming& $p,
-    float64 $maxNs
-) : float32
-{
-    float32 $cy = $y;
-    float32 $cpuW = ((($p->cpuNs / $maxNs) as float32) * BAR_W);
-    $vg->fillColor(Color(0.35f, 0.85f, 0.45f, 0.85f));
-    if ($cpuW > 1.0f) {
-        $vg->fillRect(Vec2($x, $cy), Vec2($cpuW, BAR_H));
-    }
-
-    $cy = $cy + BAR_H;
-    if ($p->gpuNs > 0.0) {
-        $cy = $cy + BAR_GAP;
-        float32 $gpuW = ((($p->gpuNs / $maxNs) as float32) * BAR_W);
-        $vg->fillColor(Color(0.40f, 0.65f, 0.95f, 0.85f));
-        if ($gpuW > 1.0f) {
-            $vg->fillRect(Vec2($x, $cy), Vec2($gpuW, BAR_H));
+        if ($used + $h > $room) {
+            break;
         }
 
-        $cy = $cy + BAR_H;
+        $used = $used + $h;
+        $i = $i + 1;
     }
 
-    return $cy;
+    return $i;
 }
 
-internal function passBarMax(const array<PassTiming>& $passes) : float64
+/**
+ * A content scale the HUD can divide by: the target's, or 1 when it reports none.
+ */
+internal function hudScale(float32 $scale) : float32
 {
-    float64 $maxNs = 0.0;
-    foreach ($passes as $p) {
-        if ($p->cpuNs > $maxNs) {
-            $maxNs = $p->cpuNs;
-        }
-
-        if ($p->gpuNs > $maxNs) {
-            $maxNs = $p->gpuNs;
-        }
+    if ($scale < 0.0001f) {
+        return 1.0f;
     }
 
-    return $maxNs;
+    return $scale;
 }
 
-internal function passBarStack(const PassTiming& $p) : float32
+/**
+ * Backbuffer size in HUD points.
+ */
+internal function hudSize(TargetRef $target) : Vec2
 {
-    if ($p->gpuNs > 0.0) {
-        return BAR_H + BAR_GAP + BAR_H;
-    }
-
-    return BAR_H;
+    return Vec2(
+        ($target->width as float32) / hudScale($target->contentScaleX),
+        ($target->height as float32) / hudScale($target->contentScaleY),
+    );
 }

@@ -86,6 +86,62 @@ test vtex_cook_png_has_mips
     assert($img->format == PixelFormat::rgba8Srgb, 'srgb');
 }
 
+test vtex_max_mips_keep_cutout_coverage
+{
+    string $src = texTmp('max-src');
+    mkdirTex($src);
+    string $ds = env::DS;
+    array<uint8> $rgba = array<uint8>();
+    $rgba[] = 255;
+    $rgba[] = 255;
+    $rgba[] = 255;
+    $rgba[] = 255;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    $rgba[] = 0;
+    Pixels $px = Pixels(2, 2, $rgba);
+    guard $px->write("{$src}{$ds}alpha.png") else ($e) {
+        die($e->message());
+    }
+    guard io::writefile("{$src}{$ds}alpha.vtex", '{"srgb":false,"mip":"max"}') else ($e) {
+        die($e->message());
+    }
+
+    string $out = texTmp('max-out');
+    mkdirTex($out);
+    Kitchen $k = Kitchen();
+    $k->add(TextureCooker());
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    $assets->register(KIND_TEXTURE, function(Assets $a, Blob $b) : result<CookedImage, AssetError> {
+        return decodeTexture($a, $b);
+    });
+    DirectoryStore $store = guard DirectoryStore::open($out) else ($e) {
+        die($e->message());
+    }
+    guard $assets->mount($store) else ($e) {
+        die($e->message());
+    }
+    CookedImage $img = guard $assets->load<CookedImage>('alpha') else ($e) {
+        die($e->message());
+    }
+    assert($img->mips >= 2, 'has a 1x1 mip');
+    // mip 0 is 2x2 (16 bytes); mip 1 is one pixel. box average would be 63.
+    assert($img->texels->byte(16) == 255, 'max keeps the opaque texel');
+}
+
 test vtex_cook_vmat_linear
 {
     string $src = texTmp('vmat-lin-src');
@@ -104,7 +160,7 @@ test vtex_cook_vmat_linear
         die($e->message());
     }
 
-    guard io::writefile("{$folder}{$ds}rock.vmat", '{"normal":{"srgb":false}}') else ($e) {
+    guard io::writefile("{$folder}{$ds}rock.vtex", '{"normal":{"srgb":false}}') else ($e) {
         die($e->message());
     }
 
@@ -115,7 +171,7 @@ test vtex_cook_vmat_linear
     array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
         die($e->message());
     }
-    assert($items->count() == 2, 'vmat + png');
+    assert($items->count() == 1, 'png only, vtex is cook-time');
 
     DirectoryStore $store = guard DirectoryStore::open($out) else ($e) {
         die($e->message());

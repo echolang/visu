@@ -10,6 +10,7 @@
 namespace visu::runtime;
 
 use std::time;
+use visu::profile::{Profiler, profiler};
 
 public class GameLoop
 {
@@ -132,12 +133,17 @@ public class GameLoop
         }
 
         $this->lag = $this->lag + $delta;
+        // the loop owns the profiler's frame: ticks fold into one `update` scope, render nests under Host
+        Profiler $prof = profiler();
+        $prof->beginFrame();
 
         int32 $ticks = 0;
         while ($this->lag >= $this->timestepNs && $ticks < $this->maxUpdatesPerFrame) {
             $this->lag = $this->lag - $this->timestepNs;
             int64 $t0 = $this->nowNs();
+            $prof->begin('update');
             $this->delegate->update();
+            $prof->end();
             $this->push64($this->tickTimes, $this->nowNs() - $t0, $this->tickTimeSampleCount);
             $ticks = $ticks + 1;
         }
@@ -147,6 +153,7 @@ public class GameLoop
         }
 
         if ($this->delegate->shouldStop() || $this->forceStop) {
+            $prof->endFrame();
             return;
         }
 
@@ -157,6 +164,7 @@ public class GameLoop
 
         $this->compensation = $compensation;
         $this->delegate->render($compensation);
+        $prof->endFrame();
 
         // the inter-frame delta, not how long advance() took: a frame that blocks on present must show up in the fps readout
         if ($delta > 0) {

@@ -6,6 +6,8 @@
 
 namespace visu::instrument;
 
+use visu::profile::{FrameProfile, PROFILE_DISABLED_NOTE, StatsBook};
+
 public class Instruments
 {
     private array<Source> $sources;
@@ -14,7 +16,8 @@ public class Instruments
     private map<string, Gauge> $gauges;
     private array<TabSpec> $declared;
     private Sink $push;
-    private array<PassTiming> $graph;
+    private StatsBook? $stats;
+    private float64 $submitNs;
     private map<string, array<Metric>> $passExtras;
     private Sample? $last;
     private float64 $renderNs;
@@ -27,7 +30,8 @@ public class Instruments
         $this->gauges = map<string, Gauge>();
         $this->declared = array<TabSpec>();
         $this->push = Sink::empty();
-        $this->graph = array<PassTiming>();
+        $this->stats = null;
+        $this->submitNs = 0.0;
         $this->passExtras = map<string, array<Metric>>();
         $this->last = null;
         $this->renderNs = 0.0;
@@ -123,74 +127,13 @@ public class Instruments
         );
     }
 
-    public function noteGraph(const array<PassTiming>& $passes) : void
-    {
-        $this->graph = $passes->clone();
-    }
-
-    public function noteGraph(const array<visu::graphics::PassProfile>& $passes) : void
-    {
-        array<PassTiming> $out = array<PassTiming>();
-        foreach ($passes as $p) {
-            PassTiming $t = PassTiming();
-            $t->name = $p->name;
-            $t->cpuNs = $p->cpuNs;
-            $t->draw = $p->draw;
-            $out[] = $t;
-        }
-
-        $this->graph = $out;
-    }
-
     /**
-     * Fold resolved GPU timestamps onto the last noteGraph rows, by pass name.
-     * Unknown names (e.g. `submit`) append a GPU-only row.
+     * Rolling stats for the graph tab, plus this frame's whole-submit GPU time.
      */
-    public function noteGpu(const array<visu::graphics::GpuScopeSample>& $samples) : void
+    public function noteProfile(FrameProfile $frame, StatsBook $stats) : void
     {
-        foreach ($samples as $s) {
-            if ($s->name->empty() || $s->ns <= 0.0) {
-                continue;
-            }
-
-            array<PassTiming> $kept = array<PassTiming>();
-            bool $found = false;
-            array<PassTiming> $have = $this->graph;
-            foreach ($have as $p) {
-                if ($p->name == $s->name) {
-                    PassTiming $row = $p;
-                    $row->gpuNs = $s->ns;
-                    $kept[] = $row;
-                    $found = true;
-                } else {
-                    $kept[] = $p;
-                }
-            }
-
-            if (!$found) {
-                PassTiming $row = PassTiming();
-                $row->name = $s->name;
-                $row->gpuNs = $s->ns;
-                $kept[] = $row;
-            }
-
-            $this->graph = $kept;
-        }
-    }
-
-    /**
-     * Last graph row for `$name`, if noteGraph saw it.
-     */
-    public const function lastPass(string $name) : PassTiming?
-    {
-        array<PassTiming> $passes = $this->graph;
-        foreach ($passes as $p) {
-            if ($p->name == $name) {
-                return $p;
-            }
-        }
-
-        return null;
+        $this->stats = $stats;
+        $this->submitNs = $frame->submitNs;
     }
 
     public function gauge(string $name, float64 $value, Unit $unit = Unit::count) : void
@@ -238,9 +181,14 @@ public class Instruments
 
         mergeSink($sink, $this->push);
         $sink->tab('graph', title: 'Graph', 10);
-        array<PassTiming> $graph = $this->graph;
-        foreach ($graph as $p) {
-            $sink->pass($p);
+
+        if (!visu::profile::enabled()) {
+            $sink->note(PROFILE_DISABLED_NOTE);
+        }
+
+        if ($this->stats != null) {
+            StatsBook $book = guard $this->stats;
+            $sink->replacePasses(rowsFromStats($book));
         }
 
         map<string, array<Metric>> $extras = $this->passExtras;
@@ -269,6 +217,7 @@ public class Instruments
 
         LoopStats $loop = $sink->loop;
         $loop->renderNs = $this->renderNs;
+        $loop->gpuNs = $this->submitNs;
         array<Tab> $tabs = $sink->snapshotTabs();
         Sample $snap = Sample($loop, $sink->memory, $sink->adapter, $list, liveAllocations(), $tabs);
         $this->last = $snap;

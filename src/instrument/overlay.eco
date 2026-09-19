@@ -1,7 +1,8 @@
 /**
  * VG HUD on the backbuffer.
  * Compact: one horizontal line, white on a dark panel, with a sparkline under each section.
- * F1 toggles visibility. F2 expands a tab panel underneath. `[` `]` cycle tabs.
+ * F1 toggles visibility. F2 expands a tab panel underneath. `[` `]` cycle tabs, `-` `=` change the graph depth,
+ * the wheel scrolls a body taller than the window.
  * Extra rows drain even when hidden.
  * Sampling lives on Instruments, not here.
  */
@@ -15,7 +16,7 @@ use visu::graphics::{
 use visu::math::Vec2;
 use visu::os::input;
 use visu::os::input::KeyPhase;
-use visu::signal::{Dispatcher, Flow, KeySignal};
+use visu::signal::{Dispatcher, Flow, KeySignal, ScrollSignal};
 use visu::vg::{Canvas, VgError, VgRenderer};
 
 public class Overlay
@@ -23,7 +24,16 @@ public class Overlay
     public bool $enabled = true;
     public bool $expanded = false;
     public string $selected = 'rendering';
+    /**
+     * Deepest graph row drawn: 0 frame roots, 1 passes, 2 pass sub-scopes. `-` / `=` when expanded.
+     */
+    public int32 $graphDepth = 2;
+    /**
+     * First body item drawn on the expanded tab; the wheel moves it and paint clamps it to the rows.
+     */
+    public int32 $scroll = 0;
 
+    private float64 $scrollAcc;
     private VgRenderer $vg;
     private FullscreenTextureRenderer $blit;
     private Texture? $spark0;
@@ -52,6 +62,7 @@ public class Overlay
         $this->loaded = false;
         $this->dead = false;
         $this->lastSample = null;
+        $this->scrollAcc = 0.0;
     }
 
     destructor()
@@ -115,6 +126,16 @@ public class Overlay
                 return .proceed;
             }
 
+            if ($key->key == input::Key::minus) {
+                $overlay->setGraphDepth($overlay->graphDepth - 1);
+                return .proceed;
+            }
+
+            if ($key->key == input::Key::equal) {
+                $overlay->setGraphDepth($overlay->graphDepth + 1);
+                return .proceed;
+            }
+
             int32 $n1 = input::Key::num1->value();
             int32 $n9 = input::Key::num9->value();
             int32 $v = $key->key->value();
@@ -124,6 +145,46 @@ public class Overlay
 
             return .proceed;
         });
+        $dispatcher->register(function(const ScrollSignal& $scroll) : Flow {
+            if (!$overlay->expanded || !$overlay->enabled) {
+                return .proceed;
+            }
+
+            // the panel owns the wheel while it is open, so the camera does not zoom under it
+            $overlay->wheel($scroll->y);
+            return .stop;
+        });
+    }
+
+    /**
+     * Wheel steps accumulate until a whole row; up (positive) shows earlier rows.
+     */
+    public function wheel(float64 $dy) : void
+    {
+        $this->scrollAcc = $this->scrollAcc + $dy;
+
+        while ($this->scrollAcc >= 1.0) {
+            $this->setScroll($this->scroll - 1);
+            $this->scrollAcc = $this->scrollAcc - 1.0;
+        }
+
+        while ($this->scrollAcc <= -1.0) {
+            $this->setScroll($this->scroll + 1);
+            $this->scrollAcc = $this->scrollAcc + 1.0;
+        }
+    }
+
+    /**
+     * Lower bound here; the upper bound depends on the rows and is applied when the panel paints.
+     */
+    public function setScroll(int32 $first) : void
+    {
+        if ($first < 0) {
+            $this->scroll = 0;
+            return;
+        }
+
+        $this->scroll = $first;
     }
 
     public function cycle(int32 $delta) : void
@@ -155,6 +216,22 @@ public class Overlay
 
         $next = $next % $wrap;
         $this->selected = $tabs[$next as usize]->id;
+        $this->scroll = 0;
+    }
+
+    public function setGraphDepth(int32 $depth) : void
+    {
+        int32 $d = $depth;
+
+        if ($d < 0) {
+            $d = 0;
+        }
+
+        if ($d > 15) {
+            $d = 15;
+        }
+
+        $this->graphDepth = $d;
     }
 
     public function selectIndex(int32 $index) : void
@@ -168,6 +245,7 @@ public class Overlay
         }
 
         $this->selected = $tabs[$index as usize]->id;
+        $this->scroll = 0;
     }
 
     public function row(string $line) : void
@@ -192,11 +270,15 @@ public class Overlay
         array<SparkSlot> $slots = measureSparkSlots($this->vg->canvas, $target, $drawn);
         bool $expanded = $this->expanded;
         string $selected = $this->selected;
+        int32 $graphDepth = $this->graphDepth;
+        int32 $scroll = $this->scroll;
+        float32 $viewH = hudSize($target)->y;
         array<Tab> $tabs = $sample->tabs;
+        Overlay $overlay = $this;
         $this->vg->pass($pipeline, $target, function(Canvas $vg) : void {
             float32 $bottom = paintHud($vg, $drawn, $below, $slots);
             if ($expanded) {
-                paintTabs($vg, $tabs, $selected, $bottom);
+                $overlay->scroll = paintTabs($vg, $tabs, $selected, $graphDepth, $scroll, $bottom, $viewH);
             }
         });
         $this->stampSpark($pipeline, $target, $slots);
@@ -286,20 +368,10 @@ public class Overlay
 
         int32 $stripW = sparkStripWidth($slots);
         int32 $stripH = SPARK_H;
-        float32 $sx = $target->contentScaleX;
-        float32 $sy = $target->contentScaleY;
-
-        if ($sx < 0.0001f) {
-            $sx = 1.0f;
-        }
-
-        if ($sy < 0.0001f) {
-            $sy = 1.0f;
-        }
-
+        Vec2 $size = hudSize($target);
         Vec2 $origin = sparkStripOrigin();
-        int32 $capW = sparkRound(($target->width as float32) / $sx - $origin->x);
-        int32 $capH = sparkRound(($target->height as float32) / $sy - $origin->y);
+        int32 $capW = sparkRound($size->x - $origin->x);
+        int32 $capH = sparkRound($size->y - $origin->y);
 
         if ($capW < 1 || $capH < 1) {
             return;

@@ -1,0 +1,55 @@
+/**
+ * Profile console grammar.
+ */
+
+use visu::console::{ProfileAction, parseProfileConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal function profileLine(const string& $line) : ProfileAction
+{
+    return parseProfileConsole(ConsoleCommandSignal($line));
+}
+
+test profile_console_grammar
+{
+    int32 $bare = match (profileLine('profile')) {
+        ProfileAction::tree($d) => $d,
+        else => -1,
+    };
+    assert($bare == 2, 'bare profile is the tree two deep');
+    int32 $deep = match (profileLine('profile depth 4')) {
+        ProfileAction::tree($d) => $d,
+        else => -1,
+    };
+    assert($deep == 4, 'depth');
+    bool $badDepth = match (profileLine('profile depth lots')) {
+        ProfileAction::usage => true,
+        else => false,
+    };
+    assert($badDepth, 'non-numeric depth is usage');
+    bool $queued = match (profileLine('profile dump')) {
+        ProfileAction::dumpQueued => true,
+        else => false,
+    };
+    assert($queued, 'bare dump queues');
+    string $path = match (profileLine('profile dump var/p.json')) {
+        ProfileAction::dump($p) => $p,
+        else => '',
+    };
+    assert($path == 'var/p.json', 'dump path');
+    bool $reset = match (profileLine('profile reset')) {
+        ProfileAction::reset => true,
+        else => false,
+    };
+    assert($reset, 'reset');
+    bool $gpu = match (profileLine('profile gpu')) {
+        ProfileAction::gpu => true,
+        else => false,
+    };
+    assert($gpu, 'gpu');
+    bool $usage = match (profileLine('profile what')) {
+        ProfileAction::usage => true,
+        else => false,
+    };
+    assert($usage, 'unknown word is usage');
+}

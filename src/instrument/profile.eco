@@ -1,0 +1,148 @@
+/**
+ * Graph-tab rows from the profiler's StatsBook: every scope seen inside the window, depth-first,
+ * siblings sorted by average GPU then average CPU (descending, name as the tie break). Averages are
+ * per frame over the window, so the order and the bars move slowly instead of flickering with the
+ * frame that happened to complete last. The frame root is skipped, so `update`, `build`, `render`
+ * and `present` sit at depth 0 and passes under `render` at depth 1.
+ */
+
+namespace visu::instrument;
+
+use visu::profile::{ScopeStats, StatsBook};
+
+public function rowsFromStats(const StatsBook& $stats) : array<PassTiming>
+{
+    array<ScopeStats> $all = $stats->all();
+    array<PassTiming> $out = array<PassTiming>();
+    appendStatRows($stats, $all, '', array<bool>(), $out);
+    return $out;
+}
+
+/**
+ * `$guides` carries one flag per ancestor level, true where that ancestor has later siblings; the
+ * row keeps it for the tree connectors and its children get it extended by the row's own flag.
+ */
+internal function appendStatRows(
+    const StatsBook& $stats,
+    const array<ScopeStats>& $all,
+    const string& $parentPath,
+    const array<bool>& $guides,
+    array<PassTiming>& $out
+) : void
+{
+    array<ScopeStats> $siblings = array<ScopeStats>();
+    foreach ($all as $s) {
+        if ($s->parentPath == $parentPath) {
+            $siblings = insertByAverage($siblings, $s);
+        }
+    }
+
+    usize $count = $siblings->count();
+    usize $i = 0;
+
+    while ($i < $count) {
+        ScopeStats $s = $siblings[$i];
+        $i = $i + 1;
+        PassTiming $row = PassTiming();
+        $row->name = $s->name;
+        $row->guides = $guides;
+        $row->last = $i == $count;
+        $row->path = $s->path;
+        $row->depth = $s->depth - 1;
+        $row->calls = $s->lastCalls;
+        $row->childCount = childStatCount($all, $s->path);
+        $row->cpuNs = $s->cpu->last;
+        $row->avgCpuNs = $s->cpu->avg();
+        $row->maxCpuNs = $s->cpu->max();
+        $row->gpuKnown = $stats->gpuKnown($s);
+
+        if ($row->gpuKnown) {
+            $row->gpuNs = $s->gpu->last;
+            $row->avgGpuNs = $s->gpu->avg();
+            $row->maxGpuNs = $s->gpu->max();
+        }
+
+        $row->draw = $s->lastDraw;
+        $out[] = $row;
+        array<bool> $below = $guides;
+        $below[] = !$row->last;
+        appendStatRows($stats, $all, $s->path, $below, $out);
+    }
+}
+
+internal function childStatCount(const array<ScopeStats>& $all, const string& $path) : int32
+{
+    int32 $n = 0;
+    foreach ($all as $s) {
+        if ($s->parentPath == $path) {
+            $n = $n + 1;
+        }
+    }
+
+    return $n;
+}
+
+internal function insertByAverage(array<ScopeStats> $list, ScopeStats $s) : array<ScopeStats>
+{
+    array<ScopeStats> $out = array<ScopeStats>();
+    bool $placed = false;
+    foreach ($list as $have) {
+        if (!$placed && statBefore($s, $have)) {
+            $out[] = $s;
+            $placed = true;
+        }
+
+        $out[] = $have;
+    }
+
+    if (!$placed) {
+        $out[] = $s;
+    }
+
+    return $out;
+}
+
+internal function statBefore(const ScopeStats& $a, const ScopeStats& $b) : bool
+{
+    float64 $ga = $a->gpu->avg();
+    float64 $gb = $b->gpu->avg();
+
+    if ($ga != $gb) {
+        return $ga > $gb;
+    }
+
+    float64 $ca = $a->cpu->avg();
+    float64 $cb = $b->cpu->avg();
+
+    if ($ca != $cb) {
+        return $ca > $cb;
+    }
+
+    return nameBefore($a->name, $b->name);
+}
+
+/**
+ * Byte-wise ordering of two names; Echo strings have `==` but no `<`.
+ */
+internal function nameBefore(const string& $a, const string& $b) : bool
+{
+    ptr<const uint8> $pa = $a->cstr();
+    ptr<const uint8> $pb = $b->cstr();
+    usize $n = $a->size();
+
+    if ($b->size() < $n) {
+        $n = $b->size();
+    }
+
+    usize $i = 0;
+
+    while ($i < $n) {
+        if ($pa:$[$i] != $pb:$[$i]) {
+            return $pa:$[$i] < $pb:$[$i];
+        }
+
+        $i = $i + 1;
+    }
+
+    return $a->size() < $b->size();
+}

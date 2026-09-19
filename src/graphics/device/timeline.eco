@@ -1,0 +1,85 @@
+/**
+ * Backend-neutral GPU timing mailbox
+ */
+
+namespace visu::graphics;
+
+public struct GpuSpan
+{
+    public int32 $scope = -1;
+    public float64 $ns = 0.0;
+}
+
+/**
+ * One resolved GPU frame waiting for the profiler to fold it in. Empty `$spans` is a valid
+ * resolve (no encoders, or every sample came back zero).
+ */
+public struct GpuPublish
+{
+    public uint64 $frame = 0;
+    public array<GpuSpan> $spans = array<GpuSpan>();
+    public int32 $dropped = 0;
+}
+
+public class GpuTimeline
+{
+    public int32 $scope;
+    public uint64 $resolvedFrame;
+    public array<GpuSpan> $resolved;
+    /** set by Device.initialize; false when the device cannot sample timestamps or under VISU_RELEASE */
+    public bool $supported;
+    /** encoders of the resolved frame that got no timestamps because the per-frame capacity ran out */
+    public int32 $dropped;
+    private array<GpuPublish> $inbox;
+
+    public constructor()
+    {
+        $this->scope = -1;
+        $this->resolvedFrame = 0;
+        $this->resolved = array<GpuSpan>();
+        $this->supported = false;
+        $this->dropped = 0;
+        $this->inbox = array<GpuPublish>();
+    }
+
+    /**
+     * The backend hands over one resolved frame: its spans and how many encoders got no samples.
+     */
+    public function publish(uint64 $frame, array<GpuSpan> $spans, int32 $dropped) : void
+    {
+        GpuPublish $item = GpuPublish();
+        $item->frame = $frame;
+        $item->spans = $spans;
+        $item->dropped = $dropped;
+        $this->inbox[] = $item;
+        $this->resolvedFrame = $frame;
+        $this->resolved = $spans;
+        $this->dropped = $dropped;
+    }
+
+    /**
+     * Drain every unpublished resolve. Empty is a real result: nothing landed since the last take.
+     */
+    public function take() : array<GpuPublish>
+    {
+        array<GpuPublish> $have = $this->inbox;
+        $this->inbox = array<GpuPublish>();
+        return $have;
+    }
+}
+
+/**
+ * A zero-filled readback buffer for `$count` timestamps; both arms resolve into one of these.
+ */
+internal function zeroTicks(uint32 $count) : array<uint64>
+{
+    array<uint64> $ticks = arr::room<uint64>($count as usize);
+    uint32 $i = 0;
+
+    while ($i < $count) {
+        $ticks[] = 0;
+        $i = $i + 1;
+    }
+
+    return $ticks;
+}

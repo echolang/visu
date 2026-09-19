@@ -1,0 +1,230 @@
+/**
+ * glTF 2.0 `animations[]` → `Clip`s. Channels target node names; CUBICSPLINE keeps the value
+ * sample of each triple and plays as linear. Morph `weights` channels are skipped.
+ */
+
+namespace visu::asset;
+
+use json;
+
+internal function gltfParseClips(json::Value $root, GltfFile $file) : result<array<Clip>, GltfError>
+{
+    array<json::Value> $anims = gltfArray($root, 'animations');
+    array<Clip> $out = array<Clip>();
+    int32 $i = 0;
+    while (($i as usize) < $anims->count()) {
+        json::Value $anim = $anims[$i as usize];
+        string $name = gltfStr($anim, 'name', "clip_{$i}");
+        array<AnimTrack> $tracks = array<AnimTrack>();
+        array<json::Value> $channels = gltfArray($anim, 'channels');
+        array<json::Value> $samplers = gltfArray($anim, 'samplers');
+        foreach ($channels as $channel) {
+            AnimTrack? $track = guard gltfChannel($file, $channel, $samplers) else ($e) {
+                return .error($e);
+            }
+            AnimTrack $have = guard $track else {
+                continue;
+            }
+            $tracks[] = $have;
+        }
+
+        if ($tracks->count() == 0) {
+            $i = $i + 1;
+            continue;
+        }
+
+        float32 $duration = 0.0f;
+        foreach ($tracks as $track) {
+            float32 $end = 0.0f;
+            int32 $n = $track->keys();
+            if ($n > 0) {
+                $end = $track->times[($n - 1) as usize];
+            }
+
+            if ($end > $duration) {
+                $duration = $end;
+            }
+        }
+
+        $out[] = Clip($name, $duration, $tracks);
+        $i = $i + 1;
+    }
+
+    return .ok($out);
+}
+
+internal function gltfChannel(
+    GltfFile $file,
+    json::Value $channel,
+    const array<json::Value>& $samplers
+) : result<AnimTrack?, GltfError>
+{
+    json::Value? $targetVal = $channel->get('target');
+    json::Value $target = guard $targetVal else {
+        return .ok(null);
+    }
+    string $pathRaw = gltfStr($target, 'path', '');
+    if ($pathRaw->equals('weights')) {
+        return .ok(null);
+    }
+
+    AnimPath? $path = parsePath($pathRaw);
+    AnimPath $p = guard $path else {
+        return .ok(null);
+    }
+    int64? $nodeId = gltfInt($target, 'node');
+    int64 $nodeIndex = guard $nodeId else {
+        return .ok(null);
+    }
+    if ($nodeIndex < 0 || ($nodeIndex as usize) >= $file->nodes->count()) {
+        return .error(.json('animation channel node does not exist'));
+    }
+
+    GltfNode $node = $file->nodes[$nodeIndex as usize];
+    int64? $samplerId = gltfInt($channel, 'sampler');
+    int64 $samplerIndex = guard $samplerId else {
+        return .error(.json('animation channel has no sampler'));
+    }
+    if ($samplerIndex < 0 || ($samplerIndex as usize) >= $samplers->count()) {
+        return .error(.json('animation sampler does not exist'));
+    }
+
+    json::Value $sampler = $samplers[$samplerIndex as usize];
+    int64? $inId = gltfInt($sampler, 'input');
+    int64 $input = guard $inId else {
+        return .error(.json('animation sampler has no input'));
+    }
+    int64? $outId = gltfInt($sampler, 'output');
+    int64 $output = guard $outId else {
+        return .error(.json('animation sampler has no output'));
+    }
+    string $interpRaw = gltfStr($sampler, 'interpolation', 'LINEAR');
+    array<float32> $times = guard gltfReadFloats($file, $input as int32, 1) else ($e) {
+        return .error($e);
+    }
+    int32 $comp = match ($p) {
+        AnimPath::rotation => 4,
+        else => 3,
+    };
+    array<float32> $values = guard gltfReadFloats($file, $output as int32, $comp) else ($e) {
+        return .error($e);
+    }
+    AnimInterp $interp = .linear;
+    if (str::lower($interpRaw)->equals('step')) {
+        $interp = .step;
+    }
+
+    if (str::lower($interpRaw)->equals('cubicspline')) {
+        array<float32> $mid = gltfCubicValues($values, $times->count() as int32, $comp);
+        $values = $mid;
+        $interp = .linear;
+    }
+
+    if ($times->count() == 0) {
+        return .ok(null);
+    }
+
+    if (($values->count() as int32) != ($times->count() as int32) * $comp) {
+        return .error(.json("animation '{$node->name}' value count does not match keys"));
+    }
+
+    if (gltfValuesConstant($values, $comp) && gltfTrackMatchesRest($node, $p, $values, $comp)) {
+        return .ok(null);
+    }
+
+    return .ok(AnimTrack($node->name, $p, $interp, $times, $values));
+}
+
+/**
+ * True when the packed first key equals the node's rest TRS for `$path`.
+ */
+internal function gltfTrackMatchesRest(
+    const GltfNode& $node,
+    AnimPath $path,
+    const array<float32>& $values,
+    int32 $comp
+) : bool
+{
+    if (($values->count() as int32) < $comp) {
+        return false;
+    }
+
+    if ($path == AnimPath::rotation) {
+        Quat $rest = matRotation($node->local);
+        float32 $x = $values[0];
+        float32 $y = $values[1];
+        float32 $z = $values[2];
+        float32 $w = $values[3];
+        bool $same = gltfClose($x, $rest->x) && gltfClose($y, $rest->y) && gltfClose($z, $rest->z) && gltfClose($w, $rest->w);
+        bool $flipped = gltfClose($x, 0.0f - $rest->x) && gltfClose($y, 0.0f - $rest->y) && gltfClose($z, 0.0f - $rest->z) && gltfClose($w, 0.0f - $rest->w);
+        return $same || $flipped;
+    }
+
+    Vec3 $rest = match ($path) {
+        AnimPath::translation => matTranslation($node->local),
+        else => matScale($node->local),
+    };
+    return gltfClose($values[0], $rest->x) && gltfClose($values[1], $rest->y) && gltfClose($values[2], $rest->z);
+}
+
+internal function gltfClose(float32 $a, float32 $b) : bool
+{
+    float32 $d = $a - $b;
+    if ($d < 0.0f) {
+        $d = 0.0f - $d;
+    }
+
+    return $d <= 0.0001f;
+}
+
+internal function gltfValuesConstant(const array<float32>& $values, int32 $comp) : bool
+{
+    int32 $n = $values->count() as int32;
+    if ($n <= $comp) {
+        return true;
+    }
+
+    int32 $i = $comp;
+    while ($i < $n) {
+        int32 $c = 0;
+        while ($c < $comp) {
+            float32 $a = $values[$c as usize];
+            float32 $b = $values[($i + $c) as usize];
+            if (!gltfClose($a, $b)) {
+                return false;
+            }
+
+            $c = $c + 1;
+        }
+
+        $i = $i + $comp;
+    }
+
+    return true;
+}
+
+/**
+ * CUBICSPLINE stores in-tangent, value, out-tangent per key. Keep the value.
+ */
+internal function gltfCubicValues(const array<float32>& $values, int32 $keys, int32 $comp) : array<float32>
+{
+    array<float32> $out = array<float32>();
+    int32 $need = $keys * 3 * $comp;
+    if (($values->count() as int32) < $need || $keys < 1) {
+        return $values;
+    }
+
+    int32 $k = 0;
+    while ($k < $keys) {
+        int32 $base = ($k * 3 + 1) * $comp;
+        int32 $c = 0;
+        while ($c < $comp) {
+            $out[] = $values[($base + $c) as usize];
+            $c = $c + 1;
+        }
+
+        $k = $k + 1;
+    }
+
+    return $out;
+}

@@ -171,3 +171,21 @@ test script_bad_json_and_shape
     DCaptureError $flag = failure('{"flags":{"a":[1]}}');
     assert($flag->message() == 'flags.a: expected boolean, number or string', 'flag type');
 }
+
+test script_profile_step_is_a_flag_not_a_frame_pad
+{
+    Script $s = guard Script::parse('{"steps":[{"frame":40,"profile":true}]}') else ($e) {
+        die($e->message());
+    }
+    assert($s->steps->count() == 1, 'one step');
+    assert($s->steps[0]->profile, 'profile flag');
+    assert($s->hasProfile(), 'has profile');
+    int32? $implied = $s->impliedFrames();
+    assert(($implied ?? 0) == 42, 'script cap is last frame + 2');
+
+    Script $plain = guard Script::parse('{"steps":[{"frame":40,"dump":["scene"]}]}') else ($e) {
+        die($e->message());
+    }
+    assert(!$plain->steps[0]->profile, 'profile defaults off');
+    assert(($plain->impliedFrames() ?? 0) == 42, 'plain cap unchanged');
+}

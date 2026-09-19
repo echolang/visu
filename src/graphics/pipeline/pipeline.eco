@@ -1,9 +1,12 @@
 /**
  * Per-frame pass list. `setup()` runs at `add()`; `execute()` runs in scheduled I/O order.
  * Pending clears live here until `RenderContext.beginRender` consumes them.
+ * Every pass runs inside a `visu::profile` scope named after it.
  */
 
 namespace visu::graphics;
+
+use visu::profile::{Profiler, profiler};
 
 // public: stdlib array<T> / map<K,V> must name T, so module-internal is not enough
 public enum Access
@@ -37,16 +40,6 @@ public class PendingClear
     }
 }
 
-/**
- * CPU time and draw delta for one scheduled pass. GPU ns land on the instrument PassTiming.
- */
-public struct PassProfile
-{
-    public string $name = '';
-    public float64 $cpuNs = 0.0;
-    public DrawStats $draw = DrawStats();
-}
-
 public class Pipeline
 {
     private Pool $pool;
@@ -55,7 +48,6 @@ public class Pipeline
     private map<string, bool> $names;
     private array<Io> $io;
     private map<string, PendingClear> $clears;
-    private array<PassProfile> $timings;
 
     public constructor(Pool $pool, Frame $frame, RenderTarget $backbuffer)
     {
@@ -65,7 +57,6 @@ public class Pipeline
         $this->names = map<string, bool>();
         $this->io = array<Io>();
         $this->clears = map<string, PendingClear>();
-        $this->timings = array<PassProfile>();
 
         TargetRef $bb = $this->importTarget('backbuffer', $backbuffer);
         $this->frame->set(BackbufferData($bb));
@@ -168,13 +159,13 @@ public class Pipeline
     public function execute(int32 $tick, float32 $compensation = 0.0f) : status<PipelineError>
     {
         $this->pool->setCurrentTick($tick);
-        $this->timings = array<PassProfile>();
         array<int32> $order = guard schedule($this->passes->count() as int32, $this->io) else ($e) {
             return .error($e);
         }
         $this->touchIo();
 
         RenderContext $ctx = RenderContext($this->pool->device, $this, $this->frame, $this->pool, $compensation);
+        Profiler $prof = profiler();
 
         foreach ($order as $index) {
             guard $this->flushClearsForReads($index, $ctx) else ($e) {
@@ -182,18 +173,11 @@ public class Pipeline
             }
             $this->transitionReads($index);
             Pass $pass = $this->passes[$index as usize];
-            string $name = $pass->name();
-            DrawStats $before = $ctx->device->draws->frame;
-            $ctx->device->gpuScopes->begin($name);
-            float64 $t0 = visu::runtime::seconds();
+            // one profile scope per pass; a pass that leaves a sub-scope open is a wiring bug close() asserts on
+            int32 $mark = $prof->depth();
+            $prof->begin($pass->name());
             status<PipelineError> $ran = $pass->execute($ctx);
-            float64 $cpuNs = (visu::runtime::seconds() - $t0) * 1000000000.0;
-            $ctx->device->gpuScopes->end();
-            PassProfile $prof = PassProfile();
-            $prof->name = $name;
-            $prof->cpuNs = $cpuNs;
-            $prof->draw = $ctx->device->draws->frame->since($before);
-            $this->timings[] = $prof;
+            $prof->close($mark);
             guard $ran else ($e) {
                 return .error($e);
             }
@@ -207,13 +191,6 @@ public class Pipeline
         return .ok;
     }
 
-    /**
-     * CPU + draw delta per pass from the last execute. Empty before the first execute.
-     */
-    public const function timings() : array<PassProfile>
-    {
-        return $this->timings;
-    }
 
     internal function record(int32 $passIndex, ResourceIo $resource, Access $access) : void
     {

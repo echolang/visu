@@ -1,0 +1,209 @@
+/**
+ * Playback state for node-TRS clips. Sit this on the assembly root next to `AssemblyInstance`.
+ * `play()` with no name runs every clip together (Blender per-object actions); `play($name)`
+ * selects one.
+ */
+
+namespace visu::components;
+
+use visu::asset::{Clip, loopTime, pingpongTime};
+
+public enum AnimationWrap
+{
+    case once;
+    case loop;
+    case pingpong;
+}
+
+public struct AnimationPlayer
+{
+    public array<Clip> $clips;
+    public int32 $index;
+    public float32 $time;
+    public float32 $speed;
+    public bool $playing;
+    public AnimationWrap $wrap;
+
+    public constructor()
+    {
+        $this->clips = array<Clip>();
+        $this->index = -1;
+        $this->time = 0.0f;
+        $this->speed = 1.0f;
+        $this->playing = false;
+        $this->wrap = .loop;
+    }
+
+    public constructor(array<Clip> $clips)
+    {
+        $this->clips = $clips;
+        $this->index = -1;
+        $this->time = 0.0f;
+        $this->speed = 1.0f;
+        $this->playing = false;
+        $this->wrap = .loop;
+    }
+
+    public const function clip() : Clip?
+    {
+        if ($this->index < 0) {
+            return null;
+        }
+
+        if (($this->index as usize) >= $this->clips->count()) {
+            return null;
+        }
+
+        return $this->clips[$this->index as usize];
+    }
+
+    /**
+     * Length of the current clip, or the longest clip when `play()` runs them together.
+     */
+    public const function duration() : float32
+    {
+        Clip $one = guard $this->clip() else {
+            float32 $d = 0.0f;
+            foreach ($this->clips as $clip) {
+                if ($clip->duration > $d) {
+                    $d = $clip->duration;
+                }
+            }
+
+            return $d;
+        }
+        return $one->duration;
+    }
+
+    /**
+     * Play every clip at once. Blender writes one glTF animation per object action.
+     */
+    public function play() : void
+    {
+        if ($this->clips->empty()) {
+            return;
+        }
+
+        $this->index = -1;
+        $this->playing = true;
+    }
+
+    public function play(string $name) : void
+    {
+        int32 $i = 0;
+        while ($i < ($this->clips->count() as int32)) {
+            if ($this->clips[$i as usize]->name->equals($name)) {
+                $this->index = $i;
+                $this->time = 0.0f;
+                $this->playing = true;
+                return;
+            }
+
+            $i = $i + 1;
+        }
+    }
+
+    public function pause() : void
+    {
+        $this->playing = false;
+    }
+
+    public function stop() : void
+    {
+        $this->playing = false;
+        $this->time = 0.0f;
+    }
+
+    public function reverse() : void
+    {
+        $this->speed = 0.0f - $this->speed;
+    }
+
+    public function seek(float32 $seconds) : void
+    {
+        float32 $d = $this->duration();
+        if ($d <= 0.0f) {
+            $this->time = $seconds;
+            return;
+        }
+        $this->time = match ($this->wrap) {
+            AnimationWrap::once => clampTime($seconds, $d),
+            AnimationWrap::loop => loopTime($seconds, $d),
+            AnimationWrap::pingpong => pingpongTime($seconds, $d),
+        };
+    }
+
+    /**
+     * Advance the playhead by `$dt * speed` and apply wrap. No-op while paused.
+     */
+    public function advance(float32 $dt) : void
+    {
+        if (!$this->playing) {
+            return;
+        }
+
+        float32 $d = $this->duration();
+        if ($d <= 0.0f) {
+            return;
+        }
+
+        $this->time = $this->time + $dt * $this->speed;
+        match ($this->wrap) {
+            AnimationWrap::once => {
+                if ($this->time >= $d) {
+                    $this->time = $d;
+                    $this->playing = false;
+                }
+
+                if ($this->time <= 0.0f) {
+                    $this->time = 0.0f;
+                    if ($this->speed < 0.0f) {
+                        $this->playing = false;
+                    }
+                }
+            },
+            AnimationWrap::loop => {
+                $this->time = loopTime($this->time, $d);
+            },
+            AnimationWrap::pingpong => {
+                bouncePlayhead($this, $d);
+            },
+        };
+    }
+}
+
+internal function clampTime(float32 $time, float32 $duration) : float32
+{
+    if ($time < 0.0f) {
+        return 0.0f;
+    }
+
+    if ($time > $duration) {
+        return $duration;
+    }
+
+    return $time;
+}
+
+internal function bouncePlayhead(AnimationPlayer& $p, float32 $duration) : void
+{
+    if ($duration <= 0.0f) {
+        $p->time = 0.0f;
+        return;
+    }
+
+    int32 $guard = 0;
+    while ($guard < 8) {
+        if ($p->time > $duration) {
+            $p->time = $duration - ($p->time - $duration);
+            $p->speed = 0.0f - $p->speed;
+        } else if ($p->time < 0.0f) {
+            $p->time = 0.0f - $p->time;
+            $p->speed = 0.0f - $p->speed;
+        } else {
+            return;
+        }
+
+        $guard = $guard + 1;
+    }
+}

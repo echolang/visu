@@ -1,0 +1,181 @@
+/**
+ * GPU span merging against a hand-built GpuTimeline: roll-up, the submit span on `render`,
+ * unknown GPU for CPU-only scopes, and the two-frame lag through the pending ring.
+ */
+
+// the profiler measures nothing under VISU_RELEASE, so none of this holds there
+#[if: !VISU_RELEASE]
+use visu::graphics::{DrawCounters, GpuSpan, GpuTimeline};
+use visu::profile::{FrameProfile, Profiler, ScopeNode};
+
+function attached(GpuTimeline $tl) : Profiler
+{
+    Profiler $prof = Profiler();
+    $prof->attach(DrawCounters(), $tl);
+    return $prof;
+}
+
+function renderFrame(Profiler $prof, uint64 $gpuFrame, int32 $frame) : void
+{
+    $prof->beginFrame();
+    $prof->bindFrame($gpuFrame, $frame);
+    $prof->begin('render');
+    $prof->captureSubmit();
+    $prof->begin('gbuffer');
+    $prof->begin('terrain');
+    $prof->end();
+    $prof->end();
+    $prof->begin('ssao');
+    $prof->end();
+    $prof->end();
+    $prof->endFrame();
+}
+
+test profile_spans_fold_and_roll_up
+{
+    GpuTimeline $tl = GpuTimeline();
+    $tl->supported = true;
+    Profiler $prof = attached($tl);
+    renderFrame($prof, 5, 10);
+    assert($prof->complete() == null, 'waits for gpu spans');
+
+    FrameProfile? $peek = $prof->latest();
+    assert($peek == null, 'nothing complete yet');
+
+    // node ids are DFS order: 0 frame, 1 render, 2 gbuffer, 3 terrain, 4 ssao
+    array<GpuSpan> $spans = array<GpuSpan>();
+    $spans[] = GpuSpan(-1, 1000.0);
+    $spans[] = GpuSpan(2, 300.0);
+    $spans[] = GpuSpan(4, 200.0);
+    $tl->publish(5, $spans, 0);
+    $prof->mergeGpu();
+
+    FrameProfile $f = guard $prof->complete() else {
+        die('frame did not complete');
+    }
+    assert($f->frame == 10, 'host frame');
+    assert($f->gpuFrame == 5, 'gpu frame');
+    assert($f->gpuResolved, 'resolved');
+    assert($f->submitNs == 1000.0, 'submit');
+    ScopeNode $gbuffer = guard $f->find('render/gbuffer') else {
+        die('gbuffer');
+    }
+    assert($gbuffer->gpuNs == 300.0 && $gbuffer->gpuSpans == 1, 'gbuffer span');
+    ScopeNode $terrain = guard $f->find('render/gbuffer/terrain') else {
+        die('terrain');
+    }
+    assert($terrain->gpuSpans == 0, 'cpu-only scope has unknown gpu');
+    ScopeNode $render = guard $f->find('render') else {
+        die('render');
+    }
+    assert($render->gpuNs == 1000.0 && $render->gpuSpans == 1, 'render takes the submit span');
+    assert($f->root()->gpuNs == 1000.0, 'root mirrors submit');
+
+    // a repeated resolve of the same frame is a no-op
+    $prof->mergeGpu();
+    assert($prof->complete() == null, 'idempotent');
+}
+
+test profile_children_roll_up_without_submit
+{
+    GpuTimeline $tl = GpuTimeline();
+    $tl->supported = true;
+    Profiler $prof = attached($tl);
+    renderFrame($prof, 1, 1);
+    array<GpuSpan> $spans = array<GpuSpan>();
+    $spans[] = GpuSpan(3, 50.0);
+    $spans[] = GpuSpan(4, 70.0);
+    $tl->publish(1, $spans, 0);
+    $prof->mergeGpu();
+    FrameProfile $f = guard $prof->complete() else {
+        die('frame');
+    }
+    ScopeNode $gbuffer = guard $f->find('render/gbuffer') else {
+        die('gbuffer');
+    }
+    assert($gbuffer->gpuNs == 50.0, 'terrain rolled into gbuffer');
+    ScopeNode $render = guard $f->find('render') else {
+        die('render');
+    }
+    assert($render->gpuNs == 120.0 && $render->gpuSpans == 2, 'render sums its children');
+}
+
+test profile_unsupported_gpu_completes_at_end_frame
+{
+    GpuTimeline $tl = GpuTimeline();
+    Profiler $prof = attached($tl);
+    renderFrame($prof, 3, 3);
+    FrameProfile $f = guard $prof->complete() else {
+        die('frame');
+    }
+    assert($f->gpuSupported == false, 'unsupported');
+    assert($f->gpuResolved == false, 'not resolved');
+}
+
+test profile_older_frames_complete_when_newer_resolves
+{
+    GpuTimeline $tl = GpuTimeline();
+    $tl->supported = true;
+    Profiler $prof = attached($tl);
+    renderFrame($prof, 7, 7);
+    renderFrame($prof, 8, 8);
+    array<GpuSpan> $spans = array<GpuSpan>();
+    $spans[] = GpuSpan(-1, 10.0);
+    $tl->publish(8, $spans, 0);
+    $prof->mergeGpu();
+    FrameProfile $first = guard $prof->complete() else {
+        die('first');
+    }
+    FrameProfile $second = guard $prof->complete() else {
+        die('second');
+    }
+    assert($first->frame == 7 && $first->gpuResolved == false, 'older frame gave up on gpu');
+    assert($second->frame == 8 && $second->gpuResolved, 'newer frame resolved');
+}
+
+test profile_ring_overflow_completes_oldest_without_gpu
+{
+    GpuTimeline $tl = GpuTimeline();
+    $tl->supported = true;
+    Profiler $prof = attached($tl);
+    int32 $i = 0;
+
+    while ($i < 6) {
+        renderFrame($prof, $i as uint64, $i);
+        $i = $i + 1;
+    }
+
+    FrameProfile $f = guard $prof->complete() else {
+        die('overflow frame');
+    }
+    assert($f->frame == 0 && $f->gpuResolved == false, 'oldest dropped out of the ring');
+}
+
+test profile_abandon_flushes_pending
+{
+    GpuTimeline $tl = GpuTimeline();
+    $tl->supported = true;
+    Profiler $prof = attached($tl);
+    renderFrame($prof, 2, 2);
+    $prof->abandon();
+    FrameProfile $f = guard $prof->complete() else {
+        die('abandoned frame');
+    }
+    assert($f->gpuResolved == false, 'abandoned without gpu');
+}
+
+test profile_empty_spans_still_resolve
+{
+    GpuTimeline $tl = GpuTimeline();
+    $tl->supported = true;
+    Profiler $prof = attached($tl);
+    renderFrame($prof, 3, 3);
+    $tl->publish(3, array<GpuSpan>(), 0);
+    $prof->mergeGpu();
+    FrameProfile $f = guard $prof->complete() else {
+        die('empty resolve');
+    }
+    assert($f->gpuResolved, 'empty spans are a real resolve');
+    assert($f->submitNs == 0.0, 'no submit');
+}
+#[end]

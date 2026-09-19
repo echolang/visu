@@ -1,0 +1,112 @@
+/**
+ * GpuTimeline end to end: two quad encoders under two scope ids, four frames, spans land two
+ * frames late tagged with the frame they were recorded in. Skips when the device cannot sample.
+ */
+
+use visu::graphics::{
+    CallbackPass, ClearPass, ClearPassOptions, Device, Frame, GpuPass, GpuSpan, GpuTimeline, IoSink,
+    Mesh, Pipeline, PipelineError, Raster, RenderContext, RenderEncoder, ShaderCollection,
+    ShaderProgram, TargetRef, VertexLayout
+};
+use visu::math::Vec4;
+
+public function checkGpuTimeline(GpuContext $gpu) : void
+{
+    GpuTimeline $timeline = $gpu->device->gpuTimeline;
+
+    if (!$timeline->supported) {
+        echo 'gpucheck: gpu timestamps unsupported here, timeline check skipped';
+        return;
+    }
+
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('quad') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    ShaderProgram $program = $ref->program();
+    int32 $i = 0;
+
+    while ($i < 4) {
+        uint64 $before = $gpu->device->frameIndex();
+        $gpu->runFrame(function(Pipeline $p) : void {
+            TargetRef $a = offscreen64($p, 'tl-a');
+            TargetRef $b = offscreen64($p, 'tl-b');
+            $p->add(ClearPass($a, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
+            $p->add(ClearPass($b, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
+            $p->add(scopedQuad($timeline, 'quad7', 7, $program, $a, Vec4(1.0f, 0.0f, 0.0f, 1.0f)));
+            $p->add(scopedQuad($timeline, 'quad9', 9, $program, $b, Vec4(0.0f, 1.0f, 0.0f, 1.0f)));
+        });
+        $timeline->scope = -1;
+
+        if ($before >= 2) {
+            assert($timeline->resolvedFrame == $before - 2, 'spans arrive two frames late');
+            assert($timeline->dropped == 0, 'no dropped encoders');
+            bool $submit = false;
+            int32 $encoders = 0;
+            int32 $lastScope = -1;
+            array<GpuSpan> $spans = $timeline->resolved;
+            foreach ($spans as $span) {
+                assert($span->ns > 0.0, 'every published span has a duration');
+
+                if ($span->scope == -1) {
+                    $submit = true;
+                    continue;
+                }
+
+                assert($span->scope != $lastScope, 'encoders carry distinct scopes');
+                $lastScope = $span->scope;
+                $encoders = $encoders + 1;
+            }
+
+            assert($submit, 'whole-submit span present');
+            assert($encoders == 2, 'two encoder spans');
+        }
+
+        $i = $i + 1;
+    }
+
+    $shaders->destroy();
+}
+
+/**
+ * A fullscreen quad into `$target` whose encoder is tagged with `$scope`. Draws through GpuPass
+ * directly: the generic QuadPass<T> has no destructor symbol on this compiler and segfaults.
+ */
+internal function scopedQuad(
+    GpuTimeline $timeline,
+    string $name,
+    int32 $scope,
+    ShaderProgram $program,
+    TargetRef $target,
+    Vec4 $tint
+) : CallbackPass
+{
+    return CallbackPass(
+        $name,
+        setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+            $io->writes($target);
+        },
+        execute: function(RenderContext $ctx) : status<PipelineError> {
+            $timeline->scope = $scope;
+            RenderEncoder $enc = guard $ctx->beginRender($target) else ($e) {
+                return .error($e);
+            }
+            Device $device = $ctx->device;
+            Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+                return .quad($device);
+            });
+            GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+            $pass->draw($enc, $mesh, QuadParams($tint));
+            $enc->endRender();
+            return .ok;
+        }
+    );
+}

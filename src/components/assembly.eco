@@ -1,0 +1,72 @@
+/**
+ * Spawn a cooked assembly as a parented entity tree. The returned entity is the asset root;
+ * each node gets a `Transform` and a `StaticModel` or `DynamicModel` pointing at its part.
+ */
+
+namespace visu::components;
+
+use visu::asset::{Assembly, AssemblyPart};
+use visu::ecs::{Entities, Entity};
+use visu::geo::Transform;
+
+/**
+ * Create the root plus every node. `$root` is the asset transform in the world.
+ */
+public function spawnAssembly(Entities $world, Assembly $assembly, Transform $root) : Entity
+{
+    Entity $rootId = $world->create();
+    $world->attach($rootId, $root);
+    map<string, Entity> $ids = map<string, Entity>();
+    $ids[''] = $rootId;
+    int32 $guard = 0;
+    int32 $need = $assembly->nodes->count() as int32;
+    while (($ids->count() as int32) - 1 < $need && $guard < $need + 1) {
+        foreach ($assembly->nodes as $node) {
+            if ($ids->has($node->name)) {
+                continue;
+            }
+
+            if (!$ids->has($node->parent)) {
+                continue;
+            }
+
+            Entity $e = $world->create();
+            Transform $t = Transform();
+            $t->position = $node->position;
+            $t->orientation = $node->orientation;
+            $t->scale = $node->scale;
+            $t->parent($world, $ids[$node->parent]);
+            $world->attach($e, $t);
+            attachPartModel($world, $e, $assembly, $node->part);
+            $ids[$node->name] = $e;
+        }
+
+        $guard = $guard + 1;
+    }
+
+    AssemblyInstance $inst = AssemblyInstance($assembly->id);
+    $inst->nodes = $ids;
+    $world->attach($rootId, $inst);
+    if ($assembly->clips->count() > 0) {
+        $world->attach($rootId, AnimationPlayer($assembly->clips));
+    }
+
+    return $rootId;
+}
+
+internal function attachPartModel(Entities $world, Entity $e, Assembly $assembly, const string& $partName) : void
+{
+    if ($partName->empty()) {
+        return;
+    }
+
+    AssemblyPart $part = guard $assembly->findPart($partName) else {
+        return;
+    }
+
+    if ($part->dynamic) {
+        $world->attach($e, DynamicModel($part->model));
+    } else {
+        $world->attach($e, StaticModel($part->model));
+    }
+}

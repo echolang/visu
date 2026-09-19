@@ -3,7 +3,7 @@
  *
  * Top level: `out`, `headless`, `window: [w, h]`, `frames`, `flags`, `list`, `steps`.
  * A step carries exactly one timing key (`frame`, `tick`, `after`) and any of the actions
- * `label`, `flags`, `camera`, `console`, `dump`, `list`, `log`, `stop`. Parsing is strict: a
+ * `label`, `flags`, `camera`, `console`, `dump`, `profile`, `list`, `log`, `stop`. Parsing is strict: a
  * wrong shape names the JSON path it tripped on, so an agent can fix the script blind.
  */
 
@@ -53,6 +53,8 @@ public class Step
     public const CameraSpec $camera;
     public const array<string> $console;
     public const array<string> $dump;
+    /** write this frame's profile tree as JSON once its GPU spans landed */
+    public const bool $profile;
     public const bool $list;
     public const string $log;
     public const bool $stop;
@@ -65,6 +67,7 @@ public class Step
         CameraSpec $camera,
         array<string> $console,
         array<string> $dump,
+        bool $profile,
         bool $list,
         string $log,
         bool $stop,
@@ -77,6 +80,7 @@ public class Step
         $this->camera = $camera;
         $this->console = $console;
         $this->dump = $dump;
+        $this->profile = $profile;
         $this->list = $list;
         $this->log = $log;
         $this->stop = $stop;
@@ -137,9 +141,21 @@ public class Script
         return false;
     }
 
+    public const function hasProfile() : bool
+    {
+        foreach ($this->steps as $step) {
+            if ($step->profile) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /**
      * Frame cap for the host: the explicit `frames`, else two past the last frame step when
-     * nothing stops the run, else null for "until the window closes".
+     * nothing stops the run, else null for "until the window closes". Host adds in-flight GPU
+     * frames when a step profiles.
      */
     public const function impliedFrames() : int32?
     {

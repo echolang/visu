@@ -81,7 +81,7 @@ gltf = {
         {'name': '_L2_ball', 'mesh': 2},
     ],
     'meshes': gmeshes,
-    'materials': [{'name': 'model.ball'}, {'name': 'model.ball_far'}],
+    'materials': [{'name': 'skin'}, {'name': 'far'}],
     'accessors': accessors, 'bufferViews': views, 'buffers': [{'byteLength': len(bin_)}],
 }
 js = json.dumps(gltf, separators=(',', ':')).encode()
@@ -101,10 +101,19 @@ for y in range(W):
         rough += [r, r, r, 255]
 open(os.path.join(OUT, 'ball_albedo.png'), 'wb').write(png(W, W, albedo))
 open(os.path.join(OUT, 'ball_rough.png'), 'wb').write(png(W, W, rough))
-open(os.path.join(OUT, 'ball.vmat'), 'w').write(json.dumps({
-    'ball_rough': {'srgb': False},
-    'model.ball': {'albedo': 'ball_albedo', 'rough': 'ball_rough', 'metallicFactor': 0.0},
-    'model.ball_far': {'fallback': [0.9, 0.3, 0.1], 'roughnessFactor': 0.6},
-    'ball': {'lod': [6, 14], 'cullDistance': 60},
+open(os.path.join(OUT, 'ball.vmod'), 'w').write(json.dumps({
+    'lod': [6, 14],
+    'cullDistance': 60,
+    'slots': {'skin': 'props/ball/skin', 'far': 'props/ball/far'},
 }, indent=4) + '\n')
+open(os.path.join(OUT, 'skin.vmat'), 'w').write(json.dumps({
+    'albedo': 'ball_albedo',
+    'rough': 'ball_rough',
+    'metallicFactor': 0.0,
+}, indent=4) + '\n')
+open(os.path.join(OUT, 'far.vmat'), 'w').write(json.dumps({
+    'fallback': [0.9, 0.3, 0.1],
+    'roughnessFactor': 0.6,
+}, indent=4) + '\n')
+open(os.path.join(OUT, 'ball_rough.vtex'), 'w').write(json.dumps({'srgb': False}, indent=4) + '\n')
 print('wrote', OUT, len(glb), 'bytes glb')

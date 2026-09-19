@@ -1,6 +1,5 @@
 /**
- * JSON material / folder sheet (`*.vmat`). Generic bag: cook knobs, map binds, later shader scalars.
- * One file per folder. Sibling textures fill missing binds by stem.
+ * JSON material (`*.vmat`). One PBR surface per file. Cook rewrites map binds to catalog ids.
  */
 
 namespace visu::asset;
@@ -297,11 +296,24 @@ internal function vmatRewriteBind(json::Value& $sheet, const string& $folderId, 
 
 internal function vmatBindId(const string& $folderId, const string& $raw) : string
 {
-    if ($raw->find('/') != $raw->size() && !$raw->ends('.png') && !$raw->ends('.hdr')) {
+    // already a catalog id
+    if ($raw->find('/') != $raw->size()) {
         return $raw;
     }
 
-    string $stem = stripExt($raw);
+    // only filenames lose a suffix; `model.bush_albedo` is a stem, not `model` + extension
+    string $stem = $raw;
+    string $lower = str::lower($raw);
+    if (
+        $lower->ends('.png')
+        || $lower->ends('.hdr')
+        || $lower->ends('.jpg')
+        || $lower->ends('.jpeg')
+        || $lower->ends('.tga')
+    ) {
+        $stem = stripExt($raw);
+    }
+
     if ($folderId->empty()) {
         return $stem;
     }
@@ -377,6 +389,33 @@ internal function vmatBindIfMissing(
         }
 
         $existing['file'] = json::str($id);
+    }
+}
+
+/**
+ * One `.vmat` file is one material. Binds rewrite to catalog ids relative to the file's folder.
+ */
+public class MaterialCooker : Cooker
+{
+    public function kind() : string
+    {
+        return KIND_VMAT;
+    }
+
+    public function accepts(const string& $path) : bool
+    {
+        return str::lower($path)->ends('.vmat');
+    }
+
+    public function cook(const Source& $src) : result<array<PackItem>, AssetError>
+    {
+        json::Value $sheet = guard loadVmatFile($src->path) else ($e) {
+            return .error($e);
+        }
+        vmatRewriteBinds($sheet, parentId($src->id));
+        array<PackItem> $items = array<PackItem>();
+        $items[] = PackItem($src->id, KIND_VMAT, Blob(json::pretty($sheet)));
+        return .ok($items);
     }
 }
 

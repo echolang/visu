@@ -1,0 +1,88 @@
+/**
+ * JSON shape of a completed frame: round trip through the parser, known flag per node.
+ */
+
+// the profiler measures nothing under VISU_RELEASE, so none of this holds there
+#[if: !VISU_RELEASE]
+use visu::graphics::{DrawCounters, GpuSpan, GpuTimeline};
+use visu::profile::{FrameProfile, Profiler, profileJson};
+
+function jsInt(json::Value $v) : int64
+{
+    int64 $n = guard $v->asInt() else {
+        die('json: expected an integer');
+    }
+    return $n;
+}
+
+function jsFloat(json::Value $v) : float64
+{
+    float64 $n = guard $v->asFloat() else {
+        die('json: expected a number');
+    }
+    return $n;
+}
+
+function jsBool(json::Value $v) : bool
+{
+    bool $b = guard $v->asBool() else {
+        die('json: expected a bool');
+    }
+    return $b;
+}
+
+function jsStr(json::Value $v) : string
+{
+    string $s = guard $v->asStr() else {
+        die('json: expected a string');
+    }
+    return $s;
+}
+
+test profile_json_round_trips
+{
+    GpuTimeline $tl = GpuTimeline();
+    $tl->supported = true;
+    Profiler $prof = Profiler();
+    $prof->attach(DrawCounters(), $tl);
+    $prof->beginFrame();
+    $prof->bindFrame(4, 40);
+    $prof->begin('render');
+    $prof->captureSubmit();
+    $prof->begin('gbuffer');
+    $prof->begin('terrain');
+    $prof->end();
+    $prof->end();
+    $prof->end();
+    $prof->endFrame();
+    array<GpuSpan> $spans = array<GpuSpan>();
+    $spans[] = GpuSpan(-1, 900.0);
+    $spans[] = GpuSpan(2, 400.0);
+    $tl->publish(4, $spans, 0);
+    $prof->mergeGpu();
+    FrameProfile $f = guard $prof->complete() else {
+        die('frame');
+    }
+
+    json::Value $root = profileJson($f, $prof->stats);
+    string $text = json::pretty($root);
+    json::Value $back = guard json::parse($text) else ($e) {
+        die($e->message());
+    }
+    assert(jsInt($back['frame']) == 40, 'frame');
+    assert(jsBool($back['gpuResolved']), 'resolved');
+    assert(jsFloat($back['submitNs']) == 900.0, 'submit');
+    json::Value $tree = $back['tree'];
+    assert($tree->count() == 1, 'one root child');
+    json::Value $render = $tree[0];
+    assert(jsStr($render['name']) == 'render', 'render');
+    assert(jsBool($render['gpu']['known']), 'render gpu known');
+    json::Value $gbuffer = $render['children'][0];
+    assert(jsStr($gbuffer['path']) == 'render/gbuffer', 'path');
+    assert(jsFloat($gbuffer['gpu']['last']) == 400.0, 'gbuffer gpu');
+    json::Value $terrain = $gbuffer['children'][0];
+    assert(jsBool($terrain['gpu']['known']) == false, 'terrain gpu unknown');
+    assert(jsInt($terrain['depth']) == 3, 'depth');
+    assert(jsFloat($terrain['cpu']['avg']) >= 0.0, 'avg present');
+}
+#[end]

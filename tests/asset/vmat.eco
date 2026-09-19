@@ -1,5 +1,5 @@
 /**
- * Folder `.vmat` JSON: overlay, convention binds, cook knobs.
+ * `.vmat` is one material; `.vtex` is texture cook knobs (folder sheet + sidecar).
  */
 
 use std::env;
@@ -8,7 +8,8 @@ use json;
 use visu::graphics::{Device, PixelFormat, Pixels};
 use visu::asset::{
     AssetError, Assets, Blob, CookedImage, DirectoryStore, KIND_TEXTURE, KIND_VMAT, Kitchen,
-    PackItem, TextureCooker, Vmat, decodeTexture, decodeVmat, vmatMerge, vmatView
+    MaterialCooker, PackItem, TextureCooker, Vmat, decodeTexture, decodeVmat, vmatMerge, vmatResolve,
+    vmatView
 };
 
 function vmatTmp(string $tag) : string
@@ -93,7 +94,7 @@ test vmat_view_record_overlay
     assert(!$srgb, 'record wins');
 }
 
-test vmat_convention_binds
+test vmat_explicit_material_binds
 {
     string $src = vmatTmp('conv-src');
     mkdirVmat($src);
@@ -102,7 +103,10 @@ test vmat_convention_binds
     mkdirVmat($folder);
     writeDot("{$folder}{$ds}albedo.png", 1, 1);
     writeDot("{$folder}{$ds}normal.png", 1, 1);
-    guard io::writefile("{$folder}{$ds}rock.vmat", '{"shader":"pbr","rough":0.4}') else ($e) {
+    guard io::writefile(
+        "{$folder}{$ds}rock.vmat",
+        '{"shader":"pbr","albedo":"albedo","normal":"normal","roughnessFactor":0.4}'
+    ) else ($e) {
         die($e->message());
     }
 
@@ -110,13 +114,14 @@ test vmat_convention_binds
     mkdirVmat($out);
     Kitchen $k = Kitchen();
     $k->add(TextureCooker());
+    $k->add(MaterialCooker());
     array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
         die($e->message());
     }
-    assert($items->count() == 3, 'sheet + 2 png');
+    assert($items->count() == 3, 'material + 2 png');
 
     Assets $assets = mountCooked($out);
-    Vmat $mat = guard $assets->load<Vmat>('rock') else ($e) {
+    Vmat $mat = guard $assets->load<Vmat>('rock/rock') else ($e) {
         die($e->message());
     }
     assert(($mat->root['shader']->asStr() ?? '')->equals('pbr'), 'shader stays');
@@ -126,6 +131,23 @@ test vmat_convention_binds
         die($e->message());
     }
     assert($img->format == PixelFormat::rgba8Srgb, 'default srgb');
+}
+
+test vmat_bind_keeps_dots_in_stem
+{
+    json::Value $sheet = json::object();
+    $sheet['albedo'] = json::str('model.bush_albedo');
+    $sheet['normal'] = json::str('model.bush_normal.png');
+    array<string> $stems = array<string>();
+    vmatResolve($sheet, 'foliage/bush_01', $stems);
+    assert(
+        ($sheet['albedo']->asStr() ?? '')->equals('foliage/bush_01/model.bush_albedo'),
+        'dotted stem is not an extension'
+    );
+    assert(
+        ($sheet['normal']->asStr() ?? '')->equals('foliage/bush_01/model.bush_normal'),
+        'png suffix still strips'
+    );
 }
 
 test vmat_explicit_bind_wins
@@ -145,12 +167,13 @@ test vmat_explicit_bind_wins
     mkdirVmat($out);
     Kitchen $k = Kitchen();
     $k->add(TextureCooker());
+    $k->add(MaterialCooker());
     guard $k->cook($src, $out) else ($e) {
         die($e->message());
     }
 
     Assets $assets = mountCooked($out);
-    Vmat $mat = guard $assets->load<Vmat>('rock') else ($e) {
+    Vmat $mat = guard $assets->load<Vmat>('rock/rock') else ($e) {
         die($e->message());
     }
     assert(($mat->root['albedo']->asStr() ?? '')->equals('rock/rocks_color'), 'explicit');
@@ -164,7 +187,7 @@ test vmat_mips_false
     string $folder = "{$src}{$ds}ui";
     mkdirVmat($folder);
     writeDot("{$folder}{$ds}icon.png", 2, 2);
-    guard io::writefile("{$folder}{$ds}ui.vmat", '{"mips":false}') else ($e) {
+    guard io::writefile("{$folder}{$ds}ui.vtex", '{"mips":false}') else ($e) {
         die($e->message());
     }
 
@@ -191,7 +214,7 @@ test vmat_format_bc7
     string $folder = "{$src}{$ds}rock";
     mkdirVmat($folder);
     writeDot("{$folder}{$ds}albedo.png", 4, 4);
-    guard io::writefile("{$folder}{$ds}rock.vmat", '{"format":"bc7","mips":false,"srgb":false}') else ($e) {
+    guard io::writefile("{$folder}{$ds}rock.vtex", '{"format":"bc7","mips":false,"srgb":false}') else ($e) {
         die($e->message());
     }
 
@@ -211,7 +234,7 @@ test vmat_format_bc7
     assert($img->texels->size() == 16, 'one block');
 }
 
-test vmat_two_files_fail
+test vmat_two_materials_in_one_folder
 {
     string $src = vmatTmp('two-src');
     mkdirVmat($src);
@@ -219,10 +242,10 @@ test vmat_two_files_fail
     string $folder = "{$src}{$ds}rock";
     mkdirVmat($folder);
     writeDot("{$folder}{$ds}albedo.png", 1, 1);
-    guard io::writefile("{$folder}{$ds}rock.vmat", '{}') else ($e) {
+    guard io::writefile("{$folder}{$ds}rock.vmat", '{"albedo":"albedo"}') else ($e) {
         die($e->message());
     }
-    guard io::writefile("{$folder}{$ds}other.vmat", '{}') else ($e) {
+    guard io::writefile("{$folder}{$ds}other.vmat", '{"roughnessFactor":0.2}') else ($e) {
         die($e->message());
     }
 
@@ -230,8 +253,34 @@ test vmat_two_files_fail
     mkdirVmat($out);
     Kitchen $k = Kitchen();
     $k->add(TextureCooker());
+    $k->add(MaterialCooker());
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+    assert($items->count() == 3, 'two materials plus png');
+}
+
+test vtex_two_folder_sheets_fail
+{
+    string $src = vmatTmp('two-vtex-src');
+    mkdirVmat($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}rock";
+    mkdirVmat($folder);
+    writeDot("{$folder}{$ds}albedo.png", 1, 1);
+    guard io::writefile("{$folder}{$ds}a.vtex", '{}') else ($e) {
+        die($e->message());
+    }
+    guard io::writefile("{$folder}{$ds}b.vtex", '{}') else ($e) {
+        die($e->message());
+    }
+
+    string $out = vmatTmp('two-vtex-out');
+    mkdirVmat($out);
+    Kitchen $k = Kitchen();
+    $k->add(TextureCooker());
     result<array<PackItem>, AssetError> $r = $k->cook($src, $out);
-    assert($r->failed(), 'two vmat');
+    assert($r->failed(), 'two folder vtex');
 }
 
 test vmat_child_overlays_parent
@@ -245,10 +294,10 @@ test vmat_child_overlays_parent
     mkdirVmat($ui);
     writeDot("{$tex}{$ds}ground.png", 4, 4);
     writeDot("{$ui}{$ds}icon.png", 1, 1);
-    guard io::writefile("{$tex}{$ds}tex.vmat", '{"format":"bc7","mips":false,"srgb":false}') else ($e) {
+    guard io::writefile("{$tex}{$ds}tex.vtex", '{"format":"bc7","mips":false,"srgb":false}') else ($e) {
         die($e->message());
     }
-    guard io::writefile("{$ui}{$ds}ui.vmat", '{"format":"rgba8"}') else ($e) {
+    guard io::writefile("{$ui}{$ds}ui.vtex", '{"format":"rgba8"}') else ($e) {
         die($e->message());
     }
 
@@ -284,7 +333,7 @@ test vmat_overlay_record_gets_file
     writeDot("{$folder}{$ds}height.png", 1, 1);
     writeDot("{$folder}{$ds}roughness.png", 1, 1);
     guard io::writefile(
-        "{$folder}{$ds}rock.vmat",
+        "{$folder}{$ds}rock.vtex",
         '{"normal":{"srgb":false},"ao":{"srgb":false},"height":{"srgb":false},"roughness":{"srgb":false}}'
     ) else ($e) {
         die($e->message());
@@ -299,20 +348,12 @@ test vmat_overlay_record_gets_file
     }
 
     Assets $assets = mountCooked($out);
-    Vmat $mat = guard $assets->load<Vmat>('rock') else ($e) {
+    CookedImage $n = guard $assets->load<CookedImage>('rock/normal') else ($e) {
         die($e->message());
     }
-    json::Value $n = guard $mat->root->get('normal') else {
-        die('normal');
+    assert($n->format == PixelFormat::rgba8, 'normal linear');
+    CookedImage $albedo = guard $assets->load<CookedImage>('rock/albedo') else ($e) {
+        die($e->message());
     }
-    assert(($n['file']->asStr() ?? '')->equals('rock/normal'), 'normal file');
-    json::Value $ao = guard $mat->root->get('ao') else {
-        die('ao');
-    }
-    assert(($ao['file']->asStr() ?? '')->equals('rock/ao'), 'ao file');
-    json::Value $h = guard $mat->root->get('height') else {
-        die('height');
-    }
-    assert(($h['file']->asStr() ?? '')->equals('rock/height'), 'height file');
-    assert(($mat->root['rough']->asStr() ?? '')->equals('rock/roughness'), 'rough bind');
+    assert($albedo->format == PixelFormat::rgba8Srgb, 'albedo srgb');
 }

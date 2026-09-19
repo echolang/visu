@@ -1,0 +1,207 @@
+/**
+ * Console verb for the scope profiler: print the tree of the last complete frame, cap its depth,
+ * dump it as JSON now or through the dcapture queue, reset the rolling stats, report GPU support.
+ * The Host registers this directly on the console registry so scene loads do not drop the name.
+ */
+
+namespace visu::console;
+
+use visu::dcapture::DumpQueue;
+use visu::instrument::{PassTiming, formatPassWindow, rowsFromStats};
+use visu::profile::{FrameProfile, Profiler, PROFILE_DISABLED_NOTE, writeProfile};
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal const PROFILE_USAGE = 'usage: profile [depth <n>|dump [path]|reset|gpu]';
+internal const PROFILE_DEFAULT_DEPTH = 2;
+
+internal enum ProfileAction
+{
+    case usage;
+    case tree(int32 $depth);
+    case dump(string $path);
+    case dumpQueued;
+    case reset;
+    case gpu;
+}
+
+/**
+ * `profile` prints the tree two levels deep; `profile depth <n>`; `profile dump` queues a JSON dump of
+ * this frame next to dcapture's images; `profile dump <path>` writes the last complete frame now;
+ * `profile reset`; `profile gpu`.
+ */
+internal function parseProfileConsole(const ConsoleCommandSignal& $cmd) : ProfileAction
+{
+    if (!$cmd->isAction('profile')) {
+        return .usage;
+    }
+
+    if ($cmd->parts->count() < 2) {
+        return .tree(PROFILE_DEFAULT_DEPTH);
+    }
+
+    string $arg = $cmd->parts[1];
+
+    if ($arg == 'depth') {
+        int32 $n = guard consoleInt($cmd, 2) else {
+            return .usage;
+        }
+        return .tree($n);
+    }
+
+    if ($arg == 'dump') {
+        if ($cmd->parts->count() >= 3) {
+            return .dump($cmd->parts[2]);
+        }
+
+        return .dumpQueued;
+    }
+
+    if ($arg == 'reset') {
+        return .reset;
+    }
+
+    if ($arg == 'gpu') {
+        return .gpu;
+    }
+
+    return .usage;
+}
+
+public class ProfileConsole : ConsoleCommandHandler
+{
+    private Profiler $profiler;
+    private DumpQueue $dumps;
+
+    public constructor(Profiler $profiler, DumpQueue $dumps)
+    {
+        $this->profiler = $profiler;
+        $this->dumps = $dumps;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('profile', $this, '[depth <n>|dump [path]|reset|gpu]');
+        array<string> $names = array<string>();
+        $names[] = 'profile';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        ProfileAction $action = parseProfileConsole($cmd);
+        match ($action) {
+            ProfileAction::usage => {
+                $console->writeLine(PROFILE_USAGE);
+            },
+            ProfileAction::tree($depth) => {
+                $this->writeTree($console, $depth);
+            },
+            ProfileAction::dump($path) => {
+                $this->writeDump($console, $path);
+            },
+            ProfileAction::dumpQueued => {
+                if (!visu::profile::enabled()) {
+                    $console->writeLine(PROFILE_DISABLED_NOTE);
+                    return;
+                }
+
+                $this->dumps->queueProfile('console');
+                $console->writeLine('profile: dump queued for this frame, see manifest.json');
+            },
+            ProfileAction::reset => {
+                $this->profiler->reset();
+                $console->writeLine('profile: stats reset');
+            },
+            ProfileAction::gpu => {
+                $this->writeGpu($console);
+            },
+        };
+    }
+
+    private function writeTree(DebugConsole $console, int32 $depth) : void
+    {
+        FrameProfile $frame = guard $this->latestFrame($console) else {
+            return;
+        }
+        string $gpu = gpuState($frame);
+        $console->writeLine("profile: frame {$frame->frame} gpu {$gpu} (avg / max over the window)");
+        array<PassTiming> $rows = rowsFromStats($this->profiler->stats);
+        foreach ($rows as $row) {
+            if ($row->depth > $depth) {
+                continue;
+            }
+
+            $console->writeLine(formatPassWindow($row));
+        }
+    }
+
+    private function writeDump(DebugConsole $console, string $path) : void
+    {
+        FrameProfile $frame = guard $this->latestFrame($console) else {
+            return;
+        }
+        guard writeProfile($path, $frame, $this->profiler->stats) else ($e) {
+            string $why = $e->message();
+            $console->writeLine("profile: {$why}");
+            return;
+        }
+        $console->writeLine("profile: wrote {$path}");
+    }
+
+    /**
+     * The last complete frame, or null after telling the console why there is none.
+     */
+    private function latestFrame(DebugConsole $console) : FrameProfile?
+    {
+        if (!visu::profile::enabled()) {
+            $console->writeLine(PROFILE_DISABLED_NOTE);
+            return null;
+        }
+
+        FrameProfile $frame = guard $this->profiler->latest() else {
+            $console->writeLine('profile: no complete frame yet');
+            return null;
+        }
+        return $frame;
+    }
+
+    private function writeGpu(DebugConsole $console) : void
+    {
+        string $enabled = 'on';
+
+        if (!visu::profile::enabled()) {
+            $enabled = 'compiled out (VISU_RELEASE)';
+        }
+
+        if ($this->profiler->timeline == null) {
+            $console->writeLine("profile: scopes {$enabled}, no device attached");
+            return;
+        }
+
+        string $supported = 'unsupported';
+
+        if ($this->profiler->gpuSupported()) {
+            $supported = 'per encoder';
+        }
+
+        FrameProfile $frame = guard $this->profiler->latest() else {
+            $console->writeLine("profile: scopes {$enabled}, gpu timestamps {$supported}");
+            return;
+        }
+        $console->writeLine("profile: scopes {$enabled}, gpu timestamps {$supported}, gpuFrame {$frame->gpuFrame}");
+    }
+}
+
+internal function gpuState(const FrameProfile& $frame) : string
+{
+    if (!$frame->gpuSupported) {
+        return 'unsupported';
+    }
+
+    if ($frame->gpuResolved) {
+        return 'resolved';
+    }
+
+    return 'missing';
+}

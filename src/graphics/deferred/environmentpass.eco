@@ -67,7 +67,9 @@ public class EnvironmentPass : Pass
             return .error($e);
         }
 
+        visu::profile::begin('mips');
         $ctx->device->generateMipmaps($this->environment->cube);
+        visu::profile::end();
         $this->environment->cubeDone($this->state);
         return .ok;
     }
@@ -138,17 +140,22 @@ public class EnvironmentPass : Pass
             $desc->colors[] = $color;
             $desc->depth = $depthTarget;
             RenderEncoder $enc = $device->beginRender($desc);
+            // one encoder per face: the sub-scopes below are CPU only, the GPU time lands on the pass
+            visu::profile::begin('sky');
             $pass->bind($enc);
             CaptureUniforms $captureUniforms = CaptureUniforms($projection, captureView($face), Vec4(0.0f, 0.0f, 0.0f, 0.0f));
             $enc->upload($captureUniforms, slot: 0);
             $enc->upload($skyUniforms, slot: 2);
             $mesh->draw($enc);
+            visu::profile::end();
             ProbeCapture $view = ProbeCapture(
                 probeCamera($face, $position, $size, PROBE_NEAR, PROBE_FAR),
                 $skyUniforms,
                 $face
             );
+            visu::profile::begin('capture');
             $capture($ctx, $enc, $view);
+            visu::profile::end();
             $enc->endRender();
             $face = $face + 1;
         }

@@ -1,5 +1,6 @@
 /**
- * One in-flight slot: previous command buffer for the wait, and a host-visible uniform ring reset in beginFrame.
+ * One in-flight slot: previous command buffer for the wait, a host-visible uniform ring reset in beginFrame,
+ * and the GPU timestamp samples of the frame it recorded.
  */
 
 namespace visu::graphics;
@@ -72,6 +73,7 @@ internal class FrameSlot
     public HostRing $ring;
     public mtl::SharedEvent $gpuDone;
     public uint64 $epoch;
+    public GpuTimestamps $stamps;
 
     public constructor(mtl::SharedEvent $gpuDone)
     {
@@ -79,6 +81,7 @@ internal class FrameSlot
         $this->ring = HostRing();
         $this->gpuDone = $gpuDone;
         $this->epoch = 0;
+        $this->stamps = GpuTimestamps();
     }
 }
 
@@ -98,6 +101,10 @@ internal function mtlCreateSlots(Device $device) : status<DeviceError>
             return .error($e);
         }
 
+        if ($device->gpuTimeline->supported) {
+            mtlTimestampsCreate($gpu, $slot->stamps);
+        }
+
         $device->slots[] = $slot;
         $i = $i + 1;
     }
@@ -109,6 +116,7 @@ internal function mtlDestroySlots(Device $device) : void
 {
     foreach ($device->slots as $slot) {
         $slot->prev = null;
+        $slot->stamps->buffer = null;
         $slot->ring->destroy();
     }
 

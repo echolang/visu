@@ -1,5 +1,6 @@
 /**
- * png → vtex. Cook knobs come from the folder `.vmat` view on `Source.$meta`.
+ * png → vtex. Cook knobs come from the folder `.vtex` view on `Source.$meta`.
+ * `mip: "max"` keeps cutout coverage through the chain; box average is the default.
  */
 
 namespace visu::asset;
@@ -30,10 +31,15 @@ public class TextureCooker : Cooker
         bool $mips = guard vmatBool($src->meta, 'mips', true) else ($e) {
             return .error($e);
         }
+        string $filter = str::lower(vmatStr($src->meta, 'mip', 'box'));
+        if (!$filter->equals('box') && !$filter->equals('max')) {
+            return .error(.decode($src->id, "unknown mip '{$filter}'"));
+        }
+
         PixelFormat $fmt = guard cookPixelFormat($src->meta, $srgb) else ($e) {
             return .error($e);
         }
-        Blob $blob = guard encodeTexture($px, $fmt, $mips) else ($e) {
+        Blob $blob = guard encodeTexture($px, $fmt, $mips, $filter->equals('max')) else ($e) {
             return .error($e);
         }
         array<PackItem> $items = array<PackItem>();

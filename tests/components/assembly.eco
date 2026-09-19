@@ -1,0 +1,64 @@
+/**
+ * Assembly spawn: parented transforms and StaticModel / DynamicModel per node.
+ */
+
+use json;
+use visu::asset::{Assembly, parseAssembly};
+use visu::components::{AssemblyInstance, DynamicModel, StaticModel, spawnAssembly};
+use visu::ecs::{Entities, Entity};
+use visu::geo::Transform;
+use visu::math::{Vec3, equal};
+
+test spawn_assembly_parents_dynamic_wheel
+{
+    json::Value $root = guard json::parse('{"parts":{"body":{"model":"car/body"},"wheel":{"model":"car/wheel","dynamic":true}},"nodes":[{"name":"body","part":"body","position":[1,0,0]},{"name":"wheel_fl","part":"wheel","parent":"body","position":[0.8,0.3,1.2]}]}') else ($e) {
+        die($e->message());
+    }
+    Assembly $doc = guard parseAssembly('car', $root, '') else ($e) {
+        die($e->message());
+    }
+    Entities $world = Entities();
+    Transform $rootT = Transform();
+    Entity $rootId = spawnAssembly($world, $doc, $rootT);
+    assert($world->has<Transform>($rootId), 'root transform');
+    int32 $models = 0;
+    int32 $dyn = 0;
+    foreach ($world->view<StaticModel>() as $id => &$m) {
+        $models = $models + 1;
+        assert($m->model->equals('car/body'), 'body model');
+    }
+    foreach ($world->view<DynamicModel>() as $id => &$m) {
+        $dyn = $dyn + 1;
+        assert($m->model->equals('car/wheel'), 'wheel model');
+        Transform $t = $world->get<Transform>($id);
+        assert($t->parent != $rootId, 'wheel is not on the asset root');
+        assert(equal($t->position->x, 0.8f), 'wheel local x');
+    }
+    assert($models == 1 && $dyn == 1, 'one of each');
+    assert($world->has<AssemblyInstance>($rootId), 'instance on root');
+    AssemblyInstance $inst = $world->get<AssemblyInstance>($rootId);
+    assert($inst->nodes->has('wheel_fl'), 'named child');
+    assert($inst->nodes->has(''), 'root slot');
+}
+
+test spawn_assembly_skips_empty_part
+{
+    json::Value $root = guard json::parse('{"parts":{"body":{"model":"car/body"}},"nodes":[{"name":"joint","part":"","position":[0,1,0]},{"name":"body","part":"body","parent":"joint"}]}') else ($e) {
+        die($e->message());
+    }
+    Assembly $doc = guard parseAssembly('car', $root, '') else ($e) {
+        die($e->message());
+    }
+    Entities $world = Entities();
+    Entity $rootId = spawnAssembly($world, $doc, Transform());
+    int32 $models = 0;
+    foreach ($world->view<StaticModel>() as $id => &$m) {
+        $models = $models + 1;
+    }
+    foreach ($world->view<DynamicModel>() as $id => &$m) {
+        $models = $models + 1;
+    }
+    assert($models == 1, 'joint has no mesh');
+    AssemblyInstance $inst = $world->get<AssemblyInstance>($rootId);
+    assert($inst->node('joint') != null, 'joint entity');
+}

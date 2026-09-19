@@ -1,0 +1,49 @@
+/**
+ * One scope of a frame's profile tree. Nodes live in an array in DFS-begin order, so a parent's
+ * index is always below its children's and a reverse walk rolls children up into parents.
+ * Equal-named siblings fold into one node and `$calls` counts the folds.
+ *
+ * Struct in an array: mutate through a borrow (`ScopeNode& $n = $nodes->at($id);`), never by
+ * copying out and writing back, since `$children` is a heap array.
+ */
+
+namespace visu::profile;
+
+use visu::graphics::DrawStats;
+
+public struct ScopeNode
+{
+    /** -1 for the frame root */
+    public int32 $parent = -1;
+    /** root 0, frame roots such as `render` 1, passes 2, pass sub-scopes 3 */
+    public int32 $depth = 0;
+    public string $name = '';
+    /** `render/deferred.ssao/blur`; empty for the root */
+    public string $path = '';
+    public int32 $calls = 0;
+    public float64 $cpuNs = 0.0;
+    public float64 $gpuNs = 0.0;
+    /** resolved GPU spans folded in, own plus rolled-up children; 0 means the GPU time is unknown */
+    public int32 $gpuSpans = 0;
+    /** draw delta over the scope, children included */
+    public DrawStats $draw = DrawStats();
+    public array<int32> $children = array<int32>();
+}
+
+/**
+ * Index of the child of `$parent` named `$name` in `$nodes`, or -1.
+ */
+public function childOf(const array<ScopeNode>& $nodes, int32 $parent, const string& $name) : int32
+{
+    if ($parent < 0 || ($parent as usize) >= $nodes->count()) {
+        return -1;
+    }
+
+    foreach ($nodes[$parent as usize]->children as $child) {
+        if ($nodes[$child as usize]->name == $name) {
+            return $child;
+        }
+    }
+
+    return -1;
+}

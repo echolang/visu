@@ -1,0 +1,549 @@
+/**
+ * Hierarchical CPU + GPU scopes. `begin('name')` / `end()` nest into a per-frame tree; the pipeline
+ * opens one scope per pass and passes open sub-scopes inside. GPU time per scope is the sum of the
+ * encoders opened while it was innermost (the device tags each encoder with `GpuTimeline.scope`),
+ * so a scope that never opened an encoder has no GPU time, not zero GPU time.
+ *
+ * Frames complete late: GPU spans land FRAMES_IN_FLIGHT frames after the frame ran, so ended frames
+ * wait in a small ring until `mergeGpu` sees their `resolvedFrame`. Names should be literals: an
+ * interpolated name allocates per call and never folds with its siblings.
+ *
+ * Process singleton like `visu::app::flags()`: Host attaches the device, GameLoop owns the frame
+ * boundaries, and a `begin` outside a frame opens one lazily. Single-threaded; `$open`, `$nodes`
+ * and `GpuTimeline.scope` are what would become per-thread once Echo has thread-local storage.
+ *
+ * Under `--define VISU_RELEASE` every measuring body is empty: no tree, no ring, no stats, and the
+ * device never samples. Call sites stay unconditional.
+ */
+
+namespace visu::profile;
+
+use std::time;
+use visu::graphics::{DrawCounters, DrawStats, FRAMES_IN_FLIGHT, GpuPublish, GpuSpan, GpuTimeline};
+
+public const int32 MAX_DEPTH = 16;
+/** what the console and the overlay say when `enabled()` is false */
+public const string PROFILE_DISABLED_NOTE = 'profiling compiled out (VISU_RELEASE)';
+internal const usize RING = (FRAMES_IN_FLIGHT as usize) + 1;
+
+internal struct OpenScope
+{
+    public int32 $node;
+    public time::instant $t0;
+    public DrawStats $draws0;
+}
+
+/**
+ * An ended frame waiting for its GPU spans.
+ */
+internal class PendingFrame
+{
+    public int32 $frame;
+    public uint64 $gpuFrame;
+    public int32 $submit;
+    public float64 $submitNs;
+    public array<ScopeNode> $nodes;
+
+    public constructor(int32 $frame, uint64 $gpuFrame, int32 $submit, array<ScopeNode> $nodes)
+    {
+        $this->frame = $frame;
+        $this->gpuFrame = $gpuFrame;
+        $this->submit = $submit;
+        $this->submitNs = 0.0;
+        $this->nodes = $nodes;
+    }
+}
+
+public class Profiler
+{
+    public StatsBook $stats;
+    public GpuTimeline? $timeline;
+    private DrawCounters? $draws;
+    private array<ScopeNode> $nodes;
+    private array<OpenScope> $open;
+    private int32 $frame;
+    private uint64 $gpuFrame;
+    private bool $bound;
+    private bool $inFrame;
+    private time::instant $frameStart;
+    private array<PendingFrame> $pending;
+    private array<FrameProfile> $done;
+    private FrameProfile? $latest;
+    private int32 $submitNode;
+
+    public constructor()
+    {
+        $this->stats = StatsBook();
+        $this->timeline = null;
+        $this->draws = null;
+        $this->nodes = array<ScopeNode>();
+        $this->open = array<OpenScope>();
+        $this->frame = -1;
+        $this->gpuFrame = 0;
+        $this->bound = false;
+        $this->inFrame = false;
+        $this->frameStart = time::instant::now();
+        $this->pending = array<PendingFrame>();
+        $this->done = array<FrameProfile>();
+        $this->latest = null;
+        $this->submitNode = -1;
+    }
+
+    /**
+     * Host calls this once: draw counters for per-scope draw deltas, the timeline for GPU spans.
+     */
+    public function attach(DrawCounters $draws, GpuTimeline $timeline) : void
+    {
+        $this->timeline = $timeline;
+        #[if: !VISU_RELEASE]
+        $this->draws = $draws;
+        #[end]
+    }
+
+    /**
+     * Open a frame. A frame left open by an early return ends here first.
+     */
+    public function beginFrame() : void
+    {
+        #[if: !VISU_RELEASE]
+        if ($this->inFrame) {
+            $this->endFrame();
+        }
+
+        $this->openFrame();
+        #[end]
+    }
+
+    /**
+     * Tie the open frame to the device frame whose encoders it opens, and to the host frame index.
+     */
+    public function bindFrame(uint64 $gpuFrame, int32 $frame) : void
+    {
+        #[if: !VISU_RELEASE]
+        if (!$this->inFrame) {
+            $this->openFrame();
+        }
+
+        $this->gpuFrame = $gpuFrame;
+        $this->frame = $frame;
+        $this->bound = true;
+        #[end]
+    }
+
+    /**
+     * Close the frame. Open scopes are a wiring bug; they are closed anyway so the tree stays sane.
+     */
+    public function endFrame() : void
+    {
+        #[if: !VISU_RELEASE]
+        if (!$this->inFrame) {
+            return;
+        }
+
+        assert($this->open->empty(), 'profile: endFrame with open scopes');
+
+        while (!$this->open->empty()) {
+            $this->end();
+        }
+
+        ScopeNode& $root = $this->nodes->at(0);
+        $root->calls = 1;
+        $root->cpuNs = (time::instant::now() - $this->frameStart)->as_nanos() as float64;
+        $this->inFrame = false;
+        bool $waitsForGpu = $this->bound && $this->gpuSupported();
+        PendingFrame $p = PendingFrame($this->frame, $this->gpuFrame, $this->submitNode, $this->nodes);
+        $this->nodes = array<ScopeNode>();
+
+        if (!$waitsForGpu) {
+            $this->finish($p, false);
+            return;
+        }
+
+        $this->pending[] = $p;
+
+        while ($this->pending->count() > RING) {
+            PendingFrame $oldest = $this->pending[0];
+            $this->pending->remove(0);
+            $this->finish($oldest, false);
+        }
+        #[end]
+    }
+
+    public function begin(const string& $name) : void
+    {
+        #[if: !VISU_RELEASE]
+        if (!$this->inFrame) {
+            $this->openFrame();
+        }
+
+        int32 $parent = 0;
+
+        if (!$this->open->empty()) {
+            $parent = $this->open[$this->open->count() - 1]->node;
+        }
+
+        int32 $id = childOf($this->nodes, $parent, $name);
+
+        if ($id < 0) {
+            ScopeNode& $p = $this->nodes->at($parent as usize);
+            assert($p->depth + 1 < MAX_DEPTH, 'profile: scopes nested deeper than MAX_DEPTH');
+            $id = $this->nodes->count() as int32;
+            ScopeNode $n = ScopeNode();
+            $n->parent = $parent;
+            $n->depth = $p->depth + 1;
+            $n->name = $name;
+            $n->path = $name;
+
+            if (!$p->path->empty()) {
+                string $pp = $p->path;
+                $n->path = "{$pp}/{$name}";
+            }
+
+            // the append may move the array, so the parent borrow is done before it
+            $p->children[] = $id;
+            $this->nodes[] = $n;
+        }
+
+        ScopeNode& $node = $this->nodes->at($id as usize);
+        $node->calls = $node->calls + 1;
+        $this->open[] = OpenScope($id, time::instant::now(), $this->drawsNow());
+        $this->setScope($id);
+        #[end]
+    }
+
+    public function end() : void
+    {
+        #[if: !VISU_RELEASE]
+        assert(!$this->open->empty(), 'profile: end without begin');
+
+        if ($this->open->empty()) {
+            return;
+        }
+
+        OpenScope $top = $this->open[$this->open->count() - 1];
+        $this->open->pop();
+        ScopeNode& $node = $this->nodes->at($top->node as usize);
+        $node->cpuNs = $node->cpuNs + ((time::instant::now() - $top->t0)->as_nanos() as float64);
+        $node->draw = addDraws($node->draw, $this->drawsNow()->since($top->draws0));
+
+        if ($this->open->empty()) {
+            $this->setScope(-1);
+            return;
+        }
+
+        $this->setScope($this->open[$this->open->count() - 1]->node);
+        #[end]
+    }
+
+    /**
+     * The current open scope owns the whole-submit GPU span for this frame.
+     */
+    public function captureSubmit() : void
+    {
+        #[if: !VISU_RELEASE]
+        if ($this->open->empty()) {
+            return;
+        }
+
+        $this->submitNode = $this->open[$this->open->count() - 1]->node;
+        #[end]
+    }
+
+    /**
+     * Open scope count; 0 between frames and always 0 under VISU_RELEASE.
+     */
+    public const function depth() : int32
+    {
+        return $this->open->count() as int32;
+    }
+
+    /**
+     * Close down to `$mark` open scopes. A pass that left a scope open is a wiring bug.
+     */
+    public function close(int32 $mark) : void
+    {
+        #[if: !VISU_RELEASE]
+        assert($this->depth() == $mark + 1, 'profile: scope left open');
+
+        while ($this->depth() > $mark) {
+            $this->end();
+        }
+        #[end]
+    }
+
+    /**
+     * Fold the attached timeline's resolved spans into the frame they belong to and complete it,
+     * along with any older frame still waiting. Repeated calls for one `resolvedFrame` are no-ops:
+     * the first call drains every frame up to it and later frames carry a higher `gpuFrame`.
+     */
+    public function mergeGpu() : void
+    {
+        #[if: !VISU_RELEASE]
+        GpuTimeline $timeline = guard $this->timeline else {
+            return;
+        }
+
+        array<GpuPublish> $pubs = $timeline->take();
+        if ($pubs->empty()) {
+            return;
+        }
+
+        foreach ($pubs as $pub) {
+            array<PendingFrame> $kept = array<PendingFrame>();
+            array<PendingFrame> $have = $this->pending;
+            foreach ($have as $p) {
+                if ($p->gpuFrame == $pub->frame) {
+                    $this->fold($p, $pub->spans);
+                    $this->finish($p, true);
+                } else if ($p->gpuFrame < $pub->frame) {
+                    $this->finish($p, false);
+                } else {
+                    $kept[] = $p;
+                }
+            }
+
+            $this->pending = $kept;
+        }
+        #[end]
+    }
+
+    /**
+     * Oldest completed frame not yet taken, or null.
+     */
+    public function complete() : FrameProfile?
+    {
+        if ($this->done->empty()) {
+            return null;
+        }
+
+        FrameProfile $f = $this->done[0];
+        $this->done->remove(0);
+        return $f;
+    }
+
+    /**
+     * Most recently completed frame, whether or not it was taken.
+     */
+    public const function latest() : FrameProfile?
+    {
+        return $this->latest;
+    }
+
+    /**
+     * Complete every waiting frame without GPU time. Host.destroy, after the device went idle.
+     */
+    public function abandon() : void
+    {
+        #[if: !VISU_RELEASE]
+        if ($this->inFrame) {
+            $this->endFrame();
+        }
+
+        array<PendingFrame> $have = $this->pending;
+        $this->pending = array<PendingFrame>();
+        foreach ($have as $p) {
+            $this->finish($p, false);
+        }
+        #[end]
+    }
+
+    public function reset() : void
+    {
+        $this->stats->reset();
+    }
+
+    public const function gpuSupported() : bool
+    {
+        GpuTimeline $tl = guard $this->timeline else {
+            return false;
+        }
+        return $tl->supported;
+    }
+
+    private function openFrame() : void
+    {
+        ScopeNode $root = ScopeNode();
+        $root->name = 'frame';
+        array<ScopeNode> $nodes = array<ScopeNode>();
+        $nodes[] = $root;
+        $this->nodes = $nodes;
+        $this->open = array<OpenScope>();
+        $this->frame = -1;
+        $this->gpuFrame = 0;
+        $this->bound = false;
+        $this->inFrame = true;
+        $this->frameStart = time::instant::now();
+        $this->submitNode = -1;
+        $this->setScope(-1);
+    }
+
+    private function setScope(int32 $id) : void
+    {
+        GpuTimeline $tl = guard $this->timeline else {
+            return;
+        }
+        $tl->scope = $id;
+    }
+
+    /**
+     * The device's running draw counters, or zeros before Host attached them.
+     */
+    private const function drawsNow() : DrawStats
+    {
+        DrawCounters $dc = guard $this->draws else {
+            return DrawStats();
+        }
+        return $dc->frame;
+    }
+
+    /**
+     * Add spans to their nodes, then roll GPU time up to parents in reverse order. The node
+     * captured by `captureSubmit` takes the whole-submit span instead of a sum.
+     */
+    private function fold(PendingFrame $p, const array<GpuSpan>& $spans) : void
+    {
+        usize $count = $p->nodes->count();
+        foreach ($spans as $s) {
+            if ($s->ns <= 0.0) {
+                continue;
+            }
+
+            if ($s->scope < 0) {
+                $p->submitNs = $p->submitNs + $s->ns;
+                continue;
+            }
+
+            if (($s->scope as usize) >= $count) {
+                continue;
+            }
+
+            ScopeNode& $n = $p->nodes->at($s->scope as usize);
+            $n->gpuNs = $n->gpuNs + $s->ns;
+            $n->gpuSpans = $n->gpuSpans + 1;
+        }
+
+        int32 $submit = $p->submit;
+        usize $i = $count;
+
+        while ($i > 1) {
+            $i = $i - 1;
+            ScopeNode& $child = $p->nodes->at($i);
+
+            if ($child->gpuSpans == 0 || $child->parent < 0) {
+                continue;
+            }
+
+            if (($i as int32) == $submit && $p->submitNs > 0.0) {
+                continue;
+            }
+
+            ScopeNode& $parent = $p->nodes->at($child->parent as usize);
+            $parent->gpuNs = $parent->gpuNs + $child->gpuNs;
+            $parent->gpuSpans = $parent->gpuSpans + $child->gpuSpans;
+        }
+
+        if ($submit >= 0 && ($submit as usize) < $count && $p->submitNs > 0.0) {
+            ScopeNode& $owner = $p->nodes->at($submit as usize);
+            $owner->gpuNs = $p->submitNs;
+            $owner->gpuSpans = 1;
+            ScopeNode& $root = $p->nodes->at(0);
+            $root->gpuNs = $p->submitNs;
+            $root->gpuSpans = 1;
+        }
+    }
+
+    private function finish(PendingFrame $p, bool $gpuResolved) : void
+    {
+        FrameProfile $f = FrameProfile(
+            $p->frame,
+            $p->gpuFrame,
+            $this->gpuSupported(),
+            $gpuResolved,
+            $p->submitNs,
+            $p->nodes
+        );
+        $this->stats->note($f);
+        $this->done[] = $f;
+        $this->latest = $f;
+    }
+}
+
+internal function addDraws(const DrawStats& $a, const DrawStats& $b) : DrawStats
+{
+    DrawStats $d = DrawStats();
+    $d->draws = $a->draws + $b->draws;
+    $d->indexed = $a->indexed + $b->indexed;
+    $d->pipelineBinds = $a->pipelineBinds + $b->pipelineBinds;
+    $d->vertices = $a->vertices + $b->vertices;
+    $d->triangles = $a->triangles + $b->triangles;
+    $d->patches = $a->patches + $b->patches;
+    return $d;
+}
+
+internal class ProcessProfiler
+{
+    public static Profiler? $held = null;
+}
+
+public function installProfiler(Profiler $profiler) : void
+{
+    ProcessProfiler::$held = $profiler;
+}
+
+/**
+ * The process profiler. Fill-if-absent so a system may open scopes before Host exists.
+ */
+public function profiler() : Profiler
+{
+    Profiler? $held = ProcessProfiler::$held;
+    if ($held != null) {
+        Profiler $current = guard $held;
+        return $current;
+    }
+
+    Profiler $fresh = Profiler();
+    installProfiler($fresh);
+    return $fresh;
+}
+
+/**
+ * Open a scope on the process profiler. Literal names only.
+ */
+#[inline]
+public function begin(const string& $name) : void
+{
+    #[if: !VISU_RELEASE]
+    profiler()->begin($name);
+    #[end]
+}
+
+#[inline]
+public function end() : void
+{
+    #[if: !VISU_RELEASE]
+    profiler()->end();
+    #[end]
+}
+
+/**
+ * The current open scope owns the whole-submit GPU span. Host calls this on `render`.
+ */
+#[inline]
+public function captureSubmit() : void
+{
+    #[if: !VISU_RELEASE]
+    profiler()->captureSubmit();
+    #[end]
+}
+
+/**
+ * False under `--define VISU_RELEASE`, where every scope is compiled to nothing.
+ */
+public function enabled() : bool
+{
+    #[if: VISU_RELEASE]
+    return false;
+    #[else]
+    return true;
+    #[end]
+}

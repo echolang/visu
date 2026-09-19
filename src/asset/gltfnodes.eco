@@ -6,7 +6,7 @@
 
 namespace visu::asset;
 
-use visu::math::Mat4;
+use visu::math::{Mat4, Quat, Vec3, Vec4, length};
 
 /**
  * A mesh instance that belongs to one object: which glTF mesh, its baked world matrix, its LOD level.
@@ -161,6 +161,16 @@ internal function gltfVisit(
         return .ok;
     }
 
+    if ($node->camera >= 0 || $node->light >= 0) {
+        foreach ($node->children as $child) {
+            guard gltfVisit($file, $child, $world, $objects, $pending, $depth + 1) else ($e) {
+                return .error($e);
+            }
+        }
+
+        return .ok;
+    }
+
     if ($node->mesh >= 0 && $level > 0) {
         GltfPendingLod $hold = GltfPendingLod();
         $hold->index = $index;
@@ -180,7 +190,24 @@ internal function gltfVisit(
         GltfParts $object = GltfParts($node->name);
         $object->parts[] = GltfPart($node->mesh, $world, 0);
         foreach ($node->children as $child) {
-            guard gltfAddChild($file, $child, $world, $object, $depth + 1) else ($e) {
+            if ($child < 0 || ($child as usize) >= $file->nodes->count()) {
+                return .error(.json("node {$child} does not exist"));
+            }
+
+            GltfNode $kid = $file->nodes[$child as usize];
+            int32 $kidLevel = gltfLodLevel($kid->name);
+            if ($kidLevel == -2) {
+                continue;
+            }
+
+            if ($kidLevel > 0) {
+                guard gltfAddChild($file, $child, $world, $object, $depth + 1) else ($e) {
+                    return .error($e);
+                }
+                continue;
+            }
+
+            guard gltfVisit($file, $child, $world, $objects, $pending, $depth + 1) else ($e) {
                 return .error($e);
             }
         }
@@ -256,4 +283,45 @@ internal function gltfAddSubtree(
     }
 
     return .ok;
+}
+
+internal function matTranslation(const Mat4& $m) : Vec3
+{
+    return Vec3($m->c3->x, $m->c3->y, $m->c3->z);
+}
+
+internal function matScale(const Mat4& $m) : Vec3
+{
+    return Vec3(
+        length(Vec3($m->c0->x, $m->c0->y, $m->c0->z)),
+        length(Vec3($m->c1->x, $m->c1->y, $m->c1->z)),
+        length(Vec3($m->c2->x, $m->c2->y, $m->c2->z))
+    );
+}
+
+internal function matRotation(const Mat4& $m) : Quat
+{
+    Vec3 $s = matScale($m);
+    float32 $sx = $s->x;
+    float32 $sy = $s->y;
+    float32 $sz = $s->z;
+    if ($sx < 0.000001f) {
+        $sx = 1.0f;
+    }
+
+    if ($sy < 0.000001f) {
+        $sy = 1.0f;
+    }
+
+    if ($sz < 0.000001f) {
+        $sz = 1.0f;
+    }
+
+    Mat4 $r = Mat4(
+        Vec4($m->c0->x / $sx, $m->c0->y / $sx, $m->c0->z / $sx, 0.0f),
+        Vec4($m->c1->x / $sy, $m->c1->y / $sy, $m->c1->z / $sy, 0.0f),
+        Vec4($m->c2->x / $sz, $m->c2->y / $sz, $m->c2->z / $sz, 0.0f),
+        Vec4(0.0f, 0.0f, 0.0f, 1.0f)
+    );
+    return Quat($r);
 }

@@ -107,7 +107,21 @@ public class Sink
     }
 
     /**
+     * A free line on the current tab, above its sections.
+     */
+    public function note(string $text) : void
+    {
+        if ($this->currentTab->empty()) {
+            $this->tab('app');
+        }
+
+        TabMail $mail = $this->tabs[$this->currentTab];
+        $mail->notes[] = $text;
+    }
+
+    /**
      * Append or replace a graph pass on the current tab (usually `graph`).
+     * Rows match by path when both carry one, else by name.
      */
     public function pass(PassTiming $timing) : void
     {
@@ -117,6 +131,19 @@ public class Sink
 
         TabMail $mail = $this->tabs[$this->currentTab];
         $mail->writePass($timing);
+    }
+
+    /**
+     * Replace the current tab's graph rows. StatsBook sampling is a full tree each frame.
+     */
+    public function replacePasses(array<PassTiming> $rows) : void
+    {
+        if ($this->currentTab->empty()) {
+            $this->tab('graph', title: 'Graph', 10);
+        }
+
+        TabMail $mail = $this->tabs[$this->currentTab];
+        $mail->passes = $rows;
     }
 
     public function passExtra(string $pass, string $name, float64 $value, Unit $unit) : void
@@ -176,6 +203,7 @@ public class TabMail
     public array<string> $sectionOrder;
     public map<string, array<Metric>> $sections;
     public array<PassTiming> $passes;
+    public array<string> $notes;
 
     public constructor(string $id, string $title, int32 $order)
     {
@@ -185,6 +213,7 @@ public class TabMail
         $this->sectionOrder = array<string>();
         $this->sections = map<string, array<Metric>>();
         $this->passes = array<PassTiming>();
+        $this->notes = array<string>();
     }
 
     public function ensureSection(string $id) : void
@@ -210,7 +239,7 @@ public class TabMail
         bool $replaced = false;
         array<PassTiming> $have = $this->passes;
         foreach ($have as $p) {
-            if ($p->name == $timing->name) {
+            if (samePass($p, $timing)) {
                 $kept[] = $timing;
                 $replaced = true;
             } else {
@@ -242,6 +271,14 @@ public class TabMail
         array<PassTiming> $have = $this->passes;
         foreach ($have as $p) {
             PassTiming $row = $p;
+            // extras attach by full path first (`render/terrain`), then by leaf name (`terrain`)
+            if (!$p->path->empty() && $extras->has($p->path)) {
+                array<Metric> $byPath = $extras[$p->path];
+                foreach ($byPath as $m) {
+                    $row->extras = replaceMetric($row->extras, $m);
+                }
+            }
+
             if ($extras->has($p->name)) {
                 array<Metric> $more = $extras[$p->name];
                 foreach ($more as $m) {
@@ -252,8 +289,24 @@ public class TabMail
             $passes[] = $row;
         }
 
-        return Tab($this->id, $this->title, $this->order, $sections, $passes);
+        return Tab($this->id, $this->title, $this->order, $sections, $passes, $this->notes);
     }
+}
+
+/**
+ * Two rows are the same scope when their paths agree, or when neither has a path and the names do.
+ */
+internal function samePass(const PassTiming& $a, const PassTiming& $b) : bool
+{
+    if (!$a->path->empty() && !$b->path->empty()) {
+        return $a->path == $b->path;
+    }
+
+    if ($a->path->empty() && $b->path->empty()) {
+        return $a->name == $b->name;
+    }
+
+    return false;
 }
 
 internal function replaceMetric(array<Metric> $list, Metric $metric) : array<Metric>

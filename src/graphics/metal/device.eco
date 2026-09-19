@@ -38,7 +38,8 @@ public class Device : DeviceProtocol
     internal map<uint32, mtl::DepthStencilState> $depthStates;
     internal PixelFormat $bbFormat;
     public DrawCounters $draws;
-    public GpuScopes $gpuScopes;
+    public GpuTimeline $gpuTimeline;
+    internal GpuClock $clock;
 
     public constructor()
     {
@@ -75,7 +76,8 @@ public class Device : DeviceProtocol
         $this->depthStates = map<uint32, mtl::DepthStencilState>();
         $this->bbFormat = .bgra8;
         $this->draws = DrawCounters();
-        $this->gpuScopes = GpuScopes();
+        $this->gpuTimeline = GpuTimeline();
+        $this->clock = GpuClock();
     }
 
     destructor()
@@ -103,6 +105,8 @@ public class Device : DeviceProtocol
         }
         $this->gpu = $gpu;
         $this->queue = $queue;
+        $this->gpuTimeline->supported = mtlTimestampsSupported($gpu);
+        mtlClockSample($gpu, $this->clock);
         guard mtlCreateSlots($this) else ($e) {
             $this->shutdown();
             return .error($e);
@@ -120,6 +124,11 @@ public class Device : DeviceProtocol
         announceVersion();
         string $line = $info->line();
         info("graphics: {$line}");
+
+        if ($this->gpuTimeline->supported) {
+            info('gpu timestamps: on (stage boundary)');
+        }
+
         return .ok;
     }
 
@@ -228,16 +237,11 @@ public class Device : DeviceProtocol
                 $slot->prev = null;
                 return $this->acquireFrame($width, $height);
             }
-            float64 $t0 = $prev->gpuStart();
-            float64 $t1 = $prev->gpuEnd();
-            if ($t1 > $t0 && $t0 > 0.0) {
-                GpuScopeSample $sample = GpuScopeSample();
-                $sample->name = 'submit';
-                $sample->ns = ($t1 - $t0) * 1000000000.0;
-                array<GpuScopeSample> $resolved = array<GpuScopeSample>();
-                $resolved[] = $sample;
-                $this->gpuScopes->resolved = $resolved;
+            mtl::Device $gpu = guard $this->gpu else {
+                return .error(.noDevice);
             }
+            mtlClockSample($gpu, $this->clock);
+            mtlTimestampsResolve($slot->stamps, $prev, $this->clock, $this->gpuTimeline);
         }
         $slot->prev = null;
         return $this->acquireFrame($width, $height);
@@ -649,7 +653,9 @@ public class Device : DeviceProtocol
             mtl::CommandBuffer $cmd = guard $this->cmd else {
                 die('generateMipmaps without a command buffer');
             }
-            mtl::BlitCommandEncoder $blit = guard $cmd->blitCommandEncoder() else {
+            mtl::BlitPassDescriptor $blitPass = mtl::BlitPassDescriptor();
+            mtlTimestampsAttachBlit($this->slots[$this->slot]->stamps, $blitPass, $this->gpuTimeline->scope);
+            mtl::BlitCommandEncoder $blit = guard $cmd->blitCommandEncoder($blitPass) else {
                 die('metal: blitCommandEncoder failed');
             }
             $blit->generateMipmaps($mt);
@@ -769,6 +775,7 @@ public class Device : DeviceProtocol
     {
         FrameSlot $slot = $this->slots[$this->slot];
         $slot->ring->reset();
+        $slot->stamps->reset($this->frames);
         mtl::Layer $layer = guard $this->layer else {
             return .ok(.skipped);
         }
@@ -802,6 +809,7 @@ public class Device : DeviceProtocol
         int32 $height
     ) : RenderEncoder
     {
+        mtlTimestampsAttach($this->slots[$this->slot]->stamps, $pass, $this->gpuTimeline->scope);
         mtl::RenderCommandEncoder $enc = guard $cmd->renderCommandEncoder($pass) else {
             die('metal: renderCommandEncoder failed');
         }
@@ -824,17 +832,7 @@ public class Device : DeviceProtocol
 
     private function waitSlots() : void
     {
-        if ($this->slots->count() == 0) {
-            return;
-        }
-
-        foreach ($this->slots as $slot) {
-            mtl::CommandBuffer $prev = guard $slot->prev else {
-                continue;
-            }
-            $prev->waitUntilCompleted();
-            $slot->prev = null;
-        }
+        mtlTimestampsHarvest($this);
     }
 
     private function abortFrame() : void
@@ -860,6 +858,8 @@ public class Device : DeviceProtocol
             $cmd->waitUntilCompleted();
             $this->cmd = null;
             $this->inFrame = false;
+            // the aborted buffer never becomes $prev, so its samples must not pair with the next one
+            $this->slots[$this->slot]->stamps->reset($this->frames);
         }
 
         $this->drawable = null;

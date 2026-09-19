@@ -1,0 +1,145 @@
+/**
+ * Scope tree shape: nesting, paths, sibling folds, lazy frame open, close(mark).
+ */
+
+// the profiler measures nothing under VISU_RELEASE, so none of this holds there
+#[if: !VISU_RELEASE]
+use visu::profile::{FrameProfile, Profiler, ScopeNode};
+
+function completed(Profiler $prof) : FrameProfile
+{
+    FrameProfile $f = guard $prof->complete() else {
+        die('no completed frame');
+    }
+    return $f;
+}
+
+test profile_nesting_builds_paths
+{
+    Profiler $prof = Profiler();
+    $prof->beginFrame();
+    $prof->begin('render');
+    $prof->begin('deferred.ssao');
+    $prof->begin('blur');
+    $prof->end();
+    $prof->end();
+    $prof->end();
+    $prof->endFrame();
+
+    FrameProfile $f = completed($prof);
+    ScopeNode $root = $f->root();
+    assert($root->name == 'frame', 'root name');
+    assert($root->path->empty(), 'root path');
+    assert($root->children->count() == 1, 'one root child');
+    ScopeNode $blur = guard $f->find('render/deferred.ssao/blur') else {
+        die('blur missing');
+    }
+    assert($blur->depth == 3, 'blur depth');
+    assert($blur->calls == 1, 'blur calls');
+    assert($blur->cpuNs >= 0.0, 'blur cpu');
+    ScopeNode $render = guard $f->find('render') else {
+        die('render missing');
+    }
+    assert($render->depth == 1, 'render depth');
+    assert($render->cpuNs >= $blur->cpuNs, 'parent covers child');
+    assert($f->frame == -1, 'unbound frame index');
+    assert($f->gpuResolved == false, 'no gpu without a device');
+}
+
+test profile_sibling_folds_count_calls
+{
+    Profiler $prof = Profiler();
+    $prof->beginFrame();
+    $prof->begin('render');
+    $prof->begin('ClearPass');
+    $prof->end();
+    $prof->begin('quad');
+    $prof->end();
+    $prof->begin('ClearPass');
+    $prof->end();
+    $prof->end();
+    $prof->endFrame();
+
+    FrameProfile $f = completed($prof);
+    ScopeNode $render = guard $f->find('render') else {
+        die('render missing');
+    }
+    assert($render->children->count() == 2, 'two distinct children');
+    ScopeNode $clear = guard $f->find('render/ClearPass') else {
+        die('clear missing');
+    }
+    assert($clear->calls == 2, 'clear folded twice');
+    assert($f->nodes->count() == 4, 'root, render, ClearPass, quad');
+}
+
+test profile_begin_outside_frame_opens_one
+{
+    Profiler $prof = Profiler();
+    $prof->begin('update');
+    $prof->end();
+    $prof->endFrame();
+    FrameProfile $f = completed($prof);
+    assert($f->find('update') != null, 'lazy frame holds the scope');
+    assert($prof->complete() == null, 'taken once');
+}
+
+test profile_close_to_mark_ends_the_pass_scope
+{
+    Profiler $prof = Profiler();
+    $prof->beginFrame();
+    $prof->begin('render');
+    int32 $mark = $prof->depth();
+    assert($mark == 1, 'render open');
+    $prof->begin('pass');
+    $prof->close($mark);
+    assert($prof->depth() == 1, 'back at the mark');
+    $prof->end();
+    $prof->endFrame();
+    FrameProfile $f = completed($prof);
+    assert($f->find('render/pass') != null, 'pass recorded');
+}
+
+test profile_latest_survives_complete
+{
+    Profiler $prof = Profiler();
+    $prof->beginFrame();
+    $prof->endFrame();
+    assert($prof->latest() != null, 'latest set on completion');
+    FrameProfile $f = completed($prof);
+    assert($prof->latest() != null, 'latest kept after take');
+    assert($f->root()->calls == 1, 'root call');
+}
+
+
+#[tests: expects death]
+test profile_end_without_begin_dies
+{
+    Profiler $prof = Profiler();
+    $prof->beginFrame();
+    $prof->end();
+}
+
+#[tests: expects death]
+test profile_leaked_scope_dies_at_close
+{
+    Profiler $prof = Profiler();
+    $prof->beginFrame();
+    int32 $mark = $prof->depth();
+    $prof->begin('pass');
+    $prof->begin('leaked');
+    $prof->close($mark);
+}
+
+#[tests: expects death]
+test profile_too_deep_dies
+{
+    Profiler $prof = Profiler();
+    $prof->beginFrame();
+    int32 $i = 0;
+
+    while ($i < 20) {
+        $prof->begin('deep');
+        $i = $i + 1;
+    }
+}
+#[end]

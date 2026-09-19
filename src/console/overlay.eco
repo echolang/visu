@@ -19,10 +19,12 @@ internal enum MetricsAction
     case expand(bool $on);
     case expandToggle;
     case tab(string $id);
+    case depth(int32 $depth);
 }
 
 /**
- * `metrics` alone is status; `metrics on|off|toggle`; `metrics expand [on|off]`; `metrics tab <id>`.
+ * `metrics` alone is status; `metrics on|off|toggle`; `metrics expand [on|off]`; `metrics tab <id>`;
+ * `metrics depth <n>` limits the graph tree.
  */
 internal function parseMetricsConsole(const ConsoleCommandSignal& $cmd) : MetricsAction
 {
@@ -72,6 +74,13 @@ internal function parseMetricsConsole(const ConsoleCommandSignal& $cmd) : Metric
         return .tab($cmd->parts[2]);
     }
 
+    if ($arg == 'depth') {
+        int32 $n = guard consoleInt($cmd, 2) else {
+            return .usage;
+        }
+        return .depth($n);
+    }
+
     return .usage;
 }
 
@@ -86,7 +95,7 @@ public class OverlayConsole : ConsoleCommandHandler
 
     public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
     {
-        $registry->add('metrics', $this, 'on|off|toggle|expand|tab <id>');
+        $registry->add('metrics', $this, 'on|off|toggle|expand|tab <id>|depth <n>');
         array<string> $names = array<string>();
         $names[] = 'metrics';
         return $names;
@@ -100,7 +109,7 @@ public class OverlayConsole : ConsoleCommandHandler
                 $this->writeStatus($console);
             },
             MetricsAction::usage => {
-                $console->writeLine('usage: metrics [on|off|toggle|expand|tab <id>]');
+                $console->writeLine('usage: metrics [on|off|toggle|expand|tab <id>|depth <n>]');
             },
             MetricsAction::on => {
                 $this->overlay->enabled = true;
@@ -127,6 +136,10 @@ public class OverlayConsole : ConsoleCommandHandler
                 $this->overlay->expanded = true;
                 $this->writeStatus($console);
             },
+            MetricsAction::depth($depth) => {
+                $this->overlay->setGraphDepth($depth);
+                $this->writeStatus($console);
+            },
         };
     }
 
@@ -143,7 +156,8 @@ public class OverlayConsole : ConsoleCommandHandler
             $exp = 'expanded';
         }
 
-        $console->writeLine("metrics: {$vis} {$exp} tab {$overlay->selected}");
+        int32 $depth = $overlay->graphDepth;
+        $console->writeLine("metrics: {$vis} {$exp} tab {$overlay->selected} depth {$depth}");
         Sample $sample = guard $overlay->lastSample else {
             return;
         }
@@ -151,7 +165,7 @@ public class OverlayConsole : ConsoleCommandHandler
         Tab $tab = guard findTab($sample, $overlay->selected) else {
             return;
         }
-        array<string> $lines = formatTab($tab);
+        array<string> $lines = formatTab($tab, $depth);
         foreach ($lines as $line) {
             $console->writeLine($line);
         }

@@ -1,0 +1,200 @@
+/**
+ * Console grammar and handler for `AnimationPlayer`. The system samples; this type owns the
+ * `anim` verb.
+ */
+
+namespace visu::console;
+
+use visu::asset::Clip;
+use visu::components::AnimationPlayer;
+use visu::ecs::{Entities, Entity};
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal enum AnimConsoleAction
+{
+    case status;
+    case usage;
+    case play;
+    case playNamed(string $name);
+    case pause;
+    case stop;
+    case reverse;
+    case seek(float32 $seconds);
+    case speed(float32 $speed);
+}
+
+internal function parseAnimConsole(const ConsoleCommandSignal& $cmd) : AnimConsoleAction
+{
+    if (!$cmd->isAction('anim')) {
+        return .usage;
+    }
+
+    if ($cmd->parts->count() == 1) {
+        return .status;
+    }
+
+    string $arg = $cmd->parts[1];
+    if ($arg == 'play') {
+        if ($cmd->parts->count() >= 3) {
+            return .playNamed($cmd->parts[2]);
+        }
+
+        return .play;
+    }
+
+    if ($arg == 'pause') {
+        return .pause;
+    }
+
+    if ($arg == 'stop') {
+        return .stop;
+    }
+
+    if ($arg == 'reverse') {
+        return .reverse;
+    }
+
+    if ($arg == 'seek') {
+        if ($cmd->parts->count() < 3) {
+            return .usage;
+        }
+
+        float64? $parsed = str::float($cmd->parts[2]);
+        float64 $seconds = guard $parsed else {
+            return .usage;
+        }
+        return .seek($seconds as float32);
+    }
+
+    if ($arg == 'speed') {
+        if ($cmd->parts->count() < 3) {
+            return .usage;
+        }
+
+        float64? $parsed = str::float($cmd->parts[2]);
+        float64 $speed = guard $parsed else {
+            return .usage;
+        }
+        return .speed($speed as float32);
+    }
+
+    return .usage;
+}
+
+public class AnimConsole : ConsoleCommandHandler
+{
+    private Entities $world;
+
+    public constructor(Entities $world)
+    {
+        $this->world = $world;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('anim', $this, 'play [clip]|pause|stop|seek <s>|speed <n>|reverse');
+        array<string> $names = array<string>();
+        $names[] = 'anim';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        AnimConsoleAction $action = parseAnimConsole($cmd);
+        bool $usage = match ($action) {
+            AnimConsoleAction::usage => true,
+            else => false,
+        };
+        if ($usage) {
+            $console->writeLine('usage: anim [play [clip]|pause|stop|seek <s>|speed <n>|reverse]');
+            return;
+        }
+
+        Entity $e = guard firstPlayerId($this->world) else {
+            $console->writeLine('anim: no player');
+            return;
+        }
+        AnimationPlayer& $player = $this->world->get<AnimationPlayer>($e);
+        match ($action) {
+            AnimConsoleAction::status => {
+                printAnim($console, $player);
+            },
+            AnimConsoleAction::usage => {
+                $console->writeLine('usage: anim [play [clip]|pause|stop|seek <s>|speed <n>|reverse]');
+            },
+            AnimConsoleAction::play => {
+                $player->play();
+                $console->writeLine('anim: play');
+            },
+            AnimConsoleAction::playNamed($name) => {
+                playNamedClip($player, $console, $name);
+            },
+            AnimConsoleAction::pause => {
+                $player->pause();
+                $console->writeLine('anim: pause');
+            },
+            AnimConsoleAction::stop => {
+                $player->stop();
+                $console->writeLine('anim: stop');
+            },
+            AnimConsoleAction::reverse => {
+                $player->reverse();
+                $console->writeLine("anim: speed {$player->speed}");
+            },
+            AnimConsoleAction::seek($seconds) => {
+                $player->seek($seconds);
+                $console->writeLine("anim: {$player->time:.2f}s");
+            },
+            AnimConsoleAction::speed($speed) => {
+                $player->speed = $speed;
+                $console->writeLine("anim: speed {$player->speed}");
+            },
+        };
+    }
+}
+
+internal function playNamedClip(AnimationPlayer& $player, DebugConsole $console, string $name) : void
+{
+    $player->play($name);
+    Clip $clip = guard $player->clip() else {
+        $console->writeLine("anim: no clip '{$name}'");
+        return;
+    }
+    if (!$clip->name->equals($name)) {
+        $console->writeLine("anim: no clip '{$name}'");
+        return;
+    }
+
+    $console->writeLine("anim: play {$clip->name}");
+}
+
+internal function firstPlayerId(Entities $world) : Entity?
+{
+    foreach ($world->view<AnimationPlayer>() as $id => &$player) {
+        return $id;
+    }
+
+    return null;
+}
+
+internal function printAnim(DebugConsole $console, const AnimationPlayer& $player) : void
+{
+    string $clip = '-';
+    if ($player->playing && $player->index < 0) {
+        $clip = 'all';
+    } else {
+        Clip? $have = $player->clip();
+        if ($have != null) {
+            Clip $c = guard $have;
+            $clip = $c->name;
+        }
+    }
+
+    string $state = 'paused';
+    if ($player->playing) {
+        $state = 'playing';
+    }
+
+    $console->writeLine("anim: {$clip} {$state} {$player->time:.2f}s speed {$player->speed}");
+}

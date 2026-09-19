@@ -1,0 +1,230 @@
+/**
+ * StatsBook to graph rows: tree order with siblings by average, depth, calls, GPU known flag,
+ * extras by path, two same-named leaves under different parents staying apart, and rows that
+ * survive a frame the scope did not run in.
+ */
+
+// the profiler measures nothing under VISU_RELEASE, so none of this holds there
+#[if: !VISU_RELEASE]
+use visu::graphics::{DrawCounters, GpuSpan, GpuTimeline};
+use visu::instrument::{Instruments, PassTiming, Section, Sink, Tab, findTab, formatPass, formatTab, rowsFromStats};
+use visu::profile::{FrameProfile, Profiler};
+
+function sampleFrame(Profiler $prof) : FrameProfile
+{
+    $prof->beginFrame();
+    $prof->bindFrame(1, 1);
+    $prof->begin('render');
+    $prof->begin('terrain');
+    $prof->begin('cull');
+    $prof->end();
+    $prof->end();
+    $prof->begin('models');
+    $prof->begin('cull');
+    $prof->end();
+    $prof->end();
+    $prof->begin('ClearPass');
+    $prof->end();
+    $prof->begin('ClearPass');
+    $prof->end();
+    $prof->end();
+    $prof->endFrame();
+    FrameProfile $f = guard $prof->complete() else {
+        die('frame');
+    }
+    return $f;
+}
+
+test rows_follow_tree_order_and_depth
+{
+    Profiler $prof = Profiler();
+    FrameProfile $f = sampleFrame($prof);
+    array<PassTiming> $rows = rowsFromStats($prof->stats);
+    assert($rows->count() == 6, 'render, terrain, cull, models, cull, ClearPass');
+    assert($rows[0]->name == 'render' && $rows[0]->depth == 0, 'render first');
+    assert($rows[0]->childCount == 3, 'render has three children');
+    int32 $depthOne = 0;
+    int32 $culls = 0;
+    foreach ($rows as $row) {
+        if ($row->depth == 1) {
+            $depthOne = $depthOne + 1;
+        }
+
+        if ($row->name == 'cull') {
+            $culls = $culls + 1;
+            assert($row->depth == 2, 'cull nested two deep');
+        }
+
+        if ($row->name == 'ClearPass') {
+            assert($row->calls == 2, 'clear folded');
+        }
+
+        assert($row->gpuKnown == false, 'no gpu without spans');
+    }
+
+    assert($depthOne == 3, 'three passes under render');
+    assert($culls == 2, 'both culls listed');
+}
+
+test rows_carry_tree_guides
+{
+    Profiler $prof = Profiler();
+    FrameProfile $f = sampleFrame($prof);
+    array<PassTiming> $rows = rowsFromStats($prof->stats);
+    assert($rows[0]->last && $rows[0]->guides->empty(), 'render is the only root');
+    int32 $closing = 0;
+    foreach ($rows as $row) {
+        if ($row->depth == 1) {
+            assert($row->guides->count() == 1 && !$row->guides[0], 'render has no later sibling');
+
+            if ($row->last) {
+                $closing = $closing + 1;
+            }
+        }
+
+        if ($row->name == 'cull') {
+            assert($row->guides->count() == 2, 'one flag per ancestor');
+            assert($row->last, 'cull is an only child');
+        }
+    }
+
+    assert($closing == 1, 'exactly one closing connector under render');
+    array<string> $lines = formatTab(Tab('graph', 'Graph', 0, array<Section>(), $rows));
+    bool $sawBranch = false;
+    bool $sawClose = false;
+    foreach ($lines as $line) {
+        if ($line->contains('|- ')) {
+            $sawBranch = true;
+        }
+
+        if ($line->contains('`- ')) {
+            $sawClose = true;
+        }
+    }
+
+    assert($sawBranch && $sawClose, 'console rows draw both connector kinds');
+}
+
+test rows_keep_a_scope_that_skipped_a_frame
+{
+    Profiler $prof = Profiler();
+    $prof->beginFrame();
+    $prof->begin('update');
+    $prof->end();
+    $prof->begin('render');
+    $prof->end();
+    $prof->endFrame();
+    guard $prof->complete() else {
+        die('first');
+    }
+    $prof->beginFrame();
+    $prof->begin('render');
+    $prof->end();
+    $prof->endFrame();
+    guard $prof->complete() else {
+        die('second');
+    }
+    array<PassTiming> $rows = rowsFromStats($prof->stats);
+    assert($rows->count() == 2, 'update stays listed on a frame without a tick');
+    bool $sawUpdate = false;
+    foreach ($rows as $row) {
+        if ($row->name == 'update') {
+            $sawUpdate = true;
+            assert($row->cpuNs == 0.0, 'absent frame counts as zero');
+        }
+    }
+
+    assert($sawUpdate, 'update row present');
+}
+
+test rows_sort_siblings_by_average
+{
+    GpuTimeline $tl = GpuTimeline();
+    $tl->supported = true;
+    Profiler $prof = Profiler();
+    $prof->attach(DrawCounters(), $tl);
+    $prof->beginFrame();
+    $prof->bindFrame(1, 1);
+    $prof->begin('render');
+    $prof->begin('cheap');
+    $prof->end();
+    $prof->begin('costly');
+    $prof->end();
+    $prof->end();
+    $prof->endFrame();
+    // node ids: 0 frame, 1 render, 2 cheap, 3 costly
+    array<GpuSpan> $spans = array<GpuSpan>();
+    $spans[] = GpuSpan(2, 10.0);
+    $spans[] = GpuSpan(3, 900.0);
+    $tl->publish(1, $spans, 0);
+    $prof->mergeGpu();
+    guard $prof->complete() else {
+        die('frame');
+    }
+    array<PassTiming> $rows = rowsFromStats($prof->stats);
+    assert($rows->count() == 3, 'render and two passes');
+    assert($rows[1]->name == 'costly', 'largest gpu average first');
+    assert($rows[2]->name == 'cheap', 'smaller after');
+}
+
+test rows_keep_same_named_leaves_apart
+{
+    Profiler $prof = Profiler();
+    FrameProfile $f = sampleFrame($prof);
+    Instruments $inst = Instruments();
+    $inst->noteProfile($f, $prof->stats);
+    $inst->passExtra('render/terrain', 'quads', 12.0, .count);
+    $sample = $inst->sample();
+    Tab $g = guard findTab($sample, 'graph') else {
+        die('graph');
+    }
+    int32 $culls = 0;
+    bool $extraOnTerrain = false;
+    array<PassTiming> $passes = $g->passes;
+    foreach ($passes as $p) {
+        if ($p->name == 'cull') {
+            $culls = $culls + 1;
+        }
+
+        if ($p->path == 'render/terrain' && $p->extras->count() == 1) {
+            $extraOnTerrain = true;
+        }
+    }
+
+    assert($culls == 2, 'both cull rows survive replacePasses');
+    assert($extraOnTerrain, 'extra attached by path');
+    array<string> $lines = formatTab($g, 1);
+    assert($lines->count() == 5, 'depth 1 shows render, its three children and the terrain extra');
+}
+
+test rows_gpu_known_after_merge
+{
+    GpuTimeline $tl = GpuTimeline();
+    $tl->supported = true;
+    Profiler $prof = Profiler();
+    $prof->attach(DrawCounters(), $tl);
+    $prof->beginFrame();
+    $prof->bindFrame(9, 9);
+    $prof->begin('render');
+    $prof->captureSubmit();
+    $prof->begin('gbuffer');
+    $prof->end();
+    $prof->end();
+    $prof->endFrame();
+    array<GpuSpan> $spans = array<GpuSpan>();
+    $spans[] = GpuSpan(-1, 500.0);
+    $spans[] = GpuSpan(2, 200.0);
+    $tl->publish(9, $spans, 0);
+    $prof->mergeGpu();
+    FrameProfile $f = guard $prof->complete() else {
+        die('frame');
+    }
+    array<PassTiming> $rows = rowsFromStats($prof->stats);
+    assert($rows[1]->gpuKnown && $rows[1]->gpuNs == 200.0, 'gbuffer gpu');
+    assert($rows[0]->gpuKnown && $rows[0]->gpuNs == 500.0, 'render takes submit');
+    string $line = formatPass($rows[1]);
+    assert($line->contains('`- gbuffer'), 'an only child closes the tree');
+    assert(formatPass($rows[1], false)->contains('   gbuffer'), 'the panel gets a blank indent');
+    assert($line->contains('GPU:') && !$line->contains('GPU:        —'), 'no gpu dash when known');
+}
+#[end]

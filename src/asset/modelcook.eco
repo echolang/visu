@@ -1,12 +1,13 @@
 /**
- * glb / gltf → vmodel, one item per mesh-carrying object in the file. LOD distances, bias and cull
- * distance come from the folder `.vmat` view for the object name (`Source.$meta` is the file's view;
- * an object record overlays it).
+ * glb / gltf → one VMDL per assembly part plus a `KIND_ASSEMBLY` blob. LOD distances, bias and
+ * cull come from the sibling `.vmod` (`Source.$meta`). Vertices bake in the part's LOD0 space.
  */
 
 namespace visu::asset;
 
 use json;
+use std::io;
+use visu::math::{Mat4, inverse};
 
 /**
  * BetaBrain's defaults when the sheet names no distances: level n switches in at `[n - 1]`.
@@ -50,58 +51,346 @@ public class ModelCooker : Cooker
         GltfFile $file = guard GltfFile::load($src->path) else ($e) {
             return .error(gltfAssetError($src->path, $e));
         }
-        array<GltfModel> $models = guard gltfModels($file) else ($e) {
+        array<GltfParts> $objects = array<GltfParts>();
+        array<GltfPendingLod> $pending = array<GltfPendingLod>();
+        guard gltfCollect($file, $objects, $pending) else ($e) {
             return .error(gltfAssetError($src->id, $e));
         }
+        if ($objects->count() == 0) {
+            return .error(.decode($src->id, 'no mesh objects'));
+        }
+
         string $folder = parentId($src->id);
+        string $stem = stripExt(dirBase($src->path));
+        string $assemblyId = $folder;
+        if ($assemblyId->empty()) {
+            $assemblyId = $src->id;
+        }
+
+        Assembly $doc = guard assemblyFromSource($src, $stem, $assemblyId, $objects) else ($e) {
+            return .error($e);
+        }
+
+        $doc->clips = $file->clips;
+        retargetClipNodes($file, $doc);
+        if ($file->clips->count() > 0) {
+            markAnimatedParts($doc);
+        }
+
+        fillNodeTransforms($doc, $objects);
+
         array<PackItem> $items = array<PackItem>();
-        foreach ($models as $entry) {
-            json::Value $view = vmatView($src->meta, $entry->name);
-            CookedModel $model = $entry->model;
-            guard applyModelSheet($model, $view, $src->id) else ($e) {
+        map<string, bool> $baked = map<string, bool>();
+        foreach ($doc->parts as $part) {
+            if ($baked->has($part->name)) {
+                continue;
+            }
+
+            GltfParts? $found = gltfFindObject($objects, $part->name);
+            if ($found == null) {
+                $found = gltfObjectForPart($objects, $doc, $part->name);
+            }
+
+            GltfParts $object = guard $found else {
+                return .error(.decode($src->id, "part '{$part->name}' has no mesh"));
+            }
+            Mat4 $origin = gltfPartOrigin($object);
+            CookedModel $model = guard gltfBuild($file, $object, $origin) else ($e) {
+                return .error(gltfAssetError($src->id, $e));
+            }
+            guard applyPartLod($model, $part, $src->id) else ($e) {
                 return .error($e);
             }
+            remapSlots($model->slots, $folder, $part->slots);
+            if ($part->model->empty()) {
+                $part->model = sourceId($folder, $part->name);
+            }
+
             Blob $blob = guard encodeModel($model) else ($e) {
                 return .error($e);
             }
-            $items[] = PackItem(sourceId($folder, $entry->name), KIND_MODEL, $blob);
+            $items[] = PackItem($part->model, KIND_MODEL, $blob);
+            $baked[$part->name] = true;
         }
 
+        $items[] = PackItem($assemblyId, KIND_ASSEMBLY, encodeAssembly($doc));
         return .ok($items);
     }
 }
 
-/**
- * `lod` (array of switch distances for level 1..n), `lodBias`, `cullDistance` from the sheet view.
- * Defaults fill when `lod` is absent. A present `lod` must be an array of numbers of length `lods-1`.
- */
-internal function applyModelSheet(CookedModel $model, json::Value $view, const string& $id) : status<AssetError>
+internal function assemblyFromSource(
+    const Source& $src,
+    const string& $stem,
+    const string& $assemblyId,
+    const array<GltfParts>& $objects
+) : result<Assembly, AssetError>
 {
-    int32 $n = $model->lods->count() as int32;
-    json::Value? $got = $view->get('lod');
-    if ($got != null) {
-        json::Value $lod = guard $got;
-        array<json::Value>? $arr = $lod->asArray();
-        array<json::Value> $vals = guard $arr else {
-            return .error(.decode($id, 'lod must be an array of numbers'));
-        }
-        int32 $want = $n - 1;
-        if ($want < 0) {
-            $want = 0;
+    Assembly? $fromVmod = guard loadSiblingVmod($src->path, $stem, $assemblyId) else ($e) {
+        return .error($e);
+    }
+    if ($fromVmod != null) {
+        Assembly $doc = guard $fromVmod;
+        return .ok($doc);
+    }
+
+    array<AssemblyPart> $parts = array<AssemblyPart>();
+    array<AssemblyNode> $nodes = array<AssemblyNode>();
+    foreach ($objects as $object) {
+        // the cook loop fills `$part->model` from the folder and part name
+        AssemblyPart $part = AssemblyPart();
+        $part->name = $object->name;
+        $parts[] = $part;
+        $nodes[] = nodeFromWorld($object->name, $object->name, gltfPartOrigin($object));
+    }
+
+    return .ok(Assembly($assemblyId, 0.0f, '', 0.0f, $parts, $nodes));
+}
+
+/**
+ * Sibling `{stem}.vmod` next to the glb / gltf, or null when that file is absent.
+ */
+internal function loadSiblingVmod(
+    const string& $path,
+    const string& $stem,
+    const string& $assemblyId
+) : result<Assembly?, AssetError>
+{
+    string $vmod = stripExt($path);
+    $vmod->append('.vmod');
+    string $text = guard io::readfile($vmod) else ($e) {
+        if ($e->missing()) {
+            return .ok(null);
         }
 
-        if (($vals->count() as int32) != $want) {
+        return .error(.io($vmod, $e->message()));
+    }
+    json::Value $root = guard json::parse($text) else ($e) {
+        return .error(.corrupt($vmod, $e->message()));
+    }
+    if (!$root->isObject()) {
+        return .error(.corrupt($vmod, 'vmod is not a JSON object'));
+    }
+    Assembly $doc = guard parseAssembly($assemblyId, $root, $stem) else ($e) {
+        return .error($e);
+    }
+    return .ok($doc);
+}
+
+internal function gltfObjectForPart(
+    const array<GltfParts>& $objects,
+    Assembly $doc,
+    const string& $partName
+) : GltfParts?
+{
+    foreach ($doc->nodes as $node) {
+        if (!$node->part->equals($partName)) {
+            continue;
+        }
+
+        GltfParts? $found = gltfFindObject($objects, $node->name);
+        if ($found != null) {
+            return $found;
+        }
+    }
+
+    return null;
+}
+
+internal function markAnimatedParts(Assembly $doc) : void
+{
+    map<string, bool> $animated = map<string, bool>();
+    foreach ($doc->clips as $clip) {
+        foreach ($clip->tracks as $track) {
+            $animated[$track->node] = true;
+        }
+    }
+
+    map<string, string> $parentOf = map<string, string>();
+    foreach ($doc->nodes as $node) {
+        $parentOf[$node->name] = $node->parent;
+    }
+
+    int32 $i = 0;
+    while ($i < ($doc->parts->count() as int32)) {
+        AssemblyPart $part = $doc->parts[$i as usize];
+        if ($part->dynamic) {
+            $i = $i + 1;
+            continue;
+        }
+
+        string $at = '';
+        foreach ($doc->nodes as $node) {
+            if ($node->part->equals($part->name)) {
+                $at = $node->name;
+                break;
+            }
+        }
+
+        if ($at->empty()) {
+            $at = $part->name;
+        }
+
+        int32 $guard = 0;
+        while (!$at->empty() && $guard < 64) {
+            if ($animated->has($at)) {
+                $part->dynamic = true;
+                $doc->parts[$i as usize] = $part;
+                break;
+            }
+
+            if (!$parentOf->has($at)) {
+                break;
+            }
+
+            $at = $parentOf[$at];
+            $guard = $guard + 1;
+        }
+
+        $i = $i + 1;
+    }
+}
+
+internal function nodeFromWorld(const string& $name, const string& $part, const Mat4& $world) : AssemblyNode
+{
+    AssemblyNode $node = AssemblyNode();
+    $node->name = $name;
+    $node->part = $part;
+    $node->position = matTranslation($world);
+    $node->orientation = matRotation($world);
+    $node->scale = matScale($world);
+    return $node;
+}
+
+/**
+ * Blender actions target the parent transform (`RING`); vmod nodes are the mesh children
+ * (`RING_standardSurface1_0`). Point tracks at the mesh node when that is the only child.
+ */
+internal function retargetClipNodes(GltfFile $file, Assembly $doc) : void
+{
+    foreach ($doc->clips as $clip) {
+        foreach ($clip->tracks as $track) {
+            if (assemblyHasNode($doc, $track->node)) {
+                continue;
+            }
+
+            string $mapped = gltfMeshChildName($file, $track->node);
+            if ($mapped->empty()) {
+                continue;
+            }
+
+            if (assemblyHasNode($doc, $mapped)) {
+                $track->node = $mapped;
+            }
+        }
+    }
+}
+
+internal function assemblyHasNode(const Assembly& $doc, const string& $name) : bool
+{
+    foreach ($doc->nodes as $node) {
+        if ($node->name->equals($name)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+internal function gltfMeshChildName(GltfFile $file, const string& $name) : string
+{
+    foreach ($file->nodes as $node) {
+        if (!$node->name->equals($name)) {
+            continue;
+        }
+
+        if ($node->mesh >= 0) {
+            return $node->name;
+        }
+
+        foreach ($node->children as $childIdx) {
+            if ($childIdx < 0 || ($childIdx as usize) >= $file->nodes->count()) {
+                continue;
+            }
+
+            GltfNode $child = $file->nodes[$childIdx as usize];
+            if ($child->mesh >= 0) {
+                return $child->name;
+            }
+        }
+    }
+
+    return '';
+}
+
+/**
+ * Identity vmod TRS means "use the glTF rest pose". An explicit vmod offset is kept.
+ */
+internal function fillNodeTransforms(Assembly $doc, const array<GltfParts>& $objects) : void
+{
+    int32 $i = 0;
+    while ($i < ($doc->nodes->count() as int32)) {
+        AssemblyNode $node = $doc->nodes[$i as usize];
+        if (!nodeIsRest($node)) {
+            $i = $i + 1;
+            continue;
+        }
+
+        GltfParts? $found = gltfFindObject($objects, $node->name);
+        GltfParts $object = guard $found else {
+            $i = $i + 1;
+            continue;
+        }
+        Mat4 $world = gltfPartOrigin($object);
+        Mat4 $local = $world;
+        if (!$node->parent->empty()) {
+            GltfParts? $parent = gltfFindObject($objects, $node->parent);
+            if ($parent != null) {
+                GltfParts $p = guard $parent;
+                $local = inverse(gltfPartOrigin($p)) * $world;
+            }
+        }
+
+        AssemblyNode $written = nodeFromWorld($node->name, $node->part, $local);
+        $written->parent = $node->parent;
+        $doc->nodes[$i as usize] = $written;
+        $i = $i + 1;
+    }
+}
+
+internal function nodeIsRest(const AssemblyNode& $n) : bool
+{
+    if ($n->position->x != 0.0f || $n->position->y != 0.0f || $n->position->z != 0.0f) {
+        return false;
+    }
+
+    if ($n->scale->x != 1.0f || $n->scale->y != 1.0f || $n->scale->z != 1.0f) {
+        return false;
+    }
+
+    if ($n->orientation->x != 0.0f || $n->orientation->y != 0.0f || $n->orientation->z != 0.0f) {
+        return false;
+    }
+
+    return $n->orientation->w == 1.0f;
+}
+
+internal function applyPartLod(CookedModel $model, AssemblyPart $part, const string& $id) : status<AssetError>
+{
+    int32 $n = $model->lods->count() as int32;
+    int32 $want = $n - 1;
+    if ($want < 0) {
+        $want = 0;
+    }
+
+    if ($part->lod->count() > 0) {
+        if (($part->lod->count() as int32) != $want) {
             return .error(.decode($id, "lod must have {$want} distances"));
         }
 
         int32 $level = 1;
         while ($level < $n) {
-            float64? $f = $vals[($level - 1) as usize]->asFloat();
-            float64 $distance = guard $f else {
-                return .error(.decode($id, 'lod must be an array of numbers'));
-            }
             ModelLodDesc $desc = $model->lods[$level as usize];
-            $desc->distance = $distance as float32;
+            $desc->distance = $part->lod[($level - 1) as usize];
             $model->lods[$level as usize] = $desc;
             $level = $level + 1;
         }
@@ -115,9 +404,40 @@ internal function applyModelSheet(CookedModel $model, json::Value $view, const s
         }
     }
 
-    $model->lodBias = vmatF32($view, 'lodBias', 1.0f);
-    $model->cullDistance = vmatF32($view, 'cullDistance', 0.0f);
+    $model->lodBias = $part->lodBias;
+    $model->cullDistance = $part->cullDistance;
     return .ok;
+}
+
+internal function remapSlots(array<string>& $slots, const string& $folder, const map<string, string>& $map) : void
+{
+    int32 $i = 0;
+    while ($i < ($slots->count() as int32)) {
+        string $name = $slots[$i as usize];
+        if ($map->has($name)) {
+            $slots[$i as usize] = $map[$name];
+        } else {
+            $slots[$i as usize] = slotId($folder, $name);
+        }
+
+        $i = $i + 1;
+    }
+}
+
+/**
+ * Catalog id for a glTF material name in `$folder`. Names keep their dots (`model.bush`);
+ * `sourceId` would treat the last segment as a file extension.
+ */
+internal function slotId(const string& $folder, const string& $name) : string
+{
+    if ($folder->empty()) {
+        return $name;
+    }
+
+    string $id = $folder;
+    $id->append('/');
+    $id->append($name);
+    return $id;
 }
 
 internal function gltfAssetError(const string& $id, GltfError $e) : AssetError

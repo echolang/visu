@@ -3,7 +3,8 @@
  */
 
 use visu::instrument::{
-    PassTiming, Section, Tab, TabBodyItem, passBarStack, tabBodyItems
+    GuideRow, PassTiming, Section, Tab, TabBodyItem, barWidth, clampTabScroll, guideRows, guideStart,
+    maxTabScroll, passBarMax, passBarStack, tabBodyItems, visibleTabItems
 };
 
 test pass_bar_stack_cpu_only
@@ -18,6 +19,7 @@ test pass_bar_stack_cpu_and_gpu
     PassTiming $p = PassTiming();
     $p->cpuNs = 1000000.0;
     $p->gpuNs = 2000000.0;
+    $p->gpuKnown = true;
     assert(passBarStack($p) == 10.0f, 'cpu+gap+gpu');
 }
 
@@ -30,8 +32,162 @@ test tab_body_items_are_one_walk
     $passes[] = $p;
     array<Section> $sections = array<Section>();
     Tab $tab = Tab('graph', 'Graph', 0, $sections, $passes);
-    array<TabBodyItem> $none = tabBodyItems($tab, $passes, 0.0);
+    array<TabBodyItem> $none = tabBodyItems($tab, $passes, 0.0, 2);
     assert($none->count() == 1, 'pass line, no bars when max is 0');
-    array<TabBodyItem> $withBars = tabBodyItems($tab, $passes, 1000000.0);
-    assert($withBars->count() == 2, 'pass line plus bars');
+    array<TabBodyItem> $withBars = tabBodyItems($tab, $passes, 1000000.0, 2);
+    assert($withBars->count() == 1, 'pass line and bars are one item');
+}
+
+test tab_body_items_cut_at_depth
+{
+    PassTiming $render = PassTiming();
+    $render->name = 'render';
+    $render->depth = 0;
+    $render->childCount = 1;
+    $render->cpuNs = 3000000.0;
+    PassTiming $pass = PassTiming();
+    $pass->name = 'gbuffer';
+    $pass->depth = 1;
+    $pass->childCount = 1;
+    $pass->cpuNs = 2000000.0;
+    PassTiming $inner = PassTiming();
+    $inner->name = 'terrain';
+    $inner->depth = 2;
+    $inner->cpuNs = 1000000.0;
+    array<PassTiming> $passes = array<PassTiming>();
+    $passes[] = $render;
+    $passes[] = $pass;
+    $passes[] = $inner;
+    array<Section> $sections = array<Section>();
+    array<string> $notes = array<string>();
+    $notes[] = 'hello';
+    Tab $tab = Tab('graph', 'Graph', 0, $sections, $passes, $notes);
+    array<TabBodyItem> $all = tabBodyItems($tab, $passes, 0.0, 5);
+    assert($all->count() == 4, 'note plus three rows');
+    array<TabBodyItem> $cut = tabBodyItems($tab, $passes, 0.0, 1);
+    assert($cut->count() == 3, 'note plus two rows at depth <= 1');
+    string $last = match ($cut[2]) {
+        TabBodyItem::row($p, $text, $bars) => $text,
+        else => '',
+    };
+    assert($last->contains('+1'), 'cutoff row names its hidden children');
+}
+
+/**
+ * render (bars), then terrain with bars, then models: terrain's connector hangs off render's
+ * bottom below its bars, models' connector continues from terrain's elbow.
+ */
+test tree_guides_start_at_the_parent_bottom_or_the_sibling_elbow
+{
+    PassTiming $render = PassTiming();
+    $render->name = 'render';
+    $render->depth = 0;
+    $render->cpuNs = 3000000.0;
+    PassTiming $terrain = PassTiming();
+    $terrain->name = 'terrain';
+    $terrain->depth = 1;
+    $terrain->last = false;
+    $terrain->cpuNs = 2000000.0;
+    PassTiming $models = PassTiming();
+    $models->name = 'models';
+    $models->depth = 1;
+    $models->cpuNs = 1000000.0;
+    array<PassTiming> $passes = array<PassTiming>();
+    $passes[] = $render;
+    $passes[] = $terrain;
+    $passes[] = $models;
+    array<Section> $sections = array<Section>();
+    Tab $tab = Tab('graph', 'Graph', 0, $sections, $passes);
+    array<TabBodyItem> $items = tabBodyItems($tab, $passes, 3000000.0, 2);
+    assert($items->count() == 3, 'three pass rows, bars included');
+    array<GuideRow> $rows = guideRows($items, 100.0f, 18.0f);
+    assert($rows->count() == 3, 'one guide row per pass');
+    // a row is 18 high, a cpu-only bar stack 4 + 4 gap
+    assert($rows[0]->mid == 109.0f, 'render elbow');
+    assert($rows[0]->bottom == 126.0f, 'render bottom is under its bars');
+    assert($rows[1]->mid == 135.0f, 'terrain elbow');
+    assert(guideStart($rows, 1, 100.0f) == 126.0f, 'terrain hangs off render');
+    assert(guideStart($rows, 2, 100.0f) == 135.0f, 'models continues from terrain');
+    assert(guideStart($rows, 0, 100.0f) == 100.0f, 'a root has nothing above');
+}
+
+test bars_clamp_to_the_row_and_normalise_to_any_depth
+{
+    PassTiming $render = PassTiming();
+    $render->name = 'render';
+    $render->depth = 0;
+    $render->gpuKnown = true;
+    $render->gpuNs = 9000000.0;
+    PassTiming $ibl = PassTiming();
+    $ibl->name = 'ibl';
+    $ibl->depth = 1;
+    $ibl->gpuKnown = true;
+    $ibl->gpuNs = 27000000.0;
+    array<PassTiming> $passes = array<PassTiming>();
+    $passes[] = $render;
+    $passes[] = $ibl;
+    assert(passBarMax($passes) == 27000000.0, 'a child wider than its parent sets the scale');
+    assert(barWidth(27000000.0, 9000000.0, 200.0f) == 200.0f, 'never past the row');
+    assert(barWidth(4500000.0, 9000000.0, 200.0f) == 100.0f, 'half');
+    assert(barWidth(1.0, 0.0, 200.0f) == 0.0f, 'no scale, no bar');
+}
+
+function tenLines() : array<TabBodyItem>
+{
+    array<TabBodyItem> $items = array<TabBodyItem>();
+    int32 $i = 0;
+
+    while ($i < 10) {
+        TabBodyItem $line = .line("row {$i}");
+        $items[] = $line;
+        $i = $i + 1;
+    }
+
+    return $items;
+}
+
+test visible_items_fit_the_room_with_markers
+{
+    array<TabBodyItem> $items = tenLines();
+    // ten lines of 18 fit in 200
+    array<TabBodyItem> $all = visibleTabItems($items, 0, 200.0f, 18.0f);
+    assert($all->count() == 10, 'everything fits, no markers');
+    // five lines of room: four rows plus the below marker
+    array<TabBodyItem> $top = visibleTabItems($items, 0, 90.0f, 18.0f);
+    assert($top->count() == 5, 'four rows and a marker');
+    string $last = match ($top[4]) {
+        TabBodyItem::line($text) => $text,
+        else => '',
+    };
+    assert($last == 'v 6 more', 'below marker counts the hidden rows');
+    // scrolled: above marker, three rows, below marker
+    array<TabBodyItem> $mid = visibleTabItems($items, 2, 90.0f, 18.0f);
+    assert($mid->count() == 5, 'markers on both ends');
+    string $first = match ($mid[0]) {
+        TabBodyItem::line($text) => $text,
+        else => '',
+    };
+    string $second = match ($mid[1]) {
+        TabBodyItem::line($text) => $text,
+        else => '',
+    };
+    assert($first == '^ 2 more' && $second == 'row 2', 'starts at the scrolled row');
+}
+
+test scroll_clamps_to_the_last_row
+{
+    array<TabBodyItem> $items = tenLines();
+    assert(maxTabScroll($items, 200.0f, 18.0f) == 0, 'nothing to scroll when it fits');
+    // 90 of room: marker plus four rows, so the last page starts at row 6
+    assert(maxTabScroll($items, 90.0f, 18.0f) == 6, 'last page shows rows 6..9');
+    assert(clampTabScroll($items, 50, 90.0f, 18.0f) == 6, 'past the end clamps');
+    assert(clampTabScroll($items, 3, 90.0f, 18.0f) == 3, 'inside stays');
+    assert(clampTabScroll($items, -4, 90.0f, 18.0f) == 0, 'negative is the top');
+    array<TabBodyItem> $end = visibleTabItems($items, 6, 90.0f, 18.0f);
+    assert($end->count() == 5, 'marker plus the last four rows');
+    string $tail = match ($end[4]) {
+        TabBodyItem::line($text) => $text,
+        else => '',
+    };
+    assert($tail == 'row 9', 'ends on the last row, no below marker');
 }

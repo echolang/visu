@@ -7,7 +7,7 @@ namespace visu::asset;
 
 use visu::geo::AABB;
 use visu::graphics::{IndexType, indexWidth};
-use visu::math::{Mat4, Vec2, Vec3, Vec4, cross, dot, length, normalize};
+use visu::math::{Mat4, Vec2, Vec3, Vec4, cross, dot, inverse, length, normalize};
 
 /**
  * Per-slot index list of one level while the object is being assembled.
@@ -62,6 +62,15 @@ internal class GltfPrimitive
  */
 internal function gltfBuild(GltfFile $file, GltfParts $object) : result<CookedModel, GltfError>
 {
+    return gltfBuild($file, $object, Mat4());
+}
+
+/**
+ * Bake `$object` with vertices in `$origin`'s space (`inverse(origin) * world`). Identity origin
+ * is the old world bake, used by `gltfModels`. The cooker passes the part's LOD0 world matrix.
+ */
+internal function gltfBuild(GltfFile $file, GltfParts $object, const Mat4& $origin) : result<CookedModel, GltfError>
+{
     array<string> $slots = array<string>();
     array<GltfChunk> $chunks = array<GltfChunk>();
     array<AABB> $levelBounds = array<AABB>();
@@ -100,7 +109,7 @@ internal function gltfBuild(GltfFile $file, GltfParts $object) : result<CookedMo
                 return .error($e);
             }
             int32 $slot = gltfSlot($file->materials, $prim->material, $slots);
-            gltfBake($data, $part->world);
+            gltfBake($data, inverse($origin) * $part->world);
             AABB $box = $levelBounds[$part->level as usize];
             if (!$levelSeen[$part->level as usize]) {
                 $box = $data->bounds;
@@ -164,6 +173,21 @@ internal function gltfBuild(GltfFile $file, GltfParts $object) : result<CookedMo
     }
 
     return .ok(CookedModel($slots, $lods, $bounds, 1.0f, 0.0f, $indexType, $vertices, $indices));
+}
+
+internal function gltfPartOrigin(GltfParts $object) : Mat4
+{
+    foreach ($object->parts as $part) {
+        if ($part->level == 0) {
+            return $part->world;
+        }
+    }
+
+    if ($object->parts->count() == 0) {
+        return Mat4();
+    }
+
+    return $object->parts[0]->world;
 }
 
 internal function gltfSlot(const array<string>& $materials, int32 $materialIndex, array<string>& $slots) : int32

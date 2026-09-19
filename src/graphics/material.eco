@@ -6,7 +6,7 @@
 namespace visu::graphics;
 
 use json;
-use visu::asset::{AssetError, AssetRef, Assets, Vmat, vmatBool, vmatF32, vmatMap, vmatRgb, vmatVec2};
+use visu::asset::{AssetError, AssetRef, Assets, Vmat, parentId, vmatBool, vmatF32, vmatMap, vmatRgb, vmatVec2};
 use visu::math::{Vec2, Vec3};
 
 public class Material
@@ -15,7 +15,7 @@ public class Material
     public const Vmat $sheet;
 
     /**
-     * The JSON this material reads: the sheet root, or one record overlaid on it (`view:`).
+     * The JSON this material reads: the cooked `.vmat` root.
      */
     public const json::Value $root;
 
@@ -62,33 +62,7 @@ public class Material
         $this->id = $sheet->id;
         $this->sheet = $sheet;
         $this->root = $sheet->root;
-        $this->folder = $sheet->id;
-        $this->textureScale = Vec2(1.0f);
-        $this->diffuseColor = Vec3(1.0f);
-        $this->roughnessFactor = 0.8f;
-        $this->metallicFactor = 0.0f;
-        $this->alphaCutoff = 0.0f;
-        $this->backfaceCull = true;
-        $this->albedo = null;
-        $this->normal = null;
-        $this->roughness = null;
-        $this->metal = null;
-        $this->height = null;
-        $this->ao = null;
-        $this->emissive = null;
-        $this->alpha = null;
-        $this->read();
-    }
-
-    /**
-     * One record of a folder sheet, overlaid on the folder root: a model's per-material entry.
-     */
-    public constructor(Vmat $sheet, view: string $record)
-    {
-        $this->id = "{$sheet->id}:{$record}";
-        $this->sheet = $sheet;
-        $this->root = $sheet->view($record);
-        $this->folder = $sheet->id;
+        $this->folder = parentId($sheet->id);
         $this->textureScale = Vec2(1.0f);
         $this->diffuseColor = Vec3(1.0f);
         $this->roughnessFactor = 0.8f;
@@ -150,7 +124,7 @@ public class Material
     }
 
     /**
-     * Load the folder sheet and bind catalog slots.
+     * Load a cooked `.vmat` and bind catalog slots.
      */
     public static function load(Assets $assets, string $id) : result<Material, AssetError>
     {

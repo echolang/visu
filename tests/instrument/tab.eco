@@ -127,27 +127,39 @@ test instruments_gauge_lands_on_app_tab
     assert($sample->gauges->count() == 1, 'gauge still on sample');
 }
 
+#[if: !VISU_RELEASE]
 test instruments_pass_extra_push_clears_next_sample
 {
     Instruments $inst = Instruments();
-    PassTiming $row = PassTiming();
-    $row->name = 'terrain';
-    $row->cpuNs = 1000.0;
-    array<PassTiming> $passes = array<PassTiming>();
-    $passes[] = $row;
-    $inst->noteGraph($passes);
+    visu::profile::Profiler $prof = visu::profile::Profiler();
+    $prof->beginFrame();
+    $prof->begin('render');
+    $prof->begin('terrain');
+    $prof->end();
+    $prof->end();
+    $prof->endFrame();
+    visu::profile::FrameProfile $frame = guard $prof->complete() else {
+        die('profile');
+    }
+    $inst->noteProfile($frame, $prof->stats);
     $inst->passExtra('terrain', 'cull', 50.0, .ns);
     $first = $inst->sample();
     Tab $g = guard findTab($first, 'graph') else {
         die('graph');
     }
-    assert($g->passes[0]->extras->count() == 1, 'extra');
+    assert($g->passes->count() == 2, 'render and terrain rows');
+    assert($g->passes[0]->name == 'render', 'render first');
+    assert($g->passes[0]->depth == 0, 'render at depth 0');
+    assert($g->passes[1]->name == 'terrain', 'terrain second');
+    assert($g->passes[1]->depth == 1, 'terrain nested');
+    assert($g->passes[1]->extras->count() == 1, 'extra');
     $second = $inst->sample();
     Tab $g2 = guard findTab($second, 'graph') else {
         die('graph2');
     }
-    assert($g2->passes[0]->extras->count() == 0, 'cleared');
+    assert($g2->passes[1]->extras->count() == 0, 'cleared');
 }
+#[end]
 
 test format_metric_ratio
 {

@@ -1,0 +1,313 @@
+/**
+ * GPU timestamps per frame slot: one shared MTLCounterSampleBuffer, four samples per render encoder
+ * (start / end of vertex, start / end of fragment) and two per blit (encoder start / end). A span
+ * is vertex duration plus fragment duration: on Apple GPUs the vertex work of one encoder overlaps
+ * the fragment work of the previous one, so the wall span from vertex start to fragment end would
+ * count the wait in between and sum far past the frame. Resolved when the slot's command buffer has
+ * completed, into the device's GpuTimeline.
+ *
+ * Every body is a no-op under VISU_RELEASE so device.eco stays unconditional. Encoders that draw
+ * nothing run no stage and leave those samples at 0; such stages count as zero.
+ */
+
+namespace visu::graphics;
+
+internal const uint32 GPU_SAMPLES = 512;
+internal const uint64 CLOCK_CALIBRATE_NS = 200000000;
+
+internal struct PendingSpan
+{
+    public int32 $scope;
+    public uint32 $start;
+    /** 4 for a render encoder, 2 for a blit */
+    public uint32 $count;
+}
+
+/**
+ * CPU / GPU clock pair from `sampleTimestamps`. Apple silicon reports both in nanoseconds on one
+ * timeline, so `$nsPerTick` stays 1.0 there; other GPUs need the measured ratio.
+ */
+internal class GpuClock
+{
+    public uint64 $cpu0;
+    public uint64 $gpu0;
+    public float64 $nsPerTick;
+
+    public constructor()
+    {
+        $this->cpu0 = 0;
+        $this->gpu0 = 0;
+        $this->nsPerTick = 1.0;
+    }
+}
+
+internal class GpuTimestamps
+{
+    public mtl::CounterSampleBuffer? $buffer;
+    public array<PendingSpan> $pending;
+    public array<uint64> $ticks;
+    public uint32 $cursor;
+    public int32 $dropped;
+    public uint64 $frame;
+
+    public constructor()
+    {
+        $this->buffer = null;
+        $this->pending = array<PendingSpan>();
+        $this->ticks = array<uint64>();
+        $this->cursor = 0;
+        $this->dropped = 0;
+        $this->frame = 0;
+    }
+
+    public function reset(uint64 $frame) : void
+    {
+        $this->pending->clear();
+        $this->cursor = 0;
+        $this->dropped = 0;
+        $this->frame = $frame;
+    }
+}
+
+internal function mtlTimestampsSupported(mtl::Device $gpu) : bool
+{
+    #[if: VISU_RELEASE]
+    return false;
+    #[else]
+    return $gpu->supportsCounterSampling(.atStageBoundary) && $gpu->hasTimestampCounters();
+    #[end]
+}
+
+internal function mtlTimestampsCreate(mtl::Device $gpu, GpuTimestamps $t) : void
+{
+    #[if: !VISU_RELEASE]
+    mtl::CounterSampleBuffer $buf = guard $gpu->newCounterSampleBuffer(GPU_SAMPLES as uint64, .shared, 'visu frame') else ($e) {
+        string $why = $e->message();
+        visu::app::info("gpu timestamps: {$why}");
+        return;
+    }
+    $t->buffer = $buf;
+    $t->ticks = zeroTicks(GPU_SAMPLES);
+    #[end]
+}
+
+/**
+ * Claim the next `$count` samples for `$scope`: the first sample index, or null when the frame's
+ * capacity ran out, which counts as one dropped encoder.
+ */
+internal function mtlTimestampsReserve(GpuTimestamps $t, int32 $scope, uint32 $count) : uint32?
+{
+    if ($t->cursor + $count > GPU_SAMPLES) {
+        $t->dropped = $t->dropped + 1;
+        return null;
+    }
+
+    uint32 $start = $t->cursor;
+    $t->pending[] = PendingSpan($scope, $start, $count);
+    $t->cursor = $start + $count;
+    return $start;
+}
+
+/**
+ * Point `$pass` at the next four samples and remember which scope they belong to.
+ */
+internal function mtlTimestampsAttach(GpuTimestamps $t, mtl::RenderPassDescriptor& $pass, int32 $scope) : void
+{
+    #[if: !VISU_RELEASE]
+    mtl::CounterSampleBuffer $buf = guard $t->buffer else {
+        return;
+    }
+    uint32 $s = guard mtlTimestampsReserve($t, $scope, 4) else {
+        return;
+    }
+    $pass->sample = mtl::RenderPassSample(
+        $buf,
+        $s as uint64,
+        ($s + 1) as uint64,
+        ($s + 2) as uint64,
+        ($s + 3) as uint64
+    );
+    #[end]
+}
+
+internal function mtlTimestampsAttachBlit(GpuTimestamps $t, mtl::BlitPassDescriptor& $pass, int32 $scope) : void
+{
+    #[if: !VISU_RELEASE]
+    mtl::CounterSampleBuffer $buf = guard $t->buffer else {
+        return;
+    }
+    uint32 $s = guard mtlTimestampsReserve($t, $scope, 2) else {
+        return;
+    }
+    $pass->sample = mtl::BlitPassSample($buf, $s as uint64, ($s + 1) as uint64);
+    #[end]
+}
+
+/**
+ * Wait out every slot that still has a previous command buffer, resolve its timestamps in
+ * frame order, then drop `$prev` so shutdown does not abandon in-flight GPU time.
+ */
+internal function mtlTimestampsHarvest(Device $device) : void
+{
+    #[if: !VISU_RELEASE]
+    if ($device->slots->count() == 0) {
+        return;
+    }
+
+    array<FrameSlot> $ready = array<FrameSlot>();
+    foreach ($device->slots as $slot) {
+        if ($slot->prev != null) {
+            $ready[] = $slot;
+        }
+    }
+
+    array<FrameSlot> $ordered = array<FrameSlot>();
+    foreach ($ready as $slot) {
+        array<FrameSlot> $next = array<FrameSlot>();
+        bool $placed = false;
+        foreach ($ordered as $have) {
+            if (!$placed && $slot->stamps->frame < $have->stamps->frame) {
+                $next[] = $slot;
+                $placed = true;
+            }
+
+            $next[] = $have;
+        }
+
+        if (!$placed) {
+            $next[] = $slot;
+        }
+
+        $ordered = $next;
+    }
+
+    foreach ($ordered as $slot) {
+        mtl::CommandBuffer $prev = guard $slot->prev else {
+            continue;
+        }
+        if ($prev->status() != mtl::CommandBufferStatus::completed) {
+            $prev->waitUntilCompleted();
+        }
+
+        mtl::Device $gpu = guard $device->gpu else {
+            $slot->prev = null;
+            continue;
+        }
+        mtlClockSample($gpu, $device->clock);
+        mtlTimestampsResolve($slot->stamps, $prev, $device->clock, $device->gpuTimeline);
+        $slot->prev = null;
+    }
+    #[else]
+    if ($device->slots->count() == 0) {
+        return;
+    }
+
+    foreach ($device->slots as $slot) {
+        mtl::CommandBuffer $prev = guard $slot->prev else {
+            continue;
+        }
+        $prev->waitUntilCompleted();
+        $slot->prev = null;
+    }
+    #[end]
+}
+
+internal function mtlTimestampsResolve(GpuTimestamps $t, mtl::CommandBuffer $prev, GpuClock $clock, GpuTimeline $out) : void
+{
+    #[if: !VISU_RELEASE]
+    if ($prev->status() != mtl::CommandBufferStatus::completed) {
+        $prev->waitUntilCompleted();
+    }
+
+    array<GpuSpan> $spans = array<GpuSpan>();
+    float64 $t0 = $prev->gpuStart();
+    float64 $t1 = $prev->gpuEnd();
+
+    if ($t1 > $t0 && $t0 > 0.0) {
+        $spans[] = GpuSpan(-1, ($t1 - $t0) * 1000000000.0);
+    }
+
+    appendEncoderSpans($t, $clock, $spans);
+    $out->publish($t->frame, $spans, $t->dropped);
+    #[end]
+}
+
+/**
+ * One span per pending encoder whose samples resolved; nothing without a sample buffer.
+ */
+internal function appendEncoderSpans(GpuTimestamps $t, GpuClock $clock, array<GpuSpan>& $spans) : void
+{
+    mtl::CounterSampleBuffer $buf = guard $t->buffer else {
+        return;
+    }
+
+    if ($t->cursor == 0) {
+        return;
+    }
+
+    uint64 $got = $buf->resolve(0, $t->cursor as uint64, &$t->ticks[0]);
+    uint64 $bad = mtl::counterErrorValue();
+    foreach ($t->pending as const &$p) {
+        if ((($p->start + $p->count - 1) as uint64) >= $got) {
+            continue;
+        }
+
+        uint64 $ticks = stageTicks($t->ticks, $p->start, $bad);
+
+        if ($p->count == 4) {
+            $ticks = $ticks + stageTicks($t->ticks, $p->start + 2, $bad);
+        }
+
+        if ($ticks == 0) {
+            continue;
+        }
+
+        $spans[] = GpuSpan($p->scope, ($ticks as float64) * $clock->nsPerTick);
+    }
+}
+
+/**
+ * Duration of one stage from its start / end samples; 0 when the stage never ran or a sample failed.
+ */
+internal function stageTicks(const array<uint64>& $ticks, uint32 $start, uint64 $bad) : uint64
+{
+    uint64 $a = $ticks[$start as usize];
+    uint64 $b = $ticks[($start + 1) as usize];
+
+    if ($a == 0 || $b == 0 || $a == $bad || $b == $bad || $b < $a) {
+        return 0;
+    }
+
+    return $b - $a;
+}
+
+/**
+ * Read both clocks; after CLOCK_CALIBRATE_NS of CPU time the ratio is fixed and re-based.
+ */
+internal function mtlClockSample(mtl::Device $gpu, GpuClock $clock) : void
+{
+    #[if: !VISU_RELEASE]
+    mtl::Timestamps $now = $gpu->sampleTimestamps();
+
+    if ($clock->cpu0 == 0) {
+        $clock->cpu0 = $now->cpuNs;
+        $clock->gpu0 = $now->gpuTicks;
+        return;
+    }
+
+    if ($now->cpuNs <= $clock->cpu0 || $now->gpuTicks <= $clock->gpu0) {
+        return;
+    }
+
+    uint64 $dc = $now->cpuNs - $clock->cpu0;
+
+    if ($dc < CLOCK_CALIBRATE_NS) {
+        return;
+    }
+
+    uint64 $dg = $now->gpuTicks - $clock->gpu0;
+    $clock->nsPerTick = ($dc as float64) / ($dg as float64);
+    $clock->cpu0 = $now->cpuNs;
+    $clock->gpu0 = $now->gpuTicks;
+    #[end]
+}

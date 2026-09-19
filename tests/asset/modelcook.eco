@@ -1,16 +1,16 @@
 /**
- * Kitchen with the model cooker: a model folder cooks to one item per object, the sheet's per-object
- * LOD record lands in the blob, and per-material records get their binds rewritten to catalog ids.
+ * Kitchen with the model cooker: a glTF plus `.vmod` cooks to one VMDL per part and an assembly.
  */
 
 use std::env;
 use std::io;
 use json;
 use visu::asset::{
-    Assets, CookedModel, KIND_MODEL, Kitchen, PackItem, Vmat, decodeCookedModel, vmatMap, vmatResolve
+    Assembly, AssemblyPart, Assets, CookedModel, KIND_ASSEMBLY, KIND_MODEL, Kitchen, PackItem, Vmat,
+    decodeAssembly, decodeCookedModel, parseAssembly
 };
 use visu::graphics::{Device, Material, Pixels};
-use visu::math::equal;
+use visu::math::{Vec3, equal};
 
 internal function cookTmp(string $tag) : string
 {
@@ -56,7 +56,7 @@ internal function cookFind(const array<PackItem>& $items, string $id) : PackItem
 
 test kitchen_cooks_gltf_objects_with_sheet_lods_and_binds
 {
-    string $src = cookTmp('src');
+    string $src = cookTmp('src-vmod');
     cookMkdir($src);
     string $ds = env::DS;
     string $folder = "{$src}{$ds}props";
@@ -67,16 +67,26 @@ test kitchen_cooks_gltf_objects_with_sheet_lods_and_binds
     gltfWriteFixture($inner);
     cookDot("{$inner}{$ds}wood.png");
     cookDot("{$inner}{$ds}wood_n.png");
-    string $sheet = '';
-    $sheet->append('{"wood_n": {"srgb": false},');
-    $sheet->append(' "model.wood": {"albedo": "wood", "normal": "wood_n", "roughnessFactor": 0.4},');
-    $sheet->append(' "model.metal": {"alpha": "wood", "backfaceCull": false},');
-    $sheet->append(' "crate": {"lod": [12.5], "lodBias": 2.0, "cullDistance": 300}}');
-    guard io::writefile("{$inner}{$ds}crate_01.vmat", $sheet) else ($e) {
+    guard io::writefile("{$inner}{$ds}paint.vmat", '{"albedo":"wood","normal":"wood_n","roughnessFactor":0.4}') else ($e) {
+        die($e->message());
+    }
+    guard io::writefile("{$inner}{$ds}metal.vmat", '{"alpha":"wood","backfaceCull":false}') else ($e) {
+        die($e->message());
+    }
+    guard io::writefile("{$inner}{$ds}wood_n.vtex", '{"srgb":false}') else ($e) {
+        die($e->message());
+    }
+    string $vmod = '';
+    $vmod->append('{"parts":{');
+    $vmod->append('"crate":{"lod":[12.5],"lodBias":2.0,"cullDistance":300,');
+    $vmod->append('"slots":{"model.wood":"props/crate_01/paint","model.metal":"props/crate_01/metal"}},');
+    $vmod->append('"pot":{"slots":{"model.metal":"props/crate_01/metal"}}},');
+    $vmod->append('"nodes":[{"name":"crate","part":"crate","position":[9,8,7]},{"name":"pot","part":"pot"}]}');
+    guard io::writefile("{$inner}{$ds}fixture.vmod", $vmod) else ($e) {
         die($e->message());
     }
 
-    string $out = cookTmp('out');
+    string $out = cookTmp('out-vmod');
     cookMkdir($out);
     Kitchen $k = Kitchen::defaults();
     array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
@@ -91,7 +101,10 @@ test kitchen_cooks_gltf_objects_with_sheet_lods_and_binds
     assert($crate->kind->equals(KIND_MODEL), 'crate kind');
     assert($pot->kind->equals(KIND_MODEL), 'pot kind');
     assert(cookFind($items, 'props/crate_01/wood') != null, 'texture cooked beside the model');
-    assert(cookFind($items, 'props/crate_01') != null, 'folder sheet cooked');
+    PackItem $assembly = guard cookFind($items, 'props/crate_01') else {
+        die('assembly missing');
+    }
+    assert($assembly->kind->equals(KIND_ASSEMBLY), 'assembly kind');
 
     Device $device = Device();
     Assets $assets = Assets($device);
@@ -99,48 +112,81 @@ test kitchen_cooks_gltf_objects_with_sheet_lods_and_binds
         die($e->message());
     }
     assert($model->lods->count() == 2, 'two levels');
-    assert(equal($model->lods[1]->distance, 12.5f), 'lod distance from the object record');
-    assert(equal($model->lodBias, 2.0f), 'lod bias from the record');
-    assert(equal($model->cullDistance, 300.0f), 'cull distance from the record');
+    assert(equal($model->lods[1]->distance, 12.5f), 'lod distance from the part');
+    assert(equal($model->lodBias, 2.0f), 'lod bias from the part');
+    assert(equal($model->cullDistance, 300.0f), 'cull distance from the part');
+    assert($model->slots[0]->equals('props/crate_01/paint'), 'wood slot is a material id');
+    assert(equal($model->bounds->min->x, 0.0f) && equal($model->bounds->max->x, 1.0f), 'part-local x');
     CookedModel $potModel = guard decodeCookedModel($assets, $pot->blob) else ($e) {
         die($e->message());
     }
-    assert(equal($potModel->lodBias, 1.0f) && equal($potModel->cullDistance, 0.0f), 'pot has no record, defaults');
-}
-
-/**
- * The record view a model's materials read, and how a record's bind names resolve to catalog ids.
- */
-test model_sheet_records_resolve_and_bind
-{
-    string $text = '';
-    $text->append('{"wood_n": {"srgb": false},');
-    $text->append(' "model.wood": {"albedo": "wood", "normal": "wood_n", "roughnessFactor": 0.4},');
-    $text->append(' "model.metal": {"alpha": "wood", "backfaceCull": false},');
-    $text->append(' "crate": {"lod": [12.5], "lodBias": 2.0, "cullDistance": 300}}');
-    json::Value $root = guard json::parse($text) else ($e) {
+    assert(equal($potModel->lodBias, 1.0f) && equal($potModel->cullDistance, 0.0f), 'pot has defaults');
+    Assembly $tree = guard decodeAssembly($assets, $assembly->blob) else ($e) {
         die($e->message());
     }
-    array<string> $stems = array<string>();
-    $stems[] = 'wood';
-    $stems[] = 'wood_n';
-    json::Value $resolved = $root->clone();
-    vmatResolve($resolved, 'props/crate_01', $stems);
-    Vmat $vmat = Vmat('props/crate_01', $resolved);
+    assert($tree->parts->count() == 2, 'two parts');
+    assert($tree->nodes->count() == 2, 'two nodes');
+    assert(equal($tree->nodes[0]->position, Vec3(9.0f, 8.0f, 7.0f)), 'vmod node TRS is canonical');
+}
 
-    json::Value $wood = $vmat->view('model.wood');
-    assert((vmatMap($wood, 'albedo') ?? '')->equals('wood'), 'record keeps the name its author wrote');
-    Material $woodMat = Material($vmat, view: 'model.wood');
-    assert($woodMat->mapId('wood')->equals('props/crate_01/wood'), 'a bare stem resolves against the folder');
+test kitchen_default_slots_keep_dotted_material_names
+{
+    string $src = cookTmp('src-dots');
+    cookMkdir($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}props";
+    cookMkdir($folder);
+    string $inner = "{$folder}{$ds}crate_01";
+    cookMkdir($inner);
+    gltfWriteFixture($inner);
+    cookDot("{$inner}{$ds}wood.png");
+
+    string $out = cookTmp('out-dots');
+    cookMkdir($out);
+    Kitchen $k = Kitchen::defaults();
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+    PackItem $crate = guard cookFind($items, 'props/crate_01/crate') else {
+        die('crate item missing');
+    }
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    CookedModel $model = guard decodeCookedModel($assets, $crate->blob) else ($e) {
+        die($e->message());
+    }
+    assert($model->slots->count() == 2, 'two slots');
+    assert($model->slots[0]->equals('props/crate_01/model.wood'), 'wood keeps the dots');
+    assert($model->slots[1]->equals('props/crate_01/model.metal'), 'metal keeps the dots');
+}
+
+test vmod_shorthand_is_one_part
+{
+    json::Value $root = guard json::parse('{"lod":[6,14],"cullDistance":60,"slots":{"skin":"props/ball/skin"}}') else ($e) {
+        die($e->message());
+    }
+    Assembly $doc = guard parseAssembly('props/ball', $root, 'ball') else ($e) {
+        die($e->message());
+    }
+    assert($doc->parts->count() == 1, 'one part');
+    assert($doc->parts[0]->name->equals('ball'), 'part name is the stem');
+    assert($doc->nodes->count() == 1 && $doc->nodes[0]->part->equals('ball'), 'one node');
+    assert(equal($doc->cullDistance, 0.0f), 'shorthand cull is on the part');
+    assert(equal($doc->parts[0]->cullDistance, 60.0f), 'part cull from shorthand');
+    assert($doc->parts[0]->slots['skin']->equals('props/ball/skin'), 'slot map');
+}
+
+test material_file_binds_against_its_folder
+{
+    json::Value $root = guard json::parse('{"albedo":"wood","normal":"wood_n","roughnessFactor":0.4}') else ($e) {
+        die($e->message());
+    }
+    Vmat $vmat = Vmat('props/crate_01/wood', $root);
+    Material $woodMat = Material($vmat);
+    assert($woodMat->mapId('wood')->equals('props/crate_01/wood'), 'bare stem is the folder plus the name');
     assert($woodMat->mapId('other/thing')->equals('other/thing'), 'a full id is left alone');
-    assert(equal($woodMat->roughnessFactor, 0.4f), 'record scalar');
-    assert(!$woodMat->cutout(), 'wood is opaque');
-    assert($woodMat->backfaceCull, 'wood culls');
-    assert($woodMat->id->equals('props/crate_01:model.wood'), 'record material id');
-    Material $metalMat = Material($vmat, view: 'model.metal');
-    assert($metalMat->cutout(), 'alpha map implies a cutoff');
-    assert(equal($metalMat->alphaCutoff, 0.5f), 'default cutoff');
-    assert(!$metalMat->backfaceCull, 'metal record is double sided');
+    assert(equal($woodMat->roughnessFactor, 0.4f), 'scalar');
+    assert($woodMat->id->equals('props/crate_01/wood'), 'material id is the catalog id');
 }
 
 test kitchen_refuses_two_sources_for_one_id
@@ -157,4 +203,106 @@ test kitchen_refuses_two_sources_for_one_id
     cookMkdir($out);
     Kitchen $k = Kitchen::defaults();
     assert($k->cook($src, $out)->failed(), 'duplicate id is refused');
+}
+
+test kitchen_shorthand_vmod_without_lod_still_remaps_slots
+{
+    string $src = cookTmp('src-short');
+    cookMkdir($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}props";
+    cookMkdir($folder);
+    string $inner = "{$folder}{$ds}spin_01";
+    cookMkdir($inner);
+    gltfWriteSpinFixture($inner);
+    guard io::writefile("{$inner}{$ds}spin.vmod", '{"slots":{"default":"props/spin_01/skin"}}') else ($e) {
+        die($e->message());
+    }
+    string $out = cookTmp('out-short');
+    cookMkdir($out);
+    Kitchen $k = Kitchen::defaults();
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+    PackItem $modelItem = guard cookFind($items, 'props/spin_01/spin') else {
+        die('spin model');
+    }
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    CookedModel $model = guard decodeCookedModel($assets, $modelItem->blob) else ($e) {
+        die($e->message());
+    }
+    assert($model->slots->count() == 1, 'one slot');
+    assert($model->slots[0]->equals('props/spin_01/skin'), 'shorthand slots reached remap');
+}
+
+test kitchen_cooks_clips_and_marks_dynamic
+{
+    string $src = cookTmp('src-spin');
+    cookMkdir($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}props";
+    cookMkdir($folder);
+    string $inner = "{$folder}{$ds}spin_01";
+    cookMkdir($inner);
+    gltfWriteSpinFixture($inner);
+    string $out = cookTmp('out-spin');
+    cookMkdir($out);
+    Kitchen $k = Kitchen::defaults();
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+    PackItem $assembly = guard cookFind($items, 'props/spin_01') else {
+        die('assembly missing');
+    }
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    Assembly $tree = guard decodeAssembly($assets, $assembly->blob) else ($e) {
+        die($e->message());
+    }
+    assert($tree->clips->count() == 1, 'cooked clip');
+    assert($tree->clips[0]->name->equals('turn'), 'clip name');
+    AssemblyPart? $spin = $tree->findPart('spin');
+    AssemblyPart $spinPart = guard $spin else {
+        die('spin part');
+    }
+    assert($spinPart->dynamic, 'animated child is dynamic');
+    AssemblyPart? $base = $tree->findPart('base');
+    AssemblyPart $basePart = guard $base else {
+        die('base part');
+    }
+    assert(!$basePart->dynamic, 'static parent stays static');
+}
+
+test kitchen_retargets_parent_action_to_mesh_node
+{
+    string $src = cookTmp('src-arm');
+    cookMkdir($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}props";
+    cookMkdir($folder);
+    string $inner = "{$folder}{$ds}arm_01";
+    cookMkdir($inner);
+    gltfWriteArmFixture($inner);
+    guard io::writefile("{$inner}{$ds}arm.vmod", '{"parts":{"arm_mesh":{}},"nodes":[{"name":"arm_mesh","part":"arm_mesh"}]}') else ($e) {
+        die($e->message());
+    }
+    string $out = cookTmp('out-arm');
+    cookMkdir($out);
+    Kitchen $k = Kitchen::defaults();
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+    PackItem $assembly = guard cookFind($items, 'props/arm_01') else {
+        die('assembly missing');
+    }
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    Assembly $tree = guard decodeAssembly($assets, $assembly->blob) else ($e) {
+        die($e->message());
+    }
+    assert($tree->clips->count() == 1, 'one clip');
+    assert($tree->clips[0]->tracks[0]->node->equals('arm_mesh'), 'retargeted to the mesh node');
+    assert($tree->nodes->count() == 1, 'vmod node');
+    assert(equal($tree->nodes[0]->position->y, 2.0f), 'glTF rest pose filled identity vmod TRS');
 }

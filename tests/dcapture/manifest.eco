@@ -3,7 +3,7 @@
  */
 
 use visu::app::Flags;
-use visu::dcapture::{DumpRecord, Manifest};
+use visu::dcapture::{DumpRecord, Manifest, ProfileRecord};
 
 test manifest_round_trips
 {
@@ -11,6 +11,7 @@ test manifest_round_trips
     $m->frames = 31;
     $m->ticks = 30;
     $m->dumps[] = DumpRecord('scene', 'var/dcapture/0030_top_scene.png', 30, 'top');
+    $m->profiles[] = ProfileRecord(30, 'var/dcapture/profile.f30.json', 'top');
     $m->events[] = 'frame 30: steps[0] at frame 30';
     $m->errors[] = 'nope: matches nothing';
     array<string> $catalog = ['scene', 'pbr.gbuffer.albedo'];
@@ -33,6 +34,10 @@ test manifest_round_trips
     assert(($first['name']->asStr() ?? '') == 'scene', 'dump name');
     assert(($first['frame']->asInt() ?? 0) == 30, 'dump frame');
     assert(($first['label']->asStr() ?? '') == 'top', 'dump label');
+    assert($back['profiles']->count() == 1, 'one profile');
+    json::Value $prof = $back['profiles'][0 as usize];
+    assert(($prof['frame']->asInt() ?? 0) == 30, 'profile frame');
+    assert(($prof['path']->asStr() ?? '')->contains('profile.f30.json'), 'profile path');
     assert($back['events']->count() == 1, 'events');
     assert($back['errors']->count() == 1, 'errors');
     assert($back['skipped']->count() == 0, 'skipped');

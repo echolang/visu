@@ -313,11 +313,21 @@ class EXPORT_SCENE_OT_visu_model(*( (bpy.types.Operator, ExportHelper) if bpy el
             return {"CANCELLED"}
         export.select_only(context, objects)
         try:
-            bpy.ops.export_scene.gltf(
-                filepath=str(path),
-                export_format="GLB",
-                use_selection=True,
-            )
+            kwargs = {
+                "filepath": str(path),
+                "export_format": "GLB",
+                "use_selection": True,
+                "export_animations": True,
+            }
+            try:
+                bpy.ops.export_scene.gltf(
+                    **kwargs,
+                    export_skins=True,
+                    export_nla_strips=True,
+                    export_force_sampling=True,
+                )
+            except TypeError:
+                bpy.ops.export_scene.gltf(**kwargs)
         except Exception as e:
             self.report({"ERROR"}, f"glTF export failed: {e}")
             return {"CANCELLED"}

@@ -1,0 +1,186 @@
+/**
+ * Rolling window: last / avg / max, the wrap, and reset.
+ */
+
+// the profiler measures nothing under VISU_RELEASE, so none of this holds there
+#[if: !VISU_RELEASE]
+use visu::graphics::{DrawCounters, GpuSpan, GpuTimeline};
+use visu::profile::{FrameProfile, Profiler, STATS_WINDOW, ScopeStats, StatsBook, Window};
+
+test window_tracks_last_avg_max
+{
+    Window $w = Window();
+    $w->push(10.0);
+    $w->push(30.0);
+    assert($w->last == 30.0, 'last');
+    assert($w->avg() == 20.0, 'avg');
+    assert($w->max() == 30.0, 'max');
+    assert($w->count() == 2, 'count');
+}
+
+test window_wraps_after_the_window
+{
+    Window $w = Window();
+    int32 $i = 0;
+
+    while ($i < STATS_WINDOW + 5) {
+        $w->push(1.0);
+        $i = $i + 1;
+    }
+
+    assert($w->count() == (STATS_WINDOW as usize), 'capped');
+    assert($w->avg() == 1.0, 'avg after wrap');
+    $w->push(100.0);
+    assert($w->max() == 100.0, 'max sees the new value');
+}
+
+test stats_book_notes_frames_by_path
+{
+    Profiler $prof = Profiler();
+    int32 $i = 0;
+
+    while ($i < 3) {
+        $prof->beginFrame();
+        $prof->begin('render');
+        $prof->end();
+        $prof->endFrame();
+        FrameProfile $f = guard $prof->complete() else {
+            die('frame');
+        }
+        $i = $i + 1;
+    }
+
+    ScopeStats $s = guard $prof->stats->find('render') else {
+        die('render stats');
+    }
+    assert($s->cpu->count() == 3, 'three frames noted');
+    assert($s->gpu->count() == 3, 'gpu window is per frame too');
+    assert($s->gpu->avg() == 0.0, 'zero gpu without spans');
+    assert(!$prof->stats->gpuKnown($s), 'never had an encoder');
+    assert($s->name == 'render' && $s->depth == 1 && $s->parentPath->empty(), 'shape recorded');
+    assert($s->lastSeen == 3, 'seen on the third frame');
+    assert($prof->stats->frames() == 3, 'frame counter');
+    assert($prof->stats->all()->count() == 1, 'one scope listed');
+    assert($prof->stats->find('') == null, 'root is not booked');
+    $prof->reset();
+    assert($prof->stats->find('render') == null, 'reset clears');
+}
+
+test stats_book_zero_fills_and_forgets
+{
+    Profiler $prof = Profiler();
+    $prof->beginFrame();
+    $prof->begin('once');
+    $prof->end();
+    $prof->endFrame();
+    guard $prof->complete() else {
+        die('first');
+    }
+    int32 $i = 0;
+
+    while ($i < STATS_WINDOW - 1) {
+        $prof->beginFrame();
+        $prof->begin('always');
+        $prof->end();
+        $prof->endFrame();
+        guard $prof->complete() else {
+            die('frame');
+        }
+        $i = $i + 1;
+    }
+
+    ScopeStats $once = guard $prof->stats->find('once') else {
+        die('once still inside the window');
+    }
+    assert($once->cpu->count() == (STATS_WINDOW as usize), 'zero-filled every absent frame');
+    assert($once->cpu->last == 0.0, 'last is zero');
+    assert($prof->stats->all()->count() == 2, 'both listed inside the window');
+
+    $prof->beginFrame();
+    $prof->begin('always');
+    $prof->end();
+    $prof->endFrame();
+    guard $prof->complete() else {
+        die('last');
+    }
+    assert($prof->stats->find('once') == null, 'dropped once the window passed');
+    assert($prof->stats->all()->count() == 1, 'only the live scope remains');
+}
+
+/**
+ * A pass that runs every frame but bakes on one of them: the GPU average is per frame, so a 2400 ns
+ * bake over 3 frames reads 800, and the scope stays known until the bake leaves the window.
+ */
+test stats_book_gpu_averages_over_frames_without_spans
+{
+    GpuTimeline $tl = GpuTimeline();
+    $tl->supported = true;
+    Profiler $prof = Profiler();
+    $prof->attach(DrawCounters(), $tl);
+    $prof->beginFrame();
+    $prof->bindFrame(1, 1);
+    $prof->begin('render');
+    $prof->captureSubmit();
+    $prof->begin('ibl');
+    $prof->end();
+    $prof->end();
+    $prof->endFrame();
+    // node ids: 0 frame, 1 render, 2 ibl
+    array<GpuSpan> $spans = array<GpuSpan>();
+    $spans[] = GpuSpan(-1, 3000.0);
+    $spans[] = GpuSpan(2, 2400.0);
+    $tl->publish(1, $spans, 0);
+    $prof->mergeGpu();
+    guard $prof->complete() else {
+        die('bake frame');
+    }
+    int32 $i = 0;
+
+    while ($i < 2) {
+        $prof->beginFrame();
+        $prof->bindFrame(($i + 2) as uint64, $i + 2);
+        $prof->begin('render');
+        $prof->captureSubmit();
+        $prof->begin('ibl');
+        $prof->end();
+        $prof->end();
+        $prof->endFrame();
+        array<GpuSpan> $quiet = array<GpuSpan>();
+        $quiet[] = GpuSpan(-1, 3000.0);
+        $tl->publish(($i + 2) as uint64, $quiet, 0);
+        $prof->mergeGpu();
+        guard $prof->complete() else {
+            die('quiet frame');
+        }
+        $i = $i + 1;
+    }
+
+    ScopeStats $ibl = guard $prof->stats->find('render/ibl') else {
+        die('ibl stats');
+    }
+    assert($ibl->gpu->count() == 3, 'one gpu sample per frame');
+    assert($ibl->gpu->avg() == 800.0, 'bake spread over the frames it did not run on');
+    assert($ibl->gpu->max() == 2400.0, 'max keeps the bake');
+    assert($ibl->gpu->last == 0.0, 'last frame had no encoder');
+    assert($prof->stats->gpuKnown($ibl), 'known while the bake is inside the window');
+
+    while ($i < STATS_WINDOW) {
+        $prof->beginFrame();
+        $prof->begin('render');
+        $prof->begin('ibl');
+        $prof->end();
+        $prof->end();
+        $prof->endFrame();
+        guard $prof->complete() else {
+            die('later frame');
+        }
+        $i = $i + 1;
+    }
+
+    ScopeStats $later = guard $prof->stats->find('render/ibl') else {
+        die('ibl still listed');
+    }
+    assert(!$prof->stats->gpuKnown($later), 'unknown once the bake left the window');
+    assert($later->gpu->avg() == 0.0, 'average forgets it too');
+}
+#[end]

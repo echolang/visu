@@ -96,12 +96,12 @@ public class CookedImage
     }
 }
 
-public function encodeTexture(const Pixels& $pixels, PixelFormat $fmt, bool $mips) : result<Blob, AssetError>
+public function encodeTexture(const Pixels& $pixels, PixelFormat $fmt, bool $mips, bool $maxFilter = false) : result<Blob, AssetError>
 {
     string $rgba = rgbaToBytes($pixels->rgba);
     int32 $levels = 1;
     if ($mips) {
-        $levels = appendMips($rgba, $pixels->width, $pixels->height);
+        $levels = appendMips($rgba, $pixels->width, $pixels->height, $maxFilter);
     }
 
     string $texels = $rgba;
@@ -282,7 +282,7 @@ internal function rgbaToBytes(const array<uint8>& $rgba) : string
     return $out;
 }
 
-internal function appendMips(string& $texels, int32 $width, int32 $height) : int32
+internal function appendMips(string& $texels, int32 $width, int32 $height, bool $maxFilter) : int32
 {
     int32 $levels = 1;
     int32 $w = $width;
@@ -299,7 +299,7 @@ internal function appendMips(string& $texels, int32 $width, int32 $height) : int
             $nh = 1;
         }
 
-        string $mip = boxMip($texels, $srcOff, $w, $h, $nw, $nh);
+        string $mip = boxMip($texels, $srcOff, $w, $h, $nw, $nh, $maxFilter);
         $srcOff = $texels->size();
         putMagic($texels, $mip);
         $w = $nw;
@@ -316,7 +316,8 @@ internal function boxMip(
     int32 $w,
     int32 $h,
     int32 $nw,
-    int32 $nh
+    int32 $nh,
+    bool $maxFilter
 ) : string
 {
     string $out = '';
@@ -343,10 +344,29 @@ internal function boxMip(
                     int32 $py = $sy + $oy;
                     if ($px < $w && $py < $h) {
                         usize $i = $srcOff + ((($py * $w) + $px) * 4) as usize;
-                        $r = $r + ($texels->byte($i) as uint32);
-                        $g = $g + ($texels->byte($i + 1) as uint32);
-                        $b = $b + ($texels->byte($i + 2) as uint32);
-                        $a = $a + ($texels->byte($i + 3) as uint32);
+                        uint32 $pr = $texels->byte($i) as uint32;
+                        uint32 $pg = $texels->byte($i + 1) as uint32;
+                        uint32 $pb = $texels->byte($i + 2) as uint32;
+                        uint32 $pa = $texels->byte($i + 3) as uint32;
+                        if ($maxFilter) {
+                            if ($pr > $r) {
+                                $r = $pr;
+                            }
+                            if ($pg > $g) {
+                                $g = $pg;
+                            }
+                            if ($pb > $b) {
+                                $b = $pb;
+                            }
+                            if ($pa > $a) {
+                                $a = $pa;
+                            }
+                        } else {
+                            $r = $r + $pr;
+                            $g = $g + $pg;
+                            $b = $b + $pb;
+                            $a = $a + $pa;
+                        }
                         $n = $n + 1;
                     }
 
@@ -356,14 +376,21 @@ internal function boxMip(
                 $oy = $oy + 1;
             }
 
-            if ($n < 1) {
-                $n = 1;
-            }
+            if ($maxFilter) {
+                $out->push($r as uint8);
+                $out->push($g as uint8);
+                $out->push($b as uint8);
+                $out->push($a as uint8);
+            } else {
+                if ($n < 1) {
+                    $n = 1;
+                }
 
-            $out->push(($r / ($n as uint32)) as uint8);
-            $out->push(($g / ($n as uint32)) as uint8);
-            $out->push(($b / ($n as uint32)) as uint8);
-            $out->push(($a / ($n as uint32)) as uint8);
+                $out->push(($r / ($n as uint32)) as uint8);
+                $out->push(($g / ($n as uint32)) as uint8);
+                $out->push(($b / ($n as uint32)) as uint8);
+                $out->push(($a / ($n as uint32)) as uint8);
+            }
             $x = $x + 1;
         }
 

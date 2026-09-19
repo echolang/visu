@@ -25,13 +25,14 @@ public class Kitchen
     }
 
     /**
-     * Texture png, sound wav/flac/mp3, model glb/gltf. Games add more with `add`.
+     * Texture png, sound wav/flac/mp3, material vmat, model glb/gltf. Games add more with `add`.
      */
     public static function defaults() : Kitchen
     {
         Kitchen $k = Kitchen();
         $k->add(TextureCooker());
         $k->add(SoundCooker());
+        $k->add(MaterialCooker());
         $k->add(ModelCooker());
         return $k;
     }
@@ -83,7 +84,9 @@ public class Kitchen
         }
         array<string> $subs = array<string>();
         array<string> $files = array<string>();
-        array<string> $vmats = array<string>();
+        map<string, bool> $pngStems = map<string, bool>();
+        array<string> $folderVtex = array<string>();
+        map<string, string> $sidecarVtex = map<string, string>();
 
         foreach ($d as $entry) {
             if ($entry->is_directory()) {
@@ -96,52 +99,64 @@ public class Kitchen
                 continue;
             }
 
-            if (str::lower($name)->ends('.vmat')) {
-                $vmats[] = $entry->path();
-                continue;
+            string $lower = str::lower($name);
+            string $stem = stripExt($name);
+            if ($lower->ends('.png')) {
+                $pngStems[$stem] = true;
             }
 
             $files[] = $entry->path();
         }
 
-        if ($vmats->count() > 1) {
-            return .error(.corrupt($dir, 'two .vmat files in one folder'));
+        foreach ($files as $path) {
+            string $name = dirBase($path);
+            string $lower = str::lower($name);
+            string $stem = stripExt($name);
+            if ($lower->ends('.vtex')) {
+                if ($pngStems->has($stem)) {
+                    $sidecarVtex[$stem] = $path;
+                } else {
+                    $folderVtex[] = $path;
+                }
+            }
+        }
+
+        if ($folderVtex->count() > 1) {
+            return .error(.corrupt($dir, 'two folder .vtex files in one folder'));
         }
 
         json::Value $sheet = $parent;
-        if ($vmats->count() == 1) {
-            json::Value $parsed = guard loadVmatFile($vmats[0]) else ($e) {
+        if ($folderVtex->count() == 1) {
+            json::Value $parsed = guard loadVmatFile($folderVtex[0]) else ($e) {
                 return .error($e);
             }
             $sheet = vmatMerge($parent, $parsed);
         }
 
-        array<string> $stems = array<string>();
         foreach ($files as $path) {
-            if ($this->matchCooker($path) != null) {
-                $stems[] = stripExt(dirBase($path));
+            string $name = dirBase($path);
+            string $lower = str::lower($name);
+            if ($lower->ends('.vtex') || $lower->ends('.vmod')) {
+                continue;
             }
-        }
 
-        if ($vmats->count() == 1 && !$prefix->empty()) {
-            json::Value $resolved = $sheet->clone();
-            vmatResolve($resolved, $prefix, $stems);
-            guard $this->claim($prefix, $dir) else ($e) {
-                return .error($e);
-            }
-            $items[] = PackItem($prefix, KIND_VMAT, Blob(json::pretty($resolved)));
-        }
-
-        foreach ($files as $path) {
             Cooker? $cooker = $this->matchCooker($path);
             Cooker $c = guard $cooker else {
                 continue;
             }
-            string $name = dirBase($path);
+            string $stem = stripExt($name);
             Source $src = Source();
             $src->path = $path;
             $src->id = sourceId($prefix, $name);
-            $src->meta = vmatView($sheet, stripExt($name));
+            json::Value $meta = vmatView($sheet, $stem);
+            if ($sidecarVtex->has($stem)) {
+                json::Value $side = guard loadVmatFile($sidecarVtex[$stem]) else ($e) {
+                    return .error($e);
+                }
+                $meta = vmatMerge($meta, $side);
+            }
+
+            $src->meta = $meta;
             array<PackItem> $cooked = guard $c->cook($src) else ($e) {
                 return .error($e);
             }
@@ -233,7 +248,7 @@ internal function stripExt(const string& $name) : string
 /**
  * `foliage/bush_01/bush` → `foliage/bush_01`; a bare stem gives an empty folder.
  */
-internal function parentId(const string& $id) : string
+public function parentId(const string& $id) : string
 {
     usize $n = $id->size();
     usize $i = $n;

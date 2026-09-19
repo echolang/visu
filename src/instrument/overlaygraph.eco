@@ -1,0 +1,444 @@
+/**
+ * Graph-tab body: one item per pass (name, extras, optional bars) plus note/section lines.
+ * Overlaydraw paints HUD chrome and scrolls this list.
+ */
+
+namespace visu::instrument;
+
+use visu::geo::AABB2D;
+use visu::math::Vec2;
+use visu::vg::{Canvas, Color};
+
+internal const float32 BAR_H = 4.0f;
+internal const float32 BAR_GAP = 2.0f;
+internal const float32 BAR_W = 220.0f;
+
+internal enum TabBodyItem
+{
+    case line(string $text);
+    /** name, extras, and optional bars as one scroll row */
+    case row(PassTiming $p, string $text, bool $bars);
+}
+
+/**
+ * Lines and pass rows of one tab: notes, sections, then passes down to `$maxDepth`.
+ * A row at the cutoff with hidden children says how many it hides.
+ */
+internal function tabBodyItems(
+    const Tab& $body,
+    const array<PassTiming>& $passes,
+    float64 $maxNs,
+    int32 $maxDepth
+) : array<TabBodyItem>
+{
+    array<TabBodyItem> $items = array<TabBodyItem>();
+    array<string> $notes = $body->notes;
+    foreach ($notes as $note) {
+        TabBodyItem $noteLine = .line($note);
+        $items[] = $noteLine;
+    }
+
+    array<Section> $sections = $body->sections;
+    foreach ($sections as $sec) {
+        if (!$sec->id->empty()) {
+            TabBodyItem $heading = .line($sec->id);
+            $items[] = $heading;
+        }
+
+        array<Metric> $metrics = $sec->metrics;
+        foreach ($metrics as $m) {
+            string $line = formatMetric($m);
+            if (!$sec->id->empty()) {
+                $line = "  {$line}";
+            }
+
+            TabBodyItem $row = .line($line);
+            $items[] = $row;
+        }
+    }
+
+    foreach ($passes as $p) {
+        if ($p->depth > $maxDepth) {
+            continue;
+        }
+
+        string $text = formatPass($p, false);
+
+        if ($p->depth == $maxDepth && $p->childCount > 0) {
+            $text = "{$text}  +{$p->childCount}";
+        }
+
+        bool $bars = $maxNs > 0.0;
+        TabBodyItem $passLine = .row($p, $text, $bars);
+        $items[] = $passLine;
+    }
+
+    return $items;
+}
+
+internal function measureTabBody(
+    Canvas $vg,
+    AABB2D $box,
+    bool $any,
+    float32 $x,
+    float32 $y,
+    float32 $lh,
+    const array<TabBodyItem>& $items
+) : AABB2D
+{
+    float32 $cy = $y;
+    foreach ($items as $item) {
+        $box = extendTabBodyItem($vg, $box, $any, $x, $cy, $item);
+        $any = true;
+        $cy = $cy + tabBodyItemHeight($item, $lh);
+    }
+
+    return $box;
+}
+
+internal function paintTabBody(
+    Canvas $vg,
+    float32 $x,
+    float32 $y,
+    float32 $lh,
+    const array<TabBodyItem>& $items,
+    float64 $maxNs
+) : void
+{
+    float32 $cw = treeCell($vg, $x, $y);
+    float32 $cy = $y;
+    foreach ($items as $item) {
+        paintTabBodyItem($vg, $x, $cy, $lh, $item, $maxNs, $cw);
+        $cy = $cy + tabBodyItemHeight($item, $lh);
+    }
+
+    paintTreeGuides($vg, $x, $y, $lh, $cw, $items);
+}
+
+/**
+ * Width of one tree level in the debug font: TREE_CELL characters of the monospace face.
+ */
+internal function treeCell(Canvas $vg, float32 $x, float32 $y) : float32
+{
+    return $vg->textAdvance(Vec2($x, $y), ' ') * (TREE_CELL as float32);
+}
+
+internal function tabBodyItemHeight(const TabBodyItem& $item, float32 $lh) : float32
+{
+    return match ($item) {
+        TabBodyItem::line($text) => $lh,
+        TabBodyItem::row($p, $text, $bars) => passItemHeight($p, $bars, $lh),
+    };
+}
+
+internal function passItemHeight(PassTiming $p, bool $bars, float32 $lh) : float32
+{
+    float32 $h = $lh;
+    $h = $h + ($p->extras->count() as float32) * $lh;
+    if ($bars) {
+        $h = $h + passBarStack($p) + SPARK_GAP;
+    }
+
+    return $h;
+}
+
+/**
+ * Where one pass row sits: `$bottom` is pushed down past the extras and bars that follow it, so a
+ * child's connector starts under its parent's bars rather than through them.
+ */
+internal struct GuideRow
+{
+    public int32 $depth = 0;
+    public float32 $mid = 0.0f;
+    public float32 $bottom = 0.0f;
+}
+
+internal function guideRows(const array<TabBodyItem>& $items, float32 $y, float32 $lh) : array<GuideRow>
+{
+    array<GuideRow> $rows = array<GuideRow>();
+    float32 $cy = $y;
+    foreach ($items as $item) {
+        float32 $h = tabBodyItemHeight($item, $lh);
+        int32 $depth = rowDepth($item);
+
+        if ($depth >= 0) {
+            $rows[] = GuideRow($depth, $cy + $lh * 0.5f, $cy + $h);
+        } else if (!$rows->empty()) {
+            usize $lastRow = $rows->count() - 1;
+            GuideRow $r = $rows[$lastRow];
+            $r->bottom = $cy + $h;
+            $rows[$lastRow] = $r;
+        }
+
+        $cy = $cy + $h;
+    }
+
+    return $rows;
+}
+
+internal function rowDepth(const TabBodyItem& $item) : int32
+{
+    return match ($item) {
+        TabBodyItem::row($p, $text, $bars) => $p->depth,
+        else => -1,
+    };
+}
+
+/**
+ * The tree lines: every row below depth 0 gets an elbow from its parent's column to its name, the
+ * vertical part running from the previous sibling's elbow (or the parent's bottom) down to it. A
+ * scrolled-away parent starts the line at the body top.
+ */
+internal function paintTreeGuides(
+    Canvas $vg,
+    float32 $x,
+    float32 $y,
+    float32 $lh,
+    float32 $cw,
+    const array<TabBodyItem>& $items
+) : void
+{
+    array<GuideRow> $rows = guideRows($items, $y, $lh);
+
+    if ($rows->empty()) {
+        return;
+    }
+
+    float32 $char = $cw / (TREE_CELL as float32);
+    $vg->strokeColor(Color(0.55f, 0.58f, 0.66f, 0.9f));
+    $vg->strokeWidth(1.0f);
+    usize $i = 0;
+    usize $n = $rows->count();
+
+    while ($i < $n) {
+        GuideRow $r = $rows[$i];
+
+        if ($r->depth > 0) {
+            float32 $colX = $x + $cw * (($r->depth - 1) as float32) + $char * 0.5f;
+            float32 $textX = $x + $cw * ($r->depth as float32) - $char * 0.4f;
+            $vg->beginPath();
+            $vg->moveTo(Vec2($colX, guideStart($rows, $i, $y)));
+            $vg->lineTo(Vec2($colX, $r->mid));
+            $vg->lineTo(Vec2($textX, $r->mid));
+            $vg->stroke();
+        }
+
+        $i = $i + 1;
+    }
+}
+
+/**
+ * Top of row `$i`'s connector: the previous sibling's elbow, else the parent's bottom, else the
+ * body top when the parent is scrolled out of view.
+ */
+internal function guideStart(const array<GuideRow>& $rows, usize $i, float32 $top) : float32
+{
+    int32 $depth = $rows[$i]->depth;
+    usize $j = $i;
+
+    while ($j > 0) {
+        $j = $j - 1;
+        GuideRow $r = $rows[$j];
+
+        if ($r->depth == $depth) {
+            return $r->mid;
+        }
+
+        if ($r->depth < $depth) {
+            return $r->bottom;
+        }
+    }
+
+    return $top;
+}
+
+internal function extendTabBodyItem(
+    Canvas $vg,
+    AABB2D $box,
+    bool $any,
+    float32 $x,
+    float32 $y,
+    const TabBodyItem& $item
+) : AABB2D
+{
+    return match ($item) {
+        TabBodyItem::line($text) => hudExtend($box, lineBox($vg, $x, $y, $text), $any),
+        TabBodyItem::row($p, $text, $bars) => extendPassItem($vg, $box, $any, $x, $y, $p, $text, $bars),
+    };
+}
+
+internal function extendPassItem(
+    Canvas $vg,
+    AABB2D $box,
+    bool $any,
+    float32 $x,
+    float32 $y,
+    PassTiming $p,
+    string $text,
+    bool $bars
+) : AABB2D
+{
+    $box = hudExtend($box, lineBox($vg, $x, $y, $text), $any);
+    float32 $cy = $y + HUD_LH;
+    array<Metric> $extras = $p->extras;
+    foreach ($extras as $m) {
+        string $extra = formatMetric($m);
+        $box = hudExtend($box, lineBox($vg, $x, $cy, "    {$extra}"), true);
+        $cy = $cy + HUD_LH;
+    }
+
+    if ($bars) {
+        $box = hudExtend($box, AABB2D(Vec2($x, $cy), Vec2($x + BAR_W, $cy + passBarStack($p))), true);
+    }
+
+    return $box;
+}
+
+internal function paintTabBodyItem(
+    Canvas $vg,
+    float32 $x,
+    float32 $y,
+    float32 $lh,
+    const TabBodyItem& $item,
+    float64 $maxNs,
+    float32 $cw
+) : void
+{
+    match ($item) {
+        TabBodyItem::line($text) => {
+            paintBodyLine($vg, $x, $y, $text);
+        },
+        TabBodyItem::row($p, $text, $bars) => {
+            paintPassItem($vg, $x, $y, $lh, $p, $text, $bars, $maxNs, $cw);
+        },
+    }
+}
+
+internal function paintPassItem(
+    Canvas $vg,
+    float32 $x,
+    float32 $y,
+    float32 $lh,
+    PassTiming $p,
+    string $text,
+    bool $bars,
+    float64 $maxNs,
+    float32 $cw
+) : void
+{
+    paintBodyLine($vg, $x, $y, $text);
+    float32 $cy = $y + $lh;
+    array<Metric> $extras = $p->extras;
+    foreach ($extras as $m) {
+        string $extra = formatMetric($m);
+        paintBodyLine($vg, $x, $cy, "    {$extra}");
+        $cy = $cy + $lh;
+    }
+
+    if ($bars) {
+        paintBodyBars($vg, $x, $cy, $p, $maxNs, $cw);
+    }
+}
+
+internal function paintBodyLine(Canvas $vg, float32 $x, float32 $y, string $text) : void
+{
+    $vg->fillColor(Color::white());
+    $vg->text(Vec2($x, $y), $text);
+}
+
+// a match binding is a value, and paintPassBars wants a borrow
+internal function paintBodyBars(
+    Canvas $vg,
+    float32 $x,
+    float32 $y,
+    PassTiming $p,
+    float64 $maxNs,
+    float32 $cw
+) : void
+{
+    paintPassBars($vg, $x, $y, $p, $maxNs, $cw);
+}
+
+/**
+ * Bars start under the row's name, `$cw` (one tree level) per depth, so they never sit under a
+ * parent's guide line.
+ */
+internal function paintPassBars(
+    Canvas $vg,
+    float32 $x,
+    float32 $y,
+    const PassTiming& $p,
+    float64 $maxNs,
+    float32 $cw
+) : void
+{
+    float32 $cy = $y;
+    float32 $indent = ($p->depth as float32) * $cw;
+    float32 $width = BAR_W - $indent;
+    float32 $cpuW = barWidth(shownCpu($p), $maxNs, $width);
+    $vg->fillColor(Color(0.35f, 0.85f, 0.45f, 0.85f));
+    if ($cpuW > 1.0f) {
+        $vg->fillRect(Vec2($x + $indent, $cy), Vec2($cpuW, BAR_H));
+    }
+
+    $cy = $cy + BAR_H;
+    if ($p->gpuKnown) {
+        $cy = $cy + BAR_GAP;
+        float32 $gpuW = barWidth(shownGpu($p), $maxNs, $width);
+        $vg->fillColor(Color(0.40f, 0.65f, 0.95f, 0.85f));
+        if ($gpuW > 1.0f) {
+            $vg->fillRect(Vec2($x + $indent, $cy), Vec2($gpuW, BAR_H));
+        }
+    }
+}
+
+/**
+ * Width of one bar, never past the row's room: a child can outrun its parent (stage overlap on a
+ * tile GPU, a bake averaged differently), and the panel edge is where it stops.
+ */
+internal function barWidth(float64 $ns, float64 $maxNs, float32 $width) : float32
+{
+    if ($maxNs <= 0.0 || $ns <= 0.0) {
+        return 0.0f;
+    }
+
+    float32 $w = (($ns / $maxNs) as float32) * $width;
+
+    if ($w > $width) {
+        return $width;
+    }
+
+    return $w;
+}
+
+/**
+ * Bars normalise to the slowest shown value on any row, so the widest bar is always the full
+ * width and no bar leaves the panel.
+ */
+internal function passBarMax(const array<PassTiming>& $passes) : float64
+{
+    float64 $maxNs = 0.0;
+    foreach ($passes as $p) {
+        float64 $cpu = shownCpu($p);
+        float64 $gpu = shownGpu($p);
+
+        if ($cpu > $maxNs) {
+            $maxNs = $cpu;
+        }
+
+        if ($gpu > $maxNs) {
+            $maxNs = $gpu;
+        }
+    }
+
+    return $maxNs;
+}
+
+internal function passBarStack(const PassTiming& $p) : float32
+{
+    if ($p->gpuKnown) {
+        return BAR_H + BAR_GAP + BAR_H;
+    }
+
+    return BAR_H;
+}

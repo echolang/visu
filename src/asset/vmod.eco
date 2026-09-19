@@ -1,0 +1,345 @@
+/**
+ * `.vmod` assembly sidecar: parts, instances, per-part LOD/cull, slot → material ids.
+ * Shorthand (lod / slots at the root, no `parts`) is one part named like the glb stem.
+ * The cooked blob is pretty JSON (`KIND_ASSEMBLY`); distances also bake into each part's VMDL.
+ */
+
+namespace visu::asset;
+
+use json;
+use visu::math::{Quat, Vec3};
+
+public const string KIND_ASSEMBLY = 'assembly';
+
+/**
+ * One unique cooked mesh in an assembly.
+ */
+public class AssemblyPart
+{
+    public string $name = '';
+    public string $model = '';
+    public bool $dynamic = false;
+    public bool $impostor = false;
+    public float32 $lodBias = 1.0f;
+    public float32 $cullDistance = 0.0f;
+    public array<float32> $lod;
+    public map<string, string> $slots;
+
+    public constructor()
+    {
+        $this->lod = array<float32>();
+        $this->slots = map<string, string>();
+    }
+}
+
+/**
+ * One spawned instance of a part, local TRS relative to `$parent` (empty is the asset root).
+ */
+public class AssemblyNode
+{
+    public string $name = '';
+    public string $part = '';
+    public string $parent = '';
+    public Vec3 $position;
+    public Quat $orientation;
+    public Vec3 $scale;
+
+    public constructor()
+    {
+        $this->position = Vec3(0.0f);
+        $this->orientation = Quat();
+        $this->scale = Vec3(1.0f);
+    }
+}
+
+/**
+ * Cooked assembly: spawn tree plus the catalog id of each part's model.
+ */
+public class Assembly
+{
+    public const string $id;
+    public float32 $cullDistance;
+    public string $impostorPart;
+    public float32 $impostorDistance;
+    public array<AssemblyPart> $parts;
+    public array<AssemblyNode> $nodes;
+    public array<Clip> $clips;
+
+    public constructor(
+        string $id,
+        float32 $cullDistance,
+        string $impostorPart,
+        float32 $impostorDistance,
+        array<AssemblyPart> $parts,
+        array<AssemblyNode> $nodes,
+        array<Clip> $clips = array<Clip>()
+    )
+    {
+        $this->id = $id;
+        $this->cullDistance = $cullDistance;
+        $this->impostorPart = $impostorPart;
+        $this->impostorDistance = $impostorDistance;
+        $this->parts = $parts;
+        $this->nodes = $nodes;
+        $this->clips = $clips;
+    }
+
+    public const function findPart(const string& $name) : AssemblyPart?
+    {
+        foreach ($this->parts as $part) {
+            if ($part->name->equals($name)) {
+                return $part;
+            }
+        }
+
+        return null;
+    }
+
+    public const function findClip(const string& $name) : Clip?
+    {
+        return clipNamed($this->clips, $name);
+    }
+}
+
+public function decodeAssembly(Assets $assets, Blob $blob) : result<Assembly, AssetError>
+{
+    json::Value $root = guard json::parse($blob->bytes) else ($e) {
+        return .error(.decode($assets->loading, $e->message()));
+    }
+    if (!$root->isObject()) {
+        return .error(.decode($assets->loading, 'assembly is not a JSON object'));
+    }
+
+    return parseAssembly($assets->loading, $root, '');
+}
+
+/**
+ * Parse a source `.vmod` or a cooked assembly blob. `$stem` is the shorthand part name
+ * (glb stem) when the file has no `parts` object.
+ */
+public function parseAssembly(const string& $id, json::Value $root, const string& $stem) : result<Assembly, AssetError>
+{
+    if (!$root->isObject()) {
+        return .error(.decode($id, 'vmod is not a JSON object'));
+    }
+
+    float32 $cull = 0.0f;
+    string $impostorPart = '';
+    float32 $impostorDistance = 0.0f;
+    json::Value? $imp = $root->get('impostor');
+    if ($imp != null) {
+        json::Value $impostor = guard $imp;
+        if ($impostor->isObject()) {
+            $impostorPart = vmatStr($impostor, 'part', '');
+            $impostorDistance = vmatF32($impostor, 'distance', 0.0f);
+        }
+    }
+
+    array<AssemblyPart> $parts = array<AssemblyPart>();
+    array<AssemblyNode> $nodes = array<AssemblyNode>();
+    json::Value? $partsVal = $root->get('parts');
+    if ($partsVal != null) {
+        $cull = vmatF32($root, 'cullDistance', 0.0f);
+        json::Value $partsObj = guard $partsVal;
+        ordered_map<string, json::Value>? $fields = $partsObj->asObject();
+        ordered_map<string, json::Value> $map = guard $fields else {
+            return .error(.decode($id, 'parts must be an object'));
+        }
+        array<string> $keys = $map->keys();
+        foreach ($keys as $name) {
+            json::Value $rec = guard $partsObj->get($name) else {
+                continue;
+            }
+            AssemblyPart $part = guard parsePart($id, $name, $rec) else ($e) {
+                return .error($e);
+            }
+            $parts[] = $part;
+        }
+
+        json::Value? $nodesVal = $root->get('nodes');
+        if ($nodesVal != null) {
+            json::Value $nodesArr = guard $nodesVal;
+            array<json::Value>? $list = $nodesArr->asArray();
+            array<json::Value> $items = guard $list else {
+                return .error(.decode($id, 'nodes must be an array'));
+            }
+            foreach ($items as $item) {
+                AssemblyNode $node = guard parseNode($id, $item) else ($e) {
+                    return .error($e);
+                }
+                $nodes[] = $node;
+            }
+        }
+    } else {
+        if ($stem->empty()) {
+            return .error(.decode($id, 'vmod shorthand needs a part name'));
+        }
+
+        AssemblyPart $part = guard parsePart($id, $stem, $root) else ($e) {
+            return .error($e);
+        }
+        $part->name = $stem;
+        $parts[] = $part;
+        AssemblyNode $node = AssemblyNode();
+        $node->name = $stem;
+        $node->part = $stem;
+        $nodes[] = $node;
+    }
+
+    array<Clip> $clips = guard parseClips($id, $root) else ($e) {
+        return .error($e);
+    }
+
+    return .ok(Assembly($id, $cull, $impostorPart, $impostorDistance, $parts, $nodes, $clips));
+}
+
+public function encodeAssembly(const Assembly& $assembly) : Blob
+{
+    json::Value $root = json::object();
+    $root['cullDistance'] = json::float($assembly->cullDistance as float64);
+    if (!$assembly->impostorPart->empty()) {
+        json::Value $imp = json::object();
+        $imp['part'] = json::str($assembly->impostorPart);
+        $imp['distance'] = json::float($assembly->impostorDistance as float64);
+        $root['impostor'] = $imp;
+    }
+
+    json::Value $parts = json::object();
+    foreach ($assembly->parts as $part) {
+        json::Value $rec = json::object();
+        $rec['model'] = json::str($part->model);
+        $rec['dynamic'] = json::bool($part->dynamic);
+        if ($part->impostor) {
+            $rec['impostor'] = json::bool(true);
+        }
+
+        $parts[$part->name] = $rec;
+    }
+
+    $root['parts'] = $parts;
+    json::Value $nodes = json::arr();
+    foreach ($assembly->nodes as $node) {
+        json::Value $rec = json::object();
+        $rec['name'] = json::str($node->name);
+        $rec['part'] = json::str($node->part);
+        if (!$node->parent->empty()) {
+            $rec['parent'] = json::str($node->parent);
+        }
+
+        $rec['position'] = vec3Json($node->position);
+        $rec['orientation'] = quatJson($node->orientation);
+        $rec['scale'] = vec3Json($node->scale);
+        $nodes[] = $rec;
+    }
+
+    $root['nodes'] = $nodes;
+    if ($assembly->clips->count() > 0) {
+        $root['clips'] = clipsJson($assembly->clips);
+    }
+
+    return Blob(json::pretty($root));
+}
+
+internal function parsePart(const string& $id, const string& $name, json::Value $rec) : result<AssemblyPart, AssetError>
+{
+    AssemblyPart $part = AssemblyPart();
+    $part->name = $name;
+    $part->model = vmatStr($rec, 'model', '');
+    $part->dynamic = vmatBool($rec, 'dynamic', false)->or(false);
+    $part->impostor = vmatBool($rec, 'impostor', false)->or(false);
+    $part->lodBias = vmatF32($rec, 'lodBias', 1.0f);
+    $part->cullDistance = vmatF32($rec, 'cullDistance', 0.0f);
+    json::Value? $lod = $rec->get('lod');
+    if ($lod != null) {
+        json::Value $arrVal = guard $lod;
+        array<json::Value>? $arr = $arrVal->asArray();
+        array<json::Value> $vals = guard $arr else {
+            return .error(.decode($id, 'lod must be an array of numbers'));
+        }
+        foreach ($vals as $item) {
+            float64? $f = $item->asFloat();
+            float64 $n = guard $f else {
+                return .error(.decode($id, 'lod must be an array of numbers'));
+            }
+            $part->lod[] = $n as float32;
+        }
+    }
+
+    json::Value? $slots = $rec->get('slots');
+    if ($slots != null) {
+        json::Value $obj = guard $slots;
+        ordered_map<string, json::Value>? $fields = $obj->asObject();
+        ordered_map<string, json::Value> $map = guard $fields else {
+            return .error(.decode($id, 'slots must be an object'));
+        }
+        array<string> $keys = $map->keys();
+        foreach ($keys as $key) {
+            json::Value $v = guard $obj->get($key) else {
+                continue;
+            }
+            string? $s = $v->asStr();
+            string $idVal = guard $s else {
+                return .error(.decode($id, "slot '{$key}' must be a string"));
+            }
+            $part->slots[$key] = $idVal;
+        }
+    }
+
+    return .ok($part);
+}
+
+internal function parseNode(const string& $id, json::Value $rec) : result<AssemblyNode, AssetError>
+{
+    if (!$rec->isObject()) {
+        return .error(.decode($id, 'node must be an object'));
+    }
+
+    AssemblyNode $node = AssemblyNode();
+    $node->name = vmatStr($rec, 'name', '');
+    $node->part = vmatStr($rec, 'part', $node->name);
+    $node->parent = vmatStr($rec, 'parent', '');
+    if ($node->name->empty()) {
+        return .error(.decode($id, 'node needs a name'));
+    }
+
+    $node->position = vmatRgb($rec, 'position', Vec3(0.0f));
+    $node->scale = vmatRgb($rec, 'scale', Vec3(1.0f));
+    json::Value? $ori = $rec->get('orientation');
+    if ($ori != null) {
+        json::Value $q = guard $ori;
+        array<json::Value>? $arr = $q->asArray();
+        array<json::Value> $vals = guard $arr else {
+            return .error(.decode($id, 'orientation must be [x,y,z,w]'));
+        }
+        if ($vals->count() < 4) {
+            return .error(.decode($id, 'orientation must be [x,y,z,w]'));
+        }
+
+        float64 $x = $vals[0]->asFloat() ?? 0.0;
+        float64 $y = $vals[1]->asFloat() ?? 0.0;
+        float64 $z = $vals[2]->asFloat() ?? 0.0;
+        float64 $w = $vals[3]->asFloat() ?? 1.0;
+        $node->orientation = Quat($x as float32, $y as float32, $z as float32, $w as float32);
+    }
+
+    return .ok($node);
+}
+
+internal function vec3Json(const Vec3& $v) : json::Value
+{
+    json::Value $a = json::arr();
+    $a[] = json::float($v->x as float64);
+    $a[] = json::float($v->y as float64);
+    $a[] = json::float($v->z as float64);
+    return $a;
+}
+
+internal function quatJson(const Quat& $q) : json::Value
+{
+    json::Value $a = json::arr();
+    $a[] = json::float($q->x as float64);
+    $a[] = json::float($q->y as float64);
+    $a[] = json::float($q->z as float64);
+    $a[] = json::float($q->w as float64);
+    return $a;
+}

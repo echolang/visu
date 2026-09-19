@@ -1,0 +1,270 @@
+/**
+ * GPU timestamps per frame slot: one timestamp query pool, queries 0 and 1 bracket the whole
+ * submit, then two per encoder (TOP_OF_PIPE before CmdBeginRendering, BOTTOM_OF_PIPE after
+ * CmdEndRendering). Read back after the slot's fence into the device's GpuTimeline.
+ *
+ * Every body is a no-op under VISU_RELEASE so device.eco stays unconditional. MoltenVK may
+ * resolve every query of a command buffer to the same value when it falls back to CPU-side
+ * timestamps; those zero spans are skipped and only the submit span survives.
+ */
+
+namespace visu::graphics;
+
+internal const uint32 GPU_QUERIES = 258;
+internal const uint32 GPU_FIRST_ENCODER_QUERY = 2;
+
+internal struct PendingSpan
+{
+    public int32 $scope;
+    public uint32 $start;
+    public uint32 $end;
+}
+
+internal class GpuTimestamps
+{
+    public vk::QueryPool $pool;
+    public array<PendingSpan> $pending;
+    public array<uint64> $ticks;
+    public uint32 $cursor;
+    public int32 $dropped;
+    public uint64 $frame;
+    /** a frame with queries was submitted on this slot and waits for its fence */
+    public bool $recorded;
+    /** an encoder span is open and its end query is still to be written */
+    public bool $open;
+
+    public constructor()
+    {
+        $this->pool = vk::QueryPool::none();
+        $this->pending = array<PendingSpan>();
+        $this->ticks = array<uint64>();
+        $this->cursor = GPU_FIRST_ENCODER_QUERY;
+        $this->dropped = 0;
+        $this->frame = 0;
+        $this->recorded = false;
+        $this->open = false;
+    }
+
+    public function reset(uint64 $frame) : void
+    {
+        $this->pending->clear();
+        $this->cursor = GPU_FIRST_ENCODER_QUERY;
+        $this->dropped = 0;
+        $this->frame = $frame;
+        $this->open = false;
+    }
+}
+
+internal function vkTimestampsSupported(Device $device) : bool
+{
+    #[if: VISU_RELEASE]
+    return false;
+    #[else]
+    return $device->timestampPeriod > 0.0f && $device->timestampBits > 0;
+    #[end]
+}
+
+internal function vkTimestampsCreate(Device $device, FrameSlot $slot) : status<DeviceError>
+{
+    #[if: !VISU_RELEASE]
+    vk::QueryPoolCreateInfo $qci = vk::QueryPoolCreateInfo();
+    $qci->queryType = vk::QUERY_TYPE_TIMESTAMP;
+    $qci->queryCount = GPU_QUERIES;
+    guard vkCheck(
+        vk::CreateQueryPool($device->logical, &$qci, null, &$slot->stamps->pool),
+        'CreateQueryPool'
+    ) else ($e) {
+        return .error($e);
+    }
+    $slot->stamps->ticks = zeroTicks(GPU_QUERIES);
+    #[end]
+    return .ok;
+}
+
+/**
+ * Right after BeginCommandBuffer: reset the pool and stamp the submit start.
+ */
+internal function vkTimestampsBegin(FrameSlot $slot, uint64 $frame) : void
+{
+    #[if: !VISU_RELEASE]
+    GpuTimestamps $t = $slot->stamps;
+
+    if ($t->pool->handle == 0) {
+        return;
+    }
+
+    $t->reset($frame);
+    vk::CmdResetQueryPool($slot->cmd, $t->pool, 0, GPU_QUERIES);
+    vk::CmdWriteTimestamp($slot->cmd, vk::PIPELINE_STAGE_TOP_OF_PIPE_BIT, $t->pool, 0);
+    #[end]
+}
+
+/**
+ * Before an encoder starts recording: open a span for `$scope`.
+ */
+internal function vkTimestampsOpen(FrameSlot $slot, int32 $scope) : void
+{
+    #[if: !VISU_RELEASE]
+    GpuTimestamps $t = $slot->stamps;
+
+    if ($t->pool->handle == 0 || $t->open) {
+        return;
+    }
+
+    if ($t->cursor + 2 > GPU_QUERIES) {
+        $t->dropped = $t->dropped + 1;
+        return;
+    }
+
+    vk::CmdWriteTimestamp($slot->cmd, vk::PIPELINE_STAGE_TOP_OF_PIPE_BIT, $t->pool, $t->cursor);
+    $t->pending[] = PendingSpan($scope, $t->cursor, $t->cursor + 1);
+    $t->cursor = $t->cursor + 2;
+    $t->open = true;
+    #[end]
+}
+
+/**
+ * After the encoder ended: close the open span, if the open was not dropped.
+ */
+internal function vkTimestampsClose(FrameSlot $slot) : void
+{
+    #[if: !VISU_RELEASE]
+    GpuTimestamps $t = $slot->stamps;
+
+    if (!$t->open) {
+        return;
+    }
+
+    PendingSpan $last = $t->pending[$t->pending->count() - 1];
+    vk::CmdWriteTimestamp($slot->cmd, vk::PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, $t->pool, $last->end);
+    $t->open = false;
+    #[end]
+}
+
+/**
+ * Before EndCommandBuffer: stamp the submit end.
+ */
+internal function vkTimestampsEnd(FrameSlot $slot) : void
+{
+    #[if: !VISU_RELEASE]
+    GpuTimestamps $t = $slot->stamps;
+
+    if ($t->pool->handle == 0) {
+        return;
+    }
+
+    vk::CmdWriteTimestamp($slot->cmd, vk::PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, $t->pool, 1);
+    $t->recorded = true;
+    #[end]
+}
+
+/**
+ * After the slot's fence: read every query written and publish the spans.
+ */
+internal function vkTimestampsResolve(Device $device, FrameSlot $slot, GpuTimeline $out) : void
+{
+    #[if: !VISU_RELEASE]
+    GpuTimestamps $t = $slot->stamps;
+
+    if (!$t->recorded || $t->pool->handle == 0) {
+        return;
+    }
+
+    uint32 $count = $t->cursor;
+    vk::Result $r = vk::GetQueryPoolResults(
+        $device->logical,
+        $t->pool,
+        0,
+        $count,
+        ($count as usize) * 8,
+        ptr<uint8>(&$t->ticks[0]),
+        8,
+        vk::QUERY_RESULT_64_BIT | vk::QUERY_RESULT_WAIT_BIT
+    );
+
+    if ($r != vk::Result::success) {
+        return;
+    }
+
+    $t->recorded = false;
+
+    uint64 $mask = 0;
+
+    if ($device->timestampBits >= 64) {
+        $mask = 0 - 1;
+    } else {
+        $mask = ((1 as uint64) << $device->timestampBits) - 1;
+    }
+
+    float64 $period = $device->timestampPeriod as float64;
+    array<GpuSpan> $spans = array<GpuSpan>();
+    uint64 $submit = ($t->ticks[1] - $t->ticks[0]) & $mask;
+
+    if ($submit > 0) {
+        $spans[] = GpuSpan(-1, ($submit as float64) * $period);
+    }
+
+    foreach ($t->pending as const &$p) {
+        uint64 $a = $t->ticks[$p->start as usize];
+        uint64 $b = $t->ticks[$p->end as usize];
+
+        if ($a == 0 || $b == 0 || $b < $a) {
+            continue;
+        }
+
+        uint64 $d = ($b - $a) & $mask;
+        $spans[] = GpuSpan($p->scope, ($d as float64) * $period);
+    }
+
+    $out->publish($t->frame, $spans, $t->dropped);
+    #[end]
+}
+
+/**
+ * Resolve every slot that recorded timestamps, oldest frame first, after the device is idle.
+ */
+internal function vkTimestampsHarvest(Device $device) : void
+{
+    #[if: !VISU_RELEASE]
+    array<FrameSlot> $ready = array<FrameSlot>();
+    foreach ($device->slots as $slot) {
+        if ($slot->stamps->recorded) {
+            $ready[] = $slot;
+        }
+    }
+
+    array<FrameSlot> $ordered = array<FrameSlot>();
+    foreach ($ready as $slot) {
+        array<FrameSlot> $next = array<FrameSlot>();
+        bool $placed = false;
+        foreach ($ordered as $have) {
+            if (!$placed && $slot->stamps->frame < $have->stamps->frame) {
+                $next[] = $slot;
+                $placed = true;
+            }
+
+            $next[] = $have;
+        }
+
+        if (!$placed) {
+            $next[] = $slot;
+        }
+
+        $ordered = $next;
+    }
+
+    foreach ($ordered as $slot) {
+        vkTimestampsResolve($device, $slot, $device->gpuTimeline);
+    }
+    #[end]
+}
+
+internal function vkTimestampsDestroy(Device $device, FrameSlot $slot) : void
+{
+    #[if: !VISU_RELEASE]
+    if ($slot->stamps->pool->handle != 0) {
+        vk::DestroyQueryPool($device->logical, $slot->stamps->pool, null);
+        $slot->stamps->pool = vk::QueryPool::none();
+    }
+    #[end]
+}

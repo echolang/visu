@@ -14,6 +14,8 @@ internal struct GltfNode
 {
     public string $name;
     public int32 $mesh;
+    public int32 $camera;
+    public int32 $light;
     public array<int32> $children;
     public Mat4 $local;
 
@@ -21,6 +23,8 @@ internal struct GltfNode
     {
         $this->name = '';
         $this->mesh = -1;
+        $this->camera = -1;
+        $this->light = -1;
         $this->children = array<int32>();
         $this->local = Mat4();
     }
@@ -69,6 +73,7 @@ public class GltfFile
     public array<GltfAccessor> $accessors;
     public array<string> $materials;
     public array<int32> $roots;
+    public array<Clip> $clips;
 
     public constructor(
         string $bin,
@@ -85,6 +90,7 @@ public class GltfFile
         $this->accessors = $accessors;
         $this->materials = $materials;
         $this->roots = $roots;
+        $this->clips = array<Clip>();
     }
 
     /**
@@ -197,7 +203,12 @@ internal function gltfDocument(json::Value $root, string $bin) : result<GltfFile
     }
     array<string> $materials = gltfParseMaterials($root);
     array<int32> $roots = gltfSceneRoots($root, $nodes->count() as int32);
-    return .ok(GltfFile($bin, $nodes, $meshes, $accessors, $materials, $roots));
+    GltfFile $file = GltfFile($bin, $nodes, $meshes, $accessors, $materials, $roots);
+    array<Clip> $clips = guard gltfParseClips($root, $file) else ($e) {
+        return .error($e);
+    }
+    $file->clips = $clips;
+    return .ok($file);
 }
 
 internal function gltfParseNodes(json::Value $root) : result<array<GltfNode>, GltfError>
@@ -213,6 +224,8 @@ internal function gltfParseNodes(json::Value $root) : result<array<GltfNode>, Gl
         GltfNode $parsed = GltfNode();
         $parsed->name = gltfStr($node, 'name', "node_{$i}");
         $parsed->mesh = (gltfInt($node, 'mesh') ?? -1) as int32;
+        $parsed->camera = (gltfInt($node, 'camera') ?? -1) as int32;
+        $parsed->light = gltfLightIndex($node);
         $parsed->children = gltfChildIds($node, $items->count() as int32);
         $parsed->local = $local;
         $out[] = $parsed;
@@ -220,6 +233,19 @@ internal function gltfParseNodes(json::Value $root) : result<array<GltfNode>, Gl
     }
 
     return .ok($out);
+}
+
+internal function gltfLightIndex(json::Value $node) : int32
+{
+    json::Value? $extVal = $node->get('extensions');
+    json::Value $ext = guard $extVal else {
+        return -1;
+    }
+    json::Value? $khrVal = $ext->get('KHR_lights_punctual');
+    json::Value $khr = guard $khrVal else {
+        return -1;
+    }
+    return (gltfInt($khr, 'light') ?? -1) as int32;
 }
 
 internal function gltfParseMeshes(json::Value $root) : result<array<GltfMesh>, GltfError>

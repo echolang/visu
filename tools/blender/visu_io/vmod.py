@@ -68,6 +68,8 @@ def compact(data: dict[str, Any], stem: str = "") -> dict[str, Any]:
                 out["slots"] = part["slots"]
             if part.get("dynamic"):
                 out["dynamic"] = True
+            if part.get("impostor"):
+                out["impostor"] = True
             if part.get("model"):
                 out["model"] = part["model"]
             return out

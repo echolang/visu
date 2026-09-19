@@ -53,8 +53,10 @@ public class Device : DeviceProtocol
     internal SamplerHandle $dummySampler;
     internal uint64 $allocated;
     internal uint64 $heapBudget;
+    internal float32 $timestampPeriod;
+    internal uint32 $timestampBits;
     public DrawCounters $draws;
-    public GpuScopes $gpuScopes;
+    public GpuTimeline $gpuTimeline;
 
     public constructor()
     {
@@ -104,8 +106,10 @@ public class Device : DeviceProtocol
         $this->dummySampler = SamplerHandle::none();
         $this->allocated = 0;
         $this->heapBudget = 0;
+        $this->timestampPeriod = 0.0f;
+        $this->timestampBits = 0;
         $this->draws = DrawCounters();
-        $this->gpuScopes = GpuScopes();
+        $this->gpuTimeline = GpuTimeline();
     }
 
     destructor()
@@ -131,6 +135,7 @@ public class Device : DeviceProtocol
             $this->shutdown();
             return .error($e);
         }
+        $this->gpuTimeline->supported = vkTimestampsSupported($this);
         guard vkCreateSlots($this) else ($e) {
             $this->shutdown();
             return .error($e);
@@ -201,6 +206,7 @@ public class Device : DeviceProtocol
 
         if ($this->logical->handle != 0) {
             vk::DeviceWaitIdle($this->logical);
+            vkTimestampsHarvest($this);
         }
     }
 
@@ -248,6 +254,7 @@ public class Device : DeviceProtocol
             return .error($e);
         }
 
+        vkTimestampsResolve($this, $slot, $this->gpuTimeline);
         $slot->ring->reset();
         $slot->uniformsDirty = true;
 
@@ -314,6 +321,7 @@ public class Device : DeviceProtocol
             vkRecreateSignaledFence($this, $slot);
             return .error($e);
         }
+        vkTimestampsBegin($slot, $this->frames);
 
         TextureHandle $th = TextureHandle(
             $this->images[$index],
@@ -343,6 +351,7 @@ public class Device : DeviceProtocol
         Texture $bb = guard $this->bb;
         $this->transitionTexture($bb, .present);
         FrameSlot $slot = $this->slots[$this->slot];
+        vkTimestampsEnd($slot);
         guard vkCheck(vk::EndCommandBuffer($slot->cmd), 'EndCommandBuffer') else ($e) {
             vkRecreateSignaledFence($this, $slot);
             $this->lostFlag = true;
@@ -516,34 +525,34 @@ public class Device : DeviceProtocol
         $info->layerCount = 1;
         $info->colorAttachmentCount = $n;
         $info->pColorAttachments:$ = &$atts[0];
-        DepthTarget $depth = guard $desc->depth else {
-            vk::CmdBeginRendering($this->currentCmd(), &$info);
-            $this->encoderOpen = true;
-            return RenderEncoder($this, $formats, $passWidth, $passHeight);
-        }
-        $formats->depth = $depth->texture->desc->format;
-        $formats->hasDepth = true;
-        ResourceState $depthFrom = $depth->texture->state;
-
-        if ($depth->load != LoadOp::load) {
-            $depthFrom = .undefined;
-        }
-
-        vkBarrier(
-            $this,
-            $depth->texture->handle->image,
-            $depthFrom,
-            .depthTarget,
-            vkAspect($depth->texture->desc->format)
-        );
-        $depth->texture->state = .depthTarget;
         vk::RenderingAttachmentInfo $depthAtt = vk::RenderingAttachmentInfo();
-        $depthAtt->imageView = $depth->texture->handle->view;
-        $depthAtt->imageLayout = vk::IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        $depthAtt->loadOp = vkLoadOp($depth->load);
-        $depthAtt->storeOp = vkStoreOp($depth->store);
-        $depthAtt->clearValue = vk::ClearValue(depth: $depth->clearDepth, stencil: 0);
-        $info->pDepthAttachment:$ = &$depthAtt;
+        if ($desc->depth != null) {
+            DepthTarget $depth = guard $desc->depth;
+            $formats->depth = $depth->texture->desc->format;
+            $formats->hasDepth = true;
+            ResourceState $depthFrom = $depth->texture->state;
+
+            if ($depth->load != LoadOp::load) {
+                $depthFrom = .undefined;
+            }
+
+            vkBarrier(
+                $this,
+                $depth->texture->handle->image,
+                $depthFrom,
+                .depthTarget,
+                vkAspect($depth->texture->desc->format)
+            );
+            $depth->texture->state = .depthTarget;
+            $depthAtt->imageView = $depth->texture->handle->view;
+            $depthAtt->imageLayout = vk::IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            $depthAtt->loadOp = vkLoadOp($depth->load);
+            $depthAtt->storeOp = vkStoreOp($depth->store);
+            $depthAtt->clearValue = vk::ClearValue(depth: $depth->clearDepth, stencil: 0);
+            $info->pDepthAttachment:$ = &$depthAtt;
+        }
+
+        vkTimestampsOpen($this->slots[$this->slot], $this->gpuTimeline->scope);
         vk::CmdBeginRendering($this->currentCmd(), &$info);
         $this->encoderOpen = true;
         return RenderEncoder($this, $formats, $passWidth, $passHeight);
@@ -778,6 +787,7 @@ public class Device : DeviceProtocol
     internal function encoderClosed() : void
     {
         $this->encoderOpen = false;
+        vkTimestampsClose($this->slots[$this->slot]);
     }
 
     public function shutdown() : void

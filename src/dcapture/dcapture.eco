@@ -1,7 +1,7 @@
 /**
  * Scripted debug run: `--dcapture '<json>'` or `--dcapture @file` drives the app without a hand
  * on the keyboard. Steps apply flags, pin the camera, submit console lines, dump named GPU
- * images at frames or ticks, and stop. `--flag k=v` is applied by bootstrap after the script
+ * images or the frame's profile tree at frames or ticks, and stop. `--flag k=v` is applied by bootstrap after the script
  * flags, and works without a script.
  *
  * Dump-after-present lives on `DumpQueue` (always on Services) so console `dump` works without a
@@ -12,7 +12,7 @@ namespace visu::dcapture;
 
 use std::io;
 use visu::app::{Flags, HostConfig, flags, info};
-use visu::graphics::CameraOverrideData;
+use visu::graphics::{CameraOverrideData, FRAMES_IN_FLIGHT};
 use visu::math::{Quat, Vec3};
 use visu::runtime::DebugConsole;
 
@@ -126,6 +126,10 @@ public class DCapture
         int32? $frames = $this->script->impliedFrames();
         if ($frames != null) {
             int32 $cap = guard $frames;
+            if ($this->script->hasProfile()) {
+                $cap = $cap + (FRAMES_IN_FLIGHT as int32);
+            }
+
             $config->maxFrames = $cap;
         }
 
@@ -209,6 +213,10 @@ public class DCapture
 
         foreach ($step->dump as $pattern) {
             $this->dumps->queue($pattern, $step->label);
+        }
+
+        if ($step->profile) {
+            $this->dumps->queueProfile($step->label);
         }
 
         if ($step->list) {

@@ -30,16 +30,6 @@ public struct DrawStats
     }
 }
 
-/**
- * One GPU scope sample, resolved from a previous frame slot.
- * `$ns` is 0 when the backend has no timestamp yet.
- */
-public struct GpuScopeSample
-{
-    public string $name = '';
-    public float64 $ns = 0.0;
-}
-
 public class DrawCounters
 {
     public DrawStats $frame;
@@ -133,40 +123,6 @@ internal function drawPatches(Topology $top, int32 $count, int32 $instances, int
         Topology::patches => ($count / $p) * $instances,
         else => 0,
     };
-}
-
-/**
- * Nested GPU scopes are refused. Backends fill `$resolved` when timestamps land.
- */
-public class GpuScopes
-{
-    public string $current;
-    public array<GpuScopeSample> $resolved;
-
-    public constructor()
-    {
-        $this->current = '';
-        $this->resolved = array<GpuScopeSample>();
-    }
-
-    public function begin(string $name) : void
-    {
-        if ($name->empty()) {
-            return;
-        }
-
-        assert($this->current->empty(), 'nested gpu scope');
-        $this->current = $name;
-    }
-
-    public function end() : void
-    {
-        if ($this->current->empty()) {
-            return;
-        }
-
-        $this->current = '';
-    }
 }
 
 internal function sub32(int32 $a, int32 $b) : int32

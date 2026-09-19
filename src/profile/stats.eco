@@ -1,0 +1,205 @@
+/**
+ * Rolling per-scope statistics over the last STATS_WINDOW completed frames, keyed by scope path.
+ * The book is the stable view of the tree: a scope stays listed while it was seen inside the
+ * window, and a frame it did not run in counts as 0, so averages are per frame and the overlay's
+ * rows neither jump nor flicker when a scope runs only on some frames (`update` on tick frames,
+ * `prefilter` while a bake is in flight). GPU follows the same rule: a frame where no encoder ran
+ * under the scope pushes 0, so a 27 ms probe bake on one frame averages to 27 / 120 ms, not 27.
+ */
+
+namespace visu::profile;
+
+use visu::graphics::DrawStats;
+
+public const int32 STATS_WINDOW = 120;
+
+public struct Window
+{
+    public array<float64> $samples = array<float64>();
+    public usize $next = 0;
+    public float64 $last = 0.0;
+    public float64 $sum = 0.0;
+
+    public function push(float64 $v) : void
+    {
+        $this->last = $v;
+
+        if ($this->samples->count() < (STATS_WINDOW as usize)) {
+            $this->samples[] = $v;
+            $this->sum = $this->sum + $v;
+            return;
+        }
+
+        $this->sum = $this->sum - $this->samples[$this->next] + $v;
+        $this->samples[$this->next] = $v;
+        $this->next = ($this->next + 1) % (STATS_WINDOW as usize);
+    }
+
+    public const function count() : usize
+    {
+        return $this->samples->count();
+    }
+
+    public const function avg() : float64
+    {
+        if ($this->samples->empty()) {
+            return 0.0;
+        }
+
+        return $this->sum / ($this->samples->count() as float64);
+    }
+
+    public const function max() : float64
+    {
+        float64 $m = 0.0;
+        foreach ($this->samples as $s) {
+            if ($s > $m) {
+                $m = $s;
+            }
+        }
+
+        return $m;
+    }
+}
+
+public struct ScopeStats
+{
+    public string $path = '';
+    public string $name = '';
+    /** empty for a frame root such as `render` */
+    public string $parentPath = '';
+    public int32 $depth = 0;
+    /** per frame; a frame the scope did not run in pushes 0 */
+    public Window $cpu = Window();
+    /** per frame; a frame with no encoder under the scope (or no run) pushes 0 */
+    public Window $gpu = Window();
+    /** from the last frame the scope ran in */
+    public int32 $lastCalls = 0;
+    public DrawStats $lastDraw = DrawStats();
+    /** book frame counter when the scope last ran */
+    public uint64 $lastSeen = 0;
+    /** book frame counter when the scope last had GPU spans; 0 never */
+    public uint64 $gpuSeen = 0;
+}
+
+public class StatsBook
+{
+    // scope paths are an open key set, so a map is the right shape here
+    private map<string, ScopeStats> $byPath;
+    private uint64 $noted;
+
+    public constructor()
+    {
+        $this->byPath = map<string, ScopeStats>();
+        $this->noted = 0;
+    }
+
+    /**
+     * Fold one completed frame in. Scopes absent from it but seen inside the window get a 0 sample.
+     */
+    public function note(const FrameProfile& $frame) : void
+    {
+        $this->noted = $this->noted + 1;
+        foreach ($frame->nodes as $n) {
+            if ($n->path->empty()) {
+                continue;
+            }
+
+            if (!$this->byPath->has($n->path)) {
+                ScopeStats $fresh = ScopeStats();
+                $fresh->path = $n->path;
+                $fresh->name = $n->name;
+                $fresh->depth = $n->depth;
+                $fresh->parentPath = $frame->nodes[$n->parent as usize]->path;
+                $this->byPath[$n->path] = $fresh;
+            }
+
+            // the windows own heap arrays, so mutate the entry in place instead of copying it out
+            ScopeStats& $s = $this->byPath->at($n->path);
+            $s->cpu->push($n->cpuNs);
+
+            if ($n->gpuSpans > 0) {
+                $s->gpu->push($n->gpuNs);
+                $s->gpuSeen = $this->noted;
+            } else {
+                $s->gpu->push(0.0);
+            }
+
+            $s->lastCalls = $n->calls;
+            $s->lastDraw = $n->draw;
+            $s->lastSeen = $this->noted;
+        }
+
+        // scopes the frame did not run in were not touched above, so their lastSeen is older
+        array<string> $paths = $this->byPath->keys();
+        foreach ($paths as $path) {
+            ScopeStats& $s = $this->byPath->at($path);
+
+            if ($s->lastSeen == $this->noted) {
+                continue;
+            }
+
+            if (!$this->inWindow($s)) {
+                $this->byPath->remove($path);
+                continue;
+            }
+
+            $s->cpu->push(0.0);
+            $s->gpu->push(0.0);
+        }
+    }
+
+    /**
+     * True while the window holds a frame in which an encoder ran under the scope. A scope that
+     * only ever ran on the CPU shows a dash; one whose bake fell out of the window goes back to it.
+     */
+    public const function gpuKnown(const ScopeStats& $s) : bool
+    {
+        return $s->gpuSeen > 0 && $s->gpuSeen + (STATS_WINDOW as uint64) > $this->noted;
+    }
+
+    public const function find(const string& $path) : ScopeStats?
+    {
+        if (!$this->byPath->has($path)) {
+            return null;
+        }
+
+        return $this->byPath[$path];
+    }
+
+    /**
+     * Every scope seen inside the window, in no particular order.
+     */
+    public const function all() : array<ScopeStats>
+    {
+        array<ScopeStats> $out = array<ScopeStats>();
+        array<string> $paths = $this->byPath->keys();
+        foreach ($paths as $path) {
+            ScopeStats $s = $this->byPath[$path];
+
+            if ($this->inWindow($s)) {
+                $out[] = $s;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Completed frames folded in so far.
+     */
+    public const function frames() : uint64
+    {
+        return $this->noted;
+    }
+
+    public function reset() : void
+    {
+        $this->byPath = map<string, ScopeStats>();
+    }
+
+    private const function inWindow(const ScopeStats& $s) : bool
+    {
+        return $s->lastSeen + (STATS_WINDOW as uint64) > $this->noted;
+    }
+}

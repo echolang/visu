@@ -9,12 +9,14 @@
 
 namespace visu::app;
 
+use visu::profile::{FrameProfile, Profiler, profiler};
+
 use std::env;
 use std::io;
 use visu::asset::{
-    AssetError, Assets, AudioClip, Blob, DirectoryStore, KIND_BYTES, KIND_MODEL, KIND_SOUND,
-    KIND_TEXTURE, KIND_VMAT, PackStore, Vmat, decodeBytes, decodeGpuTexture,
-    decodeSound, decodeVmat
+    Assembly, AssetError, Assets, AudioClip, Blob, DirectoryStore, KIND_ASSEMBLY, KIND_BYTES,
+    KIND_MODEL, KIND_SOUND, KIND_TEXTURE, KIND_VMAT, PackStore, Vmat, decodeAssembly, decodeBytes,
+    decodeGpuTexture, decodeSound, decodeVmat
 };
 use visu::graphics::{
     BackbufferData, CameraOverrideData, ClearPass, ClearPassOptions, RenderContext, Device, DeviceError,
@@ -22,7 +24,7 @@ use visu::graphics::{
     Pool, RenderTarget, SceneTargetData, ShaderCollection, TargetRef, Texture,
     TextureOptions, TextureRef
 };
-use visu::console::{DCaptureConsole, FlagConsole, OverlayConsole};
+use visu::console::{DCaptureConsole, FlagConsole, OverlayConsole, ProfileConsole};
 use visu::dcapture::{DCapture, DumpQueue};
 use visu::instrument::{DrawSource, Instruments, Overlay, Sample};
 use visu::math::Vec2;
@@ -93,6 +95,7 @@ public class Host
         $this->events = EventLoop();
         $this->instruments = Instruments();
         $this->instruments->add(id: 'draw', DrawSource($this->device));
+        profiler()->attach($this->device->draws, $this->device->gpuTimeline);
         $this->ui = null;
         $this->frameIndex = 0;
         $this->fail = .none;
@@ -175,6 +178,8 @@ public class Host
             return;
         }
 
+        profiler()->bindFrame($this->device->frameIndex(), $this->frameIndex);
+        visu::profile::begin('build');
         Frame $frame = Frame();
         RenderTarget $windowRt = $this->window->renderTarget();
         Pipeline $pipeline = Pipeline($this->pool, $frame, $windowRt);
@@ -206,6 +211,7 @@ public class Host
             $console->attachPass($pipeline, $back->target);
         }
 
+        visu::profile::end();
         $this->finishFrame($pipeline, $frame, $compensation, $afterPresent);
     }
 
@@ -228,6 +234,11 @@ public class Host
     public function destroy() : void
     {
         $this->device->waitIdle();
+        // frames still waiting for GPU spans complete without them so a dcapture profile step is never lost
+        Profiler $prof = profiler();
+        $prof->mergeGpu();
+        $prof->abandon();
+        $this->publishProfiles();
         DCapture? $maybeScript = $this->script;
         if ($maybeScript != null) {
             DCapture $dcapture = guard $maybeScript;
@@ -307,12 +318,16 @@ public class Host
         function<void()>? $afterPresent,
     ) : void
     {
+        visu::profile::begin('render');
+        visu::profile::captureSubmit();
         float64 $t0 = visu::runtime::seconds();
         status<PipelineError> $exec = $pipeline->execute($this->frameIndex, $compensation);
         $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
-        $this->instruments->noteGraph($pipeline->timings());
-        $this->instruments->noteGpu($this->device->gpuScopes->resolved);
+        visu::profile::end();
+        visu::profile::begin('present');
         bool $presented = $this->present();
+        visu::profile::end();
+        $this->publishProfiles();
         guard $exec else ($e) {
             if (!$this->fail->failed()) {
                 $this->fail = .pipeline($e);
@@ -334,6 +349,23 @@ public class Host
             return;
         }
         $after();
+    }
+
+    /**
+     * Fold the device's resolved GPU spans in and hand every completed frame to the instruments and dumps.
+     */
+    private function publishProfiles() : void
+    {
+        Profiler $prof = profiler();
+        $prof->mergeGpu();
+        FrameProfile? $done = $prof->complete();
+
+        while ($done != null) {
+            FrameProfile $f = guard $done;
+            $this->instruments->noteProfile($f, $prof->stats);
+            $this->dumps->noteProfile($f, $prof->stats);
+            $done = $prof->complete();
+        }
     }
 
     private function advanceDCapture() : void
@@ -421,6 +453,8 @@ public class Host
         $flagVerbs->registerConsoleCommands($console->registry);
         DCaptureConsole $verbs = DCaptureConsole($this->dumps, $this->script);
         $verbs->registerConsoleCommands($console->registry);
+        ProfileConsole $profileVerbs = ProfileConsole(profiler(), $this->dumps);
+        $profileVerbs->registerConsoleCommands($console->registry);
         Overlay? $maybeOverlay = $this->overlay;
         if ($maybeOverlay != null) {
             Overlay $hud = guard $maybeOverlay;
@@ -462,6 +496,9 @@ public class Host
         });
         $this->assets->register(KIND_VMAT, function(Assets $a, Blob $b) : result<Vmat, AssetError> {
             return decodeVmat($a, $b);
+        });
+        $this->assets->register(KIND_ASSEMBLY, function(Assets $a, Blob $b) : result<Assembly, AssetError> {
+            return decodeAssembly($a, $b);
         });
         $this->assets->register(KIND_MODEL, function(Assets $a, Blob $b) : result<Model, AssetError> {
             return decodeModel($a, $b);

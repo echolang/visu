@@ -1,6 +1,7 @@
 /**
  * A decoded model: one GPU mesh (shared vertices + indices), its LOD table, and one `Material` per
- * slot resolved from the folder `.vmat`. `Assets.load<Model>` builds it through `decodeModel`.
+ * slot resolved from a cooked `.vmat` whose catalog id is the slot string. `Assets.load<Model>`
+ * builds it through `decodeModel`.
  * The `ModelBank` owns every live model and is the only thing that destroys one; the destructor
  * is the safety net for a handle that never reached a bank.
  */
@@ -9,8 +10,7 @@ namespace visu::graphics;
 
 use json;
 use visu::asset::{
-    AssetError, Assets, Blob, CookedModel, MODEL_VERTEX_BYTES, ModelLodDesc, Vmat, decodeCookedModel,
-    parentId
+    AssetError, Assets, Blob, CookedModel, MODEL_VERTEX_BYTES, ModelLodDesc, Vmat, decodeCookedModel
 };
 use visu::geo::AABB;
 
@@ -33,7 +33,7 @@ public class Model
     public array<string> $slots;
 
     /**
-     * One per slot, in slot order. A slot without a sheet record gets the folder material.
+     * One per slot, in slot order. A missing material id gets an empty material.
      */
     public array<Material> $materials;
     private bool $dead;
@@ -74,8 +74,8 @@ public class Model
 }
 
 /**
- * The `model` kind decoder: cooked bytes to GPU buffers plus bound materials. Needs the folder
- * sheet only if there is one; a model with no `.vmat` beside it gets empty materials.
+ * The `model` kind decoder: cooked bytes to GPU buffers plus bound materials. Each slot is a
+ * material catalog id; a missing id yields an empty material.
  */
 public function decodeModel(Assets $assets, Blob $blob) : result<Model, AssetError>
 {
@@ -91,26 +91,20 @@ public function decodeModel(Assets $assets, Blob $blob) : result<Model, AssetErr
 }
 
 /**
- * The folder sheet viewed per slot name. Without a sheet every slot is an empty material.
+ * Load each slot as a material catalog id. Missing ids stay empty.
  */
 internal function modelMaterials(Assets $assets, const string& $id, const array<string>& $slots) : array<Material>
 {
     array<Material> $out = array<Material>();
-    string $folder = parentId($id);
-    Vmat? $found = null;
-    if (!$folder->empty()) {
-        result<Vmat, AssetError> $r = $assets->load<Vmat>($folder);
-        if (!$r->failed()) {
-            $found = $r->or(Vmat($folder, json::object()));
-        }
-    }
-
     foreach ($slots as $slot) {
-        Vmat $sheet = guard $found else {
+        result<Vmat, AssetError> $r = $assets->load<Vmat>($slot);
+        if ($r->failed()) {
             $out[] = Material(id: "{$id}:{$slot}");
             continue;
         }
-        Material $mat = Material($sheet, view: $slot);
+
+        Vmat $sheet = $r->or(Vmat($slot, json::object()));
+        Material $mat = Material($sheet);
         $mat->bind($assets);
         $out[] = $mat;
     }

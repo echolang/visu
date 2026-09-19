@@ -4,8 +4,9 @@
 
 use std::env;
 use std::io;
-use visu::app::{Flags, applyArgvFlags};
+use visu::app::{Flags, HostConfig, applyArgvFlags};
 use visu::dcapture::{DCapture, DCaptureError};
+use visu::graphics::FRAMES_IN_FLIGHT;
 
 internal function parsedArgs(const array<string>& $argv) : DCapture?
 {
@@ -82,6 +83,16 @@ test args_script_from_file
     array<string> $missing = ['prog', '--dcapture', '@/definitely/not/here.json'];
     DCaptureError $e = failedArgs($missing);
     assert($e->message()->starts('/definitely/not/here.json:'), 'io error names the path');
+}
+
+test args_profile_step_pads_host_frame_cap
+{
+    array<string> $argv = ['prog', '--dcapture', '{"steps":[{"frame":40,"profile":true}]}'];
+    DCapture $h = requireCapture(parsedArgs($argv));
+    HostConfig $cfg = HostConfig();
+    $h->configure($cfg);
+    int32 $want = 42 + (FRAMES_IN_FLIGHT as int32);
+    assert(($cfg->maxFrames ?? 0) == $want, 'host waits in-flight frames for the profile dump');
 }
 
 test args_errors

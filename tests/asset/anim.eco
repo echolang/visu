@@ -1,0 +1,274 @@
+/**
+ * Clip sampling, wrap, JSON round-trip, and glTF animation parse.
+ */
+
+use std::env;
+use std::io;
+use json;
+use visu::asset::{
+    AnimInterp, AnimPath, AnimTrack, Clip, GltfFile, applyTrack, clipsJson, loopTime, parseClip,
+    pingpongTime, sampleQuat
+};
+use visu::geo::Transform;
+use visu::math::{Quat, Vec3, equal};
+
+internal function animTrackTurn() : AnimTrack
+{
+    array<float32> $times = array<float32>();
+    $times[] = 0.0f;
+    $times[] = 1.0f;
+    array<float32> $values = array<float32>();
+    Quat $a = Quat();
+    Quat $b = Quat(angleAxis: std::math::PI_F32 / 2.0f, Vec3(0.0f, 1.0f, 0.0f));
+    $values[] = $a->x;
+    $values[] = $a->y;
+    $values[] = $a->z;
+    $values[] = $a->w;
+    $values[] = $b->x;
+    $values[] = $b->y;
+    $values[] = $b->z;
+    $values[] = $b->w;
+    return AnimTrack('spin', .rotation, .linear, $times, $values);
+}
+
+test clip_samples_linear_rotation
+{
+    AnimTrack $track = animTrackTurn();
+    Quat $q0 = guard sampleQuat($track, 0.0f) else {
+        die('t0');
+    }
+    assert(equal($q0, Quat(), 0.001f), 'identity at start');
+    Quat $q1 = guard sampleQuat($track, 1.0f) else {
+        die('t1');
+    }
+    Quat $end = Quat(angleAxis: std::math::PI_F32 / 2.0f, Vec3(0.0f, 1.0f, 0.0f));
+    assert(equal($q1, $end, 0.001f), '90 deg at end');
+    Quat $qMid = guard sampleQuat($track, 0.5f) else {
+        die('tmid');
+    }
+    Quat $mid = Quat(angleAxis: std::math::PI_F32 / 4.0f, Vec3(0.0f, 1.0f, 0.0f));
+    assert(equal($qMid, $mid, 0.01f), '45 deg halfway');
+}
+
+test clip_apply_writes_transform
+{
+    AnimTrack $track = animTrackTurn();
+    Transform $t = Transform();
+    applyTrack($track, 1.0f, $t);
+    Quat $end = Quat(angleAxis: std::math::PI_F32 / 2.0f, Vec3(0.0f, 1.0f, 0.0f));
+    assert(equal($t->orientation, $end, 0.001f), 'orientation sampled');
+    assert(equal($t->position->y, 0.0f), 'translation untouched');
+}
+
+test clip_loop_and_pingpong_fold
+{
+    assert(equal(loopTime(1.25f, 1.0f), 0.25f), 'loop wraps');
+    assert(equal(loopTime(-0.25f, 1.0f), 0.75f), 'loop negative');
+    assert(equal(pingpongTime(0.25f, 1.0f), 0.25f), 'pingpong out');
+    assert(equal(pingpongTime(1.25f, 1.0f), 0.75f), 'pingpong back');
+}
+
+test clip_json_round_trip
+{
+    AnimTrack $track = animTrackTurn();
+    array<AnimTrack> $tracks = array<AnimTrack>();
+    $tracks[] = $track;
+    Clip $clip = Clip('turn', 1.0f, $tracks);
+    json::Value $root = json::object();
+    array<Clip> $one = array<Clip>();
+    $one[] = $clip;
+    $root['clips'] = clipsJson($one);
+    json::Value $clips = $root['clips'];
+    Clip $back = guard parseClip('test', $clips[0]) else ($e) {
+        die($e->message());
+    }
+    assert($back->name->equals('turn'), 'name');
+    assert(equal($back->duration, 1.0f), 'duration');
+    assert($back->tracks->count() == 1, 'one track');
+    assert($back->tracks[0]->path == AnimPath::rotation, 'path');
+    assert($back->tracks[0]->interp == AnimInterp::linear, 'interp');
+}
+
+internal function gltfWriteSpinFixture(const string& $dir) : string
+{
+    string $ds = env::DS;
+    string $bin = '';
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 1.0f);
+    gltfPushU16($bin, 0); gltfPushU16($bin, 1); gltfPushU16($bin, 2);
+    $bin->push(0 as uint8);
+    $bin->push(0 as uint8);
+    gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f);
+    Quat $a = Quat();
+    Quat $b = Quat(angleAxis: std::math::PI_F32 / 2.0f, Vec3(0.0f, 1.0f, 0.0f));
+    gltfPushF32($bin, $a->x); gltfPushF32($bin, $a->y); gltfPushF32($bin, $a->z); gltfPushF32($bin, $a->w);
+    gltfPushF32($bin, $b->x); gltfPushF32($bin, $b->y); gltfPushF32($bin, $b->z); gltfPushF32($bin, $b->w);
+    guard io::writefile("{$dir}{$ds}spin.bin", $bin) else ($e) {
+        die($e->message());
+    }
+
+    string $json = '';
+    $json->append('{"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],');
+    $json->append('"nodes":[');
+    $json->append('{"name":"base","mesh":0,"children":[1]},');
+    $json->append('{"name":"spin","mesh":0,"translation":[0,1,0]}');
+    $json->append('],');
+    $json->append('"meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1}]}],');
+    $json->append('"materials":[{"name":"plain"}],');
+    $json->append('"animations":[{"name":"turn","channels":[{"sampler":0,"target":{"node":1,"path":"rotation"}}],');
+    $json->append('"samplers":[{"input":2,"interpolation":"LINEAR","output":3}]}],');
+    $json->append('"accessors":[');
+    $json->append('{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},');
+    $json->append('{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"},');
+    $json->append('{"bufferView":2,"componentType":5126,"count":2,"type":"SCALAR"},');
+    $json->append('{"bufferView":3,"componentType":5126,"count":2,"type":"VEC4"}');
+    $json->append('],');
+    $json->append('"bufferViews":[');
+    $json->append('{"buffer":0,"byteOffset":0,"byteLength":36},');
+    $json->append('{"buffer":0,"byteOffset":36,"byteLength":6},');
+    $json->append('{"buffer":0,"byteOffset":44,"byteLength":8},');
+    $json->append('{"buffer":0,"byteOffset":52,"byteLength":32}');
+    $json->append('],');
+    $json->append('"buffers":[{"byteLength":84,"uri":"spin.bin"}]}');
+    string $path = "{$dir}{$ds}spin.gltf";
+    guard io::writefile($path, $json) else ($e) {
+        die($e->message());
+    }
+    return $path;
+}
+
+/**
+ * Parent transform `arm` holds the mesh child `arm_mesh`. The clip targets the parent, as Blender
+ * does for per-object actions.
+ */
+internal function gltfWriteArmFixture(const string& $dir) : string
+{
+    string $ds = env::DS;
+    string $bin = '';
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 1.0f);
+    gltfPushU16($bin, 0); gltfPushU16($bin, 1); gltfPushU16($bin, 2);
+    $bin->push(0 as uint8);
+    $bin->push(0 as uint8);
+    gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f);
+    Quat $a = Quat();
+    Quat $b = Quat(angleAxis: std::math::PI_F32 / 2.0f, Vec3(0.0f, 1.0f, 0.0f));
+    gltfPushF32($bin, $a->x); gltfPushF32($bin, $a->y); gltfPushF32($bin, $a->z); gltfPushF32($bin, $a->w);
+    gltfPushF32($bin, $b->x); gltfPushF32($bin, $b->y); gltfPushF32($bin, $b->z); gltfPushF32($bin, $b->w);
+    guard io::writefile("{$dir}{$ds}arm.bin", $bin) else ($e) {
+        die($e->message());
+    }
+
+    string $json = '';
+    $json->append('{"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],');
+    $json->append('"nodes":[');
+    $json->append('{"name":"arm","children":[1],"translation":[0,2,0]},');
+    $json->append('{"name":"arm_mesh","mesh":0}');
+    $json->append('],');
+    $json->append('"meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1}]}],');
+    $json->append('"animations":[{"name":"armAction","channels":[{"sampler":0,"target":{"node":0,"path":"rotation"}}],');
+    $json->append('"samplers":[{"input":2,"interpolation":"LINEAR","output":3}]}],');
+    $json->append('"accessors":[');
+    $json->append('{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},');
+    $json->append('{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"},');
+    $json->append('{"bufferView":2,"componentType":5126,"count":2,"type":"SCALAR"},');
+    $json->append('{"bufferView":3,"componentType":5126,"count":2,"type":"VEC4"}');
+    $json->append('],');
+    $json->append('"bufferViews":[');
+    $json->append('{"buffer":0,"byteOffset":0,"byteLength":36},');
+    $json->append('{"buffer":0,"byteOffset":36,"byteLength":6},');
+    $json->append('{"buffer":0,"byteOffset":44,"byteLength":8},');
+    $json->append('{"buffer":0,"byteOffset":52,"byteLength":32}');
+    $json->append('],');
+    $json->append('"buffers":[{"byteLength":84,"uri":"arm.bin"}]}');
+    string $path = "{$dir}{$ds}arm.gltf";
+    guard io::writefile($path, $json) else ($e) {
+        die($e->message());
+    }
+    return $path;
+}
+
+internal function gltfWriteHoldFixture(const string& $dir) : string
+{
+    string $ds = env::DS;
+    string $bin = '';
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 0.0f); gltfPushF32($bin, 0.0f); gltfPushF32($bin, 1.0f);
+    gltfPushU16($bin, 0); gltfPushU16($bin, 1); gltfPushU16($bin, 2);
+    $bin->push(0 as uint8);
+    $bin->push(0 as uint8);
+    gltfPushF32($bin, 0.0f);
+    gltfPushF32($bin, 1.0f);
+    Quat $q = Quat(angleAxis: std::math::PI_F32 / 2.0f, Vec3(0.0f, 1.0f, 0.0f));
+    gltfPushF32($bin, $q->x); gltfPushF32($bin, $q->y); gltfPushF32($bin, $q->z); gltfPushF32($bin, $q->w);
+    gltfPushF32($bin, $q->x); gltfPushF32($bin, $q->y); gltfPushF32($bin, $q->z); gltfPushF32($bin, $q->w);
+    guard io::writefile("{$dir}{$ds}hold.bin", $bin) else ($e) {
+        die($e->message());
+    }
+
+    string $json = '';
+    $json->append('{"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],');
+    $json->append('"nodes":[{"name":"hold","mesh":0}],');
+    $json->append('"meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1}]}],');
+    $json->append('"animations":[{"name":"pose","channels":[{"sampler":0,"target":{"node":0,"path":"rotation"}}],');
+    $json->append('"samplers":[{"input":2,"interpolation":"STEP","output":3}]}],');
+    $json->append('"accessors":[');
+    $json->append('{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},');
+    $json->append('{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"},');
+    $json->append('{"bufferView":2,"componentType":5126,"count":2,"type":"SCALAR"},');
+    $json->append('{"bufferView":3,"componentType":5126,"count":2,"type":"VEC4"}');
+    $json->append('],');
+    $json->append('"bufferViews":[');
+    $json->append('{"buffer":0,"byteOffset":0,"byteLength":36},');
+    $json->append('{"buffer":0,"byteOffset":36,"byteLength":6},');
+    $json->append('{"buffer":0,"byteOffset":44,"byteLength":8},');
+    $json->append('{"buffer":0,"byteOffset":52,"byteLength":32}');
+    $json->append('],');
+    $json->append('"buffers":[{"byteLength":84,"uri":"hold.bin"}]}');
+    string $path = "{$dir}{$ds}hold.gltf";
+    guard io::writefile($path, $json) else ($e) {
+        die($e->message());
+    }
+    return $path;
+}
+
+test gltf_keeps_constant_offset_pose
+{
+    string $dir = gltfTmp('hold');
+    gltfMkdir($dir);
+    string $path = gltfWriteHoldFixture($dir);
+    GltfFile $file = guard GltfFile::load($path) else ($e) {
+        die($e->message());
+    }
+    assert($file->clips->count() == 1, 'constant non-rest survived');
+    Quat $q = guard sampleQuat($file->clips[0]->tracks[0], 0.0f) else {
+        die('sample');
+    }
+    Quat $hold = Quat(angleAxis: std::math::PI_F32 / 2.0f, Vec3(0.0f, 1.0f, 0.0f));
+    assert(equal($q, $hold, 0.001f), 'offset pose');
+}
+
+test gltf_parses_rotation_clip
+{
+    string $dir = gltfTmp('spin');
+    gltfMkdir($dir);
+    string $path = gltfWriteSpinFixture($dir);
+    GltfFile $file = guard GltfFile::load($path) else ($e) {
+        die($e->message());
+    }
+    assert($file->clips->count() == 1, 'one clip');
+    assert($file->clips[0]->name->equals('turn'), 'name');
+    assert(equal($file->clips[0]->duration, 1.0f), 'duration');
+    assert($file->clips[0]->tracks->count() == 1, 'one track');
+    assert($file->clips[0]->tracks[0]->node->equals('spin'), 'target');
+    Quat $q = guard sampleQuat($file->clips[0]->tracks[0], 1.0f) else {
+        die('sample');
+    }
+    Quat $end = Quat(angleAxis: std::math::PI_F32 / 2.0f, Vec3(0.0f, 1.0f, 0.0f));
+    assert(equal($q, $end, 0.001f), 'gltf end pose');
+}

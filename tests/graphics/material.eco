@@ -7,7 +7,7 @@ use std::io;
 use visu::graphics::{Device, Material, Pixels};
 use visu::asset::{
     AssetError, AssetRef, Assets, Blob, CookedImage, DirectoryStore, KIND_TEXTURE, KIND_VMAT,
-    Kitchen, TextureCooker, Vmat, decodeTexture, decodeVmat
+    Kitchen, MaterialCooker, TextureCooker, Vmat, decodeTexture, decodeVmat
 };
 use visu::math::equal;
 
@@ -79,7 +79,7 @@ test material_load_convention_binds
     writeMatDot("{$folder}{$ds}normal.png", 1, 1);
     guard io::writefile(
         "{$folder}{$ds}rock.vmat",
-        '{"shader":"pbr","textureScale":0.05,"fallback":[0.22,0.38,0.16]}'
+        '{"shader":"pbr","textureScale":0.05,"fallback":[0.22,0.38,0.16],"albedo":"albedo","normal":"normal"}'
     ) else ($e) {
         die($e->message());
     }
@@ -88,12 +88,13 @@ test material_load_convention_binds
     mkdirMat($out);
     Kitchen $k = Kitchen();
     $k->add(TextureCooker());
+    $k->add(MaterialCooker());
     guard $k->cook($src, $out) else ($e) {
         die($e->message());
     }
 
     Assets $assets = mountMat($out);
-    Material $mat = guard Material::load($assets, 'rock') else ($e) {
+    Material $mat = guard Material::load($assets, 'rock/rock') else ($e) {
         die($e->message());
     }
     AssetRef $albedo = guard $mat->albedo else {
@@ -121,7 +122,7 @@ test material_roughness_stem
     mkdirMat($folder);
     writeMatDot("{$folder}{$ds}albedo.png", 1, 1);
     writeMatDot("{$folder}{$ds}roughness.png", 1, 1);
-    guard io::writefile("{$folder}{$ds}dirt.vmat", '{}') else ($e) {
+    guard io::writefile("{$folder}{$ds}dirt.vmat", '{"albedo":"albedo","rough":"roughness"}') else ($e) {
         die($e->message());
     }
 
@@ -129,12 +130,13 @@ test material_roughness_stem
     mkdirMat($out);
     Kitchen $k = Kitchen();
     $k->add(TextureCooker());
+    $k->add(MaterialCooker());
     guard $k->cook($src, $out) else ($e) {
         die($e->message());
     }
 
     Assets $assets = mountMat($out);
-    Material $mat = guard Material::load($assets, 'dirt') else ($e) {
+    Material $mat = guard Material::load($assets, 'dirt/dirt') else ($e) {
         die($e->message());
     }
     AssetRef $rough = guard $mat->roughness else {
@@ -157,7 +159,7 @@ test material_overlay_maps
     writeMatDot("{$folder}{$ds}roughness.png", 1, 1);
     guard io::writefile(
         "{$folder}{$ds}rock.vmat",
-        '{"normal":{"srgb":false},"ao":{"srgb":false},"height":{"srgb":false},"roughness":{"srgb":false}}'
+        '{"albedo":"albedo","normal":"normal","ao":"ao","height":"height","rough":"roughness"}'
     ) else ($e) {
         die($e->message());
     }
@@ -166,12 +168,13 @@ test material_overlay_maps
     mkdirMat($out);
     Kitchen $k = Kitchen();
     $k->add(TextureCooker());
+    $k->add(MaterialCooker());
     guard $k->cook($src, $out) else ($e) {
         die($e->message());
     }
 
     Assets $assets = mountMat($out);
-    Material $mat = guard Material::load($assets, 'rock') else ($e) {
+    Material $mat = guard Material::load($assets, 'rock/rock') else ($e) {
         die($e->message());
     }
     assert(($mat->normal?->id ?? '')->equals('rock/normal'), 'normal');

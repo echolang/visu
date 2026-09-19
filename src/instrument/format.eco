@@ -64,6 +64,7 @@ public function formatRows(const Sample& $sample) : array<HudRow>
     string $ut = formatNs($sample->loop->tickNs);
     string $ft = formatNs($sample->loop->frameNs);
     string $rt = formatNs($sample->loop->renderNs);
+    string $gpu = formatGpu($sample->loop->gpuNs, $sample->loop->gpuNs > 0.0);
     string $vram = formatVram($sample->memory->used, $sample->memory->budget);
     array<HudRow> $rows = array<HudRow>();
     $rows[] = HudRow("FPS: {$fps:>4}", 'fps', $fpsRaw as float32, true, false);
@@ -71,6 +72,7 @@ public function formatRows(const Sample& $sample) : array<HudRow>
     $rows[] = HudRow("UT: {$ut}", 'ut', $sample->loop->tickNs as float32, true, true);
     $rows[] = HudRow("FT: {$ft}", 'ft', $sample->loop->frameNs as float32, true, true);
     $rows[] = HudRow("RT: {$rt}", 'rt', $sample->loop->renderNs as float32, true, true);
+    $rows[] = HudRow("GPU: {$gpu}", 'gpu', $sample->loop->gpuNs as float32, true, true);
     $rows[] = HudRow("VRAM: {$vram}", 'vram', $sample->memory->used as float32, true, true);
     usize $allocs = $sample->allocations;
 
@@ -82,39 +84,35 @@ public function formatRows(const Sample& $sample) : array<HudRow>
 }
 
 /**
- * One tab as overlay lines: section headers, metrics, then pass rows.
+ * One tab as overlay lines: notes, section headers, metrics, then the pass tree in its own order,
+ * showing pass rows down to `$maxDepth` only. The default shows every row a profile can hold.
  */
-public function formatTab(const Tab& $tab) : array<string>
+public function formatTab(const Tab& $tab, int32 $maxDepth = visu::profile::MAX_DEPTH) : array<string>
 {
     array<string> $lines = array<string>();
-    array<Section> $sections = $tab->sections;
-    foreach ($sections as $sec) {
-        if (!$sec->id->empty()) {
-            $lines[] = $sec->id;
-        }
-
-        array<Metric> $metrics = $sec->metrics;
-        foreach ($metrics as $m) {
-            string $line = formatMetric($m);
-            if ($sec->id->empty()) {
-                $lines[] = $line;
-            } else {
-                $lines[] = "  {$line}";
-            }
-        }
-    }
-
-    array<PassTiming> $passes = sortPasses($tab->passes);
-    foreach ($passes as $p) {
-        $lines[] = formatPass($p);
-        array<Metric> $extras = $p->extras;
-        foreach ($extras as $m) {
-            string $extra = formatMetric($m);
-            $lines[] = "    {$extra}";
-        }
+    array<TabBodyItem> $items = tabBodyItems($tab, $tab->passes, 0.0, $maxDepth);
+    foreach ($items as $item) {
+        match ($item) {
+            TabBodyItem::line($text) => {
+                $lines[] = $text;
+            },
+            TabBodyItem::row($p, $text, $bars) => {
+                appendPassLines($lines, $p);
+            },
+        };
     }
 
     return $lines;
+}
+
+internal function appendPassLines(array<string>& $lines, PassTiming $p) : void
+{
+    $lines[] = formatPass($p);
+    array<Metric> $extras = $p->extras;
+    foreach ($extras as $m) {
+        string $extra = formatMetric($m);
+        $lines[] = "    {$extra}";
+    }
 }
 
 public function formatMetric(const Metric& $m) : string
@@ -128,24 +126,59 @@ public function formatMetric(const Metric& $m) : string
     return "{$m->name}: {$value}";
 }
 
-public function formatPass(const PassTiming& $p) : string
+/**
+ * One tree row: name behind its tree connectors (plain indent when `$tree` is false and the panel
+ * draws the lines itself), the rolling average when the window has data (else the last frame), a
+ * dash for GPU when no encoder ran under the scope, `xN` for folded siblings.
+ */
+public function formatPass(const PassTiming& $p, bool $tree = true) : string
 {
-    string $name = padPassName($p->name);
-    string $cpu = formatNs($p->cpuNs);
-    string $gpu = formatGpu($p->gpuNs);
+    string $name = padPassName(indentPassName($p, $tree));
+    string $cpu = formatNs(shownCpu($p));
+    string $gpu = formatGpu(shownGpu($p), $p->gpuKnown);
     string $draws = formatCount($p->draw->draws as float64);
     string $tri = formatGeom($p->draw->triangles);
-    return "{$name}  CPU: {$cpu}  GPU: {$gpu}  draws: {$draws}  tri: {$tri}";
+    string $calls = formatCalls($p->calls);
+    return "{$name}  CPU: {$cpu}  GPU: {$gpu}  draws: {$draws}  tri: {$tri}{$calls}";
 }
 
-public function sortPasses(array<PassTiming> $passes) : array<PassTiming>
+/**
+ * Console row: avg / max for CPU and GPU over the window.
+ */
+public function formatPassWindow(const PassTiming& $p) : string
 {
-    array<PassTiming> $out = array<PassTiming>();
-    foreach ($passes as $p) {
-        $out = insertPass($out, $p);
+    string $name = padPassName(indentPassName($p, true));
+    string $cpuAvg = formatNs(shownCpu($p));
+    string $cpuMax = formatNs(shownMax($p->maxCpuNs, $p->cpuNs));
+    string $gpuAvg = formatGpu(shownGpu($p), $p->gpuKnown);
+    string $gpuMax = formatGpu(shownMax($p->maxGpuNs, $p->gpuNs), $p->gpuKnown);
+    string $calls = formatCalls($p->calls);
+    return "{$name}  CPU: {$cpuAvg} / {$cpuMax}  GPU: {$gpuAvg} / {$gpuMax}{$calls}";
+}
+
+/**
+ * Rolling average when the window has data, else the last frame.
+ */
+public function shownCpu(const PassTiming& $p) : float64
+{
+    if ($p->avgCpuNs > 0.0) {
+        return $p->avgCpuNs;
     }
 
-    return $out;
+    return $p->cpuNs;
+}
+
+public function shownGpu(const PassTiming& $p) : float64
+{
+    if (!$p->gpuKnown) {
+        return 0.0;
+    }
+
+    if ($p->avgGpuNs > 0.0) {
+        return $p->avgGpuNs;
+    }
+
+    return $p->gpuNs;
 }
 
 public function findTab(const Sample& $sample, string $id) : Tab?
@@ -252,49 +285,86 @@ internal function formatGeom(int64 $n) : string
     return "{$n:>8}";
 }
 
-internal function formatGpu(float64 $ns) : string
+internal function formatGpu(float64 $ns, bool $known) : string
 {
-    if ($ns <= 0.0) {
+    if (!$known || $ns <= 0.0) {
         return '       —  ';
     }
 
     return formatNs($ns);
 }
 
-internal function padPassName(string $name) : string
+internal function shownMax(float64 $max, float64 $last) : float64
 {
-    if ($name->size() > 16) {
-        return $name->sub(0, 16);
+    if ($max > 0.0) {
+        return $max;
     }
 
-    return str::rpad($name, 16, 32 as uint8);
+    return $last;
 }
 
-internal function insertPass(array<PassTiming> $passes, PassTiming $p) : array<PassTiming>
+internal function formatCalls(int32 $calls) : string
 {
-    array<PassTiming> $out = array<PassTiming>();
-    bool $placed = false;
-    foreach ($passes as $have) {
-        if (!$placed && passBefore($p, $have)) {
-            $out[] = $p;
-            $placed = true;
+    if ($calls <= 1) {
+        return '';
+    }
+
+    return "  x{$calls}";
+}
+
+/**
+ * Characters one tree level takes in front of a name; the panel's bars and guide lines use the
+ * same cell so they line up with the text.
+ */
+public const int32 TREE_CELL = 3;
+internal const usize PASS_NAME_W = 26;
+
+/**
+ * `render` stays flush; a child gets `|  ` under every ancestor that continues, then `|- ` or
+ * `` `- `` for its own connector. Without `$tree` the same columns are blank.
+ */
+internal function indentPassName(const PassTiming& $p, bool $tree) : string
+{
+    if ($p->depth <= 0) {
+        return $p->name;
+    }
+
+    string $prefix = '';
+    array<bool> $guides = $p->guides;
+    int32 $k = 1;
+
+    while ($k < $p->depth) {
+        bool $on = false;
+
+        if (($k as usize) < $guides->count()) {
+            $on = $guides[$k as usize];
         }
 
-        $out[] = $have;
+        if ($tree && $on) {
+            $prefix->append('|  ');
+        } else {
+            $prefix->append('   ');
+        }
+
+        $k = $k + 1;
     }
 
-    if (!$placed) {
-        $out[] = $p;
+    if (!$tree) {
+        $prefix->append('   ');
+    } else if ($p->last) {
+        $prefix->append('`- ');
+    } else {
+        $prefix->append('|- ');
     }
 
-    return $out;
+    return "{$prefix}{$p->name}";
 }
 
-internal function passBefore(const PassTiming& $a, const PassTiming& $b) : bool
+internal function padPassName(string $name) : string
 {
-    if ($a->gpuNs != $b->gpuNs) {
-        return $a->gpuNs > $b->gpuNs;
+    if ($name->size() > PASS_NAME_W) {
+        return $name->sub(0, PASS_NAME_W);
     }
 
-    return $a->cpuNs > $b->cpuNs;
+    return str::rpad($name, PASS_NAME_W, 32 as uint8);
 }

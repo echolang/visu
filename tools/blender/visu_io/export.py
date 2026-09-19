@@ -120,15 +120,20 @@ except ImportError:  # pragma: no cover
 
 
 def export_objects(context) -> list:
-    """Meshes to put in the glb: selection (with children), else VISU asset objects."""
+    """Meshes to put in the glb: selection (with children), else VISU asset objects.
+
+    Armature and empty ancestors come along so bone-parented clips survive `use_selection`.
+    """
     if bpy is None:
         return []
     selected = list(context.selected_objects)
     if selected:
-        return _with_mesh_children(selected)
+        return _with_ancestors(_with_mesh_children(selected))
     tagged = []
     for obj in context.scene.objects:
         if obj.type != "MESH":
+            continue
+        if getattr(obj, "hide_viewport", False) or not obj.visible_get():
             continue
         if getattr(obj, "visu_asset", False):
             tagged.append(obj)
@@ -137,7 +142,20 @@ def export_objects(context) -> list:
             if getattr(col, "visu_asset", False):
                 tagged.append(obj)
                 break
-    return _with_mesh_children(tagged)
+    return _with_ancestors(_with_mesh_children(tagged))
+
+
+def _with_ancestors(objects: list) -> list:
+    seen: set[int] = {id(obj) for obj in objects}
+    extra = []
+    for obj in objects:
+        parent = obj.parent
+        while parent is not None:
+            if id(parent) not in seen:
+                extra.append(parent)
+                seen.add(id(parent))
+            parent = parent.parent
+    return list(objects) + extra
 
 
 def _with_mesh_children(roots: list) -> list:
@@ -219,11 +237,29 @@ def dump_from_blender(objects: list, glb_path: Path) -> tuple[dict, dict, dict]:
     return assembly, materials, vtex
 
 
+def _object_animated(obj) -> bool:
+    ad = getattr(obj, "animation_data", None)
+    if ad is not None and (ad.action or len(ad.nla_tracks) > 0):
+        return True
+    if getattr(obj, "parent_type", "") == "BONE":
+        arm = obj.parent
+        if arm is not None and _object_animated(arm):
+            return True
+    parent = obj.parent
+    while parent is not None:
+        if _object_animated(parent):
+            return True
+        parent = parent.parent
+    return False
+
+
 def _parts_from_objects(objects: list, folder: str, glb_stem: str) -> list[dict[str, Any]]:
     from . import lod
 
     grouped: dict[str, dict[str, Any]] = {}
     for obj in objects:
+        if getattr(obj, "type", "") != "MESH":
+            continue
         coll_part = None
         for col in obj.users_collection:
             if getattr(col, "visu_part", False):
@@ -238,7 +274,7 @@ def _parts_from_objects(objects: list, folder: str, glb_stem: str) -> list[dict[
                     "lod": _parse_lods(getattr(coll_part, "visu_lod_distances", "")),
                     "lodBias": float(getattr(coll_part, "visu_lod_bias", 1) or 1),
                     "cullDistance": float(getattr(coll_part, "visu_cull_distance", 0) or 0),
-                    "dynamic": bool(getattr(coll_part, "visu_dynamic", False)),
+                    "dynamic": bool(getattr(coll_part, "visu_dynamic", False) or _object_animated(obj)),
                     "impostor": bool(getattr(coll_part, "visu_impostor", False)),
                     "mat_names": [],
                 },
@@ -252,11 +288,12 @@ def _parts_from_objects(objects: list, folder: str, glb_stem: str) -> list[dict[
                     "lod": [],
                     "lodBias": 1.0,
                     "cullDistance": 0.0,
-                    "dynamic": False,
+                    "dynamic": bool(_object_animated(obj)),
                     "impostor": False,
                     "mat_names": [],
                 },
             )
+            spec["dynamic"] = bool(spec.get("dynamic") or _object_animated(obj))
         for slot in obj.material_slots:
             if slot.material is not None and slot.material.name not in spec["mat_names"]:
                 spec["mat_names"].append(slot.material.name)
@@ -376,7 +413,11 @@ def _follow_image(socket, depth: int = 0) -> tuple[Any, int | None]:
     node = link.from_node
     ntype = getattr(node, "type", "")
     if ntype == "TEX_IMAGE":
-        return getattr(node, "image", None), None
+        img = getattr(node, "image", None)
+        sock_name = getattr(link.from_socket, "name", "")
+        if sock_name in ("Alpha", "A"):
+            return img, 3
+        return img, None
     if ntype == "NORMAL_MAP":
         return _follow_image(node.inputs.get("Color"), depth + 1)
     if ntype in ("SEPARATE_COLOR", "SEPARATE_RGB", "SEPRGB"):

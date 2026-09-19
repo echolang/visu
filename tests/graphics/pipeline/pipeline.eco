@@ -105,18 +105,27 @@ test pipeline_execute_order
         }
     ));
 
+    visu::profile::Profiler $prof = visu::profile::Profiler();
+    visu::profile::installProfiler($prof);
+    $prof->beginFrame();
     guard $pipeline->execute( 0) else ($e) {
         die($e->message());
     }
+    $prof->endFrame();
     Log $out = $frame->get<Log>();
     assert($out->names->count() == 2, 'two');
     assert($out->names[0] == 'a', 'first');
     assert($out->names[1] == 'b', 'second');
-    array<visu::graphics::PassProfile> $timings = $pipeline->timings();
-    assert($timings->count() == 2, 'timed');
-    assert($timings[0]->name == 'a', 'name a');
-    assert($timings[1]->name == 'b', 'name b');
-    assert($timings[0]->cpuNs >= 0.0, 'cpu');
+    #[if: !VISU_RELEASE]
+    visu::profile::FrameProfile $timed = guard $prof->complete() else {
+        die('no frame profile');
+    }
+    visu::profile::ScopeNode $root = $timed->root();
+    assert($root->children->count() == 2, 'timed');
+    assert($timed->nodes[$root->children[0] as usize]->name == 'a', 'name a');
+    assert($timed->nodes[$root->children[1] as usize]->name == 'b', 'name b');
+    assert($timed->nodes[$root->children[0] as usize]->cpuNs >= 0.0, 'cpu');
+    #[end]
 }
 
 test pipeline_unread_created_target_is_an_error

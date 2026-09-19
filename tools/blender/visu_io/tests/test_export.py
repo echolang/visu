@@ -67,6 +67,13 @@ def test_compact_shorthand_when_part_matches_stem():
     assert compact["model"] == "props/x/robot"
 
 
+def test_compact_shorthand_keeps_impostor():
+    parts = [{"name": "card", "slots": {}, "impostor": True}]
+    asm = export.assembly_for_parts("card", "props/x", parts)
+    compact = vmod.compact(asm, stem="card")
+    assert compact.get("impostor") is True
+
+
 def test_vmat_from_maps_omits_defaults():
     data = export.vmat_from_maps(
         {"albedo": "a", "normal": "n"},

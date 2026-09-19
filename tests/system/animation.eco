@@ -1,0 +1,133 @@
+/**
+ * AnimationPlayer wrap and AnimationSystem sampling onto a named child.
+ */
+
+use json;
+use visu::asset::{AnimTrack, Assembly, Clip, parseAssembly};
+use visu::components::{AnimationPlayer, AnimationWrap, AssemblyInstance, spawnAssembly};
+use visu::ecs::{Entities, Entity, Schedule};
+use visu::geo::Transform;
+use visu::math::{Quat, Vec3, equal};
+use visu::system::AnimationSystem;
+
+internal function turnClips() : array<Clip>
+{
+    array<float32> $times = array<float32>();
+    $times[] = 0.0f;
+    $times[] = 1.0f;
+    array<float32> $values = array<float32>();
+    Quat $a = Quat();
+    Quat $b = Quat(angleAxis: std::math::PI_F32 / 2.0f, Vec3(0.0f, 1.0f, 0.0f));
+    $values[] = $a->x; $values[] = $a->y; $values[] = $a->z; $values[] = $a->w;
+    $values[] = $b->x; $values[] = $b->y; $values[] = $b->z; $values[] = $b->w;
+    AnimTrack $track = AnimTrack('spin', .rotation, .linear, $times, $values);
+    array<AnimTrack> $tracks = array<AnimTrack>();
+    $tracks[] = $track;
+    array<Clip> $clips = array<Clip>();
+    $clips[] = Clip('turn', 1.0f, $tracks);
+    return $clips;
+}
+
+test animation_player_play_pause_seek_reverse_loop
+{
+    AnimationPlayer $p = AnimationPlayer(turnClips());
+    $p->wrap = .loop;
+    $p->play('turn');
+    assert($p->index == 0, 'named clip');
+    $p->advance(0.25f);
+    assert($p->playing, 'playing');
+    assert(equal($p->time, 0.25f), 'quarter');
+    $p->pause();
+    $p->advance(1.0f);
+    assert(equal($p->time, 0.25f), 'pause holds');
+    $p->play();
+    $p->advance(1.0f);
+    assert(equal($p->time, 0.25f), 'looped');
+    $p->seek(0.5f);
+    assert(equal($p->time, 0.5f), 'seek');
+    $p->reverse();
+    assert(equal($p->speed, -1.0f), 'reversed');
+    $p->stop();
+    assert(!$p->playing && equal($p->time, 0.0f), 'stop');
+}
+
+test animation_player_once_stops
+{
+    AnimationPlayer $p = AnimationPlayer(turnClips());
+    $p->wrap = .once;
+    $p->play();
+    assert($p->index < 0, 'play() runs every clip');
+    $p->advance(2.0f);
+    assert(!$p->playing, 'stopped');
+    assert(equal($p->time, 1.0f), 'clamped to end');
+}
+
+test animation_system_play_samples_every_clip
+{
+    json::Value $root = guard json::parse('{"parts":{"spin":{"model":"x/spin","dynamic":true},"ring":{"model":"x/ring","dynamic":true}},"nodes":[{"name":"spin","part":"spin"},{"name":"ring","part":"ring"}]}') else ($e) {
+        die($e->message());
+    }
+    Assembly $doc = guard parseAssembly('x', $root, '') else ($e) {
+        die($e->message());
+    }
+    array<Clip> $clips = turnClips();
+    array<float32> $times = array<float32>();
+    $times[] = 0.0f;
+    $times[] = 1.0f;
+    array<float32> $values = array<float32>();
+    $values[] = 1.0f;
+    $values[] = 0.0f;
+    $values[] = 0.0f;
+    $values[] = 2.0f;
+    $values[] = 0.0f;
+    $values[] = 0.0f;
+    AnimTrack $move = AnimTrack('ring', .translation, .linear, $times, $values);
+    array<AnimTrack> $tracks = array<AnimTrack>();
+    $tracks[] = $move;
+    $clips[] = Clip('slide', 1.0f, $tracks);
+    $doc->clips = $clips;
+    Entities $world = Entities();
+    Entity $rootId = spawnAssembly($world, $doc, Transform());
+    AnimationPlayer& $player = $world->get<AnimationPlayer>($rootId);
+    $player->play();
+    AnimationSystem $sys = AnimationSystem(0.5f);
+    $sys->update($world);
+    AssemblyInstance $inst = $world->get<AssemblyInstance>($rootId);
+    Entity $spin = guard $inst->node('spin') else {
+        die('spin');
+    }
+    Entity $ring = guard $inst->node('ring') else {
+        die('ring');
+    }
+    Transform $ts = $world->get<Transform>($spin);
+    Transform $tr = $world->get<Transform>($ring);
+    Quat $mid = Quat(angleAxis: std::math::PI_F32 / 4.0f, Vec3(0.0f, 1.0f, 0.0f));
+    assert(equal($ts->orientation, $mid, 0.01f), 'spin clip');
+    assert(equal($tr->position->x, 1.5f, 0.01f), 'slide clip');
+}
+
+test animation_system_samples_named_node
+{
+    json::Value $root = guard json::parse('{"parts":{"spin":{"model":"x/spin","dynamic":true}},"nodes":[{"name":"spin","part":"spin","position":[0,1,0]}]}') else ($e) {
+        die($e->message());
+    }
+    Assembly $doc = guard parseAssembly('x', $root, '') else ($e) {
+        die($e->message());
+    }
+    $doc->clips = turnClips();
+    Entities $world = Entities();
+    Entity $rootId = spawnAssembly($world, $doc, Transform());
+    AnimationPlayer& $player = $world->get<AnimationPlayer>($rootId);
+    $player->play();
+    AnimationSystem $sys = AnimationSystem(0.5f);
+    Schedule $schedule = Schedule();
+    $sys->schedule($schedule);
+    $sys->update($world);
+    AssemblyInstance $inst = $world->get<AssemblyInstance>($rootId);
+    Entity $spin = guard $inst->node('spin') else {
+        die('spin node');
+    }
+    Transform $t = $world->get<Transform>($spin);
+    Quat $mid = Quat(angleAxis: std::math::PI_F32 / 4.0f, Vec3(0.0f, 1.0f, 0.0f));
+    assert(equal($t->orientation, $mid, 0.01f), 'sampled at 0.5s');
+}

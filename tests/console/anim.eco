@@ -1,0 +1,58 @@
+/**
+ * Pure half of AnimConsole: the `anim` grammar.
+ */
+
+use visu::console::{AnimConsoleAction, parseAnimConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal function animConsole(const string& $line) : AnimConsoleAction
+{
+    return parseAnimConsole(ConsoleCommandSignal($line));
+}
+
+internal function isUsage(AnimConsoleAction $action) : bool
+{
+    return match ($action) {
+        AnimConsoleAction::usage => true,
+        else => false,
+    };
+}
+
+test anim_console_bare_verb_is_status
+{
+    bool $status = match (animConsole('anim')) {
+        AnimConsoleAction::status => true,
+        else => false,
+    };
+    assert($status, 'anim alone is status');
+    assert(isUsage(animConsole('model')), 'another verb is not ours');
+    assert(isUsage(animConsole('anim nonsense')), 'unknown is usage');
+}
+
+test anim_console_play_pause_seek_speed
+{
+    bool $play = match (animConsole('anim play')) {
+        AnimConsoleAction::play => true,
+        else => false,
+    };
+    string $named = match (animConsole('anim play walk')) {
+        AnimConsoleAction::playNamed($n) => $n,
+        else => '',
+    };
+    bool $pause = match (animConsole('anim pause')) {
+        AnimConsoleAction::pause => true,
+        else => false,
+    };
+    float32 $seek = match (animConsole('anim seek 1.5')) {
+        AnimConsoleAction::seek($s) => $s,
+        else => -1.0f,
+    };
+    float32 $speed = match (animConsole('anim speed -1')) {
+        AnimConsoleAction::speed($s) => $s,
+        else => 0.0f,
+    };
+    assert($play && $pause, 'play pause');
+    assert($named == 'walk', 'play named clip');
+    assert($seek > 1.4f && $seek < 1.6f, 'seek');
+    assert($speed < 0.0f, 'speed');
+}

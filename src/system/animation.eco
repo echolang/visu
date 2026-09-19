@@ -1,0 +1,97 @@
+/**
+ * Samples `AnimationPlayer` clips onto the named child `Transform`s. Runs in update so the
+ * pose is ready before `ModelSystem.fill`. Dynamics pick the interpolated world matrix.
+ */
+
+namespace visu::system;
+
+use visu::asset::{Clip, applyTrack};
+use visu::components::{AnimationPlayer, AssemblyInstance};
+use visu::ecs::{Entities, Entity, Schedule, System};
+use visu::geo::Transform;
+use visu::graphics::RenderContext;
+
+public class AnimationSystem : System
+{
+    /**
+     * Seconds per update. Pass the game loop timestep; the default is 60 Hz.
+     */
+    public float32 $dt;
+
+    public constructor(float32 $dt = 0.016666668f)
+    {
+        $this->dt = $dt;
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->render = false;
+    }
+
+    public function update(Entities $entities) : void
+    {
+        foreach ($entities->view<AnimationPlayer>() as $id => &$player) {
+            samplePlayer($entities, $id, $player, $this->dt);
+        }
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+    }
+}
+
+internal function samplePlayer(Entities $entities, Entity $id, AnimationPlayer& $player, float32 $dt) : void
+{
+    if (!$entities->has<AssemblyInstance>($id)) {
+        return;
+    }
+
+    AssemblyInstance& $inst = $entities->get<AssemblyInstance>($id);
+    $player->advance($dt);
+    if ($player->index < 0) {
+        if (!$player->playing) {
+            return;
+        }
+
+        foreach ($player->clips as $clip) {
+            applyClip($entities, $inst, $clip, $player->time);
+        }
+
+        return;
+    }
+
+    Clip $clip = guard $player->clip() else {
+        return;
+    }
+    applyClip($entities, $inst, $clip, $player->time);
+}
+
+internal function applyClip(
+    Entities $entities,
+    AssemblyInstance& $inst,
+    const Clip& $clip,
+    float32 $time
+) : void
+{
+    foreach ($clip->tracks as $track) {
+        Entity? $target = $inst->node($track->node);
+        Entity $e = guard $target else {
+            continue;
+        }
+        if (!$entities->has<Transform>($e)) {
+            continue;
+        }
+
+        Transform& $t = $entities->get<Transform>($e);
+        $t->storePrevious();
+        applyTrack($track, $time, $t);
+    }
+}

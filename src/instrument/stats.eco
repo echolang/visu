@@ -15,6 +15,8 @@ public struct LoopStats
     public float64 $tickNs = 0.0;
     public float64 $tickCount = 0.0;
     public float64 $renderNs = 0.0;
+    /** whole-submit GPU time of the last completed profile frame; 0 when unknown */
+    public float64 $gpuNs = 0.0;
     public float32 $compensation = 0.0f;
 }
 
@@ -63,15 +65,31 @@ public struct Section
 }
 
 /**
- * One render-graph pass. `$gpuNs` is 0 when the backend has no timestamp (overlay prints —).
+ * One row of the graph tab: a profile scope, flattened depth-first. `$gpuNs` is 0 and `$gpuKnown`
+ * false when no encoder ran under the scope (overlay prints —). Avg / max are the rolling window.
  */
 public struct PassTiming
 {
     public string $name = '';
+    /** scope path such as `render/deferred.ssao/blur`; empty for push-path rows */
+    public string $path = '';
+    /** 0 for `update` / `render` / `present`, 1 for passes, 2 for pass sub-scopes */
+    public int32 $depth = 0;
+    public int32 $calls = 1;
+    public int32 $childCount = 0;
     public float64 $cpuNs = 0.0;
     public float64 $gpuNs = 0.0;
+    public bool $gpuKnown = false;
+    public float64 $avgCpuNs = 0.0;
+    public float64 $avgGpuNs = 0.0;
+    public float64 $maxCpuNs = 0.0;
+    public float64 $maxGpuNs = 0.0;
     public DrawStats $draw = DrawStats();
     public array<Metric> $extras = array<Metric>();
+    /** one flag per ancestor level: true when that ancestor has later siblings, so its guide continues */
+    public array<bool> $guides = array<bool>();
+    /** last among its siblings: the connector closes instead of continuing down */
+    public bool $last = true;
 }
 
 /**
@@ -84,13 +102,16 @@ public class Tab
     public const int32 $order;
     public const array<Section> $sections;
     public const array<PassTiming> $passes;
+    /** free lines above the sections, such as `profiling compiled out (VISU_RELEASE)` */
+    public const array<string> $notes;
 
     public constructor(
         string $id,
         string $title,
         int32 $order,
         array<Section> $sections,
-        array<PassTiming> $passes
+        array<PassTiming> $passes,
+        array<string> $notes = array<string>()
     )
     {
         $this->id = $id;
@@ -98,5 +119,6 @@ public class Tab
         $this->order = $order;
         $this->sections = $sections;
         $this->passes = $passes;
+        $this->notes = $notes;
     }
 }

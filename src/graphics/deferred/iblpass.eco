@@ -156,9 +156,12 @@ public class IblPass : Pass
         int32 $step = $env->iblStep;
 
         if ($step == 0) {
+            visu::profile::begin('irradiance');
             guard $this->bakeIrradiance($ctx, $mesh, $cube, $sampler, $projection, $state->irradiance) else ($e) {
+                visu::profile::end();
                 return .error($e);
             }
+            visu::profile::end();
             $device->transitionTexture($state->irradiance, ResourceState::shaderRead);
         }
 
@@ -177,9 +180,12 @@ public class IblPass : Pass
         int32 $mip = $step;
 
         while ($mip < $end) {
+            visu::profile::begin('prefilter');
             guard $this->bakePrefilter($ctx, $mesh, $cube, $sampler, $projection, $state->prefilter, $mip) else ($e) {
+                visu::profile::end();
                 return .error($e);
             }
+            visu::profile::end();
             $mip = $mip + 1;
         }
 
@@ -195,9 +201,12 @@ public class IblPass : Pass
             Mesh $quad = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
                 return .quad($device);
             });
+            visu::profile::begin('brdf');
             guard $this->bakeBrdf($ctx, $quad) else ($e) {
+                visu::profile::end();
                 return .error($e);
             }
+            visu::profile::end();
             $device->transitionTexture($env->brdf, ResourceState::shaderRead);
             $env->brdfReady = true;
         }

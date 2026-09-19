@@ -251,14 +251,18 @@ public class ModelSystem : System
         GpuPass $twoSided = guard $this->doubleSided else {
             return .ok;
         }
+        visu::profile::begin('cull');
         $this->submitAll($entities, $camera, $ctx->compensation);
         $this->dca->build($camera->frustum, $camera->position);
+        visu::profile::end();
         bool $geometry = $this->dca->commandCount() > 0;
         if (!$geometry && $this->lines->empty()) {
             return .ok;
         }
 
+        visu::profile::begin('draw');
         RenderEncoder $enc = guard $ctx->beginRender($gbuffer->target) else ($e) {
+            visu::profile::end();
             return .error($e);
         }
         $this->renderer->bindCamera($enc);
@@ -278,6 +282,7 @@ public class ModelSystem : System
 
         $this->drawLines($enc);
         $enc->endRender();
+        visu::profile::end();
         return .ok;
     }
 

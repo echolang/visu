@@ -1,0 +1,58 @@
+/**
+ * One completed frame's profile. Fact: built once by the profiler, read by the instrument
+ * overlay, the console and dcapture. `$frame` is the Host frame index (what dumps and the
+ * manifest call the frame); `$gpuFrame` is the Device.frameIndex() the GPU spans were keyed by.
+ */
+
+namespace visu::profile;
+
+public class FrameProfile
+{
+    public const int32 $frame;
+    public const uint64 $gpuFrame;
+    /** the device could sample timestamps when this frame ran */
+    public const bool $gpuSupported;
+    /** GPU spans were merged in; false when the frame completed without them */
+    public const bool $gpuResolved;
+    /** whole-submit GPU time, 0 when absent */
+    public const float64 $submitNs;
+    public const array<ScopeNode> $nodes;
+
+    public constructor(
+        int32 $frame,
+        uint64 $gpuFrame,
+        bool $gpuSupported,
+        bool $gpuResolved,
+        float64 $submitNs,
+        array<ScopeNode> $nodes
+    )
+    {
+        $this->frame = $frame;
+        $this->gpuFrame = $gpuFrame;
+        $this->gpuSupported = $gpuSupported;
+        $this->gpuResolved = $gpuResolved;
+        $this->submitNs = $submitNs;
+        $this->nodes = $nodes;
+    }
+
+    public const function root() : ScopeNode
+    {
+        return $this->nodes[0];
+    }
+
+    public const function find(const string& $path) : ScopeNode?
+    {
+        foreach ($this->nodes as $n) {
+            if ($n->path == $path) {
+                return $n;
+            }
+        }
+
+        return null;
+    }
+
+    public const function childOf(int32 $parent, const string& $name) : int32
+    {
+        return visu::profile::childOf($this->nodes, $parent, $name);
+    }
+}

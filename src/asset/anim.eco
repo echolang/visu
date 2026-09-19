@@ -1,0 +1,479 @@
+/**
+ * Node TRS clip: named tracks sampled onto a `Transform`. Cooked into the assembly JSON, not a
+ * separate catalog kind. GPU skinning is a later consumer of the same tracks.
+ */
+
+namespace visu::asset;
+
+use json;
+use visu::geo::Transform;
+use visu::math::{Quat, Vec3, mix, slerp};
+
+public enum AnimPath
+{
+    case translation;
+    case rotation;
+    case scale;
+}
+
+public enum AnimInterp
+{
+    case step;
+    case linear;
+}
+
+/**
+ * One channel: times in seconds, values packed 3 (translation / scale) or 4 (rotation) floats per key.
+ */
+public class AnimTrack
+{
+    public string $node;
+    public AnimPath $path;
+    public AnimInterp $interp;
+    public array<float32> $times;
+    public array<float32> $values;
+
+    public constructor(
+        string $node,
+        AnimPath $path,
+        AnimInterp $interp,
+        array<float32> $times,
+        array<float32> $values
+    )
+    {
+        $this->node = $node;
+        $this->path = $path;
+        $this->interp = $interp;
+        $this->times = $times;
+        $this->values = $values;
+    }
+
+    public const function keys() : int32
+    {
+        return $this->times->count() as int32;
+    }
+
+    public const function stride() : int32
+    {
+        return match ($this->path) {
+            AnimPath::rotation => 4,
+            else => 3,
+        };
+    }
+}
+
+/**
+ * Shared clip. Many `AnimationPlayer`s hold this handle.
+ */
+public class Clip
+{
+    public const string $name;
+    public const float32 $duration;
+    public const array<AnimTrack> $tracks;
+
+    public constructor(string $name, float32 $duration, array<AnimTrack> $tracks)
+    {
+        $this->name = $name;
+        $this->duration = $duration;
+        $this->tracks = $tracks;
+    }
+}
+
+public function clipNamed(const array<Clip>& $clips, const string& $name) : Clip?
+{
+    foreach ($clips as $clip) {
+        if ($clip->name->equals($name)) {
+            return $clip;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Write translation, rotation or scale at `$time` onto `$t`. Missing keys leave that channel.
+ */
+public function applyTrack(const AnimTrack& $track, float32 $time, Transform& $t) : void
+{
+    if ($track->path == AnimPath::translation) {
+        Vec3? $v = sampleVec3($track, $time);
+        Vec3 $p = guard $v else {
+            return;
+        }
+        $t->position = $p;
+        return;
+    }
+
+    if ($track->path == AnimPath::rotation) {
+        Quat? $q = sampleQuat($track, $time);
+        Quat $r = guard $q else {
+            return;
+        }
+        $t->orientation = $r;
+        return;
+    }
+
+    Vec3? $v = sampleVec3($track, $time);
+    Vec3 $s = guard $v else {
+        return;
+    }
+    $t->scale = $s;
+}
+
+public function sampleVec3(const AnimTrack& $track, float32 $time) : Vec3?
+{
+    int32 $i0 = 0;
+    int32 $i1 = 0;
+    float32 $u = 0.0f;
+    if (!trackSpan($track, $time, $i0, $i1, $u)) {
+        return null;
+    }
+
+    Vec3 $a = trackVec3($track, $i0);
+    if ($track->interp == AnimInterp::step || $i0 == $i1) {
+        return $a;
+    }
+
+    return mix($a, trackVec3($track, $i1), $u);
+}
+
+public function sampleQuat(const AnimTrack& $track, float32 $time) : Quat?
+{
+    int32 $i0 = 0;
+    int32 $i1 = 0;
+    float32 $u = 0.0f;
+    if (!trackSpan($track, $time, $i0, $i1, $u)) {
+        return null;
+    }
+
+    Quat $a = trackQuat($track, $i0);
+    if ($track->interp == AnimInterp::step || $i0 == $i1) {
+        return $a;
+    }
+
+    return slerp($a, trackQuat($track, $i1), $u);
+}
+
+/**
+ * Fold `$time` into `[0, $duration)` for looping. Zero duration stays at 0.
+ */
+public function loopTime(float32 $time, float32 $duration) : float32
+{
+    if ($duration <= 0.0f) {
+        return 0.0f;
+    }
+
+    float32 $m = $time - $duration * (std::math::floor(($time / $duration) as float64) as float32);
+    if ($m < 0.0f) {
+        $m = $m + $duration;
+    }
+
+    if ($m >= $duration) {
+        return 0.0f;
+    }
+
+    return $m;
+}
+
+/**
+ * Triangle-wave fold into `[0, $duration]` for ping-pong seek.
+ */
+public function pingpongTime(float32 $time, float32 $duration) : float32
+{
+    if ($duration <= 0.0f) {
+        return 0.0f;
+    }
+
+    float32 $cycle = $duration * 2.0f;
+    float32 $m = loopTime($time, $cycle);
+    if ($m > $duration) {
+        return $duration - ($m - $duration);
+    }
+
+    return $m;
+}
+
+public function parseClips(const string& $id, json::Value $root) : result<array<Clip>, AssetError>
+{
+    json::Value? $got = $root->get('clips');
+    json::Value $arrVal = guard $got else {
+        return .ok(array<Clip>());
+    }
+    array<json::Value>? $list = $arrVal->asArray();
+    array<json::Value> $items = guard $list else {
+        return .error(.decode($id, 'clips must be an array'));
+    }
+    array<Clip> $out = array<Clip>();
+    foreach ($items as $item) {
+        Clip $clip = guard parseClip($id, $item) else ($e) {
+            return .error($e);
+        }
+        $out[] = $clip;
+    }
+
+    return .ok($out);
+}
+
+public function parseClip(const string& $id, json::Value $v) : result<Clip, AssetError>
+{
+    if (!$v->isObject()) {
+        return .error(.decode($id, 'clip must be an object'));
+    }
+
+    string $name = vmatStr($v, 'name', '');
+    if ($name->empty()) {
+        return .error(.decode($id, 'clip needs a name'));
+    }
+
+    float32 $duration = vmatF32($v, 'duration', 0.0f);
+    json::Value? $tracksVal = $v->get('tracks');
+    json::Value $tracksArr = guard $tracksVal else {
+        return .error(.decode($id, "clip '{$name}' needs tracks"));
+    }
+    array<json::Value>? $list = $tracksArr->asArray();
+    array<json::Value> $items = guard $list else {
+        return .error(.decode($id, "clip '{$name}' tracks must be an array"));
+    }
+    array<AnimTrack> $tracks = array<AnimTrack>();
+    foreach ($items as $item) {
+        AnimTrack $track = guard parseTrack($id, $item) else ($e) {
+            return .error($e);
+        }
+        $tracks[] = $track;
+        float32 $last = trackEnd($track);
+        if ($last > $duration) {
+            $duration = $last;
+        }
+    }
+
+    return .ok(Clip($name, $duration, $tracks));
+}
+
+public function clipsJson(const array<Clip>& $clips) : json::Value
+{
+    json::Value $arr = json::arr();
+    foreach ($clips as $clip) {
+        $arr[] = clipJson($clip);
+    }
+
+    return $arr;
+}
+
+internal function clipJson(const Clip& $clip) : json::Value
+{
+    json::Value $v = json::object();
+    $v['name'] = json::str($clip->name);
+    $v['duration'] = json::float($clip->duration as float64);
+    json::Value $tracks = json::arr();
+    foreach ($clip->tracks as $track) {
+        json::Value $rec = json::object();
+        $rec['node'] = json::str($track->node);
+        $rec['path'] = json::str(pathName($track->path));
+        $rec['interpolation'] = json::str(interpName($track->interp));
+        $rec['times'] = floatsJson($track->times);
+        $rec['values'] = floatsJson($track->values);
+        $tracks[] = $rec;
+    }
+
+    $v['tracks'] = $tracks;
+    return $v;
+}
+
+internal function parseTrack(const string& $id, json::Value $v) : result<AnimTrack, AssetError>
+{
+    if (!$v->isObject()) {
+        return .error(.decode($id, 'track must be an object'));
+    }
+
+    string $node = vmatStr($v, 'node', '');
+    if ($node->empty()) {
+        return .error(.decode($id, 'track needs a node'));
+    }
+
+    AnimPath? $path = parsePath(vmatStr($v, 'path', ''));
+    AnimPath $p = guard $path else {
+        return .error(.decode($id, "track '{$node}' path must be translation, rotation or scale"));
+    }
+    AnimInterp $interp = parseInterp(vmatStr($v, 'interpolation', 'linear'));
+    array<float32> $times = guard parseFloats($id, $v, 'times') else ($e) {
+        return .error($e);
+    }
+    array<float32> $values = guard parseFloats($id, $v, 'values') else ($e) {
+        return .error($e);
+    }
+    int32 $stride = match ($p) {
+        AnimPath::rotation => 4,
+        else => 3,
+    };
+    if ($times->count() == 0) {
+        return .error(.decode($id, "track '{$node}' has no keys"));
+    }
+
+    if (($values->count() as int32) != ($times->count() as int32) * $stride) {
+        return .error(.decode($id, "track '{$node}' value count does not match keys"));
+    }
+
+    return .ok(AnimTrack($node, $p, $interp, $times, $values));
+}
+
+internal function parseFloats(const string& $id, json::Value $v, const string& $key) : result<array<float32>, AssetError>
+{
+    json::Value? $got = $v->get($key);
+    json::Value $arrVal = guard $got else {
+        return .error(.decode($id, "track {$key} missing"));
+    }
+    array<json::Value>? $list = $arrVal->asArray();
+    array<json::Value> $items = guard $list else {
+        return .error(.decode($id, "track {$key} must be an array"));
+    }
+    array<float32> $out = array<float32>();
+    foreach ($items as $item) {
+        float64? $f = $item->asFloat();
+        float64 $n = guard $f else {
+            return .error(.decode($id, "track {$key} must be numbers"));
+        }
+        $out[] = $n as float32;
+    }
+
+    return .ok($out);
+}
+
+internal function parsePath(const string& $raw) : AnimPath?
+{
+    if ($raw->equals('translation')) {
+        return .translation;
+    }
+
+    if ($raw->equals('rotation')) {
+        return .rotation;
+    }
+
+    if ($raw->equals('scale')) {
+        return .scale;
+    }
+
+    return null;
+}
+
+internal function parseInterp(const string& $raw) : AnimInterp
+{
+    string $lower = str::lower($raw);
+    if ($lower->equals('step')) {
+        return .step;
+    }
+
+    return .linear;
+}
+
+internal function pathName(AnimPath $path) : string
+{
+    return match ($path) {
+        AnimPath::translation => 'translation',
+        AnimPath::rotation => 'rotation',
+        AnimPath::scale => 'scale',
+    };
+}
+
+internal function interpName(AnimInterp $interp) : string
+{
+    return match ($interp) {
+        AnimInterp::step => 'step',
+        AnimInterp::linear => 'linear',
+    };
+}
+
+internal function floatsJson(const array<float32>& $vals) : json::Value
+{
+    json::Value $a = json::arr();
+    foreach ($vals as $v) {
+        float32 $n = $v;
+        $a[] = json::float($n as float64);
+    }
+
+    return $a;
+}
+
+internal function trackEnd(const AnimTrack& $track) : float32
+{
+    int32 $n = $track->keys();
+    if ($n < 1) {
+        return 0.0f;
+    }
+
+    return $track->times[($n - 1) as usize];
+}
+
+internal function trackSpan(
+    const AnimTrack& $track,
+    float32 $time,
+    int32& $i0,
+    int32& $i1,
+    float32& $u
+) : bool
+{
+    int32 $n = $track->keys();
+    if ($n < 1) {
+        return false;
+    }
+
+    int32 $stride = $track->stride();
+    if (($track->values->count() as int32) < $n * $stride) {
+        return false;
+    }
+
+    if ($n == 1 || $time <= $track->times[0]) {
+        $i0 = 0;
+        $i1 = 0;
+        $u = 0.0f;
+        return true;
+    }
+
+    int32 $last = $n - 1;
+    if ($time >= $track->times[$last as usize]) {
+        $i0 = $last;
+        $i1 = $last;
+        $u = 0.0f;
+        return true;
+    }
+
+    int32 $lo = 0;
+    int32 $hi = $last;
+    while ($lo + 1 < $hi) {
+        int32 $mid = ($lo + $hi) / 2;
+        if ($track->times[$mid as usize] <= $time) {
+            $lo = $mid;
+        } else {
+            $hi = $mid;
+        }
+    }
+
+    $i0 = $lo;
+    $i1 = $hi;
+    float32 $t0 = $track->times[$lo as usize];
+    float32 $t1 = $track->times[$hi as usize];
+    float32 $dt = $t1 - $t0;
+    if ($dt <= 0.0000001f) {
+        $u = 0.0f;
+    } else {
+        $u = ($time - $t0) / $dt;
+    }
+
+    return true;
+}
+
+internal function trackVec3(const AnimTrack& $track, int32 $i) : Vec3
+{
+    int32 $s = $i * 3;
+    return Vec3($track->values[$s as usize], $track->values[($s + 1) as usize], $track->values[($s + 2) as usize]);
+}
+
+internal function trackQuat(const AnimTrack& $track, int32 $i) : Quat
+{
+    int32 $s = $i * 4;
+    return Quat(
+        $track->values[$s as usize],
+        $track->values[($s + 1) as usize],
+        $track->values[($s + 2) as usize],
+        $track->values[($s + 3) as usize]
+    );
+}

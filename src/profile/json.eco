@@ -1,0 +1,92 @@
+/**
+ * `profile.f<N>.json`: one completed frame as a tree, with the rolling window's avg / max beside
+ * each node's last value. Written by dcapture's `"profile": true` step and the `profile dump` verb.
+ */
+
+namespace visu::profile;
+
+use std::io;
+
+public enum ProfileError
+{
+    case io(string $path, string $message);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            ProfileError::io($path, $message) => "{$path}: {$message}",
+        };
+    }
+}
+
+public function profileJson(const FrameProfile& $frame, const StatsBook& $stats) : json::Value
+{
+    json::Value $root = json::object();
+    $root['frame'] = json::int($frame->frame as int64);
+    $root['gpuFrame'] = json::int($frame->gpuFrame as int64);
+    $root['window'] = json::int(STATS_WINDOW as int64);
+    $root['gpuSupported'] = json::bool($frame->gpuSupported);
+    $root['gpuResolved'] = json::bool($frame->gpuResolved);
+    $root['submitNs'] = json::float($frame->submitNs);
+    $root['tree'] = childrenJson($frame, $stats, 0);
+    return $root;
+}
+
+public function writeProfile(const string& $path, const FrameProfile& $frame, const StatsBook& $stats) : status<ProfileError>
+{
+    json::Value $root = profileJson($frame, $stats);
+    string $text = json::pretty($root);
+    $text->append("\n");
+    guard io::writefile($path, $text) else ($e) {
+        return .error(.io($path, $e->message()));
+    }
+    return .ok;
+}
+
+internal function childrenJson(const FrameProfile& $frame, const StatsBook& $stats, int32 $parent) : json::Value
+{
+    json::Value $list = json::arr();
+    ScopeNode $p = $frame->nodes[$parent as usize];
+    array<int32> $children = $p->children;
+    foreach ($children as $child) {
+        $list[] = nodeJson($frame, $stats, $child);
+    }
+
+    return $list;
+}
+
+internal function nodeJson(const FrameProfile& $frame, const StatsBook& $stats, int32 $id) : json::Value
+{
+    ScopeNode $n = $frame->nodes[$id as usize];
+    json::Value $item = json::object();
+    $item['name'] = json::str($n->name);
+    $item['path'] = json::str($n->path);
+    $item['depth'] = json::int($n->depth as int64);
+    $item['calls'] = json::int($n->calls as int64);
+    json::Value $cpu = json::object();
+    $cpu['last'] = json::float($n->cpuNs);
+    json::Value $gpu = json::object();
+    $gpu['last'] = json::float($n->gpuNs);
+    $gpu['known'] = json::bool($n->gpuSpans > 0);
+    ScopeStats? $maybeStats = $stats->find($n->path);
+
+    if ($maybeStats != null) {
+        ScopeStats $s = guard $maybeStats;
+        $cpu['avg'] = json::float($s->cpu->avg());
+        $cpu['max'] = json::float($s->cpu->max());
+        $gpu['avg'] = json::float($s->gpu->avg());
+        $gpu['max'] = json::float($s->gpu->max());
+    } else {
+        $cpu['avg'] = json::float($n->cpuNs);
+        $cpu['max'] = json::float($n->cpuNs);
+        $gpu['avg'] = json::float($n->gpuNs);
+        $gpu['max'] = json::float($n->gpuNs);
+    }
+
+    $item['cpu'] = $cpu;
+    $item['gpu'] = $gpu;
+    $item['draws'] = json::int($n->draw->draws as int64);
+    $item['triangles'] = json::int($n->draw->triangles);
+    $item['children'] = childrenJson($frame, $stats, $id);
+    return $item;
+}

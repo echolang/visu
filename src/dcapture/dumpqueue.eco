@@ -1,6 +1,6 @@
 /**
- * Dump-after-present queue. Always on so console `dump` works without a script. The script driver
- * queues onto the same object; stop-only steps do not stall the GPU.
+ * Dump-after-present queue for images and profile trees. Always on so console `dump` and `profile dump`
+ * work without a script. The script driver queues onto the same object; stop-only steps do not stall the GPU.
  */
 
 namespace visu::dcapture;
@@ -9,11 +9,16 @@ use std::env;
 use visu::app::{flags, info};
 use visu::graphics::{Frame, Pool};
 use visu::os::Window;
+use visu::profile::{FrameProfile, StatsBook, writeProfile};
 
-internal struct QueuedDump
+/**
+ * One dump-after-present item. Profile `$frame` is -1 until afterPresent stamps the presented
+ * frame; the JSON is written when that frame's profile completes.
+ */
+internal enum QueuedWork
 {
-    public string $pattern;
-    public string $label;
+    case dump(string $pattern, string $label);
+    case profile(int32 $frame, string $label);
 }
 
 public class DumpQueue
@@ -22,7 +27,7 @@ public class DumpQueue
     private Dumper $dumper;
     private Manifest $manifest;
     private array<DumpProvider> $providers;
-    private array<QueuedDump> $queue;
+    private array<QueuedWork> $queue;
     private bool $listQueued;
     private bool $stopQueued;
     private bool $wroteAnything;
@@ -34,7 +39,7 @@ public class DumpQueue
         $this->dumper = Dumper($out);
         $this->manifest = Manifest();
         $this->providers = builtinProviders();
-        $this->queue = array<QueuedDump>();
+        $this->queue = array<QueuedWork>();
         $this->listQueued = false;
         $this->stopQueued = false;
         $this->wroteAnything = false;
@@ -54,7 +59,17 @@ public class DumpQueue
 
     public function queue(const string& $pattern, const string& $label) : void
     {
-        $this->queue[] = QueuedDump($pattern, $label);
+        QueuedWork $dump = QueuedWork::dump($pattern, $label);
+        $this->queue[] = $dump;
+    }
+
+    /**
+     * Write the profile tree of the frame being presented next, once its GPU spans landed.
+     */
+    public function queueProfile(const string& $label) : void
+    {
+        QueuedWork $item = QueuedWork::profile(-1, $label);
+        $this->queue[] = $item;
     }
 
     public function queueList() : void
@@ -72,11 +87,6 @@ public class DumpQueue
         return $this->queue->count() as int32;
     }
 
-    public const function pendingWork() : bool
-    {
-        return !$this->queue->empty() || $this->listQueued || $this->stopQueued;
-    }
-
     /**
      * Write queued dumps, list the catalog, then stop. Outside a frame; stalls only when a dump
      * or list needs GPU readback.
@@ -84,7 +94,22 @@ public class DumpQueue
     public function afterPresent(Frame $frame, Pool $pool, Window $window, int32 $presented, int32 $tick) : void
     {
         $this->tick = $tick;
-        bool $needCatalog = !$this->queue->empty() || $this->listQueued;
+        $this->stampProfiles($presented);
+        array<QueuedWork> $dumps = array<QueuedWork>();
+        array<QueuedWork> $kept = array<QueuedWork>();
+        foreach ($this->queue as $item) {
+            match ($item) {
+                QueuedWork::dump($pattern, $label) => {
+                    $dumps[] = $item;
+                },
+                else => {
+                    $kept[] = $item;
+                },
+            }
+        }
+
+        $this->queue = $kept;
+        bool $needCatalog = !$dumps->empty() || $this->listQueued;
         if (!$needCatalog && !$this->stopQueued) {
             return;
         }
@@ -97,10 +122,14 @@ public class DumpQueue
             }
         }
 
-        array<QueuedDump> $batch = $this->queue;
-        $this->queue = array<QueuedDump>();
-        foreach ($batch as $request) {
-            $this->writeMatches($catalog, $pool, $request, $presented);
+        foreach ($dumps as $item) {
+            match ($item) {
+                QueuedWork::dump($pattern, $label) => {
+                    $this->writeDump($catalog, $pool, $pattern, $label, $presented);
+                },
+                else => {
+                },
+            }
         }
 
         if ($this->listQueued) {
@@ -123,6 +152,45 @@ public class DumpQueue
         $this->writeManifest();
     }
 
+    /**
+     * A frame's profile completed (GPU spans in, or abandoned at shutdown): write every dump queued
+     * for it. Host calls this from its frame end and from destroy.
+     */
+    public function noteProfile(const FrameProfile& $profile, const StatsBook& $stats) : void
+    {
+        if ($this->queue->empty()) {
+            return;
+        }
+
+        array<QueuedWork> $kept = array<QueuedWork>();
+        array<QueuedWork> $have = $this->queue;
+        bool $wrote = false;
+        foreach ($have as $item) {
+            bool $keep = true;
+            match ($item) {
+                QueuedWork::profile($frame, $label) => {
+                    if ($frame == $profile->frame) {
+                        $this->writeProfileFile($profile, $stats, $frame, $label);
+                        $wrote = true;
+                        $keep = false;
+                    }
+                },
+                else => {
+                },
+            }
+
+            if ($keep) {
+                $kept[] = $item;
+            }
+        }
+
+        $this->queue = $kept;
+
+        if ($wrote) {
+            $this->writeManifest();
+        }
+    }
+
     public function skip(const array<Step>& $left) : void
     {
         foreach ($left as $step) {
@@ -135,6 +203,22 @@ public class DumpQueue
         $this->tick = $tick;
         $this->manifest->frames = $framesRun;
         $this->manifest->ticks = $tick;
+        array<QueuedWork> $left = $this->queue;
+        $this->queue = array<QueuedWork>();
+        foreach ($left as $item) {
+            match ($item) {
+                QueuedWork::profile($frame, $label) => {
+                    if ($frame < 0) {
+                        $this->fail('profile: run ended before the step frame was presented');
+                    } else {
+                        $this->fail("profile f{$frame}: run ended before the frame completed");
+                    }
+                },
+                else => {
+                },
+            }
+        }
+
         if (!$force && !$this->wroteAnything) {
             return;
         }
@@ -153,17 +237,23 @@ public class DumpQueue
         $this->manifest->errors[] = $text;
     }
 
-    private function writeMatches(DumpCatalog $catalog, Pool $pool, QueuedDump $request, int32 $presented) : void
+    private function writeDump(
+        DumpCatalog $catalog,
+        Pool $pool,
+        string $pattern,
+        string $label,
+        int32 $presented
+    ) : void
     {
-        array<DumpEntry> $entries = $catalog->resolve($request->pattern);
+        array<DumpEntry> $entries = $catalog->resolve($pattern);
         if ($entries->empty()) {
-            DumpFailure $miss = .unknown($request->pattern);
+            DumpFailure $miss = .unknown($pattern);
             $this->fail($miss->message());
             return;
         }
 
         foreach ($entries as $entry) {
-            array<DumpRecord> $records = guard $this->dumper->write($pool, $entry, $presented, $request->label) else ($e) {
+            array<DumpRecord> $records = guard $this->dumper->write($pool, $entry, $presented, $label) else ($e) {
                 $this->fail($e->message());
                 continue;
             }
@@ -173,6 +263,53 @@ public class DumpQueue
             }
             $this->wroteAnything = true;
         }
+    }
+
+    private function stampProfiles(int32 $presented) : void
+    {
+        int32 $i = 0;
+        while ($i < ($this->queue->count() as int32)) {
+            match ($this->queue[$i as usize]) {
+                QueuedWork::profile($frame, $label) => {
+                    if ($frame < 0) {
+                        QueuedWork $stamped = QueuedWork::profile($presented, $label);
+                        $this->queue[$i as usize] = $stamped;
+                    }
+                },
+                else => {
+                },
+            }
+            $i = $i + 1;
+        }
+    }
+
+    private function writeProfileFile(
+        const FrameProfile& $profile,
+        const StatsBook& $stats,
+        int32 $frame,
+        string $label
+    ) : void
+    {
+        guard ensureDir($this->out) else ($e) {
+            $this->fail($e->message());
+            return;
+        }
+        string $ds = env::DS;
+        string $path = "{$this->out}{$ds}profile.f{$frame}.json";
+        guard writeProfile($path, $profile, $stats) else ($e) {
+            $this->fail($e->message());
+            return;
+        }
+        $this->manifest->profiles[] = ProfileRecord($frame, $path, $label);
+        string $gpu = 'gpu resolved';
+
+        if (!$profile->gpuResolved) {
+            $gpu = 'gpu missing';
+        }
+
+        $this->note("frame {$frame}: profile written, {$gpu}");
+        info("dcapture: wrote {$path}");
+        $this->wroteAnything = true;
     }
 
     private function writeManifest() : void
