@@ -58,6 +58,7 @@ public class InputHub : WindowEventHandler
     private Vec2 $mouseDelta;
     private Vec2 $pointerDelta;
     private Vec2 $mouseWheel;
+    private Vec2 $wheelFrame;
     private int32 $pinchA;
     private int32 $pinchB;
     private float32 $pinchPrev;
@@ -96,6 +97,7 @@ public class InputHub : WindowEventHandler
         $this->mouseDelta = Vec2(0.0f);
         $this->pointerDelta = Vec2(0.0f);
         $this->mouseWheel = Vec2(0.0f);
+        $this->wheelFrame = Vec2(0.0f);
         $this->pinchA = -1;
         $this->pinchB = -1;
         $this->pinchPrev = 0.0f;
@@ -279,6 +281,15 @@ public class InputHub : WindowEventHandler
     }
 
     /**
+     * Scroll this displayed frame.
+     * Accumulates across polls; cleared in `endFrame`.
+     */
+    public const function frameScroll() : Vec2
+    {
+        return $this->wheelFrame;
+    }
+
+    /**
      * A hovering cursor exists (mouse moved).
      * Fingers do not hover.
      */
@@ -365,6 +376,7 @@ public class InputHub : WindowEventHandler
         $this->pointerPressFrame = false;
         $this->pointerReleaseFrame = false;
         $this->charFrame->clear();
+        $this->wheelFrame = Vec2(0.0f);
     }
 
     public const function unclaimed() : bool
@@ -538,7 +550,9 @@ public class InputHub : WindowEventHandler
 
     private function applyScroll(float64 $x, float64 $y) : void
     {
-        $this->mouseWheel = $this->mouseWheel + Vec2($x as float32, $y as float32);
+        Vec2 $delta = Vec2($x as float32, $y as float32);
+        $this->mouseWheel = $this->mouseWheel + $delta;
+        $this->wheelFrame = $this->wheelFrame + $delta;
         $this->dispatcher->dispatch(ScrollSignal($x, $y));
     }
 

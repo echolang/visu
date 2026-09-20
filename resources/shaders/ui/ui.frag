@@ -25,7 +25,10 @@ void main()
 {
     vec4 color = vColor;
     float cover = 1.0;
-    if (vShape.w > 2.5) {
+    if (vShape.w > 3.5) {
+        vec4 tex = texture(uTex, vUv);
+        color = vColor * vec4(tex.rgb, 1.0) * tex.a;
+    } else if (vShape.w > 2.5) {
         float d = abs(sdRoundBox(vUv, vShape.xy, vShape.z)) - 1.0;
         cover = clamp(0.5 - d / max(fwidth(d), 0.0001), 0.0, 1.0);
     } else if (vShape.w > 1.5) {

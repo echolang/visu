@@ -13,11 +13,12 @@ internal function uiButtonGroup(
     const string& $name,
     const array<Choice>& $choices,
     string& $selected,
-    const string& $id
+    const string& $id,
+    const GroupStyle& $st
 ) : bool
 {
     uint64 $wid = $ui->makeId($id, $name);
-    touchSlot($ui->slots, $wid);
+    touchSlot($ui->slots, $wid, $ui->stamp);
     bool $changed = false;
     usize $i = 0;
     usize $n = $choices->count();
@@ -34,20 +35,19 @@ internal function uiButtonGroup(
         $i = $i + 1;
     }
 
-    int32 $p = $ui->lists->count() as int32;
-    $ui->lists[] = ListRun($name, $choices, $selected, array<int32>());
+    int32 $p = $ui->groups->count() as int32;
+    $ui->groups[] = GroupRun($name, $choices, $selected, $st);
     Node $node = Node();
     $node->kind = .group;
     $node->payload = $p;
     $node->id = $wid;
-    $node->measured = measureGroup($ui, $name, $choices);
+    $node->measured = measureGroup($ui, $choices, $st);
     $ui->push($node);
     return $changed;
 }
 
-internal function measureGroup(Ui $ui, const string& $name, const array<Choice>& $choices) : Vec2
+internal function measureGroup(Ui $ui, const array<Choice>& $choices, const GroupStyle& $st) : Vec2
 {
-    GroupStyle $st = $ui->theme->buttonGroup;
     float32 $w = $st->buttonSpacing;
     usize $i = 0;
     usize $n = $choices->count();
@@ -60,7 +60,7 @@ internal function measureGroup(Ui $ui, const string& $name, const array<Choice>&
 
     $w = $w - $st->buttonSpacing;
     float32 $h = $st->fontSize * 1.8f + $st->innerOffset * 2.0f;
-    $h = $h + $ui->theme->labelHeight;
+    $h = $h + $st->labelHeight;
     return Vec2($w, $h);
 }
 
@@ -71,10 +71,10 @@ internal function groupOptionWidth(float32 $textW, const GroupStyle& $st) : floa
 
 internal function writeGroupRects(Ui $ui, const Node& $node) : void
 {
-    touchSlot($ui->slots, $node->id);
-    ListRun $run = $ui->lists[$node->payload as usize];
-    GroupStyle $st = $ui->theme->buttonGroup;
-    float32 $labelH = $ui->theme->labelHeight;
+    touchSlot($ui->slots, $node->id, $ui->stamp);
+    GroupRun $run = $ui->groups[$node->payload as usize];
+    GroupStyle $st = $run->style;
+    float32 $labelH = $st->labelHeight;
     float32 $x = $node->pos->x + $st->buttonSpacing;
     float32 $y = $node->pos->y + $labelH + $st->innerOffset;
     float32 $bh = $node->size->y - $labelH - $st->innerOffset * 2.0f;
@@ -86,11 +86,10 @@ internal function writeGroupRects(Ui $ui, const Node& $node) : void
         Vec2 $ts = $ui->measureText($ch->label, $st->fontSize, true);
         float32 $bw = groupOptionWidth($ts->x, $st);
         uint64 $oid = mixId($node->id, $ch->id);
-        touchSlot($ui->slots, $oid);
+        touchSlot($ui->slots, $oid, $ui->stamp);
         Slot $s = $ui->slots[$oid];
         $s->pos = Vec2($x - $st->buttonSpacing + $st->innerOffset, $y);
         $s->size = Vec2($bw, $bh);
-        $s->seen = true;
         $ui->slots[$oid] = $s;
         $x = $x + $ts->x + $st->buttonSpacing * 2.0f;
         $i = $i + 1;
@@ -112,7 +111,7 @@ internal function animatePills(Ui $ui, float32 $dt) : void
 
 internal function animateGroupPill(Ui $ui, const Node& $n, float32 $dt) : void
 {
-    ListRun $run = $ui->lists[$n->payload as usize];
+    GroupRun $run = $ui->groups[$n->payload as usize];
 
     if ($run->selected->empty() || !$ui->slots->has($n->id)) {
         return;
@@ -135,7 +134,7 @@ internal function animateGroupPill(Ui $ui, const Node& $n, float32 $dt) : void
         $pill->pillW = $tw;
         $pill->hasPill = true;
     } else {
-        GroupStyle $st = $ui->theme->buttonGroup;
+        GroupStyle $st = $run->style;
         float32 $k = 1.0f - std::math::exp(0.0f - $st->animationSpeed * $dt);
         $pill->pillX = $pill->pillX + ($tx - $pill->pillX) * $k;
         $pill->pillW = $pill->pillW + ($tw - $pill->pillW) * $k;
@@ -147,15 +146,30 @@ internal function animateGroupPill(Ui $ui, const Node& $n, float32 $dt) : void
 
 internal function emitGroupBox(Ui $ui, const Node& $n, float32 $pad) : void
 {
-    ListRun $run = $ui->lists[$n->payload as usize];
-    GroupStyle $st = $ui->theme->buttonGroup;
-    float32 $labelH = $ui->theme->labelHeight;
+    GroupRun $run = $ui->groups[$n->payload as usize];
+    GroupStyle $st = $run->style;
+    float32 $labelH = $st->labelHeight;
     Vec2 $box = Vec2($n->pos->x, $n->pos->y + $labelH);
     Vec2 $boxSize = Vec2($n->size->x, $n->size->y - $labelH);
-    fillBox($ui, $box, $boxSize, $st->radius, $st->bg, $pad);
+
+    if ($st->bg->a > 0.0f) {
+        fillBox($ui, $box, $boxSize, $st->radius, $st->bg, $pad);
+    }
 
     if ($st->border->a > 0.0f) {
         strokeRing($ui, $box, $boxSize, $st->radius, $st->border, $pad);
+    }
+
+    if ($st->baseline) {
+        float32 $rule = 1.0f;
+        fillBox(
+            $ui,
+            Vec2($box->x, $box->y + $boxSize->y - $rule),
+            Vec2($boxSize->x, $rule),
+            0.0f,
+            $st->inactiveText->withAlpha(0.2f),
+            $pad
+        );
     }
 
     if (!$ui->slots->has($n->id) || $run->choices->count() == 0) {
@@ -176,6 +190,33 @@ internal function emitGroupBox(Ui $ui, const Node& $n, float32 $pad) : void
     }
 
     Slot $opt = $ui->slots[$oid0];
+
+    if ($st->indicator == Indicator::underline) {
+        float32 $th = $st->indicatorSize;
+
+        if ($th <= 0.0f) {
+            $th = 2.0f;
+        }
+
+        float32 $inset = $st->buttonSpacing;
+        float32 $uw = $pill->pillW - $inset * 2.0f;
+
+        if ($uw < 1.0f) {
+            $uw = $pill->pillW;
+            $inset = 0.0f;
+        }
+
+        fillBox(
+            $ui,
+            Vec2($pill->pillX + $inset, $opt->pos->y + $opt->size->y - $th),
+            Vec2($uw, $th),
+            0.0f,
+            $st->activeBg,
+            $pad
+        );
+        return;
+    }
+
     fillBox(
         $ui,
         Vec2($pill->pillX, $opt->pos->y),
@@ -188,17 +229,21 @@ internal function emitGroupBox(Ui $ui, const Node& $n, float32 $pad) : void
 
 internal function emitGroupText(Ui $ui, const Node& $n) : Texture?
 {
-    ListRun $run = $ui->lists[$n->payload as usize];
-    GroupStyle $st = $ui->theme->buttonGroup;
-    Texture? $atlas = paintText(
-        $ui,
-        $n->pos,
-        $run->name,
-        $ui->theme->labelFontSize,
-        $ui->theme->labelTextColor,
-        true,
-        false
-    );
+    GroupRun $run = $ui->groups[$n->payload as usize];
+    GroupStyle $st = $run->style;
+    Texture? $atlas = null;
+
+    if ($st->labelHeight > 0.0f && !$run->name->empty()) {
+        $atlas = paintText(
+            $ui,
+            $n->pos,
+            $run->name,
+            $ui->theme->labelFontSize,
+            $ui->theme->labelTextColor,
+            true,
+            false
+        );
+    }
     usize $i = 0;
     usize $nch = $run->choices->count();
 
@@ -213,7 +258,9 @@ internal function emitGroupText(Ui $ui, const Node& $n) : Texture?
 
         Color $col = $st->inactiveText;
 
-        if ($ch->id != $run->selected && contains($s->pos, $s->size, $ui->io->pointer)) {
+        if ($st->indicator == Indicator::underline && $ch->id == $run->selected) {
+            $col = $st->activeText;
+        } else if ($ch->id != $run->selected && contains($s->pos, $s->size, $ui->io->pointer)) {
             $col = $st->hoverText;
         }
 
@@ -227,7 +274,7 @@ internal function emitGroupText(Ui $ui, const Node& $n) : Texture?
         $i = $i + 1;
     }
 
-    if ($nch == 0 || !$ui->slots->has($n->id)) {
+    if ($nch == 0 || !$ui->slots->has($n->id) || $st->indicator == Indicator::underline) {
         return $atlas;
     }
 

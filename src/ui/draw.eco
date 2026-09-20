@@ -30,6 +30,12 @@ internal function emitUi(Ui $ui) : void
     beginRun($ui->batch);
     emitOverlayGlyphs($ui);
     endRun($ui->batch);
+
+    if ($ui->outline) {
+        $first = $ui->batch->indices->count() as int32;
+        emitOutlines($ui, 0);
+        closeDraw($ui->batch, $first, $white);
+    }
 }
 
 internal function prepareFonts(Ui $ui) : void
@@ -81,6 +87,38 @@ internal function strokeRing(
     emitStrokeBox($ui->batch, $pos, $size, $r, $color, noClip(), $pad);
 }
 
+internal function outlineColor(Kind $kind) : Color
+{
+    return match ($kind) {
+        Kind::layout => Color(0.15f, 0.85f, 1.0f, 0.95f),
+        Kind::text => Color(1.0f, 0.85f, 0.2f, 0.95f),
+        Kind::label => Color(1.0f, 0.55f, 0.15f, 0.95f),
+        Kind::space => Color(0.65f, 0.65f, 0.65f, 0.55f),
+        Kind::button => Color(0.2f, 0.9f, 0.4f, 0.95f),
+        Kind::checkbox => Color(0.95f, 0.3f, 0.85f, 0.95f),
+        Kind::group => Color(0.4f, 0.65f, 1.0f, 0.95f),
+        Kind::select => Color(1.0f, 0.25f, 0.3f, 0.95f),
+        Kind::slider => Color(0.3f, 0.4f, 1.0f, 0.95f),
+        Kind::image => Color(0.95f, 0.55f, 0.2f, 0.95f),
+    };
+}
+
+internal function emitOutlines(Ui $ui, int32 $i) : void
+{
+    Node $n = $ui->nodes[$i as usize];
+
+    if ($n->size->x >= 0.5f && $n->size->y >= 0.5f) {
+        strokeRing($ui, $n->pos, $n->size, 0.0f, outlineColor($n->kind), aaPad($ui));
+    }
+
+    int32 $c = $n->firstChild;
+
+    while ($c >= 0) {
+        emitOutlines($ui, $c);
+        $c = $ui->nodes[$c as usize]->next;
+    }
+}
+
 internal function emitBoxes(Ui $ui, int32 $i) : void
 {
     Node $n = $ui->nodes[$i as usize];
@@ -102,6 +140,12 @@ internal function emitBoxes(Ui $ui, int32 $i) : void
         },
         Kind::select => {
             emitSelectBox($ui, $n, $pad);
+        },
+        Kind::slider => {
+            emitSliderBox($ui, $n, $pad);
+        },
+        Kind::image => {
+            emitImageBox($ui, $n, $pad);
         },
         else => {
         },
@@ -178,6 +222,16 @@ internal function emitNodeGlyphs(Ui $ui, const Node& $n) : void
 
     if ($n->kind == Kind::select) {
         emitSelectText($ui, $n);
+        return;
+    }
+
+    if ($n->kind == Kind::slider) {
+        emitSliderText($ui, $n);
+        return;
+    }
+
+    if ($n->kind == Kind::image) {
+        emitImage($ui, $n);
     }
 }
 

@@ -6,6 +6,7 @@
 namespace visu::app;
 
 use std::env;
+use std::io;
 
 public class Paths
 {
@@ -29,5 +30,60 @@ public class Paths
         $this->resourcesFont = "{$root}{$ds}resources{$ds}font";
         $this->resourcesSource = "{$root}{$ds}resources{$ds}source";
         $this->resourcesPack = "{$root}{$ds}resources{$ds}pack";
+    }
+
+    /**
+     * Create `$dir` and every missing parent. `io::mkdir` is one level, so walk the separators.
+     */
+    public static function ensureDir(const string& $dir) : status<io::ioerror>
+    {
+        if ($dir->empty() || $dir->equals('.') || $dir->equals('..')) {
+            return .ok;
+        }
+
+        usize $n = $dir->size();
+        usize $i = 1;
+
+        while ($i <= $n) {
+            bool $boundary = $i == $n || isPathSep($dir->byte($i));
+
+            if ($boundary) {
+                string $prefix = $dir->sub(0, $i)->clone();
+                $made = io::mkdir($prefix);
+
+                if ($made->failed() && !$made->failure()->exists()) {
+                    return .error($made->failure());
+                }
+            }
+
+            $i = $i + 1;
+        }
+
+        return .ok;
+    }
+
+    /**
+     * Create every directory above `$path`. A file with no separator is a no-op.
+     */
+    public static function ensureParentDir(const string& $path) : status<io::ioerror>
+    {
+        usize $n = $path->size();
+        usize $cut = 0;
+        usize $i = 0;
+
+        while ($i < $n) {
+            if (isPathSep($path->byte($i))) {
+                $cut = $i;
+            }
+
+            $i = $i + 1;
+        }
+
+        if ($cut == 0) {
+            return .ok;
+        }
+
+        string $dir = $path->sub(0, $cut)->clone();
+        return Paths::ensureDir($dir);
     }
 }

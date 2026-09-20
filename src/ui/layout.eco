@@ -258,15 +258,31 @@ internal function placeNode(array<Node>& $nodes, int32 $i) : void
         $totalY = $totalY + $gap;
     }
 
-    Vec2 $off = alignOffset($n->align, Vec2($totalX, $totalY), Vec2($innerW, $innerH));
-    float32 $x = $n->pos->x + $n->pad->left + $off->x;
-    float32 $y = $n->pos->y + $n->pad->top + $off->y;
+    float32 $main = packMain($n->align, $n->flow, Vec2($totalX, $totalY), Vec2($innerW, $innerH));
+    float32 $x = $n->pos->x + $n->pad->left;
+    float32 $y = $n->pos->y + $n->pad->top;
+
+    if ($n->flow == Flow::horizontal) {
+        $x = $x + $main;
+    } else {
+        $y = $y + $main;
+    }
+
     $c = $n->firstChild;
 
     while ($c >= 0) {
         int32 $next = $nodes[$c as usize]->next;
         Vec2 $sz = $nodes[$c as usize]->size;
-        $nodes->at($c as usize)->pos = Vec2($x, $y);
+        float32 $cx = $x;
+        float32 $cy = $y;
+
+        if ($n->flow == Flow::horizontal) {
+            $cy = $y + alignY($n->align, $sz->y, $innerH);
+        } else {
+            $cx = $x + alignX($n->align, $sz->x, $innerW);
+        }
+
+        $nodes->at($c as usize)->pos = Vec2($cx, $cy);
         placeNode($nodes, $c);
 
         if ($n->flow == Flow::horizontal) {
@@ -279,32 +295,47 @@ internal function placeNode(array<Node>& $nodes, int32 $i) : void
     }
 }
 
-internal function alignOffset(Align $align, Vec2 $content, Vec2 $inner) : Vec2
+internal function packMain(Align $align, Flow $flow, Vec2 $content, Vec2 $inner) : float32
 {
-    float32 $x = 0.0f;
-    float32 $y = 0.0f;
-
-    if ($align == Align::topCenter || $align == Align::center || $align == Align::bottomCenter) {
-        $x = ($inner->x - $content->x) * 0.5f;
-    } else if ($align == Align::topRight || $align == Align::centerRight || $align == Align::bottomRight) {
-        $x = $inner->x - $content->x;
+    if ($flow == Flow::horizontal) {
+        return alignX($align, $content->x, $inner->x);
     }
 
-    if ($align == Align::centerLeft || $align == Align::center || $align == Align::centerRight) {
-        $y = ($inner->y - $content->y) * 0.5f;
-    } else if ($align == Align::bottomLeft || $align == Align::bottomCenter || $align == Align::bottomRight) {
-        $y = $inner->y - $content->y;
+    return alignY($align, $content->y, $inner->y);
+}
+
+internal function alignX(Align $align, float32 $content, float32 $inner) : float32
+{
+    float32 $x = 0.0f;
+
+    if ($align == Align::topCenter || $align == Align::center || $align == Align::bottomCenter) {
+        $x = ($inner - $content) * 0.5f;
+    } else if ($align == Align::topRight || $align == Align::centerRight || $align == Align::bottomRight) {
+        $x = $inner - $content;
     }
 
     if ($x < 0.0f) {
         $x = 0.0f;
     }
 
+    return $x;
+}
+
+internal function alignY(Align $align, float32 $content, float32 $inner) : float32
+{
+    float32 $y = 0.0f;
+
+    if ($align == Align::centerLeft || $align == Align::center || $align == Align::centerRight) {
+        $y = ($inner - $content) * 0.5f;
+    } else if ($align == Align::bottomLeft || $align == Align::bottomCenter || $align == Align::bottomRight) {
+        $y = $inner - $content;
+    }
+
     if ($y < 0.0f) {
         $y = 0.0f;
     }
 
-    return Vec2($x, $y);
+    return $y;
 }
 
 internal function contains(const Node& $n, Vec2 $p) : bool

@@ -27,6 +27,11 @@ internal class FlyUiDemo
     public bool $autoSave;
     public bool $showGrid;
     public bool $sounds;
+    public string $settingsTab;
+    public float32 $density;
+    public float32 $radius;
+    public bool $vsync;
+    public string $quality;
 
     public constructor()
     {
@@ -44,6 +49,11 @@ internal class FlyUiDemo
         $this->autoSave = true;
         $this->showGrid = false;
         $this->sounds = true;
+        $this->settingsTab = 'graphics';
+        $this->density = 1.0f;
+        $this->radius = 70.0f;
+        $this->vsync = true;
+        $this->quality = 'medium';
     }
 }
 
@@ -102,6 +112,18 @@ internal function paint(FlyUiDemo $demo, Ui $ui) : void
         $demo->current = 'selects';
     }
 
+    if ($ui->button('Components - Sliders', fill: true)) {
+        $demo->current = 'sliders';
+    }
+
+    if ($ui->button('Components - Tabs', fill: true)) {
+        $demo->current = 'tabs';
+    }
+
+    if ($ui->button('Settings', fill: true)) {
+        $demo->current = 'settings';
+    }
+
     $ui->end();
 
     Layout $content = Layout();
@@ -121,6 +143,12 @@ internal function paint(FlyUiDemo $demo, Ui $ui) : void
         demoGroups($demo, $ui);
     } else if ($demo->current == 'checks') {
         demoChecks($demo, $ui);
+    } else if ($demo->current == 'sliders') {
+        demoSliders($demo, $ui);
+    } else if ($demo->current == 'tabs') {
+        demoTabs($demo, $ui);
+    } else if ($demo->current == 'settings') {
+        demoSettings($demo, $ui);
     } else {
         demoSelects($demo, $ui);
     }
@@ -313,6 +341,54 @@ internal function demoSelects(FlyUiDemo $demo, Ui $ui) : void
 
     $ui->text("Fruit: {$fruit}");
     $ui->end();
+    $ui->end();
+}
+
+internal function demoSliders(FlyUiDemo $demo, Ui $ui) : void
+{
+    $ui->beginSection('Sliders');
+    $ui->slider('Density', &$demo->density, min: 0.0f, max: 2.0f, step: 0.05f);
+    $ui->slider('Radius', &$demo->radius, min: 8.0f, max: 90.0f, step: 1.0f);
+    $ui->text("density {$demo->density:.2f}, radius {$demo->radius:.0f}");
+    $ui->end();
+}
+
+internal function demoTabs(FlyUiDemo $demo, Ui $ui) : void
+{
+    array<Choice> $pages = array<Choice>();
+    $pages[] = Choice('basics', 'Basics');
+    $pages[] = Choice('display', 'Display');
+    $pages[] = Choice('graphics', 'Graphics');
+    $ui->beginSection('Same choices');
+    $ui->tabBar('Pages', $pages, &$demo->settingsTab, id: 'tabs');
+    $ui->space(0.0f, 12.0f);
+    $ui->buttonGroup('Pages', $pages, &$demo->settingsTab, id: 'group');
+    $ui->text("tab: {$demo->settingsTab}");
+    $ui->end();
+}
+
+internal function demoSettings(FlyUiDemo $demo, Ui $ui) : void
+{
+    array<Choice> $pages = array<Choice>();
+    $pages[] = Choice('basics', 'Basics');
+    $pages[] = Choice('display', 'Display');
+    $pages[] = Choice('graphics', 'Graphics');
+    $ui->tabBar('Settings', $pages, &$demo->settingsTab);
+    $ui->space(0.0f, 16.0f);
+    $ui->beginCard();
+    $ui->beginSettingRow('V-Sync');
+    $ui->checkbox('', &$demo->vsync, id: 'vsync');
+    $ui->endSettingRow();
+    $ui->beginSettingRow('Quality');
+    array<Choice> $levels = array<Choice>();
+    $levels[] = Choice('low', 'Low');
+    $levels[] = Choice('medium', 'Medium');
+    $levels[] = Choice('high', 'High');
+    $ui->select('', $levels, &$demo->quality, id: 'quality');
+    $ui->endSettingRow();
+    $ui->beginSettingRow('Density');
+    $ui->slider('', &$demo->density, min: 0.0f, max: 2.0f, step: 0.05f, id: 'density');
+    $ui->endSettingRow();
     $ui->end();
 }
 

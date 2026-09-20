@@ -6,7 +6,7 @@
 
 namespace visu::ui;
 
-use visu::graphics::{Device, Pipeline, TargetRef};
+use visu::graphics::{Device, Pipeline, TargetRef, Texture};
 use visu::math::Vec2;
 use visu::os::input::{InputHub, Key};
 use visu::vg::{Canvas, Color, Font};
@@ -22,6 +22,7 @@ internal struct FrameInput
     public bool $hovering = false;
     public bool $consumed = false;
     public array<int32> $chars;
+    public Vec2 $scroll = Vec2(0.0f);
     public Key? $key = null;
 
     init
@@ -39,6 +40,9 @@ public class Ui
     internal array<ButtonRun> $buttons;
     internal array<CheckRun> $checks;
     internal array<ListRun> $lists;
+    internal array<GroupRun> $groups;
+    internal array<SliderRun> $sliders;
+    internal array<ImageRun> $images;
     internal array<int32> $parents;
     internal array<uint64> $ids;
     internal map<uint64, Slot> $slots;
@@ -51,9 +55,15 @@ public class Ui
     internal Vec2 $frame;
     internal float32 $scale;
     internal float64 $tick;
+    internal int32 $stamp;
+    internal array<uint64> $stale;
     internal InputHub? $input;
     internal UiBatch $batch;
     internal UiGpu? $gpu;
+    /**
+     * Stroke every placed node. `--flag ui.outline=true`.
+     */
+    public bool $outline;
     private bool $dead;
 
     public constructor(Device $device, InputHub? $input = null)
@@ -66,6 +76,9 @@ public class Ui
         $this->buttons = array<ButtonRun>();
         $this->checks = array<CheckRun>();
         $this->lists = array<ListRun>();
+        $this->groups = array<GroupRun>();
+        $this->sliders = array<SliderRun>();
+        $this->images = array<ImageRun>();
         $this->parents = array<int32>();
         $this->ids = array<uint64>();
         $this->slots = map<uint64, Slot>();
@@ -78,7 +91,10 @@ public class Ui
         $this->frame = Vec2(1.0f);
         $this->scale = 1.0f;
         $this->tick = 0.0;
+        $this->stamp = 0;
+        $this->stale = array<uint64>();
         $this->dead = false;
+        $this->outline = false;
         $this->batch = UiBatch();
         $this->gpu = null;
         $this->nodes->reserve(256);
@@ -127,49 +143,81 @@ public class Ui
         $this->io->chars = $chars;
     }
 
+    public function seedScroll(Vec2 $delta) : void
+    {
+        $this->io->scroll = $delta;
+    }
+
     public function seedKey(Key $key) : void
     {
         $this->io->key = $key;
     }
 
-    public function beginFrame(Vec2 $size, float32 $scale = 1.0f) : void
+    /**
+     * True while a dropdown (or anything else that steals keys) is open.
+     * Escape must not also close a panel sitting under that widget.
+     */
+    public const function capturesKeyboard() : bool
+    {
+        foreach ($this->slots as $s) {
+            if (selectIsOpen($s)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * `$framebuffer` is the scene target in pixels. Layout space is framebuffer / dpi / uiScale.
+     * Draw scale is dpi × uiScale. The pointer is window pixels and divides by uiScale only.
+     */
+    public function beginFrame(Vec2 $framebuffer, float32 $dpi = 1.0f, float32 $uiScale = 1.0f) : void
     {
         assert(!$this->dead, 'ui beginFrame after destroy');
-        $this->frame = $size;
-        $this->scale = $scale;
 
-        if ($this->scale < 0.0001f) {
-            $this->scale = 0.0001f;
+        if ($dpi < 0.0001f) {
+            $dpi = 1.0f;
         }
+
+        if ($uiScale < 0.0001f) {
+            $uiScale = 1.0f;
+        }
+
+        $this->frame = Vec2($framebuffer->x / $dpi / $uiScale, $framebuffer->y / $dpi / $uiScale);
+        $this->scale = $dpi * $uiScale;
+        $this->outline = visu::app::flags()->bool('ui.outline', false);
 
         InputHub? $maybe = $this->input;
 
         if ($maybe != null) {
             InputHub $in = guard $maybe;
-            $this->io->pointer = $in->pointer();
+            $this->io->pointer = scalePointer($in->pointer(), $uiScale);
             $this->io->leftPressed = $in->hasBeenPressedThisFrame();
             $this->io->leftReleased = $in->hasBeenReleasedThisFrame();
             $this->io->leftDown = $in->pointerDown();
             $this->io->hovering = $in->hovering();
             $this->io->chars = $in->frameChars();
+            $this->io->scroll = $in->frameScroll();
             $this->io->key = null;
+        } else if ($uiScale != 1.0f) {
+            $this->io->pointer = scalePointer($this->io->pointer, $uiScale);
         }
 
         $this->io->consumed = false;
+        $this->stamp = $this->stamp + 1;
         $this->nodes->clear();
         $this->texts->clear();
         $this->buttons->clear();
         $this->checks->clear();
         $this->lists->clear();
+        $this->groups->clear();
+        $this->sliders->clear();
+        $this->images->clear();
         $this->parents->clear();
         $this->ids->clear();
         $this->overlays->clear();
         $this->animated->clear();
-        array<uint64> $keys = $this->slots->keys();
-
-        foreach ($keys as $k) {
-            $this->slots->at($k)->seen = false;
-        }
 
         Node $root = Node();
         $root->kind = .layout;
@@ -206,10 +254,11 @@ public class Ui
 
         $this->tick = $now;
         animatePills($this, $dt);
-        dropUnseen($this->slots);
+        dropUnseen($this->slots, $this->stamp, $this->stale);
         $this->claimHover();
         $this->open = false;
-        $this->io->chars = array<int32>();
+        $this->io->chars->clear();
+        $this->io->scroll = Vec2(0.0f);
         $this->io->key = null;
     }
 
@@ -308,7 +357,7 @@ public class Ui
         $this->begin($l);
     }
 
-    public function beginCard() : void
+    public function beginCard(float32 $width = 0.0f) : void
     {
         Theme $t = $this->theme;
         Layout $l = Layout();
@@ -319,6 +368,7 @@ public class Ui
         $l->spacing = $t->cardSpacing;
         $l->bg = $t->cardBg;
         $l->radius = $t->cardRadius;
+        $l->width = $width;
         $this->begin($l);
     }
 
@@ -327,7 +377,7 @@ public class Ui
         Theme $t = $this->theme;
         Layout $l = Layout();
         $l->flow = .vertical;
-        $l->h = .fit;
+        $l->h = .fill;
         $l->v = .fit;
         $l->spacing = $t->sectionSpacing;
         $l->pad = Edges(0.0f, 0.0f, 0.0f, $t->sectionBottomSpace);
@@ -350,6 +400,43 @@ public class Ui
         $n->kind = .space;
         $n->measured = Vec2($w, $h);
         $this->push($n);
+    }
+
+    /**
+     * One child that takes leftover space on the parent's flow axis.
+     */
+    public function spacer() : void
+    {
+        Node $n = Node();
+        $n->kind = .space;
+        int32 $parent = $this->peekParent();
+        Node $p = $this->nodes[$parent as usize];
+
+        if ($p->flow == Flow::horizontal) {
+            $n->h = .fill;
+        } else {
+            $n->v = .fill;
+        }
+
+        $this->push($n);
+    }
+
+    public function beginSettingRow(string $label) : void
+    {
+        Layout $l = Layout();
+        $l->flow = .horizontal;
+        $l->h = .fill;
+        $l->v = .fit;
+        $l->align = Align::center;
+        $l->spacing = $this->theme->spacing;
+        $this->begin($l);
+        $this->label($label);
+        $this->spacer();
+    }
+
+    public function endSettingRow() : void
+    {
+        $this->end();
     }
 
     public function text(
@@ -412,7 +499,32 @@ public class Ui
         id: string $id = ''
     ) : bool
     {
-        return uiButtonGroup($this, $name, $choices, $selected, $id);
+        return uiButtonGroup($this, $name, $choices, $selected, $id, $this->theme->buttonGroup);
+    }
+
+    public function tabBar(
+        string $name,
+        const array<Choice>& $choices,
+        string& $selected,
+        id: string $id = ''
+    ) : bool
+    {
+        bool $changed = uiButtonGroup($this, $name, $choices, $selected, $id, $this->theme->tabBar);
+        usize $n = $this->nodes->count();
+        $this->nodes->at($n - 1)->h = Sizing::fill;
+        return $changed;
+    }
+
+    public function slider(
+        string $label,
+        float32& $value,
+        min: float32 $min,
+        max: float32 $max,
+        step: float32 $step = 0.0f,
+        id: string $id = ''
+    ) : bool
+    {
+        return uiSlider($this, $label, $value, $min, $max, $step, $id);
     }
 
     public function select(
@@ -423,6 +535,21 @@ public class Ui
     ) : bool
     {
         return uiSelect($this, $name, $choices, $selected, $id);
+    }
+
+    /**
+     * Textured rect. `$height` 0 uses the texture aspect; a missing texture still occupies the box.
+     * `$border` paints a filled frame around the image.
+     */
+    public function image(
+        Texture? $tex,
+        float32 $width,
+        float32 $height = 0.0f,
+        border: Color? $border = null,
+        radius: float32 $radius = 0.0f
+    ) : void
+    {
+        uiImage($this, $tex, $width, $height, $border, $radius);
     }
 
     internal function tessellate() : void
@@ -470,8 +597,9 @@ public class Ui
             $label = $fallback;
         }
 
+        assert(!$label->empty(), 'ui widget id empty');
         uint64 $id = mixId($this->peekId(), $label);
-        touchSlot($this->slots, $id);
+        touchSlot($this->slots, $id, $this->stamp);
         return $id;
     }
 
@@ -481,7 +609,7 @@ public class Ui
             return false;
         }
 
-        touchSlot($this->slots, $id);
+        touchSlot($this->slots, $id, $this->stamp);
         Slot $s = $this->slots[$id];
         bool $over = contains($s->pos, $s->size, $this->io->pointer);
         bool $fire = false;
@@ -498,9 +626,42 @@ public class Ui
             $s->pressed = false;
         }
 
-        $s->seen = true;
         $this->slots[$id] = $s;
         return $fire;
+    }
+
+    /**
+     * True while this id owns the pointer: grab on the press edge over the rect, hold even if
+     * the pointer leaves, release on up or a lost down.
+     */
+    internal function drag(uint64 $id) : bool
+    {
+        if ($this->io->consumed) {
+            return false;
+        }
+
+        touchSlot($this->slots, $id, $this->stamp);
+        Slot $s = $this->slots[$id];
+        bool $over = contains($s->pos, $s->size, $this->io->pointer);
+
+        if ($over && $this->io->leftPressed) {
+            $s->pressed = true;
+            $s->pressAt = visu::runtime::seconds();
+        }
+
+        bool $held = $s->pressed;
+
+        if ($s->pressed && ($this->io->leftReleased || !$this->io->leftDown)) {
+            $s->pressed = false;
+        }
+
+        $this->slots[$id] = $s;
+
+        if ($held) {
+            $this->consume();
+        }
+
+        return $held;
     }
 
     internal function consume() : void
@@ -621,6 +782,15 @@ public function resolveFontDir(const string& $preferred) : string
     }
 
     return $preferred;
+}
+
+internal function scalePointer(Vec2 $pointer, float32 $uiScale) : Vec2
+{
+    if ($uiScale == 1.0f) {
+        return $pointer;
+    }
+
+    return Vec2($pointer->x / $uiScale, $pointer->y / $uiScale);
 }
 
 internal function fontHere(string $dir) : bool

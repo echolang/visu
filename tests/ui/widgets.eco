@@ -5,6 +5,22 @@
 use visu::graphics::Device;
 use visu::math::{Vec2, equal};
 use visu::ui::{Choice, Kind, Node, Ui, mixId, selectData, selectIsOpen};
+use visu::vg::Color;
+
+test ui_begin_frame_maps_pointer_into_layout_space
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->seed(Vec2(200.0f, 100.0f), false, false, false);
+    $ui->beginFrame(Vec2(800.0f, 800.0f), 2.0f, 2.0f);
+    assert(equal($ui->io->pointer->x, 100.0f), 'x');
+    assert(equal($ui->io->pointer->y, 50.0f), 'y');
+    assert(equal($ui->frame->x, 200.0f), 'layout w');
+    assert(equal($ui->frame->y, 200.0f), 'layout h');
+    assert(equal($ui->scale, 4.0f), 'draw');
+    $ui->destroy();
+    $device->shutdown();
+}
 
 test ui_column_fit_two_spaces
 {
@@ -425,6 +441,237 @@ test ui_select_outside_does_not_click_later_button
     $ui->endFrame();
     assert(!selectIsOpen($ui->slots[$id]), 'closed');
     assert(!$hit, 'button skipped');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_setting_row_right_aligns_its_control
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginSettingRow('Name');
+    $ui->space(40.0f, 10.0f);
+    $ui->endSettingRow();
+    $ui->endFrame();
+    Node $ctrl = $ui->nodes[$ui->nodes->count() - 1];
+    assert(equal($ctrl->pos->x, 360.0f), 'right');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_setting_row_inside_section_right_aligns
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginSection('SSAO');
+    $ui->beginSettingRow('Quality');
+    $ui->space(40.0f, 10.0f);
+    $ui->endSettingRow();
+    $ui->end();
+    $ui->endFrame();
+    Node $ctrl = $ui->nodes[$ui->nodes->count() - 1];
+    assert(equal($ctrl->pos->x, 360.0f), 'right');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_empty_name_checkbox_is_just_the_switch
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    bool $on = true;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->checkbox('Vsync', &$on);
+    $ui->checkbox('', &$on, id: 'bare');
+    $ui->endFrame();
+    Node $named = firstKind($ui, Kind::checkbox);
+    Node $bare = nthKind($ui, Kind::checkbox, 1);
+    assert($bare->size->x < $named->size->x, 'no label pad');
+    assert(equal($bare->size->x, 48.0f), 'switch');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_tab_bar_is_tighter_than_a_button_group
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('a', 'A');
+    $opts[] = Choice('b', 'B');
+    string $sel = 'a';
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->buttonGroup('Size', $opts, &$sel);
+    $ui->endFrame();
+    float32 $groupW = firstKind($ui, Kind::group)->measured->x;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->tabBar('Pages', $opts, &$sel);
+    $ui->endFrame();
+    assert(firstKind($ui, Kind::group)->measured->x < $groupW, 'tighter');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_empty_name_select_has_no_label_row
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('low', 'Low');
+    string $sel = 'low';
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->select('Quality', $opts, &$sel);
+    $ui->select('', $opts, &$sel, id: 'bare');
+    $ui->endFrame();
+    Node $named = firstKind($ui, Kind::select);
+    Node $bare = nthKind($ui, Kind::select, 1);
+    assert($bare->size->y < $named->size->y, 'no label row');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_tab_bar_selects_and_has_no_label_row
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $opts = array<Choice>();
+    $opts[] = Choice('a', 'A');
+    $opts[] = Choice('b', 'B');
+    string $sel = 'a';
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->buttonGroup('Size', $opts, &$sel);
+    $ui->endFrame();
+    Node $group = firstKind($ui, Kind::group);
+    float32 $groupH = $group->size->y;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->tabBar('Pages', $opts, &$sel);
+    $ui->endFrame();
+    Node $tabs = firstKind($ui, Kind::group);
+    assert($tabs->size->y < $groupH, 'no label row');
+    uint64 $oid = mixId($tabs->id, 'b');
+    $opt = $ui->slots[$oid];
+    Vec2 $mid = Vec2($opt->pos->x + $opt->size->x * 0.5f, $opt->pos->y + $opt->size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->tabBar('Pages', $opts, &$sel);
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    bool $changed = $ui->tabBar('Pages', $opts, &$sel);
+    $ui->endFrame();
+    assert($changed, 'changed');
+    assert($sel == 'b', 'b');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_slider_drag_clamp_step_and_ignores_foreign_drag
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    float32 $value = 0.5f;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->slider('', &$value, min: 0.0f, max: 1.0f, step: 0.25f, id: 's');
+    $ui->endFrame();
+    Node $sl = firstKind($ui, Kind::slider);
+    Vec2 $at = Vec2($sl->pos->x + $sl->size->x * 0.9f, $sl->pos->y + $sl->size->y * 0.5f);
+    $ui->seed($at, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    bool $changed = $ui->slider('', &$value, min: 0.0f, max: 1.0f, step: 0.25f, id: 's');
+    $ui->endFrame();
+    assert($changed, 'changed');
+    assert($value > 0.74f && $value < 1.01f, 'stepped');
+    $ui->seed($at, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->slider('', &$value, min: 0.0f, max: 1.0f, step: 0.25f, id: 's');
+    $ui->endFrame();
+    $value = 0.5f;
+    $ui->seed(Vec2(300.0f, 180.0f), true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->slider('', &$value, min: 0.0f, max: 1.0f, id: 's');
+    $ui->endFrame();
+    $ui->seed($at, false, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    bool $stolen = $ui->slider('', &$value, min: 0.0f, max: 1.0f, id: 's');
+    $ui->endFrame();
+    assert(!$stolen, 'foreign drag');
+    assert($value > 0.49f && $value < 0.51f, 'unchanged');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_slider_drag_does_not_click_later_button
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    float32 $value = 0.5f;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->slider('', &$value, min: 0.0f, max: 1.0f, id: 's');
+    $ui->button('Later');
+    $ui->endFrame();
+    Node $sl = firstKind($ui, Kind::slider);
+    Node $btn = firstKind($ui, Kind::button);
+    Vec2 $press = Vec2($sl->pos->x + $sl->size->x * 0.5f, $sl->pos->y + $sl->size->y * 0.5f);
+    $ui->seed($press, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->slider('', &$value, min: 0.0f, max: 1.0f, id: 's');
+    $ui->button('Later');
+    $ui->endFrame();
+    Vec2 $overBtn = Vec2($btn->pos->x + $btn->size->x * 0.5f, $btn->pos->y + $btn->size->y * 0.5f);
+    $ui->seed($overBtn, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->slider('', &$value, min: 0.0f, max: 1.0f, id: 's');
+    bool $hit = $ui->button('Later');
+    $ui->endFrame();
+    assert(!$hit, 'button skipped');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_image_measures_given_size
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->beginColumn();
+    $ui->image(null, 120.0f, 80.0f);
+    $ui->end();
+    $ui->endFrame();
+    Node $img = firstKind($ui, Kind::image);
+    assert(equal($img->measured->x, 120.0f), 'w');
+    assert(equal($img->measured->y, 80.0f), 'h');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_image_border_grows_measured_size
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->beginColumn();
+    $ui->image(null, 120.0f, 80.0f, border: Color::black());
+    $ui->end();
+    $ui->endFrame();
+    Node $img = firstKind($ui, Kind::image);
+    assert(equal($img->measured->x, 124.0f), 'w');
+    assert(equal($img->measured->y, 84.0f), 'h');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_image_missing_height_is_square
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->image(null, 90.0f);
+    $ui->endFrame();
+    Node $img = firstKind($ui, Kind::image);
+    assert(equal($img->measured->x, 90.0f), 'w');
+    assert(equal($img->measured->y, 90.0f), 'h');
     $ui->destroy();
     $device->shutdown();
 }

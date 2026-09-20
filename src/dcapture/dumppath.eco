@@ -6,7 +6,6 @@
 namespace visu::dcapture;
 
 use std::env;
-use std::io;
 
 /**
  * Glob match where `*` spans any run of bytes; everything else is literal.
@@ -102,23 +101,12 @@ public function dumpPath(
 }
 
 /**
- * Create `$dir` and every missing parent. `io::mkdir` is one level, so walk the separators.
+ * Create `$dir` and every missing parent.
  */
 public function ensureDir(const string& $dir) : status<DCaptureError>
 {
-    usize $n = $dir->size();
-    usize $i = 1;
-    while ($i <= $n) {
-        bool $boundary = $i == $n || $dir->byte($i) == 47 || $dir->byte($i) == 92;
-        if ($boundary) {
-            string $prefix = $dir->sub(0, $i)->clone();
-            $made = io::mkdir($prefix);
-            if ($made->failed() && !$made->failure()->exists()) {
-                return .error(.io($prefix, $made->failure()->message()));
-            }
-        }
-
-        $i = $i + 1;
+    guard visu::app::Paths::ensureDir($dir) else ($e) {
+        return .error(.io($dir, $e->message()));
     }
 
     return .ok;

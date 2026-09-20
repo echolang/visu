@@ -1,0 +1,47 @@
+/**
+ * mkdir-p walker on Paths.
+ */
+
+use std::env;
+use std::io;
+use visu::app::Paths;
+
+test paths_ensure_parent_dir_creates_the_chain
+{
+    string $ds = env::DS;
+    string::view $tmp = env::tmp();
+    string $root = "{$tmp}{$ds}visu_paths_test";
+    string $file = "{$root}{$ds}nested{$ds}out.json";
+    guard Paths::ensureParentDir($file) else ($e) {
+        assert(false, 'ensure parent');
+        return;
+    }
+
+    bool $here = guard io::exists("{$root}{$ds}nested") else {
+        assert(false, 'nested missing');
+        return;
+    }
+
+    assert($here, 'nested dir');
+}
+
+test paths_ensure_parent_dir_of_a_bare_name_is_a_noop
+{
+    guard Paths::ensureParentDir('settings.json') else ($e) {
+        assert(false, 'bare name');
+        return;
+    }
+}
+
+test paths_ensure_dir_skips_dot_and_empty
+{
+    guard Paths::ensureDir('.') else ($e) {
+        assert(false, 'dot');
+        return;
+    }
+
+    guard Paths::ensureDir('') else ($e) {
+        assert(false, 'empty');
+        return;
+    }
+}

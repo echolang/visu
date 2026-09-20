@@ -58,6 +58,7 @@ public class Host
     public int32 $tickIndex;
     public HostError $fail;
     public DumpQueue $dumps;
+    public float32 $uiScale;
     private DCapture? $script;
     private FullscreenTextureRenderer $blit;
     private Overlay? $overlay;
@@ -77,6 +78,7 @@ public class Host
         $this->dumps = $services->get<DumpQueue>();
         $this->tickIndex = 0;
         $this->config = $config;
+        $this->uiScale = $config->uiScale;
         $this->services = $services;
         $this->device = Device();
         $this->window = Window(
@@ -144,6 +146,24 @@ public class Host
         $this->events->tick();
         $this->tickIndex = $this->tickIndex + 1;
         $this->advanceDCapture();
+    }
+
+    public const function overlayEnabled() : bool
+    {
+        Overlay $overlay = guard $this->overlay else {
+            return false;
+        }
+
+        return $overlay->enabled;
+    }
+
+    public function setOverlayEnabled(bool $on) : void
+    {
+        Overlay $overlay = guard $this->overlay else {
+            return;
+        }
+
+        $overlay->enabled = $on;
     }
 
     public function renderFrame(
@@ -284,15 +304,12 @@ public class Host
         Ui $ui = guard $this->ui else {
             return;
         }
-        float32 $scale = $scene->contentScaleX;
-
-        if ($scale < 0.0001f) {
-            $scale = 1.0f;
-        }
-
-        float32 $w = ($scene->width as float32) / $scale;
-        float32 $h = ($scene->height as float32) / $scale;
-        $ui->beginFrame(Vec2($w, $h), $scale);
+        float32 $dpi = $scene->contentScaleX;
+        $ui->beginFrame(
+            Vec2($scene->width as float32, $scene->height as float32),
+            $dpi,
+            $this->uiScale
+        );
         $fn($ui);
         $ui->endFrame();
         $ui->pass($pipeline, $scene);
@@ -439,9 +456,13 @@ public class Host
         return true;
     }
 
+    /**
+     * Headless still loads FlyUI when `$config->ui` is set: dcapture dumps the scene
+     * target the UI pass composites onto, so font files must be present.
+     */
     private function bootUi() : void
     {
-        if ($this->config->headless || !$this->config->ui) {
+        if (!$this->config->ui) {
             return;
         }
 

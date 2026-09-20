@@ -37,43 +37,51 @@ fragment fs_out fs(fs_in in [[stage_in]], texture2d<float> uTex [[texture(0)]], 
     fs_out out = {};
     float4 color = in.vColor;
     float cover = 1.0;
-    if (in.vShape.w > 2.5)
+    if (in.vShape.w > 3.5)
     {
-        float2 param = in.vUv;
-        float2 param_1 = in.vShape.xy;
-        float param_2 = in.vShape.z;
-        float d = abs(sdRoundBox(param, param_1, param_2)) - 1.0;
-        cover = fast::clamp(0.5 - (d / fast::max(fwidth(d), 9.9999997473787516355514526367188e-05)), 0.0, 1.0);
+        float4 tex = uTex.sample(uTexSmplr, in.vUv);
+        color = (in.vColor * float4(tex.xyz, 1.0)) * tex.w;
     }
     else
     {
-        if (in.vShape.w > 1.5)
+        if (in.vShape.w > 2.5)
         {
-            color = in.vColor * uTex.sample(uTexSmplr, in.vUv).x;
+            float2 param = in.vUv;
+            float2 param_1 = in.vShape.xy;
+            float param_2 = in.vShape.z;
+            float d = abs(sdRoundBox(param, param_1, param_2)) - 1.0;
+            cover = fast::clamp(0.5 - (d / fast::max(fwidth(d), 9.9999997473787516355514526367188e-05)), 0.0, 1.0);
         }
         else
         {
-            if (in.vShape.w > 0.5)
+            if (in.vShape.w > 1.5)
             {
-                float2 param_3 = in.vUv;
-                float2 param_4 = in.vShape.xy;
-                float param_5 = in.vShape.z;
-                float d_1 = sdRoundBox(param_3, param_4, param_5);
-                cover = fast::clamp(0.5 - (d_1 / fast::max(fwidth(d_1), 9.9999997473787516355514526367188e-05)), 0.0, 1.0);
+                color = in.vColor * uTex.sample(uTexSmplr, in.vUv).x;
+            }
+            else
+            {
+                if (in.vShape.w > 0.5)
+                {
+                    float2 param_3 = in.vUv;
+                    float2 param_4 = in.vShape.xy;
+                    float param_5 = in.vShape.z;
+                    float d_1 = sdRoundBox(param_3, param_4, param_5);
+                    cover = fast::clamp(0.5 - (d_1 / fast::max(fwidth(d_1), 9.9999997473787516355514526367188e-05)), 0.0, 1.0);
+                }
             }
         }
     }
-    bool _129 = in.vClip.z > 0.5;
-    bool _136;
-    if (!_129)
+    bool _152 = in.vClip.z > 0.5;
+    bool _159;
+    if (!_152)
     {
-        _136 = in.vClip.w > 0.5;
+        _159 = in.vClip.w > 0.5;
     }
     else
     {
-        _136 = _129;
+        _159 = _152;
     }
-    if (_136)
+    if (_159)
     {
         float2 p = in.vPos - in.vClip.xy;
         float2 param_6 = p;

@@ -5,7 +5,7 @@
 namespace visu::asset;
 
 use std::io;
-use visu::app::slashDir;
+use visu::app::{Paths, slashDir};
 
 public class DirectoryStore : Store
 {
@@ -192,66 +192,8 @@ internal function split4(const string& $line) : array<string>
 
 internal function ensureParent(const string& $path) : status<AssetError>
 {
-    usize $slash = 0;
-    usize $i = 0;
-    usize $n = $path->size();
-
-    while ($i < $n) {
-        uint8 $c = $path->byte($i);
-        if ($c == 47 || $c == 92) {
-            $slash = $i;
-        }
-
-        $i = $i + 1;
-    }
-
-    if ($slash == 0) {
-        return .ok;
-    }
-
-    string $parent = $path->sub(0, $slash);
-    return ensureDir($parent->clone());
-}
-
-internal function ensureDir(const string& $dir) : status<AssetError>
-{
-    if ($dir->empty() || $dir->equals('.') || $dir->equals('..')) {
-        return .ok;
-    }
-
-    bool $here = guard io::exists($dir) else ($e) {
-        return .error(.io($dir, $e->message()));
-    }
-    if ($here) {
-        return .ok;
-    }
-
-    usize $slash = 0;
-    usize $i = 0;
-    usize $n = $dir->size();
-
-    while ($i < $n) {
-        uint8 $c = $dir->byte($i);
-        if ($c == 47 || $c == 92) {
-            $slash = $i;
-        }
-
-        $i = $i + 1;
-    }
-
-    if ($slash > 0) {
-        string $parent = $dir->sub(0, $slash);
-        guard ensureDir($parent->clone()) else ($e) {
-            return .error($e);
-        }
-    }
-
-    guard io::mkdir($dir) else ($e) {
-        if ($e->exists()) {
-            return .ok;
-        }
-
-        return .error(.io($dir, $e->message()));
+    guard Paths::ensureParentDir($path) else ($e) {
+        return .error(.io($path, $e->message()));
     }
 
     return .ok;

@@ -1,0 +1,105 @@
+/**
+ * Textured rect: construct, emit. Optional filled border around the image.
+ */
+
+namespace visu::ui;
+
+use visu::graphics::{ResourceState, Texture};
+use visu::math::Vec2;
+use visu::vg::Color;
+
+internal const float32 IMAGE_BORDER = 2.0f;
+
+internal function uiImage(
+    Ui $ui,
+    Texture? $tex,
+    float32 $width,
+    float32 $height,
+    Color? $border,
+    float32 $radius
+) : void
+{
+    float32 $w = $width;
+    float32 $h = $height;
+    Texture $got = guard $tex else {
+        if ($h <= 0.0f) {
+            $h = $w;
+        }
+
+        pushImage($ui, null, $w, $h, $border, $radius);
+        return;
+    }
+
+    if ($h <= 0.0f) {
+        int32 $tw = $got->desc->width;
+        int32 $th = $got->desc->height;
+
+        if ($tw > 0 && $th > 0) {
+            $h = $w * ($th as float32) / ($tw as float32);
+        } else {
+            $h = $w;
+        }
+    }
+
+    pushImage($ui, $got, $w, $h, $border, $radius);
+}
+
+internal function pushImage(
+    Ui $ui,
+    Texture? $tex,
+    float32 $width,
+    float32 $height,
+    Color? $border,
+    float32 $radius
+) : void
+{
+    Color $b = $border ?? Color::transparent();
+    float32 $bw = 0.0f;
+
+    if ($b->a > 0.0f) {
+        $bw = IMAGE_BORDER;
+    }
+
+    int32 $p = $ui->images->count() as int32;
+    $ui->images[] = ImageRun($tex, $b, $bw);
+    Node $n = Node();
+    $n->kind = .image;
+    $n->payload = $p;
+    $n->radius = $radius;
+    $n->measured = Vec2($width + $bw * 2.0f, $height + $bw * 2.0f);
+    $ui->push($n);
+}
+
+internal function emitImageBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    ImageRun $run = $ui->images[$n->payload as usize];
+
+    if ($run->border->a <= 0.0f) {
+        return;
+    }
+
+    fillBox($ui, $n->pos, $n->size, $n->radius, $run->border, $pad);
+}
+
+internal function emitImage(Ui $ui, const Node& $n) : void
+{
+    ImageRun $run = $ui->images[$n->payload as usize];
+    Texture $tex = guard $run->texture else {
+        return;
+    }
+
+    if ($tex->state != ResourceState::shaderRead) {
+        $ui->device->transitionTexture($tex, .shaderRead);
+    }
+
+    float32 $bw = $run->borderWidth;
+    Vec2 $pos = Vec2($n->pos->x + $bw, $n->pos->y + $bw);
+    Vec2 $size = Vec2($n->size->x - $bw * 2.0f, $n->size->y - $bw * 2.0f);
+
+    if ($size->x <= 0.0f || $size->y <= 0.0f) {
+        return;
+    }
+
+    bindAtlas($ui->batch, $tex);
+    emitImageQuad($ui->batch, $pos, $size, Color::white(), noClip());
+}

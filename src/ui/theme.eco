@@ -18,6 +18,12 @@ public struct ButtonStyle
     public Color $hoverText;
 }
 
+public enum Indicator
+{
+    case pill;
+    case underline;
+}
+
 public struct GroupStyle
 {
     public Edges $pad;
@@ -33,6 +39,28 @@ public struct GroupStyle
     public Color $activeText;
     public Color $inactiveText;
     public Color $hoverText;
+    public Indicator $indicator = .pill;
+    public float32 $indicatorSize = 0.0f;
+    public bool $baseline = false;
+    public float32 $labelHeight = 24.0f;
+}
+
+public struct SliderStyle
+{
+    public float32 $height = 20.0f;
+    public float32 $trackHeight = 4.0f;
+    public float32 $thumb = 14.0f;
+    public float32 $width = 180.0f;
+    public Color $track;
+    public Color $fill;
+    public Color $thumbColor;
+
+    init
+    {
+        $this->track = Color(0.82f, 0.82f, 0.84f, 1.0f);
+        $this->fill = Color(0.256f, 0.271f, 0.906f, 1.0f);
+        $this->thumbColor = Color::white();
+    }
 }
 
 public struct SelectStyle
@@ -57,6 +85,7 @@ public struct SelectStyle
     public Color $optionHoverText;
     public Color $optionSelectedText;
     public Color $arrow;
+    public float32 $minWidth = 180.0f;
 }
 
 public class Theme
@@ -79,6 +108,10 @@ public class Theme
     public Color $labelTextColor;
     public float32 $labelFontSize = 13.0f;
     public float32 $labelHeight = 24.0f;
+    public Color $surface;
+    public Color $onSurface;
+    public Color $accent;
+    public Color $border;
     public float32 $cardRadius = 5.0f;
     public Edges $cardPad;
     public Color $cardBg;
@@ -86,7 +119,9 @@ public class Theme
     public ButtonStyle $primaryButton;
     public ButtonStyle $secondaryButton;
     public GroupStyle $buttonGroup;
+    public GroupStyle $tabBar;
     public SelectStyle $select;
+    public SliderStyle $slider;
     public Color $checkboxBg;
     public Color $checkboxHoverBg;
     public Color $checkboxActiveBg;
@@ -94,6 +129,10 @@ public class Theme
     public constructor()
     {
         Color $z = Color::transparent();
+        $this->surface = Color::white();
+        $this->onSurface = Color::black();
+        $this->accent = Color(0.256f, 0.271f, 0.906f, 1.0f);
+        $this->border = Color::black()->withAlpha(0.16f);
         $this->textColor = $z;
         $this->mutedTextColor = $z;
         $this->sectionHeaderTextColor = $z;
@@ -109,6 +148,8 @@ public class Theme
             Edges(), 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
             $z, $z, $z, $z, $z, $z
         );
+        $this->tabBar = $this->buttonGroup;
+        $this->slider = SliderStyle();
         $this->select = SelectStyle(
             Edges(), 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, '',
             $z, $z, $z, $z, $z, $z, $z, $z, $z, $z, $z, $z, $z
@@ -118,37 +159,40 @@ public class Theme
 
     public function applyGenerals() : void
     {
-        $this->textColor = Color::black();
-        $this->mutedTextColor = $this->textColor->lighten(0.4f);
+        Color $surface = $this->surface;
+        Color $on = $this->onSurface;
+        Color $accent = $this->accent;
+        Color $border = $this->border;
+        $this->textColor = $on;
+        $this->mutedTextColor = $on->lighten(0.4f);
         $this->sectionSpacing = $this->spacing * 2.0f;
-        $this->sectionBottomSpace = $this->spacing * 4.0f;
+        $this->sectionBottomSpace = $this->spacing;
         $this->sectionHeaderTextColor = $this->mutedTextColor;
         $this->sectionHeaderFontSize = $this->smallFontSize;
-        $this->labelTextColor = Color::black();
+        $this->labelTextColor = $on;
         $this->labelFontSize = $this->fontSize;
         $this->cardPad = Edges::all($this->padding);
         $this->cardRadius = $this->borderRadius;
-        $this->cardBg = Color::white();
-        Color $primary = Color(0.256f, 0.271f, 0.906f, 1.0f);
+        $this->cardBg = $surface;
         float32 $bp = $this->padding * 1.2f;
         float32 $bv = $this->padding * 0.6f;
         $this->primaryButton = ButtonStyle(
             Edges($bp, $bp, $bv, $bv),
             $this->borderRadius,
             $this->fontSize,
-            $primary,
-            $primary->lighten(0.05f),
-            Color::white(),
-            Color::white()
+            $accent,
+            $accent->lighten(0.05f),
+            $surface,
+            $surface
         );
         $this->secondaryButton = $this->primaryButton;
-        $this->secondaryButton->bg = Color::black();
-        $this->secondaryButton->hoverBg = Color::black()->lighten(0.2f);
+        $this->secondaryButton->bg = $on;
+        $this->secondaryButton->hoverBg = $on->lighten(0.2f);
         $this->checkboxBg = Color(0.9f, 0.9f, 0.9f, 1.0f);
         $this->checkboxHoverBg = $this->checkboxBg->lighten(0.05f);
-        $this->checkboxActiveBg = $primary;
+        $this->checkboxActiveBg = $accent;
         float32 $gp = $this->padding * 0.4f;
-        $this->buttonGroup = GroupStyle(
+        GroupStyle $group = GroupStyle(
             Edges::all($gp),
             $this->borderRadius * 2.0f,
             $this->borderRadius * 1.4f,
@@ -156,13 +200,33 @@ public class Theme
             30.0f,
             4.0f,
             8.0f,
-            Color::white(),
-            Color::black()->withAlpha(0.05f),
-            $primary,
-            Color::white(),
-            Color::black(),
+            $surface,
+            $on->withAlpha(0.05f),
+            $accent,
+            $surface,
+            $on,
             Color(0.3f, 0.3f, 0.3f, 1.0f)
         );
+        $group->labelHeight = $this->labelHeight;
+        $this->buttonGroup = $group;
+        GroupStyle $tabs = $group;
+        $tabs->bg = Color::transparent();
+        $tabs->border = Color::transparent();
+        $tabs->indicator = .underline;
+        $tabs->indicatorSize = 2.0f;
+        $tabs->baseline = true;
+        $tabs->labelHeight = 0.0f;
+        $tabs->buttonRadius = 0.0f;
+        $tabs->activeText = $accent;
+        $tabs->buttonSpacing = 8.0f;
+        $tabs->innerOffset = 0.0f;
+        $tabs->animationSpeed = 24.0f;
+        $this->tabBar = $tabs;
+        SliderStyle $slider = SliderStyle();
+        $slider->fill = $accent;
+        $slider->track = $on->withAlpha(0.12f);
+        $slider->thumbColor = $surface;
+        $this->slider = $slider;
         $this->select = SelectStyle(
             Edges($bp, $bp, $bv, $bv),
             $this->borderRadius,
@@ -171,18 +235,18 @@ public class Theme
             28.0f,
             200.0f,
             'Please select...',
-            Color::white(),
+            $surface,
             Color(0.96f, 0.96f, 0.97f, 1.0f),
-            Color::black()->withAlpha(0.16f),
-            Color::white(),
-            Color::black()->withAlpha(0.16f),
-            Color::black()->withAlpha(0.05f),
-            $primary,
-            Color::black(),
-            Color::black()->withAlpha(0.3f),
-            Color::black(),
-            Color::black(),
-            Color::white(),
+            $border,
+            $surface,
+            $border,
+            $on->withAlpha(0.05f),
+            $accent,
+            $on,
+            $on->withAlpha(0.3f),
+            $on,
+            $on,
+            $surface,
             Color(0.5f, 0.5f, 0.5f, 1.0f)
         );
     }

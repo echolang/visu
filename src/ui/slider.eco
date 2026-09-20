@@ -1,0 +1,160 @@
+/**
+ * Linear slider: drag the thumb, optional step, clamp to [min, max].
+ * Slot.pressed is the drag capture; grab is the press edge so a drag begun elsewhere cannot steal it.
+ */
+
+namespace visu::ui;
+
+use visu::math::Vec2;
+use visu::vg::Color;
+
+internal function uiSlider(
+    Ui $ui,
+    const string& $label,
+    float32& $value,
+    float32 $min,
+    float32 $max,
+    float32 $step,
+    const string& $id
+) : bool
+{
+    uint64 $wid = $ui->makeId($id, $label);
+    bool $changed = false;
+    float32 $lo = $min;
+    float32 $hi = $max;
+
+    if ($hi < $lo) {
+        float32 $swap = $lo;
+        $lo = $hi;
+        $hi = $swap;
+    }
+
+    float32 $span = $hi - $lo;
+
+    if ($ui->drag($wid) && $span > 0.0f) {
+        Slot $s = $ui->slots[$wid];
+        float32 $t = 0.0f;
+
+        if ($s->size->x > 0.0f) {
+            $t = ($ui->io->pointer->x - $s->pos->x) / $s->size->x;
+        }
+
+        if ($t < 0.0f) {
+            $t = 0.0f;
+        }
+
+        if ($t > 1.0f) {
+            $t = 1.0f;
+        }
+
+        float32 $v = $lo + $t * $span;
+
+        if ($step > 0.0f) {
+            float32 $n = std::math::round(($v - $lo) / $step);
+            $v = $lo + $n * $step;
+        }
+
+        if ($v < $lo) {
+            $v = $lo;
+        }
+
+        if ($v > $hi) {
+            $v = $hi;
+        }
+
+        if ($v != $value) {
+            $value = $v;
+            $changed = true;
+        }
+    } else if ($value < $lo) {
+        $value = $lo;
+        $changed = true;
+    } else if ($value > $hi) {
+        $value = $hi;
+        $changed = true;
+    }
+
+    int32 $p = $ui->sliders->count() as int32;
+    $ui->sliders[] = SliderRun($label, $value, $lo, $hi);
+    SliderStyle $st = $ui->theme->slider;
+    Node $n = Node();
+    $n->kind = .slider;
+    $n->payload = $p;
+    $n->id = $wid;
+    float32 $h = $st->height;
+    float32 $labelH = 0.0f;
+
+    if (!$label->empty()) {
+        $labelH = $ui->theme->labelHeight;
+    }
+
+    $n->measured = Vec2($st->width, $h + $labelH);
+    $ui->push($n);
+    return $changed;
+}
+
+internal function emitSliderBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    SliderRun $run = $ui->sliders[$n->payload as usize];
+    SliderStyle $st = $ui->theme->slider;
+    float32 $labelH = 0.0f;
+
+    if (!$run->label->empty()) {
+        $labelH = $ui->theme->labelHeight;
+    }
+
+    float32 $trackH = $st->trackHeight;
+    float32 $y = $n->pos->y + $labelH + ($st->height - $trackH) * 0.5f;
+    Vec2 $track = Vec2($n->pos->x, $y);
+    Vec2 $trackSize = Vec2($n->size->x, $trackH);
+    fillBox($ui, $track, $trackSize, $trackH * 0.5f, $st->track, $pad);
+    float32 $span = $run->max - $run->min;
+    float32 $t = 0.0f;
+
+    if ($span > 0.0f) {
+        $t = ($run->value - $run->min) / $span;
+    }
+
+    if ($t < 0.0f) {
+        $t = 0.0f;
+    }
+
+    if ($t > 1.0f) {
+        $t = 1.0f;
+    }
+
+    float32 $fillW = $trackSize->x * $t;
+    fillBox($ui, $track, Vec2($fillW, $trackH), $trackH * 0.5f, $st->fill, $pad);
+    float32 $thumb = $st->thumb;
+    float32 $tx = $n->pos->x + $trackSize->x * $t - $thumb * 0.5f;
+    float32 $ty = $n->pos->y + $labelH + ($st->height - $thumb) * 0.5f;
+    fillBox($ui, Vec2($tx, $ty), Vec2($thumb, $thumb), $thumb * 0.5f, $st->fill, $pad);
+    float32 $inner = $thumb * 0.45f;
+    fillBox(
+        $ui,
+        Vec2($tx + ($thumb - $inner) * 0.5f, $ty + ($thumb - $inner) * 0.5f),
+        Vec2($inner, $inner),
+        $inner * 0.5f,
+        $st->thumbColor,
+        $pad
+    );
+}
+
+internal function emitSliderText(Ui $ui, const Node& $n) : visu::graphics::Texture?
+{
+    SliderRun $run = $ui->sliders[$n->payload as usize];
+
+    if ($run->label->empty()) {
+        return null;
+    }
+
+    return paintText(
+        $ui,
+        $n->pos,
+        $run->label,
+        $ui->theme->labelFontSize,
+        $ui->theme->labelTextColor,
+        true,
+        false
+    );
+}

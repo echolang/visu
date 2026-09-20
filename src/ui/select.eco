@@ -19,7 +19,7 @@ internal function uiSelect(
 ) : bool
 {
     uint64 $wid = $ui->makeId($id, $name);
-    touchSlot($ui->slots, $wid);
+    touchSlot($ui->slots, $wid, $ui->stamp);
     Slot $slot = $ui->slots[$wid];
     SelectPersist $sel = selectData($slot);
     setSelect($slot, $sel);
@@ -87,7 +87,7 @@ internal function uiSelect(
             int32 $ci = $shown[$i];
             Choice $ch = $choices[$ci as usize];
             uint64 $oid = mixId($wid, $ch->id);
-            touchSlot($ui->slots, $oid);
+            touchSlot($ui->slots, $oid, $ui->stamp);
 
             if (contains($ui->slots[$oid]->pos, $ui->slots[$oid]->size, $ui->io->pointer)) {
                 $sel->highlight = $i as int32;
@@ -121,7 +121,7 @@ internal function uiSelect(
     $node->kind = .select;
     $node->payload = $p;
     $node->id = $wid;
-    $node->measured = measureSelect($ui, $choices);
+    $node->measured = measureSelect($ui, $choices, $name);
     $ui->push($node);
     return $changed;
 }
@@ -321,7 +321,16 @@ internal function selectBoxText(const ListRun& $run, const string& $query, const
     return choiceLabel($run->choices, $run->selected, $placeholder);
 }
 
-internal function measureSelect(Ui $ui, const array<Choice>& $choices) : Vec2
+internal function selectNameHeight(Ui $ui, const string& $name) : float32
+{
+    if ($name->empty()) {
+        return 0.0f;
+    }
+
+    return $ui->theme->labelHeight;
+}
+
+internal function measureSelect(Ui $ui, const array<Choice>& $choices, const string& $name) : Vec2
 {
     SelectStyle $st = $ui->theme->select;
     float32 $maxW = $ui->measureText($st->placeholder, $st->fontSize, true)->x;
@@ -338,23 +347,28 @@ internal function measureSelect(Ui $ui, const array<Choice>& $choices) : Vec2
         $i = $i + 1;
     }
 
-    return Vec2($maxW + $st->pad->width() + SELECT_ARROW_W, $ui->theme->labelHeight + selectBoxHeight($st));
+    float32 $boxW = $maxW + $st->pad->width() + SELECT_ARROW_W;
+
+    if ($boxW < $st->minWidth) {
+        $boxW = $st->minWidth;
+    }
+
+    return Vec2($boxW, selectNameHeight($ui, $name) + selectBoxHeight($st));
 }
 
 internal function writeSelectRects(Ui $ui, const Node& $node, int32 $index) : void
 {
     ListRun $run = $ui->lists[$node->payload as usize];
     SelectStyle $st = $ui->theme->select;
-    float32 $labelH = $ui->theme->labelHeight;
+    float32 $labelH = selectNameHeight($ui, $run->name);
     float32 $boxH = selectBoxHeight($st);
     Vec2 $boxPos = Vec2($node->pos->x, $node->pos->y + $labelH);
     Vec2 $boxSize = Vec2($node->size->x, $boxH);
-    touchSlot($ui->slots, $node->id);
+    touchSlot($ui->slots, $node->id, $ui->stamp);
     Slot $box = $ui->slots[$node->id];
     SelectPersist $sel = selectData($box);
     $box->pos = $boxPos;
     $box->size = $boxSize;
-    $box->seen = true;
     array<int32> $shown = $run->shown;
     usize $n = $shown->count();
     usize $vis = visibleOptionCount($st, $n as int32);
@@ -379,11 +393,10 @@ internal function writeSelectRects(Ui $ui, const Node& $node, int32 $index) : vo
     while ($i < $vis) {
         Choice $ch = $run->choices[$shown[$i] as usize];
         uint64 $oid = mixId($node->id, $ch->id);
-        touchSlot($ui->slots, $oid);
+        touchSlot($ui->slots, $oid, $ui->stamp);
         Slot $s = $ui->slots[$oid];
         $s->pos = Vec2($sel->dropPos->x, $sel->dropPos->y + ($i as float32) * $st->optionHeight);
         $s->size = Vec2($sel->dropSize->x, $st->optionHeight);
-        $s->seen = true;
         $ui->slots[$oid] = $s;
         $i = $i + 1;
     }
@@ -391,8 +404,9 @@ internal function writeSelectRects(Ui $ui, const Node& $node, int32 $index) : vo
 
 internal function emitSelectBox(Ui $ui, const Node& $n, float32 $pad) : void
 {
+    ListRun $run = $ui->lists[$n->payload as usize];
     SelectStyle $st = $ui->theme->select;
-    float32 $labelH = $ui->theme->labelHeight;
+    float32 $labelH = selectNameHeight($ui, $run->name);
     Vec2 $box = Vec2($n->pos->x, $n->pos->y + $labelH);
     Vec2 $boxSize = Vec2($n->size->x, selectBoxHeight($st));
     bool $hot = contains($box, $boxSize, $ui->io->pointer);
@@ -479,15 +493,20 @@ internal function emitSelectText(Ui $ui, const Node& $n) : Texture?
 {
     ListRun $run = $ui->lists[$n->payload as usize];
     SelectStyle $st = $ui->theme->select;
-    Texture? $atlas = paintText(
-        $ui,
-        $n->pos,
-        $run->name,
-        $ui->theme->labelFontSize,
-        $ui->theme->labelTextColor,
-        true,
-        false
-    );
+    Texture? $atlas = null;
+
+    if (!$run->name->empty()) {
+        $atlas = paintText(
+            $ui,
+            $n->pos,
+            $run->name,
+            $ui->theme->labelFontSize,
+            $ui->theme->labelTextColor,
+            true,
+            false
+        );
+    }
+
     string $query = '';
 
     if ($ui->slots->has($n->id)) {
@@ -501,7 +520,7 @@ internal function emitSelectText(Ui $ui, const Node& $n) : Texture?
         $col = $st->text;
     }
 
-    float32 $labelH = $ui->theme->labelHeight;
+    float32 $labelH = selectNameHeight($ui, $run->name);
     float32 $boxH = selectBoxHeight($st);
     Vec2 $box = Vec2($n->pos->x, $n->pos->y + $labelH);
     float32 $textW = $n->size->x - $st->pad->left - SELECT_ARROW_W;

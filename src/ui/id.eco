@@ -35,7 +35,7 @@ internal struct Slot
 {
     public Vec2 $pos = Vec2(0.0f);
     public Vec2 $size = Vec2(0.0f);
-    public bool $seen = false;
+    public int32 $stamp = -1;
     public bool $pressed = false;
     public float64 $pressAt = -99.0;
     public Persist $data = .none;
@@ -46,23 +46,27 @@ internal function mixId(uint64 $parent, const string& $label) : uint64
     return hash::combine($parent, hash::of($label));
 }
 
-internal function touchSlot(map<uint64, Slot>& $slots, uint64 $id) : void
+internal function touchSlot(map<uint64, Slot>& $slots, uint64 $id, int32 $stamp) : void
 {
     if (!$slots->has($id)) {
         $slots[$id] = Slot();
     }
 
-    $slots->at($id)->seen = true;
+    $slots->at($id)->stamp = $stamp;
 }
 
-internal function dropUnseen(map<uint64, Slot>& $slots) : void
+internal function dropUnseen(map<uint64, Slot>& $slots, int32 $stamp, array<uint64>& $stale) : void
 {
-    array<uint64> $keys = $slots->keys();
+    $stale->clear();
 
-    foreach ($keys as $k) {
-        if (!$slots[$k]->seen) {
-            $slots->remove($k);
+    foreach ($slots as $k => $s) {
+        if ($s->stamp != $stamp) {
+            $stale[] = $k;
         }
+    }
+
+    foreach ($stale as $k) {
+        $slots->remove($k);
     }
 }
 
