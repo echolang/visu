@@ -1,0 +1,213 @@
+/**
+ * Console grammar and handler for deferred cascaded shadows. The renderer owns the quality
+ * field; this type owns the `shadows` verb.
+ */
+
+namespace visu::console;
+
+use visu::graphics::{
+    DeferredRenderer, SHADOW_CASCADES, ShadowQuality, shadowCascadeFars, shadowSplitsIncrease
+};
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal const SHADOWS_USAGE = 'usage: shadows [on|off|toggle|debug|splits [d0 d1 d2 d3 d4]]';
+
+public class ShadowConsole : ConsoleCommandHandler
+{
+    public DeferredRenderer $renderer;
+
+    /**
+     * Last quality while shadows are off, so `shadows on` restores splits and debug.
+     */
+    private ShadowQuality? $held;
+
+    public constructor(DeferredRenderer $renderer)
+    {
+        $this->renderer = $renderer;
+        $this->held = null;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('shadows', $this, 'on|off|toggle|debug|splits [d0 d1 d2 d3 d4]');
+        array<string> $names = array<string>();
+        $names[] = 'shadows';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if (!$cmd->isAction('shadows')) {
+            return;
+        }
+
+        usize $n = $cmd->parts->count();
+        if ($n == 1) {
+            $console->writeLine($this->statusLine());
+            return;
+        }
+
+        string $verb = $cmd->parts[1];
+        if ($verb == 'splits') {
+            $this->onSplits($cmd, $console);
+            return;
+        }
+
+        if ($n != 2) {
+            $console->writeLine(SHADOWS_USAGE);
+            return;
+        }
+
+        if ($verb == 'on') {
+            $this->enable();
+            $console->writeLine($this->statusLine());
+            return;
+        }
+
+        if ($verb == 'off') {
+            $this->disable();
+            $console->writeLine($this->statusLine());
+            return;
+        }
+
+        if ($verb == 'toggle') {
+            if ($this->renderer->shadows != null) {
+                $this->disable();
+            } else {
+                $this->enable();
+            }
+
+            $console->writeLine($this->statusLine());
+            return;
+        }
+
+        if ($verb == 'debug') {
+            ShadowQuality $quality = $this->quality();
+            $quality->debug = !$quality->debug;
+            $console->writeLine($this->statusLine());
+            return;
+        }
+
+        $console->writeLine(SHADOWS_USAGE);
+    }
+
+    private function onSplits(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        usize $n = $cmd->parts->count();
+        if ($n == 2) {
+            $console->writeLine(shadowsSplitsLine($this->quality()));
+            return;
+        }
+
+        usize $want = (SHADOW_CASCADES as usize) + 2;
+        if ($n != $want) {
+            $console->writeLine(SHADOWS_USAGE);
+            return;
+        }
+
+        array<float32> $splits = array<float32>();
+        $splits->reserve(SHADOW_CASCADES as usize);
+        int32 $i = 0;
+        while ($i < SHADOW_CASCADES) {
+            float64 $raw = guard str::float($cmd->parts[($i + 2) as usize]) else {
+                $console->writeLine(SHADOWS_USAGE);
+                return;
+            }
+            $splits[] = $raw as float32;
+            $i = $i + 1;
+        }
+
+        ShadowQuality $quality = $this->quality();
+        if (!shadowSplitsIncrease($splits, $quality->near)) {
+            $console->writeLine('shadows: splits must increase and sit past near');
+            return;
+        }
+
+        applyShadowSplits($quality, $splits);
+        $console->writeLine(shadowsSplitsLine($quality));
+    }
+
+    private function enable() : void
+    {
+        if ($this->renderer->shadows != null) {
+            return;
+        }
+
+        $this->renderer->shadows = $this->held ?? ShadowQuality();
+    }
+
+    private function disable() : void
+    {
+        ShadowQuality? $current = $this->renderer->shadows;
+        if ($current != null) {
+            ShadowQuality $quality = guard $current;
+            $this->held = $quality;
+            $this->renderer->shadows = null;
+        }
+    }
+
+    /**
+     * Live quality when shadows are on, otherwise the held off-state bag.
+     * Does not enable shadows.
+     */
+    private function quality() : ShadowQuality
+    {
+        ShadowQuality? $live = $this->renderer->shadows;
+        if ($live != null) {
+            ShadowQuality $q = guard $live;
+            return $q;
+        }
+
+        ShadowQuality $held = $this->held ?? ShadowQuality();
+        $this->held = $held;
+        return $held;
+    }
+
+    private function statusLine() : string
+    {
+        string $state = 'off';
+        if ($this->renderer->shadows != null) {
+            $state = 'on';
+        }
+
+        ShadowQuality? $q = $this->renderer->shadows;
+        if ($q == null) {
+            $q = $this->held;
+        }
+
+        if ($q == null) {
+            return "shadows: {$state}";
+        }
+
+        ShadowQuality $quality = guard $q;
+        string $debug = 'off';
+        if ($quality->debug) {
+            $debug = 'on';
+        }
+
+        return "shadows: {$state}, {$quality->resolution}, debug {$debug}";
+    }
+}
+
+internal function applyShadowSplits(ShadowQuality $quality, array<float32> $splits) : void
+{
+    $quality->splits = $splits;
+    if ($splits->count() > 0) {
+        $quality->maxLength = $splits[($splits->count() - 1) as usize];
+    }
+}
+
+internal function shadowsSplitsLine(const ShadowQuality& $quality) : string
+{
+    float32[5] $fars = shadowCascadeFars($quality);
+    string $buf = 'shadows splits:';
+    int32 $i = 0;
+    while ($i < SHADOW_CASCADES) {
+        float32 $d = $fars[$i];
+        $buf = "{$buf} {$d:.0f}";
+        $i = $i + 1;
+    }
+
+    return $buf;
+}

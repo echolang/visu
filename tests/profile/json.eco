@@ -4,7 +4,7 @@
 
 // the profiler measures nothing under VISU_RELEASE, so none of this holds there
 #[if: !VISU_RELEASE]
-use visu::graphics::{DrawCounters, GpuSpan, GpuTimeline};
+use visu::graphics::{DrawCounters, GpuSpan, GpuProfiler};
 use visu::profile::{FrameProfile, Profiler, profileJson};
 
 function jsInt(json::Value $v) : int64
@@ -41,14 +41,13 @@ function jsStr(json::Value $v) : string
 
 test profile_json_round_trips
 {
-    GpuTimeline $tl = GpuTimeline();
+    GpuProfiler $tl = GpuProfiler();
     $tl->supported = true;
     Profiler $prof = Profiler();
     $prof->attach(DrawCounters(), $tl);
     $prof->beginFrame();
     $prof->bindFrame(4, 40);
     $prof->begin('render');
-    $prof->captureSubmit();
     $prof->begin('gbuffer');
     $prof->begin('terrain');
     $prof->end();
@@ -56,9 +55,8 @@ test profile_json_round_trips
     $prof->end();
     $prof->endFrame();
     array<GpuSpan> $spans = array<GpuSpan>();
-    $spans[] = GpuSpan(-1, 900.0);
     $spans[] = GpuSpan(2, 400.0);
-    $tl->publish(4, $spans, 0);
+    $tl->publish(4, $spans, 0, 900.0);
     $prof->mergeGpu();
     FrameProfile $f = guard $prof->complete() else {
         die('frame');

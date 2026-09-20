@@ -4,7 +4,7 @@
 
 // the profiler measures nothing under VISU_RELEASE, so none of this holds there
 #[if: !VISU_RELEASE]
-use visu::graphics::{DrawCounters, GpuSpan, GpuTimeline};
+use visu::graphics::{DrawCounters, GpuSpan, GpuProfiler};
 use visu::profile::{FrameProfile, Profiler, STATS_WINDOW, ScopeStats, StatsBook, Window};
 
 test window_tracks_last_avg_max
@@ -113,23 +113,21 @@ test stats_book_zero_fills_and_forgets
  */
 test stats_book_gpu_averages_over_frames_without_spans
 {
-    GpuTimeline $tl = GpuTimeline();
+    GpuProfiler $tl = GpuProfiler();
     $tl->supported = true;
     Profiler $prof = Profiler();
     $prof->attach(DrawCounters(), $tl);
     $prof->beginFrame();
     $prof->bindFrame(1, 1);
     $prof->begin('render');
-    $prof->captureSubmit();
     $prof->begin('ibl');
     $prof->end();
     $prof->end();
     $prof->endFrame();
     // node ids: 0 frame, 1 render, 2 ibl
     array<GpuSpan> $spans = array<GpuSpan>();
-    $spans[] = GpuSpan(-1, 3000.0);
     $spans[] = GpuSpan(2, 2400.0);
-    $tl->publish(1, $spans, 0);
+    $tl->publish(1, $spans, 0, 3000.0);
     $prof->mergeGpu();
     guard $prof->complete() else {
         die('bake frame');
@@ -140,14 +138,12 @@ test stats_book_gpu_averages_over_frames_without_spans
         $prof->beginFrame();
         $prof->bindFrame(($i + 2) as uint64, $i + 2);
         $prof->begin('render');
-        $prof->captureSubmit();
         $prof->begin('ibl');
         $prof->end();
         $prof->end();
         $prof->endFrame();
         array<GpuSpan> $quiet = array<GpuSpan>();
-        $quiet[] = GpuSpan(-1, 3000.0);
-        $tl->publish(($i + 2) as uint64, $quiet, 0);
+        $tl->publish(($i + 2) as uint64, $quiet, 0, 3000.0);
         $prof->mergeGpu();
         guard $prof->complete() else {
             die('quiet frame');

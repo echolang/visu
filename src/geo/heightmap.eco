@@ -14,6 +14,8 @@ public class Heightmap
     public const int32 $height;
     public const float32 $ppu;
     private array<float32> $data;
+    private float32 $lo;
+    private float32 $hi;
 
     /**
      * `$data` is row-major in Z, `width * height` samples. `$ppu` must be > 0.
@@ -28,6 +30,7 @@ public class Heightmap
         $this->height = $height;
         $this->ppu = $ppu;
         $this->data = $data;
+        $this->recount();
     }
 
     /**
@@ -60,7 +63,22 @@ public class Heightmap
     {
         assert($ix >= 0 && $ix < $this->width, 'heightmap x');
         assert($iz >= 0 && $iz < $this->height, 'heightmap z');
-        $this->data[($iz * $this->width + $ix) as usize] = $h;
+        usize $i = ($iz * $this->width + $ix) as usize;
+        float32 $old = $this->data[$i];
+        float32 $oldLo = $this->lo;
+        float32 $oldHi = $this->hi;
+        $this->data[$i] = $h;
+        if ($h < $this->lo) {
+            $this->lo = $h;
+        }
+
+        if ($h > $this->hi) {
+            $this->hi = $h;
+        }
+
+        if (($old == $oldLo && $h > $oldLo) || ($old == $oldHi && $h < $oldHi)) {
+            $this->recount();
+        }
     }
 
     /**
@@ -247,30 +265,38 @@ public class Heightmap
         return $test;
     }
 
+    /**
+     * Lowest sample. Cached; `set` keeps it in sync.
+     */
     public const function min() : float32
     {
-        float32 $lo = $this->data[0];
+        return $this->lo;
+    }
 
+    /**
+     * Highest sample. Cached; `set` keeps it in sync.
+     */
+    public const function max() : float32
+    {
+        return $this->hi;
+    }
+
+    private function recount() : void
+    {
+        float32 $lo = $this->data[0];
+        float32 $hi = $lo;
         foreach ($this->data as $h) {
             if ($h < $lo) {
                 $lo = $h;
             }
-        }
 
-        return $lo;
-    }
-
-    public const function max() : float32
-    {
-        float32 $hi = $this->data[0];
-
-        foreach ($this->data as $h) {
             if ($h > $hi) {
                 $hi = $h;
             }
         }
 
-        return $hi;
+        $this->lo = $lo;
+        $this->hi = $hi;
     }
 
     /**

@@ -73,6 +73,8 @@ public struct ScopeStats
     public Window $cpu = Window();
     /** per frame; a frame with no encoder under the scope (or no run) pushes 0 */
     public Window $gpu = Window();
+    /** 0.9 previous + 0.1 last; 0 until the first GPU sample */
+    public float64 $gpuEma = 0.0;
     /** from the last frame the scope ran in */
     public int32 $lastCalls = 0;
     public DrawStats $lastDraw = DrawStats();
@@ -82,16 +84,39 @@ public struct ScopeStats
     public uint64 $gpuSeen = 0;
 }
 
+/**
+ * Overlay/graph view of a scope: window aggregates without copying the sample arrays.
+ */
+public struct ScopeSnap
+{
+    public string $path = '';
+    public string $name = '';
+    public string $parentPath = '';
+    public int32 $depth = 0;
+    public int32 $lastCalls = 0;
+    public DrawStats $lastDraw = DrawStats();
+    public float64 $cpuLast = 0.0;
+    public float64 $cpuAvg = 0.0;
+    public float64 $cpuMax = 0.0;
+    public float64 $gpuLast = 0.0;
+    public float64 $gpuAvg = 0.0;
+    public float64 $gpuMax = 0.0;
+    public float64 $gpuEma = 0.0;
+    public bool $gpuKnown = false;
+}
+
 public class StatsBook
 {
     // scope paths are an open key set, so a map is the right shape here
     private map<string, ScopeStats> $byPath;
     private uint64 $noted;
+    private array<ScopeSnap> $snaps;
 
     public constructor()
     {
         $this->byPath = map<string, ScopeStats>();
         $this->noted = 0;
+        $this->snaps = array<ScopeSnap>();
     }
 
     /**
@@ -121,6 +146,12 @@ public class StatsBook
             if ($n->gpuSpans > 0) {
                 $s->gpu->push($n->gpuNs);
                 $s->gpuSeen = $this->noted;
+
+                if ($s->gpuEma <= 0.0) {
+                    $s->gpuEma = $n->gpuNs;
+                } else {
+                    $s->gpuEma = $s->gpuEma * 0.9 + $n->gpuNs * 0.1;
+                }
             } else {
                 $s->gpu->push(0.0);
             }
@@ -147,6 +178,8 @@ public class StatsBook
             $s->cpu->push(0.0);
             $s->gpu->push(0.0);
         }
+
+        $this->rebuildSnaps();
     }
 
     /**
@@ -186,6 +219,14 @@ public class StatsBook
     }
 
     /**
+     * Window aggregates for every in-window scope, rebuilt in `note`. No sample-array copies.
+     */
+    public const function snaps() : array<ScopeSnap>
+    {
+        return $this->snaps;
+    }
+
+    /**
      * Completed frames folded in so far.
      */
     public const function frames() : uint64
@@ -196,6 +237,37 @@ public class StatsBook
     public function reset() : void
     {
         $this->byPath = map<string, ScopeStats>();
+        $this->snaps = array<ScopeSnap>();
+    }
+
+    private function rebuildSnaps() : void
+    {
+        $this->snaps->clear();
+        array<string> $paths = $this->byPath->keys();
+        foreach ($paths as $path) {
+            ScopeStats& $s = $this->byPath->at($path);
+
+            if (!$this->inWindow($s)) {
+                continue;
+            }
+
+            ScopeSnap $o = ScopeSnap();
+            $o->path = $s->path;
+            $o->name = $s->name;
+            $o->parentPath = $s->parentPath;
+            $o->depth = $s->depth;
+            $o->lastCalls = $s->lastCalls;
+            $o->lastDraw = $s->lastDraw;
+            $o->cpuLast = $s->cpu->last;
+            $o->cpuAvg = $s->cpu->avg();
+            $o->cpuMax = $s->cpu->max();
+            $o->gpuLast = $s->gpu->last;
+            $o->gpuAvg = $s->gpu->avg();
+            $o->gpuMax = $s->gpu->max();
+            $o->gpuEma = $s->gpuEma;
+            $o->gpuKnown = $this->gpuKnown($s);
+            $this->snaps[] = $o;
+        }
     }
 
     private const function inWindow(const ScopeStats& $s) : bool

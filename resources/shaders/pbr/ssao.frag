@@ -19,6 +19,9 @@ layout(std140, set = 0, binding = 0) uniform SsaoUniforms {
 layout(set = 1, binding = 0) uniform sampler2D gbuffer_position;
 layout(set = 1, binding = 1) uniform sampler2D gbuffer_normal;
 layout(set = 1, binding = 2) uniform sampler2D noise_texture;
+layout(set = 1, binding = 3) uniform sampler2D gbuffer_id;
+
+#include "visu/gbuffer_id.glsl"
 
 /*
  * The position attachment stores camera-relative xyz (P - eye). A view
@@ -50,6 +53,8 @@ void main()
         return;
     }
 
+    uint centre_id = gbuffer_id_decode(texture(gbuffer_id, v_uv).r);
+
     vec3 view_pos = mat3(u_view) * P.xyz;
     vec3 view_normal = normalize(mat3(u_view) * texture(gbuffer_normal, v_uv).xyz);
     vec3 noise = normalize(texture(noise_texture, v_uv * u_screen.zw).xyz * 2.0 - 1.0);
@@ -69,7 +74,8 @@ void main()
             continue;
         }
 
-        vec4 occluder = texture(gbuffer_position, uv_from_ndc(clip.xy / clip.w));
+        vec2 occluder_uv = uv_from_ndc(clip.xy / clip.w);
+        vec4 occluder = texture(gbuffer_position, occluder_uv);
 
         if (occluder.a < 0.5) {
             continue;
@@ -79,11 +85,19 @@ void main()
 
         // view space looks down -Z, so a larger z sits nearer the camera
         if (occluder_z >= sample_view.z + bias) {
-            occlusion += smoothstep(0.0, 1.0, radius / abs(view_pos.z - occluder_z));
+            uint oid = gbuffer_id_decode(texture(gbuffer_id, occluder_uv).r);
+            float weight = 1.0;
+            if (gbuffer_id_soft_ao(oid)) {
+                weight = 0.15;
+            }
+            occlusion += weight * smoothstep(0.0, 1.0, radius / abs(view_pos.z - occluder_z));
         }
     }
 
     float ao = 1.0 - (occlusion / float(count));
     ao = mix(1.0, ao, fade);
+    if (gbuffer_id_soft_ao(centre_id)) {
+        ao = mix(1.0, ao, 0.35);
+    }
     frag_ao = pow(clamp(ao, 0.0, 1.0), strength);
 }

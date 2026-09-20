@@ -1,24 +1,20 @@
 /**
- * GPU timestamps per frame slot: one timestamp query pool, queries 0 and 1 bracket the whole
- * submit, then two per encoder (TOP_OF_PIPE before CmdBeginRendering, BOTTOM_OF_PIPE after
- * CmdEndRendering). Read back after the slot's fence into the device's GpuTimeline.
+ * GPU timestamps per frame slot: two queries per encoder (TOP_OF_PIPE before CmdBeginRendering,
+ * BOTTOM_OF_PIPE after CmdEndRendering), tagged with the current CPU profile node.
+ * MoltenVK does not produce timestamps for vkCmdWriteTimestamp outside a rendering pass, so
+ * pass-level TOP/BOTTOM around execute is not used. HUD `GPU:` is the union of those intervals.
+ * Read back after the slot's fence. WAIT_BIT is only used then, never on the live frame.
+ *
+ * Present-path encoders are not timestamped once the scene command buffer has been submitted.
  *
  * Every body is a no-op under VISU_RELEASE so device.eco stays unconditional. MoltenVK may
  * resolve every query of a command buffer to the same value when it falls back to CPU-side
- * timestamps; those zero spans are skipped and only the submit span survives.
+ * timestamps; those zero spans are skipped and submit busy is 0 rather than a vsync lie.
  */
 
 namespace visu::graphics;
 
-internal const uint32 GPU_QUERIES = 258;
-internal const uint32 GPU_FIRST_ENCODER_QUERY = 2;
-
-internal struct PendingSpan
-{
-    public int32 $scope;
-    public uint32 $start;
-    public uint32 $end;
-}
+internal const uint32 GPU_QUERIES = GPU_QUERY_COUNT;
 
 internal class GpuTimestamps
 {
@@ -30,28 +26,46 @@ internal class GpuTimestamps
     public uint64 $frame;
     /** a frame with queries was submitted on this slot and waits for its fence */
     public bool $recorded;
-    /** an encoder span is open and its end query is still to be written */
-    public bool $open;
+    /** number of GPU scopes whose end timestamp is still to be written */
+    public int32 $open;
+    /**
+     * When true, HUD busy unions only the first `$busyCount` pending scopes (scene).
+     */
+    public bool $busyClamped;
+    public uint32 $busyCount;
+    public bool $gpuOpen;
+    public string $name;
 
     public constructor()
     {
         $this->pool = vk::QueryPool::none();
         $this->pending = array<PendingSpan>();
         $this->ticks = array<uint64>();
-        $this->cursor = GPU_FIRST_ENCODER_QUERY;
+        $this->cursor = 0;
         $this->dropped = 0;
         $this->frame = 0;
         $this->recorded = false;
-        $this->open = false;
+        $this->open = 0;
+        $this->busyClamped = false;
+        $this->busyCount = 0;
+        $this->gpuOpen = false;
+        $this->name = '';
+        $this->pending->reserve(MAX_GPU_SCOPES as usize);
+        $this->ticks->reserve(GPU_QUERY_COUNT as usize);
     }
 
     public function reset(uint64 $frame) : void
     {
         $this->pending->clear();
-        $this->cursor = GPU_FIRST_ENCODER_QUERY;
+        $this->cursor = 0;
         $this->dropped = 0;
         $this->frame = $frame;
-        $this->open = false;
+        $this->open = 0;
+        $this->busyClamped = false;
+        $this->busyCount = 0;
+        $this->recorded = false;
+        $this->gpuOpen = false;
+        $this->name = '';
     }
 }
 
@@ -82,7 +96,7 @@ internal function vkTimestampsCreate(Device $device, FrameSlot $slot) : status<D
 }
 
 /**
- * Right after BeginCommandBuffer: reset the pool and stamp the submit start.
+ * Right after BeginCommandBuffer on the scene buffer: reset the pool. No whole-submit stamp.
  */
 internal function vkTimestampsBegin(FrameSlot $slot, uint64 $frame) : void
 {
@@ -95,54 +109,77 @@ internal function vkTimestampsBegin(FrameSlot $slot, uint64 $frame) : void
 
     $t->reset($frame);
     vk::CmdResetQueryPool($slot->cmd, $t->pool, 0, GPU_QUERIES);
-    vk::CmdWriteTimestamp($slot->cmd, vk::PIPELINE_STAGE_TOP_OF_PIPE_BIT, $t->pool, 0);
     #[end]
 }
 
-/**
- * Before an encoder starts recording: open a span for `$scope`.
- */
-internal function vkTimestampsOpen(FrameSlot $slot, int32 $scope) : void
+internal function vkGpuBegin(Device $device, const string& $name, GpuQueue $queue) : GpuProfileScope
 {
     #[if: !VISU_RELEASE]
+    if (!$device->gpuProfiler->supported || $device->slots->count() == 0) {
+        return GpuProfileScope();
+    }
+
+    FrameSlot $slot = $device->slots[$device->slot];
     GpuTimestamps $t = $slot->stamps;
 
-    if ($t->pool->handle == 0 || $t->open) {
-        return;
+    if ($t->pool->handle == 0 || $slot->sceneSubmitted) {
+        return GpuProfileScope();
     }
 
     if ($t->cursor + 2 > GPU_QUERIES) {
         $t->dropped = $t->dropped + 1;
-        return;
+        return GpuProfileScope();
     }
 
-    vk::CmdWriteTimestamp($slot->cmd, vk::PIPELINE_STAGE_TOP_OF_PIPE_BIT, $t->pool, $t->cursor);
-    $t->pending[] = PendingSpan($scope, $t->cursor, $t->cursor + 1);
-    $t->cursor = $t->cursor + 2;
-    $t->open = true;
+    vk::CommandBuffer $cmd = $slot->cmd;
+
+    if ($device->debugLabels && !$name->empty()) {
+        vk::DebugUtilsLabelEXT $label = vk::DebugUtilsLabelEXT();
+        $label->pLabelName:$ = $name->cstr();
+        vk::CmdBeginDebugUtilsLabelEXT($cmd, &$label);
+    }
+
+    $t->name = $name;
+    $t->gpuOpen = true;
+    GpuProfileScope $scope = GpuProfileScope();
+    $scope->index = 0;
+    return $scope;
+    #[else]
+    return GpuProfileScope();
     #[end]
 }
 
-/**
- * After the encoder ended: close the open span, if the open was not dropped.
- */
-internal function vkTimestampsClose(FrameSlot $slot) : void
+internal function vkGpuEnd(Device $device, GpuProfileScope $scope) : void
 {
     #[if: !VISU_RELEASE]
-    GpuTimestamps $t = $slot->stamps;
-
-    if (!$t->open) {
+    if ($scope->index < 0 || $device->slots->count() == 0) {
         return;
     }
 
-    PendingSpan $last = $t->pending[$t->pending->count() - 1];
-    vk::CmdWriteTimestamp($slot->cmd, vk::PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, $t->pool, $last->end);
-    $t->open = false;
+    FrameSlot $slot = $device->slots[$device->slot];
+    GpuTimestamps $t = $slot->stamps;
+
+    $t->gpuOpen = false;
+    $t->name = '';
+
+    if ($device->debugLabels) {
+        vk::CmdEndDebugUtilsLabelEXT($slot->cmd);
+    }
     #[end]
 }
 
+internal function vkWriteTimestamp(
+    vk::CommandBuffer $cmd,
+    uint32 $stage,
+    vk::QueryPool $pool,
+    uint32 $query
+) : void
+{
+    vk::CmdWriteTimestamp($cmd, $stage, $pool, $query);
+}
+
 /**
- * Before EndCommandBuffer: stamp the submit end.
+ * Before EndCommandBuffer on the scene buffer: the queries written so far are this frame's.
  */
 internal function vkTimestampsEnd(FrameSlot $slot) : void
 {
@@ -153,15 +190,66 @@ internal function vkTimestampsEnd(FrameSlot $slot) : void
         return;
     }
 
-    vk::CmdWriteTimestamp($slot->cmd, vk::PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, $t->pool, 1);
     $t->recorded = true;
+    #[end]
+}
+
+/**
+ * Before an encoder starts: open a span tagged with the current GPU scope.
+ */
+internal function vkTimestampsOpen(FrameSlot $slot) : void
+{
+    #[if: !VISU_RELEASE]
+    GpuTimestamps $t = $slot->stamps;
+
+    if ($t->pool->handle == 0 || $t->open > 0 || $slot->sceneSubmitted) {
+        return;
+    }
+
+    if ($t->cursor + 2 > GPU_QUERIES) {
+        $t->dropped = $t->dropped + 1;
+        return;
+    }
+
+    int32 $cpu = visu::profile::profiler()->currentNode();
+    vkWriteTimestamp($slot->cmd, vk::PIPELINE_STAGE_TOP_OF_PIPE_BIT, $t->pool, $t->cursor);
+    $t->pending[] = PendingSpan($cpu, $t->cursor, 2, .graphics, false);
+    $t->cursor = $t->cursor + 2;
+    $t->open = $t->open + 1;
+    #[end]
+}
+
+/**
+ * After the encoder ended: close the open span.
+ */
+internal function vkTimestampsClose(FrameSlot $slot) : void
+{
+    #[if: !VISU_RELEASE]
+    GpuTimestamps $t = $slot->stamps;
+
+    if ($t->open <= 0) {
+        return;
+    }
+
+    PendingSpan $last = $t->pending[($t->pending->count() - 1) as usize];
+    vkWriteTimestamp($slot->cmd, vk::PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, $t->pool, $last->start + 1);
+    $t->open = $t->open - 1;
+    #[end]
+}
+
+internal function vkTimestampsClampBusy(FrameSlot $slot) : void
+{
+    #[if: !VISU_RELEASE]
+    GpuTimestamps $t = $slot->stamps;
+    $t->busyClamped = true;
+    $t->busyCount = $t->pending->count() as uint32;
     #[end]
 }
 
 /**
  * After the slot's fence: read every query written and publish the spans.
  */
-internal function vkTimestampsResolve(Device $device, FrameSlot $slot, GpuTimeline $out) : void
+internal function vkTimestampsResolve(Device $device, FrameSlot $slot, GpuProfiler $out) : void
 {
     #[if: !VISU_RELEASE]
     GpuTimestamps $t = $slot->stamps;
@@ -171,6 +259,15 @@ internal function vkTimestampsResolve(Device $device, FrameSlot $slot, GpuTimeli
     }
 
     uint32 $count = $t->cursor;
+
+    if ($count == 0) {
+        $t->recorded = false;
+        array<GpuSpan> $empty = array<GpuSpan>();
+        $out->publish($t->frame, $empty, $t->dropped);
+        return;
+    }
+    // after this slot's fence: WAIT_BIT must not run on the live frame. MoltenVK
+    // still returns NOT_READY without it even when the fence has signalled.
     vk::Result $r = vk::GetQueryPoolResults(
         $device->logical,
         $t->pool,
@@ -198,25 +295,54 @@ internal function vkTimestampsResolve(Device $device, FrameSlot $slot, GpuTimeli
 
     float64 $period = $device->timestampPeriod as float64;
     array<GpuSpan> $spans = array<GpuSpan>();
-    uint64 $submit = ($t->ticks[1] - $t->ticks[0]) & $mask;
+    array<GpuInterval> $busy = array<GpuInterval>();
+    array<GpuInterval> $running = array<GpuInterval>();
+    uint32 $index = 0;
+    uint32 $busyUntil = $t->pending->count() as uint32;
 
-    if ($submit > 0) {
-        $spans[] = GpuSpan(-1, ($submit as float64) * $period);
+    if ($t->busyClamped) {
+        $busyUntil = $t->busyCount;
     }
 
     foreach ($t->pending as const &$p) {
-        uint64 $a = $t->ticks[$p->start as usize];
-        uint64 $b = $t->ticks[$p->end as usize];
+        uint64 $a = $t->ticks[$p->start as usize] & $mask;
+        uint64 $b = $t->ticks[($p->start + 1) as usize] & $mask;
 
         if ($a == 0 || $b == 0 || $b < $a) {
+            $index = $index + 1;
             continue;
         }
 
         uint64 $d = ($b - $a) & $mask;
-        $spans[] = GpuSpan($p->scope, ($d as float64) * $period);
+        float64 $lo = ($a as float64) * $period;
+        float64 $hi = (($a + $d) as float64) * $period;
+        GpuSpan $span = GpuSpan();
+        $span->scope = $p->cpuScope;
+        $span->ns = gpuExclusiveInsert($running, $lo, $hi);
+        $span->beginNs = $lo;
+        $span->endNs = $hi;
+        $spans[] = $span;
+
+        if ($index < $busyUntil) {
+            GpuInterval $iv = GpuInterval();
+            $iv->lo = $lo;
+            $iv->hi = $hi;
+            $busy[] = $iv;
+        }
+
+        $index = $index + 1;
     }
 
-    $out->publish($t->frame, $spans, $t->dropped);
+    float64 $submit = gpuBusyNs($busy);
+    float64 $spanNs = gpuSpanNs($busy);
+
+    GpuPublish $pub = GpuPublish();
+    $pub->frame = $t->frame;
+    $pub->spans = $spans;
+    $pub->busyNs = $submit;
+    $pub->spanNs = $spanNs;
+    $pub->dropped = $t->dropped;
+    $out->publish($pub);
     #[end]
 }
 
@@ -226,35 +352,10 @@ internal function vkTimestampsResolve(Device $device, FrameSlot $slot, GpuTimeli
 internal function vkTimestampsHarvest(Device $device) : void
 {
     #[if: !VISU_RELEASE]
-    array<FrameSlot> $ready = array<FrameSlot>();
     foreach ($device->slots as $slot) {
         if ($slot->stamps->recorded) {
-            $ready[] = $slot;
+            vkTimestampsResolve($device, $slot, $device->gpuProfiler);
         }
-    }
-
-    array<FrameSlot> $ordered = array<FrameSlot>();
-    foreach ($ready as $slot) {
-        array<FrameSlot> $next = array<FrameSlot>();
-        bool $placed = false;
-        foreach ($ordered as $have) {
-            if (!$placed && $slot->stamps->frame < $have->stamps->frame) {
-                $next[] = $slot;
-                $placed = true;
-            }
-
-            $next[] = $have;
-        }
-
-        if (!$placed) {
-            $next[] = $slot;
-        }
-
-        $ordered = $next;
-    }
-
-    foreach ($ordered as $slot) {
-        vkTimestampsResolve($device, $slot, $device->gpuTimeline);
     }
     #[end]
 }

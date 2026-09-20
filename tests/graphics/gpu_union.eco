@@ -1,0 +1,36 @@
+/**
+ * Frame GPU busy is the union of intervals, not their sum. Occupancy (span)
+ * is last end minus first start and can be larger when work has a hole.
+ */
+
+use visu::graphics::{GpuInterval, gpuBusyNs, gpuSpanNs};
+
+test gpu_busy_is_union_not_sum
+{
+    array<GpuInterval> $xs = array<GpuInterval>();
+    GpuInterval $a = GpuInterval();
+    $a->lo = 0.0;
+    $a->hi = 6000000.0;
+    GpuInterval $b = GpuInterval();
+    $b->lo = 2000000.0;
+    $b->hi = 6000000.0;
+    $xs[] = $a;
+    $xs[] = $b;
+    assert(gpuBusyNs($xs) == 6000000.0, 'overlapping work folds');
+    assert(gpuSpanNs($xs) == 6000000.0, 'no hole, span equals busy');
+}
+
+test gpu_span_includes_a_hole_busy_does_not
+{
+    array<GpuInterval> $xs = array<GpuInterval>();
+    GpuInterval $a = GpuInterval();
+    $a->lo = 0.0;
+    $a->hi = 2000000.0;
+    GpuInterval $b = GpuInterval();
+    $b->lo = 5000000.0;
+    $b->hi = 6000000.0;
+    $xs[] = $a;
+    $xs[] = $b;
+    assert(gpuBusyNs($xs) == 3000000.0, 'hole is idle');
+    assert(gpuSpanNs($xs) == 6000000.0, 'span is first start to last end');
+}

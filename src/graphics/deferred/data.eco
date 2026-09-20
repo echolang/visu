@@ -6,7 +6,38 @@
 namespace visu::graphics;
 
 /**
- * Position.a is coverage. Material is R roughness, G metallic, B AO.
+ * Kind stored in the GBuffer id attachment. Not a .vmat hash: eight bits of
+ * shading class so SSAO and the light pass can branch without another flag.
+ * Ids 6-15 are reserved; 16-255 are free for a game.
+ */
+public enum GBufferId
+{
+    case none;
+    case opaque;
+    case terrain;
+    case grass;
+    case foliage;
+    case unlit;
+
+    /**
+     * Value written as code / 255 into the r8 attachment.
+     */
+    public const function code() : int32
+    {
+        return match ($this) {
+            GBufferId::none => 0,
+            GBufferId::opaque => 1,
+            GBufferId::terrain => 2,
+            GBufferId::grass => 3,
+            GBufferId::foliage => 4,
+            GBufferId::unlit => 5,
+        };
+    }
+}
+
+/**
+ * Position.a is coverage. Material is R roughness, G metallic, B AO. Id is an
+ * r8 GBufferId code.
  */
 public class GBufferData
 {
@@ -16,6 +47,7 @@ public class GBufferData
     public const TextureRef $albedo;
     public const TextureRef $material;
     public const TextureRef $emissive;
+    public const TextureRef $id;
     public const TextureRef $depth;
 
     public constructor(
@@ -25,6 +57,7 @@ public class GBufferData
         TextureRef $albedo,
         TextureRef $material,
         TextureRef $emissive,
+        TextureRef $id,
         TextureRef $depth
     )
     {
@@ -34,6 +67,7 @@ public class GBufferData
         $this->albedo = $albedo;
         $this->material = $material;
         $this->emissive = $emissive;
+        $this->id = $id;
         $this->depth = $depth;
     }
 }
@@ -65,6 +99,39 @@ public class SsaoData
     {
         $this->target = $target;
         $this->blurred = $blurred;
+    }
+}
+
+/**
+ * Cascaded shadow depth array for this frame. Absent when shadows are off.
+ * Cascades and the map are a fact; `$casters` is the mailbox systems append to during fill.
+ */
+public class ShadowMapData
+{
+    public const TextureRef $map;
+    public const ShadowCascade[5] $cascades;
+    public const bool $debug;
+    public array<ShadowCaster> $casters;
+
+    public constructor(
+        TextureRef $map,
+        ShadowCascade[5] $cascades,
+        bool $debug,
+        array<ShadowCaster> $casters
+    )
+    {
+        $this->map = $map;
+        $this->cascades = $cascades;
+        $this->debug = $debug;
+        $this->casters = $casters;
+    }
+
+    /**
+     * Opt this system into the shadow pass. Prepare first; the pass only calls `cast`.
+     */
+    public function add(ShadowCaster $caster) : void
+    {
+        $this->casters[] = $caster;
     }
 }
 

@@ -1,16 +1,17 @@
 /**
- * Hierarchical CPU + GPU scopes. `begin('name')` / `end()` nest into a per-frame tree; the pipeline
- * opens one scope per pass and passes open sub-scopes inside. GPU time per scope is the sum of the
- * encoders opened while it was innermost (the device tags each encoder with `GpuTimeline.scope`),
- * so a scope that never opened an encoder has no GPU time, not zero GPU time.
+ * Hierarchical CPU + GPU scopes. `begin('name')` / `end()` nest into a persistent interned
+ * tree; the pipeline opens one CPU scope per pass and passes open sub-scopes inside. GPU time
+ * per scope is the sum of encoders opened while that CPU node was current, so a scope that
+ * never opened an encoder has no GPU time, not zero GPU time. HUD `GPU:` / the `render` row
+ * takes the scene busy union (`GpuPublish.busyNs`) instead of a sum of overlapping stages.
  *
- * Frames complete late: GPU spans land FRAMES_IN_FLIGHT frames after the frame ran, so ended frames
- * wait in a small ring until `mergeGpu` sees their `resolvedFrame`. Names should be literals: an
- * interpolated name allocates per call and never folds with its siblings.
+ * Frames complete late: GPU publishes land FRAMES_IN_FLIGHT frames after the frame ran, so
+ * ended frames wait in a small ring until `mergeGpu` sees their `gpuFrame`. Names should be
+ * literals: an interpolated name allocates per call and never folds with its siblings.
  *
  * Process singleton like `visu::app::flags()`: Host attaches the device, GameLoop owns the frame
- * boundaries, and a `begin` outside a frame opens one lazily. Single-threaded; `$open`, `$nodes`
- * and `GpuTimeline.scope` are what would become per-thread once Echo has thread-local storage.
+ * boundaries, and a `begin` outside a frame opens one lazily. Single-threaded; `$open` is what
+ * would become per-thread once Echo has thread-local storage.
  *
  * Under `--define VISU_RELEASE` every measuring body is empty: no tree, no ring, no stats, and the
  * device never samples. Call sites stay unconditional.
@@ -19,12 +20,13 @@
 namespace visu::profile;
 
 use std::time;
-use visu::graphics::{DrawCounters, DrawStats, FRAMES_IN_FLIGHT, GpuPublish, GpuSpan, GpuTimeline};
+use visu::graphics::{DrawCounters, DrawStats, FRAMES_IN_FLIGHT, GpuProfiler, GpuPublish, GpuSpan};
 
 public const int32 MAX_DEPTH = 16;
 /** what the console and the overlay say when `enabled()` is false */
 public const string PROFILE_DISABLED_NOTE = 'profiling compiled out (VISU_RELEASE)';
 internal const usize RING = (FRAMES_IN_FLIGHT as usize) + 1;
+internal const usize SCOPE_ROOM = 64;
 
 internal struct OpenScope
 {
@@ -33,33 +35,52 @@ internal struct OpenScope
     public DrawStats $draws0;
 }
 
+internal struct ScopeDef
+{
+    public int32 $parent = -1;
+    public int32 $depth = 0;
+    public string $name = '';
+    public string $path = '';
+    public array<int32> $children = array<int32>();
+}
+
+internal struct ScopeValues
+{
+    public int32 $calls = 0;
+    public float64 $cpuNs = 0.0;
+    public float64 $gpuNs = 0.0;
+    public int32 $gpuSpans = 0;
+    public DrawStats $draw = DrawStats();
+}
+
 /**
- * An ended frame waiting for its GPU spans.
+ * An ended frame waiting for its GPU spans. Reused in a RING-sized pool; `$frame` < 0 is empty.
  */
 internal class PendingFrame
 {
     public int32 $frame;
     public uint64 $gpuFrame;
-    public int32 $submit;
     public float64 $submitNs;
-    public array<ScopeNode> $nodes;
+    public usize $n;
+    public array<ScopeValues> $values;
 
-    public constructor(int32 $frame, uint64 $gpuFrame, int32 $submit, array<ScopeNode> $nodes)
+    public constructor()
     {
-        $this->frame = $frame;
-        $this->gpuFrame = $gpuFrame;
-        $this->submit = $submit;
+        $this->frame = -1;
+        $this->gpuFrame = 0;
         $this->submitNs = 0.0;
-        $this->nodes = $nodes;
+        $this->n = 0;
+        $this->values = arr::room<ScopeValues>(SCOPE_ROOM);
     }
 }
 
 public class Profiler
 {
     public StatsBook $stats;
-    public GpuTimeline? $timeline;
+    public GpuProfiler? $timeline;
     private DrawCounters? $draws;
-    private array<ScopeNode> $nodes;
+    private array<ScopeDef> $defs;
+    private array<ScopeValues> $live;
     private array<OpenScope> $open;
     private int32 $frame;
     private uint64 $gpuFrame;
@@ -69,30 +90,40 @@ public class Profiler
     private array<PendingFrame> $pending;
     private array<FrameProfile> $done;
     private FrameProfile? $latest;
-    private int32 $submitNode;
+    private int32 $renderId;
 
     public constructor()
     {
         $this->stats = StatsBook();
         $this->timeline = null;
         $this->draws = null;
-        $this->nodes = array<ScopeNode>();
-        $this->open = array<OpenScope>();
+        $this->defs = arr::room<ScopeDef>(SCOPE_ROOM);
+        $this->live = arr::room<ScopeValues>(SCOPE_ROOM);
+        $this->open = arr::room<OpenScope>(MAX_DEPTH as usize);
         $this->frame = -1;
         $this->gpuFrame = 0;
         $this->bound = false;
         $this->inFrame = false;
         $this->frameStart = time::instant::now();
         $this->pending = array<PendingFrame>();
+        $this->pending->reserve(RING);
+        usize $i = 0;
+
+        while ($i < RING) {
+            $this->pending[] = PendingFrame();
+            $i = $i + 1;
+        }
+
         $this->done = array<FrameProfile>();
         $this->latest = null;
-        $this->submitNode = -1;
+        $this->renderId = -1;
+        $this->internRoot();
     }
 
     /**
      * Host calls this once: draw counters for per-scope draw deltas, the timeline for GPU spans.
      */
-    public function attach(DrawCounters $draws, GpuTimeline $timeline) : void
+    public function attach(DrawCounters $draws, GpuProfiler $timeline) : void
     {
         $this->timeline = $timeline;
         #[if: !VISU_RELEASE]
@@ -146,26 +177,24 @@ public class Profiler
             $this->end();
         }
 
-        ScopeNode& $root = $this->nodes->at(0);
+        ScopeValues& $root = $this->live->at(0);
         $root->calls = 1;
         $root->cpuNs = (time::instant::now() - $this->frameStart)->as_nanos() as float64;
         $this->inFrame = false;
         bool $waitsForGpu = $this->bound && $this->gpuSupported();
-        PendingFrame $p = PendingFrame($this->frame, $this->gpuFrame, $this->submitNode, $this->nodes);
-        $this->nodes = array<ScopeNode>();
 
         if (!$waitsForGpu) {
-            $this->finish($p, false);
+            usize $n = $this->live->count();
+            array<ScopeValues> $values = $this->live;
+            $this->finishValues($values, $n, $this->frame, $this->gpuFrame, 0.0, false);
             return;
         }
 
-        $this->pending[] = $p;
-
-        while ($this->pending->count() > RING) {
-            PendingFrame $oldest = $this->pending[0];
-            $this->pending->remove(0);
-            $this->finish($oldest, false);
-        }
+        PendingFrame $slot = $this->takeSlot();
+        $this->storeLive($slot);
+        $slot->frame = $this->frame;
+        $slot->gpuFrame = $this->gpuFrame;
+        $slot->submitNs = 0.0;
         #[end]
     }
 
@@ -182,32 +211,15 @@ public class Profiler
             $parent = $this->open[$this->open->count() - 1]->node;
         }
 
-        int32 $id = childOf($this->nodes, $parent, $name);
+        int32 $id = $this->childId($parent, $name);
 
         if ($id < 0) {
-            ScopeNode& $p = $this->nodes->at($parent as usize);
-            assert($p->depth + 1 < MAX_DEPTH, 'profile: scopes nested deeper than MAX_DEPTH');
-            $id = $this->nodes->count() as int32;
-            ScopeNode $n = ScopeNode();
-            $n->parent = $parent;
-            $n->depth = $p->depth + 1;
-            $n->name = $name;
-            $n->path = $name;
-
-            if (!$p->path->empty()) {
-                string $pp = $p->path;
-                $n->path = "{$pp}/{$name}";
-            }
-
-            // the append may move the array, so the parent borrow is done before it
-            $p->children[] = $id;
-            $this->nodes[] = $n;
+            $id = $this->intern($parent, $name);
         }
 
-        ScopeNode& $node = $this->nodes->at($id as usize);
+        ScopeValues& $node = $this->live->at($id as usize);
         $node->calls = $node->calls + 1;
         $this->open[] = OpenScope($id, time::instant::now(), $this->drawsNow());
-        $this->setScope($id);
         #[end]
     }
 
@@ -222,30 +234,9 @@ public class Profiler
 
         OpenScope $top = $this->open[$this->open->count() - 1];
         $this->open->pop();
-        ScopeNode& $node = $this->nodes->at($top->node as usize);
+        ScopeValues& $node = $this->live->at($top->node as usize);
         $node->cpuNs = $node->cpuNs + ((time::instant::now() - $top->t0)->as_nanos() as float64);
         $node->draw = addDraws($node->draw, $this->drawsNow()->since($top->draws0));
-
-        if ($this->open->empty()) {
-            $this->setScope(-1);
-            return;
-        }
-
-        $this->setScope($this->open[$this->open->count() - 1]->node);
-        #[end]
-    }
-
-    /**
-     * The current open scope owns the whole-submit GPU span for this frame.
-     */
-    public function captureSubmit() : void
-    {
-        #[if: !VISU_RELEASE]
-        if ($this->open->empty()) {
-            return;
-        }
-
-        $this->submitNode = $this->open[$this->open->count() - 1]->node;
         #[end]
     }
 
@@ -273,13 +264,12 @@ public class Profiler
 
     /**
      * Fold the attached timeline's resolved spans into the frame they belong to and complete it,
-     * along with any older frame still waiting. Repeated calls for one `resolvedFrame` are no-ops:
-     * the first call drains every frame up to it and later frames carry a higher `gpuFrame`.
+     * along with any older frame still waiting. Repeated calls that drain an empty inbox are no-ops.
      */
     public function mergeGpu() : void
     {
         #[if: !VISU_RELEASE]
-        GpuTimeline $timeline = guard $this->timeline else {
+        GpuProfiler $timeline = guard $this->timeline else {
             return;
         }
 
@@ -289,20 +279,19 @@ public class Profiler
         }
 
         foreach ($pubs as $pub) {
-            array<PendingFrame> $kept = array<PendingFrame>();
-            array<PendingFrame> $have = $this->pending;
-            foreach ($have as $p) {
-                if ($p->gpuFrame == $pub->frame) {
-                    $this->fold($p, $pub->spans);
-                    $this->finish($p, true);
-                } else if ($p->gpuFrame < $pub->frame) {
-                    $this->finish($p, false);
-                } else {
-                    $kept[] = $p;
-                }
-            }
+            $this->finishOlderThan($pub->frame);
+            usize $i = 0;
 
-            $this->pending = $kept;
+            while ($i < RING) {
+                PendingFrame $p = $this->pending[$i];
+
+                if ($p->frame >= 0 && $p->gpuFrame == $pub->frame) {
+                    $this->fold($p, $pub->spans, $pub->busyNs);
+                    $this->finish($p, true);
+                }
+
+                $i = $i + 1;
+            }
         }
         #[end]
     }
@@ -339,10 +328,16 @@ public class Profiler
             $this->endFrame();
         }
 
-        array<PendingFrame> $have = $this->pending;
-        $this->pending = array<PendingFrame>();
-        foreach ($have as $p) {
-            $this->finish($p, false);
+        usize $i = 0;
+
+        while ($i < RING) {
+            PendingFrame $p = $this->pending[$i];
+
+            if ($p->frame >= 0) {
+                $this->finish($p, false);
+            }
+
+            $i = $i + 1;
         }
         #[end]
     }
@@ -354,35 +349,92 @@ public class Profiler
 
     public const function gpuSupported() : bool
     {
-        GpuTimeline $tl = guard $this->timeline else {
+        GpuProfiler $tl = guard $this->timeline else {
             return false;
         }
         return $tl->supported;
     }
 
+    /**
+     * Innermost open CPU node id (interned), or -1 between scopes. Encoder timestamps capture this.
+     */
+    public const function currentNode() : int32
+    {
+        if ($this->open->empty()) {
+            return -1;
+        }
+
+        return $this->open[$this->open->count() - 1]->node;
+    }
+
+    private function internRoot() : void
+    {
+        ScopeDef $root = ScopeDef();
+        $root->name = 'frame';
+        $this->defs[] = $root;
+        $this->live[] = ScopeValues();
+    }
+
     private function openFrame() : void
     {
-        ScopeNode $root = ScopeNode();
-        $root->name = 'frame';
-        array<ScopeNode> $nodes = array<ScopeNode>();
-        $nodes[] = $root;
-        $this->nodes = $nodes;
-        $this->open = array<OpenScope>();
+        usize $n = $this->live->count();
+        usize $i = 0;
+
+        while ($i < $n) {
+            $this->live[$i] = ScopeValues();
+            $i = $i + 1;
+        }
+
+        $this->open->clear();
         $this->frame = -1;
         $this->gpuFrame = 0;
         $this->bound = false;
         $this->inFrame = true;
         $this->frameStart = time::instant::now();
-        $this->submitNode = -1;
-        $this->setScope(-1);
     }
 
-    private function setScope(int32 $id) : void
+    private function childId(int32 $parent, const string& $name) : int32
     {
-        GpuTimeline $tl = guard $this->timeline else {
-            return;
+        if ($parent < 0 || ($parent as usize) >= $this->defs->count()) {
+            return -1;
         }
-        $tl->scope = $id;
+
+        foreach ($this->defs[$parent as usize]->children as $child) {
+            if ($this->defs[$child as usize]->name == $name) {
+                return $child;
+            }
+        }
+
+        return -1;
+    }
+
+    private function intern(int32 $parent, const string& $name) : int32
+    {
+        ScopeDef& $p = $this->defs->at($parent as usize);
+        assert($p->depth + 1 < MAX_DEPTH, 'profile: scopes nested deeper than MAX_DEPTH');
+        int32 $depth = $p->depth + 1;
+        string $parentPath = $p->path;
+        int32 $id = $this->defs->count() as int32;
+        $p->children[] = $id;
+        ScopeDef $n = ScopeDef();
+        $n->parent = $parent;
+        $n->depth = $depth;
+        $n->name = $name;
+        $n->path = $name;
+
+        if (!$parentPath->empty()) {
+            $n->path = "{$parentPath}/{$name}";
+        }
+
+        // the append may move the array, so the parent borrow is done before it
+        $this->defs[] = $n;
+        $this->live[] = ScopeValues();
+
+        if ($n->path == 'render') {
+            $this->renderId = $id;
+        }
+
+        return $id;
     }
 
     /**
@@ -396,75 +448,210 @@ public class Profiler
         return $dc->frame;
     }
 
-    /**
-     * Add spans to their nodes, then roll GPU time up to parents in reverse order. The node
-     * captured by `captureSubmit` takes the whole-submit span instead of a sum.
-     */
-    private function fold(PendingFrame $p, const array<GpuSpan>& $spans) : void
+    private function takeSlot() : PendingFrame
     {
-        usize $count = $p->nodes->count();
+        int32 $oldest = -1;
+        uint64 $oldestGpu = 0;
+        usize $i = 0;
+
+        while ($i < RING) {
+            PendingFrame $p = $this->pending[$i];
+
+            if ($p->frame < 0) {
+                return $p;
+            }
+
+            if ($oldest < 0 || $p->gpuFrame < $oldestGpu) {
+                $oldest = $i as int32;
+                $oldestGpu = $p->gpuFrame;
+            }
+
+            $i = $i + 1;
+        }
+
+        PendingFrame $drop = $this->pending[$oldest as usize];
+        $this->finish($drop, false);
+        return $drop;
+    }
+
+    private function storeLive(PendingFrame $slot) : void
+    {
+        usize $n = $this->live->count();
+
+        while ($slot->values->count() < $n) {
+            $slot->values[] = ScopeValues();
+        }
+
+        usize $i = 0;
+
+        while ($i < $n) {
+            $slot->values[$i] = $this->live[$i];
+            $i = $i + 1;
+        }
+
+        $slot->n = $n;
+    }
+
+    private function finishOlderThan(uint64 $gpuFrame) : void
+    {
+        while (true) {
+            int32 $best = -1;
+            uint64 $bestGpu = 0;
+            usize $i = 0;
+
+            while ($i < RING) {
+                PendingFrame $p = $this->pending[$i];
+
+                if ($p->frame >= 0 && $p->gpuFrame < $gpuFrame) {
+                    if ($best < 0 || $p->gpuFrame < $bestGpu) {
+                        $best = $i as int32;
+                        $bestGpu = $p->gpuFrame;
+                    }
+                }
+
+                $i = $i + 1;
+            }
+
+            if ($best < 0) {
+                return;
+            }
+
+            $this->finish($this->pending[$best as usize], false);
+        }
+    }
+
+    /**
+     * Add exclusive encoder time to interned nodes, roll up to parents, then give `render` and
+     * the root the scene busy union when `$busyNs` is present.
+     */
+    private function fold(PendingFrame $p, const array<GpuSpan>& $spans, float64 $busyNs) : void
+    {
+        usize $count = $p->n;
         foreach ($spans as $s) {
-            if ($s->ns <= 0.0) {
+            if ($s->ns <= 0.0 || $s->scope < 0 || ($s->scope as usize) >= $count) {
                 continue;
             }
 
-            if ($s->scope < 0) {
-                $p->submitNs = $p->submitNs + $s->ns;
-                continue;
-            }
-
-            if (($s->scope as usize) >= $count) {
-                continue;
-            }
-
-            ScopeNode& $n = $p->nodes->at($s->scope as usize);
+            ScopeValues& $n = $p->values->at($s->scope as usize);
             $n->gpuNs = $n->gpuNs + $s->ns;
             $n->gpuSpans = $n->gpuSpans + 1;
         }
 
-        int32 $submit = $p->submit;
         usize $i = $count;
 
         while ($i > 1) {
             $i = $i - 1;
-            ScopeNode& $child = $p->nodes->at($i);
+            ScopeValues& $child = $p->values->at($i);
 
-            if ($child->gpuSpans == 0 || $child->parent < 0) {
+            if ($child->gpuSpans == 0) {
                 continue;
             }
 
-            if (($i as int32) == $submit && $p->submitNs > 0.0) {
+            int32 $parent = $this->defs[$i]->parent;
+
+            if ($parent < 0) {
                 continue;
             }
 
-            ScopeNode& $parent = $p->nodes->at($child->parent as usize);
-            $parent->gpuNs = $parent->gpuNs + $child->gpuNs;
-            $parent->gpuSpans = $parent->gpuSpans + $child->gpuSpans;
+            ScopeValues& $par = $p->values->at($parent as usize);
+            $par->gpuNs = $par->gpuNs + $child->gpuNs;
+            $par->gpuSpans = $par->gpuSpans + $child->gpuSpans;
         }
 
-        if ($submit >= 0 && ($submit as usize) < $count && $p->submitNs > 0.0) {
-            ScopeNode& $owner = $p->nodes->at($submit as usize);
-            $owner->gpuNs = $p->submitNs;
-            $owner->gpuSpans = 1;
-            ScopeNode& $root = $p->nodes->at(0);
-            $root->gpuNs = $p->submitNs;
+        $p->submitNs = $busyNs;
+
+        if ($busyNs > 0.0) {
+            int32 $render = $this->renderId;
+
+            if ($render >= 0 && ($render as usize) < $count) {
+                ScopeValues& $owner = $p->values->at($render as usize);
+                $owner->gpuNs = $busyNs;
+                $owner->gpuSpans = 1;
+            }
+
+            ScopeValues& $root = $p->values->at(0);
+            $root->gpuNs = $busyNs;
             $root->gpuSpans = 1;
         }
     }
 
     private function finish(PendingFrame $p, bool $gpuResolved) : void
     {
+        $this->finishValues($p->values, $p->n, $p->frame, $p->gpuFrame, $p->submitNs, $gpuResolved);
+        $p->frame = -1;
+    }
+
+    private function finishValues(
+        const array<ScopeValues>& $values,
+        usize $count,
+        int32 $frame,
+        uint64 $gpuFrame,
+        float64 $submitNs,
+        bool $gpuResolved
+    ) : void
+    {
         FrameProfile $f = FrameProfile(
-            $p->frame,
-            $p->gpuFrame,
+            $frame,
+            $gpuFrame,
             $this->gpuSupported(),
             $gpuResolved,
-            $p->submitNs,
-            $p->nodes
+            $submitNs,
+            $this->assemble($values, $count)
         );
         $this->stats->note($f);
         $this->done[] = $f;
         $this->latest = $f;
+    }
+
+    private function assemble(const array<ScopeValues>& $values, usize $count) : array<ScopeNode>
+    {
+        array<int32> $map = arr::room<int32>($count);
+        usize $i = 0;
+
+        while ($i < $count) {
+            $map[] = -1;
+            $i = $i + 1;
+        }
+
+        array<ScopeNode> $nodes = arr::room<ScopeNode>($count);
+        $i = 0;
+
+        while ($i < $count) {
+            if ($values[$i]->calls == 0) {
+                $i = $i + 1;
+                continue;
+            }
+
+            int32 $cid = $nodes->count() as int32;
+            $map[$i] = $cid;
+            ScopeDef $d = $this->defs[$i];
+            ScopeValues $v = $values[$i];
+            ScopeNode $n = ScopeNode();
+            $n->parent = -1;
+
+            if ($d->parent >= 0) {
+                $n->parent = $map[$d->parent as usize];
+            }
+
+            $n->depth = $d->depth;
+            $n->name = $d->name;
+            $n->path = $d->path;
+            $n->calls = $v->calls;
+            $n->cpuNs = $v->cpuNs;
+            $n->gpuNs = $v->gpuNs;
+            $n->gpuSpans = $v->gpuSpans;
+            $n->draw = $v->draw;
+            $nodes[] = $n;
+
+            if ($n->parent >= 0) {
+                ScopeNode& $par = $nodes->at($n->parent as usize);
+                $par->children[] = $cid;
+            }
+
+            $i = $i + 1;
+        }
+
+        return $nodes;
     }
 }
 
@@ -522,17 +709,6 @@ public function end() : void
 {
     #[if: !VISU_RELEASE]
     profiler()->end();
-    #[end]
-}
-
-/**
- * The current open scope owns the whole-submit GPU span. Host calls this on `render`.
- */
-#[inline]
-public function captureSubmit() : void
-{
-    #[if: !VISU_RELEASE]
-    profiler()->captureSubmit();
     #[end]
 }
 

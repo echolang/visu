@@ -9,6 +9,9 @@ internal class FrameSlot
 {
     public vk::CommandPool $pool;
     public vk::CommandBuffer $cmd;
+    public vk::CommandBuffer $sceneCmd;
+    public vk::CommandBuffer $presentCmd;
+    public bool $sceneSubmitted;
     public vk::Fence $fence;
     public vk::Semaphore $acquire;
     public HostRing $ring;
@@ -23,6 +26,9 @@ internal class FrameSlot
         $this->stamps = GpuTimestamps();
         $this->pool = vk::CommandPool::none();
         $this->cmd = vk::CommandBuffer::none();
+        $this->sceneCmd = vk::CommandBuffer::none();
+        $this->presentCmd = vk::CommandBuffer::none();
+        $this->sceneSubmitted = false;
         $this->fence = vk::Fence::none();
         $this->acquire = vk::Semaphore::none();
         $this->ring = HostRing();
@@ -62,11 +68,20 @@ internal function vkCreateSlots(Device $device) : status<DeviceError>
         $ai->level = vk::COMMAND_BUFFER_LEVEL_PRIMARY;
         $ai->commandBufferCount = 1;
         guard vkCheck(
-            vk::AllocateCommandBuffers($device->logical, &$ai, &$slot->cmd),
+            vk::AllocateCommandBuffers($device->logical, &$ai, &$slot->sceneCmd),
             'AllocateCommandBuffers'
         ) else ($e) {
             return .error($e);
         }
+
+        guard vkCheck(
+            vk::AllocateCommandBuffers($device->logical, &$ai, &$slot->presentCmd),
+            'AllocateCommandBuffers'
+        ) else ($e) {
+            return .error($e);
+        }
+
+        $slot->cmd = $slot->sceneCmd;
 
         vk::SemaphoreCreateInfo $sci = vk::SemaphoreCreateInfo();
         guard vkCheck(
@@ -85,7 +100,7 @@ internal function vkCreateSlots(Device $device) : status<DeviceError>
             return .error($e);
         }
 
-        if ($device->gpuTimeline->supported) {
+        if ($device->gpuProfiler->supported) {
             guard vkTimestampsCreate($device, $slot) else ($e) {
                 return .error($e);
             }
@@ -123,25 +138,186 @@ internal function vkAbortFrame(Device $device) : void
     vk::Result $end = vk::EndCommandBuffer($slot->cmd);
     $device->inFrame = false;
     $device->bb = null;
+    $slot->sceneSubmitted = false;
 
     if (!$end->ok()) {
         vkRecreateSignaledFence($device, $slot);
         return;
     }
 
-    uint32 $waitStage = vk::PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    // already-submitted scene work is waited by DeviceWaitIdle; do not wait on acquire
+    vkRecreateSignaledFence($device, $slot);
+}
+
+internal function vkEndSubmit(Device $device, bool $present) : status<DeviceError>
+{
+    FrameSlot $slot = $device->slots[$device->slot];
+
+    if (!$slot->sceneSubmitted) {
+        vkTimestampsEnd($slot);
+    }
+
+    guard vkCheck(vk::EndCommandBuffer($slot->cmd), 'EndCommandBuffer') else ($e) {
+        vkRecreateSignaledFence($device, $slot);
+        $device->lostFlag = true;
+        $device->inFrame = false;
+        $device->bb = null;
+        $slot->sceneSubmitted = false;
+        return .error($e);
+    }
+
     vk::SubmitInfo $si = vk::SubmitInfo();
-    $si->waitSemaphoreCount = 1;
-    $si->pWaitSemaphores:$ = &$slot->acquire;
-    $si->pWaitDstStageMask:$ = &$waitStage;
     $si->commandBufferCount = 1;
     $si->pCommandBuffers:$ = &$slot->cmd;
-    vk::Result $sub = vk::QueueSubmit($device->queue, 1, &$si, $slot->fence);
 
-    if (!$sub->ok()) {
-        $device->lostFlag = true;
-        vkRecreateSignaledFence($device, $slot);
+    if ($present) {
+        uint32 $waitStage = vk::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        $si->waitSemaphoreCount = 1;
+        $si->pWaitSemaphores:$ = &$slot->acquire;
+        $si->pWaitDstStageMask:$ = &$waitStage;
+        $si->signalSemaphoreCount = 1;
+        $si->pSignalSemaphores:$ = &$device->renderDone[$device->imageIndex];
     }
+
+    guard vkCheck(vk::QueueSubmit($device->queue, 1, &$si, $slot->fence), 'QueueSubmit') else ($e) {
+        vkRecreateSignaledFence($device, $slot);
+        $device->lostFlag = true;
+        $device->inFrame = false;
+        $device->bb = null;
+        $slot->sceneSubmitted = false;
+        return .error($e);
+    }
+
+    if ($present) {
+        vk::PresentInfoKHR $pi = vk::PresentInfoKHR();
+        $pi->waitSemaphoreCount = 1;
+        $pi->pWaitSemaphores:$ = &$device->renderDone[$device->imageIndex];
+        $pi->swapchainCount = 1;
+        $pi->pSwapchains:$ = &$device->swapchain;
+        $pi->pImageIndices:$ = &$device->imageIndex;
+        vk::Result $pr = vk::QueuePresentKHR($device->queue, &$pi);
+
+        if ($pr == vk::Result::errorOutOfDateKhr || $pr == vk::Result::suboptimalKhr) {
+            $device->pendingResize = true;
+        } else if (!$pr->ok()) {
+            $device->inFrame = false;
+            $device->bb = null;
+            $slot->sceneSubmitted = false;
+            if ($pr == vk::Result::errorDeviceLost || $pr == vk::Result::errorSurfaceLostKhr) {
+                $device->lostFlag = true;
+            }
+
+            return .error(vkErr($pr, 'QueuePresentKHR'));
+        }
+    }
+
+    $device->inFrame = false;
+    $device->bb = null;
+    $slot->sceneSubmitted = false;
+    $device->frames = $device->frames + 1;
+    $device->slot = ($device->slot + 1) % FRAMES_IN_FLIGHT;
+    $device->draws->roll();
+    return .ok;
+}
+
+/**
+ * Commit offscreen work without waiting on the swapchain, then start the present buffer.
+ */
+internal function vkSubmitScene(Device $device) : status<DeviceError>
+{
+    FrameSlot $slot = $device->slots[$device->slot];
+    vkTimestampsClampBusy($slot);
+    vkTimestampsEnd($slot);
+    guard vkCheck(vk::EndCommandBuffer($slot->cmd), 'EndCommandBuffer') else ($e) {
+        return .error($e);
+    }
+
+    vk::SubmitInfo $si = vk::SubmitInfo();
+    $si->commandBufferCount = 1;
+    $si->pCommandBuffers:$ = &$slot->cmd;
+    guard vkCheck(vk::QueueSubmit($device->queue, 1, &$si, vk::Fence::none()), 'QueueSubmit') else ($e) {
+        return .error($e);
+    }
+
+    $slot->sceneSubmitted = true;
+    $slot->cmd = $slot->presentCmd;
+    vk::CommandBufferBeginInfo $begin = vk::CommandBufferBeginInfo();
+    $begin->flags = vk::COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    guard vkCheck(vk::BeginCommandBuffer($slot->cmd, &$begin), 'BeginCommandBuffer') else ($e) {
+        return .error($e);
+    }
+
+    return .ok;
+}
+
+internal function vkAcquireBackbuffer(Device $device) : Texture
+{
+    assert($device->inFrame, 'backbuffer outside beginFrame');
+    FrameSlot $slot = $device->slots[$device->slot];
+    bool $hadWork = $slot->stamps->pending->count() > 0 || $slot->stamps->open > 0;
+
+    if ($hadWork && !$slot->sceneSubmitted) {
+        guard vkSubmitScene($device) else ($e) {
+            die($e->message());
+        }
+    }
+
+    uint32 $index = 0;
+    vk::Result $acq = vk::AcquireNextImageKHR(
+        $device->logical,
+        $device->swapchain,
+        vk::WHOLE_SIZE,
+        $slot->acquire,
+        vk::Fence::none(),
+        &$index
+    );
+
+    if ($acq == vk::Result::errorDeviceLost || $acq == vk::Result::errorSurfaceLostKhr) {
+        $device->lostFlag = true;
+        die('AcquireNextImageKHR: surface lost');
+    }
+
+    if ($acq == vk::Result::errorOutOfDateKhr) {
+        int32 $w = $device->extent->width as int32;
+        int32 $h = $device->extent->height as int32;
+        guard vkBootSwapchain($device, $w, $h) else ($e) {
+            die($e->message());
+        }
+
+        $acq = vk::AcquireNextImageKHR(
+            $device->logical,
+            $device->swapchain,
+            vk::WHOLE_SIZE,
+            $slot->acquire,
+            vk::Fence::none(),
+            &$index
+        );
+    }
+
+    if (!$acq->ok() && $acq != vk::Result::suboptimalKhr) {
+        DeviceError $err = vkErr($acq, 'AcquireNextImageKHR');
+        die($err->message());
+    }
+
+    $device->imageIndex = $index;
+    TextureHandle $th = TextureHandle(
+        $device->images[$index],
+        $device->views[$index],
+        array<vk::ImageView>(),
+        vk::DeviceMemory::none(),
+        true,
+        0 as uint64
+    );
+    TextureDesc $bbDesc = TextureDesc(
+        $format: $device->bbFormat,
+        $width: $device->extent->width as int32,
+        $height: $device->extent->height as int32
+    );
+    $bbDesc->usage = 0 as uint32;
+    Texture $bb = Texture(imported: $device, $th, $bbDesc);
+    $bb->state = .undefined;
+    $device->bb = $bb;
+    return $bb;
 }
 
 internal function vkRecreateSignaledFence(Device $device, FrameSlot $slot) : void

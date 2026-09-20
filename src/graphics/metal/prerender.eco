@@ -1,0 +1,103 @@
+/**
+ * Scene command-buffer commit and the Metal pre-render tessellation compute encoder.
+ * Device holds the slots; these helpers keep device.eco from growing past the pass methods.
+ */
+
+namespace visu::graphics;
+
+internal function mtlCommitScene(Device $device) : void
+{
+    assert(!$device->encoderOpen, 'commitScene with an open encoder');
+    mtlCommitPreRender($device, false);
+    FrameSlot $slot = $device->slots[$device->slot];
+    $slot->stamps->clampBusy();
+    mtl::CommandBuffer $cmd = guard $device->cmd else {
+        return;
+    }
+    $cmd->commit();
+    $slot->prev = $cmd;
+    mtl::CommandQueue $queue = guard $device->queue else {
+        die('metal: no command queue');
+    }
+    mtl::CommandBuffer $next = guard $queue->commandBuffer() else {
+        die('metal: present command buffer');
+    }
+    $device->cmd = $next;
+    $device->sceneCommitted = true;
+}
+
+internal function mtlPreComputeEncoder(Device $device) : mtl::ComputeCommandEncoder
+{
+    mtl::ComputeCommandEncoder $held = guard $device->preEnc else {
+        mtl::CommandQueue $queue = guard $device->queue else {
+            die('metal: no command queue');
+        }
+        mtl::CommandBuffer $cmd = guard $queue->commandBuffer() else {
+            die('metal: pre-render command buffer');
+        }
+        mtl::ComputePassDescriptor $computePass = mtl::ComputePassDescriptor();
+        mtlTimestampsAttachCompute($device->slots[$device->slot]->stamps, $computePass);
+        mtl::ComputeCommandEncoder $enc = guard $cmd->computeCommandEncoder($computePass) else {
+            die('metal: pre-render compute encoder');
+        }
+        GpuTimestamps $stamps = $device->slots[$device->slot]->stamps;
+
+        if ($stamps->gpuOpen && !$stamps->name->empty()) {
+            $enc->setLabel($stamps->name);
+            $cmd->pushDebugGroup($stamps->name);
+        }
+
+        $device->preCmd = $cmd;
+        $device->preEnc = $enc;
+        $device->preScope = visu::profile::profiler()->currentNode();
+        return $enc;
+    }
+    return $held;
+}
+
+internal function mtlComputePipeline(Device $device, ComputeProgram $kernel) : mtl::ComputePipelineState
+{
+    if ($device->computePsos->has($kernel->id)) {
+        return $device->computePsos[$kernel->id];
+    }
+
+    mtl::Device $gpu = guard $device->gpu else {
+        die('metal: no device');
+    }
+    mtl::Function $fn = guard $kernel->cs->fn else {
+        die("metal: compute '{$kernel->name}' has no function");
+    }
+    mtl::ComputePipelineState $pso = guard $gpu->newComputePipelineState($fn) else ($e) {
+        die($e->message());
+    }
+    $device->computePsos[$kernel->id] = $pso;
+    return $pso;
+}
+
+internal function mtlCommitPreRender(Device $device, bool $wait) : void
+{
+    mtl::ComputeCommandEncoder $enc = guard $device->preEnc else {
+        $device->preCmd = null;
+        $device->preScope = -1;
+        return;
+    }
+    $enc->endEncoding();
+    $device->preEnc = null;
+    mtl::CommandBuffer $pre = guard $device->preCmd else {
+        $device->preScope = -1;
+        return;
+    }
+    $pre->commit();
+    if ($wait) {
+        $pre->waitUntilCompleted();
+        $device->preCmd = null;
+        $device->preScope = -1;
+        return;
+    }
+
+    FrameSlot $slot = $device->slots[$device->slot];
+    $slot->prePrev = $pre;
+    $slot->preScope = $device->preScope;
+    $device->preCmd = null;
+    $device->preScope = -1;
+}

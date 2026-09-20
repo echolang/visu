@@ -7,12 +7,13 @@
 namespace visu::console;
 
 use visu::dcapture::DumpQueue;
+use visu::graphics::{GpuProfiler, GpuProfilerMode};
 use visu::instrument::{PassTiming, formatPassWindow, rowsFromStats};
 use visu::profile::{FrameProfile, Profiler, PROFILE_DISABLED_NOTE, writeProfile};
 use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
 use visu::signal::ConsoleCommandSignal;
 
-internal const PROFILE_USAGE = 'usage: profile [depth <n>|dump [path]|reset|gpu]';
+internal const PROFILE_USAGE = 'usage: profile [depth <n>|dump [path]|reset|gpu [lightweight|detailed]]';
 internal const PROFILE_DEFAULT_DEPTH = 2;
 
 internal enum ProfileAction
@@ -23,6 +24,7 @@ internal enum ProfileAction
     case dumpQueued;
     case reset;
     case gpu;
+    case gpuMode(GpuProfilerMode $mode);
 }
 
 /**
@@ -62,7 +64,21 @@ internal function parseProfileConsole(const ConsoleCommandSignal& $cmd) : Profil
     }
 
     if ($arg == 'gpu') {
-        return .gpu;
+        if ($cmd->parts->count() < 3) {
+            return .gpu;
+        }
+
+        string $mode = $cmd->parts[2];
+
+        if ($mode == 'detailed') {
+            return .gpuMode(.detailed);
+        }
+
+        if ($mode == 'lightweight' || $mode == 'light') {
+            return .gpuMode(.lightweight);
+        }
+
+        return .usage;
     }
 
     return .usage;
@@ -81,7 +97,7 @@ public class ProfileConsole : ConsoleCommandHandler
 
     public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
     {
-        $registry->add('profile', $this, '[depth <n>|dump [path]|reset|gpu]');
+        $registry->add('profile', $this, '[depth <n>|dump [path]|reset|gpu [lightweight|detailed]]');
         array<string> $names = array<string>();
         $names[] = 'profile';
         return $names;
@@ -115,6 +131,9 @@ public class ProfileConsole : ConsoleCommandHandler
             },
             ProfileAction::gpu => {
                 $this->writeGpu($console);
+            },
+            ProfileAction::gpuMode($mode) => {
+                $this->setGpuMode($console, $mode);
             },
         };
     }
@@ -182,7 +201,7 @@ public class ProfileConsole : ConsoleCommandHandler
         string $supported = 'unsupported';
 
         if ($this->profiler->gpuSupported()) {
-            $supported = 'per encoder';
+            $supported = 'per pass';
         }
 
         FrameProfile $frame = guard $this->profiler->latest() else {
@@ -190,6 +209,30 @@ public class ProfileConsole : ConsoleCommandHandler
             return;
         }
         $console->writeLine("profile: scopes {$enabled}, gpu timestamps {$supported}, gpuFrame {$frame->gpuFrame}");
+    }
+
+    private function setGpuMode(DebugConsole $console, GpuProfilerMode $mode) : void
+    {
+        GpuProfiler? $gpu = $this->profiler->timeline;
+        GpuProfiler $profiler = guard $gpu else {
+            $console->writeLine('profile: no device attached');
+            return;
+        }
+        if ($mode == GpuProfilerMode::detailed) {
+            #[if: os != ios && (os != darwin || VISU_BACKEND_VULKAN)]
+            $console->writeLine('profile: gpu detailed is Metal-only (encoder sample barriers)');
+            return;
+            #[end]
+        }
+
+        $profiler->mode = $mode;
+        string $name = 'lightweight';
+
+        if ($mode == GpuProfilerMode::detailed) {
+            $name = 'detailed';
+        }
+
+        $console->writeLine("profile: gpu mode {$name} (encoder sample barriers on detailed; Apple silicon stays stage-boundary)");
     }
 }
 

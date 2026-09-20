@@ -1,0 +1,396 @@
+/**
+ * Cascaded shadow maps for the deferred sun. `$splits` is the far distance of each
+ * cascade in metres; empty falls back to the GPU Gems 3 log/uniform mix. Each cascade
+ * is a tightly fitted ortho around that slice, texel-snapped so the map does not shimmer.
+ */
+
+namespace visu::graphics;
+
+use std::math;
+use visu::geo::Frustum;
+use visu::math::{
+    Mat4, Vec3, Vec4, clipZeroOne, dot, inverse, length, lookAt, mix, normalize, ortho,
+    perspective
+};
+
+public const int32 SHADOW_CASCADES = 5;
+
+/**
+ * Class so `ShadowQuality?` can be a renderer field; Echo crashes on optional structs.
+ * Null quality means shadows are off.
+ */
+public class ShadowQuality
+{
+    /**
+     * Square shadow-map resolution per cascade.
+     */
+    public int32 $resolution;
+
+    /**
+     * Mix toward the logarithmic split (1) versus uniform (0). BBEngine uses 0.99.
+     * Ignored when `$splits` has `SHADOW_CASCADES` entries.
+     */
+    public float32 $lambda;
+
+    /**
+     * Far plane used for cascade splits, not the play camera far.
+     * Ignored when `$splits` has `SHADOW_CASCADES` entries; the last split is the far.
+     */
+    public float32 $maxLength;
+
+    /**
+     * Far distance of each cascade in metres from the camera, nearest first.
+     * Empty uses `lambda` / `maxLength`. Length must be `SHADOW_CASCADES` and increasing.
+     */
+    public array<float32> $splits;
+
+    /**
+     * View-camera near used with `maxLength` to build the split frustum.
+     */
+    public float32 $near;
+
+    /**
+     * Extra shadow-camera near pull, so casters behind the slice still land in the map.
+     */
+    public float32 $longShadow;
+
+    /**
+     * Snap the ortho translation to shadow-map texels.
+     */
+    public bool $stabilize;
+
+    /**
+     * Tint the light pass by cascade index.
+     */
+    public bool $debug;
+
+    public constructor()
+    {
+        $this->resolution = 2048;
+        $this->lambda = 0.99f;
+        $this->maxLength = 16000.0f;
+        $this->splits = array<float32>();
+        $this->near = 0.1f;
+        $this->longShadow = 1024.0f;
+        $this->stabilize = true;
+        $this->debug = false;
+    }
+
+    public static function medium() : ShadowQuality
+    {
+        return ShadowQuality();
+    }
+
+    public static function high() : ShadowQuality
+    {
+        ShadowQuality $q = ShadowQuality();
+        $q->resolution = 4096;
+        return $q;
+    }
+}
+
+/**
+ * One cascade the caster draws into. `uniforms` is the light camera at slot 1;
+ * `lightSpace` is `uniforms.projectionView`. `nearViewZ` and `splitViewZ` bound
+ * the view-space slice (negative, more negative is farther).
+ */
+public struct ShadowCascade
+{
+    public int32 $index;
+    public Mat4 $lightSpace;
+    public Frustum $frustum;
+    public CameraUniforms $uniforms;
+    public float32 $nearViewZ;
+    public float32 $splitViewZ;
+}
+
+/**
+ * Draw into an already-open cascade encoder. Implementations are classes; only a
+ * class can be stored as an interface value. Each system decides what to submit
+ * during its own fill (or equivalent), then `ShadowMapData.add`s itself.
+ * `cast` must not begin or end the encoder.
+ */
+public interface ShadowCaster
+{
+    function cast(RenderContext $ctx, RenderEncoder $enc, const ShadowCascade& $cascade) : void;
+}
+
+/**
+ * Far distance of each cascade in metres. `$quality.splits` when it has five entries,
+ * otherwise the log/uniform mix over `[near, maxLength]`.
+ */
+public function shadowCascadeFars(const ShadowQuality& $quality) : float32[5]
+{
+    usize $n = $quality->splits->count();
+    float32[5] $out;
+    if ($n == SHADOW_CASCADES as usize) {
+        shadowCheckFars($quality->splits, $quality->near);
+        int32 $c = 0;
+        while ($c < SHADOW_CASCADES) {
+            $out[$c] = $quality->splits[$c as usize];
+            $c = $c + 1;
+        }
+
+        return $out;
+    }
+
+    assert($n == 0, 'shadow: splits must be empty or SHADOW_CASCADES long');
+    float32 $nearClip = $quality->near;
+    float32 $farClip = $quality->maxLength;
+    float32 $clipRange = $farClip - $nearClip;
+    float32 $ratio = $farClip / $nearClip;
+    int32 $i = 0;
+    while ($i < SHADOW_CASCADES) {
+        $out[$i] = shadowSplitDistance($i, SHADOW_CASCADES, $nearClip, $clipRange, $ratio, $quality->lambda);
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+/**
+ * Five cascades for `$view` under `$sun`. Far plane is the last cascade far.
+ */
+public function shadowCascades(
+    const CameraData& $view,
+    const DirectionalLight& $sun,
+    const ShadowQuality& $quality
+) : ShadowCascade[5]
+{
+    float32[5] $fars = shadowCascadeFars($quality);
+    float32 $nearClip = $quality->near;
+    float32 $farClip = $fars[SHADOW_CASCADES - 1];
+    float32 $clipRange = $farClip - $nearClip;
+    Mat4 $splitProj = clipZeroOne(perspective(
+        fovY: shadowFovY($view->projection),
+        aspect: ($view->resolutionX as float32) / ($view->resolutionY as float32),
+        near: $nearClip,
+        far: $farClip
+    ));
+    Mat4 $invPV = inverse($splitProj * $view->view);
+    Vec3 $lightDir = normalize($sun->direction);
+    ShadowCascade[5] $out;
+    int32 $i = 0;
+
+    while ($i < SHADOW_CASCADES) {
+        float32 $end = $fars[$i];
+        float32 $start = $nearClip;
+        if ($i > 0) {
+            $start = $fars[$i - 1];
+        }
+
+        float32 $split = ($end - $nearClip) / $clipRange;
+        float32 $prev = ($start - $nearClip) / $clipRange;
+        if ($i == 0) {
+            $prev = 0.0f;
+        }
+
+        $out[$i] = shadowCascade(
+            $i,
+            $invPV,
+            $prev,
+            $split,
+            $lightDir,
+            $nearClip,
+            $clipRange,
+            $quality
+        );
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function shadowFovY(const Mat4& $projection) : float32
+{
+    return 2.0f * (math::atan(1.0f / $projection->c1->y) as float32);
+}
+
+internal function shadowSplitDistance(
+    int32 $index,
+    int32 $count,
+    float32 $nearClip,
+    float32 $clipRange,
+    float32 $ratio,
+    float32 $lambda
+) : float32
+{
+    float32 $p = (($index + 1) as float32) / ($count as float32);
+    float32 $minZ = $nearClip;
+    float32 $log = $minZ * (math::pow($ratio as float64, $p as float64) as float32);
+    float32 $uniform = $minZ + $clipRange * $p;
+    return mix($uniform, $log, $lambda);
+}
+
+internal function shadowSplitsIncrease(const array<float32>& $splits, float32 $near) : bool
+{
+    float32 $prev = $near;
+    foreach ($splits as $d) {
+        if ($d <= $prev) {
+            return false;
+        }
+
+        $prev = $d;
+    }
+
+    return true;
+}
+
+internal function shadowCheckFars(const array<float32>& $splits, float32 $near) : void
+{
+    assert(shadowSplitsIncrease($splits, $near), 'shadow: splits must increase and sit past near');
+}
+
+internal function shadowCascade(
+    int32 $index,
+    const Mat4& $invPV,
+    float32 $lastSplit,
+    float32 $split,
+    Vec3 $lightDir,
+    float32 $nearClip,
+    float32 $clipRange,
+    const ShadowQuality& $quality
+) : ShadowCascade
+{
+    Vec3[8] $corners = shadowSliceCorners($invPV, $lastSplit, $split);
+    Vec3 $center = shadowCenter($corners);
+    float32 $radius = shadowRadius($corners, $center);
+    Vec3 $up = Vec3(0.0f, 1.0f, 0.0f);
+    if (math::abs(dot($lightDir, $up)) > 0.99f) {
+        $up = Vec3(0.0f, 0.0f, 1.0f);
+    }
+
+    Vec3 $eye = $center - $lightDir * $radius;
+    Mat4 $lightView = lookAt(eye: $eye, center: $center, up: $up);
+    float32 $nearPlane = -$quality->longShadow;
+    Mat4 $glOrtho = ortho(
+        left: -$radius,
+        right: $radius,
+        bottom: -$radius,
+        top: $radius,
+        near: $nearPlane,
+        far: $radius * 2.0f
+    );
+    if ($quality->stabilize) {
+        $glOrtho = shadowSnap($glOrtho, $lightView, $quality->resolution);
+    }
+
+    Mat4 $projection = clipZeroOne($glOrtho);
+    Mat4 $lightSpace = $projection * $lightView;
+    float32 $nearViewZ = -($nearClip + $lastSplit * $clipRange);
+    float32 $splitViewZ = -($nearClip + $split * $clipRange);
+    return ShadowCascade(
+        $index,
+        $lightSpace,
+        Frustum(zeroOne: $lightSpace),
+        shadowUniforms($projection, $lightView, $lightSpace, $eye, $quality->resolution),
+        $nearViewZ,
+        $splitViewZ
+    );
+}
+
+internal function shadowSliceCorners(const Mat4& $invPV, float32 $lastSplit, float32 $split) : Vec3[8]
+{
+    Vec3[8] $ndc;
+    $ndc[0] = Vec3(-1.0f, 1.0f, 0.0f);
+    $ndc[1] = Vec3(1.0f, 1.0f, 0.0f);
+    $ndc[2] = Vec3(1.0f, -1.0f, 0.0f);
+    $ndc[3] = Vec3(-1.0f, -1.0f, 0.0f);
+    $ndc[4] = Vec3(-1.0f, 1.0f, 1.0f);
+    $ndc[5] = Vec3(1.0f, 1.0f, 1.0f);
+    $ndc[6] = Vec3(1.0f, -1.0f, 1.0f);
+    $ndc[7] = Vec3(-1.0f, -1.0f, 1.0f);
+    Vec3[8] $world;
+    int32 $i = 0;
+
+    while ($i < 8) {
+        $world[$i] = shadowUnproject($invPV, $ndc[$i]);
+        $i = $i + 1;
+    }
+
+    $i = 0;
+    while ($i < 4) {
+        Vec3 $ray = $world[$i + 4] - $world[$i];
+        $world[$i + 4] = $world[$i] + $ray * $split;
+        $world[$i] = $world[$i] + $ray * $lastSplit;
+        $i = $i + 1;
+    }
+
+    return $world;
+}
+
+internal function shadowUnproject(const Mat4& $invPV, Vec3 $ndc) : Vec3
+{
+    Vec4 $clip = $invPV * Vec4($ndc, 1.0f);
+    return $clip->xyz() / $clip->w;
+}
+
+internal function shadowCenter(Vec3[8] $corners) : Vec3
+{
+    Vec3 $sum = Vec3(0.0f, 0.0f, 0.0f);
+    int32 $i = 0;
+
+    while ($i < 8) {
+        $sum = $sum + $corners[$i];
+        $i = $i + 1;
+    }
+
+    return $sum / 8.0f;
+}
+
+internal function shadowRadius(Vec3[8] $corners, Vec3 $center) : float32
+{
+    float32 $radius = 0.0f;
+    int32 $i = 0;
+
+    while ($i < 8) {
+        float32 $d = length($corners[$i] - $center);
+        if ($d > $radius) {
+            $radius = $d;
+        }
+
+        $i = $i + 1;
+    }
+
+    return (math::ceil(($radius * 16.0f) as float64) as float32) / 16.0f;
+}
+
+internal function shadowSnap(const Mat4& $glOrtho, const Mat4& $lightView, int32 $resolution) : Mat4
+{
+    Mat4 $shadow = $glOrtho * $lightView;
+    Vec4 $origin = $shadow * Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    float32 $half = ($resolution as float32) * 0.5f;
+    $origin = $origin * $half;
+    Vec4 $rounded = Vec4(
+        math::round($origin->x as float64) as float32,
+        math::round($origin->y as float64) as float32,
+        math::round($origin->z as float64) as float32,
+        math::round($origin->w as float64) as float32
+    );
+    Vec4 $offset = ($rounded - $origin) * (2.0f / ($resolution as float32));
+    $offset->z = 0.0f;
+    $offset->w = 0.0f;
+    Mat4 $snapped = $glOrtho;
+    $snapped->c3 = $snapped->c3 + $offset;
+    return $snapped;
+}
+
+internal function shadowUniforms(
+    const Mat4& $projection,
+    const Mat4& $view,
+    const Mat4& $projectionView,
+    Vec3 $eye,
+    int32 $resolution
+) : CameraUniforms
+{
+    float32 $w = $resolution as float32;
+    return CameraUniforms(
+        $projection,
+        $view,
+        $projectionView,
+        inverse($projection),
+        inverse($projectionView),
+        Vec4($eye->x, $eye->y, $eye->z, 1.0f),
+        Vec4($w, $w, 1.0f / $w, 1.0f / $w)
+    );
+}

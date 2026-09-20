@@ -1,10 +1,20 @@
 /**
  * GPU timestamps per frame slot: one shared MTLCounterSampleBuffer, four samples per render encoder
- * (start / end of vertex, start / end of fragment) and two per blit (encoder start / end). A span
- * is vertex duration plus fragment duration: on Apple GPUs the vertex work of one encoder overlaps
- * the fragment work of the previous one, so the wall span from vertex start to fragment end would
- * count the wait in between and sum far past the frame. Resolved when the slot's command buffer has
- * completed, into the device's GpuTimeline.
+ * (start / end of vertex, start / end of fragment) and two per blit or compute (encoder start / end).
+ * Pass GPU time is how much this encoder extends the busy union of earlier encoders.
+ * Apple TBDR stage timestamps overlap: a cheap sky whose fragment window sits inside
+ * the previous pass's occupancy would otherwise show 5 ms. HUD `GPU:` stays the union.
+ *
+ * HUD `GPU:` (`GpuPublish.busyNs`) is the union of those stage intervals, not first-tick to last-tick.
+ * Occupancy envelopes include drawable wait and vsync idle between encoders and sawtooth on a
+ * live window. GPUStartTime/GPUEndTime and kernelStartTime are not the HUD number. Tessellation
+ * compute is a separate CB: its kernel time is published on the tessellateWith scope when it is
+ * at least 1 ms (the same ~0.2 ms noise is ignored) and added to busy time (it runs before scene).
+ *
+ * When the scene command buffer is committed before present, `$busyCount` clamps the union to
+ * scene encoders so blit/overlay onto the drawable cannot poison the HUD.
+ *
+ * Resolved when the slot's command buffers have completed, into the device's GpuProfiler.
  *
  * Every body is a no-op under VISU_RELEASE so device.eco stays unconditional. Encoders that draw
  * nothing run no stage and leave those samples at 0; such stages count as zero.
@@ -13,15 +23,7 @@
 namespace visu::graphics;
 
 internal const uint32 GPU_SAMPLES = 512;
-internal const uint64 CLOCK_CALIBRATE_NS = 200000000;
-
-internal struct PendingSpan
-{
-    public int32 $scope;
-    public uint32 $start;
-    /** 4 for a render encoder, 2 for a blit */
-    public uint32 $count;
-}
+internal const float64 MIN_COMPUTE_NS = 1000000.0;
 
 /**
  * CPU / GPU clock pair from `sampleTimestamps`. Apple silicon reports both in nanoseconds on one
@@ -49,6 +51,21 @@ internal class GpuTimestamps
     public uint32 $cursor;
     public int32 $dropped;
     public uint64 $frame;
+    /**
+     * When true, HUD busy time unions only the first `$busyCount` pending encoders (scene).
+     * Present blit/overlay still emit child spans.
+     */
+    public bool $busyClamped;
+    public uint32 $busyCount;
+    public bool $gpuOpen;
+    public string $name;
+    /** `sampleCountersInBuffer` at encoder begin/end. Apple silicon is stage-boundary only. */
+    public bool $drawBoundary;
+    /** `withBarrier:YES` on those samples. Serializes the GPU; detailed mode only. */
+    public bool $barrier;
+    public bool $tagOpen;
+    public uint32 $tagBegin;
+    public uint32 $tagEnd;
 
     public constructor()
     {
@@ -58,6 +75,17 @@ internal class GpuTimestamps
         $this->cursor = 0;
         $this->dropped = 0;
         $this->frame = 0;
+        $this->busyClamped = false;
+        $this->busyCount = 0;
+        $this->gpuOpen = false;
+        $this->name = '';
+        $this->drawBoundary = false;
+        $this->barrier = false;
+        $this->tagOpen = false;
+        $this->tagBegin = 0;
+        $this->tagEnd = 0;
+        $this->pending->reserve(MAX_GPU_SCOPES as usize);
+        $this->ticks->reserve(GPU_QUERY_COUNT as usize);
     }
 
     public function reset(uint64 $frame) : void
@@ -66,6 +94,22 @@ internal class GpuTimestamps
         $this->cursor = 0;
         $this->dropped = 0;
         $this->frame = $frame;
+        $this->busyClamped = false;
+        $this->busyCount = 0;
+        $this->gpuOpen = false;
+        $this->name = '';
+        $this->tagOpen = false;
+        $this->tagBegin = 0;
+        $this->tagEnd = 0;
+    }
+
+    /**
+     * Scene encoders recorded so far; later present encoders stay out of HUD `GPU:`.
+     */
+    public function clampBusy() : void
+    {
+        $this->busyClamped = true;
+        $this->busyCount = $this->pending->count() as uint32;
     }
 }
 
@@ -88,6 +132,7 @@ internal function mtlTimestampsCreate(mtl::Device $gpu, GpuTimestamps $t) : void
     }
     $t->buffer = $buf;
     $t->ticks = zeroTicks(GPU_SAMPLES);
+    $t->drawBoundary = $gpu->supportsCounterSampling(.atDrawBoundary);
     #[end]
 }
 
@@ -95,7 +140,7 @@ internal function mtlTimestampsCreate(mtl::Device $gpu, GpuTimestamps $t) : void
  * Claim the next `$count` samples for `$scope`: the first sample index, or null when the frame's
  * capacity ran out, which counts as one dropped encoder.
  */
-internal function mtlTimestampsReserve(GpuTimestamps $t, int32 $scope, uint32 $count) : uint32?
+internal function mtlTimestampsReserve(GpuTimestamps $t, uint32 $count, GpuQueue $queue) : uint32?
 {
     if ($t->cursor + $count > GPU_SAMPLES) {
         $t->dropped = $t->dropped + 1;
@@ -103,7 +148,8 @@ internal function mtlTimestampsReserve(GpuTimestamps $t, int32 $scope, uint32 $c
     }
 
     uint32 $start = $t->cursor;
-    $t->pending[] = PendingSpan($scope, $start, $count);
+    int32 $cpu = visu::profile::profiler()->currentNode();
+    $t->pending[] = PendingSpan($cpu, $start, $count, $queue, $t->barrier);
     $t->cursor = $start + $count;
     return $start;
 }
@@ -111,13 +157,19 @@ internal function mtlTimestampsReserve(GpuTimestamps $t, int32 $scope, uint32 $c
 /**
  * Point `$pass` at the next four samples and remember which scope they belong to.
  */
-internal function mtlTimestampsAttach(GpuTimestamps $t, mtl::RenderPassDescriptor& $pass, int32 $scope) : void
+internal function mtlTimestampsAttach(GpuTimestamps $t, mtl::RenderPassDescriptor& $pass) : void
 {
     #[if: !VISU_RELEASE]
     mtl::CounterSampleBuffer $buf = guard $t->buffer else {
         return;
     }
-    uint32 $s = guard mtlTimestampsReserve($t, $scope, 4) else {
+    uint32 $n = 4;
+
+    if ($t->drawBoundary) {
+        $n = 6;
+    }
+
+    uint32 $s = guard mtlTimestampsReserve($t, $n, .graphics) else {
         return;
     }
     $pass->sample = mtl::RenderPassSample(
@@ -127,19 +179,109 @@ internal function mtlTimestampsAttach(GpuTimestamps $t, mtl::RenderPassDescripto
         ($s + 2) as uint64,
         ($s + 3) as uint64
     );
+
+    if ($n == 6) {
+        $t->tagOpen = true;
+        $t->tagBegin = $s + 4;
+        $t->tagEnd = $s + 5;
+    }
     #[end]
 }
 
-internal function mtlTimestampsAttachBlit(GpuTimestamps $t, mtl::BlitPassDescriptor& $pass, int32 $scope) : void
+internal function mtlTimestampsTagBegin(GpuTimestamps $t, mtl::RenderCommandEncoder $enc) : void
+{
+    #[if: !VISU_RELEASE]
+    if (!$t->tagOpen) {
+        return;
+    }
+
+    mtl::CounterSampleBuffer $buf = guard $t->buffer else {
+        return;
+    }
+    $enc->sampleCounters($buf, $t->tagBegin as uint64, barrier: $t->barrier);
+    #[end]
+}
+
+internal function mtlTimestampsTagEnd(GpuTimestamps $t, mtl::RenderCommandEncoder $enc) : void
+{
+    #[if: !VISU_RELEASE]
+    if (!$t->tagOpen) {
+        return;
+    }
+
+    mtl::CounterSampleBuffer $buf = guard $t->buffer else {
+        $t->tagOpen = false;
+        return;
+    }
+    $enc->sampleCounters($buf, $t->tagEnd as uint64, barrier: $t->barrier);
+    $t->tagOpen = false;
+    #[end]
+}
+
+internal function mtlTimestampsAttachBlit(GpuTimestamps $t, mtl::BlitPassDescriptor& $pass) : void
 {
     #[if: !VISU_RELEASE]
     mtl::CounterSampleBuffer $buf = guard $t->buffer else {
         return;
     }
-    uint32 $s = guard mtlTimestampsReserve($t, $scope, 2) else {
+    uint32 $s = guard mtlTimestampsReserve($t, 2, .copy) else {
         return;
     }
     $pass->sample = mtl::BlitPassSample($buf, $s as uint64, ($s + 1) as uint64);
+    #[end]
+}
+
+internal function mtlTimestampsAttachCompute(GpuTimestamps $t, mtl::ComputePassDescriptor& $pass) : void
+{
+    #[if: !VISU_RELEASE]
+    mtl::CounterSampleBuffer $buf = guard $t->buffer else {
+        return;
+    }
+    uint32 $s = guard mtlTimestampsReserve($t, 2, .compute) else {
+        return;
+    }
+    $pass->sample = mtl::ComputePassSample($buf, $s as uint64, ($s + 1) as uint64);
+    #[end]
+}
+
+internal function mtlGpuBegin(Device $device, const string& $name, GpuQueue $queue) : GpuProfileScope
+{
+    #[if: !VISU_RELEASE]
+    if (!$device->gpuProfiler->supported || $device->slots->count() == 0) {
+        return GpuProfileScope();
+    }
+
+    GpuTimestamps $t = $device->slots[$device->slot]->stamps;
+    $t->gpuOpen = true;
+    $t->name = $name;
+    mtl::CommandBuffer $cmd = guard $device->cmd else {
+        GpuProfileScope $scope = GpuProfileScope();
+        $scope->index = 0;
+        return $scope;
+    }
+    $cmd->pushDebugGroup($name);
+    GpuProfileScope $out = GpuProfileScope();
+    $out->index = 0;
+    return $out;
+    #[else]
+    return GpuProfileScope();
+    #[end]
+}
+
+internal function mtlGpuEnd(Device $device, GpuProfileScope $scope) : void
+{
+    #[if: !VISU_RELEASE]
+    if ($scope->index < 0 || $device->slots->count() == 0) {
+        return;
+    }
+
+    GpuTimestamps $t = $device->slots[$device->slot]->stamps;
+    $t->gpuOpen = false;
+    $t->name = '';
+    mtl::CommandBuffer $cmd = guard $device->cmd else {
+        return;
+    }
+    $cmd->popDebugGroup();
     #[end]
 }
 
@@ -154,48 +296,24 @@ internal function mtlTimestampsHarvest(Device $device) : void
         return;
     }
 
-    array<FrameSlot> $ready = array<FrameSlot>();
     foreach ($device->slots as $slot) {
-        if ($slot->prev != null) {
-            $ready[] = $slot;
-        }
-    }
-
-    array<FrameSlot> $ordered = array<FrameSlot>();
-    foreach ($ready as $slot) {
-        array<FrameSlot> $next = array<FrameSlot>();
-        bool $placed = false;
-        foreach ($ordered as $have) {
-            if (!$placed && $slot->stamps->frame < $have->stamps->frame) {
-                $next[] = $slot;
-                $placed = true;
-            }
-
-            $next[] = $have;
-        }
-
-        if (!$placed) {
-            $next[] = $slot;
-        }
-
-        $ordered = $next;
-    }
-
-    foreach ($ordered as $slot) {
-        mtl::CommandBuffer $prev = guard $slot->prev else {
+        if ($slot->prev == null && $slot->prePrev == null && $slot->presentPrev == null) {
             continue;
-        }
-        if ($prev->status() != mtl::CommandBufferStatus::completed) {
-            $prev->waitUntilCompleted();
         }
 
         mtl::Device $gpu = guard $device->gpu else {
             $slot->prev = null;
+            $slot->prePrev = null;
+            $slot->presentPrev = null;
+            $slot->preScope = -1;
             continue;
         }
         mtlClockSample($gpu, $device->clock);
-        mtlTimestampsResolve($slot->stamps, $prev, $device->clock, $device->gpuTimeline);
+        mtlTimestampsResolve($slot, $device->clock, $device->gpuProfiler);
         $slot->prev = null;
+        $slot->prePrev = null;
+        $slot->presentPrev = null;
+        $slot->preScope = -1;
     }
     #[else]
     if ($device->slots->count() == 0) {
@@ -203,39 +321,109 @@ internal function mtlTimestampsHarvest(Device $device) : void
     }
 
     foreach ($device->slots as $slot) {
-        mtl::CommandBuffer $prev = guard $slot->prev else {
-            continue;
-        }
-        $prev->waitUntilCompleted();
+        mtlWaitDrop($slot->prev);
         $slot->prev = null;
+        mtlWaitDrop($slot->prePrev);
+        $slot->prePrev = null;
+        mtlWaitDrop($slot->presentPrev);
+        $slot->presentPrev = null;
+        $slot->preScope = -1;
     }
     #[end]
 }
 
-internal function mtlTimestampsResolve(GpuTimestamps $t, mtl::CommandBuffer $prev, GpuClock $clock, GpuTimeline $out) : void
+/**
+ * Kernel occupancy of `$cmd` in nanoseconds. Falls back to GPUStart/GPUEnd when kernel
+ * times are 0 (buffer not completed, or an OS without kernelStartTime).
+ */
+internal function mtlCommandWorkNs(mtl::CommandBuffer $cmd) : float64
 {
-    #[if: !VISU_RELEASE]
-    if ($prev->status() != mtl::CommandBufferStatus::completed) {
-        $prev->waitUntilCompleted();
+    float64 $k0 = $cmd->kernelStart();
+    float64 $k1 = $cmd->kernelEnd();
+
+    if ($k1 > $k0 && $k0 > 0.0) {
+        return ($k1 - $k0) * 1000000000.0;
     }
 
-    array<GpuSpan> $spans = array<GpuSpan>();
-    float64 $t0 = $prev->gpuStart();
-    float64 $t1 = $prev->gpuEnd();
+    float64 $t0 = $cmd->gpuStart();
+    float64 $t1 = $cmd->gpuEnd();
 
     if ($t1 > $t0 && $t0 > 0.0) {
-        $spans[] = GpuSpan(-1, ($t1 - $t0) * 1000000000.0);
+        return ($t1 - $t0) * 1000000000.0;
     }
 
-    appendEncoderSpans($t, $clock, $spans);
-    $out->publish($t->frame, $spans, $t->dropped);
+    return 0.0;
+}
+
+internal function mtlWaitDrop(mtl::CommandBuffer? $cmd) : void
+{
+    mtl::CommandBuffer $held = guard $cmd else {
+        return;
+    }
+    $held->waitUntilCompleted();
+}
+
+internal function mtlWaitIfNeeded(mtl::CommandBuffer? $cmd) : void
+{
+    mtl::CommandBuffer $held = guard $cmd else {
+        return;
+    }
+    if ($held->status() != mtl::CommandBufferStatus::completed) {
+        $held->waitUntilCompleted();
+    }
+}
+
+internal function mtlTimestampsResolve(FrameSlot $slot, GpuClock $clock, GpuProfiler $out) : void
+{
+    #[if: !VISU_RELEASE]
+    mtlWaitIfNeeded($slot->prev);
+    mtlWaitIfNeeded($slot->prePrev);
+    mtlWaitIfNeeded($slot->presentPrev);
+
+    array<GpuSpan> $spans = array<GpuSpan>();
+    array<GpuInterval> $busyIv = array<GpuInterval>();
+    appendEncoderSpans($slot->stamps, $clock, $spans, $busyIv);
+
+    float64 $tessNs = 0.0;
+    mtl::CommandBuffer? $preHeld = $slot->prePrev;
+
+    if ($preHeld != null && $slot->preScope >= 0) {
+        mtl::CommandBuffer $pre = guard $preHeld;
+        $tessNs = mtlCommandWorkNs($pre);
+
+        if ($tessNs < MIN_COMPUTE_NS) {
+            $tessNs = 0.0;
+        } else {
+            GpuSpan $span = GpuSpan();
+            $span->scope = $slot->preScope;
+            $span->ns = $tessNs;
+            $spans[] = $span;
+        }
+    }
+
+    float64 $busy = gpuBusyNs($busyIv) + $tessNs;
+    float64 $span = gpuSpanNs($busyIv);
+
+    GpuPublish $pub = GpuPublish();
+    $pub->frame = $slot->stamps->frame;
+    $pub->spans = $spans;
+    $pub->busyNs = $busy;
+    $pub->spanNs = $span;
+    $pub->dropped = $slot->stamps->dropped;
+    $out->publish($pub);
     #[end]
 }
 
 /**
  * One span per pending encoder whose samples resolved; nothing without a sample buffer.
+ * `$busyNs` is the union of stage intervals, optionally clamped to scene encoders.
  */
-internal function appendEncoderSpans(GpuTimestamps $t, GpuClock $clock, array<GpuSpan>& $spans) : void
+internal function appendEncoderSpans(
+    GpuTimestamps $t,
+    GpuClock $clock,
+    array<GpuSpan>& $spans,
+    array<GpuInterval>& $busy
+) : void
 {
     mtl::CounterSampleBuffer $buf = guard $t->buffer else {
         return;
@@ -247,67 +435,170 @@ internal function appendEncoderSpans(GpuTimestamps $t, GpuClock $clock, array<Gp
 
     uint64 $got = $buf->resolve(0, $t->cursor as uint64, &$t->ticks[0]);
     uint64 $bad = mtl::counterErrorValue();
+    uint32 $index = 0;
+    uint32 $busyUntil = $t->pending->count() as uint32;
+    array<GpuInterval> $running = array<GpuInterval>();
+
+    if ($t->busyClamped) {
+        $busyUntil = $t->busyCount;
+    }
+
     foreach ($t->pending as const &$p) {
         if ((($p->start + $p->count - 1) as uint64) >= $got) {
+            $index = $index + 1;
             continue;
         }
 
-        uint64 $ticks = stageTicks($t->ticks, $p->start, $bad);
+        uint64 $a = 0;
+        uint64 $b = 0;
+        bool $ok = pendingRange($t->ticks, $p, $bad, $a, $b);
 
-        if ($p->count == 4) {
-            $ticks = $ticks + stageTicks($t->ticks, $p->start + 2, $bad);
-        }
-
-        if ($ticks == 0) {
+        if (!$ok) {
+            $index = $index + 1;
             continue;
         }
 
-        $spans[] = GpuSpan($p->scope, ($ticks as float64) * $clock->nsPerTick);
+        float64 $lo = ($a as float64) * $clock->nsPerTick;
+        float64 $hi = ($b as float64) * $clock->nsPerTick;
+        float64 $nsPerTick = $clock->nsPerTick;
+        float64 $busyNs = 0.0;
+
+        if ($p->count >= 6 && $p->barrier) {
+            uint64 $ta = 0;
+            uint64 $tb = 0;
+            stagePair($t->ticks, $p->start + 4, $bad, $ta, $tb);
+            $busyNs = gpuExclusiveInsert($running, ($ta as float64) * $nsPerTick, ($tb as float64) * $nsPerTick);
+        } else if ($p->count >= 4) {
+            uint64 $va = 0;
+            uint64 $vb = 0;
+            uint64 $fa = 0;
+            uint64 $fb = 0;
+            stagePair($t->ticks, $p->start, $bad, $va, $vb);
+            stagePair($t->ticks, $p->start + 2, $bad, $fa, $fb);
+            $busyNs = gpuExclusiveInsert($running, ($va as float64) * $nsPerTick, ($vb as float64) * $nsPerTick);
+            $busyNs = $busyNs + gpuExclusiveInsert($running, ($fa as float64) * $nsPerTick, ($fb as float64) * $nsPerTick);
+        } else {
+            $busyNs = gpuExclusiveInsert($running, $lo, $hi);
+        }
+
+        GpuSpan $span = GpuSpan();
+        $span->scope = $p->cpuScope;
+        $span->ns = $busyNs;
+        $span->beginNs = $lo;
+        $span->endNs = $hi;
+        $spans[] = $span;
+
+        if ($index < $busyUntil) {
+            appendStageInterval($busy, $t->ticks, $p->start, $bad, $clock->nsPerTick);
+
+            if ($p->count >= 4) {
+                appendStageInterval($busy, $t->ticks, $p->start + 2, $bad, $clock->nsPerTick);
+            }
+        }
+
+        $index = $index + 1;
     }
 }
 
 /**
- * Duration of one stage from its start / end samples; 0 when the stage never ran or a sample failed.
+ * Start and end of one stage pair. 0, 0 when the stage never ran.
  */
-internal function stageTicks(const array<uint64>& $ticks, uint32 $start, uint64 $bad) : uint64
+internal function stagePair(
+    const array<uint64>& $ticks,
+    uint32 $start,
+    uint64 $bad,
+    uint64& $lo,
+    uint64& $hi
+) : void
 {
     uint64 $a = $ticks[$start as usize];
     uint64 $b = $ticks[($start + 1) as usize];
 
     if ($a == 0 || $b == 0 || $a == $bad || $b == $bad || $b < $a) {
-        return 0;
+        $lo = 0;
+        $hi = 0;
+        return;
     }
 
-    return $b - $a;
+    $lo = $a;
+    $hi = $b;
 }
 
 /**
- * Read both clocks; after CLOCK_CALIBRATE_NS of CPU time the ratio is fixed and re-based.
+ * First start / last end of a pending encoder. Occupancy, not busy: a hole
+ * between vertex and fragment is included. Count 4 and 6 both carry that pair
+ * at samples 0..3; extra draw-boundary tags sit at 4..5.
+ */
+internal function pendingRange(
+    const array<uint64>& $ticks,
+    PendingSpan $p,
+    uint64 $bad,
+    uint64& $lo,
+    uint64& $hi
+) : bool
+{
+    uint64 $a = $ticks[$p->start as usize];
+    uint64 $b = $ticks[($p->start + 1) as usize];
+    bool $have = false;
+
+    if ($a != 0 && $b != 0 && $a != $bad && $b != $bad && $b >= $a) {
+        $lo = $a;
+        $hi = $b;
+        $have = true;
+    }
+
+    if ($p->count < 4) {
+        return $have;
+    }
+
+    uint64 $c = $ticks[($p->start + 2) as usize];
+    uint64 $d = $ticks[($p->start + 3) as usize];
+
+    if ($c == 0 || $d == 0 || $c == $bad || $d == $bad || $d < $c) {
+        return $have;
+    }
+
+    if (!$have || $c < $lo) {
+        $lo = $c;
+    }
+
+    if (!$have || $d > $hi) {
+        $hi = $d;
+    }
+
+    return true;
+}
+
+internal function appendStageInterval(
+    array<GpuInterval>& $busy,
+    const array<uint64>& $ticks,
+    uint32 $start,
+    uint64 $bad,
+    float64 $nsPerTick
+) : void
+{
+    uint64 $a = $ticks[$start as usize];
+    uint64 $b = $ticks[($start + 1) as usize];
+
+    if ($a == 0 || $b == 0 || $a == $bad || $b == $bad || $b < $a) {
+        return;
+    }
+
+    GpuInterval $iv = GpuInterval();
+    $iv->lo = ($a as float64) * $nsPerTick;
+    $iv->hi = ($b as float64) * $nsPerTick;
+    $busy[] = $iv;
+}
+
+/**
+ * Intentionally a no-op. Apple silicon reports CPU and GPU timestamps in nanoseconds on one
+ * timeline, so `$nsPerTick` stays 1.0. Recalibrating `cpu_delta / gpu_delta` over a window that
+ * includes vsync idle makes the ratio track occupancy: HUD GPU ramped ~7 ms to ~15 ms every 19
+ * frames, then snapped. Discrete GPUs that need a measured ratio are not a Metal target here.
  */
 internal function mtlClockSample(mtl::Device $gpu, GpuClock $clock) : void
 {
     #[if: !VISU_RELEASE]
-    mtl::Timestamps $now = $gpu->sampleTimestamps();
-
-    if ($clock->cpu0 == 0) {
-        $clock->cpu0 = $now->cpuNs;
-        $clock->gpu0 = $now->gpuTicks;
-        return;
-    }
-
-    if ($now->cpuNs <= $clock->cpu0 || $now->gpuTicks <= $clock->gpu0) {
-        return;
-    }
-
-    uint64 $dc = $now->cpuNs - $clock->cpu0;
-
-    if ($dc < CLOCK_CALIBRATE_NS) {
-        return;
-    }
-
-    uint64 $dg = $now->gpuTicks - $clock->gpu0;
-    $clock->nsPerTick = ($dc as float64) / ($dg as float64);
-    $clock->cpu0 = $now->cpuNs;
-    $clock->gpu0 = $now->gpuTicks;
+    $clock->nsPerTick = 1.0;
     #[end]
 }

@@ -12,6 +12,7 @@ public class ShaderRef
     public const string? $variant;
     private weak<ShaderCollection> $shaders;
     internal ShaderProgram? $compiled;
+    internal ComputeProgram? $compiledCompute;
     internal array<ShaderFile> $files;
     internal array<Define> $defines;
     internal ordered_map<string, ShaderRef> $variants;
@@ -22,6 +23,7 @@ public class ShaderRef
         $this->name = $name;
         $this->variant = null;
         $this->compiled = null;
+        $this->compiledCompute = null;
         $this->files = array<ShaderFile>();
         $this->defines = array<Define>();
         $this->variants = ordered_map<string, ShaderRef>();
@@ -33,6 +35,7 @@ public class ShaderRef
         $this->name = $name;
         $this->variant = $variant;
         $this->compiled = null;
+        $this->compiledCompute = null;
         $this->files = array<ShaderFile>();
         $this->defines = array<Define>();
         $this->variants = ordered_map<string, ShaderRef>();
@@ -53,6 +56,16 @@ public class ShaderRef
     }
 
     /**
+     * Compile if needed and return the compute program. The stem must have a `.comp` stage.
+     */
+    public function loadCompute() : result<ComputeProgram, ShaderError>
+    {
+        ShaderCollection $col = guard strong($this->shaders);
+
+        return $col->compileCompute($this);
+    }
+
+    /**
      * Hot-path lookup. Asserts the program was load()ed.
      */
     public function program() : ShaderProgram
@@ -70,11 +83,13 @@ public class ShaderRef
     public function forget() : void
     {
         ShaderProgram $held = guard $this->compiled else {
+            $this->forgetCompute();
             $this->forgetVariants();
             return;
         }
         $held->destroy();
         $this->compiled = null;
+        $this->forgetCompute();
         $this->forgetVariants();
     }
 
@@ -89,6 +104,15 @@ public class ShaderRef
         }
 
         return .ok($this->variants[$variant]);
+    }
+
+    private function forgetCompute() : void
+    {
+        ComputeProgram $held = guard $this->compiledCompute else {
+            return;
+        }
+        $held->destroy();
+        $this->compiledCompute = null;
     }
 
     private function forgetVariants() : void

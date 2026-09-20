@@ -74,6 +74,22 @@ test spark_fps_low_is_red
     assert($low->r > $ok->r, 'drop is redder');
 }
 
+test spark_budget_scale_does_not_stretch_noise
+{
+    array<uint8> $px = sparkFilled(8, 24);
+    array<float32> $samples = array<float32>();
+    $samples[] = 7630000.0f;
+    $samples[] = 8480000.0f;
+    rasterizeSpark($px, $samples, 8, 24, 0, true, true, 0, 0, 16666667.0f);
+    // both sit near half height of a 16.6 ms axis, not at the top vs ring max
+    assert(sparkAlpha($px, 8, 0, 13) == 255, 'low on budget');
+    assert(sparkAlpha($px, 8, 1, 12) == 255, 'high on budget');
+    assert(sparkAlpha($px, 8, 1, 0) == 0, 'not stretched to the top');
+    SparkRgba $a = sparkTint(7630000.0f, 16666667.0f);
+    SparkRgba $b = sparkTint(8480000.0f, 16666667.0f);
+    assert($a->g == $b->g, 'both green vs the frame budget');
+}
+
 internal function sparkAlpha(const array<uint8>& $px, int32 $w, int32 $x, int32 $y) : uint8
 {
     usize $idx = (($y * $w + $x) * 4) as usize;

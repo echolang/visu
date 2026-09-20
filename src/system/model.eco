@@ -15,12 +15,12 @@ use visu::app::{FlagValue, Flags, flags, info};
 use visu::asset::MODEL_MAX_LODS;
 use visu::components::{DynamicModel, StaticModel};
 use visu::ecs::{Entities, Entity, Schedule, System};
-use visu::geo::{AABB, Transform};
+use visu::geo::{AABB, Frustum, Transform};
 use visu::graphics::{
     CallbackPass, CameraData, DebugLines, DeferredRenderer, DrawCallAssembler, Frame, GBufferData,
     GpuPass, IoSink, MaterialGpu, MeshHandle, Model, ModelBank, ModelInstanceData, Pipeline,
-    PipelineError, Raster, RenderContext, RenderEncoder, ShaderProgram, VertexLayout,
-    debugLinePass, lodIndex, modelLayout
+    PipelineError, Raster, RenderContext, RenderEncoder, SHADOW_CASCADES, ShaderProgram,
+    ShadowCascade, ShadowCaster, ShadowMapData, VertexLayout, debugLinePass, lodIndex, modelLayout
 };
 use visu::console::lodColor;
 use visu::math::{Mat4, Vec3, Vec4, length};
@@ -43,7 +43,7 @@ internal class ModelHandles
     }
 }
 
-public class ModelSystem : System
+public class ModelSystem : System, ShadowCaster
 {
     public ModelBank $bank;
     public DeferredRenderer $renderer;
@@ -81,9 +81,11 @@ public class ModelSystem : System
     public array<int32> $lodHistogram;
     private StaticSet $statics;
     private DrawCallAssembler<ModelInstanceData> $dca;
+    private array<DrawCallAssembler<ModelInstanceData>> $shadowDca;
     private VertexLayout $layout;
     private GpuPass? $opaque;
     private GpuPass? $doubleSided;
+    private GpuPass? $shadow;
     private map<string, int32> $modelIndex;
     private array<ModelHandles> $models;
     private map<Entity, int32> $dynamicOf;
@@ -113,9 +115,19 @@ public class ModelSystem : System
 
         $this->statics = StaticSet($world);
         $this->dca = DrawCallAssembler<ModelInstanceData>($bank->device);
+        $this->shadowDca = array<DrawCallAssembler<ModelInstanceData>>();
+        int32 $s = 0;
+        while ($s < SHADOW_CASCADES) {
+            DrawCallAssembler<ModelInstanceData> $shadow = DrawCallAssembler<ModelInstanceData>($bank->device);
+            $shadow->shareMeshes($this->dca);
+            $this->shadowDca[] = $shadow;
+            $s = $s + 1;
+        }
+
         $this->layout = modelLayout();
         $this->opaque = null;
         $this->doubleSided = null;
+        $this->shadow = null;
         $this->modelIndex = map<string, int32>();
         $this->models = array<ModelHandles>();
         $this->dynamicOf = map<Entity, int32>();
@@ -163,6 +175,10 @@ public class ModelSystem : System
         }
 
         $this->dca->clearMeshes();
+        foreach ($this->shadowDca as $shadow) {
+            $shadow->clearInstances();
+        }
+
         $this->models->clear();
         $this->modelIndex->clear();
         $this->statics->clear();
@@ -235,6 +251,12 @@ public class ModelSystem : System
                 return $sys->draw($world, $inner, $gbuffer);
             }
         ));
+        ShadowMapData? $shadows = $ctx->frame->find<ShadowMapData>();
+        if ($shadows != null) {
+            ShadowMapData $data = guard $shadows;
+            $this->prepareShadows($entities, $ctx, $data->cascades);
+            $data->add($this);
+        }
     }
 
     /**
@@ -252,8 +274,13 @@ public class ModelSystem : System
             return .ok;
         }
         visu::profile::begin('cull');
-        $this->submitAll($entities, $camera, $ctx->compensation);
-        $this->dca->build($camera->frustum, $camera->position);
+        $this->submitAll($entities, $camera->cullFrustum, $camera->cullPosition, $ctx->compensation);
+        $this->dca->build($camera->cullFrustum, $camera->cullPosition);
+        if ($camera->cullFrozen) {
+            $this->lines->frustum($camera->cullCorners(), Vec4(1.00f, 0.85f, 0.15f, 1.0f));
+            $this->lines->cross($camera->cullPosition, 4.0f);
+        }
+
         visu::profile::end();
         bool $geometry = $this->dca->commandCount() > 0;
         if (!$geometry && $this->lines->empty()) {
@@ -284,6 +311,113 @@ public class ModelSystem : System
         $enc->endRender();
         visu::profile::end();
         return .ok;
+    }
+
+    /**
+     * Cull against each cascade frustum, pick LODs from the play camera. The light eye sits far
+     * up the sun ray, so distance from there would put every model at its coarsest level.
+     * Statics are octree-queried per cascade; dynamics are walked once.
+     */
+    public function prepareShadows(
+        Entities $entities,
+        RenderContext $ctx,
+        const ShadowCascade[5]& $cascades
+    ) : void
+    {
+        $this->ensurePasses();
+        CameraData $view = guard $ctx->frame->find<CameraData>() else {
+            return;
+        }
+        visu::profile::begin('cull');
+        int32 $i = 0;
+        while ($i < SHADOW_CASCADES) {
+            $this->shadowDca[$i as usize]->clearInstances();
+            $i = $i + 1;
+        }
+
+        Vec3 $eye = $view->cullPosition;
+        float32 $alpha = $ctx->compensation;
+        $i = 0;
+        while ($i < SHADOW_CASCADES) {
+            ShadowCascade $cascade = $cascades[$i];
+            DrawCallAssembler<ModelInstanceData> $dca = $this->shadowDca[$i as usize];
+            $this->statics->query($cascade->frustum);
+            array<uint32> $ids = $this->statics->visible();
+            foreach ($ids as $id) {
+                StaticInstance $inst = $this->statics->get($id);
+                if (!$inst->live) {
+                    continue;
+                }
+
+                ModelHandles $h = $this->models[$inst->handles as usize];
+                $this->submitShadow($dca, $h, $inst->world, $inst->bounds, $inst->tint, $inst->lodBias, $eye);
+            }
+
+            $i = $i + 1;
+        }
+
+        foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
+            if (!$this->dynamicOf->has($id)) {
+                continue;
+            }
+
+            ModelHandles $h = $this->models[$this->dynamicOf[$id] as usize];
+            Transform& $t = $entities->get<Transform>($id);
+            Mat4 $world = $t->world($entities, $alpha);
+            AABB $bounds = $h->model->bounds->transformed($world);
+            $i = 0;
+            while ($i < SHADOW_CASCADES) {
+                if ($cascades[$i]->frustum->contains($bounds)) {
+                    $this->submitShadow(
+                        $this->shadowDca[$i as usize],
+                        $h,
+                        $world,
+                        $bounds,
+                        $dynamic->tint,
+                        $dynamic->lodBias,
+                        $eye
+                    );
+                }
+
+                $i = $i + 1;
+            }
+        }
+
+        $i = 0;
+        while ($i < SHADOW_CASCADES) {
+            $this->shadowDca[$i as usize]->build($cascades[$i]->frustum, $eye);
+            $i = $i + 1;
+        }
+
+        visu::profile::end();
+    }
+
+    /**
+     * Draw the list `prepareShadows` built into an open cascade encoder.
+     */
+    public function cast(RenderContext $ctx, RenderEncoder $enc, const ShadowCascade& $cascade) : void
+    {
+        GpuPass $pass = guard $this->shadow else {
+            return;
+        }
+        int32 $index = $cascade->index;
+        if ($index < 0 || $index >= SHADOW_CASCADES) {
+            return;
+        }
+
+        DrawCallAssembler<ModelInstanceData> $dca = $this->shadowDca[$index as usize];
+        if ($dca->commandCount() == 0) {
+            return;
+        }
+
+        $enc->upload($cascade->uniforms, slot: 1);
+        ModelBank $bank = $this->bank;
+        GpuPass $shadowPass = $pass;
+        $dca->execute($enc, function(RenderEncoder $e, int32 $material) : void {
+            $shadowPass->bind($e);
+            MaterialGpu $m = $bank->material($material);
+            $m->bind($e);
+        });
     }
 
     /**
@@ -435,9 +569,15 @@ public class ModelSystem : System
     }
 
     /**
-     * Query the octree for statics, walk the dynamics, submit each at its LOD.
+     * Query the octree for statics inside `$frustum`, walk the dynamics, submit each at the LOD
+     * its distance from `$eye` earns. Records console counters and debug lines.
      */
-    private function submitAll(Entities $entities, CameraData $camera, float32 $alpha) : void
+    private function submitAll(
+        Entities $entities,
+        const Frustum& $frustum,
+        Vec3 $eye,
+        float32 $alpha
+    ) : void
     {
         $this->dca->clearInstances();
         $this->submitted = 0;
@@ -454,8 +594,7 @@ public class ModelSystem : System
             $this->statics->draw($this->lines);
         }
 
-        Vec3 $eye = $camera->position;
-        $this->statics->query($camera->frustum);
+        $this->statics->query($frustum);
         array<uint32> $ids = $this->statics->visible();
         foreach ($ids as $id) {
             StaticInstance $inst = $this->statics->get($id);
@@ -464,7 +603,7 @@ public class ModelSystem : System
             }
 
             ModelHandles $h = $this->models[$inst->handles as usize];
-            $this->submitInstance($h, $inst->world, $inst->bounds, $inst->tint, $inst->lodBias, $eye);
+            $this->submitVisible($this->dca, $h, $inst->world, $inst->bounds, $inst->tint, $inst->lodBias, $eye, true);
         }
 
         foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
@@ -477,11 +616,12 @@ public class ModelSystem : System
             Transform& $t = $entities->get<Transform>($id);
             Mat4 $world = $t->world($entities, $alpha);
             AABB $bounds = $h->model->bounds->transformed($world);
-            $this->submitInstance($h, $world, $bounds, $dynamic->tint, $dynamic->lodBias, $eye);
+            $this->submitVisible($this->dca, $h, $world, $bounds, $dynamic->tint, $dynamic->lodBias, $eye, true);
         }
     }
 
-    private function submitInstance(
+    private function submitShadow(
+        DrawCallAssembler<ModelInstanceData> $dca,
         ModelHandles $h,
         const Mat4& $world,
         const AABB& $bounds,
@@ -490,22 +630,34 @@ public class ModelSystem : System
         Vec3 $eye
     ) : void
     {
+        $this->submitVisible($dca, $h, $world, $bounds, $tint, $lodBias, $eye, false);
+    }
+
+    private function submitVisible(
+        DrawCallAssembler<ModelInstanceData> $dca,
+        ModelHandles $h,
+        const Mat4& $world,
+        const AABB& $bounds,
+        Vec4 $tint,
+        float32 $lodBias,
+        Vec3 $eye,
+        bool $record
+    ) : void
+    {
         float32 $dist = length($bounds->closest($eye) - $eye);
         if ($h->model->cullDistance > 0.0f && $dist > $h->model->cullDistance) {
-            $this->distanceCulled = $this->distanceCulled + 1;
+            if ($record) {
+                $this->distanceCulled = $this->distanceCulled + 1;
+            }
+
             return;
         }
 
         int32 $lod = lodIndex($h->model->lods, $dist, $h->model->lodBias * $lodBias * $this->lodBias);
-        if ($this->showBounds) {
+        if ($record && $this->showBounds) {
             $this->lines->box($bounds, lodColor($lod));
         }
 
-        $this->submitLod($h, $lod, $world, $tint);
-    }
-
-    private function submitLod(ModelHandles $h, int32 $lod, const Mat4& $world, Vec4 $tint) : void
-    {
         int32 $last = ($h->lodStart->count() as int32) - 2;
         if ($last < 0) {
             return;
@@ -520,14 +672,17 @@ public class ModelSystem : System
             $level = $last;
         }
 
-        $this->lodHistogram[$level as usize] = $this->lodHistogram[$level as usize] + 1;
-        $this->submitted = $this->submitted + 1;
+        if ($record) {
+            $this->lodHistogram[$level as usize] = $this->lodHistogram[$level as usize] + 1;
+            $this->submitted = $this->submitted + 1;
+        }
+
         int32 $start = $h->lodStart[$level as usize];
         int32 $end = $h->lodStart[($level + 1) as usize];
-        int32 $i = $start;
-        while ($i < $end) {
-            $this->dca->submit($h->handles[$i as usize], $world, ModelInstanceData($tint), 0.0f);
-            $i = $i + 1;
+        int32 $n = $start;
+        while ($n < $end) {
+            $dca->submit($h->handles[$n as usize], $world, ModelInstanceData($tint), 0.0f);
+            $n = $n + 1;
         }
     }
 
@@ -552,13 +707,14 @@ public class ModelSystem : System
             $h->lodStart[] = $h->handles->count() as int32;
             foreach ($lod->primitives as $prim) {
                 MaterialGpu $m = $this->bank->materialOf($model, $prim->slot);
-                $h->handles[] = $this->dca->register(
+                MeshHandle $handle = $this->dca->register(
                     $model->mesh,
                     $lod->bounds,
                     firstIndex: $prim->firstIndex,
                     indexCount: $prim->indexCount,
                     material: $m->index
                 );
+                $h->handles[] = $handle;
             }
         }
 
@@ -603,6 +759,7 @@ public class ModelSystem : System
         Raster $open = $raster;
         $open->cull = .none;
         $this->doubleSided = GpuPass($program, $this->layout, $open);
+        $this->shadow = $this->renderer->shadowPass($this->layout);
         ShaderProgram $lines = guard $this->renderer->program('debug_lines') else {
             return;
         }

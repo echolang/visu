@@ -14,6 +14,11 @@ public class Device : DeviceProtocol
     internal mtl::Layer? $layer;
     internal mtl::Drawable? $drawable;
     internal mtl::CommandBuffer? $cmd;
+    internal mtl::CommandBuffer? $preCmd;
+    internal mtl::ComputeCommandEncoder? $preEnc;
+    // profile node of the first tessellateWith this frame, or -1
+    internal int32 $preScope;
+    internal map<uint32, mtl::ComputePipelineState> $computePsos;
     internal array<FrameSlot> $slots;
     internal uint32 $slot;
     internal uint64 $frames;
@@ -30,6 +35,7 @@ public class Device : DeviceProtocol
     internal bool $encoderOpen;
     internal mtl::RenderCommandEncoder? $activeEnc;
     internal bool $inFrame;
+    internal bool $sceneCommitted;
     internal DeviceLimits $limits;
     internal AdapterInfo $adapter;
     internal Texture? $bb;
@@ -38,7 +44,7 @@ public class Device : DeviceProtocol
     internal map<uint32, mtl::DepthStencilState> $depthStates;
     internal PixelFormat $bbFormat;
     public DrawCounters $draws;
-    public GpuTimeline $gpuTimeline;
+    public GpuProfiler $gpuProfiler;
     internal GpuClock $clock;
 
     public constructor()
@@ -48,6 +54,10 @@ public class Device : DeviceProtocol
         $this->layer = null;
         $this->drawable = null;
         $this->cmd = null;
+        $this->preCmd = null;
+        $this->preEnc = null;
+        $this->preScope = -1;
+        $this->computePsos = map<uint32, mtl::ComputePipelineState>();
         $this->slots = array<FrameSlot>();
         $this->slot = 0;
         $this->frames = 0;
@@ -64,6 +74,7 @@ public class Device : DeviceProtocol
         $this->encoderOpen = false;
         $this->activeEnc = null;
         $this->inFrame = false;
+        $this->sceneCommitted = false;
         $this->limits = DeviceLimits();
         $this->limits->uniformAlign = 16;
         $this->limits->vertexTextures = true;
@@ -76,7 +87,7 @@ public class Device : DeviceProtocol
         $this->depthStates = map<uint32, mtl::DepthStencilState>();
         $this->bbFormat = .bgra8;
         $this->draws = DrawCounters();
-        $this->gpuTimeline = GpuTimeline();
+        $this->gpuProfiler = GpuProfiler();
         $this->clock = GpuClock();
     }
 
@@ -105,7 +116,11 @@ public class Device : DeviceProtocol
         }
         $this->gpu = $gpu;
         $this->queue = $queue;
-        $this->gpuTimeline->supported = mtlTimestampsSupported($gpu);
+        $this->gpuProfiler->supported = mtlTimestampsSupported($gpu);
+
+        if ($this->gpuProfiler->supported) {
+            $this->gpuProfiler->mode = .lightweight;
+        }
         mtlClockSample($gpu, $this->clock);
         guard mtlCreateSlots($this) else ($e) {
             $this->shutdown();
@@ -125,7 +140,8 @@ public class Device : DeviceProtocol
         string $line = $info->line();
         info("graphics: {$line}");
 
-        if ($this->gpuTimeline->supported) {
+        if ($this->gpuProfiler->supported) {
+            $this->gpuProfiler->mode = .lightweight;
             info('gpu timestamps: on (stage boundary)');
         }
 
@@ -233,51 +249,67 @@ public class Device : DeviceProtocol
                 return .error(.metal('beginFrame', 'gpu timeline wait timed out'));
             }
 
-            mtl::CommandBuffer $prev = guard $slot->prev else {
-                $slot->prev = null;
-                return $this->acquireFrame($width, $height);
-            }
             mtl::Device $gpu = guard $this->gpu else {
                 return .error(.noDevice);
             }
             mtlClockSample($gpu, $this->clock);
-            mtlTimestampsResolve($slot->stamps, $prev, $this->clock, $this->gpuTimeline);
+            mtlTimestampsResolve($slot, $this->clock, $this->gpuProfiler);
         }
         $slot->prev = null;
-        return $this->acquireFrame($width, $height);
+        $slot->prePrev = null;
+        $slot->presentPrev = null;
+        $slot->preScope = -1;
+        return $this->openScene();
     }
 
     public function endFrame() : status<DeviceError>
     {
         assert($this->inFrame, 'endFrame outside beginFrame');
         assert(!$this->encoderOpen, 'endFrame with an open encoder');
+        if (!$this->sceneCommitted) {
+            mtlCommitPreRender($this, false);
+        }
+
         $this->bb = null;
         FrameSlot $slot = $this->slots[$this->slot];
         mtl::CommandBuffer $cmd = guard $this->cmd else {
             $this->inFrame = false;
+            $this->sceneCommitted = false;
             $this->draws->roll();
             return .ok;
         }
         $slot->epoch = $slot->epoch + 1;
         $cmd->encodeSignalEvent($slot->gpuDone, $slot->epoch);
-        mtl::Drawable $drawable = guard $this->drawable else {
+        mtl::Drawable $held = guard $this->drawable else {
             $cmd->commit();
-            $slot->prev = $cmd;
+            if ($this->sceneCommitted) {
+                $slot->presentPrev = $cmd;
+            } else {
+                $slot->prev = $cmd;
+            }
+
             $this->cmd = null;
+            $this->drawable = null;
             $this->inFrame = false;
+            $this->sceneCommitted = false;
             $this->frames = $this->frames + 1;
             $this->slot = ($this->slot + 1) % FRAMES_IN_FLIGHT;
             $this->draws->roll();
             return .ok;
         }
-
-        $cmd->present($drawable);
-
+        $cmd->present($held);
         $cmd->commit();
-        $slot->prev = $cmd;
+
+        if ($this->sceneCommitted) {
+            $slot->presentPrev = $cmd;
+        } else {
+            $slot->prev = $cmd;
+        }
+
         $this->cmd = null;
         $this->drawable = null;
         $this->inFrame = false;
+        $this->sceneCommitted = false;
         $this->frames = $this->frames + 1;
         $this->slot = ($this->slot + 1) % FRAMES_IN_FLIGHT;
         $this->draws->roll();
@@ -301,10 +333,10 @@ public class Device : DeviceProtocol
 
     public function backbuffer() : Texture
     {
-        Texture $bb = guard $this->bb else {
-            die('backbuffer outside beginFrame');
+        Texture $have = guard $this->bb else {
+            return $this->acquireBackbuffer();
         }
-        return $bb;
+        return $have;
     }
 
     public const function backbufferFormat() : PixelFormat
@@ -366,7 +398,8 @@ public class Device : DeviceProtocol
             die('beginRender without a command buffer');
         }
         uint32 $n = $desc->colors->count() as uint32;
-        assert($n > 0 && $n <= MAX_COLOR_TARGETS, 'beginRender color targets');
+        assert($n <= MAX_COLOR_TARGETS, 'beginRender color targets');
+        assert($n > 0 || $desc->depth != null, 'beginRender needs a color or a depth target');
         mtl::RenderPassDescriptor $pass = mtl::RenderPassDescriptor();
         TargetFormats $formats = TargetFormats();
         uint32 $i = 0;
@@ -399,13 +432,19 @@ public class Device : DeviceProtocol
 
         $formats->colorCount = $n;
         $formats->samples = .one;
-        ColorTarget $first = $desc->colors[0];
-        int32 $passWidth = $first->width();
-        int32 $passHeight = $first->height();
+        int32 $passWidth = 1;
+        int32 $passHeight = 1;
+        if ($n > 0) {
+            ColorTarget $first = $desc->colors[0];
+            $passWidth = $first->width();
+            $passHeight = $first->height();
+        }
+
         mtl::PixelFormat $depthFmt = mtl::PixelFormat::invalid;
         DepthTarget $depth = guard $desc->depth else {
             return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $passWidth, $passHeight);
         }
+        $depth->validate();
         $depth->texture->state = .depthTarget;
         mtl::Texture $depthTex = guard $depth->texture->handle->texture else {
             die('beginRender depth texture handle is empty');
@@ -414,9 +453,16 @@ public class Device : DeviceProtocol
         $pass->depthLoadAction = mtlLoadOp($depth->load);
         $pass->depthStoreAction = mtlStoreOp($depth->store);
         $pass->depthClear = $depth->clearDepth;
+        $pass->depthLevel = $depth->mip as uint32;
+        $pass->depthSlice = $depth->face as uint32;
         $formats->depth = $depth->texture->desc->format;
         $formats->hasDepth = true;
         $depthFmt = mtlPixelFormat($depth->texture->desc->format);
+        if ($n == 0) {
+            $passWidth = $depth->width();
+            $passHeight = $depth->height();
+        }
+
         return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $passWidth, $passHeight);
     }
 
@@ -643,7 +689,10 @@ public class Device : DeviceProtocol
     {
         assert($this->gpu != null, 'generateMipmaps before initialize');
         assert(!$this->encoderOpen, 'generateMipmaps with an open encoder');
-        assert($texture->desc->mips > 1, 'generateMipmaps needs mips > 1');
+        if ($texture->desc->mips <= 1) {
+            $texture->state = .shaderRead;
+            return;
+        }
         mtl::Texture $mt = guard $texture->handle->texture else {
             die('generateMipmaps handle is empty');
         }
@@ -654,7 +703,7 @@ public class Device : DeviceProtocol
                 die('generateMipmaps without a command buffer');
             }
             mtl::BlitPassDescriptor $blitPass = mtl::BlitPassDescriptor();
-            mtlTimestampsAttachBlit($this->slots[$this->slot]->stamps, $blitPass, $this->gpuTimeline->scope);
+            mtlTimestampsAttachBlit($this->slots[$this->slot]->stamps, $blitPass);
             mtl::BlitCommandEncoder $blit = guard $cmd->blitCommandEncoder($blitPass) else {
                 die('metal: blitCommandEncoder failed');
             }
@@ -764,6 +813,7 @@ public class Device : DeviceProtocol
         $this->waitSlots();
         mtlDestroySlots($this);
         $this->psos = map<string, PipelineHandle>();
+        $this->computePsos = map<uint32, mtl::ComputePipelineState>();
         $this->samplerHandles = map<string, SamplerHandle>();
         $this->depthStates = map<uint32, mtl::DepthStencilState>();
         $this->queue = null;
@@ -771,15 +821,14 @@ public class Device : DeviceProtocol
         $this->ready = false;
     }
 
-    private function acquireFrame(int32 $width, int32 $height) : result<FrameStatus, DeviceError>
+    private function openScene() : result<FrameStatus, DeviceError>
     {
         FrameSlot $slot = $this->slots[$this->slot];
         $slot->ring->reset();
         $slot->stamps->reset($this->frames);
+        $slot->stamps->barrier = $this->gpuProfiler->mode == GpuProfilerMode::detailed;
+        $this->sceneCommitted = false;
         mtl::Layer $layer = guard $this->layer else {
-            return .ok(.skipped);
-        }
-        mtl::Drawable $next = guard $layer->nextDrawable() else {
             return .ok(.skipped);
         }
         mtl::CommandQueue $queue = guard $this->queue else {
@@ -788,16 +837,45 @@ public class Device : DeviceProtocol
         mtl::CommandBuffer $cmd = guard $queue->commandBuffer() else {
             return .error(.metal('beginFrame', 'command buffer'));
         }
-        $this->drawable = $next;
+        $this->drawable = null;
+        $this->bb = null;
         $this->cmd = $cmd;
+        $this->inFrame = true;
+        return .ok(.ready);
+    }
+
+    /**
+     * Take the drawable. If the scene command buffer already recorded work, commit it first so
+     * offscreen passes do not wait on the vsync queue.
+     */
+    private function acquireBackbuffer() : Texture
+    {
+        assert($this->inFrame, 'backbuffer outside beginFrame');
+        FrameSlot $slot = $this->slots[$this->slot];
+        bool $hadWork = $slot->stamps->pending->count() > 0 || $this->preEnc != null;
+
+        if ($hadWork && !$this->sceneCommitted) {
+            mtlCommitScene($this);
+        }
+
+        mtl::Layer $layer = guard $this->layer else {
+            die('backbuffer without a surface');
+        }
+        mtl::Drawable $next = guard $layer->nextDrawable() else {
+            die('metal: nextDrawable failed');
+        }
+        $this->drawable = $next;
         TextureHandle $th = TextureHandle($next->texture(), true);
-        TextureDesc $bbDesc = TextureDesc($format: $this->bbFormat, $width: $width, $height: $height);
+        TextureDesc $bbDesc = TextureDesc(
+            $format: $this->bbFormat,
+            $width: $this->drawableW,
+            $height: $this->drawableH
+        );
         $bbDesc->usage = 0 as uint32;
         Texture $bb = Texture(imported: $this, $th, $bbDesc);
         $bb->state = .undefined;
         $this->bb = $bb;
-        $this->inFrame = true;
-        return .ok(.ready);
+        return $bb;
     }
 
     private function openEncoder(
@@ -809,18 +887,36 @@ public class Device : DeviceProtocol
         int32 $height
     ) : RenderEncoder
     {
-        mtlTimestampsAttach($this->slots[$this->slot]->stamps, $pass, $this->gpuTimeline->scope);
+        mtlTimestampsAttach($this->slots[$this->slot]->stamps, $pass);
         mtl::RenderCommandEncoder $enc = guard $cmd->renderCommandEncoder($pass) else {
             die('metal: renderCommandEncoder failed');
         }
+        GpuTimestamps $stamps = $this->slots[$this->slot]->stamps;
+        mtlTimestampsTagBegin($stamps, $enc);
+
+        if ($stamps->gpuOpen && !$stamps->name->empty()) {
+            $enc->setLabel($stamps->name);
+            $enc->pushDebugGroup($stamps->name);
+        }
+
         $this->encoderOpen = true;
         $this->activeEnc = $enc;
         return RenderEncoder($this, $formats, $width, $height, $enc, $depthFmt);
     }
 
+    public function gpuBegin(const string& $name) : GpuProfileScope
+    {
+        return mtlGpuBegin($this, $name, .graphics);
+    }
+
+    public function gpuEnd(GpuProfileScope $scope) : void
+    {
+        mtlGpuEnd($this, $scope);
+    }
+
     /**
      * Only on a state change; never per frame.
-     * Each write opens an implicit CATransaction on the main thread, so doing this every frame dirties the layer and costs us the compositor fast path.
+     * A CATransaction around the layer write; doing this every frame dirties the layer and costs the compositor fast path.
      */
     private function applyVsync() : void
     {
@@ -828,6 +924,9 @@ public class Device : DeviceProtocol
             return;
         }
         $owned->setDisplaySync($this->vsync);
+        if ($this->vsync != $owned->displaySync()) {
+            info('metal: displaySyncEnabled did not take');
+        }
     }
 
     private function waitSlots() : void
@@ -835,8 +934,19 @@ public class Device : DeviceProtocol
         mtlTimestampsHarvest($this);
     }
 
+    internal function preComputeEncoder() : mtl::ComputeCommandEncoder
+    {
+        return mtlPreComputeEncoder($this);
+    }
+
+    internal function computePipeline(ComputeProgram $kernel) : mtl::ComputePipelineState
+    {
+        return mtlComputePipeline($this, $kernel);
+    }
+
     private function abortFrame() : void
     {
+        mtlCommitPreRender($this, true);
         mtl::RenderCommandEncoder? $held = $this->activeEnc;
 
         if ($held != null) {
@@ -850,6 +960,7 @@ public class Device : DeviceProtocol
         if ($this->inFrame) {
             mtl::CommandBuffer $cmd = guard $this->cmd else {
                 $this->inFrame = false;
+                $this->sceneCommitted = false;
                 $this->drawable = null;
                 $this->bb = null;
                 return;
@@ -858,8 +969,14 @@ public class Device : DeviceProtocol
             $cmd->waitUntilCompleted();
             $this->cmd = null;
             $this->inFrame = false;
+            $this->sceneCommitted = false;
+            FrameSlot $slot = $this->slots[$this->slot];
+            mtlWaitDrop($slot->prev);
+            $slot->prev = null;
+            mtlWaitDrop($slot->presentPrev);
+            $slot->presentPrev = null;
             // the aborted buffer never becomes $prev, so its samples must not pair with the next one
-            $this->slots[$this->slot]->stamps->reset($this->frames);
+            $slot->stamps->reset($this->frames);
         }
 
         $this->drawable = null;

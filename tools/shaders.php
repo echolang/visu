@@ -31,6 +31,7 @@ const STAGES = [
     'geo' => ['glslang' => 'geom', 'spirv' => 'geom', 'entry' => ''],
     'tessc' => ['glslang' => 'tesc', 'spirv' => 'tesc', 'entry' => ''],
     'tesse' => ['glslang' => 'tese', 'spirv' => 'tese', 'entry' => 'vs'],
+    'comp' => ['glslang' => 'comp', 'spirv' => 'comp', 'entry' => 'cs'],
 ];
 
 /**

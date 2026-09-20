@@ -41,22 +41,19 @@ public struct AABB
 
     /**
      * World AABB of the eight corners after `$m`. Rotation makes it looser than the local box.
+     * Corners stay on the stack: a cull loop cannot afford `corners()`'s heap array.
      */
     public const function transformed(const Mat4& $m) : AABB
     {
-        array<Vec3> $c = $this->corners();
-        Vec4 $p0 = $m * Vec4($c[0], 1.0f);
-        Vec3 $lo = $p0->xyz();
+        Vec3 $lo = aabbXform($m, $this->min->x, $this->min->y, $this->min->z);
         Vec3 $hi = $lo;
-        usize $n = $c->count();
-
-        for ($i = 1 as usize; $i < $n; $i = $i + 1) {
-            Vec4 $p = $m * Vec4($c[$i], 1.0f);
-            Vec3 $q = $p->xyz();
-            $lo = min($lo, $q);
-            $hi = max($hi, $q);
-        }
-
+        aabbGrow($m, $this->max->x, $this->min->y, $this->min->z, $lo, $hi);
+        aabbGrow($m, $this->max->x, $this->max->y, $this->min->z, $lo, $hi);
+        aabbGrow($m, $this->min->x, $this->max->y, $this->min->z, $lo, $hi);
+        aabbGrow($m, $this->min->x, $this->min->y, $this->max->z, $lo, $hi);
+        aabbGrow($m, $this->max->x, $this->min->y, $this->max->z, $lo, $hi);
+        aabbGrow($m, $this->max->x, $this->max->y, $this->max->z, $lo, $hi);
+        aabbGrow($m, $this->min->x, $this->max->y, $this->max->z, $lo, $hi);
         return AABB($lo, $hi);
     }
 
@@ -209,6 +206,19 @@ public struct AABB
         ];
         return $out;
     }
+}
+
+internal function aabbXform(const Mat4& $m, float32 $x, float32 $y, float32 $z) : Vec3
+{
+    Vec4 $p = $m * Vec4($x, $y, $z, 1.0f);
+    return $p->xyz();
+}
+
+internal function aabbGrow(const Mat4& $m, float32 $x, float32 $y, float32 $z, Vec3& $lo, Vec3& $hi) : void
+{
+    Vec3 $q = aabbXform($m, $x, $y, $z);
+    $lo = min($lo, $q);
+    $hi = max($hi, $q);
 }
 
 internal function slab(

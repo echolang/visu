@@ -1,0 +1,103 @@
+/**
+ * Drives the `RtsCamera` that also has `ActiveCamera`.
+ * Bind after `CameraSystem`; only the marked camera consumes input.
+ */
+
+namespace visu::system;
+
+use visu::components::{ActiveCamera, RtsCamera};
+use visu::ecs::{Entities, Entity, Schedule, System};
+use visu::geo::{Transform, projectOnPlane};
+use visu::graphics::RenderContext;
+use visu::math::{Vec2, Vec3, length2};
+use visu::os::input::InputHub;
+
+public class RtsCameraSystem : System
+{
+    private InputHub $input;
+
+    public constructor(InputHub $input)
+    {
+        $this->input = $input;
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->render = false;
+    }
+
+    public function update(Entities $entities) : void
+    {
+        Entity $active = guard $entities->firstWith<ActiveCamera>() else {
+            return;
+        }
+
+        if (!$entities->has<RtsCamera>($active) || !$entities->has<Transform>($active)) {
+            return;
+        }
+
+        RtsCamera& $rts = $entities->get<RtsCamera>($active);
+        Transform& $transform = $entities->get<Transform>($active);
+        InputHub $input = $this->input;
+
+        if ($input->unclaimed()) {
+            float32 $span = $rts->max;
+            if ($span < $rts->min) {
+                $span = $rts->min;
+            }
+
+            float32 $c = $rts->radius / $span;
+            float32 $speed = $c * $rts->focusSpeed;
+            Vec3 $flat = projectOnPlane($transform->forward(), Transform::worldUp());
+            if (length2(Vec3($flat->x, 0.0f, $flat->z)) > 0.0001f) {
+                if ($input->down(.w)) {
+                    $rts->focusVelocity = $rts->focusVelocity + $flat * $speed;
+                } else if ($input->down(.s)) {
+                    $rts->focusVelocity = $rts->focusVelocity - $flat * $speed;
+                }
+            }
+
+            Vec3 $side = projectOnPlane($transform->right(), Transform::worldUp());
+            if (length2(Vec3($side->x, 0.0f, $side->z)) > 0.0001f) {
+                if ($input->down(.a)) {
+                    $rts->focusVelocity = $rts->focusVelocity - $side * $speed;
+                } else if ($input->down(.d)) {
+                    $rts->focusVelocity = $rts->focusVelocity + $side * $speed;
+                }
+            }
+
+            if ($input->down(.q)) {
+                $rts->spin->x = $rts->spin->x + $rts->keySpeed;
+            } else if ($input->down(.e)) {
+                $rts->spin->x = $rts->spin->x - $rts->keySpeed;
+            }
+
+            bool $left = $input->down(button: .left) && !$input->hasBeenPressed(button: .left);
+            bool $middle = $input->down(button: .middle) && !$input->hasBeenPressed(button: .middle);
+            if ($left || $middle) {
+                Vec2 $delta = $input->mouseDelta();
+                $rts->spin->x = $rts->spin->x + $delta->x * $rts->lookSpeed;
+                $rts->spin->y = $rts->spin->y + $delta->y * $rts->lookSpeed;
+            }
+
+            Vec2 $wheel = $input->mouseScroll();
+            if ($wheel->y != 0.0f) {
+                $rts->radius = $rts->radius - $wheel->y * $c * $rts->zoom;
+            }
+        }
+
+        $rts->advance($transform);
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+    }
+}

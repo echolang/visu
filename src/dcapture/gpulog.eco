@@ -1,0 +1,41 @@
+/**
+ * One JSON line of GPU times for a completed frame. Used by dcapture `"gpuLog": true`.
+ */
+
+namespace visu::dcapture;
+
+use visu::profile::{FrameProfile, ScopeNode};
+
+/**
+ * Compact GPU series row: host frame, submit ms (HUD GPU:), resolved flag, then every scope
+ * that has a GPU span, in tree order, milliseconds.
+ */
+public function formatGpuLog(const FrameProfile& $frame) : string
+{
+    float64 $submit = $frame->submitNs / 1000000.0;
+    string $resolved = 'false';
+
+    if ($frame->gpuResolved) {
+        $resolved = 'true';
+    }
+
+    string $buf = "{\"f\":{$frame->frame},\"s\":{$submit:.3f},\"r\":{$resolved},\"g\":{";
+    bool $first = true;
+    array<ScopeNode> $nodes = $frame->nodes;
+    foreach ($nodes as $n) {
+        if ($n->path->empty() || $n->gpuSpans <= 0) {
+            continue;
+        }
+
+        if (!$first) {
+            $buf->append(',');
+        }
+
+        $first = false;
+        float64 $ms = $n->gpuNs / 1000000.0;
+        $buf->append("\"{$n->path}\":{$ms:.3f}");
+    }
+
+    $buf->append('}}');
+    return $buf;
+}

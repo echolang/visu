@@ -1,6 +1,8 @@
 /**
  * Everything a pass needs from the camera this frame. Written once by `CameraSystem.render`;
  * later passes read it through `Frame.get<CameraData>()`. Immutable so readers cannot disagree.
+ * Render matrices (view, projection, frustum, position) are what the GPU binds. The cull set is
+ * the same until freeze, then it stays on the snapshot so culling and LOD do not follow the fly camera.
  */
 
 namespace visu::graphics;
@@ -21,6 +23,16 @@ public class CameraData
      * Interpolated world position of the camera.
      */
     public const Vec3 $position;
+
+    /**
+     * Cull half. Equals the render frustum/eye until `camera freeze`; then this set stays on the
+     * snapshot while view/projection/position keep following the flying camera.
+     * `cullInverseProjectionView` is only for `cullCorners`.
+     */
+    public const Frustum $cullFrustum;
+    public const Vec3 $cullPosition;
+    public const Mat4 $cullInverseProjectionView;
+    public const bool $cullFrozen;
 
     /**
      * Lag between ticks, 0 just after an update, approaching 1 before the next.
@@ -68,6 +80,44 @@ public class CameraData
         $this->contentScaleY = $contentScaleY;
         $this->viewport = $viewport;
         $this->hasViewport = $hasViewport;
+        $this->cullFrustum = $frustum;
+        $this->cullPosition = $position;
+        $this->cullInverseProjectionView = $inverseProjectionView;
+        $this->cullFrozen = false;
+    }
+
+    /**
+     * Render half from `$render`, cull half from `$cull`'s render matrices. Freeze is the only
+     * caller: both halves start equal from the unmarked constructor.
+     */
+    public constructor(cullFrom: CameraData $render, CameraData $cull)
+    {
+        $this->projection = $render->projection;
+        $this->view = $render->view;
+        $this->projectionView = $render->projectionView;
+        $this->inverseProjection = $render->inverseProjection;
+        $this->inverseProjectionView = $render->inverseProjectionView;
+        $this->frustum = $render->frustum;
+        $this->position = $render->position;
+        $this->compensation = $render->compensation;
+        $this->resolutionX = $render->resolutionX;
+        $this->resolutionY = $render->resolutionY;
+        $this->contentScaleX = $render->contentScaleX;
+        $this->contentScaleY = $render->contentScaleY;
+        $this->viewport = $render->viewport;
+        $this->hasViewport = $render->hasViewport;
+        $this->cullFrustum = $cull->frustum;
+        $this->cullPosition = $cull->position;
+        $this->cullInverseProjectionView = $cull->inverseProjectionView;
+        $this->cullFrozen = true;
+    }
+
+    /**
+     * Keep this fact's render camera and take the cull volume from `$cull`.
+     */
+    public const function withCullFrom(CameraData $cull) : CameraData
+    {
+        return CameraData(cullFrom: $this, $cull);
     }
 
     /**
@@ -97,6 +147,15 @@ public class CameraData
         Vec4 $far = $this->inverseProjectionView * Vec4($ndc->x, $ndc->y, 1.0f, 1.0f);
         Vec3 $point = Vec3($far->x / $far->w, $far->y / $far->w, $far->z / $far->w);
         return Ray($this->position, normalize($point - $this->position));
+    }
+
+    /**
+     * Eight world corners of the cull volume. 0..3 is the near rectangle, 4..7 the far, in the
+     * same NDC order as the shadow slice (top-left, top-right, bottom-right, bottom-left).
+     */
+    public const function cullCorners() : Vec3[8]
+    {
+        return cameraUnprojectCorners($this->cullInverseProjectionView);
     }
 
     /**
@@ -130,4 +189,26 @@ public struct CameraUniforms
     public Mat4 $inverseProjectionView;
     public Vec4 $position;
     public Vec4 $resolution;
+}
+
+internal function cameraUnprojectCorners(const Mat4& $invPV) : Vec3[8]
+{
+    Vec3[8] $ndc;
+    $ndc[0] = Vec3(-1.0f, 1.0f, 0.0f);
+    $ndc[1] = Vec3(1.0f, 1.0f, 0.0f);
+    $ndc[2] = Vec3(1.0f, -1.0f, 0.0f);
+    $ndc[3] = Vec3(-1.0f, -1.0f, 0.0f);
+    $ndc[4] = Vec3(-1.0f, 1.0f, 1.0f);
+    $ndc[5] = Vec3(1.0f, 1.0f, 1.0f);
+    $ndc[6] = Vec3(1.0f, -1.0f, 1.0f);
+    $ndc[7] = Vec3(-1.0f, -1.0f, 1.0f);
+    Vec3[8] $world;
+    int32 $i = 0;
+    while ($i < 8) {
+        Vec4 $clip = $invPV * Vec4($ndc[$i], 1.0f);
+        $world[$i] = $clip->xyz() / $clip->w;
+        $i = $i + 1;
+    }
+
+    return $world;
 }

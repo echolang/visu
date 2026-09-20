@@ -18,6 +18,7 @@ public class Instruments
     private Sink $push;
     private StatsBook? $stats;
     private float64 $submitNs;
+    private array<PassTiming> $graphRows;
     private map<string, array<Metric>> $passExtras;
     private Sample? $last;
     private float64 $renderNs;
@@ -32,6 +33,7 @@ public class Instruments
         $this->push = Sink::empty();
         $this->stats = null;
         $this->submitNs = 0.0;
+        $this->graphRows = array<PassTiming>();
         $this->passExtras = map<string, array<Metric>>();
         $this->last = null;
         $this->renderNs = 0.0;
@@ -134,6 +136,7 @@ public class Instruments
     {
         $this->stats = $stats;
         $this->submitNs = $frame->submitNs;
+        $this->graphRows = rowsFromStats($stats);
     }
 
     public function gauge(string $name, float64 $value, Unit $unit = Unit::count) : void
@@ -187,8 +190,7 @@ public class Instruments
         }
 
         if ($this->stats != null) {
-            StatsBook $book = guard $this->stats;
-            $sink->replacePasses(rowsFromStats($book));
+            $sink->replacePasses($this->graphRows);
         }
 
         map<string, array<Metric>> $extras = $this->passExtras;

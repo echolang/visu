@@ -49,6 +49,20 @@ public class Pipeline
     private array<Io> $io;
     private map<string, PendingClear> $clears;
 
+    /**
+     * Offscreen graph: no window backbuffer. Host records the scene into this, then a second
+     * pipeline after `Device.backbuffer()` for blit/overlay.
+     */
+    public constructor(Pool $pool, Frame $frame)
+    {
+        $this->pool = $pool;
+        $this->frame = $frame;
+        $this->passes = array<Pass>();
+        $this->names = map<string, bool>();
+        $this->io = array<Io>();
+        $this->clears = map<string, PendingClear>();
+    }
+
     public constructor(Pool $pool, Frame $frame, RenderTarget $backbuffer)
     {
         $this->pool = $pool;
@@ -155,8 +169,10 @@ public class Pipeline
     /**
      * Run every pass in scheduled I/O order. `$compensation` defaults to 0 (no interpolation).
      * Unconsumed clears flush as empty render passes so a clear-only frame still clears.
+     * `collect:` (default true) runs `Pool.collect` after the passes. Skip it when another
+     * execute on the same pool and tick still needs last frame's unreferenced targets.
      */
-    public function execute(int32 $tick, float32 $compensation = 0.0f) : status<PipelineError>
+    public function execute(int32 $tick, float32 $compensation = 0.0f, collect: bool $collect = true) : status<PipelineError>
     {
         $this->pool->setCurrentTick($tick);
         array<int32> $order = guard schedule($this->passes->count() as int32, $this->io) else ($e) {
@@ -173,10 +189,13 @@ public class Pipeline
             }
             $this->transitionReads($index);
             Pass $pass = $this->passes[$index as usize];
-            // one profile scope per pass; a pass that leaves a sub-scope open is a wiring bug close() asserts on
+            // one CPU scope and debug label per pass; a pass that leaves a sub-scope open is a wiring bug
             int32 $mark = $prof->depth();
-            $prof->begin($pass->name());
+            string $passName = $pass->name();
+            $prof->begin($passName);
+            GpuProfileScope $gpu = $this->pool->device->gpuBegin($passName);
             status<PipelineError> $ran = $pass->execute($ctx);
+            $this->pool->device->gpuEnd($gpu);
             $prof->close($mark);
             guard $ran else ($e) {
                 return .error($e);
@@ -187,7 +206,10 @@ public class Pipeline
             return .error($e);
         }
 
-        $this->pool->collect();
+        if ($collect) {
+            $this->pool->collect();
+        }
+
         return .ok;
     }
 

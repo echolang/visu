@@ -1,14 +1,14 @@
 /**
- * GPU span merging against a hand-built GpuTimeline: roll-up, the submit span on `render`,
+ * GPU span merging against a hand-built GpuProfiler: roll-up, busyNs on `render`,
  * unknown GPU for CPU-only scopes, and the two-frame lag through the pending ring.
  */
 
 // the profiler measures nothing under VISU_RELEASE, so none of this holds there
 #[if: !VISU_RELEASE]
-use visu::graphics::{DrawCounters, GpuSpan, GpuTimeline};
+use visu::graphics::{DrawCounters, GpuSpan, GpuProfiler};
 use visu::profile::{FrameProfile, Profiler, ScopeNode};
 
-function attached(GpuTimeline $tl) : Profiler
+function attached(GpuProfiler $tl) : Profiler
 {
     Profiler $prof = Profiler();
     $prof->attach(DrawCounters(), $tl);
@@ -20,7 +20,6 @@ function renderFrame(Profiler $prof, uint64 $gpuFrame, int32 $frame) : void
     $prof->beginFrame();
     $prof->bindFrame($gpuFrame, $frame);
     $prof->begin('render');
-    $prof->captureSubmit();
     $prof->begin('gbuffer');
     $prof->begin('terrain');
     $prof->end();
@@ -33,7 +32,7 @@ function renderFrame(Profiler $prof, uint64 $gpuFrame, int32 $frame) : void
 
 test profile_spans_fold_and_roll_up
 {
-    GpuTimeline $tl = GpuTimeline();
+    GpuProfiler $tl = GpuProfiler();
     $tl->supported = true;
     Profiler $prof = attached($tl);
     renderFrame($prof, 5, 10);
@@ -44,10 +43,9 @@ test profile_spans_fold_and_roll_up
 
     // node ids are DFS order: 0 frame, 1 render, 2 gbuffer, 3 terrain, 4 ssao
     array<GpuSpan> $spans = array<GpuSpan>();
-    $spans[] = GpuSpan(-1, 1000.0);
     $spans[] = GpuSpan(2, 300.0);
     $spans[] = GpuSpan(4, 200.0);
-    $tl->publish(5, $spans, 0);
+    $tl->publish(5, $spans, 0, 1000.0);
     $prof->mergeGpu();
 
     FrameProfile $f = guard $prof->complete() else {
@@ -68,7 +66,7 @@ test profile_spans_fold_and_roll_up
     ScopeNode $render = guard $f->find('render') else {
         die('render');
     }
-    assert($render->gpuNs == 1000.0 && $render->gpuSpans == 1, 'render takes the submit span');
+    assert($render->gpuNs == 1000.0 && $render->gpuSpans == 1, 'render takes the submit envelope');
     assert($f->root()->gpuNs == 1000.0, 'root mirrors submit');
 
     // a repeated resolve of the same frame is a no-op
@@ -78,7 +76,7 @@ test profile_spans_fold_and_roll_up
 
 test profile_children_roll_up_without_submit
 {
-    GpuTimeline $tl = GpuTimeline();
+    GpuProfiler $tl = GpuProfiler();
     $tl->supported = true;
     Profiler $prof = attached($tl);
     renderFrame($prof, 1, 1);
@@ -102,7 +100,7 @@ test profile_children_roll_up_without_submit
 
 test profile_unsupported_gpu_completes_at_end_frame
 {
-    GpuTimeline $tl = GpuTimeline();
+    GpuProfiler $tl = GpuProfiler();
     Profiler $prof = attached($tl);
     renderFrame($prof, 3, 3);
     FrameProfile $f = guard $prof->complete() else {
@@ -114,14 +112,13 @@ test profile_unsupported_gpu_completes_at_end_frame
 
 test profile_older_frames_complete_when_newer_resolves
 {
-    GpuTimeline $tl = GpuTimeline();
+    GpuProfiler $tl = GpuProfiler();
     $tl->supported = true;
     Profiler $prof = attached($tl);
     renderFrame($prof, 7, 7);
     renderFrame($prof, 8, 8);
     array<GpuSpan> $spans = array<GpuSpan>();
-    $spans[] = GpuSpan(-1, 10.0);
-    $tl->publish(8, $spans, 0);
+    $tl->publish(8, $spans, 0, 10.0);
     $prof->mergeGpu();
     FrameProfile $first = guard $prof->complete() else {
         die('first');
@@ -135,7 +132,7 @@ test profile_older_frames_complete_when_newer_resolves
 
 test profile_ring_overflow_completes_oldest_without_gpu
 {
-    GpuTimeline $tl = GpuTimeline();
+    GpuProfiler $tl = GpuProfiler();
     $tl->supported = true;
     Profiler $prof = attached($tl);
     int32 $i = 0;
@@ -153,7 +150,7 @@ test profile_ring_overflow_completes_oldest_without_gpu
 
 test profile_abandon_flushes_pending
 {
-    GpuTimeline $tl = GpuTimeline();
+    GpuProfiler $tl = GpuProfiler();
     $tl->supported = true;
     Profiler $prof = attached($tl);
     renderFrame($prof, 2, 2);
@@ -166,7 +163,7 @@ test profile_abandon_flushes_pending
 
 test profile_empty_spans_still_resolve
 {
-    GpuTimeline $tl = GpuTimeline();
+    GpuProfiler $tl = GpuProfiler();
     $tl->supported = true;
     Profiler $prof = attached($tl);
     renderFrame($prof, 3, 3);

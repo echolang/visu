@@ -1,0 +1,30 @@
+/**
+ * Compact GPU log line: submit ms plus every scoped GPU span, idle scopes omitted.
+ */
+
+use visu::dcapture::formatGpuLog;
+use visu::profile::{FrameProfile, ScopeNode};
+
+test gpu_log_line_is_submit_and_known_spans
+{
+    array<ScopeNode> $nodes = array<ScopeNode>();
+    ScopeNode $root = ScopeNode();
+    ScopeNode $render = ScopeNode();
+    $render->path = 'render';
+    $render->gpuNs = 5000000.0;
+    $render->gpuSpans = 1;
+    ScopeNode $cpuOnly = ScopeNode();
+    $cpuOnly->path = 'build';
+    $cpuOnly->cpuNs = 1000000.0;
+    ScopeNode $terrain = ScopeNode();
+    $terrain->path = 'render/terrain';
+    $terrain->gpuNs = 2000000.0;
+    $terrain->gpuSpans = 1;
+    $nodes[] = $root;
+    $nodes[] = $render;
+    $nodes[] = $cpuOnly;
+    $nodes[] = $terrain;
+    FrameProfile $f = FrameProfile(40, 40 as uint64, true, true, 5000000.0, $nodes);
+    string $line = formatGpuLog($f);
+    assert($line == '{"f":40,"s":5.000,"r":true,"g":{"render":5.000,"render/terrain":2.000}}', 'gpu log line');
+}

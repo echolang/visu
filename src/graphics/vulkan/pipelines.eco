@@ -249,23 +249,19 @@ internal function vkPipelineFromPass(
         $colorN = MAX_COLOR_TARGETS;
     }
 
-    if ($colorN == 0) {
-        $colorN = 1;
-        $blendAtts[0] = vkFillBlend($pass->raster);
-        $colorFormats[0] = vkFormat($formats->colors[0]);
-    } else {
-        uint32 $ci = 0;
+    uint32 $ci = 0;
 
-        while ($ci < $colorN) {
-            $blendAtts[$ci] = vkFillBlend($pass->raster);
-            $colorFormats[$ci] = vkFormat($formats->colors[$ci]);
-            $ci = $ci + 1;
-        }
+    while ($ci < $colorN) {
+        $blendAtts[$ci] = vkFillBlend($pass->raster);
+        $colorFormats[$ci] = vkFormat($formats->colors[$ci]);
+        $ci = $ci + 1;
     }
 
     vk::PipelineColorBlendStateCreateInfo $blend = vk::PipelineColorBlendStateCreateInfo();
     $blend->attachmentCount = $colorN;
-    $blend->pAttachments:$ = &$blendAtts[0];
+    if ($colorN > 0) {
+        $blend->pAttachments:$ = &$blendAtts[0];
+    }
 
     uint32[2] $dyn;
     $dyn[0] = vk::DYNAMIC_STATE_VIEWPORT;
@@ -276,7 +272,9 @@ internal function vkPipelineFromPass(
 
     vk::PipelineRenderingCreateInfo $rendering = vk::PipelineRenderingCreateInfo();
     $rendering->colorAttachmentCount = $colorN;
-    $rendering->pColorAttachmentFormats:$ = &$colorFormats[0];
+    if ($colorN > 0) {
+        $rendering->pColorAttachmentFormats:$ = &$colorFormats[0];
+    }
 
     if ($formats->hasDepth) {
         $rendering->depthAttachmentFormat = vkFormat($formats->depth);

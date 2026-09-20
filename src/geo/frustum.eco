@@ -117,28 +117,14 @@ public struct Frustum
      */
     public const function contains(const AABB& $box) : bool
     {
-        if (boxOutside($this->left, $box)) {
-            return false;
-        }
+        Plane[6] $planes = frustumPlanes($this);
+        int32 $i = 0;
+        while ($i < 6) {
+            if (boxOutside($planes[$i], $box)) {
+                return false;
+            }
 
-        if (boxOutside($this->right, $box)) {
-            return false;
-        }
-
-        if (boxOutside($this->top, $box)) {
-            return false;
-        }
-
-        if (boxOutside($this->bottom, $box)) {
-            return false;
-        }
-
-        if (boxOutside($this->near, $box)) {
-            return false;
-        }
-
-        if (boxOutside($this->far, $box)) {
-            return false;
+            $i = $i + 1;
         }
 
         return true;
@@ -150,17 +136,19 @@ public struct Frustum
      */
     public const function classify(const AABB& $box) : Containment
     {
+        Plane[6] $planes = frustumPlanes($this);
         bool $straddles = false;
-        array<Plane> $planes = [$this->left, $this->right, $this->top, $this->bottom, $this->near, $this->far];
-
-        foreach ($planes as $plane) {
-            if (boxOutside($plane, $box)) {
+        int32 $i = 0;
+        while ($i < 6) {
+            if (boxOutside($planes[$i], $box)) {
                 return .outside;
             }
 
-            if (!boxInside($plane, $box)) {
+            if (!boxInside($planes[$i], $box)) {
                 $straddles = true;
             }
+
+            $i = $i + 1;
         }
 
         if ($straddles) {
@@ -169,6 +157,18 @@ public struct Frustum
 
         return .inside;
     }
+}
+
+internal function frustumPlanes(const Frustum& $f) : Plane[6]
+{
+    Plane[6] $p;
+    $p[0] = $f->left;
+    $p[1] = $f->right;
+    $p[2] = $f->top;
+    $p[3] = $f->bottom;
+    $p[4] = $f->near;
+    $p[5] = $f->far;
+    return $p;
 }
 
 /**
@@ -191,7 +191,7 @@ internal function boxInside(const Plane& $plane, const AABB& $box) : bool
         $z = $box->min->z;
     }
 
-    return dot($plane->normal, Vec3($x, $y, $z)) + $plane->distance >= 0.0f;
+    return $plane->normal->x * $x + $plane->normal->y * $y + $plane->normal->z * $z + $plane->distance >= 0.0f;
 }
 
 internal function boxOutside(const Plane& $plane, const AABB& $box) : bool
@@ -211,5 +211,5 @@ internal function boxOutside(const Plane& $plane, const AABB& $box) : bool
         $z = $box->max->z;
     }
 
-    return dot($plane->normal, Vec3($x, $y, $z)) + $plane->distance < 0.0f;
+    return $plane->normal->x * $x + $plane->normal->y * $y + $plane->normal->z * $z + $plane->distance < 0.0f;
 }

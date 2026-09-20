@@ -1,10 +1,10 @@
 /**
- * GpuTimeline end to end: two quad encoders under two scope ids, four frames, spans land two
+ * GpuProfiler end to end: two quad encoders under two scope ids, four frames, spans land two
  * frames late tagged with the frame they were recorded in. Skips when the device cannot sample.
  */
 
 use visu::graphics::{
-    CallbackPass, ClearPass, ClearPassOptions, Device, Frame, GpuPass, GpuSpan, GpuTimeline, IoSink,
+    CallbackPass, ClearPass, ClearPassOptions, Device, Frame, GpuPass, GpuSpan, GpuPublish, GpuProfiler, IoSink,
     Mesh, Pipeline, PipelineError, Raster, RenderContext, RenderEncoder, ShaderCollection,
     ShaderProgram, TargetRef, VertexLayout
 };
@@ -12,7 +12,7 @@ use visu::math::Vec4;
 
 public function checkGpuTimeline(GpuContext $gpu) : void
 {
-    GpuTimeline $timeline = $gpu->device->gpuTimeline;
+    GpuProfiler $timeline = $gpu->device->gpuProfiler;
 
     if (!$timeline->supported) {
         echo 'gpucheck: gpu timestamps unsupported here, timeline check skipped';
@@ -41,32 +41,34 @@ public function checkGpuTimeline(GpuContext $gpu) : void
             TargetRef $b = offscreen64($p, 'tl-b');
             $p->add(ClearPass($a, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
             $p->add(ClearPass($b, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
-            $p->add(scopedQuad($timeline, 'quad7', 7, $program, $a, Vec4(1.0f, 0.0f, 0.0f, 1.0f)));
-            $p->add(scopedQuad($timeline, 'quad9', 9, $program, $b, Vec4(0.0f, 1.0f, 0.0f, 1.0f)));
+            $p->add(scopedQuad('quad7', $program, $a, Vec4(1.0f, 0.0f, 0.0f, 1.0f)));
+            $p->add(scopedQuad('quad9', $program, $b, Vec4(0.0f, 1.0f, 0.0f, 1.0f)));
         });
-        $timeline->scope = -1;
 
         if ($before >= 2) {
-            assert($timeline->resolvedFrame == $before - 2, 'spans arrive two frames late');
-            assert($timeline->dropped == 0, 'no dropped encoders');
-            bool $submit = false;
+            array<GpuPublish> $pubs = $timeline->take();
+            GpuPublish $hit = GpuPublish();
+            bool $found = false;
+            foreach ($pubs as $pub) {
+                if ($pub->frame == $before - 2) {
+                    $hit = $pub;
+                    $found = true;
+                }
+            }
+
+            assert($found, 'spans arrive two frames late');
+            assert($hit->dropped == 0, 'no dropped encoders');
+            assert($hit->busyNs > 0.0, 'scene busy union present');
             int32 $encoders = 0;
             int32 $lastScope = -1;
-            array<GpuSpan> $spans = $timeline->resolved;
-            foreach ($spans as $span) {
+            foreach ($hit->spans as $span) {
                 assert($span->ns > 0.0, 'every published span has a duration');
-
-                if ($span->scope == -1) {
-                    $submit = true;
-                    continue;
-                }
-
+                assert($span->scope >= 0, 'encoder spans tag a cpu node');
                 assert($span->scope != $lastScope, 'encoders carry distinct scopes');
                 $lastScope = $span->scope;
                 $encoders = $encoders + 1;
             }
 
-            assert($submit, 'whole-submit span present');
             assert($encoders == 2, 'two encoder spans');
         }
 
@@ -77,13 +79,12 @@ public function checkGpuTimeline(GpuContext $gpu) : void
 }
 
 /**
- * A fullscreen quad into `$target` whose encoder is tagged with `$scope`. Draws through GpuPass
- * directly: the generic QuadPass<T> has no destructor symbol on this compiler and segfaults.
+ * A fullscreen quad into `$target`. Pipeline.execute opens the GPU scope; the encoder
+ * is timestamped under that pass. Draws through GpuPass directly: the generic QuadPass<T>
+ * has no destructor symbol on this compiler and segfaults.
  */
 internal function scopedQuad(
-    GpuTimeline $timeline,
     string $name,
-    int32 $scope,
     ShaderProgram $program,
     TargetRef $target,
     Vec4 $tint
@@ -95,7 +96,6 @@ internal function scopedQuad(
             $io->writes($target);
         },
         execute: function(RenderContext $ctx) : status<PipelineError> {
-            $timeline->scope = $scope;
             RenderEncoder $enc = guard $ctx->beginRender($target) else ($e) {
                 return .error($e);
             }

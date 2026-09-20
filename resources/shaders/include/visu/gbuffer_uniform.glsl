@@ -2,19 +2,22 @@
  * GBuffer reads for the deferred light pass.
  * 0 position (camera-relative xyz in the attachment; gbuffer.P is world),
  * 1 normal, 2 albedo, 3 material (roughness, metallic, AO),
- * 4 emissive, 5 screen-space AO, 6+ environment / IBL.
+ * 4 emissive, 5 id (GBufferId / 255), 6+ environment / IBL, 11 shadow,
+ * 12 screen-space AO.
  */
 #ifndef VISU_GBUFFER_UNIFORM_GLSL
 #define VISU_GBUFFER_UNIFORM_GLSL
 
 #include "visu/camera.glsl"
+#include "visu/gbuffer_id.glsl"
 
 layout(set = 1, binding = 0) uniform sampler2D gbuffer_position;
 layout(set = 1, binding = 1) uniform sampler2D gbuffer_normal;
 layout(set = 1, binding = 2) uniform sampler2D gbuffer_albedo;
 layout(set = 1, binding = 3) uniform sampler2D gbuffer_material;
 layout(set = 1, binding = 4) uniform sampler2D gbuffer_emissive;
-layout(set = 1, binding = 5) uniform sampler2D gbuffer_ao;
+layout(set = 1, binding = 5) uniform sampler2D gbuffer_id;
+layout(set = 1, binding = 12) uniform sampler2D gbuffer_ao;
 
 struct GBuffer
 {
@@ -26,6 +29,7 @@ struct GBuffer
     float roughness;
     float ao;
     vec3 emissive;
+    uint id;
     float coverage;
 };
 
@@ -45,8 +49,10 @@ GBuffer gbuffer_make(vec2 uv)
     gbuffer.metallic = material.g;
     gbuffer.ao = material.b * texture(gbuffer_ao, uv).r;
     gbuffer.emissive = texture(gbuffer_emissive, uv).rgb;
+    gbuffer.id = gbuffer_id_decode(texture(gbuffer_id, uv).r);
     gbuffer.coverage = position.a;
     return gbuffer;
 }
 
 #endif
+

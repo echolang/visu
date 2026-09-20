@@ -31,6 +31,8 @@ public class RenderEncoder : RenderEncoderProtocol
     private uint64 $tessFactorOff;
     private bool $tessFactorSet;
     private uint32 $tessInstanceStride;
+    private uint64 $vertexTransientOff;
+    private bool $vertexTransientSet;
 
     public constructor(
         Device $device,
@@ -56,6 +58,8 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->tessFactorOff = 0;
         $this->tessFactorSet = false;
         $this->tessInstanceStride = 0;
+        $this->vertexTransientOff = 0;
+        $this->vertexTransientSet = false;
         $this->indexBuffer = null;
         $this->indexTransient = null;
         $this->indexType = .uint16;
@@ -185,6 +189,8 @@ public class RenderEncoder : RenderEncoderProtocol
             die('metal: ring is empty');
         }
         $this->enc->setVertexBuffer($buf, $slice->offset as uint32, index: $binding);
+        $this->vertexTransientOff = $slice->offset;
+        $this->vertexTransientSet = true;
     }
 
     public function setIndexTransient(TransientSlice $slice, IndexType $type) : void
@@ -229,13 +235,46 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->texturesDirty = true;
     }
 
-    public function setTessellationFactors(TransientSlice $slice, uint32 $instanceStride) : void
+    public function tessellateWith(ComputeProgram $kernel, uint32 $patchCount) : void
     {
-        assert(!$this->ended, 'setTessellationFactors after endRender');
-        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
-        $this->tessFactorOff = $slice->offset;
+        assert(!$this->ended, 'tessellateWith after endRender');
+        assert($this->vertexTransientSet, 'tessellateWith before setVertexTransient');
+        if ($patchCount < 1) {
+            return;
+        }
+
+        uint64 $factBytes = ($patchCount as uint64) * (QUAD_TESS_FACTOR_STRIDE as uint64);
+        uint64 $factAlign = $this->device->limits->tessFactorAlign;
+        if ($factAlign < TESS_FACTOR_ALIGN) {
+            $factAlign = TESS_FACTOR_ALIGN;
+        }
+
+        TransientSlice $facts = $this->device->allocTransient($factBytes, $factAlign);
+        mtl::ComputeCommandEncoder $compute = $this->device->preComputeEncoder();
+        mtl::ComputePipelineState $pso = $this->device->computePipeline($kernel);
+        $compute->setComputePipelineState($pso);
+        FrameSlot $fs = $this->device->slots[$this->device->slot];
+        mtl::Buffer $ring = guard $fs->ring->buffer else {
+            die('metal: ring is empty');
+        }
+        $compute->setBuffer($ring, $this->vertexTransientOff as uint32, index: 0);
+        $compute->setBuffer($ring, $facts->offset as uint32, index: 1);
+        uint32 $i = 0;
+        while ($i < UNIFORM_SLOTS) {
+            if ($this->uniformSet[$i]) {
+                $compute->setBuffer($ring, $this->uniformOff[$i] as uint32, index: METAL_UNIFORM_BASE + $i);
+            }
+
+            $i = $i + 1;
+        }
+
+        $compute->dispatchThreads(
+            mtl::Size($patchCount as usize, 1 as usize, 1 as usize),
+            mtl::Size(64 as usize, 1 as usize, 1 as usize)
+        );
+        $this->tessFactorOff = $facts->offset;
         $this->tessFactorSet = true;
-        $this->tessInstanceStride = $instanceStride;
+        $this->tessInstanceStride = 0;
     }
 
     public function draw(int32 $first, int32 $count, int32 $instances = 1) : void
@@ -316,6 +355,13 @@ public class RenderEncoder : RenderEncoderProtocol
     {
         assert(!$this->ended, 'RenderEncoder.endRender twice');
         $this->ended = true;
+        GpuTimestamps $stamps = $this->device->slots[$this->device->slot]->stamps;
+
+        if ($stamps->gpuOpen && !$stamps->name->empty()) {
+            $this->enc->popDebugGroup();
+        }
+
+        mtlTimestampsTagEnd($stamps, $this->enc);
         $this->enc->endEncoding();
         $this->device->encoderClosed();
     }

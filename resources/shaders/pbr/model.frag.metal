@@ -31,6 +31,7 @@ struct fs_out
     float4 gbuffer_out_albedo [[color(2)]];
     float4 gbuffer_out_material [[color(3)]];
     float4 gbuffer_out_emissive [[color(4)]];
+    float4 gbuffer_out_id [[color(5)]];
 };
 
 struct fs_in
@@ -43,21 +44,43 @@ struct fs_in
 };
 
 static inline __attribute__((always_inline))
-void gbuffer_write(thread const float3& position, thread const float3& normal, thread const float3& albedo, thread const float& metallic, thread const float& roughness, thread const float3& emissive, thread const float& ao, thread float4& gbuffer_out_position, constant CameraUniforms& _27, thread float4& gbuffer_out_normal, thread float4& gbuffer_out_albedo, thread float4& gbuffer_out_material, thread float4& gbuffer_out_emissive)
+float gbuffer_id_encode(thread const uint& id)
 {
-    gbuffer_out_position = float4(position - _27.u_camera_position.xyz, 1.0);
+    return float(id) / 255.0;
+}
+
+static inline __attribute__((always_inline))
+void gbuffer_write(thread const float3& position, thread const float3& normal, thread const float3& albedo, thread const float& metallic, thread const float& roughness, thread const float3& emissive, thread const float& ao, thread const uint& id, thread float4& gbuffer_out_position, constant CameraUniforms& _50, thread float4& gbuffer_out_normal, thread float4& gbuffer_out_albedo, thread float4& gbuffer_out_material, thread float4& gbuffer_out_emissive, thread float4& gbuffer_out_id)
+{
+    gbuffer_out_position = float4(position - _50.u_camera_position.xyz, 1.0);
     gbuffer_out_normal = float4(normal, 0.0);
     gbuffer_out_albedo = float4(albedo, 1.0);
     gbuffer_out_material = float4(roughness, metallic, fast::clamp(ao, 0.0, 1.0), 1.0);
     gbuffer_out_emissive = float4(emissive, 1.0);
+    uint param = id;
+    gbuffer_out_id = float4(gbuffer_id_encode(param), 0.0, 0.0, 1.0);
 }
 
-fragment fs_out fs(fs_in in [[stage_in]], constant ModelMaterialData& _73 [[buffer(2)]], constant CameraUniforms& _27 [[buffer(3)]], texture2d<float> map_albedo [[texture(0)]], texture2d<float> map_normal [[texture(1)]], texture2d<float> map_roughness [[texture(2)]], texture2d<float> map_metallic [[texture(3)]], texture2d<float> map_ao [[texture(4)]], texture2d<float> map_alpha [[texture(5)]], sampler map_albedoSmplr [[sampler(0)]], sampler map_normalSmplr [[sampler(1)]], sampler map_roughnessSmplr [[sampler(2)]], sampler map_metallicSmplr [[sampler(3)]], sampler map_aoSmplr [[sampler(4)]], sampler map_alphaSmplr [[sampler(5)]], bool gl_FrontFacing [[front_facing]])
+static inline __attribute__((always_inline))
+void gbuffer_write(thread const float3& position, thread const float3& normal, thread const float3& albedo, thread const float& metallic, thread const float& roughness, thread const float3& emissive, thread const float& ao, thread float4& gbuffer_out_position, constant CameraUniforms& _50, thread float4& gbuffer_out_normal, thread float4& gbuffer_out_albedo, thread float4& gbuffer_out_material, thread float4& gbuffer_out_emissive, thread float4& gbuffer_out_id)
+{
+    float3 param = position;
+    float3 param_1 = normal;
+    float3 param_2 = albedo;
+    float param_3 = metallic;
+    float param_4 = roughness;
+    float3 param_5 = emissive;
+    float param_6 = ao;
+    uint param_7 = 1u;
+    gbuffer_write(param, param_1, param_2, param_3, param_4, param_5, param_6, param_7, gbuffer_out_position, _50, gbuffer_out_normal, gbuffer_out_albedo, gbuffer_out_material, gbuffer_out_emissive, gbuffer_out_id);
+}
+
+fragment fs_out fs(fs_in in [[stage_in]], constant ModelMaterialData& _118 [[buffer(2)]], constant CameraUniforms& _50 [[buffer(3)]], texture2d<float> map_albedo [[texture(0)]], texture2d<float> map_normal [[texture(1)]], texture2d<float> map_roughness [[texture(2)]], texture2d<float> map_metallic [[texture(3)]], texture2d<float> map_ao [[texture(4)]], texture2d<float> map_alpha [[texture(5)]], sampler map_albedoSmplr [[sampler(0)]], sampler map_normalSmplr [[sampler(1)]], sampler map_roughnessSmplr [[sampler(2)]], sampler map_metallicSmplr [[sampler(3)]], sampler map_aoSmplr [[sampler(4)]], sampler map_alphaSmplr [[sampler(5)]], bool gl_FrontFacing [[front_facing]])
 {
     fs_out out = {};
-    float2 uv = in.v_uv * _73.u_uv_scale.xy;
-    int flags = int(_73.u_factors.z + 0.5);
-    float3 albedo = _73.u_base_color.xyz;
+    float2 uv = in.v_uv * _118.u_uv_scale.xy;
+    int flags = int(_118.u_factors.z + 0.5);
+    float3 albedo = _118.u_base_color.xyz;
     float alpha = 1.0;
     if ((flags & 1) != 0)
     {
@@ -69,17 +92,17 @@ fragment fs_out fs(fs_in in [[stage_in]], constant ModelMaterialData& _73 [[buff
     {
         alpha = map_alpha.sample(map_alphaSmplr, uv).x;
     }
-    bool _130 = _73.u_base_color.w > 0.0;
-    bool _137;
-    if (_130)
+    bool _174 = _118.u_base_color.w > 0.0;
+    bool _181;
+    if (_174)
     {
-        _137 = alpha < _73.u_base_color.w;
+        _181 = alpha < _118.u_base_color.w;
     }
     else
     {
-        _137 = _130;
+        _181 = _174;
     }
-    if (_137)
+    if (_181)
     {
         discard_fragment();
     }
@@ -97,12 +120,12 @@ fragment fs_out fs(fs_in in [[stage_in]], constant ModelMaterialData& _73 [[buff
         float3 tn = (map_normal.sample(map_normalSmplr, uv).xyz * 2.0) - float3(1.0);
         n = fast::normalize(float3x3(float3(t), float3(b), float3(n)) * tn);
     }
-    float roughness = _73.u_factors.x;
+    float roughness = _118.u_factors.x;
     if ((flags & 4) != 0)
     {
         roughness = map_roughness.sample(map_roughnessSmplr, uv).x;
     }
-    float metallic = _73.u_factors.y;
+    float metallic = _118.u_factors.y;
     if ((flags & 8) != 0)
     {
         metallic = map_metallic.sample(map_metallicSmplr, uv).x;
@@ -119,7 +142,7 @@ fragment fs_out fs(fs_in in [[stage_in]], constant ModelMaterialData& _73 [[buff
     float param_4 = roughness;
     float3 param_5 = float3(0.0);
     float param_6 = ao;
-    gbuffer_write(param, param_1, param_2, param_3, param_4, param_5, param_6, out.gbuffer_out_position, _27, out.gbuffer_out_normal, out.gbuffer_out_albedo, out.gbuffer_out_material, out.gbuffer_out_emissive);
+    gbuffer_write(param, param_1, param_2, param_3, param_4, param_5, param_6, out.gbuffer_out_position, _50, out.gbuffer_out_normal, out.gbuffer_out_albedo, out.gbuffer_out_material, out.gbuffer_out_emissive, out.gbuffer_out_id);
     return out;
 }
 

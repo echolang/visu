@@ -87,20 +87,16 @@ internal function metalPipelineFromPass(
         }
 
         $desc->maxTessellationFactor = $max;
-        $desc->tessellationPartitionMode = mtl::TessellationPartitionMode::pow2;
+        $desc->tessellationPartitionMode = mtlPartitionMode($pass->spacing);
         $desc->tessellationFactorStepFunction = mtl::TessellationFactorStepFunction::perPatch;
         $desc->tessellationOutputWindingOrder = mtl::Winding::counterClockwise;
     }
     uint32 $ci = 0;
     uint32 $colorN = $formats->colorCount;
 
-    if ($colorN == 0) {
-        $desc->colorPixelFormats[] = mtl::PixelFormat::bgra8Unorm;
-    } else {
-        while ($ci < $colorN) {
-            $desc->colorPixelFormats[] = mtlPixelFormat($formats->colors[$ci]);
-            $ci = $ci + 1;
-        }
+    while ($ci < $colorN) {
+        $desc->colorPixelFormats[] = mtlPixelFormat($formats->colors[$ci]);
+        $ci = $ci + 1;
     }
 
     mtlApplyRaster($desc, $pass->raster);
@@ -177,4 +173,14 @@ internal function metalDepthState(Device $device, const Raster& $raster) : mtl::
     }
     $device->depthStates[$key] = $made;
     return $made;
+}
+
+internal function mtlPartitionMode(TessellationSpacing $spacing) : mtl::TessellationPartitionMode
+{
+    return match ($spacing) {
+        TessellationSpacing::pow2 => mtl::TessellationPartitionMode::pow2,
+        TessellationSpacing::integer => mtl::TessellationPartitionMode::integer,
+        TessellationSpacing::fractionalOdd => mtl::TessellationPartitionMode::fractionalOdd,
+        TessellationSpacing::fractionalEven => mtl::TessellationPartitionMode::fractionalEven,
+    };
 }

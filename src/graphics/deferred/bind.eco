@@ -21,6 +21,8 @@ internal function bindPooled(
     return .ok;
 }
 
+internal const uint32 LIGHT_SSAO_SLOT = 12;
+
 internal function readGBuffer(IoSink $io, GBufferData $gbuffer) : void
 {
     $io->reads($gbuffer->position);
@@ -28,6 +30,7 @@ internal function readGBuffer(IoSink $io, GBufferData $gbuffer) : void
     $io->reads($gbuffer->albedo);
     $io->reads($gbuffer->material);
     $io->reads($gbuffer->emissive);
+    $io->reads($gbuffer->id);
 }
 
 internal function readSsao(IoSink $io, Frame $frame) : void
@@ -52,16 +55,33 @@ internal function bindGBuffer(
         $gbuffer->albedo,
         $gbuffer->material,
         $gbuffer->emissive,
+        $gbuffer->id,
     ];
     uint32 $slot = 0;
 
-    while ($slot < 5) {
+    while ($slot < 6) {
         guard bindPooled($ctx, $enc, $slot, $inputs[$slot as usize], $sampler) else ($e) {
             return .error($e);
         }
         $slot = $slot + 1;
     }
 
+    return .ok;
+}
+
+internal function bindShadowOrDummy(
+    RenderContext $ctx,
+    RenderEncoder $enc,
+    DeferredGpu $gpu
+) : status<PipelineError>
+{
+    ShadowMapData? $shadows = $ctx->frame->find<ShadowMapData>();
+    if ($shadows != null) {
+        ShadowMapData $found = guard $shadows;
+        return bindPooled($ctx, $enc, 11, $found->map, $gpu->shadow);
+    }
+
+    $enc->bindTexture(11, $gpu->shadowDummy, $gpu->shadow);
     return .ok;
 }
 
@@ -76,9 +96,9 @@ internal function bindSsaoOrWhite(
 
     if ($ssao != null) {
         SsaoData $found = guard $ssao;
-        return bindPooled($ctx, $enc, 5, $found->blurred, $sampler);
+        return bindPooled($ctx, $enc, LIGHT_SSAO_SLOT, $found->blurred, $sampler);
     }
 
-    $enc->bindTexture(5, $gpu->white, $sampler);
+    $enc->bindTexture(LIGHT_SSAO_SLOT, $gpu->white, $sampler);
     return .ok;
 }

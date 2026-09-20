@@ -273,14 +273,24 @@ internal function vkGenerateMipmaps(Device $device, Texture $texture) : void
 {
     assert($device->logical->handle != 0, 'generateMipmaps before initialize');
     assert(!$device->encoderOpen, 'generateMipmaps with an open encoder');
-    assert($texture->desc->mips > 1, 'generateMipmaps needs mips > 1');
+    if ($texture->desc->mips <= 1) {
+        $texture->state = .shaderRead;
+        return;
+    }
+
     uint32 $needed = TEXTURE_TRANSFER_SRC | TEXTURE_TRANSFER_DST;
     assert(($texture->desc->usage & $needed) == $needed, 'generateMipmaps needs transfer usage');
+
+    // MoltenVK linear blit of a cube or 2D array encodes a null Metal texture.
+    if ($texture->cube() || $texture->layers() > 1) {
+        $texture->state = .shaderRead;
+        return;
+    }
 
     // inside a frame the source mip was written by the frame's own command buffer; the setup buffer would run before it
     if ($device->inFrame) {
         FrameSlot $slot = $device->slots[$device->slot];
-        vkTimestampsOpen($slot, $device->gpuTimeline->scope);
+        vkTimestampsOpen($slot);
         vkRecordMipChain($device->currentCmd(), $texture);
         vkTimestampsClose($slot);
         $texture->state = .shaderRead;

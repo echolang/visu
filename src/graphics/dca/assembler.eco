@@ -33,7 +33,7 @@ public class DrawCallAssembler<P>
      */
     public bool $sortFrontToBack;
     public Device $device;
-    private array<RegisteredMesh> $meshes;
+    private MeshTable $table;
     private array<Submission<P>> $pending;
     private array<Instance<P>> $stream;
     private array<DrawCommand> $commands;
@@ -45,18 +45,29 @@ public class DrawCallAssembler<P>
     private array<uint64> $keys;
     private int32 $culled;
 
+    /**
+     * The instance stream's slice in this frame's ring, uploaded by the first `execute` after
+     * a `build`. A later `execute` without another `build` rebinds that slice.
+     */
+    private TransientSlice $streamSlice;
+    private bool $streamUploaded;
+
     public constructor(Device $device)
     {
         $this->cull = true;
         $this->sortFrontToBack = true;
         $this->device = $device;
-        $this->meshes = array<RegisteredMesh>();
+        $this->table = MeshTable();
         $this->pending = array<Submission<P>>();
         $this->stream = array<Instance<P>>();
         $this->commands = array<DrawCommand>();
         $this->visible = array<uint32>();
         $this->keys = array<uint64>();
         $this->culled = 0;
+        ptr<uint8> $none;
+        $none:$ = null;
+        $this->streamSlice = TransientSlice($none, 0, 0, 0);
+        $this->streamUploaded = false;
     }
 
     /**
@@ -70,9 +81,15 @@ public class DrawCallAssembler<P>
     public function register(Mesh $mesh, int32 $first, int32 $count, const AABB& $bounds) : MeshHandle
     {
         assert($first >= 0 && $count > 0, 'dca: mesh range');
-        int32 $index = $this->meshes->count() as int32;
-        $this->meshes[] = RegisteredMesh($mesh, $first, $count, false, 0, $bounds);
-        return MeshHandle($index);
+        return MeshHandle($this->table->add(RegisteredMesh($mesh, $first, $count, false, 0, $bounds)));
+    }
+
+    /**
+     * Use `$source`'s mesh table. Register on one assembler; others submit with the same handles.
+     */
+    public function shareMeshes(DrawCallAssembler<P> $source) : void
+    {
+        $this->table = $source->table;
     }
 
     /**
@@ -90,9 +107,7 @@ public class DrawCallAssembler<P>
         assert($first >= 0 && $count > 0, 'dca: index range');
         assert($mesh->indices != null, 'dca: indexed range needs an index buffer');
         assert($material >= 0 && $material < 65536, 'dca: material key');
-        int32 $index = $this->meshes->count() as int32;
-        $this->meshes[] = RegisteredMesh($mesh, $first, $count, true, $material, $bounds);
-        return MeshHandle($index);
+        return MeshHandle($this->table->add(RegisteredMesh($mesh, $first, $count, true, $material, $bounds)));
     }
 
     public function submit(
@@ -103,7 +118,7 @@ public class DrawCallAssembler<P>
     ) : void
     {
         assert($mesh->valid(), 'dca: submit needs a registered mesh');
-        assert(($mesh->index as usize) < $this->meshes->count(), 'dca: mesh handle');
+        assert($mesh->index < $this->table->count(), 'dca: mesh handle');
         $this->pending[] = Submission<P>($mesh->index, $model, $payload, $sortBias);
     }
 
@@ -116,12 +131,13 @@ public class DrawCallAssembler<P>
         $this->stream->clear();
         $this->commands->clear();
         $this->culled = 0;
+        $this->streamUploaded = false;
     }
 
     public function clearMeshes() : void
     {
         $this->clearInstances();
-        $this->meshes->clear();
+        $this->table->clear();
     }
 
     /**
@@ -133,6 +149,7 @@ public class DrawCallAssembler<P>
         $this->stream->clear();
         $this->commands->clear();
         $this->culled = 0;
+        $this->streamUploaded = false;
         usize $n = $this->pending->count();
 
         if ($n == 0) {
@@ -147,7 +164,7 @@ public class DrawCallAssembler<P>
 
         while ($i < $n) {
             Submission<P> $sub = $this->pending[$i];
-            RegisteredMesh $mesh = $this->meshes[$sub->mesh as usize];
+            RegisteredMesh $mesh = $this->table->get($sub->mesh);
             Vec3 $centre = worldPoint($sub->model, $mesh->centre);
             // one key per submission, culled included: sortByKey looks them up by submission index, not by position in $visible
             $this->keys[] = sortKey($mesh->material, $sub->mesh, $this->depthBucket($centre, $cameraPosition, $sub->sortBias));
@@ -205,14 +222,20 @@ public class DrawCallAssembler<P>
     private function record(RenderEncoder $enc, function<void(RenderEncoder, int32)>? $bind) : void
     {
         uint64 $stride = mem::size<Instance<P>>() as uint64;
-        uint64 $bytes = ($this->stream->count() as uint64) * $stride;
-        TransientSlice $slice = $this->device->allocTransient($bytes, 16);
-        ptr<const uint8> $src = ptr<const uint8>(&$this->stream[0]);
-        mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $bytes);
+        if (!$this->streamUploaded) {
+            uint64 $bytes = ($this->stream->count() as uint64) * $stride;
+            TransientSlice $fresh = $this->device->allocTransient($bytes, 16);
+            ptr<const uint8> $src = ptr<const uint8>(&$this->stream[0]);
+            mem::copy<uint8>(ptr<uint8>($fresh->data:$), ptr<uint8>($src:$), $bytes);
+            $this->streamSlice = $fresh;
+            $this->streamUploaded = true;
+        }
+
+        TransientSlice $slice = $this->streamSlice;
         int32 $material = -1;
 
         foreach ($this->commands as $command) {
-            RegisteredMesh $mesh = $this->meshes[$command->mesh as usize];
+            RegisteredMesh $mesh = $this->table->get($command->mesh);
 
             if ($bind != null && $command->material != $material) {
                 function<void(RenderEncoder, int32)> $fn = guard $bind;
@@ -256,7 +279,7 @@ public class DrawCallAssembler<P>
 
     public const function meshCount() : int32
     {
-        return $this->meshes->count() as int32;
+        return $this->table->count();
     }
 
     public const function pendingCount() : int32
@@ -298,7 +321,7 @@ public class DrawCallAssembler<P>
                 $i = $i + 1;
             }
 
-            RegisteredMesh $mesh = $this->meshes[$base->mesh as usize];
+            RegisteredMesh $mesh = $this->table->get($base->mesh);
             $this->commands[] = DrawCommand(
                 $base->mesh,
                 $mesh->material,

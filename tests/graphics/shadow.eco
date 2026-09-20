@@ -1,0 +1,163 @@
+/**
+ * Cascade split math, lookAt placement, and texel snap.
+ */
+
+use visu::geo::Transform;
+use visu::graphics::{
+    Camera, CameraData, DirectionalLight, LightUniforms, SHADOW_CASCADES, ShadowCascade, ShadowQuality,
+    shadowCascadeFars, shadowCascades, shadowSplitsIncrease
+};
+use visu::math::{Mat4, Vec3, Vec4, equal, radians};
+
+function testView() : CameraData
+{
+    Camera $lens = Camera(.perspective);
+    $lens->fov = 60.0f;
+    $lens->near = 0.5f;
+    $lens->far = 800.0f;
+    Transform $pose = Transform();
+    $pose->position = Vec3(0.0f, 10.0f, 20.0f);
+    return $lens->data($pose->mix(0.0f), 1280, 720, 1.0f, 1.0f, 0.0f);
+}
+
+test light_uniforms_std140_size
+{
+    assert(mem::size<LightUniforms>() == 400, '3 vec4 + 5 mat4 + 2 vec4');
+}
+
+test shadow_quality_defaults
+{
+    ShadowQuality $q = ShadowQuality();
+    assert($q->resolution == 2048, 'default is medium');
+    assert($q->lambda == 0.99f, 'lambda');
+    assert($q->maxLength == 16000.0f, 'max length');
+    assert($q->longShadow == 1024.0f, 'long shadows');
+    assert($q->stabilize, 'snap on');
+    assert(!$q->debug, 'tint off');
+    ShadowQuality $m = ShadowQuality::medium();
+    assert($m->resolution == 2048, 'medium');
+    ShadowQuality $h = ShadowQuality::high();
+    assert($h->resolution == 4096, 'high');
+    assert($q->splits->empty(), 'formula until splits are set');
+}
+
+test shadow_splits_must_increase_past_near
+{
+    ShadowQuality $q = ShadowQuality();
+    $q->near = 0.5f;
+    array<float32> $ok = [10.0f, 40.0f, 100.0f, 200.0f, 400.0f];
+    assert(shadowSplitsIncrease($ok, $q->near), 'increasing');
+    array<float32> $backwards = [100.0f, 50.0f, 20.0f, 10.0f, 5.0f];
+    assert(!shadowSplitsIncrease($backwards, $q->near), 'backwards');
+    array<float32> $onNear = [0.5f, 10.0f, 20.0f, 40.0f, 80.0f];
+    assert(!shadowSplitsIncrease($onNear, $q->near), 'equal to near');
+}
+
+test shadow_explicit_splits_are_the_far_planes
+{
+    CameraData $view = testView();
+    DirectionalLight $sun = DirectionalLight(Vec3(0.0f, -1.0f, 0.2f), Vec3(1.0f, 1.0f, 1.0f), 1.0f);
+    ShadowQuality $q = ShadowQuality();
+    $q->resolution = 256;
+    $q->near = 0.5f;
+    array<float32> $splits = [10.0f, 40.0f, 100.0f, 200.0f, 400.0f];
+    $q->splits = $splits;
+    float32[5] $fars = shadowCascadeFars($q);
+    assert(equal($fars[0], 10.0f), 'first');
+    assert(equal($fars[4], 400.0f), 'last');
+    ShadowCascade[5] $cascades = shadowCascades($view, $sun, $q);
+    assert($cascades[0]->nearViewZ == -$q->near, 'first slice starts at the near plane');
+    assert(equal($cascades[0]->splitViewZ, -10.0f), 'first far');
+    assert(equal($cascades[1]->nearViewZ, -10.0f), 'second near');
+    assert(equal($cascades[4]->splitViewZ, -400.0f), 'last far');
+}
+
+test shadow_cascades_are_five_and_indexed
+{
+    CameraData $view = testView();
+    DirectionalLight $sun = DirectionalLight(Vec3(0.0f, -1.0f, 0.2f), Vec3(1.0f, 1.0f, 1.0f), 1.0f);
+    ShadowQuality $q = ShadowQuality();
+    $q->resolution = 256;
+    $q->maxLength = 400.0f;
+    $q->near = 0.5f;
+    ShadowCascade[5] $cascades = shadowCascades($view, $sun, $q);
+    int32 $i = 0;
+    while ($i < SHADOW_CASCADES) {
+        assert($cascades[$i]->index == $i, 'index');
+        $i = $i + 1;
+    }
+}
+
+test shadow_splits_go_farther
+{
+    CameraData $view = testView();
+    DirectionalLight $sun = DirectionalLight(Vec3(0.0f, -1.0f, 0.2f), Vec3(1.0f, 1.0f, 1.0f), 1.0f);
+    ShadowQuality $q = ShadowQuality();
+    $q->resolution = 256;
+    $q->maxLength = 400.0f;
+    $q->near = 0.5f;
+    ShadowCascade[5] $cascades = shadowCascades($view, $sun, $q);
+    assert($cascades[0]->nearViewZ == -$q->near, 'first slice starts at the near plane');
+    int32 $i = 1;
+    while ($i < SHADOW_CASCADES) {
+        float32 $prev = $cascades[$i - 1]->splitViewZ;
+        float32 $cur = $cascades[$i]->splitViewZ;
+        assert($cur < $prev, 'more negative is farther');
+        assert($cascades[$i]->nearViewZ == $prev, 'slices chain without gaps');
+        $i = $i + 1;
+    }
+}
+
+test shadow_eye_sits_on_the_sun_side
+{
+    CameraData $view = testView();
+    DirectionalLight $sun = DirectionalLight(Vec3(0.0f, -1.0f, 0.0f), Vec3(1.0f, 1.0f, 1.0f), 1.0f);
+    ShadowQuality $q = ShadowQuality();
+    $q->resolution = 256;
+    $q->maxLength = 200.0f;
+    $q->near = 0.5f;
+    $q->longShadow = 0.0f;
+    ShadowCascade[5] $cascades = shadowCascades($view, $sun, $q);
+    Vec4 $eye = $cascades[0]->uniforms->position;
+    // light travels down, so the shadow camera looks from above the slice
+    assert($eye->y > $view->position->y - 50.0f, 'eye not under the ground');
+}
+
+test shadow_stabilize_changes_only_translation
+{
+    CameraData $view = testView();
+    DirectionalLight $sun = DirectionalLight(Vec3(0.4f, -1.0f, 0.2f), Vec3(1.0f, 1.0f, 1.0f), 1.0f);
+    ShadowQuality $on = ShadowQuality();
+    $on->resolution = 256;
+    $on->maxLength = 200.0f;
+    $on->near = 0.5f;
+    $on->stabilize = true;
+    ShadowQuality $off = ShadowQuality();
+    $off->resolution = 256;
+    $off->maxLength = 200.0f;
+    $off->near = 0.5f;
+    $off->stabilize = false;
+    ShadowCascade[5] $a = shadowCascades($view, $sun, $on);
+    ShadowCascade[5] $b = shadowCascades($view, $sun, $off);
+    Mat4 $snapped = $a[0]->uniforms->projection;
+    Mat4 $raw = $b[0]->uniforms->projection;
+    assert($snapped->c0 == $raw->c0, 'c0');
+    assert($snapped->c1 == $raw->c1, 'c1');
+    assert($snapped->c2 == $raw->c2, 'c2');
+}
+
+test shadow_fov_extract_matches_lens
+{
+    Camera $lens = Camera(.perspective);
+    $lens->fov = 60.0f;
+    Transform $pose = Transform();
+    CameraData $data = $lens->data($pose->mix(0.0f), 1280, 720, 1.0f, 1.0f, 0.0f);
+    float32 $got = 2.0f * (std::math::atan(1.0f / $data->projection->c1->y) as float32);
+    float32 $want = radians(60.0f);
+    float32 $delta = $got - $want;
+    if ($delta < 0.0f) {
+        $delta = -$delta;
+    }
+
+    assert($delta < 0.0001f, 'fov from c1.y');
+}

@@ -1,8 +1,9 @@
 /**
  * Snapshots every `Camera` + `Transform` and publishes `CameraData` from the `ActiveCamera`.
- * Controllers (`FlyingCamera`, `OrbitCamera`) are separate systems that join on the same marker.
+ * Controllers (`FlyingCamera`, `OrbitCamera`, `RtsCamera`) are separate systems that join on the same marker.
  * An entity with only `Camera` + `Transform` is static or scripted; this system still publishes it, and does not move it.
  * A `CameraOverrideData` frame fact (DCapture) replaces the pose and optionally the fov for that frame; the Transform stays untouched.
+ * `camera freeze` keeps the cull matrices on that pose while the entity (and the render matrices) keep moving.
  *
  * Bind this before any system that reads `CameraData`, and before the controllers so the snapshot lands before they move.
  */
@@ -16,11 +17,19 @@ use visu::graphics::{
     BackbufferData, Camera, CameraData, CameraOverrideData, RenderContext, SceneTargetData, TargetRef
 };
 use visu::math::Vec3;
+use visu::runtime::DebugConsole;
 
 public class CameraSystem : System
 {
+    private bool $frozen;
+    private Pose? $frozenPose;
+    private Camera? $frozenLens;
+
     public constructor()
     {
+        $this->frozen = false;
+        $this->frozenPose = null;
+        $this->frozenLens = null;
     }
 
     public function register(Entities $entities) : void
@@ -72,14 +81,75 @@ public class CameraSystem : System
             }
         }
 
-        $ctx->frame->set($lens->data(
+        CameraData $live = $lens->data(
             $pose,
             $target->width,
             $target->height,
             $target->contentScaleX,
             $target->contentScaleY,
             $ctx->compensation
-        ));
+        );
+        if (!$this->frozen) {
+            $ctx->frame->set($live);
+            return;
+        }
+
+        Pose? $heldPose = $this->frozenPose;
+        Camera? $heldLens = $this->frozenLens;
+        if ($heldPose == null || $heldLens == null) {
+            $this->frozenPose = $pose;
+            $this->frozenLens = $lens;
+            $heldPose = $pose;
+            $heldLens = $lens;
+        }
+
+        Pose $fp = guard $heldPose;
+        Camera $fl = guard $heldLens;
+        CameraData $cull = $fl->data(
+            $fp,
+            $target->width,
+            $target->height,
+            $target->contentScaleX,
+            $target->contentScaleY,
+            $ctx->compensation
+        );
+        $ctx->frame->set($live->withCullFrom($cull));
+    }
+
+    /**
+     * Pin or release the cull camera. The Transform keeps moving; the next render copies the
+     * pose that would have been published.
+     */
+    public function setFrozen(bool $on) : void
+    {
+        $this->frozen = $on;
+        if (!$on) {
+            $this->frozenPose = null;
+            $this->frozenLens = null;
+        }
+    }
+
+    public const function frozen() : bool
+    {
+        return $this->frozen;
+    }
+
+    internal function printStatus(DebugConsole $console) : void
+    {
+        if (!$this->frozen) {
+            $console->writeLine('camera: freeze off');
+            return;
+        }
+
+        Pose? $held = $this->frozenPose;
+        if ($held == null) {
+            $console->writeLine('camera: freeze on');
+            return;
+        }
+
+        Pose $pose = guard $held;
+        Vec3 $eye = $pose->position;
+        $console->writeLine("camera: freeze on, eye {$eye->x:.1f} {$eye->y:.1f} {$eye->z:.1f}");
     }
 
     private const function target(RenderContext $ctx) : TargetRef

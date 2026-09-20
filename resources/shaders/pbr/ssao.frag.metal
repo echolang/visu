@@ -35,12 +35,24 @@ struct fs_in
 };
 
 static inline __attribute__((always_inline))
+uint gbuffer_id_decode(thread const float& t)
+{
+    return uint((t * 255.0) + 0.5);
+}
+
+static inline __attribute__((always_inline))
 float2 uv_from_ndc(thread const float2& ndc)
 {
     return float2((ndc.x * 0.5) + 0.5, 0.5 - (ndc.y * 0.5));
 }
 
-fragment fs_out fs(fs_in in [[stage_in]], constant SsaoUniforms& _57 [[buffer(2)]], constant CameraUniforms& _101 [[buffer(3)]], texture2d<float> gbuffer_position [[texture(0)]], texture2d<float> gbuffer_normal [[texture(1)]], texture2d<float> noise_texture [[texture(2)]], sampler gbuffer_positionSmplr [[sampler(0)]], sampler gbuffer_normalSmplr [[sampler(1)]], sampler noise_textureSmplr [[sampler(2)]])
+static inline __attribute__((always_inline))
+bool gbuffer_id_soft_ao(thread const uint& id)
+{
+    return (id == 3u) || (id == 4u);
+}
+
+fragment fs_out fs(fs_in in [[stage_in]], constant SsaoUniforms& _81 [[buffer(2)]], constant CameraUniforms& _133 [[buffer(3)]], texture2d<float> gbuffer_position [[texture(0)]], texture2d<float> gbuffer_normal [[texture(1)]], texture2d<float> noise_texture [[texture(2)]], texture2d<float> gbuffer_id [[texture(3)]], sampler gbuffer_positionSmplr [[sampler(0)]], sampler gbuffer_normalSmplr [[sampler(1)]], sampler noise_textureSmplr [[sampler(2)]], sampler gbuffer_idSmplr [[sampler(3)]])
 {
     fs_out out = {};
     float4 P = gbuffer_position.sample(gbuffer_positionSmplr, in.v_uv);
@@ -49,46 +61,62 @@ fragment fs_out fs(fs_in in [[stage_in]], constant SsaoUniforms& _57 [[buffer(2)
         out.frag_ao = 1.0;
         return out;
     }
-    float radius = _57.u_params.x;
+    float radius = _81.u_params.x;
     float quant = length(P.xyz) * 0.00390625;
-    float bias0 = fast::max(_57.u_params.y * radius, quant);
+    float bias0 = fast::max(_81.u_params.y * radius, quant);
     float fade = 1.0 - smoothstep(0.4000000059604644775390625, 1.0, bias0 / fast::max(radius, 9.9999997473787516355514526367188e-06));
-    float strength = _57.u_params.z;
+    float strength = _81.u_params.z;
     if (fade <= 0.0)
     {
         out.frag_ao = 1.0;
         return out;
     }
-    float3 view_pos = float3x3(_101.u_view[0].xyz, _101.u_view[1].xyz, _101.u_view[2].xyz) * P.xyz;
-    float3 view_normal = fast::normalize(float3x3(_101.u_view[0].xyz, _101.u_view[1].xyz, _101.u_view[2].xyz) * gbuffer_normal.sample(gbuffer_normalSmplr, in.v_uv).xyz);
-    float3 _noise = fast::normalize((noise_texture.sample(noise_textureSmplr, (in.v_uv * _57.u_screen.zw)).xyz * 2.0) - float3(1.0));
+    float param = gbuffer_id.sample(gbuffer_idSmplr, in.v_uv).x;
+    uint centre_id = gbuffer_id_decode(param);
+    float3 view_pos = float3x3(_133.u_view[0].xyz, _133.u_view[1].xyz, _133.u_view[2].xyz) * P.xyz;
+    float3 view_normal = fast::normalize(float3x3(_133.u_view[0].xyz, _133.u_view[1].xyz, _133.u_view[2].xyz) * gbuffer_normal.sample(gbuffer_normalSmplr, in.v_uv).xyz);
+    float3 _noise = fast::normalize((noise_texture.sample(noise_textureSmplr, (in.v_uv * _81.u_screen.zw)).xyz * 2.0) - float3(1.0));
     float3 tangent = fast::normalize(_noise - (view_normal * dot(_noise, view_normal)));
     float3 bitangent = cross(view_normal, tangent);
     float3x3 TBN = float3x3(float3(tangent), float3(bitangent), float3(view_normal));
-    int count = int(_57.u_params.w);
+    int count = int(_81.u_params.w);
     float occlusion = 0.0;
     for (int i = 0; i < count; i++)
     {
-        float3 sample_view = view_pos + ((TBN * _57.u_samples[i].xyz) * radius);
-        float4 clip = _101.u_projection * float4(sample_view, 1.0);
+        float3 sample_view = view_pos + ((TBN * _81.u_samples[i].xyz) * radius);
+        float4 clip = _133.u_projection * float4(sample_view, 1.0);
         if (clip.w <= 0.0)
         {
             continue;
         }
-        float2 param = clip.xy / float2(clip.w);
-        float4 occluder = gbuffer_position.sample(gbuffer_positionSmplr, uv_from_ndc(param));
+        float2 param_1 = clip.xy / float2(clip.w);
+        float2 occluder_uv = uv_from_ndc(param_1);
+        float4 occluder = gbuffer_position.sample(gbuffer_positionSmplr, occluder_uv);
         if (occluder.w < 0.5)
         {
             continue;
         }
-        float occluder_z = (float3x3(_101.u_view[0].xyz, _101.u_view[1].xyz, _101.u_view[2].xyz) * occluder.xyz).z;
+        float occluder_z = (float3x3(_133.u_view[0].xyz, _133.u_view[1].xyz, _133.u_view[2].xyz) * occluder.xyz).z;
         if (occluder_z >= (sample_view.z + bias0))
         {
-            occlusion += smoothstep(0.0, 1.0, radius / abs(view_pos.z - occluder_z));
+            float param_2 = gbuffer_id.sample(gbuffer_idSmplr, occluder_uv).x;
+            uint oid = gbuffer_id_decode(param_2);
+            float weight = 1.0;
+            uint param_3 = oid;
+            if (gbuffer_id_soft_ao(param_3))
+            {
+                weight = 0.1500000059604644775390625;
+            }
+            occlusion += (weight * smoothstep(0.0, 1.0, radius / abs(view_pos.z - occluder_z)));
         }
     }
     float ao = 1.0 - (occlusion / float(count));
     ao = mix(1.0, ao, fade);
+    uint param_4 = centre_id;
+    if (gbuffer_id_soft_ao(param_4))
+    {
+        ao = mix(1.0, ao, 0.3499999940395355224609375);
+    }
     out.frag_ao = pow(fast::clamp(ao, 0.0, 1.0), strength);
     return out;
 }

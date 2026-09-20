@@ -1,0 +1,89 @@
+/**
+ * HUD GPU busy time is the union of stage intervals. A hole between encoders is idle.
+ */
+
+use visu::graphics::{GpuInterval, gpuBusyNs, gpuExclusiveInsert, twoIntervalBusy};
+
+test gpu_busy_empty_is_zero
+{
+    array<GpuInterval> $none = array<GpuInterval>();
+    assert(gpuBusyNs($none) == 0.0, 'empty');
+}
+
+test gpu_busy_one_interval
+{
+    array<GpuInterval> $xs = array<GpuInterval>();
+    GpuInterval $a = GpuInterval();
+    $a->lo = 10.0;
+    $a->hi = 40.0;
+    $xs[] = $a;
+    assert(gpuBusyNs($xs) == 30.0, 'one');
+}
+
+test gpu_busy_overlap_does_not_double_count
+{
+    array<GpuInterval> $xs = array<GpuInterval>();
+    GpuInterval $a = GpuInterval();
+    $a->lo = 0.0;
+    $a->hi = 10.0;
+    GpuInterval $b = GpuInterval();
+    $b->lo = 5.0;
+    $b->hi = 12.0;
+    $xs[] = $a;
+    $xs[] = $b;
+    assert(gpuBusyNs($xs) == 12.0, 'overlap folds');
+}
+
+test gpu_busy_gap_is_not_occupancy
+{
+    array<GpuInterval> $xs = array<GpuInterval>();
+    GpuInterval $a = GpuInterval();
+    $a->lo = 0.0;
+    $a->hi = 10.0;
+    GpuInterval $b = GpuInterval();
+    $b->lo = 40.0;
+    $b->hi = 50.0;
+    $xs[] = $a;
+    $xs[] = $b;
+    assert(gpuBusyNs($xs) == 20.0, 'gap is idle');
+}
+
+test two_interval_busy_hole_is_not_occupancy
+{
+    // blit vertex 1..2, fragment 5..6: 2 ns of work, 4 ns of occupancy
+    assert(twoIntervalBusy(1.0, 2.0, 5.0, 6.0) == 2.0, 'hole is idle');
+}
+
+test two_interval_busy_overlap_folds
+{
+    assert(twoIntervalBusy(0.0, 3.0, 1.0, 4.0) == 4.0, 'overlap');
+}
+
+test two_interval_busy_one_stage
+{
+    assert(twoIntervalBusy(0.0, 2.0, 0.0, 0.0) == 2.0, 'vertex only');
+    assert(twoIntervalBusy(0.0, 0.0, 5.0, 8.0) == 3.0, 'fragment only');
+}
+
+test gpu_exclusive_nested_is_zero
+{
+    array<GpuInterval> $u = array<GpuInterval>();
+    assert(gpuExclusiveInsert($u, 0.0, 5.0) == 5.0, 'first occupies');
+    assert(gpuExclusiveInsert($u, 0.0, 5.0) == 0.0, 'same window is nested');
+    assert(gpuExclusiveInsert($u, 1.0, 4.0) == 0.0, 'inside is nested');
+    assert(gpuExclusiveInsert($u, 4.0, 7.0) == 2.0, 'only the tail');
+}
+
+test gpu_busy_touching_merges
+{
+    array<GpuInterval> $xs = array<GpuInterval>();
+    GpuInterval $a = GpuInterval();
+    $a->lo = 0.0;
+    $a->hi = 10.0;
+    GpuInterval $b = GpuInterval();
+    $b->lo = 10.0;
+    $b->hi = 25.0;
+    $xs[] = $b;
+    $xs[] = $a;
+    assert(gpuBusyNs($xs) == 25.0, 'touching');
+}

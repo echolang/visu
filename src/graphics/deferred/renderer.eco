@@ -48,12 +48,21 @@ public class DeferredRenderer
     public IblQuality $ibl;
 
     /**
+     * Null quality means off. Default is off so existing scenes stay unshadowed
+     * until they opt in.
+     */
+    public ShadowQuality? $shadows;
+
+    /**
      * `.scene` runs light + skybox. Any other case skips shading and blits that buffer.
      */
     public DeferredView $view;
     public Device $device;
     private DeferredGpu? $gpu;
     private Environment? $environment;
+    private Texture? $shadowMap;
+    private array<RetiredShadow> $retiredShadows;
+    private array<ShadowCaster> $casters;
 
     public constructor(Device $device)
     {
@@ -65,10 +74,14 @@ public class DeferredRenderer
         $this->renderSkybox = true;
         $this->ssao = SsaoQuality::ultra();
         $this->ibl = IblQuality();
+        $this->shadows = null;
         $this->view = .scene;
         $this->device = $device;
         $this->gpu = null;
         $this->environment = null;
+        $this->shadowMap = null;
+        $this->retiredShadows = arr::room<RetiredShadow>(4);
+        $this->casters = arr::room<ShadowCaster>(4);
     }
 
     /**
@@ -163,8 +176,9 @@ public class DeferredRenderer
     }
 
     /**
-     * Adds the deferred passes for this frame. `$fill` runs between the GBuffer allocation and the shading pass;
-     * add the geometry passes there, writing `$gbuffer->target`.
+     * Adds the deferred passes for this frame. `$fill` runs after GBuffer allocation (and after
+     * `ShadowMapData` is on the frame when shadows are on) so geometry systems can submit
+     * independently to the GBuffer and to the shadow mailbox.
      */
     public function render(
         RenderContext $ctx,
@@ -200,9 +214,23 @@ public class DeferredRenderer
         Pipeline $pipeline = $ctx->pipeline;
         $pipeline->add(GBufferPass($gpu->camera, $output->width, $output->height));
         GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
-        $fill($ctx, $gbuffer);
 
         DeferredView $view = $this->view;
+        if ($view->isScene()) {
+            ShadowQuality? $shadows = $this->shadows;
+            if ($shadows != null && $ctx->frame->find<CameraData>() != null) {
+                ShadowQuality $quality = guard $shadows;
+                $pipeline->add(ShadowMapPass(
+                    $this->ensureShadowMap($quality),
+                    $this->sun,
+                    $quality,
+                    $this->casters
+                ));
+            }
+        }
+
+        $fill($ctx, $gbuffer);
+
         bool $runSsao = $this->ssao != null && ($view->isScene() || $view->needsSsao());
 
         if ($runSsao) {
@@ -258,7 +286,7 @@ public class DeferredRenderer
             },
             execute: function(RenderContext $pass) : status<PipelineError> {
                 CameraData $camera = $pass->frame->get<CameraData>();
-                $assembler->build($camera->frustum, $camera->position);
+                $assembler->build($camera->cullFrustum, $camera->cullPosition);
 
                 if ($assembler->commandCount() == 0) {
                     return .ok;
@@ -305,6 +333,74 @@ public class DeferredRenderer
         $gpu->camera->bind($enc);
     }
 
+    /**
+     * Depth-only pass casters bind. Same vertex layout as the GBuffer model program.
+     */
+    public function shadowPass(const VertexLayout& $layout) : GpuPass
+    {
+        assert($this->gpu != null, 'DeferredRenderer.shadowPass before load');
+        DeferredGpu $gpu = guard $this->gpu;
+        ShaderProgram $program = guard $gpu->shaders->program('shadow');
+        return GpuPass($program, $layout, Raster::depth());
+    }
+
+    private function ensureShadowMap(ShadowQuality $quality) : Texture
+    {
+        $this->flushRetiredShadows();
+        Texture $have = guard $this->shadowMap else {
+            Texture $fresh = makeShadowMap($this->device, $quality);
+            $this->shadowMap = $fresh;
+            return $fresh;
+        }
+        if ($have->desc->width == $quality->resolution
+            && $have->desc->height == $quality->resolution
+            && $have->desc->arrayLength == SHADOW_CASCADES) {
+            return $have;
+        }
+
+        $this->retiredShadows[] = RetiredShadow($have, $this->device->frameIndex());
+        Texture $resized = makeShadowMap($this->device, $quality);
+        $this->shadowMap = $resized;
+        return $resized;
+    }
+
+    private function flushRetiredShadows() : void
+    {
+        usize $n = $this->retiredShadows->count();
+        if ($n == 0) {
+            return;
+        }
+
+        uint64 $now = $this->device->frameIndex();
+        usize $keep = 0;
+        usize $i = 0;
+        while ($i < $n) {
+            RetiredShadow $item = $this->retiredShadows[$i];
+            if ($now <= $item->frame + (FRAMES_IN_FLIGHT as uint64)) {
+                if ($keep != $i) {
+                    $this->retiredShadows[$keep] = $item;
+                }
+
+                $keep = $keep + 1;
+            } else {
+                $item->tex->destroy();
+            }
+
+            $i = $i + 1;
+        }
+
+        $this->retiredShadows->truncate($keep);
+    }
+
+    private function dropRetiredShadows() : void
+    {
+        foreach ($this->retiredShadows as $item) {
+            $item->tex->destroy();
+        }
+
+        $this->retiredShadows->clear();
+    }
+
     private function dropEnvironment() : void
     {
         Environment $env = guard $this->environment else {
@@ -317,10 +413,31 @@ public class DeferredRenderer
     public function destroy() : void
     {
         $this->dropEnvironment();
+        $this->dropRetiredShadows();
+        $this->shadowMap = dropTexture($this->shadowMap);
         DeferredGpu $gpu = guard $this->gpu else {
             return;
         }
         $gpu->destroy();
         $this->gpu = null;
     }
+}
+
+internal struct RetiredShadow
+{
+    public Texture $tex;
+    public uint64 $frame;
+}
+
+internal function makeShadowMap(Device $device, ShadowQuality $quality) : Texture
+{
+    TextureDesc $desc = TextureDesc(
+        $format: .depth32f,
+        $width: $quality->resolution,
+        $height: $quality->resolution
+    );
+    $desc->kind = .array2D;
+    $desc->arrayLength = SHADOW_CASCADES;
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET;
+    return Texture($device, 'deferred.shadow', $desc);
 }

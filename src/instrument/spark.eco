@@ -16,6 +16,11 @@ internal const float32 HUD_PAD = 6.0f;
 internal const int32 SPARK_W = 256;
 internal const int32 SPARK_ATLAS_W = 2048;
 internal const int32 SPARK_H = 18;
+/**
+ * Y-axis for UT / FT / RT / GPU sparklines. Ring-max scaling turns 0.8 ms of noise into a
+ * full-height orange/green tooth once the real work is stable.
+ */
+internal const float32 HUD_TIME_BUDGET_NS = 16666667.0f;
 internal const float32 SPARK_GAP = 4.0f;
 internal const string HUD_SEP = ' | ';
 internal const float32 TAB_GAP = 8.0f;
@@ -38,6 +43,7 @@ internal struct SparkSlot
     public float32 $w = 0.0f;
     public float32 $colW = 0.0f;
     public bool $higherWorse = true;
+    public float32 $axisMax = 0.0f;
 }
 
 internal function sparkStripOrigin() : Vec2
@@ -84,7 +90,8 @@ internal function rasterizeSpark(
     bool $higherWorse = true,
     bool $clear = true,
     int32 $x0 = 0,
-    int32 $drawW = 0
+    int32 $drawW = 0,
+    float32 $axisMax = 0.0f
 ) : void
 {
     if ($clear) {
@@ -135,11 +142,20 @@ internal function rasterizeSpark(
         }
     }
 
+    if ($axisMax > 0.0f) {
+        $max = $axisMax;
+    }
+
     if ($max <= 0.0f) {
         return;
     }
 
     float32 $avg = $sum / ($count as float32);
+    float32 $tintRef = $avg;
+
+    if ($axisMax > 0.0f) {
+        $tintRef = $axisMax;
+    }
     int32 $h1 = $height - 1;
     usize $skip = 0;
 
@@ -172,7 +188,7 @@ internal function rasterizeSpark(
             continue;
         }
 
-        SparkRgba $c = sparkTint($v, $avg, $higherWorse);
+        SparkRgba $c = sparkTint($v, $tintRef, $higherWorse);
         usize $idx = (($y * $stride + $x) * 4) as usize;
 
         if ($idx + 3 >= $n) {

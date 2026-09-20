@@ -159,6 +159,57 @@ public struct DepthTarget
     public LoadOp $load = .load;
     public StoreOp $store = .store;
     public float32 $clearDepth = 1.0f;
+
+    /**
+     * Array slice. A cube face is a slice.
+     */
+    public int32 $face = 0;
+    public int32 $mip = 0;
+
+    public constructor(Texture $texture)
+    {
+        $this->texture = $texture;
+        $this->load = .load;
+        $this->store = .store;
+        $this->clearDepth = 1.0f;
+        $this->face = 0;
+        $this->mip = 0;
+    }
+
+    /**
+     * Depth target that writes one face and mip of a cube or array texture.
+     */
+    public constructor(Texture $texture, face: int32 $face, int32 $mip = 0)
+    {
+        $this->texture = $texture;
+        $this->load = .load;
+        $this->store = .store;
+        $this->clearDepth = 1.0f;
+        $this->face = $face;
+        $this->mip = $mip;
+    }
+
+    /**
+     * Pixel width of the mip this target writes, not of mip 0.
+     */
+    public const function width() : int32
+    {
+        return mipSize($this->texture->desc->width, $this->mip);
+    }
+
+    public const function height() : int32
+    {
+        return mipSize($this->texture->desc->height, $this->mip);
+    }
+
+    /**
+     * Assert the face and mip exist. The fields are public and can be set after construct.
+     */
+    public const function validate() : void
+    {
+        assert($this->face >= 0 && $this->face < $this->texture->layers(), 'beginRender depth face');
+        assert($this->mip >= 0 && $this->mip < $this->texture->desc->mips, 'beginRender depth mip');
+    }
 }
 
 public struct RenderPassDesc
@@ -229,6 +280,8 @@ public struct DeviceLimits
     public bool $vertexTextures = false;
     public int32 $maxTessellationFactor = 0;
     public uint64 $tessFactorAlign = 256;
+    // false on MoltenVK: layered vkCmdBlitImage segfaults, so cubes and 2D arrays stay one mip
+    public bool $layeredMipgen = true;
 }
 
 public enum AdapterKind

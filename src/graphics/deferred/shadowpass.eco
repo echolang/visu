@@ -1,0 +1,72 @@
+/**
+ * Renders each cascade into one layer of a depth array, then the light pass samples it.
+ * Casters prepare draw lists once, then draw into an already-open encoder per cascade.
+ */
+
+namespace visu::graphics;
+
+public class ShadowMapPass : Pass
+{
+    private Texture $map;
+    private DirectionalLight $sun;
+    private ShadowQuality $quality;
+    private array<ShadowCaster> $casters;
+
+    public constructor(
+        Texture $map,
+        DirectionalLight $sun,
+        ShadowQuality $quality,
+        array<ShadowCaster> $casters
+    )
+    {
+        $this->map = $map;
+        $this->sun = $sun;
+        $this->quality = $quality;
+        $this->casters = $casters;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.shadow';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        CameraData $camera = $frame->get<CameraData>();
+        ShadowCascade[5] $cascades = shadowCascades($camera, $this->sun, $this->quality);
+        TextureRef $ref = $pipeline->importTexture('shadow.map', $this->map);
+        $this->casters->clear();
+        $frame->set(ShadowMapData($ref, $cascades, $this->quality->debug, $this->casters));
+        $io->writes($ref);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        ShadowMapData $data = $ctx->frame->get<ShadowMapData>();
+        Device $device = $ctx->device;
+        Texture $map = $this->map;
+        array<ShadowCaster> $casters = $data->casters;
+        int32 $i = 0;
+        while ($i < SHADOW_CASCADES) {
+            ShadowCascade $cascade = $data->cascades[$i];
+            DepthTarget $depth = DepthTarget($map, face: $cascade->index);
+            $depth->load = .clear;
+            $depth->store = .store;
+            $depth->clearDepth = 1.0f;
+            RenderPassDesc $desc = RenderPassDesc();
+            $desc->depth = $depth;
+            RenderEncoder $enc = $device->beginRender($desc);
+            visu::profile::begin('cascade');
+            foreach ($casters as $caster) {
+                $caster->cast($ctx, $enc, $cascade);
+            }
+
+            visu::profile::end();
+            $enc->endRender();
+            $i = $i + 1;
+        }
+
+        $device->transitionTexture($map, .shaderRead);
+        return .ok;
+    }
+}

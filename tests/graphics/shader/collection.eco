@@ -6,7 +6,7 @@ use std::env;
 use std::io;
 use visu::graphics::{
     Device, ShaderCollection, ShaderFile, ShaderError, Define, ShaderKind,
-    shaderSuffix
+    ShaderStem, shaderStem, shaderSuffix
 };
 
 function mkdirOk(string $dir) : void
@@ -229,6 +229,38 @@ test collection_scan_optional_root
     assert($nestedName->failed(), 'prefix is the scan root');
     $a = $shaders->shader('a');
     assert($a->failed(), 'parent not scanned');
+}
+
+test shader_stem_parses_compute
+{
+    string $ext = shaderSuffix();
+    ShaderStem? $maybe = shaderStem("terrain_lod.comp.{$ext}", $ext);
+    ShaderStem $stem = guard $maybe else {
+        die('compute stem');
+    }
+    assert($stem->kind == ShaderKind::compute, 'kind');
+    assert($stem->name == 'terrain_lod', 'name');
+    assert($stem->variant == null, 'no variant');
+}
+
+test collection_scan_compute_only_is_skipped_by_load
+{
+    string $dir = mkdirScan('componly');
+    writeStage($dir, 'lod', 'comp');
+    Device $device = Device();
+    ShaderCollection $shaders = ShaderCollection($device, $dir);
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+    $ref = guard $shaders->shader('lod') else ($e) {
+        die($e->message());
+    }
+    assert($ref->name == 'lod', 'name');
+    assert($ref->files->count() == 1, 'one stage');
+    assert($ref->files[0]->kind == ShaderKind::compute, 'kind');
+    guard $shaders->load() else ($e) {
+        die($e->message());
+    }
 }
 
 #[if: os != darwin || VISU_BACKEND_VULKAN]

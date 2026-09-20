@@ -4,7 +4,7 @@ layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 FragColor;
 
 layout(std140, set = 0, binding = 0) uniform DeferredViewData {
-    // x mode: 0 albedo, 1 normal, 2 gray, 3 position, 4 emissive, 5 ssao
+    // x mode: 0 albedo, 1 normal, 2 gray, 3 position, 4 emissive, 5 ssao, 6 id
     // y gray channel 0..2
     vec4 u_params;
 };
@@ -14,7 +14,10 @@ layout(set = 1, binding = 1) uniform sampler2D gbuffer_normal;
 layout(set = 1, binding = 2) uniform sampler2D gbuffer_albedo;
 layout(set = 1, binding = 3) uniform sampler2D gbuffer_material;
 layout(set = 1, binding = 4) uniform sampler2D gbuffer_emissive;
-layout(set = 1, binding = 5) uniform sampler2D gbuffer_ao;
+layout(set = 1, binding = 5) uniform sampler2D gbuffer_id;
+layout(set = 1, binding = 12) uniform sampler2D gbuffer_ao;
+
+#include "visu/gbuffer_id.glsl"
 
 void main()
 {
@@ -41,9 +44,12 @@ void main()
     } else if (mode > 3.5 && mode < 4.5) {
         s = texture(gbuffer_emissive, v_uv);
         rgb = s.rgb;
-    } else if (mode > 4.5) {
+    } else if (mode > 4.5 && mode < 5.5) {
         float g = texture(gbuffer_ao, v_uv).r;
         rgb = vec3(g);
+    } else if (mode > 5.5) {
+        uint id = gbuffer_id_decode(texture(gbuffer_id, v_uv).r);
+        rgb = gbuffer_id_color(id);
     }
 
     FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);

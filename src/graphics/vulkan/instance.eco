@@ -13,6 +13,7 @@ internal struct ExtNames
     public static string $dynamicRendering = 'VK_KHR_dynamic_rendering';
     public static string $sync2 = 'VK_KHR_synchronization2';
     public static string $copy2 = 'VK_KHR_copy_commands2';
+    public static string $debugUtils = 'VK_EXT_debug_utils';
     public static string $validation = 'VK_LAYER_KHRONOS_validation';
 }
 
@@ -114,6 +115,16 @@ internal function vkCreateInstance(Device $device, const DeviceOptions& $options
         $extBuf[$extN]:$ = $hostExts[$hi]->cstr();
         $extN = $extN + 1;
         $hi = $hi + 1;
+    }
+
+    if (instanceHas(ExtNames::$debugUtils)) {
+        if ($extN >= 32) {
+            return .error(.vulkan('instance extensions', 0));
+        }
+
+        $extBuf[$extN]:$ = ExtNames::$debugUtils->cstr();
+        $extN = $extN + 1;
+        $device->debugLabels = true;
     }
 
     bool $port = instanceHas(ExtNames::$portability);
@@ -372,6 +383,7 @@ internal function vkCreateDevice(Device $device) : status<DeviceError>
     if (deviceHas($device->physical, ExtNames::$sync2)) {
         $devBuf[$devN]:$ = ExtNames::$sync2->cstr();
         $devN = $devN + 1;
+        $device->sync2 = true;
     }
 
     if (deviceHas($device->physical, ExtNames::$copy2)) {

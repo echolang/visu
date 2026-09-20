@@ -62,6 +62,12 @@ public class LightPass : Pass
             $io->reads($found->brdfLut);
         }
 
+        ShadowMapData? $shadows = $frame->find<ShadowMapData>();
+        if ($shadows != null) {
+            ShadowMapData $found = guard $shadows;
+            $io->reads($found->map);
+        }
+
         TargetRef $target = $pipeline->createTarget(
             'lightpass',
             $gbuffer->target->width,
@@ -94,7 +100,7 @@ public class LightPass : Pass
         $this->gpu->camera->bind($enc);
         CameraData $camera = $ctx->frame->get<CameraData>();
         $enc->upload(skyUniforms($this->sky, $camera->position, false, FOG_VIEW_SAMPLES, FOG_LIGHT_SAMPLES), slot: 0);
-        $enc->upload(lightUniforms($this->sun, $this->environment), slot: 2);
+        $enc->upload(lightUniforms($this->sun, $this->environment, $ctx->frame->find<ShadowMapData>()), slot: 2);
         $enc->upload(
             fogUniforms(
                 $this->fog,
@@ -116,6 +122,10 @@ public class LightPass : Pass
             return .error($e);
         }
         guard $this->bindEnvironment($ctx, $enc, $mode) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        guard bindShadowOrDummy($ctx, $enc, $this->gpu) else ($e) {
             $enc->endRender();
             return .error($e);
         }

@@ -1,0 +1,62 @@
+/**
+ * One compute shader module. Metal mints a compute PSO lazily on first `tessellateWith`.
+ */
+
+namespace visu::graphics;
+
+internal struct ComputeProgramIds
+{
+    public static uint32 $next = 1;
+}
+
+public class ComputeProgram : GpuObject
+{
+    public Device $device;
+    public const uint32 $id;
+    public const string $name;
+    internal ShaderModuleHandle $cs;
+    private bool $dead;
+
+    public constructor(Device $device, string $name, ShaderModuleHandle $cs)
+    {
+        $this->device = $device;
+        $this->id = ComputeProgramIds::$next;
+        ComputeProgramIds::$next = ComputeProgramIds::$next + 1;
+        $this->name = $name;
+        $this->cs = $cs;
+        $this->dead = false;
+    }
+
+    destructor()
+    {
+        $this->destroy();
+    }
+
+    public static function link(
+        Device $device,
+        string $name,
+        const string& $bytes
+    ) : result<ComputeProgram, ShaderError>
+    {
+        ShaderModuleHandle $cs = guard $device->createShaderModule(.compute, $bytes, "{$name}.comp") else ($e) {
+            return .error(.compile($e->message()));
+        }
+        return .ok(ComputeProgram($device, $name, $cs));
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->dead = true;
+        $this->device->destroyShaderModule($this->cs);
+        $this->cs = ShaderModuleHandle::none();
+    }
+
+    public const function destroyed() : bool
+    {
+        return $this->dead;
+    }
+}

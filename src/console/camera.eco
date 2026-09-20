@@ -1,0 +1,94 @@
+/**
+ * Console grammar and handler for `CameraSystem`. The system publishes; this type owns the
+ * `camera` verb.
+ */
+
+namespace visu::console;
+
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+use visu::system::CameraSystem;
+
+internal const CAMERA_USAGE = 'usage: camera [freeze [on|off]]';
+
+internal enum CameraConsoleAction
+{
+    case status;
+    case usage;
+    case freeze(bool $on);
+    case freezeToggle;
+}
+
+/**
+ * `camera` alone is status; `camera freeze [on|off]` pins the cull camera.
+ */
+internal function parseCameraConsole(const ConsoleCommandSignal& $cmd) : CameraConsoleAction
+{
+    if (!$cmd->isAction('camera')) {
+        return .usage;
+    }
+
+    if ($cmd->parts->count() == 1) {
+        return .status;
+    }
+
+    if ($cmd->parts[1] != 'freeze') {
+        return .usage;
+    }
+
+    if ($cmd->parts->count() < 3) {
+        return .freezeToggle;
+    }
+
+    bool? $on = consoleSwitch($cmd->parts[2]);
+    bool $setOn = guard $on else {
+        return .usage;
+    }
+    return .freeze($setOn);
+}
+
+public class CameraConsole : ConsoleCommandHandler
+{
+    private CameraSystem $cameras;
+
+    public constructor(CameraSystem $cameras)
+    {
+        $this->cameras = $cameras;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('camera', $this, 'freeze [on|off]');
+        array<string> $names = array<string>();
+        $names[] = 'camera';
+        return $names;
+    }
+
+    /**
+     * `camera` prints freeze state; `camera freeze` pins or releases the cull matrices.
+     */
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        CameraConsoleAction $action = parseCameraConsole($cmd);
+        match ($action) {
+            CameraConsoleAction::status => {
+                $this->cameras->printStatus($console);
+            },
+            CameraConsoleAction::usage => {
+                $console->writeLine(CAMERA_USAGE);
+            },
+            CameraConsoleAction::freeze($on) => {
+                $this->setFrozen($console, $on);
+            },
+            CameraConsoleAction::freezeToggle => {
+                $this->setFrozen($console, !$this->cameras->frozen());
+            },
+        };
+    }
+
+    private function setFrozen(DebugConsole $console, bool $on) : void
+    {
+        $this->cameras->setFrozen($on);
+        $this->cameras->printStatus($console);
+    }
+}

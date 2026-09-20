@@ -134,6 +134,8 @@ public class Octree
     private array<OctreeItem> $items;
     private int32 $freeItem;
     private int32 $count;
+    private array<int32> $walkStack;
+    private array<bool> $walkInside;
 
     public constructor(const AABB& $bounds, int32 $maxDepth = 8, float32 $looseness = 2.0f)
     {
@@ -146,6 +148,10 @@ public class Octree
         $this->items = array<OctreeItem>();
         $this->freeItem = -1;
         $this->count = 0;
+        $this->walkStack = array<int32>();
+        $this->walkInside = array<bool>();
+        $this->walkStack->reserve(128);
+        $this->walkInside->reserve(128);
         OctreeNode $root = OctreeNode();
         $root->bounds = $bounds;
         $root->loose = $bounds->scaled($looseness);
@@ -199,17 +205,17 @@ public class Octree
      */
     public function query(const Frustum& $frustum, array<uint32>& $out) : void
     {
-        array<int32> $stack = array<int32>();
-        array<bool> $accepted = array<bool>();
-        $stack[] = 0;
-        $accepted[] = false;
+        $this->walkStack->clear();
+        $this->walkInside->clear();
+        $this->walkStack[] = 0;
+        $this->walkInside[] = false;
 
-        while ($stack->count() > 0) {
-            usize $top = $stack->count() - 1;
-            int32 $index = $stack[$top];
-            bool $inside = $accepted[$top];
-            $stack->pop();
-            $accepted->pop();
+        while ($this->walkStack->count() > 0) {
+            usize $top = $this->walkStack->count() - 1;
+            int32 $index = $this->walkStack[$top];
+            bool $inside = $this->walkInside[$top];
+            $this->walkStack->pop();
+            $this->walkInside->pop();
             OctreeNode $node = $this->nodes[$index as usize];
 
             if ($node->itemCount == 0 && $node->firstChild < 0) {
@@ -239,8 +245,8 @@ public class Octree
             if ($node->firstChild >= 0) {
                 int32 $child = 0;
                 while ($child < 8) {
-                    $stack[] = $node->firstChild + $child;
-                    $accepted[] = $inside;
+                    $this->walkStack[] = $node->firstChild + $child;
+                    $this->walkInside[] = $inside;
                     $child = $child + 1;
                 }
             }
@@ -252,13 +258,13 @@ public class Octree
      */
     public function query(const AABB& $box, array<uint32>& $out) : void
     {
-        array<int32> $stack = array<int32>();
-        $stack[] = 0;
+        $this->walkStack->clear();
+        $this->walkStack[] = 0;
 
-        while ($stack->count() > 0) {
-            usize $top = $stack->count() - 1;
-            int32 $index = $stack[$top];
-            $stack->pop();
+        while ($this->walkStack->count() > 0) {
+            usize $top = $this->walkStack->count() - 1;
+            int32 $index = $this->walkStack[$top];
+            $this->walkStack->pop();
             OctreeNode $node = $this->nodes[$index as usize];
 
             if ($node->itemCount == 0 && $node->firstChild < 0) {
@@ -282,7 +288,7 @@ public class Octree
             if ($node->firstChild >= 0) {
                 int32 $child = 0;
                 while ($child < 8) {
-                    $stack[] = $node->firstChild + $child;
+                    $this->walkStack[] = $node->firstChild + $child;
                     $child = $child + 1;
                 }
             }

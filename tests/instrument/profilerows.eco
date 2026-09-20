@@ -6,7 +6,7 @@
 
 // the profiler measures nothing under VISU_RELEASE, so none of this holds there
 #[if: !VISU_RELEASE]
-use visu::graphics::{DrawCounters, GpuSpan, GpuTimeline};
+use visu::graphics::{DrawCounters, GpuSpan, GpuProfiler};
 use visu::instrument::{Instruments, PassTiming, Section, Sink, Tab, findTab, formatPass, formatTab, rowsFromStats};
 use visu::profile::{FrameProfile, Profiler};
 
@@ -139,7 +139,7 @@ test rows_keep_a_scope_that_skipped_a_frame
 
 test rows_sort_siblings_by_average
 {
-    GpuTimeline $tl = GpuTimeline();
+    GpuProfiler $tl = GpuProfiler();
     $tl->supported = true;
     Profiler $prof = Profiler();
     $prof->attach(DrawCounters(), $tl);
@@ -199,22 +199,20 @@ test rows_keep_same_named_leaves_apart
 
 test rows_gpu_known_after_merge
 {
-    GpuTimeline $tl = GpuTimeline();
+    GpuProfiler $tl = GpuProfiler();
     $tl->supported = true;
     Profiler $prof = Profiler();
     $prof->attach(DrawCounters(), $tl);
     $prof->beginFrame();
     $prof->bindFrame(9, 9);
     $prof->begin('render');
-    $prof->captureSubmit();
     $prof->begin('gbuffer');
     $prof->end();
     $prof->end();
     $prof->endFrame();
     array<GpuSpan> $spans = array<GpuSpan>();
-    $spans[] = GpuSpan(-1, 500.0);
     $spans[] = GpuSpan(2, 200.0);
-    $tl->publish(9, $spans, 0);
+    $tl->publish(9, $spans, 0, 500.0);
     $prof->mergeGpu();
     FrameProfile $f = guard $prof->complete() else {
         die('frame');

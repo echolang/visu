@@ -95,7 +95,7 @@ public class Host
         $this->events = EventLoop();
         $this->instruments = Instruments();
         $this->instruments->add(id: 'draw', DrawSource($this->device));
-        profiler()->attach($this->device->draws, $this->device->gpuTimeline);
+        profiler()->attach($this->device->draws, $this->device->gpuProfiler);
         $this->ui = null;
         $this->frameIndex = 0;
         $this->fail = .none;
@@ -181,38 +181,19 @@ public class Host
         profiler()->bindFrame($this->device->frameIndex(), $this->frameIndex);
         visu::profile::begin('build');
         Frame $frame = Frame();
-        RenderTarget $windowRt = $this->window->renderTarget();
-        Pipeline $pipeline = Pipeline($this->pool, $frame, $windowRt);
-        RenderContext $ctx = RenderContext($this->device, $pipeline, $frame, $this->pool, $compensation);
-        BackbufferData $back = $frame->get<BackbufferData>();
-        TargetRef $sceneTarget = $this->sceneTarget($pipeline, $windowRt);
+        Pipeline $scenePipe = Pipeline($this->pool, $frame);
+        RenderContext $ctx = RenderContext($this->device, $scenePipe, $frame, $this->pool, $compensation);
+        TargetRef $sceneTarget = $this->sceneTarget($scenePipe);
         $sceneTarget->depthStencil = true;
-        TextureRef $color = $pipeline->createColor($sceneTarget, $this->config->colorName, TextureOptions());
+        TextureRef $color = $scenePipe->createColor($sceneTarget, $this->config->colorName, TextureOptions());
         $frame->set(HostPassData($sceneTarget, $color));
         $frame->set(SceneTargetData($sceneTarget));
         $this->publishCameraOverride($frame);
-        $pipeline->add(ClearPass($sceneTarget, ClearPassOptions(color: $this->config->clearColor)));
+        $scenePipe->add(ClearPass($sceneTarget, ClearPassOptions(color: $this->config->clearColor)));
         $scene($ctx, $sceneTarget);
-        $this->addUi($pipeline, $sceneTarget, $ui);
-        $pipeline->add(ClearPass($back->target, ClearPassOptions()));
-        $this->blit->pass($pipeline, $back->target, $color);
-        Sample $sample = $this->instruments->sample();
-        Overlay? $maybeOverlay = $this->overlay;
-
-        if ($maybeOverlay != null) {
-            Overlay $overlay = guard $maybeOverlay;
-            $overlay->pass($pipeline, $back->target, $sample);
-        }
-
-        DebugConsole? $maybeConsole = $this->console;
-
-        if ($maybeConsole != null) {
-            DebugConsole $console = guard $maybeConsole;
-            $console->attachPass($pipeline, $back->target);
-        }
-
+        $this->addUi($scenePipe, $sceneTarget, $ui);
         visu::profile::end();
-        $this->finishFrame($pipeline, $frame, $compensation, $afterPresent);
+        $this->finishFrame($scenePipe, $frame, $color, $compensation, $afterPresent);
     }
 
     public const function shouldStop() : bool
@@ -279,14 +260,20 @@ public class Host
         $this->device->shutdown();
     }
 
-    private function sceneTarget(Pipeline $pipeline, RenderTarget $windowRt) : TargetRef
+    private function sceneTarget(Pipeline $pipeline) : TargetRef
     {
-        if (!$this->config->fixedResolution) {
-            return $pipeline->createTargetLike($this->config->targetName, $windowRt);
+        if ($this->config->fixedResolution) {
+            Vec2 $fixed = $this->config->renderSize;
+            return $pipeline->createTarget($this->config->targetName, $fixed->x as int32, $fixed->y as int32);
         }
 
-        Vec2 $fixed = $this->config->renderSize;
-        return $pipeline->createTarget($this->config->targetName, $fixed->x as int32, $fixed->y as int32);
+        int32 $w = $this->window->framebufferWidth();
+        int32 $h = $this->window->framebufferHeight();
+        TargetRef $ref = $pipeline->createTarget($this->config->targetName, $w, $h);
+        float32 $s = $this->device->contentsScale() as float32;
+        $ref->contentScaleX = $s;
+        $ref->contentScaleY = $s;
+        return $ref;
     }
 
     private function addUi(Pipeline $pipeline, TargetRef $scene, function<void(Ui)>? $cb) : void
@@ -312,19 +299,66 @@ public class Host
     }
 
     private function finishFrame(
-        Pipeline $pipeline,
+        Pipeline $scenePipe,
         Frame $frame,
+        TextureRef $color,
         float32 $compensation,
         function<void()>? $afterPresent,
     ) : void
     {
         visu::profile::begin('render');
-        visu::profile::captureSubmit();
         float64 $t0 = visu::runtime::seconds();
-        status<PipelineError> $exec = $pipeline->execute($this->frameIndex, $compensation);
-        $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
+        status<PipelineError> $exec = $scenePipe->execute($this->frameIndex, $compensation, collect: false);
         visu::profile::end();
+        guard $exec else {
+            $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
+            $this->finishPresent($frame, $exec, $afterPresent, false);
+            return;
+        }
+
+        RenderTarget $windowRt = $this->window->renderTarget();
+        Pipeline $presentPipe = Pipeline($this->pool, $frame, $windowRt);
+        BackbufferData $back = $frame->get<BackbufferData>();
+        Texture $sceneColor = guard $this->pool->getTexture($color) else ($e) {
+            $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
+            $this->finishPresent($frame, .error(.pool($e)), $afterPresent, false);
+            return;
+        }
+        TextureRef $src = $presentPipe->importTexture($color->name, $sceneColor);
+        $presentPipe->add(ClearPass($back->target, ClearPassOptions()));
+        $this->blit->pass($presentPipe, $back->target, $src);
+        Sample $sample = $this->instruments->sample();
+        Overlay? $maybeOverlay = $this->overlay;
+
+        if ($maybeOverlay != null) {
+            Overlay $overlay = guard $maybeOverlay;
+            $overlay->pass($presentPipe, $back->target, $sample);
+        }
+
+        DebugConsole? $maybeConsole = $this->console;
+
+        if ($maybeConsole != null) {
+            DebugConsole $console = guard $maybeConsole;
+            $console->attachPass($presentPipe, $back->target);
+        }
+
         visu::profile::begin('present');
+        status<PipelineError> $presentExec = $presentPipe->execute($this->frameIndex, $compensation);
+        $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
+        $this->finishPresent($frame, $presentExec, $afterPresent, true);
+    }
+
+    private function finishPresent(
+        Frame $frame,
+        status<PipelineError> $exec,
+        function<void()>? $afterPresent,
+        bool $presentOpen,
+    ) : void
+    {
+        if (!$presentOpen) {
+            visu::profile::begin('present');
+        }
+
         bool $presented = $this->present();
         visu::profile::end();
         $this->publishProfiles();

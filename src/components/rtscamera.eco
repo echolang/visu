@@ -1,0 +1,205 @@
+/**
+ * Ground-focus RTS camera tunables.
+ * An ECS component on a camera entity; `RtsCameraSystem` drives the one that also has `ActiveCamera`.
+ * `place` sits on the focus at `$radius` looking at it. Optional `$ground` clamps and follows a heightmap.
+ */
+
+namespace visu::components;
+
+use visu::geo::{Heightmap, Transform};
+use visu::math::{EPS, Quat, Vec2, Vec3, dot, length, radians, sgn};
+
+public struct RtsCamera
+{
+    /**
+     * Ground point the camera looks at.
+     */
+    public Vec3 $focus;
+
+    /**
+     * World units per tick added onto `$focus`.
+     */
+    public Vec3 $focusVelocity;
+
+    /**
+     * Velocity gained while a pan key is held, scaled by `radius / max`.
+     */
+    public float32 $focusSpeed = 3.0f;
+
+    /**
+     * Fraction of pan velocity kept each tick.
+     */
+    public float32 $focusDamp = 0.8f;
+
+    /**
+     * Distance from `$focus` along camera +Z.
+     */
+    public float32 $radius = 250.0f;
+
+    /**
+     * Closest `$radius` `zoom` will admit.
+     */
+    public float32 $min = 5.0f;
+
+    /**
+     * Farthest `$radius` `zoom` will admit.
+     */
+    public float32 $max = 1000.0f;
+
+    /**
+     * World units of radius per scroll unit, scaled by `radius / max`.
+     */
+    public float32 $zoom = 100.0f;
+
+    /**
+     * Degrees per tick; x is yaw about world up, y is pitch about local left.
+     */
+    public Vec2 $spin;
+
+    /**
+     * Fraction of orbit velocity kept each tick.
+     */
+    public float32 $spinDamp = 0.9f;
+
+    /**
+     * Degrees of yaw / pitch per cursor pixel.
+     */
+    public float32 $lookSpeed = 0.1f;
+
+    /**
+     * Degrees of yaw per tick while Q or E is held.
+     */
+    public float32 $keySpeed = 0.1f;
+
+    /**
+     * Metres the eye stays above `$ground` at the camera XZ.
+     */
+    public float32 $clearance = 5.0f;
+
+    /**
+     * Optional heightfield. Without it, pan / orbit / zoom still run; no XZ clamp or Y snap.
+     */
+    public Heightmap? $ground = null;
+
+    init
+    {
+        $this->focus = Vec3(0.0f, 0.0f, 0.0f);
+        $this->focusVelocity = Vec3(0.0f, 0.0f, 0.0f);
+        $this->spin = Vec2(0.0f, 0.0f);
+    }
+
+    /**
+     * Apply pan velocity, damp it, then `place`.
+     */
+    public function advance(Transform& $transform) : void
+    {
+        $this->focus = $this->focus + $this->focusVelocity;
+        $transform->position = $transform->position + $this->focusVelocity;
+        $this->focusVelocity = $this->focusVelocity * $this->focusDamp;
+        $this->place($transform);
+    }
+
+    /**
+     * Follow `$ground` if set, sit on the focus at `$radius`, apply this tick's spin, look at the focus.
+     */
+    public function place(Transform& $transform) : void
+    {
+        $this->clampRadius();
+        $this->followGround($transform);
+
+        if ($transform->position == Vec3(0.0f, 0.0f, 0.0f) || $transform->position == $this->focus) {
+            $transform->position->z = $transform->position->z - 1.0f;
+        }
+
+        $transform->lookAt($this->focus);
+        $transform->position = $this->focus;
+        $transform->moveBackward($this->radius);
+
+        float32 $yaw = radians(-$this->spin->x);
+        float32 $pitch = radians($this->spin->y);
+        $this->spin = $this->spin * $this->spinDamp;
+
+        float32 $pole = dot($transform->backward(), Transform::worldUp());
+        if ($pole * (sgn($pitch) as float32) > 0.99f) {
+            $pitch = 0.0f;
+        }
+
+        Vec3 $offset = $transform->position - $this->focus;
+        if ($pitch != 0.0f) {
+            Vec3 $axis = $transform->left();
+            if (length($axis) > EPS) {
+                $offset = Quat(angleAxis: $pitch, $axis) * $offset;
+            }
+        }
+
+        if ($yaw != 0.0f) {
+            $offset = Quat(angleAxis: $yaw, Transform::worldUp()) * $offset;
+        }
+
+        $transform->position = $this->focus + $offset;
+        $transform->lookAt($this->focus);
+        $this->clearGround($transform);
+    }
+
+    private function followGround(Transform& $transform) : void
+    {
+        Heightmap $map = guard $this->ground else {
+            return;
+        }
+
+        float32 $minX = $map->worldX(0);
+        float32 $maxX = $map->worldX($map->width - 1);
+        float32 $minZ = $map->worldZ(0);
+        float32 $maxZ = $map->worldZ($map->height - 1);
+        if ($this->focus->x < $minX) {
+            $this->focus->x = $minX;
+        }
+
+        if ($this->focus->x > $maxX) {
+            $this->focus->x = $maxX;
+        }
+
+        if ($this->focus->z < $minZ) {
+            $this->focus->z = $minZ;
+        }
+
+        if ($this->focus->z > $maxZ) {
+            $this->focus->z = $maxZ;
+        }
+
+        float32 $height = guard $map->sample($this->focus->x, $this->focus->z) else {
+            return;
+        }
+        float32 $diff = $height - $this->focus->y;
+        $this->focus->y = $this->focus->y + $diff;
+        $transform->position->y = $transform->position->y + $diff;
+    }
+
+    private function clearGround(Transform& $transform) : void
+    {
+        Heightmap $map = guard $this->ground else {
+            return;
+        }
+        float32 $floor = guard $map->sample($transform->position->x, $transform->position->z) else {
+            return;
+        }
+        $floor = $floor + $this->clearance;
+        if ($transform->position->y < $floor) {
+            $transform->position->y = $floor;
+        }
+    }
+
+    private function clampRadius() : void
+    {
+        float32 $r = std::math::abs($this->radius);
+        if ($r < $this->min) {
+            $r = $this->min;
+        }
+
+        if ($r > $this->max) {
+            $r = $this->max;
+        }
+
+        $this->radius = $r;
+    }
+}

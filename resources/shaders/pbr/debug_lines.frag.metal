@@ -24,6 +24,7 @@ struct fs_out
     float4 gbuffer_out_albedo [[color(2)]];
     float4 gbuffer_out_material [[color(3)]];
     float4 gbuffer_out_emissive [[color(4)]];
+    float4 gbuffer_out_id [[color(5)]];
 };
 
 struct fs_in
@@ -33,16 +34,24 @@ struct fs_in
 };
 
 static inline __attribute__((always_inline))
-void gbuffer_write(thread const float3& position, thread const float3& normal, thread const float3& albedo, thread const float& metallic, thread const float& roughness, thread const float3& emissive, thread const float& ao, thread float4& gbuffer_out_position, constant CameraUniforms& _27, thread float4& gbuffer_out_normal, thread float4& gbuffer_out_albedo, thread float4& gbuffer_out_material, thread float4& gbuffer_out_emissive)
+float gbuffer_id_encode(thread const uint& id)
 {
-    gbuffer_out_position = float4(position - _27.u_camera_position.xyz, 1.0);
+    return float(id) / 255.0;
+}
+
+static inline __attribute__((always_inline))
+void gbuffer_write(thread const float3& position, thread const float3& normal, thread const float3& albedo, thread const float& metallic, thread const float& roughness, thread const float3& emissive, thread const float& ao, thread const uint& id, thread float4& gbuffer_out_position, constant CameraUniforms& _40, thread float4& gbuffer_out_normal, thread float4& gbuffer_out_albedo, thread float4& gbuffer_out_material, thread float4& gbuffer_out_emissive, thread float4& gbuffer_out_id)
+{
+    gbuffer_out_position = float4(position - _40.u_camera_position.xyz, 1.0);
     gbuffer_out_normal = float4(normal, 0.0);
     gbuffer_out_albedo = float4(albedo, 1.0);
     gbuffer_out_material = float4(roughness, metallic, fast::clamp(ao, 0.0, 1.0), 1.0);
     gbuffer_out_emissive = float4(emissive, 1.0);
+    uint param = id;
+    gbuffer_out_id = float4(gbuffer_id_encode(param), 0.0, 0.0, 1.0);
 }
 
-fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _27 [[buffer(3)]])
+fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _40 [[buffer(3)]])
 {
     fs_out out = {};
     float3 param = in.v_position;
@@ -52,7 +61,8 @@ fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _27 [[buffer(
     float param_4 = 1.0;
     float3 param_5 = in.v_color.xyz;
     float param_6 = 1.0;
-    gbuffer_write(param, param_1, param_2, param_3, param_4, param_5, param_6, out.gbuffer_out_position, _27, out.gbuffer_out_normal, out.gbuffer_out_albedo, out.gbuffer_out_material, out.gbuffer_out_emissive);
+    uint param_7 = 5u;
+    gbuffer_write(param, param_1, param_2, param_3, param_4, param_5, param_6, param_7, out.gbuffer_out_position, _40, out.gbuffer_out_normal, out.gbuffer_out_albedo, out.gbuffer_out_material, out.gbuffer_out_emissive, out.gbuffer_out_id);
     return out;
 }
 

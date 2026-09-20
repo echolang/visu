@@ -14,6 +14,7 @@ layout(location = 0) out vec4 fragment_color;
 #include "visu/gbuffer_uniform.glsl"
 #include "visu/pbr/surface.glsl"
 #include "visu/pbr/shade.glsl"
+#include "visu/shadow.glsl"
 
 // the light pass has no per-draw payload at slot 0 and slot 2 is LightUniforms
 #define VISU_SKY_SLOT 0
@@ -25,6 +26,10 @@ layout(std140, set = 0, binding = 2) uniform LightUniforms {
     vec4 u_sun_color;
     // x prefiltered mip count, y environment mip count, z blend towards the second IBL state
     vec4 u_ibl;
+    mat4 u_light_space[5];
+    vec4 u_splits;
+    // x fifth split, y enabled, z cascade tint, w unused
+    vec4 u_shadow;
 };
 
 #ifdef USE_ENV_CUBEMAP
@@ -39,6 +44,8 @@ layout(set = 1, binding = 9) uniform samplerCube ibl_irradiance_map_b;
 layout(set = 1, binding = 10) uniform samplerCube ibl_prefilter_map_b;
 #endif
 
+layout(set = 1, binding = 11) uniform sampler2DArray shadowmap;
+
 void main()
 {
     GBuffer gbuffer = gbuffer_make(v_uv);
@@ -50,11 +57,39 @@ void main()
 
     PBRSurface s = pbr_surface_make(gbuffer, u_camera_position.xyz);
     vec3 Lo = vec3(0.0);
+    vec3 transmitted = vec3(0.0);
+
+    if (gbuffer.id == GBUFFER_ID_UNLIT) {
+        vec3 unlit = fog_apply(s.emissive, gbuffer.relative);
+        unlit = apply_tonemap(unlit);
+        unlit = gamma_correct(unlit);
+        fragment_color = vec4(unlit, 1.0);
+        return;
+    }
 
     {
         vec3 L = normalize(-u_sun_direction.xyz);
         vec3 radiance = u_sun_color.rgb * u_sun_direction.w;
-        Lo += pbr_shade(s, L, radiance);
+        float vis = 1.0;
+        if (u_shadow.y > 0.5) {
+            float view_z = (u_view * vec4(s.P, 1.0)).z;
+            int cascade = csm_index(view_z, u_splits);
+            vis = 1.0 - shadow_sample(
+                shadowmap,
+                s.P,
+                s.N,
+                normalize(u_sun_direction.xyz),
+                u_light_space[cascade],
+                cascade
+            );
+        }
+        float wrap = gbuffer_id_wrap(gbuffer.id);
+        Lo += pbr_shade_wrapped(s, L, radiance, wrap) * vis;
+        float thickness = gbuffer_id_thickness(gbuffer.id);
+        if (thickness > 0.0) {
+            float t = pow(clamp(dot(s.V, -L), 0.0, 1.0), 2.0);
+            transmitted = s.albedo * radiance * t * thickness * vis;
+        }
     }
 
     vec3 ambient = vec3(0.0);
@@ -63,8 +98,7 @@ void main()
         vec3 R = normalize(reflect(-s.V, s.N));
 
         vec3 F = fresnel_schlick_roughness(s.F0, NdotV, s.roughness);
-        vec3 kS = F;
-        vec3 kD = (vec3(1.0) - kS) * (1.0 - s.metallic);
+        vec3 kD = (vec3(1.0) - F) * (1.0 - s.metallic);
 
         vec3 diffuseIBL = vec3(0.0);
 #ifdef USE_IBL
@@ -98,12 +132,29 @@ void main()
         specIBL = env * F;
 #endif
 
-        ambient = kD * diffuseIBL + specIBL;
+        vec3 diffuse = kD * diffuseIBL;
+        specIBL = pbr_dielectric_spec_limit(specIBL, diffuse, s.metallic, s.roughness);
+        ambient = diffuse + specIBL;
     }
 
-    vec3 color = (Lo + ambient) * s.ao + s.emissive;
+    vec3 color = (Lo + ambient) * s.ao + transmitted + s.emissive;
     color = fog_apply(color, gbuffer.relative);
     color = apply_tonemap(color);
     color = gamma_correct(color);
+    if (u_shadow.z > 0.5 && u_shadow.y > 0.5) {
+        float view_z = (u_view * vec4(s.P, 1.0)).z;
+        int cascade = csm_index(view_z, u_splits);
+        vec3 tint = vec3(1.0, 0.0, 0.0);
+        if (cascade == 1) {
+            tint = vec3(0.0, 1.0, 0.0);
+        } else if (cascade == 2) {
+            tint = vec3(0.0, 0.0, 1.0);
+        } else if (cascade == 3) {
+            tint = vec3(1.0, 0.0, 1.0);
+        } else if (cascade == 4) {
+            tint = vec3(0.0, 1.0, 1.0);
+        }
+        color += tint * 0.15;
+    }
     fragment_color = vec4(color, 1.0);
 }

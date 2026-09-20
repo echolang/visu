@@ -1,5 +1,6 @@
 /**
- * Backend-neutral GPU timing mailbox
+ * Backend-neutral GPU timing mailbox: a duration span for the CPU profiler
+ * fold, a resolved-frame publish, and the busy-union helper. `GpuProfiler` owns the inbox.
  */
 
 namespace visu::graphics;
@@ -8,63 +9,230 @@ public struct GpuSpan
 {
     public int32 $scope = -1;
     public float64 $ns = 0.0;
+    public float64 $beginNs = 0.0;
+    public float64 $endNs = 0.0;
 }
 
 /**
- * One resolved GPU frame waiting for the profiler to fold it in. Empty `$spans` is a valid
- * resolve (no encoders, or every sample came back zero).
+ * One resolved GPU frame waiting for the CPU profiler to fold it in. Empty `$spans` is a valid
+ * resolve (no GPU work, or every sample came back zero). `$busyNs` is the union of scene
+ * intervals; `$spanNs` is last end minus first start.
  */
 public struct GpuPublish
 {
     public uint64 $frame = 0;
     public array<GpuSpan> $spans = array<GpuSpan>();
+    public float64 $busyNs = 0.0;
+    public float64 $spanNs = 0.0;
     public int32 $dropped = 0;
 }
 
-public class GpuTimeline
+/**
+ * Samples reserved for one encoder. `$count` is 2 for a blit/compute or Vulkan query pair,
+ * 4 for a Metal render encoder, 6 when draw-boundary tags are attached.
+ */
+internal struct PendingSpan
 {
-    public int32 $scope;
-    public uint64 $resolvedFrame;
-    public array<GpuSpan> $resolved;
-    /** set by Device.initialize; false when the device cannot sample timestamps or under VISU_RELEASE */
-    public bool $supported;
-    /** encoders of the resolved frame that got no timestamps because the per-frame capacity ran out */
-    public int32 $dropped;
-    private array<GpuPublish> $inbox;
+    public int32 $cpuScope = -1;
+    public uint32 $start = 0;
+    public uint32 $count = 2;
+    public GpuQueue $queue = .graphics;
+    public bool $barrier = false;
+}
 
-    public constructor()
-    {
-        $this->scope = -1;
-        $this->resolvedFrame = 0;
-        $this->resolved = array<GpuSpan>();
-        $this->supported = false;
-        $this->dropped = 0;
-        $this->inbox = array<GpuPublish>();
+/**
+ * One GPU-busy interval in nanoseconds. HUD `GPU:` is the union of these, not first-tick to
+ * last-tick: a gap between encoders (drawable wait, vsync) is idle, not work.
+ */
+internal struct GpuInterval
+{
+    public float64 $lo = 0.0;
+    public float64 $hi = 0.0;
+}
+
+/**
+ * Occupied GPU time: overlapping and touching intervals fold, a hole between them does not.
+ */
+internal function gpuBusyNs(const array<GpuInterval>& $spans) : float64
+{
+    array<GpuInterval> $xs = array<GpuInterval>();
+    foreach ($spans as $s) {
+        if ($s->hi > $s->lo) {
+            gpuInsertInterval($xs, $s->lo, $s->hi);
+        }
     }
 
-    /**
-     * The backend hands over one resolved frame: its spans and how many encoders got no samples.
-     */
-    public function publish(uint64 $frame, array<GpuSpan> $spans, int32 $dropped) : void
-    {
-        GpuPublish $item = GpuPublish();
-        $item->frame = $frame;
-        $item->spans = $spans;
-        $item->dropped = $dropped;
-        $this->inbox[] = $item;
-        $this->resolvedFrame = $frame;
-        $this->resolved = $spans;
-        $this->dropped = $dropped;
+    float64 $ns = 0.0;
+    foreach ($xs as $s) {
+        $ns = $ns + ($s->hi - $s->lo);
     }
 
-    /**
-     * Drain every unpublished resolve. Empty is a real result: nothing landed since the last take.
-     */
-    public function take() : array<GpuPublish>
-    {
-        array<GpuPublish> $have = $this->inbox;
-        $this->inbox = array<GpuPublish>();
-        return $have;
+    return $ns;
+}
+
+/**
+ * Busy time of two stage intervals. A hole between them is idle, overlap folds.
+ * A missing stage is lo == hi.
+ */
+internal function twoIntervalBusy(float64 $aLo, float64 $aHi, float64 $bLo, float64 $bHi) : float64
+{
+    bool $a = $aHi > $aLo;
+    bool $b = $bHi > $bLo;
+
+    if (!$a && !$b) {
+        return 0.0;
+    }
+
+    if (!$a) {
+        return $bHi - $bLo;
+    }
+
+    if (!$b) {
+        return $aHi - $aLo;
+    }
+
+    if ($aHi < $bLo) {
+        return ($aHi - $aLo) + ($bHi - $bLo);
+    }
+
+    if ($bHi < $aLo) {
+        return ($aHi - $aLo) + ($bHi - $bLo);
+    }
+
+    float64 $lo = $aLo;
+
+    if ($bLo < $lo) {
+        $lo = $bLo;
+    }
+
+    float64 $hi = $aHi;
+
+    if ($bHi > $hi) {
+        $hi = $bHi;
+    }
+
+    return $hi - $lo;
+}
+
+/**
+ * Add `[$lo, $hi)` to `$union` and return how much new busy time that added.
+ * Nested occupancy (a cheap pass whose stage window sits inside an earlier
+ * encoder's window) returns 0, which matches Metal Inspector pass time.
+ */
+internal function gpuExclusiveInsert(array<GpuInterval>& $union, float64 $lo, float64 $hi) : float64
+{
+    if ($hi <= $lo) {
+        return 0.0;
+    }
+
+    float64 $cover = 0.0;
+    foreach ($union as $s) {
+        if ($s->hi <= $lo || $s->lo >= $hi) {
+            continue;
+        }
+
+        float64 $a = $lo;
+
+        if ($s->lo > $a) {
+            $a = $s->lo;
+        }
+
+        float64 $b = $hi;
+
+        if ($s->hi < $b) {
+            $b = $s->hi;
+        }
+
+        if ($b > $a) {
+            $cover = $cover + ($b - $a);
+        }
+    }
+
+    gpuInsertInterval($union, $lo, $hi);
+    return ($hi - $lo) - $cover;
+}
+
+/**
+ * Last end minus first start of `$spans`. 0 when empty. Occupancy, not busy.
+ */
+internal function gpuSpanNs(const array<GpuInterval>& $spans) : float64
+{
+    float64 $lo = 0.0;
+    float64 $hi = 0.0;
+    bool $any = false;
+    foreach ($spans as $s) {
+        if ($s->hi <= $s->lo) {
+            continue;
+        }
+
+        if (!$any || $s->lo < $lo) {
+            $lo = $s->lo;
+        }
+
+        if (!$any || $s->hi > $hi) {
+            $hi = $s->hi;
+        }
+
+        $any = true;
+    }
+
+    if (!$any) {
+        return 0.0;
+    }
+
+    return $hi - $lo;
+}
+
+internal function gpuInsertInterval(array<GpuInterval>& $xs, float64 $lo, float64 $hi) : void
+{
+    usize $n = $xs->count();
+    usize $i = 0;
+
+    while ($i < $n && $xs[$i]->hi < $lo) {
+        $i = $i + 1;
+    }
+
+    usize $from = $i;
+
+    while ($i < $n && $xs[$i]->lo <= $hi) {
+        if ($xs[$i]->lo < $lo) {
+            $lo = $xs[$i]->lo;
+        }
+
+        if ($xs[$i]->hi > $hi) {
+            $hi = $xs[$i]->hi;
+        }
+
+        $i = $i + 1;
+    }
+
+    usize $to = $i;
+
+    if ($from < $to) {
+        GpuInterval& $slot = $xs->at($from);
+        $slot->lo = $lo;
+        $slot->hi = $hi;
+        usize $r = $to;
+
+        while ($r > $from + 1) {
+            $r = $r - 1;
+            $xs->remove($r);
+        }
+
+        return;
+    }
+
+    GpuInterval $add = GpuInterval();
+    $add->lo = $lo;
+    $add->hi = $hi;
+    $xs[] = $add;
+    usize $j = $xs->count() - 1;
+
+    while ($j > $from) {
+        GpuInterval $tmp = $xs[$j];
+        $xs[$j] = $xs[$j - 1];
+        $xs[$j - 1] = $tmp;
+        $j = $j - 1;
     }
 }
 

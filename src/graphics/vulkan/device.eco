@@ -55,8 +55,10 @@ public class Device : DeviceProtocol
     internal uint64 $heapBudget;
     internal float32 $timestampPeriod;
     internal uint32 $timestampBits;
+    internal bool $sync2;
+    internal bool $debugLabels;
     public DrawCounters $draws;
-    public GpuTimeline $gpuTimeline;
+    public GpuProfiler $gpuProfiler;
 
     public constructor()
     {
@@ -108,8 +110,10 @@ public class Device : DeviceProtocol
         $this->heapBudget = 0;
         $this->timestampPeriod = 0.0f;
         $this->timestampBits = 0;
+        $this->sync2 = false;
+        $this->debugLabels = false;
         $this->draws = DrawCounters();
-        $this->gpuTimeline = GpuTimeline();
+        $this->gpuProfiler = GpuProfiler();
     }
 
     destructor()
@@ -135,7 +139,11 @@ public class Device : DeviceProtocol
             $this->shutdown();
             return .error($e);
         }
-        $this->gpuTimeline->supported = vkTimestampsSupported($this);
+        $this->gpuProfiler->supported = vkTimestampsSupported($this);
+
+        if ($this->gpuProfiler->supported) {
+            $this->gpuProfiler->mode = .lightweight;
+        }
         guard vkCreateSlots($this) else ($e) {
             $this->shutdown();
             return .error($e);
@@ -144,11 +152,19 @@ public class Device : DeviceProtocol
             $this->shutdown();
             return .error($e);
         }
+        #[if: os == darwin || os == ios]
+        $this->limits->layeredMipgen = false;
+        #[end]
         $this->ready = true;
         announceVersion();
         AdapterInfo $info = $this->adapter;
         string $line = $info->line();
         info("graphics: {$line}");
+
+        if ($this->gpuProfiler->supported) {
+            info('gpu timestamps: on (query pool)');
+        }
+
         return .ok;
     }
 
@@ -254,7 +270,7 @@ public class Device : DeviceProtocol
             return .error($e);
         }
 
-        vkTimestampsResolve($this, $slot, $this->gpuTimeline);
+        vkTimestampsResolve($this, $slot, $this->gpuProfiler);
         $slot->ring->reset();
         $slot->uniformsDirty = true;
 
@@ -272,49 +288,12 @@ public class Device : DeviceProtocol
             return .error($e);
         }
 
-        uint32 $index = 0;
-        vk::Result $acq = vk::AcquireNextImageKHR(
-            $this->logical,
-            $this->swapchain,
-            vk::WHOLE_SIZE,
-            $slot->acquire,
-            vk::Fence::none(),
-            &$index
-        );
-
-        if ($acq == vk::Result::errorDeviceLost || $acq == vk::Result::errorSurfaceLostKhr) {
-            $this->lostFlag = true;
-            return .error(.surfaceLost);
-        }
-
-        if ($acq == vk::Result::errorOutOfDateKhr) {
-            guard vkBootSwapchain($this, $width, $height) else ($e) {
-                return .error($e);
-            }
-
-            if ($this->extent->width == 0 || $this->swapchain->handle == 0) {
-                return .ok(.skipped);
-            }
-
-            $acq = vk::AcquireNextImageKHR(
-                $this->logical,
-                $this->swapchain,
-                vk::WHOLE_SIZE,
-                $slot->acquire,
-                vk::Fence::none(),
-                &$index
-            );
-        }
-
-        if (!$acq->ok() && $acq != vk::Result::suboptimalKhr) {
-            return .error(vkErr($acq, 'AcquireNextImageKHR'));
-        }
-
         guard vkCheck(vk::ResetFences($this->logical, 1, &$slot->fence), 'ResetFences') else ($e) {
             return .error($e);
         }
 
-        $this->imageIndex = $index;
+        $slot->sceneSubmitted = false;
+        $slot->cmd = $slot->sceneCmd;
         vk::CommandBufferBeginInfo $begin = vk::CommandBufferBeginInfo();
         $begin->flags = vk::COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         guard vkCheck(vk::BeginCommandBuffer($slot->cmd, &$begin), 'BeginCommandBuffer') else ($e) {
@@ -322,24 +301,7 @@ public class Device : DeviceProtocol
             return .error($e);
         }
         vkTimestampsBegin($slot, $this->frames);
-
-        TextureHandle $th = TextureHandle(
-            $this->images[$index],
-            $this->views[$index],
-            array<vk::ImageView>(),
-            vk::DeviceMemory::none(),
-            true,
-            0 as uint64
-        );
-        TextureDesc $bbDesc = TextureDesc(
-            $format: $this->bbFormat,
-            $width: $this->extent->width as int32,
-            $height: $this->extent->height as int32
-        );
-        $bbDesc->usage = 0 as uint32;
-        Texture $bb = Texture(imported: $this, $th, $bbDesc);
-        $bb->state = .undefined;
-        $this->bb = $bb;
+        $this->bb = null;
         $this->inFrame = true;
         return .ok(.ready);
     }
@@ -348,61 +310,11 @@ public class Device : DeviceProtocol
     {
         assert($this->inFrame, 'endFrame outside beginFrame');
         assert(!$this->encoderOpen, 'endFrame with an open encoder');
-        Texture $bb = guard $this->bb;
+        Texture $bb = guard $this->bb else {
+            return vkEndSubmit($this, false);
+        }
         $this->transitionTexture($bb, .present);
-        FrameSlot $slot = $this->slots[$this->slot];
-        vkTimestampsEnd($slot);
-        guard vkCheck(vk::EndCommandBuffer($slot->cmd), 'EndCommandBuffer') else ($e) {
-            vkRecreateSignaledFence($this, $slot);
-            $this->lostFlag = true;
-            $this->inFrame = false;
-            $this->bb = null;
-            return .error($e);
-        }
-
-        uint32 $waitStage = vk::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        vk::SubmitInfo $si = vk::SubmitInfo();
-        $si->waitSemaphoreCount = 1;
-        $si->pWaitSemaphores:$ = &$slot->acquire;
-        $si->pWaitDstStageMask:$ = &$waitStage;
-        $si->commandBufferCount = 1;
-        $si->pCommandBuffers:$ = &$slot->cmd;
-        $si->signalSemaphoreCount = 1;
-        $si->pSignalSemaphores:$ = &$this->renderDone[$this->imageIndex];
-        guard vkCheck(vk::QueueSubmit($this->queue, 1, &$si, $slot->fence), 'QueueSubmit') else ($e) {
-            vkRecreateSignaledFence($this, $slot);
-            $this->lostFlag = true;
-            $this->inFrame = false;
-            $this->bb = null;
-            return .error($e);
-        }
-
-        vk::PresentInfoKHR $pi = vk::PresentInfoKHR();
-        $pi->waitSemaphoreCount = 1;
-        $pi->pWaitSemaphores:$ = &$this->renderDone[$this->imageIndex];
-        $pi->swapchainCount = 1;
-        $pi->pSwapchains:$ = &$this->swapchain;
-        $pi->pImageIndices:$ = &$this->imageIndex;
-        vk::Result $pr = vk::QueuePresentKHR($this->queue, &$pi);
-
-        if ($pr == vk::Result::errorOutOfDateKhr || $pr == vk::Result::suboptimalKhr) {
-            $this->pendingResize = true;
-        } else if (!$pr->ok()) {
-            $this->inFrame = false;
-            $this->bb = null;
-            if ($pr == vk::Result::errorDeviceLost || $pr == vk::Result::errorSurfaceLostKhr) {
-                $this->lostFlag = true;
-            }
-
-            return .error(vkErr($pr, 'QueuePresentKHR'));
-        }
-
-        $this->inFrame = false;
-        $this->bb = null;
-        $this->frames = $this->frames + 1;
-        $this->slot = ($this->slot + 1) % FRAMES_IN_FLIGHT;
-        $this->draws->roll();
-        return .ok;
+        return vkEndSubmit($this, true);
     }
 
     public const function inFrame() : bool
@@ -422,10 +334,10 @@ public class Device : DeviceProtocol
 
     public function backbuffer() : Texture
     {
-        Texture $bb = guard $this->bb else {
-            die('backbuffer outside beginFrame');
+        Texture $have = guard $this->bb else {
+            return vkAcquireBackbuffer($this);
         }
-        return $bb;
+        return $have;
     }
 
     public const function backbufferFormat() : PixelFormat
@@ -476,7 +388,8 @@ public class Device : DeviceProtocol
         assert($this->inFrame, 'beginRender outside beginFrame');
         assert(!$this->encoderOpen, 'beginRender while an encoder is open');
         uint32 $n = $desc->colors->count() as uint32;
-        assert($n > 0 && $n <= MAX_COLOR_TARGETS, 'beginRender color targets');
+        assert($n <= MAX_COLOR_TARGETS, 'beginRender color targets');
+        assert($n > 0 || $desc->depth != null, 'beginRender needs a color or a depth target');
         vk::RenderingAttachmentInfo[8] $atts;
         TargetFormats $formats = TargetFormats();
         uint32 $i = 0;
@@ -517,22 +430,34 @@ public class Device : DeviceProtocol
 
         $formats->colorCount = $n;
         $formats->samples = .one;
-        ColorTarget $first = $desc->colors[0];
-        int32 $passWidth = $first->width();
-        int32 $passHeight = $first->height();
+        int32 $passWidth = 1;
+        int32 $passHeight = 1;
+        if ($n > 0) {
+            ColorTarget $first = $desc->colors[0];
+            $passWidth = $first->width();
+            $passHeight = $first->height();
+        }
+
         vk::RenderingInfo $info = vk::RenderingInfo();
         $info->renderArea->extent = vk::Extent2D($passWidth as uint32, $passHeight as uint32);
         $info->layerCount = 1;
         $info->colorAttachmentCount = $n;
-        $info->pColorAttachments:$ = &$atts[0];
+        if ($n > 0) {
+            $info->pColorAttachments:$ = &$atts[0];
+        }
+
         vk::RenderingAttachmentInfo $depthAtt = vk::RenderingAttachmentInfo();
         if ($desc->depth != null) {
             DepthTarget $depth = guard $desc->depth;
+            $depth->validate();
             $formats->depth = $depth->texture->desc->format;
             $formats->hasDepth = true;
             ResourceState $depthFrom = $depth->texture->state;
 
-            if ($depth->load != LoadOp::load) {
+            // clearing one array layer or mip must not discard the others
+            if ($depth->load != LoadOp::load
+                && $depth->texture->layers() == 1
+                && $depth->texture->desc->mips == 1) {
                 $depthFrom = .undefined;
             }
 
@@ -544,15 +469,20 @@ public class Device : DeviceProtocol
                 vkAspect($depth->texture->desc->format)
             );
             $depth->texture->state = .depthTarget;
-            $depthAtt->imageView = $depth->texture->handle->view;
+            $depthAtt->imageView = vkAttachmentView($depth->texture, $depth->face, $depth->mip);
             $depthAtt->imageLayout = vk::IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             $depthAtt->loadOp = vkLoadOp($depth->load);
             $depthAtt->storeOp = vkStoreOp($depth->store);
             $depthAtt->clearValue = vk::ClearValue(depth: $depth->clearDepth, stencil: 0);
             $info->pDepthAttachment:$ = &$depthAtt;
+            if ($n == 0) {
+                $passWidth = $depth->width();
+                $passHeight = $depth->height();
+                $info->renderArea->extent = vk::Extent2D($passWidth as uint32, $passHeight as uint32);
+            }
         }
 
-        vkTimestampsOpen($this->slots[$this->slot], $this->gpuTimeline->scope);
+        vkTimestampsOpen($this->slots[$this->slot]);
         vk::CmdBeginRendering($this->currentCmd(), &$info);
         $this->encoderOpen = true;
         return RenderEncoder($this, $formats, $passWidth, $passHeight);
@@ -788,6 +718,16 @@ public class Device : DeviceProtocol
     {
         $this->encoderOpen = false;
         vkTimestampsClose($this->slots[$this->slot]);
+    }
+
+    public function gpuBegin(const string& $name) : GpuProfileScope
+    {
+        return vkGpuBegin($this, $name, .graphics);
+    }
+
+    public function gpuEnd(GpuProfileScope $scope) : void
+    {
+        vkGpuEnd($this, $scope);
     }
 
     public function shutdown() : void

@@ -1,0 +1,118 @@
+/**
+ * ShadowConsole routing: on/off, debug/splits must not enable when off.
+ */
+
+use visu::console::ShadowConsole;
+use visu::ecs::{Entities, Systems};
+use visu::graphics::{DeferredRenderer, Device, ShadowQuality};
+use visu::os::{Window, WindowHints};
+use visu::os::input::InputHub;
+use visu::runtime::DebugConsole;
+use visu::signal::Dispatcher;
+
+test shadow_console_toggle
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d, InputHub(Window('shadows', 64, 64, WindowHints()), $d));
+    DeferredRenderer $renderer = DeferredRenderer(Device());
+    ShadowConsole $verbs = ShadowConsole($renderer);
+    Systems $systems = Systems();
+    $systems->listen($c);
+    $systems->bindConsole($verbs);
+
+    Entities $world = Entities();
+    $systems->register($world);
+
+    $c->submit('shadows');
+    array<string> $h0 = $c->history();
+    assert($h0[$h0->count() - 1] == 'shadows: off', 'default off');
+    assert($renderer->shadows == null, 'null');
+
+    $c->submit('shadows on');
+    assert($renderer->shadows != null, 'on');
+    array<string> $h1 = $c->history();
+    assert($h1[$h1->count() - 1] == 'shadows: on, 2048, debug off', 'on line');
+
+    $c->submit('shadows debug');
+    ShadowQuality $q = guard $renderer->shadows;
+    assert($q->debug, 'debug');
+    $c->submit('shadows off');
+    assert($renderer->shadows == null, 'off');
+    $c->submit('shadows on');
+    ShadowQuality $again = guard $renderer->shadows;
+    assert($again->debug, 'held debug');
+
+    $c->submit('shadows splits 20 80 250 1000 4000');
+    ShadowQuality $splitQ = guard $renderer->shadows;
+    assert($splitQ->splits->count() == 5, 'five');
+    assert($splitQ->splits[0] == 20.0f, 'near split');
+    assert($splitQ->splits[4] == 4000.0f, 'far split');
+    assert($splitQ->maxLength == 4000.0f, 'maxLength follows last');
+    array<string> $hSplits = $c->history();
+    assert($hSplits[$hSplits->count() - 1] == 'shadows splits: 20 80 250 1000 4000', 'splits line');
+
+    $systems->unregister($world);
+}
+
+test shadow_console_debug_and_splits_do_not_enable
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d, InputHub(Window('shadows-off', 64, 64, WindowHints()), $d));
+    DeferredRenderer $renderer = DeferredRenderer(Device());
+    ShadowConsole $verbs = ShadowConsole($renderer);
+    Systems $systems = Systems();
+    $systems->listen($c);
+    $systems->bindConsole($verbs);
+
+    Entities $world = Entities();
+    $systems->register($world);
+
+    $c->submit('shadows debug');
+    assert($renderer->shadows == null, 'debug leaves off');
+    array<string> $hDebug = $c->history();
+    assert($hDebug[$hDebug->count() - 1] == 'shadows: off, 2048, debug on', 'debug held');
+
+    $c->submit('shadows splits 20 80 250 1000 4000');
+    assert($renderer->shadows == null, 'splits leaves off');
+    array<string> $hSplits = $c->history();
+    assert($hSplits[$hSplits->count() - 1] == 'shadows splits: 20 80 250 1000 4000', 'splits held');
+
+    $c->submit('shadows on');
+    ShadowQuality $on = guard $renderer->shadows;
+    assert($on->debug, 'on restores debug');
+    assert($on->splits->count() == 5, 'on restores splits');
+    assert($on->splits[0] == 20.0f, 'near');
+
+    $systems->unregister($world);
+}
+
+test shadow_console_rejects_non_increasing_splits
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = DebugConsole($d, InputHub(Window('shadows-bad', 64, 64, WindowHints()), $d));
+    DeferredRenderer $renderer = DeferredRenderer(Device());
+    ShadowConsole $verbs = ShadowConsole($renderer);
+    Systems $systems = Systems();
+    $systems->listen($c);
+    $systems->bindConsole($verbs);
+
+    Entities $world = Entities();
+    $systems->register($world);
+
+    $c->submit('shadows on');
+    $c->submit('shadows splits 20 80 250 1000 4000');
+    $c->submit('shadows splits 100 50 20 10 5');
+    array<string> $hBad = $c->history();
+    assert($hBad[$hBad->count() - 1] == 'shadows: splits must increase and sit past near', 'rejected');
+    ShadowQuality $kept = guard $renderer->shadows;
+    assert($kept->splits->count() == 5, 'kept');
+    assert($kept->splits[0] == 20.0f, 'unchanged near');
+    assert($kept->splits[4] == 4000.0f, 'unchanged far');
+
+    $c->submit('shadows splits 0.05 1 2 3 4');
+    array<string> $hNear = $c->history();
+    assert($hNear[$hNear->count() - 1] == 'shadows: splits must increase and sit past near', 'past near');
+    assert($kept->splits[0] == 20.0f, 'still unchanged');
+
+    $systems->unregister($world);
+}

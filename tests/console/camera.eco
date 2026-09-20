@@ -1,0 +1,51 @@
+/**
+ * CameraConsole grammar: freeze on, off, toggle, status.
+ */
+
+use visu::console::{CameraConsoleAction, parseCameraConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal function cameraConsole(const string& $line) : CameraConsoleAction
+{
+    return parseCameraConsole(ConsoleCommandSignal($line));
+}
+
+internal function isUsage(CameraConsoleAction $action) : bool
+{
+    return match ($action) {
+        CameraConsoleAction::usage => true,
+        else => false,
+    };
+}
+
+test camera_console_bare_verb_is_status
+{
+    CameraConsoleAction $action = cameraConsole('camera');
+    bool $status = match ($action) {
+        CameraConsoleAction::status => true,
+        else => false,
+    };
+    assert($status, 'camera alone prints freeze state');
+    assert(isUsage(cameraConsole('model')), 'another verb is not ours');
+    assert(isUsage(cameraConsole('camera nonsense')), 'an unknown argument is usage');
+}
+
+test camera_console_freeze_toggles_without_an_argument
+{
+    bool $toggle = match (cameraConsole('camera freeze')) {
+        CameraConsoleAction::freezeToggle => true,
+        else => false,
+    };
+    assert($toggle, 'bare freeze toggles');
+    bool $on = match (cameraConsole('camera freeze on')) {
+        CameraConsoleAction::freeze($v) => $v,
+        else => false,
+    };
+    assert($on, 'freeze on');
+    bool $offSet = match (cameraConsole('camera freeze off')) {
+        CameraConsoleAction::freeze($v) => $v,
+        else => true,
+    };
+    assert(!$offSet, 'freeze off');
+    assert(isUsage(cameraConsole('camera freeze maybe')), 'on or off, nothing else');
+}

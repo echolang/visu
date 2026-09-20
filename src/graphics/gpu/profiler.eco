@@ -1,0 +1,55 @@
+/**
+ * GPU profiler above Metal / Vulkan. Device records timestamps into the current
+ * frame slot; this object is the mailbox the CPU profiler drains two frames later.
+ * `supported` is false when the device cannot sample or under VISU_RELEASE.
+ */
+
+namespace visu::graphics;
+
+public const uint32 MAX_GPU_SCOPES = 256;
+public const uint32 GPU_QUERY_COUNT = 512;
+
+public class GpuProfiler
+{
+    public bool $supported;
+    public GpuProfilerMode $mode;
+    private array<GpuPublish> $inbox;
+
+    public constructor()
+    {
+        $this->supported = false;
+        $this->mode = .off;
+        $this->inbox = array<GpuPublish>();
+    }
+
+    /**
+     * The backend hands over one resolved frame.
+     */
+    public function publish(GpuPublish $item) : void
+    {
+        $this->inbox[] = $item;
+    }
+
+    /**
+     * Span-only publish used by tests and backends that have not filled a full item.
+     */
+    public function publish(uint64 $frame, array<GpuSpan> $spans, int32 $dropped, float64 $busyNs = 0.0) : void
+    {
+        GpuPublish $item = GpuPublish();
+        $item->frame = $frame;
+        $item->spans = $spans;
+        $item->dropped = $dropped;
+        $item->busyNs = $busyNs;
+        $this->publish($item);
+    }
+
+    /**
+     * Drain every unpublished resolve. Empty is a real result: nothing landed since the last take.
+     */
+    public function take() : array<GpuPublish>
+    {
+        array<GpuPublish> $have = $this->inbox;
+        $this->inbox = array<GpuPublish>();
+        return $have;
+    }
+}

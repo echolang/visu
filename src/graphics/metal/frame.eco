@@ -70,6 +70,12 @@ internal class HostRing
 internal class FrameSlot
 {
     public mtl::CommandBuffer? $prev;
+    // tessellation-factor compute committed before $prev; kernel time is a GPU span
+    public mtl::CommandBuffer? $prePrev;
+    // blit/overlay command buffer when the scene submitted without the drawable
+    public mtl::CommandBuffer? $presentPrev;
+    // profile node that first called tessellateWith this frame, or -1
+    public int32 $preScope;
     public HostRing $ring;
     public mtl::SharedEvent $gpuDone;
     public uint64 $epoch;
@@ -78,6 +84,9 @@ internal class FrameSlot
     public constructor(mtl::SharedEvent $gpuDone)
     {
         $this->prev = null;
+        $this->prePrev = null;
+        $this->presentPrev = null;
+        $this->preScope = -1;
         $this->ring = HostRing();
         $this->gpuDone = $gpuDone;
         $this->epoch = 0;
@@ -101,7 +110,7 @@ internal function mtlCreateSlots(Device $device) : status<DeviceError>
             return .error($e);
         }
 
-        if ($device->gpuTimeline->supported) {
+        if ($device->gpuProfiler->supported) {
             mtlTimestampsCreate($gpu, $slot->stamps);
         }
 
@@ -116,6 +125,9 @@ internal function mtlDestroySlots(Device $device) : void
 {
     foreach ($device->slots as $slot) {
         $slot->prev = null;
+        $slot->prePrev = null;
+        $slot->presentPrev = null;
+        $slot->preScope = -1;
         $slot->stamps->buffer = null;
         $slot->ring->destroy();
     }

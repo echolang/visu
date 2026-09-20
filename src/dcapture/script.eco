@@ -1,7 +1,7 @@
 /**
  * The dcapture script: JSON text to typed steps.
  *
- * Top level: `out`, `headless`, `window: [w, h]`, `frames`, `flags`, `list`, `steps`.
+ * Top level: `out`, `headless`, `window: [w, h]`, `frames`, `flags`, `list`, `gpuLog`, `steps`.
  * A step carries exactly one timing key (`frame`, `tick`, `after`) and any of the actions
  * `label`, `flags`, `camera`, `console`, `dump`, `profile`, `list`, `log`, `stop`. Parsing is strict: a
  * wrong shape names the JSON path it tripped on, so an agent can fix the script blind.
@@ -102,6 +102,10 @@ public class Script
     public int32? $frames;
     public array<FlagAssign> $flags;
     public bool $list;
+    /**
+     * One JSON line per completed frame of GPU times only (`gpu.jsonl`), not the full profile tree.
+     */
+    public bool $gpuLog;
     public array<Step> $steps;
 
     public constructor()
@@ -113,6 +117,7 @@ public class Script
         $this->frames = null;
         $this->flags = array<FlagAssign>();
         $this->list = false;
+        $this->gpuLog = false;
         $this->steps = array<Step>();
     }
 
@@ -150,6 +155,11 @@ public class Script
         }
 
         return false;
+    }
+
+    public const function hasGpuLog() : bool
+    {
+        return $this->gpuLog;
     }
 
     /**
@@ -205,6 +215,10 @@ public class Script
             return .error($e);
         }
         $script->list = $list;
+        bool $gpuLog = guard optBool($root, 'gpuLog', 'gpuLog', false) else ($e) {
+            return .error($e);
+        }
+        $script->gpuLog = $gpuLog;
         int64 $frames = 0;
         bool $hasFrames = guard intField($root, 'frames', 'frames', $frames) else ($e) {
             return .error($e);

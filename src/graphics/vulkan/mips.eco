@@ -1,6 +1,7 @@
 /**
  * Mip chain by successive blits.
- * Every array layer (every cube face) is filled in the same pass, and the whole image is left readable.
+ * One layer per blit: MoltenVK's linear cube blit makes a 2D-array view of all faces at once
+ * and encodes a null Metal texture (Play's first environment generateMipmaps segfault).
  */
 
 namespace visu::graphics;
@@ -27,39 +28,67 @@ internal function vkRecordMipChain(vk::CommandBuffer $cmd, Texture $texture) : v
             0,
             $layers
         );
-        vk::ImageBlit $blit = vk::ImageBlit();
-        $blit->srcSubresource->aspectMask = $aspect;
-        $blit->srcSubresource->mipLevel = $srcLevel as uint32;
-        $blit->srcSubresource->baseArrayLayer = 0;
-        $blit->srcSubresource->layerCount = $layers;
-        $blit->srcOffsets[1] = vk::Offset3D(
-            mipSize($texture->desc->width, $srcLevel),
-            mipSize($texture->desc->height, $srcLevel),
-            1
-        );
-        $blit->dstSubresource->aspectMask = $aspect;
-        $blit->dstSubresource->mipLevel = $level as uint32;
-        $blit->dstSubresource->baseArrayLayer = 0;
-        $blit->dstSubresource->layerCount = $layers;
-        $blit->dstOffsets[1] = vk::Offset3D(
-            mipSize($texture->desc->width, $level),
-            mipSize($texture->desc->height, $level),
-            1
-        );
-        vk::CmdBlitImage(
-            $cmd,
-            $image,
-            vk::IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            $image,
-            vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1,
-            &$blit,
-            vk::FILTER_LINEAR
-        );
+        int32 $srcW = mipSize($texture->desc->width, $srcLevel);
+        int32 $srcH = mipSize($texture->desc->height, $srcLevel);
+        int32 $dstW = mipSize($texture->desc->width, $level);
+        int32 $dstH = mipSize($texture->desc->height, $level);
+        uint32 $layer = 0;
+
+        while ($layer < $layers) {
+            vk::ImageBlit $blit = vkMipBlit(
+                $aspect,
+                $srcLevel as uint32,
+                $level as uint32,
+                $layer,
+                $srcW,
+                $srcH,
+                $dstW,
+                $dstH
+            );
+            vk::CmdBlitImage(
+                $cmd,
+                $image,
+                vk::IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                $image,
+                vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                &$blit,
+                vk::FILTER_LINEAR
+            );
+            $layer = $layer + 1;
+        }
+
         $level = $level + 1;
     }
 
     // every level but the last read as a blit source; the last is still a destination
     vkRecordBarrierRange($cmd, $image, .transferSrc, .shaderRead, $aspect, 0, $levels - 1, 0, $layers);
     vkRecordBarrierRange($cmd, $image, .transferDst, .shaderRead, $aspect, $levels - 1, 1, 0, $layers);
+}
+
+internal function vkMipBlit(
+    uint32 $aspect,
+    uint32 $srcLevel,
+    uint32 $dstLevel,
+    uint32 $layer,
+    int32 $srcW,
+    int32 $srcH,
+    int32 $dstW,
+    int32 $dstH
+) : vk::ImageBlit
+{
+    vk::ImageBlit $blit = vk::ImageBlit();
+    $blit->srcSubresource->aspectMask = $aspect;
+    $blit->srcSubresource->mipLevel = $srcLevel;
+    $blit->srcSubresource->baseArrayLayer = $layer;
+    $blit->srcSubresource->layerCount = 1;
+    $blit->srcOffsets[0] = vk::Offset3D(0, 0, 0);
+    $blit->srcOffsets[1] = vk::Offset3D($srcW, $srcH, 1);
+    $blit->dstSubresource->aspectMask = $aspect;
+    $blit->dstSubresource->mipLevel = $dstLevel;
+    $blit->dstSubresource->baseArrayLayer = $layer;
+    $blit->dstSubresource->layerCount = 1;
+    $blit->dstOffsets[0] = vk::Offset3D(0, 0, 0);
+    $blit->dstOffsets[1] = vk::Offset3D($dstW, $dstH, 1);
+    return $blit;
 }

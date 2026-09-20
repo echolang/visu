@@ -36,7 +36,7 @@ public class ShaderCollection
 
     /**
      * Register every shader program under `$directory` (the collection directory when omitted). Recurses.
-     * Name is the relative path with `.vert|.frag|.geo|.tessc|.tesse.{suffix}` stripped; `name+variant` files become permutation refs.
+     * Name is the relative path with `.vert|.frag|.geo|.tessc|.tesse|.comp.{suffix}` stripped; `name+variant` files become permutation refs.
      * Already-registered names are left alone. Does not compile.
      */
     public function scan(string? $directory = null) : status<ShaderError>
@@ -58,6 +58,18 @@ public class ShaderCollection
         }
 
         return .ok($this->shaders[$name]);
+    }
+
+    /**
+     * Compile if needed and return the compute program. The stem must have a `.comp` stage.
+     */
+    public function compute(string $name) : result<ComputeProgram, ShaderError>
+    {
+        if (!$this->shaders->has($name)) {
+            return .error(.missing($name));
+        }
+
+        return $this->shaders[$name]->loadCompute();
     }
 
     /**
@@ -152,6 +164,10 @@ public class ShaderCollection
             ShaderRef $entry = $this->shaders[$name];
 
             if ($entry->files->count() == 0) {
+                continue;
+            }
+
+            if (shaderFilesAreComputeOnly($entry->files)) {
                 continue;
             }
 
@@ -368,6 +384,8 @@ public class ShaderCollection
                 $tcs = $bytes;
             } else if ($file->kind == ShaderKind::tessEvaluation) {
                 $tes = $bytes;
+            } else if ($file->kind == ShaderKind::compute) {
+                continue;
             } else {
                 return .error(.compile("shader '{$ref->name}': unsupported stage"));
             }
@@ -406,6 +424,62 @@ public class ShaderCollection
         $ref->compiled = $program;
         return .ok($program);
     }
+
+    internal function compileCompute(ShaderRef $ref) : result<ComputeProgram, ShaderError>
+    {
+        ComputeProgram $held = guard $ref->compiledCompute else {
+            return $this->buildCompute($ref);
+        }
+
+        if ($held->destroyed()) {
+            return $this->buildCompute($ref);
+        }
+
+        return .ok($held);
+    }
+
+    private function buildCompute(ShaderRef $ref) : result<ComputeProgram, ShaderError>
+    {
+        if ($ref->files->count() == 0) {
+            return .error(.missing($ref->name));
+        }
+
+        string $cs = '';
+        foreach ($ref->files as $file) {
+            if ($file->kind != ShaderKind::compute) {
+                continue;
+            }
+
+            string $bytes = guard $this->loader->read($file->path) else ($e) {
+                return .error($e);
+            }
+            $cs = $bytes;
+        }
+
+        if ($cs->empty()) {
+            return .error(.missing($ref->name));
+        }
+
+        ComputeProgram $program = guard ComputeProgram::link($this->device, $ref->name, $cs) else ($e) {
+            return .error($e);
+        }
+        $ref->compiledCompute = $program;
+        return .ok($program);
+    }
+}
+
+internal function shaderFilesAreComputeOnly(const array<ShaderFile>& $files) : bool
+{
+    bool $hasCompute = false;
+    foreach ($files as $file) {
+        if ($file->kind != ShaderKind::compute) {
+            return false;
+        }
+
+        $hasCompute = true;
+    }
+
+    return $hasCompute;
 }
 
 internal function definesMatch(const array<Define>& $got, const array<Define>& $want) : bool

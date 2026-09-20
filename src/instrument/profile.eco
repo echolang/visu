@@ -8,13 +8,13 @@
 
 namespace visu::instrument;
 
-use visu::profile::{ScopeStats, StatsBook};
+use visu::profile::{ScopeSnap, StatsBook};
 
 public function rowsFromStats(const StatsBook& $stats) : array<PassTiming>
 {
-    array<ScopeStats> $all = $stats->all();
+    array<ScopeSnap> $all = $stats->snaps();
     array<PassTiming> $out = array<PassTiming>();
-    appendStatRows($stats, $all, '', array<bool>(), $out);
+    appendStatRows($all, '', array<bool>(), $out);
     return $out;
 }
 
@@ -23,14 +23,13 @@ public function rowsFromStats(const StatsBook& $stats) : array<PassTiming>
  * row keeps it for the tree connectors and its children get it extended by the row's own flag.
  */
 internal function appendStatRows(
-    const StatsBook& $stats,
-    const array<ScopeStats>& $all,
+    const array<ScopeSnap>& $all,
     const string& $parentPath,
     const array<bool>& $guides,
     array<PassTiming>& $out
 ) : void
 {
-    array<ScopeStats> $siblings = array<ScopeStats>();
+    array<ScopeSnap> $siblings = array<ScopeSnap>();
     foreach ($all as $s) {
         if ($s->parentPath == $parentPath) {
             $siblings = insertByAverage($siblings, $s);
@@ -39,9 +38,10 @@ internal function appendStatRows(
 
     usize $count = $siblings->count();
     usize $i = 0;
+    float64 $busy = renderBusy($all);
 
     while ($i < $count) {
-        ScopeStats $s = $siblings[$i];
+        ScopeSnap $s = $siblings[$i];
         $i = $i + 1;
         PassTiming $row = PassTiming();
         $row->name = $s->name;
@@ -51,26 +51,42 @@ internal function appendStatRows(
         $row->depth = $s->depth - 1;
         $row->calls = $s->lastCalls;
         $row->childCount = childStatCount($all, $s->path);
-        $row->cpuNs = $s->cpu->last;
-        $row->avgCpuNs = $s->cpu->avg();
-        $row->maxCpuNs = $s->cpu->max();
-        $row->gpuKnown = $stats->gpuKnown($s);
+        $row->cpuNs = $s->cpuLast;
+        $row->avgCpuNs = $s->cpuAvg;
+        $row->maxCpuNs = $s->cpuMax;
+        $row->gpuKnown = $s->gpuKnown;
 
         if ($row->gpuKnown) {
-            $row->gpuNs = $s->gpu->last;
-            $row->avgGpuNs = $s->gpu->avg();
-            $row->maxGpuNs = $s->gpu->max();
+            $row->gpuNs = $s->gpuLast;
+            $row->avgGpuNs = $s->gpuAvg;
+            $row->maxGpuNs = $s->gpuMax;
+            $row->emaGpuNs = $s->gpuEma;
+
+            if ($busy > 0.0) {
+                $row->gpuPct = $s->gpuAvg / $busy;
+            }
         }
 
         $row->draw = $s->lastDraw;
         $out[] = $row;
         array<bool> $below = $guides;
         $below[] = !$row->last;
-        appendStatRows($stats, $all, $s->path, $below, $out);
+        appendStatRows($all, $s->path, $below, $out);
     }
 }
 
-internal function childStatCount(const array<ScopeStats>& $all, const string& $path) : int32
+internal function renderBusy(const array<ScopeSnap>& $all) : float64
+{
+    foreach ($all as $s) {
+        if ($s->path == 'render') {
+            return $s->gpuAvg;
+        }
+    }
+
+    return 0.0;
+}
+
+internal function childStatCount(const array<ScopeSnap>& $all, const string& $path) : int32
 {
     int32 $n = 0;
     foreach ($all as $s) {
@@ -82,12 +98,12 @@ internal function childStatCount(const array<ScopeStats>& $all, const string& $p
     return $n;
 }
 
-internal function insertByAverage(array<ScopeStats> $list, ScopeStats $s) : array<ScopeStats>
+internal function insertByAverage(array<ScopeSnap> $list, ScopeSnap $s) : array<ScopeSnap>
 {
-    array<ScopeStats> $out = array<ScopeStats>();
+    array<ScopeSnap> $out = array<ScopeSnap>();
     bool $placed = false;
     foreach ($list as $have) {
-        if (!$placed && statBefore($s, $have)) {
+        if (!$placed && snapBefore($s, $have)) {
             $out[] = $s;
             $placed = true;
         }
@@ -102,20 +118,14 @@ internal function insertByAverage(array<ScopeStats> $list, ScopeStats $s) : arra
     return $out;
 }
 
-internal function statBefore(const ScopeStats& $a, const ScopeStats& $b) : bool
+internal function snapBefore(const ScopeSnap& $a, const ScopeSnap& $b) : bool
 {
-    float64 $ga = $a->gpu->avg();
-    float64 $gb = $b->gpu->avg();
-
-    if ($ga != $gb) {
-        return $ga > $gb;
+    if ($a->gpuAvg != $b->gpuAvg) {
+        return $a->gpuAvg > $b->gpuAvg;
     }
 
-    float64 $ca = $a->cpu->avg();
-    float64 $cb = $b->cpu->avg();
-
-    if ($ca != $cb) {
-        return $ca > $cb;
+    if ($a->cpuAvg != $b->cpuAvg) {
+        return $a->cpuAvg > $b->cpuAvg;
     }
 
     return nameBefore($a->name, $b->name);

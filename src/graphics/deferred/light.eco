@@ -35,24 +35,52 @@ internal function lightProgram(DeferredGpu $gpu, Lighting $mode) : result<Shader
     };
 }
 
-internal function lightUniforms(const DirectionalLight& $sun, Environment? $env) : LightUniforms
+internal function iblParams(Environment? $env) : Vec4
 {
-    Vec3 $direction = normalize($sun->direction);
     Environment $held = guard $env else {
         IblQuality $fallback = IblQuality();
-        return LightUniforms(
-            Vec4($direction->x, $direction->y, $direction->z, $sun->intensity),
-            Vec4($sun->color->x, $sun->color->y, $sun->color->z, 1.0f),
-            Vec4($fallback->prefilterMips as float32, 1.0f, 0.0f, 0.0f)
-        );
+        return Vec4($fallback->prefilterMips as float32, 1.0f, 0.0f, 0.0f);
     }
     float32 $environmentMips = $held->cube->desc->mips as float32;
     // never lod into 1x1 env mips: that paints cube faces on the spheres
-    return LightUniforms(
+    return Vec4($held->ibl->prefilterMips as float32, $environmentMips, $held->blend->weight, 0.0f);
+}
+
+internal function lightUniforms(
+    const DirectionalLight& $sun,
+    Environment? $env,
+    ShadowMapData? $shadows = null
+) : LightUniforms
+{
+    Vec3 $direction = normalize($sun->direction);
+    LightUniforms $u = LightUniforms(
         Vec4($direction->x, $direction->y, $direction->z, $sun->intensity),
         Vec4($sun->color->x, $sun->color->y, $sun->color->z, 1.0f),
-        Vec4($held->ibl->prefilterMips as float32, $environmentMips, $held->blend->weight, 0.0f)
+        iblParams($env)
     );
+    ShadowMapData $held = guard $shadows else {
+        return $u;
+    }
+    ShadowCascade[5] $cascades = $held->cascades;
+    int32 $i = 0;
+    while ($i < SHADOW_CASCADES) {
+        $u->lightSpace[$i] = $cascades[$i]->lightSpace;
+        $i = $i + 1;
+    }
+
+    $u->splits = Vec4(
+        $cascades[0]->splitViewZ,
+        $cascades[1]->splitViewZ,
+        $cascades[2]->splitViewZ,
+        $cascades[3]->splitViewZ
+    );
+    float32 $debug = 0.0f;
+    if ($held->debug) {
+        $debug = 1.0f;
+    }
+
+    $u->shadow = Vec4($cascades[4]->splitViewZ, 1.0f, $debug, 0.0f);
+    return $u;
 }
 
 public struct DirectionalLight
@@ -81,7 +109,8 @@ public struct DirectionalLight
 }
 
 /**
- * Mirrors LightUniforms in resources/shaders/pbr/lightpass.frag at uniform slot 2; std140 with vec4 members only.
+ * Mirrors LightUniforms in resources/shaders/pbr/lightpass.frag at uniform slot 2.
+ * std140: three vec4s, five mat4s, then splits and shadow params.
  */
 public struct LightUniforms
 {
@@ -96,6 +125,34 @@ public struct LightUniforms
      * Prefiltered mip count in x, environment mip count in y, blend towards the second IBL state in z.
      */
     public Vec4 $ibl;
+    public Mat4[5] $lightSpace;
+
+    /**
+     * First four cascade splits as view-space Z.
+     */
+    public Vec4 $splits;
+
+    /**
+     * Fifth split in x, enabled in y, cascade tint in z.
+     */
+    public Vec4 $shadow;
+
+    public constructor(Vec4 $sunDirection, Vec4 $sunColor, Vec4 $ibl)
+    {
+        $this->sunDirection = $sunDirection;
+        $this->sunColor = $sunColor;
+        $this->ibl = $ibl;
+        Mat4[5] $space;
+        int32 $i = 0;
+        while ($i < SHADOW_CASCADES) {
+            $space[$i] = Mat4();
+            $i = $i + 1;
+        }
+
+        $this->lightSpace = $space;
+        $this->splits = Vec4(0.0f);
+        $this->shadow = Vec4(0.0f);
+    }
 }
 
 /**

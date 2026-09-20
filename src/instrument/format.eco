@@ -69,10 +69,18 @@ public function formatRows(const Sample& $sample) : array<HudRow>
     array<HudRow> $rows = array<HudRow>();
     $rows[] = HudRow("FPS: {$fps:>4}", 'fps', $fpsRaw as float32, true, false);
     $rows[] = HudRow("TC: {$tc:>5.2f}", 'tc', $tc as float32, true, true);
-    $rows[] = HudRow("UT: {$ut}", 'ut', $sample->loop->tickNs as float32, true, true);
-    $rows[] = HudRow("FT: {$ft}", 'ft', $sample->loop->frameNs as float32, true, true);
-    $rows[] = HudRow("RT: {$rt}", 'rt', $sample->loop->renderNs as float32, true, true);
-    $rows[] = HudRow("GPU: {$gpu}", 'gpu', $sample->loop->gpuNs as float32, true, true);
+    HudRow $utRow = HudRow("UT: {$ut}", 'ut', $sample->loop->tickNs as float32, true, true);
+    $utRow->axisMax = HUD_TIME_BUDGET_NS;
+    $rows[] = $utRow;
+    HudRow $ftRow = HudRow("FT: {$ft}", 'ft', $sample->loop->frameNs as float32, true, true);
+    $ftRow->axisMax = HUD_TIME_BUDGET_NS;
+    $rows[] = $ftRow;
+    HudRow $rtRow = HudRow("RT: {$rt}", 'rt', $sample->loop->renderNs as float32, true, true);
+    $rtRow->axisMax = HUD_TIME_BUDGET_NS;
+    $rows[] = $rtRow;
+    HudRow $gpuRow = HudRow("GPU: {$gpu}", 'gpu', $sample->loop->gpuNs as float32, true, true);
+    $gpuRow->axisMax = HUD_TIME_BUDGET_NS;
+    $rows[] = $gpuRow;
     $rows[] = HudRow("VRAM: {$vram}", 'vram', $sample->memory->used as float32, true, true);
     usize $allocs = $sample->allocations;
 
@@ -153,7 +161,8 @@ public function formatPassWindow(const PassTiming& $p) : string
     string $gpuAvg = formatGpu(shownGpu($p), $p->gpuKnown);
     string $gpuMax = formatGpu(shownMax($p->maxGpuNs, $p->gpuNs), $p->gpuKnown);
     string $calls = formatCalls($p->calls);
-    return "{$name}  CPU: {$cpuAvg} / {$cpuMax}  GPU: {$gpuAvg} / {$gpuMax}{$calls}";
+    string $pct = formatGpuPct($p);
+    return "{$name}  CPU: {$cpuAvg} / {$cpuMax}  GPU: {$gpuAvg} / {$gpuMax}{$pct}{$calls}";
 }
 
 /**
@@ -310,6 +319,19 @@ internal function formatCalls(int32 $calls) : string
     }
 
     return "  x{$calls}";
+}
+
+/**
+ * Frame % is this row's GPU elapsed over the window average of `render` GPU busy, not a sum of passes.
+ */
+internal function formatGpuPct(const PassTiming& $p) : string
+{
+    if (!$p->gpuKnown || $p->gpuPct <= 0.0) {
+        return '';
+    }
+
+    float64 $pct = $p->gpuPct * 100.0;
+    return "  {$pct:>3.0f}%";
 }
 
 /**

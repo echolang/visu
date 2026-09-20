@@ -62,8 +62,8 @@ public interface DeviceProtocol
     const function memoryStats() : MemoryStats;
 
     /**
-     * Acquire the next swapchain image and open the frame. `.skipped` for a 0-size drawable.
-     * Don't call this after shouldClose, or once surfaceLost().
+     * Open the frame and start the scene command buffer. The drawable is not taken yet.
+     * `.skipped` for a 0-size surface. Don't call this after shouldClose, or once surfaceLost().
      */
     function beginFrame(int32 $width, int32 $height) : result<FrameStatus, DeviceError>;
 
@@ -85,8 +85,10 @@ public interface DeviceProtocol
     const function frameIndex() : uint64;
 
     /**
-     * This frame's swapchain image as an imported Texture. Only valid between beginFrame and endFrame.
-     * Don't dump it: endFrame drops it, and Metal cannot blit the drawable.
+     * This frame's swapchain image as an imported Texture. First call acquires the drawable
+     * and, if the scene command buffer already recorded work, commits it so offscreen passes
+     * do not wait on vsync. Only valid between beginFrame and endFrame. Don't dump it:
+     * endFrame drops it, and Metal cannot blit the drawable.
      */
     function backbuffer() : Texture;
 
@@ -126,9 +128,20 @@ public interface DeviceProtocol
 
     /**
      * Open a render encoder for this pass. Must be inside a frame, and no encoder already open.
-     * Needs 1..4 color targets. Close it with endRender.
+     * 0 color targets is a depth-only pass; otherwise 1..MAX_COLOR_TARGETS. Close it with endRender.
      */
     function beginRender(const RenderPassDesc& $desc) : RenderEncoder;
+
+    /**
+     * Open a debug label on the current command buffer. Encoder timestamps tag
+     * `profiler().currentNode()`, not this label. Empty under VISU_RELEASE.
+     */
+    function gpuBegin(const string& $name) : GpuProfileScope;
+
+    /**
+     * Close a GPU profile scope opened by gpuBegin.
+     */
+    function gpuEnd(GpuProfileScope $scope) : void;
 
     /**
      * Put `$texture` into `$to`. Vulkan emits a barrier; Metal just stores the enum.

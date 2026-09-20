@@ -5,6 +5,19 @@
 
 namespace visu::graphics;
 
+/**
+ * Metal tessellation partition mode. Vulkan ignores this; the `tesse` layout qualifier must agree
+ * (`equal_spacing` with `.integer`, `fractional_even_spacing` / `fractional_odd_spacing` with the
+ * matching fractional case).
+ */
+public enum TessellationSpacing
+{
+    case integer;
+    case fractionalEven;
+    case fractionalOdd;
+    case pow2;
+}
+
 public struct GpuPass
 {
     public ShaderProgram $program;
@@ -13,6 +26,7 @@ public struct GpuPass
     public Topology $topology;
     public uint32 $slot;
     public int32 $patchControlPoints;
+    public TessellationSpacing $spacing;
     private string $key;
 
     public constructor(
@@ -21,7 +35,8 @@ public struct GpuPass
         Raster $raster,
         topology: Topology $topology = .triangles,
         slot: uint32 $slot = 0,
-        patchControlPoints: int32 $patchControlPoints = 0
+        patchControlPoints: int32 $patchControlPoints = 0,
+        spacing: TessellationSpacing $spacing = .integer
     )
     {
         $this->program = $program;
@@ -30,6 +45,7 @@ public struct GpuPass
         $this->topology = $topology;
         $this->slot = $slot;
         $this->patchControlPoints = $patchControlPoints;
+        $this->spacing = $spacing;
         if ($this->program->tessellated && $this->patchControlPoints < 1) {
             $this->patchControlPoints = 4;
         }
@@ -69,7 +85,8 @@ public struct GpuPass
             $dwrite = 1;
         }
 
-        $this->key = "{$this->program->id}|{$this->layout->fingerprint()}|{$blend}|{$write}|{$topo}|{$cull}|{$fill}|{$front}|{$dtest}|{$dwrite}|{$depth}|{$patches}";
+        int32 $space = spacingCode($this->spacing);
+        $this->key = "{$this->program->id}|{$this->layout->fingerprint()}|{$blend}|{$write}|{$topo}|{$cull}|{$fill}|{$front}|{$dtest}|{$dwrite}|{$depth}|{$patches}|{$space}";
     }
 
     public const function key() : string
@@ -127,6 +144,16 @@ internal function fillCode(FillMode $fill) : int32
     return match ($fill) {
         FillMode::fill => 0,
         FillMode::lines => 1,
+    };
+}
+
+internal function spacingCode(TessellationSpacing $spacing) : int32
+{
+    return match ($spacing) {
+        TessellationSpacing::integer => 0,
+        TessellationSpacing::fractionalEven => 1,
+        TessellationSpacing::fractionalOdd => 2,
+        TessellationSpacing::pow2 => 3,
     };
 }
 

@@ -19,6 +19,8 @@ internal class DeferredGpu
     public Sampler $linear;
     public Sampler $noiseRepeat;
     public Sampler $cube;
+    public Sampler $shadow;
+    public Texture $shadowDummy;
     public array<Vec4> $kernel;
 
     public static function load(Device $device) : result<DeferredGpu, ShaderError>
@@ -43,6 +45,10 @@ internal class DeferredGpu
             return .error($e);
         }
         guard $shaders->program('debug_lines') else ($e) {
+            $shaders->destroy();
+            return .error($e);
+        }
+        guard $shaders->program('shadow') else ($e) {
             $shaders->destroy();
             return .error($e);
         }
@@ -72,6 +78,8 @@ internal class DeferredGpu
                 $wrapT: .repeat
             )),
             $device->createSampler($cubeDesc),
+            $device->createSampler(SamplerDesc()),
+            shadowDummy($device),
             ssaoKernel(SSAO_MAX_SAMPLES)
         ));
     }
@@ -114,6 +122,7 @@ internal class DeferredGpu
     {
         $this->white->destroy();
         $this->noise->destroy();
+        $this->shadowDummy->destroy();
         $this->blit->destroy();
         $this->shaders->destroy();
     }
@@ -139,4 +148,13 @@ internal function whitePixel(Device $device) : Texture
 {
     array<uint8> $rgba = [255, 255, 255, 255];
     return Texture($device, 'deferred.white', Pixels(1, 1, $rgba));
+}
+
+internal function shadowDummy(Device $device) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .depth32f, $width: 1, $height: 1);
+    $desc->kind = .array2D;
+    $desc->arrayLength = 1;
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET;
+    return Texture($device, 'deferred.shadowDummy', $desc);
 }

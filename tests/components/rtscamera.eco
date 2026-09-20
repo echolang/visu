@@ -1,0 +1,82 @@
+/**
+ * RtsCamera place, zoom, and heightmap follow. No window, no GPU.
+ */
+
+use visu::components::RtsCamera;
+use visu::ecs::Entities;
+use visu::geo::{Heightmap, Transform};
+use visu::graphics::Camera;
+use visu::math::{Vec3, distance, equal, length, normalize};
+
+test rts_camera_place_clamps_radius_to_min_and_max
+{
+    RtsCamera $rts = RtsCamera();
+    Transform $transform = Transform();
+    $transform->position = Vec3(0.0f, 4.0f, 10.0f);
+    $rts->radius = 1.0f;
+    $rts->place($transform);
+    assert(equal($rts->radius, $rts->min), 'min');
+    $rts->radius = 5000.0f;
+    $rts->place($transform);
+    assert(equal($rts->radius, $rts->max), 'max');
+    $rts->radius = -20.0f;
+    $rts->place($transform);
+    assert(equal($rts->radius, 20.0f), 'abs');
+}
+
+test rts_camera_place_sits_on_the_radius_looking_at_focus
+{
+    RtsCamera $rts = RtsCamera();
+    $rts->focus = Vec3(1.0f, 2.0f, 3.0f);
+    $rts->radius = 10.0f;
+    Transform $transform = Transform();
+    $transform->position = Vec3(1.0f, 8.0f, 11.0f);
+    $rts->place($transform);
+    assert(equal(distance($transform->position, $rts->focus), 10.0f, 0.01f), 'radius');
+    Vec3 $to = normalize($rts->focus - $transform->position);
+    assert(equal($transform->forward(), $to, 0.01f), 'look');
+}
+
+test rts_camera_place_from_an_offset_eye_keeps_the_view
+{
+    Vec3 $focus = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 $eye = Vec3(0.0f, 4.0f, 10.0f);
+    RtsCamera $rts = RtsCamera();
+    $rts->focus = $focus;
+    $rts->radius = length($eye - $focus);
+    Transform $transform = Transform();
+    $transform->position = $eye;
+    $rts->place($transform);
+    assert(equal($transform->position, $eye, 0.01f), 'eye');
+    assert(equal($transform->forward(), normalize($focus - $eye), 0.01f), 'look');
+}
+
+test rts_camera_place_snaps_focus_to_the_heightmap
+{
+    Heightmap $map = Heightmap::flat(32, 32, 10.0f, 1.0f);
+    RtsCamera $rts = RtsCamera();
+    $rts->focus = Vec3(0.0f, 0.0f, 0.0f);
+    $rts->radius = 8.0f;
+    $rts->ground = $map;
+    Transform $transform = Transform();
+    $transform->position = Vec3(0.0f, 4.0f, 8.0f);
+    $rts->place($transform);
+    assert(equal($rts->focus->y, 10.0f, 0.01f), 'focus y');
+    assert($transform->position->y >= 10.0f + $rts->clearance - 0.01f, 'clearance');
+
+    $rts->focus = Vec3(100.0f, 0.0f, 100.0f);
+    $rts->place($transform);
+    assert($rts->focus->x <= $map->worldX($map->width - 1), 'max x');
+    assert($rts->focus->z <= $map->worldZ($map->height - 1), 'max z');
+    assert(equal($rts->focus->y, 10.0f, 0.01f), 'clamped y');
+}
+
+test spawn_rts_camera_attaches_the_controller
+{
+    Entities $world = Entities();
+    $entity = Camera::spawn($world, Vec3(0.0f, 40.0f, 120.0f));
+    $world->attach($entity, RtsCamera());
+    assert($world->has<RtsCamera>($entity), 'rts');
+    Transform& $transform = $world->get<Transform>($entity);
+    assert($transform->position->z == 120.0f, 'position z');
+}

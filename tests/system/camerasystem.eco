@@ -161,3 +161,60 @@ test camera_system_snapshots_every_camera
     assert($pa->position->x == 1.0f, 'active previous');
     assert($pb->position->x == 2.0f, 'inactive previous');
 }
+
+test camera_system_freeze_keeps_cull_on_the_snapshot
+{
+    Entities $world = Entities();
+    CameraSystem $system = CameraSystem();
+    Entity $entity = Camera::spawn($world, Vec3(0.0f, 0.0f, 4.0f));
+    ActiveCamera::activate($world, $entity);
+    RenderContext $first = headlessFrame(64, 64);
+    $system->setFrozen(true);
+    $system->render($world, $first);
+    CameraData $snap = $first->frame->get<CameraData>();
+    assert($snap->cullFrozen, 'frozen this frame');
+    assert($snap->position->z == 4.0f, 'live still here');
+    assert($snap->cullPosition->z == 4.0f, 'cull matches on the snapshot frame');
+
+    $world->get<Transform>($entity)->position = Vec3(500.0f, 0.0f, 4.0f);
+    RenderContext $moved = headlessFrame(64, 64);
+    $system->render($world, $moved);
+    CameraData $data = $moved->frame->get<CameraData>();
+    assert($data->cullFrozen, 'still frozen');
+    assert($data->position->x == 500.0f, 'render eye followed the entity');
+    assert($data->cullPosition->x == 0.0f, 'cull eye stayed');
+    assert($data->cullPosition->z == 4.0f, 'cull z stayed');
+    assert($data->cullFrustum->contains(Vec3(0.0f, 0.0f, -10.0f), 1.0f), 'old look still in cull');
+    assert(!$data->frustum->contains(Vec3(0.0f, 0.0f, -10.0f), 1.0f), 'old look is beside the live camera');
+    assert($data->frustum->contains(Vec3(500.0f, 0.0f, -10.0f), 1.0f), 'new look in the render frustum');
+    assert(!$data->cullFrustum->contains(Vec3(500.0f, 0.0f, -10.0f), 1.0f), 'new look outside the freeze');
+    Transform& $transform = $world->get<Transform>($entity);
+    assert($transform->position->x == 500.0f, 'entity was not pinned');
+
+    $system->setFrozen(false);
+    RenderContext $live = headlessFrame(64, 64);
+    $system->render($world, $live);
+    CameraData $joined = $live->frame->get<CameraData>();
+    assert(!$joined->cullFrozen, 'released');
+    assert($joined->cullPosition->x == 500.0f, 'cull joined the entity');
+    assert($joined->position->x == 500.0f, 'render stayed with the entity');
+}
+
+test camera_system_freeze_override_moves_only_the_render_half
+{
+    Entities $world = Entities();
+    CameraSystem $system = CameraSystem();
+    Entity $entity = Camera::spawn($world, Vec3(0.0f, 0.0f, 4.0f));
+    ActiveCamera::activate($world, $entity);
+    RenderContext $first = headlessFrame(64, 64);
+    $system->setFrozen(true);
+    $system->render($world, $first);
+    RenderContext $over = headlessFrame(64, 64);
+    $over->frame->set(CameraOverrideData(Vec3(1.0f, 2.0f, 9.0f), Quat(), 90.0f));
+    $system->render($world, $over);
+    CameraData $data = $over->frame->get<CameraData>();
+    assert($data->position->z == 9.0f, 'override is the render eye');
+    assert($data->cullPosition->z == 4.0f, 'cull stayed on the freeze');
+    Transform& $transform = $world->get<Transform>($entity);
+    assert($transform->position->z == 4.0f, 'entity still untouched');
+}
