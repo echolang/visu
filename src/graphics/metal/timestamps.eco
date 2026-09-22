@@ -363,6 +363,22 @@ internal function mtlWaitDrop(mtl::CommandBuffer? $cmd) : void
     $held->waitUntilCompleted();
 }
 
+/**
+ * beginFrame waits on gpuDone, not on the stored command buffers. Harvest drops those
+ * handles; this still waits the timeline so destroy() cannot race a slot still in flight.
+ */
+internal function mtlWaitGpuDone(Device $device) : void
+{
+    foreach ($device->slots as $slot) {
+        if ($slot->epoch > 0) {
+            $slot->gpuDone->waitUntilSignaledValue(
+                $slot->epoch,
+                timeoutMS: 1000000000
+            );
+        }
+    }
+}
+
 internal function mtlWaitIfNeeded(mtl::CommandBuffer? $cmd) : void
 {
     mtl::CommandBuffer $held = guard $cmd else {

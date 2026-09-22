@@ -4,7 +4,8 @@
 
 use visu::graphics::{
     Device, Pipeline, Pool, Frame, CallbackPass, TargetRef, TextureRef, IoSink,
-    RenderContext, TextureOptions, RenderTarget, PipelineError, Mesh, Texture, PoolError
+    RenderContext, TextureOptions, RenderTarget, PipelineError, Mesh, Texture, PoolError,
+    Pixels
 };
 use visu::os::{Window, WindowHints, init, terminate};
 
@@ -377,5 +378,88 @@ test pool_two_mrts_both_complete
         poolEnd($pool, $window, $device);
         die($e->message());
     }
+    poolEnd($pool, $window, $device);
+}
+
+#[group: "glfw"]
+test pool_import_of_owned_attachment_stays_owned
+{
+    Window $window = poolWindow('pool-owned');
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
+        terminate();
+        die($e->message());
+    }
+
+    Pool $pool = Pool($device);
+    Frame $sceneFrame = Frame();
+    Pipeline $scene = Pipeline($pool, $sceneFrame, $window->renderTarget());
+    TargetRef $t = $scene->createTarget('scene', 8, 8);
+    TextureRef $c = $scene->createColor($t, 'color', TextureOptions());
+    guard $pool->getTarget($t) else ($e) {
+        poolEnd($pool, $window, $device);
+        die($e->message());
+    }
+    Texture $tex = guard $pool->getTexture($c) else ($e) {
+        poolEnd($pool, $window, $device);
+        die($e->message());
+    }
+    Frame $presentFrame = Frame();
+    Pipeline $present = Pipeline($pool, $presentFrame, $window->renderTarget());
+    $present->importTexture($c->name, $tex);
+    assert(!$tex->destroyed(), 'live before reap');
+    $pool->reap();
+    assert($tex->destroyed(), 'reap destroyed the owned attachment');
+    assert(!$pool->hasTexture($c->name), 'name dropped');
+    poolEnd($pool, $window, $device);
+}
+
+#[group: "glfw"]
+test pool_collect_forgets_import_without_destroy
+{
+    Window $window = poolWindow('pool-import');
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
+        terminate();
+        die($e->message());
+    }
+
+    Pool $pool = Pool($device);
+    array<uint8> $rgba = [255, 0, 0, 255];
+    Texture $leaf = Texture($device, 'leaf', Pixels(1, 1, $rgba));
+    Frame $frame = Frame();
+    Pipeline $pipeline = Pipeline($pool, $frame, $window->renderTarget());
+    $pipeline->importTexture('leaf', $leaf);
+    $pool->setCurrentTick(1);
+    $pool->collect();
+    assert(!$pool->hasTexture('leaf'), 'forgotten');
+    assert(!$leaf->destroyed(), 'caller still owns it');
+    $leaf->destroy();
+    poolEnd($pool, $window, $device);
+}
+
+#[group: "glfw"]
+test pool_reap_forgets_imported_target
+{
+    Window $window = poolWindow('pool-bb');
+    Device $device = Device();
+    guard $window->initialize($device) else ($e) {
+        $device->shutdown();
+        terminate();
+        die($e->message());
+    }
+
+    Pool $pool = Pool($device);
+    RenderTarget $rt = $window->renderTarget();
+    int32 $w = $rt->width;
+    Frame $frame = Frame();
+    Pipeline $pipeline = Pipeline($pool, $frame, $rt);
+    assert($pool->hasTarget('backbuffer'), 'imported');
+    $pool->setCurrentTick(1);
+    $pool->collect();
+    assert(!$pool->hasTarget('backbuffer'), 'forgotten');
+    assert($rt->width == $w, 'window target lived');
     poolEnd($pool, $window, $device);
 }

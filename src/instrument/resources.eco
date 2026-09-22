@@ -1,0 +1,42 @@
+/**
+ * Live GPU object counts as the `resources` tab.
+ */
+
+namespace visu::instrument;
+
+use visu::graphics::{Device, MemoryStats, Pool};
+
+public class ResourceSource : Source
+{
+    private Device $device;
+    private Pool $pool;
+
+    public constructor(Device $device, Pool $pool)
+    {
+        $this->device = $device;
+        $this->pool = $pool;
+    }
+
+    public function collect(Sink $sink) : void
+    {
+        $sink->tab('resources', title: 'Resources', 5);
+        visu::graphics::ResourceStats $gpu = $this->device->resourceStats();
+        $sink->section('gpu');
+        $sink->metric('textures', $gpu->textures as float64, .count);
+        $sink->metric('retired', $gpu->retired as float64, .count);
+        $sink->metric('buffers', $gpu->buffers as float64, .count);
+        $sink->metric('samplerCache', $gpu->samplerCache as float64, .count);
+        $sink->metric('programs', $gpu->programs as float64, .count);
+        $sink->section('pool');
+        $sink->metric('textures', $this->pool->textureCount() as float64, .count);
+        $sink->metric('targets', $this->pool->targetCount() as float64, .count);
+        $sink->metric('cached', $this->pool->cachedCount() as float64, .count);
+        MemoryStats $mem = $this->device->memoryStats();
+        $sink->section('memory');
+        if ($mem->budget > 0) {
+            $sink->metric('vram', $mem->used as float64, .bytes, of: $mem->budget as float64);
+        } else {
+            $sink->metric('vram', $mem->used as float64, .bytes);
+        }
+    }
+}

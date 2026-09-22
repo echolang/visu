@@ -66,6 +66,20 @@ internal function copyVideoMode(ptr<const glfw::Vidmode> $raw) : VideoMode?
     return VideoMode($raw->width, $raw->height, $raw->refreshRate);
 }
 
+/**
+ * `glfwGetVideoMode` asserts on a null monitor, and there is no monitor at all when the
+ * session is locked, detached, or headless on a machine with no display. Absence is a
+ * VideoMode? of null, the same shape `glfwVideoModes` already returns for it.
+ */
+internal function monitorVideoMode(ptr<glfw::Monitor> $monitor) : VideoMode?
+{
+    if ($monitor:$ == null) {
+        return null;
+    }
+
+    return copyVideoMode(glfw::getVideoMode($monitor));
+}
+
 internal function glfwVideoModes(ptr<glfw::Monitor> $monitor) : array<VideoMode>
 {
     array<VideoMode> $out = array<VideoMode>();
@@ -147,7 +161,7 @@ internal function windowCurrentMode(ptr<glfw::Window> $window) : VideoMode?
     ptr<glfw::Monitor> $exclusive = glfw::getWindowMonitor($window);
 
     if ($exclusive:$ != null) {
-        return copyVideoMode(glfw::getVideoMode($exclusive));
+        return monitorVideoMode($exclusive);
     }
 
     int32 $cx = 0;
@@ -161,13 +175,13 @@ internal function windowCurrentMode(ptr<glfw::Window> $window) : VideoMode?
         ptr<glfw::Monitor> $m = $mons:$[$i];
 
         if (monitorContains($m, $cx, $cy)) {
-            return copyVideoMode(glfw::getVideoMode($m));
+            return monitorVideoMode($m);
         }
 
         $i = $i + 1;
     }
 
-    return copyVideoMode(glfw::getVideoMode(glfw::getPrimaryMonitor()));
+    return monitorVideoMode(glfw::getPrimaryMonitor());
 }
 
 internal function setWindowFullscreen(

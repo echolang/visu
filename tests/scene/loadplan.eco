@@ -1,0 +1,59 @@
+/**
+ * LoadPlan stage order and weighted totals.
+ */
+
+use visu::scene::{LoadError, LoadJob, LoadLane, LoadPlan, LoadStep};
+
+class WeightJob : LoadJob
+{
+    public string $name;
+    public int32 $mass;
+    public LoadLane $kind;
+
+    public constructor(string $name, int32 $mass, LoadLane $kind)
+    {
+        $this->name = $name;
+        $this->mass = $mass;
+        $this->kind = $kind;
+    }
+
+    public const function label() : string
+    {
+        return $this->name;
+    }
+
+    public const function weight() : int32
+    {
+        return $this->mass;
+    }
+
+    public const function lane() : LoadLane
+    {
+        return $this->kind;
+    }
+
+    public function step() : result<LoadStep, LoadError>
+    {
+        return .ok(.done);
+    }
+}
+
+test load_plan_sums_weights
+{
+    LoadPlan $plan = LoadPlan();
+    $plan->stage('a');
+    $plan->add(WeightJob('one', 3, .main));
+    $plan->add(WeightJob('two', 5, .worker));
+    $plan->stage('b');
+    $plan->add(WeightJob('three', 2, .main));
+    assert($plan->totalWeight() == 10, 'sum');
+    assert($plan->stageCount() == 2, 'stages');
+}
+
+test load_plan_add_opens_default_stage
+{
+    LoadPlan $plan = LoadPlan();
+    $plan->add(WeightJob('only', 1, .main));
+    assert($plan->stageCount() == 1, 'opened');
+    assert($plan->totalWeight() == 1, 'one');
+}

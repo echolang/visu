@@ -51,6 +51,40 @@ public class BakedShaders
 }
 
 /**
+ * Baked programs linked once per Device.
+ * Releasing an MTLLibrary and compiling the same MSL again smashes the AGX compiler heap.
+ * The device owns this and drops it in shutdown. The lookup is read on the first call only.
+ */
+internal class BakedShaderCache
+{
+    private BakedShaders? $shaders;
+
+    public constructor()
+    {
+        $this->shaders = null;
+    }
+
+    public function drop() : void
+    {
+        BakedShaders $shaders = guard $this->shaders else {
+            return;
+        }
+        $shaders->destroy();
+        $this->shaders = null;
+    }
+
+    public function shaders(Device $device, function<string?(string, ShaderKind)> $lookup) : BakedShaders
+    {
+        BakedShaders $have = guard $this->shaders else {
+            BakedShaders $made = BakedShaders($device, $lookup);
+            $this->shaders = $made;
+            return $made;
+        }
+        return $have;
+    }
+}
+
+/**
  * Decode a hex string from the bake into raw SPIR-V bytes.
  */
 internal function hexBytes(string $hex) : string

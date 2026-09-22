@@ -30,6 +30,7 @@ public class Texture : GpuObject
         $this->desc = $desc;
         $this->imported = false;
         $this->state = .undefined;
+        $this->dead = false;
     }
 
     /**
@@ -88,11 +89,13 @@ public class Texture : GpuObject
         $this->desc = $desc;
         $this->imported = true;
         $this->state = .undefined;
+        $this->dead = false;
     }
 
     init
     {
         $this->dead = false;
+        $this->device->counts->noteTextureCreated();
     }
 
     public const function layers() : int32
@@ -117,12 +120,23 @@ public class Texture : GpuObject
         }
 
         $this->dead = true;
+        $this->device->counts->noteTextureDestroyed();
 
         if ($this->imported) {
             return;
         }
 
         $this->device->destroyTexture($this->handle);
+        // Metal destroyTexture is a no-op. The handle stays in this device's grave
+        // until beginFrame has waited out the slot, or the caller releaseRetired()
+        // after waitIdle. Vulkan destroyTexture already freed the image.
+        $this->device->retireTexture($this->handle);
+        $this->handle = TextureHandle::none();
+    }
+
+    public const function destroyed() : bool
+    {
+        return $this->dead;
     }
 
     public function upload(int32 $mip, ptr<const uint8> $src, uint64 $bytes, int32 $bytesPerRow = 0) : void

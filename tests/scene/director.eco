@@ -143,6 +143,79 @@ test last_queued_switch_wins
 
     assert($director->current()->name() == 'c', 'last wins');
     assert($b->loads == 0, 'skipped');
+    assert($b->unloads == 0, 'unbuilt pending not unloaded');
+    assert($c->loads == 1, 'loaded');
+    $director->unload();
+}
+
+test replace_built_pending_unloads_it
+{
+    SceneHits $a = SceneHits('a');
+    SceneHits $b = SceneHits('b');
+    SceneHits $c = SceneHits('c');
+    Director $director = Director(Dummy($a));
+    $director->load();
+    $director->switch(Dummy($b), true);
+    $director->switch(Dummy($c));
+
+    assert($b->unloads == 1, 'built pending unloaded');
+    assert($b->loads == 0, 'never became current');
+    assert($c->unloads == 0, 'replacement stays queued');
+    $director->apply();
+    assert($director->current()->name() == 'c', 'last wins');
+    assert($c->loads == 1, 'replacement loaded');
+    assert($b->unloads == 1, 'still once');
+    $director->unload();
+}
+
+test apply_adopts_built_scene
+{
+    SceneHits $a = SceneHits('a');
+    SceneHits $b = SceneHits('b');
+    Director $director = Director(Dummy($a));
+    $director->load();
+    $director->switch(Dummy($b), true);
+    $director->apply();
+
+    assert($b->unloads == 0, 'adopted not unloaded');
+    assert($b->loads == 1, 'loaded');
+    assert($a->unloads == 1, 'old unloaded');
+    $director->unload();
+    assert($b->unloads == 1, 'unloaded as current');
+}
+
+test unload_drops_built_pending
+{
+    SceneHits $a = SceneHits('a');
+    SceneHits $b = SceneHits('b');
+    Director $director = Director(Dummy($a));
+    $director->load();
+    $director->switch(Dummy($b), true);
+    $director->unload();
+
+    assert($a->unloads == 1, 'current');
+    assert($b->unloads == 1, 'pending built');
+    assert($b->loads == 0, 'pending never loaded');
+}
+
+test listen_built_replaced
+{
+    SceneHits $a = SceneHits('a');
+    SceneHits $b = SceneHits('b');
+    SceneHits $c = SceneHits('c');
+    Director $director = Director(Dummy($a));
+    Dispatcher $dispatcher = Dispatcher();
+    $director->listen($dispatcher);
+    $director->load();
+    Scene $built = Dummy($b);
+    Scene $other = Dummy($c);
+    $dispatcher->dispatch(SwitchSignal($built, true));
+    $dispatcher->dispatch(SwitchSignal($other));
+
+    assert($b->unloads == 1, 'built target unloaded');
+    assert($c->loads == 0, 'still queued');
+    $director->apply();
+    assert($director->current()->name() == 'c', 'menu won');
     assert($c->loads == 1, 'loaded');
     $director->unload();
 }

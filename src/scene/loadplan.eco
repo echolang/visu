@@ -1,0 +1,75 @@
+/**
+ * Ordered stages of load work. Jobs inside a stage run in parallel; stages are sequential.
+ */
+
+namespace visu::scene;
+
+internal class LoadStage
+{
+    public string $name;
+    public array<LoadJob> $jobs;
+
+    public constructor(string $name)
+    {
+        $this->name = $name;
+        $this->jobs = array<LoadJob>();
+    }
+}
+
+public class LoadPlan
+{
+    internal array<LoadStage> $stages;
+    private int32 $open;
+
+    public constructor()
+    {
+        $this->stages = array<LoadStage>();
+        $this->open = -1;
+    }
+
+    /**
+     * Open a new stage. Later `add` calls append to it until the next `stage`.
+     */
+    public function stage(string $name) : void
+    {
+        $this->stages[] = LoadStage($name);
+        $this->open = ($this->stages->count() as int32) - 1;
+    }
+
+    /**
+     * Append `$job` to the current stage. Opens a stage named `load` when none is open.
+     */
+    public function add(LoadJob $job) : void
+    {
+        if ($this->open < 0) {
+            $this->stage('load');
+        }
+
+        int32 $i = $this->open;
+        $this->stages[$i as usize]->jobs[] = $job;
+    }
+
+    public const function totalWeight() : int32
+    {
+        int32 $sum = 0;
+        foreach ($this->stages as $stage) {
+            LoadStage $s = $stage;
+            foreach ($s->jobs as $job) {
+                LoadJob $j = $job;
+                int32 $w = $j->weight();
+                if ($w < 0) {
+                    $w = 0;
+                }
+
+                $sum = $sum + $w;
+            }
+        }
+
+        return $sum;
+    }
+
+    public const function stageCount() : int32
+    {
+        return $this->stages->count() as int32;
+    }
+}

@@ -1,0 +1,42 @@
+/**
+ * ResourceStats ledger: live texture / buffer counts on one device, no GPU.
+ */
+
+use visu::graphics::{Device, ResourceStats};
+
+test resource_stats_tracks_live_textures
+{
+    Device $device = Device();
+    ResourceStats $before = $device->resourceStats();
+    $device->counts->noteTextureCreated();
+    ResourceStats $live = $device->resourceStats();
+    assert($live->textures == $before->textures + 1, 'created');
+    $device->counts->noteTextureDestroyed();
+    ResourceStats $after = $device->resourceStats();
+    assert($after->textures == $before->textures, 'destroyed');
+    $device->shutdown();
+}
+
+test resource_stats_tracks_live_buffers
+{
+    Device $device = Device();
+    ResourceStats $before = $device->resourceStats();
+    $device->counts->noteBufferCreated();
+    ResourceStats $live = $device->resourceStats();
+    assert($live->buffers == $before->buffers + 1, 'created');
+    $device->counts->noteBufferDestroyed();
+    ResourceStats $after = $device->resourceStats();
+    assert($after->buffers == $before->buffers, 'destroyed');
+    $device->shutdown();
+}
+
+test resource_stats_are_per_device
+{
+    Device $a = Device();
+    Device $b = Device();
+    $a->counts->noteTextureCreated();
+    assert($a->resourceStats()->textures == 1, 'a');
+    assert($b->resourceStats()->textures == 0, 'b');
+    $a->shutdown();
+    $b->shutdown();
+}

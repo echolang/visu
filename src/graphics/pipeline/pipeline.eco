@@ -175,6 +175,12 @@ public class Pipeline
     public function execute(int32 $tick, float32 $compensation = 0.0f, collect: bool $collect = true) : status<PipelineError>
     {
         $this->pool->setCurrentTick($tick);
+        // imports and declarations happen before execute, often on the previous tick
+        // this pipeline still owns those names for the tick it is running
+        array<string> $claimed = $this->names->keys();
+        foreach ($claimed as $name) {
+            $this->pool->touch($name);
+        }
         array<int32> $order = guard schedule($this->passes->count() as int32, $this->io) else ($e) {
             return .error($e);
         }

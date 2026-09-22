@@ -1,0 +1,41 @@
+/**
+ * MTLDevice memory counters. currentAllocatedSize is the live footprint.
+ */
+
+namespace visu::graphics;
+
+internal function mtlResourceStats(Device $device) : ResourceStats
+{
+    return $device->counts->snapshot($device->grave->count());
+}
+
+internal function mtlMemoryStats(Device $device) : MemoryStats
+{
+    if (!$device->ready) {
+        return MemoryStats();
+    }
+
+    mtl::Device $gpu = guard $device->gpu else {
+        return MemoryStats();
+    }
+    MemoryStats $stats = MemoryStats();
+    $stats->used = $gpu->currentAllocatedSize();
+    $stats->budget = $gpu->recommendedMaxWorkingSetSize();
+    $stats->unified = $gpu->hasUnifiedMemory();
+    return $stats;
+}
+
+internal function mtlRetireTexture(Device $device, TextureHandle $handle) : void
+{
+    $device->grave->push($handle);
+}
+
+internal function mtlReleaseRetired(Device $device) : void
+{
+    $device->grave->release();
+}
+
+internal function mtlPipelineCount(Device $device) : int32
+{
+    return $device->psos->count() as int32;
+}

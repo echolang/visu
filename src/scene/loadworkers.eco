@@ -1,0 +1,226 @@
+/**
+ * Optional worker pool for one load stage.
+ * Sends only as many jobs as there are live workers, then one more when a
+ * completion comes back and the plan has not stopped. stop() does not send the rest.
+ * A worker finishes the job it already received.
+ */
+
+namespace visu::scene;
+
+use std::thread;
+
+internal struct LoadCompletion
+{
+    public int32 $weight;
+    public LoadError? $error;
+}
+
+#[atomic]
+internal class LoadWorkerEnds
+{
+    public thread::receiver<LoadJob> $jobs;
+    public thread::sender<LoadCompletion> $done;
+
+    public constructor(thread::receiver<LoadJob> $jobs, thread::sender<LoadCompletion> $done)
+    {
+        $this->jobs = $jobs;
+        $this->done = $done;
+    }
+}
+
+internal class LoadWorkers
+{
+    private array<LoadJob> $pending;
+    private int32 $inFlight;
+    private bool $stopped;
+    private array<thread::handle> $handles;
+    private thread::sender<LoadJob>? $jobTx;
+    private thread::receiver<LoadCompletion>? $doneRx;
+
+    public constructor()
+    {
+        $this->pending = array<LoadJob>();
+        $this->inFlight = 0;
+        $this->stopped = false;
+        $this->handles = array<thread::handle>();
+        $this->jobTx = null;
+        $this->doneRx = null;
+    }
+
+    destructor()
+    {
+        array<LoadCompletion> $done = array<LoadCompletion>();
+        $this->stop($done);
+    }
+
+    /**
+     * Spawn workers and send the first wave. False when none spawned.
+     * `$jobs` is only consumed after a worker exists; the remainder stays queued here.
+     */
+    public function start(array<LoadJob> $jobs, int32 $maxWorkers) : bool
+    {
+        if ($maxWorkers < 1 || $jobs->empty()) {
+            return false;
+        }
+
+        thread::channel<LoadJob> $jobCh = thread::channel<LoadJob>();
+        thread::sender<LoadJob> $tx = $jobCh->tx();
+        thread::receiver<LoadJob> $rx = $jobCh->rx();
+        thread::channel<LoadCompletion> $doneCh = thread::channel<LoadCompletion>();
+        thread::sender<LoadCompletion> $doneTx = $doneCh->tx();
+        thread::receiver<LoadCompletion> $doneRx = $doneCh->rx();
+        LoadWorkerEnds $ends = LoadWorkerEnds($rx, $doneTx);
+        int32 $want = $maxWorkers;
+        int32 $queued = $jobs->count() as int32;
+        if ($want > $queued) {
+            $want = $queued;
+        }
+
+        int32 $spawned = 0;
+        int32 $w = 0;
+        while ($w < $want) {
+            result<thread::handle, thread::error> $h = thread::spawn(function() : void {
+                loadWorkerLoop($ends);
+            });
+            if ($h->failed()) {
+                break;
+            }
+
+            $this->handles[] = $h->unwrap();
+            $spawned = $spawned + 1;
+            $w = $w + 1;
+        }
+
+        if ($spawned < 1) {
+            return false;
+        }
+
+        int32 $sent = 0;
+        while ($sent < $spawned && !$jobs->empty()) {
+            LoadJob $job = $jobs->remove(0);
+            $tx->send($job);
+            $this->inFlight = $this->inFlight + 1;
+            $sent = $sent + 1;
+        }
+
+        $this->pending = $jobs;
+        $this->jobTx = $tx;
+        $this->doneRx = $doneRx;
+        return true;
+    }
+
+    public const function idle() : bool
+    {
+        return $this->inFlight == 0 && $this->pending->empty();
+    }
+
+    /**
+     * One completion, if a worker has finished. Does not send the next job.
+     */
+    public function poll() : LoadCompletion?
+    {
+        thread::receiver<LoadCompletion> $rx = guard $this->doneRx else {
+            return null;
+        }
+
+        thread::poll<LoadCompletion> $p = $rx->try_recv();
+        match ($p) {
+            .item($c) => {
+                $this->inFlight = $this->inFlight - 1;
+                return $c;
+            },
+            .empty => {
+                return null;
+            },
+            .closed => {
+                $this->doneRx = null;
+                return null;
+            },
+        }
+    }
+
+    /**
+     * Send one pending job to a free worker. No-op once stop() has run.
+     */
+    public function refill() : void
+    {
+        if ($this->stopped || $this->pending->empty()) {
+            return;
+        }
+
+        thread::sender<LoadJob> $tx = guard $this->jobTx else {
+            return;
+        }
+        LoadJob $next = $this->pending->remove(0);
+        $tx->send($next);
+        $this->inFlight = $this->inFlight + 1;
+    }
+
+    /**
+     * Drop jobs that have not started, join workers, append in-flight completions.
+     * Returns how many jobs were dropped.
+     */
+    public function stop(array<LoadCompletion>& $done) : int32
+    {
+        if ($this->stopped) {
+            return 0;
+        }
+
+        $this->stopped = true;
+        int32 $dropped = $this->pending->count() as int32;
+        $this->pending = array<LoadJob>();
+        thread::sender<LoadJob> $tx = guard $this->jobTx else {
+            $this->join();
+            return $dropped;
+        }
+        $tx->close();
+        $this->jobTx = null;
+        $this->join();
+        while (true) {
+            LoadCompletion? $c = $this->poll();
+            if ($c == null) {
+                break;
+            }
+
+            LoadCompletion $item = guard $c;
+            $done[] = $item;
+        }
+
+        return $dropped;
+    }
+
+    private function join() : void
+    {
+        foreach ($this->handles as $h) {
+            thread::handle $w = $h;
+            $w->join();
+        }
+
+        $this->handles = array<thread::handle>();
+    }
+}
+
+internal function loadWorkerLoop(LoadWorkerEnds $ends) : void
+{
+    while (true) {
+        LoadJob $job = guard $ends->jobs->recv() else {
+            return;
+        }
+
+        LoadError? $err = null;
+        while (true) {
+            result<LoadStep, LoadError> $r = $job->step();
+            if ($r->failed()) {
+                $err = $r->failure();
+                break;
+            }
+
+            LoadStep $step = $r->unwrap();
+            if ($step == LoadStep::done) {
+                break;
+            }
+        }
+
+        $ends->done->send(LoadCompletion($job->weight(), $err));
+    }
+}

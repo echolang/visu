@@ -1,0 +1,45 @@
+/**
+ * Metal must actually free a destroyed texture so the next same-size alloc
+ * does not grow MTLDevice.currentAllocatedSize.
+ */
+
+use visu::graphics::{
+    Device, DeviceOptions, Texture, TextureDesc, TEXTURE_RENDER_TARGET, TEXTURE_SAMPLED
+};
+
+#[if: (os == darwin || os == ios) && !VISU_BACKEND_VULKAN]
+test metal_texture_destroy_realloc_does_not_grow
+{
+    Device $device = Device();
+    guard $device->initialize(DeviceOptions()) else ($e) {
+        $device->shutdown();
+        die($e->message());
+    }
+
+    uint64 $base = $device->memoryStats()->used;
+    TextureDesc $desc = TextureDesc($format: .rgba16f, $width: 1024, $height: 1024);
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET;
+    Texture $tex = Texture($device, 'recycle', $desc);
+    uint64 $with = $device->memoryStats()->used;
+    assert($with >= $base + 8 * 1024 * 1024, 'texture missing from currentAllocatedSize');
+
+    $tex->destroy();
+    $device->waitIdle();
+    $device->releaseRetired();
+    uint64 $freed = $device->memoryStats()->used;
+    assert($freed + 4 * 1024 * 1024 < $with, 'grave still holds the texture after releaseRetired');
+
+    int32 $i = 0;
+    while ($i < 8) {
+        $tex = Texture($device, 'recycle', $desc);
+        $tex->destroy();
+        $device->waitIdle();
+        $device->releaseRetired();
+        $i = $i + 1;
+    }
+
+    uint64 $end = $device->memoryStats()->used;
+    $device->shutdown();
+    assert($end < $with + 4 * 1024 * 1024, 'same-size realloc grew vram');
+}
+#[end]

@@ -1,0 +1,65 @@
+/**
+ * Dot-ring spinner. Positions are fixed; alpha walks the ring from `seconds()`.
+ * A square `emitShapedBox` with radius = half the size is already a circle.
+ */
+
+namespace visu::ui;
+
+use visu::math::Vec2;
+use visu::vg::Color;
+
+internal const int32 SPINNER_DOTS = 8;
+
+internal function uiSpinner(Ui $ui, const string& $id) : void
+{
+    SpinnerStyle $st = $ui->theme->spinner;
+    Node $n = Node();
+    $n->kind = .spinner;
+    $n->id = $ui->makeId($id, 'spinner');
+    $n->measured = Vec2($st->size, $st->size);
+    $ui->push($n);
+}
+
+internal function emitSpinnerBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    SpinnerStyle $st = $ui->theme->spinner;
+    int32 $dots = $st->dots;
+    if ($dots < 3) {
+        $dots = SPINNER_DOTS;
+    }
+
+    float32 $size = $n->size->x;
+    if ($n->size->y < $size) {
+        $size = $n->size->y;
+    }
+
+    float32 $dot = $st->dot;
+    if ($dot < 1.0f) {
+        $dot = 4.0f;
+    }
+
+    float32 $cx = $n->pos->x + $n->size->x * 0.5f;
+    float32 $cy = $n->pos->y + $n->size->y * 0.5f;
+    float32 $ring = ($size - $dot) * 0.5f;
+    if ($ring < $dot) {
+        $ring = $dot;
+    }
+
+    float64 $t = visu::runtime::seconds();
+    float64 $phase = $t * 8.0;
+    float64 $step = (std::math::TAU) / ($dots as float64);
+    Color $base = $st->color;
+    int32 $i = 0;
+    while ($i < $dots) {
+        float64 $a = ($i as float64) * $step;
+        float32 $x = $cx + ((std::math::cos($a) as float32) * $ring);
+        float32 $y = $cy + ((std::math::sin($a) as float32) * $ring);
+        float64 $wave = $phase - ($i as float64);
+        float32 $s = std::math::sin($wave) as float32;
+        float32 $alpha = 0.18f + (0.82f * (($s * 0.5f) + 0.5f));
+        Color $c = $base->withAlpha($alpha);
+        Vec2 $pos = Vec2($x - $dot * 0.5f, $y - $dot * 0.5f);
+        fillBox($ui, $pos, Vec2($dot, $dot), $dot * 0.5f, $c, $pad);
+        $i = $i + 1;
+    }
+}

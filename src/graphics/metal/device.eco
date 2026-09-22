@@ -46,6 +46,10 @@ public class Device : DeviceProtocol
     public DrawCounters $draws;
     public GpuProfiler $gpuProfiler;
     internal GpuClock $clock;
+    internal TextureGrave $grave;
+    internal GpuCounts $counts;
+    internal DeferredCache $deferred;
+    internal BakedShaderCache $sceneShaders;
 
     public constructor()
     {
@@ -89,6 +93,10 @@ public class Device : DeviceProtocol
         $this->draws = DrawCounters();
         $this->gpuProfiler = GpuProfiler();
         $this->clock = GpuClock();
+        $this->grave = TextureGrave();
+        $this->counts = GpuCounts();
+        $this->deferred = DeferredCache();
+        $this->sceneShaders = BakedShaderCache();
     }
 
     destructor()
@@ -190,6 +198,7 @@ public class Device : DeviceProtocol
     {
         $this->abortFrame();
         $this->waitSlots();
+        mtlWaitGpuDone($this);
     }
 
     public const function limits() : DeviceLimits
@@ -204,62 +213,37 @@ public class Device : DeviceProtocol
 
     public const function memoryStats() : MemoryStats
     {
-        if (!$this->ready) {
-            return MemoryStats();
-        }
+        return mtlMemoryStats($this);
+    }
 
-        MemoryStats $stats = MemoryStats();
-        $stats->used = visu_mtl_current_allocated();
-        $stats->budget = visu_mtl_working_set();
-        $stats->unified = visu_mtl_has_unified() != 0;
-        return $stats;
+    public const function resourceStats() : ResourceStats
+    {
+        return mtlResourceStats($this);
+    }
+
+    public const function pipelineCount() : int32
+    {
+        return mtlPipelineCount($this);
+    }
+
+    public function retireTexture(TextureHandle $handle) : void
+    {
+        mtlRetireTexture($this, $handle);
+    }
+
+    public function releaseRetired() : void
+    {
+        mtlReleaseRetired($this);
+    }
+
+    public function forgetProgram(uint32 $id) : void
+    {
+        mtlForgetProgram($this, $id);
     }
 
     public function beginFrame(int32 $width, int32 $height) : result<FrameStatus, DeviceError>
     {
-        assert($this->ready, 'Device.beginFrame before initialize');
-        assert(!$this->encoderOpen, 'beginFrame with an open encoder');
-        assert(!$this->inFrame, 'beginFrame twice');
-
-        if ($this->lostFlag) {
-            return .error(.surfaceLost);
-        }
-
-        if ($this->pendingResize || $width != $this->drawableW || $height != $this->drawableH) {
-            $this->pendingResize = false;
-            $this->drawableW = $width;
-            $this->drawableH = $height;
-            mtl::Layer $layer = guard $this->layer else {
-                return .ok(.skipped);
-            }
-            mtlResizeLayer($layer, $width, $height);
-        }
-
-        if ($width <= 0 || $height <= 0) {
-            return .ok(.skipped);
-        }
-
-        FrameSlot $slot = $this->slots[$this->slot];
-        if ($slot->epoch > 0) {
-            bool $ready = $slot->gpuDone->waitUntilSignaledValue(
-                $slot->epoch,
-                timeoutMS: 1000000000
-            );
-            if (!$ready) {
-                return .error(.metal('beginFrame', 'gpu timeline wait timed out'));
-            }
-
-            mtl::Device $gpu = guard $this->gpu else {
-                return .error(.noDevice);
-            }
-            mtlClockSample($gpu, $this->clock);
-            mtlTimestampsResolve($slot, $this->clock, $this->gpuProfiler);
-        }
-        $slot->prev = null;
-        $slot->prePrev = null;
-        $slot->presentPrev = null;
-        $slot->preScope = -1;
-        return $this->openScene();
+        return mtlBeginFrame($this, $width, $height);
     }
 
     public function endFrame() : status<DeviceError>
@@ -753,6 +737,7 @@ public class Device : DeviceProtocol
         }
         SamplerHandle $h = SamplerHandle($samp);
         $this->samplerHandles[$key] = $h;
+        $this->counts->noteSamplerCreated();
         return Sampler($this, $h, $desc);
     }
 
@@ -804,6 +789,8 @@ public class Device : DeviceProtocol
 
     public function shutdown() : void
     {
+        $this->deferred->drop();
+        $this->sceneShaders->drop();
         if ($this->gpu == null) {
             $this->ready = false;
             return;
@@ -811,6 +798,7 @@ public class Device : DeviceProtocol
 
         $this->loseSurface();
         $this->waitSlots();
+        $this->releaseRetired();
         mtlDestroySlots($this);
         $this->psos = map<string, PipelineHandle>();
         $this->computePsos = map<uint32, mtl::ComputePipelineState>();
@@ -821,7 +809,7 @@ public class Device : DeviceProtocol
         $this->ready = false;
     }
 
-    private function openScene() : result<FrameStatus, DeviceError>
+    internal function openScene() : result<FrameStatus, DeviceError>
     {
         FrameSlot $slot = $this->slots[$this->slot];
         $slot->ring->reset();

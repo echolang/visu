@@ -68,6 +68,13 @@ const BAKES = [
         'prefix' => 'ui',
         'title' => 'Baked FlyUI shaders.',
     ],
+    [
+        'dir' => 'loading',
+        'out' => 'src/scene/loadingshader.eco',
+        'ns' => 'visu::scene',
+        'prefix' => 'loading',
+        'title' => 'Baked loading-screen shaders.',
+    ],
 ];
 
 const DEFAULT_TREES = [

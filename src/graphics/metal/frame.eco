@@ -8,6 +8,54 @@ namespace visu::graphics;
 internal const uint64 RING_BYTES = 16777216;
 internal const uint64 RING_SLACK = 65536;
 
+internal function mtlBeginFrame(Device $device, int32 $width, int32 $height) : result<FrameStatus, DeviceError>
+{
+    assert($device->ready, 'Device.beginFrame before initialize');
+    assert(!$device->encoderOpen, 'beginFrame with an open encoder');
+    assert(!$device->inFrame, 'beginFrame twice');
+
+    if ($device->lostFlag) {
+        return .error(.surfaceLost);
+    }
+
+    if ($device->pendingResize || $width != $device->drawableW || $height != $device->drawableH) {
+        $device->pendingResize = false;
+        $device->drawableW = $width;
+        $device->drawableH = $height;
+        mtl::Layer $layer = guard $device->layer else {
+            return .ok(.skipped);
+        }
+        mtlResizeLayer($layer, $width, $height);
+    }
+
+    if ($width <= 0 || $height <= 0) {
+        return .ok(.skipped);
+    }
+
+    FrameSlot $slot = $device->slots[$device->slot];
+    if ($slot->epoch > 0) {
+        bool $ready = $slot->gpuDone->waitUntilSignaledValue(
+            $slot->epoch,
+            timeoutMS: 1000000000
+        );
+        if (!$ready) {
+            return .error(.metal('beginFrame', 'gpu timeline wait timed out'));
+        }
+
+        mtl::Device $gpu = guard $device->gpu else {
+            return .error(.noDevice);
+        }
+        mtlClockSample($gpu, $device->clock);
+        mtlTimestampsResolve($slot, $device->clock, $device->gpuProfiler);
+    }
+    $slot->prev = null;
+    $slot->prePrev = null;
+    $slot->presentPrev = null;
+    $slot->preScope = -1;
+    $device->releaseRetired();
+    return $device->openScene();
+}
+
 internal class HostRing
 {
     public mtl::Buffer? $buffer;

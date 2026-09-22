@@ -1,0 +1,83 @@
+/**
+ * Live GPU object counts for one Device. The overlay Resources tab reads the snapshot.
+ * Texture / Buffer / ShaderProgram tick the ledger. Retired handles are the Metal grave.
+ */
+
+namespace visu::graphics;
+
+public struct ResourceStats
+{
+    public int32 $textures = 0;
+    public int32 $retired = 0;
+    public int32 $buffers = 0;
+    public int32 $samplerCache = 0;
+    public int32 $programs = 0;
+}
+
+internal class GpuCounts
+{
+    public int32 $textures;
+    public int32 $buffers;
+    public int32 $samplers;
+    public int32 $programs;
+
+    public constructor()
+    {
+        $this->textures = 0;
+        $this->buffers = 0;
+        $this->samplers = 0;
+        $this->programs = 0;
+    }
+
+    public function noteTextureCreated() : void
+    {
+        $this->textures = $this->textures + 1;
+    }
+
+    public function noteTextureDestroyed() : void
+    {
+        assert($this->textures > 0, 'gpu counts: texture destroy underflows');
+        $this->textures = $this->textures - 1;
+    }
+
+    public function noteBufferCreated() : void
+    {
+        $this->buffers = $this->buffers + 1;
+    }
+
+    public function noteBufferDestroyed() : void
+    {
+        assert($this->buffers > 0, 'gpu counts: buffer destroy underflows');
+        $this->buffers = $this->buffers - 1;
+    }
+
+    public function noteSamplerCreated() : void
+    {
+        $this->samplers = $this->samplers + 1;
+    }
+
+    public function noteProgramCreated() : void
+    {
+        $this->programs = $this->programs + 1;
+    }
+
+    public function noteProgramDestroyed() : void
+    {
+        assert($this->programs > 0, 'gpu counts: program destroy underflows');
+        $this->programs = $this->programs - 1;
+    }
+
+    /**
+     * `$retired` is how many Metal handles the grave still holds.
+     */
+    public const function snapshot(int32 $retired) : ResourceStats
+    {
+        ResourceStats $stats = ResourceStats();
+        $stats->textures = $this->textures;
+        $stats->retired = $retired;
+        $stats->buffers = $this->buffers;
+        $stats->samplerCache = $this->samplers;
+        $stats->programs = $this->programs;
+        return $stats;
+    }
+}

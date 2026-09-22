@@ -71,6 +71,38 @@ test rts_camera_place_snaps_focus_to_the_heightmap
     assert(equal($rts->focus->y, 10.0f, 0.01f), 'clamped y');
 }
 
+test rts_camera_close_zoom_looks_across_the_heightmap
+{
+    Heightmap $map = Heightmap::flat(32, 32, 10.0f, 1.0f);
+    RtsCamera $rts = RtsCamera();
+    $rts->focus = Vec3(0.0f, 10.0f, 0.0f);
+    $rts->radius = $rts->min;
+    $rts->ground = $map;
+    Transform $transform = Transform();
+    $transform->position = Vec3(0.0f, 11.0f, 5.0f);
+    $rts->place($transform);
+    $rts->place($transform);
+    $rts->place($transform);
+    Vec3 $aim = Vec3($rts->focus->x, $rts->focus->y + $rts->clearance, $rts->focus->z);
+    assert(equal($transform->position->y, $aim->y, 0.05f), 'walk height');
+    assert($transform->forward()->y > -0.2f, 'across');
+    assert(equal($transform->forward(), normalize($aim - $transform->position), 0.01f), 'look');
+}
+
+test rts_camera_far_zoom_keeps_a_downward_look
+{
+    Heightmap $map = Heightmap::flat(32, 32, 10.0f, 1.0f);
+    RtsCamera $rts = RtsCamera();
+    $rts->focus = Vec3(0.0f, 10.0f, 0.0f);
+    $rts->radius = 100.0f;
+    $rts->ground = $map;
+    Transform $transform = Transform();
+    $transform->position = Vec3(0.0f, 80.0f, 60.0f);
+    $rts->place($transform);
+    assert($transform->forward()->y < -0.3f, 'down');
+    assert($transform->position->y > 10.0f + $rts->clearance + 10.0f, 'high');
+}
+
 test spawn_rts_camera_attaches_the_controller
 {
     Entities $world = Entities();

@@ -1,0 +1,52 @@
+/**
+ * In-place scale, sliced by row so a loader can yield mid-pass.
+ * Cached min/max update once, when the last row finishes.
+ */
+
+namespace visu::geo;
+
+public class HeightmapScale
+{
+    private Heightmap $map;
+    private float32 $factor;
+    private int32 $row;
+    private bool $done;
+
+    public constructor(Heightmap $map, float32 $factor)
+    {
+        $this->map = $map;
+        $this->factor = $factor;
+        $this->row = 0;
+        $this->done = false;
+    }
+
+    /**
+     * Scale up to `$maxRows` of the grid. True when every row is done and the
+     * cached bounds include `$factor`.
+     */
+    public function step(int32 $maxRows) : bool
+    {
+        if ($this->done) {
+            return true;
+        }
+
+        if ($maxRows < 1) {
+            $maxRows = 1;
+        }
+
+        int32 $h = $this->map->height;
+        int32 $end = $this->row + $maxRows;
+        if ($end > $h) {
+            $end = $h;
+        }
+
+        $this->map->scaleSlice($this->factor, $this->row, $end);
+        $this->row = $end;
+        if ($this->row >= $h) {
+            $this->map->commitScale($this->factor);
+            $this->done = true;
+        }
+
+        return $this->done;
+    }
+}

@@ -1,0 +1,198 @@
+/**
+ * Wraps a target scene plus a load plan. `load()` is cheap (baked background + runner begin);
+ * `update()` pumps and, when done, queues the target. Existing Scene implementers stay unchanged.
+ */
+
+namespace visu::scene;
+
+use visu::app::{FlagValue, Host, flags};
+use visu::dcapture::DCapture;
+use visu::graphics::{
+    BakedShaders, Device, QuadPass, RenderContext, SceneTargetData, ShaderKind, ShaderProgram
+};
+use visu::math::Vec4;
+use visu::ui::{Align, Layout, Ui};
+
+internal const int64 LOAD_SLICE_NS = 8000000;
+
+internal struct LoadingParams
+{
+    public Vec4 $time;
+}
+
+public class LoadingScene : Scene
+{
+    private Host $host;
+    private Scene? $target;
+    private LoadRunner $runner;
+    private ShaderProgram? $program;
+
+    public constructor(Host $host, Scene $target, LoadPlan $plan)
+    {
+        $this->host = $host;
+        $this->target = $target;
+        $this->runner = LoadRunner($plan, LoadProgress());
+        $this->program = null;
+    }
+
+    public const function name() : string
+    {
+        return 'loading';
+    }
+
+    public function load() : void
+    {
+        if ($this->program == null) {
+            $this->program = loadingProgram($this->host->device);
+        }
+
+        if (!loadingWorkers($this->host)) {
+            $this->runner->capWorkers(0);
+        }
+
+        $this->runner->begin();
+        if (!loadingEnabled($this->host)) {
+            while (!$this->runner->done()) {
+                $this->runner->pump(1000000000);
+            }
+        }
+    }
+
+    public function unload() : void
+    {
+        $this->runner->cancel();
+        Scene $target = guard $this->target else {
+            return;
+        }
+        $this->target = null;
+        $target->unload();
+    }
+
+    public function update() : void
+    {
+        Scene $target = guard $this->target else {
+            return;
+        }
+
+        $this->runner->pump(LOAD_SLICE_NS);
+        if (!$this->runner->done()) {
+            return;
+        }
+
+        LoadError? $err = $this->runner->failure();
+        if ($err != null) {
+            LoadError $e = guard $err;
+            die($e->message());
+        }
+
+        $this->target = null;
+        $this->host->dispatcher->dispatch(SwitchSignal($target, true));
+    }
+
+    public function render(RenderContext $ctx) : void
+    {
+        ShaderProgram $prog = guard $this->program else {
+            return;
+        }
+        SceneTargetData $scene = $ctx->frame->get<SceneTargetData>();
+        float32 $t = visu::runtime::seconds() as float32;
+        LoadingParams $params = LoadingParams(Vec4($t, 0.0f, 0.0f, 0.0f));
+        $ctx->pipeline->add(QuadPass($prog, $scene->target, $params));
+    }
+
+    public function ui(Ui $ui) : void
+    {
+        Layout $root = Layout();
+        $root->h = .fill;
+        $root->v = .fill;
+        $root->align = Align::center;
+        $ui->begin($root);
+        $ui->beginCard(360.0f);
+        $ui->text('Loading', size: $ui->theme->largeFontSize, bold: true);
+        $ui->space(0.0f, 16.0f);
+        $ui->beginRow(12.0f);
+        $ui->spinner();
+        $ui->progress($this->runner->progress());
+        $ui->end();
+        $ui->space(0.0f, 10.0f);
+        $ui->text($this->runner->hint(), color: $ui->theme->mutedTextColor);
+        $ui->end();
+        $ui->end();
+    }
+}
+
+/**
+ * Animated loading screen. `--flag loading=false` / `loading=off` turns it off.
+ * Headless, dcapture, and VISU_FINITE default off so frame indices stay stable.
+ */
+public function loadingEnabled(Host $host) : bool
+{
+    if (flags()->has('loading')) {
+        FlagValue $v = guard flags()->get('loading') else {
+            return loadingDefault($host);
+        }
+        return match ($v) {
+            FlagValue::boolean($b) => $b,
+            FlagValue::integer($n) => $n != 0,
+            FlagValue::text($s) => loadingFlagText($s),
+            else => loadingDefault($host),
+        };
+    }
+
+    return loadingDefault($host);
+}
+
+/**
+ * Worker-lane jobs. `--flag loading.workers` wins; otherwise HostConfig.loadWorkers.
+ */
+public function loadingWorkers(Host $host) : bool
+{
+    if (flags()->has('loading.workers')) {
+        return flags()->bool('loading.workers', false);
+    }
+
+    return $host->config->loadWorkers;
+}
+
+internal function loadingFlagText(string $s) : bool
+{
+    if ($s == 'off' || $s == 'false' || $s == '0') {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * The loading program is linked once per device. Releasing it and compiling the same MSL
+ * on the next transition smashes the AGX compiler heap, and the pipeline cache would keep
+ * a state object under the dead program id.
+ */
+internal function loadingProgram(Device $device) : ShaderProgram
+{
+    BakedShaders $shaders = $device->sceneShaders->shaders($device, function(string $name, ShaderKind $kind) : string? {
+        return loadingBytes($name, $kind);
+    });
+    ShaderProgram $prog = guard $shaders->program('loading') else ($e) {
+        die($e->message());
+    }
+    return $prog;
+}
+
+internal function loadingDefault(Host $host) : bool
+{
+    #[if: VISU_FINITE]
+    return false;
+    #[else]
+    if ($host->config->headless) {
+        return false;
+    }
+
+    DCapture? $script = $host->services->find<DCapture>();
+    if ($script != null) {
+        return false;
+    }
+
+    return true;
+    #[end]
+}

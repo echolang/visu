@@ -95,9 +95,20 @@ public class Pool
 
     /**
      * Import an already-created texture.
+     * A name the pool already owns stays owned: the blit re-imports scene color
+     * under that name, and that is a second graph edge, not a change of owner.
+     * An existing import is rebound. A new name is stored as imported.
      */
     public function setTexture(TextureRef $ref, Texture $texture) : void
     {
+        if ($this->textures->has($ref->name)) {
+            StoredTexture $held = $this->textures[$ref->name];
+            if (!$held->imported) {
+                $this->touch($ref->name);
+                return;
+            }
+        }
+
         $this->textures[$ref->name] = StoredTexture($texture, true, null);
         $this->touch($ref->name);
     }
@@ -207,15 +218,28 @@ public class Pool
     }
 
     /**
-     * Destroy created GPU objects that were not touched this tick.
-     * A target stays if any owned texture was touched. Imported resources and the static cache are never collected.
+     * Tick forward and collect. Owned graph textures the last frame touched are
+     * destroyed. Imports are forgotten. The static cache is not walked: long-lived
+     * GPU objects live on their owner (ModelBank, Device, cache).
+     * Call after waitIdle, once the outgoing scene has dropped its handles.
+     */
+    public function reap() : void
+    {
+        $this->tick = $this->tick + 1;
+        $this->collect();
+    }
+
+    /**
+     * Destroy owned GPU objects that were not touched this tick, and forget untouched
+     * imports (the importer still owns the Texture). A target stays if any owned
+     * texture was touched. The static cache is never collected.
      */
     public function collect() : void
     {
         array<string> $names = $this->used->keys();
 
         foreach ($names as $name) {
-            if ($this->used[$name] >= $this->tick) {
+            if (!$this->used->has($name) || $this->used[$name] >= $this->tick) {
                 continue;
             }
 
@@ -234,7 +258,7 @@ public class Pool
         $names = $this->used->keys();
 
         foreach ($names as $name) {
-            if ($this->used[$name] >= $this->tick) {
+            if (!$this->used->has($name) || $this->used[$name] >= $this->tick) {
                 continue;
             }
 
@@ -297,6 +321,21 @@ public class Pool
     public const function hasTexture(string $name) : bool
     {
         return $this->textures->has($name);
+    }
+
+    public const function textureCount() : int32
+    {
+        return $this->textures->count() as int32;
+    }
+
+    public const function targetCount() : int32
+    {
+        return $this->targets->count() as int32;
+    }
+
+    public const function cachedCount() : int32
+    {
+        return $this->cachedOwned->count() as int32;
     }
 
     /**
@@ -420,6 +459,8 @@ public class Pool
 
         StoredTarget $held = $this->targets[$name];
         if ($held->imported) {
+            // the window owns the backbuffer; the pool only forgets the name
+            $this->targets->remove($name);
             return;
         }
 
@@ -439,11 +480,10 @@ public class Pool
         }
 
         StoredTexture $held = $this->textures[$name];
-        if ($held->imported) {
-            return;
+        if (!$held->imported) {
+            $held->texture->destroy();
         }
 
-        $held->texture->destroy();
         $this->textures->remove($name);
     }
 }

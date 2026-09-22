@@ -1,7 +1,7 @@
 /**
  * Ground-focus RTS camera tunables.
  * An ECS component on a camera entity; `RtsCameraSystem` drives the one that also has `ActiveCamera`.
- * `place` sits on the focus at `$radius` looking at it. Optional `$ground` clamps and follows a heightmap.
+ * `place` sits at `$radius` looking at the focus. With `$ground`, the look-at is `$clearance` metres up so a close zoom stays a walk above the heightmap.
  */
 
 namespace visu::components;
@@ -12,7 +12,7 @@ use visu::math::{EPS, Quat, Vec2, Vec3, dot, length, radians, sgn};
 public struct RtsCamera
 {
     /**
-     * Ground point the camera looks at.
+     * Ground point the camera pans. The look-at is this, or `$clearance` above it on a heightmap.
      */
     public Vec3 $focus;
 
@@ -32,7 +32,7 @@ public struct RtsCamera
     public float32 $focusDamp = 0.8f;
 
     /**
-     * Distance from `$focus` along camera +Z.
+     * Distance from the look-at along camera +Z.
      */
     public float32 $radius = 250.0f;
 
@@ -73,8 +73,9 @@ public struct RtsCamera
 
     /**
      * Metres the eye stays above `$ground` at the camera XZ.
+     * The look-at sits this high above `$focus`, so a close zoom looks across the estate.
      */
-    public float32 $clearance = 5.0f;
+    public float32 $clearance = 2.5f;
 
     /**
      * Optional heightfield. Without it, pan / orbit / zoom still run; no XZ clamp or Y snap.
@@ -100,19 +101,20 @@ public struct RtsCamera
     }
 
     /**
-     * Follow `$ground` if set, sit on the focus at `$radius`, apply this tick's spin, look at the focus.
+     * Follow `$ground` if set, sit on the aim at `$radius`, apply this tick's spin, look at the aim.
      */
     public function place(Transform& $transform) : void
     {
         $this->clampRadius();
         $this->followGround($transform);
 
-        if ($transform->position == Vec3(0.0f, 0.0f, 0.0f) || $transform->position == $this->focus) {
+        Vec3 $aim = $this->aim();
+        if ($transform->position == Vec3(0.0f, 0.0f, 0.0f) || $transform->position == $aim) {
             $transform->position->z = $transform->position->z - 1.0f;
         }
 
-        $transform->lookAt($this->focus);
-        $transform->position = $this->focus;
+        $transform->lookAt($aim);
+        $transform->position = $aim;
         $transform->moveBackward($this->radius);
 
         float32 $yaw = radians(-$this->spin->x);
@@ -124,7 +126,7 @@ public struct RtsCamera
             $pitch = 0.0f;
         }
 
-        Vec3 $offset = $transform->position - $this->focus;
+        Vec3 $offset = $transform->position - $aim;
         if ($pitch != 0.0f) {
             Vec3 $axis = $transform->left();
             if (length($axis) > EPS) {
@@ -136,9 +138,22 @@ public struct RtsCamera
             $offset = Quat(angleAxis: $yaw, Transform::worldUp()) * $offset;
         }
 
-        $transform->position = $this->focus + $offset;
-        $transform->lookAt($this->focus);
+        $transform->position = $aim + $offset;
+        $transform->lookAt($aim);
         $this->clearGround($transform);
+    }
+
+    /**
+     * Ground focus, or `$clearance` above it when a heightmap is set.
+     */
+    private function aim() : Vec3
+    {
+        Vec3 $at = $this->focus;
+        if ($this->ground != null) {
+            $at->y = $at->y + $this->clearance;
+        }
+
+        return $at;
     }
 
     private function followGround(Transform& $transform) : void
@@ -186,6 +201,7 @@ public struct RtsCamera
         $floor = $floor + $this->clearance;
         if ($transform->position->y < $floor) {
             $transform->position->y = $floor;
+            $transform->lookAt($this->aim());
         }
     }
 

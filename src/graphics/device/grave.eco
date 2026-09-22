@@ -1,0 +1,36 @@
+/**
+ * Metal textures whose MTLTexture must outlive Texture.destroy.
+ * Vulkan frees inside destroyTexture and never pushes here.
+ * release() drops the handles. The caller has already waited out the GPU.
+ */
+
+namespace visu::graphics;
+
+internal class TextureGrave
+{
+    private array<TextureHandle> $held;
+
+    public constructor()
+    {
+        $this->held = array<TextureHandle>();
+    }
+
+    public function push(TextureHandle $handle) : void
+    {
+        $this->held->push($handle);
+    }
+
+    public const function count() : int32
+    {
+        return $this->held->count() as int32;
+    }
+
+    /**
+     * Drop every retired handle. Does not wait. Call after waitIdle, or from
+     * beginFrame once this slot's previous GPU work has finished.
+     */
+    public function release() : void
+    {
+        $this->held = array<TextureHandle>();
+    }
+}

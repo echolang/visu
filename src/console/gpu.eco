@@ -1,0 +1,69 @@
+/**
+ * Console verb `gpu`: live GPU object counts, the pipeline-state cache size, the render-graph
+ * pool, and the VRAM snapshot. The Resources overlay tab shows most of these; this prints them
+ * to the console and the log so a headless dcapture run can record them at chosen frames and a
+ * leak shows up as a delta between two lines.
+ */
+
+namespace visu::console;
+
+use visu::app::info;
+use visu::graphics::{Device, MemoryStats, Pool, ResourceStats};
+use visu::instrument::formatBytes;
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+public class GpuConsole : ConsoleCommandHandler
+{
+    private Device $device;
+    private Pool $pool;
+
+    public constructor(Device $device, Pool $pool)
+    {
+        $this->device = $device;
+        $this->pool = $pool;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('gpu', $this, 'object counts, pipeline cache, pool and VRAM');
+        array<string> $names = array<string>();
+        $names[] = 'gpu';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if (!$cmd->isAction('gpu')) {
+            return;
+        }
+
+        ResourceStats $gpu = $this->device->resourceStats();
+        $this->say($console, "gpu: textures {$gpu->textures} retired {$gpu->retired} buffers {$gpu->buffers} samplerCache {$gpu->samplerCache} programs {$gpu->programs}");
+
+        // the pipeline-state cache is keyed by program id plus target formats and is grow-only
+        // apart from forgetProgram, so a climbing count is a leak the object counters cannot see
+        int32 $psos = $this->device->pipelineCount();
+        int32 $targets = $this->pool->targetCount();
+        int32 $poolTex = $this->pool->textureCount();
+        int32 $cached = $this->pool->cachedCount();
+        $this->say($console, "gpu: psos {$psos} pool targets {$targets} textures {$poolTex} cached {$cached}");
+
+        MemoryStats $mem = $this->device->memoryStats();
+        string $used = formatBytes($mem->used);
+        // raw bytes as well, so two lines subtract cleanly without reparsing a unit suffix
+        string $vram = "gpu: vram {$used} ({$mem->used} bytes)";
+        if ($mem->budget > 0) {
+            string $budget = formatBytes($mem->budget);
+            $vram = "gpu: vram {$used} of {$budget} ({$mem->used} bytes)";
+        }
+
+        $this->say($console, $vram);
+    }
+
+    private function say(DebugConsole $console, string $line) : void
+    {
+        $console->writeLine($line);
+        info($line);
+    }
+}

@@ -62,6 +62,37 @@ public interface DeviceProtocol
     const function memoryStats() : MemoryStats;
 
     /**
+     * Live GPU object counts for this device. Retired is the Metal grave.
+     */
+    const function resourceStats() : ResourceStats;
+
+    /**
+     * Pipeline-state cache size. Keys are program id plus target formats; grow-only
+     * apart from forgetProgram.
+     */
+    const function pipelineCount() : int32;
+
+    /**
+     * Hold a destroyed texture's handle until the GPU is done with it.
+     * Metal pushes into this device's grave. Vulkan is a no-op; destroyTexture already freed it.
+     */
+    function retireTexture(TextureHandle $handle) : void;
+
+    /**
+     * Drop retired handles. Does not wait. Call after waitIdle when the next
+     * allocation happens before beginFrame, and from beginFrame after the slot wait.
+     */
+    function releaseRetired() : void;
+
+    /**
+     * Drop pipeline states whose cache key starts with `$id|`.
+     * GpuPass keys begin with the program id. The map is otherwise grow-only.
+     * Vulkan waits first: a pipeline the GPU still references is a use-after-free,
+     * and program destroy has no frame guarantee.
+     */
+    function forgetProgram(uint32 $id) : void;
+
+    /**
      * Open the frame and start the scene command buffer. The drawable is not taken yet.
      * `.skipped` for a 0-size surface. Don't call this after shouldClose, or once surfaceLost().
      */

@@ -1,0 +1,52 @@
+/**
+ * Shared, thread-safe cell the loading screen pulls from.
+ * Progress is completed weight as an atomic int; the hint string lives in a mutex
+ * because Echo has no atomic string.
+ */
+
+namespace visu::scene;
+
+use std::thread;
+
+#[atomic]
+public class LoadProgress
+{
+    private atomic<int32> $doneWeight;
+    private thread::mutex<string> $line;
+
+    public constructor()
+    {
+        $this->doneWeight = atomic<int32>(0);
+        $this->line = thread::mutex<string>('');
+    }
+
+    public function advance(int32 $weight) : void
+    {
+        if ($weight <= 0) {
+            return;
+        }
+
+        $this->doneWeight->add($weight);
+    }
+
+    public function say(string $hint) : void
+    {
+        thread::locked<string> $g = $this->line->lock();
+        unsafe {
+            $g->value = $hint;
+        }
+    }
+
+    public function weight() : int32
+    {
+        return $this->doneWeight->load();
+    }
+
+    public function hint() : string
+    {
+        thread::locked<string> $g = $this->line->lock();
+        unsafe {
+            return $g->value;
+        }
+    }
+}

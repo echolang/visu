@@ -1,8 +1,9 @@
 /**
- * Process-lifetime cache of live models and their bound material textures. One per Device; the
- * app owns it (Game, not Services) and calls `destroy` once after `waitIdle`. Scenes come and go;
- * the bank keeps the GPU objects so a reload does not re-upload every mesh and map.
- * Fallback textures are minted on first use, so the bank may be built before the GPU is up.
+ * Process-lifetime bank object. One per Device; the app owns it (Game, not Services).
+ * `release` drops acquired meshes and map textures so a menu can free VRAM; the next Play
+ * `acquire`s again. `destroy` is shutdown after `waitIdle`. F5 reloads Play without `release`,
+ * so the GPU objects survive that path. Fallback textures are minted on first use, so the
+ * bank may be built before the GPU is up.
  */
 
 namespace visu::graphics;
@@ -149,18 +150,20 @@ public class ModelBank
     }
 
     /**
-     * Free the fallbacks and every model. Loaded map textures stay with Assets. waitIdle first.
+     * Drop acquired meshes and their map textures. The bank object stays; fallbacks stay.
+     * waitIdle first. Menu calls this so Play GPU does not sit on the title screen.
+     */
+    public function release() : void
+    {
+        $this->dropAcquired();
+    }
+
+    /**
+     * Free the fallbacks and every model. waitIdle first.
      */
     public function destroy() : void
     {
-        array<string> $ids = $this->models->keys();
-        foreach ($ids as $id) {
-            $this->models[$id]->destroy();
-        }
-
-        $this->models->clear();
-        $this->materials->clear();
-        $this->byIndex->clear();
+        $this->dropAcquired();
         Texture? $white = $this->white;
         if ($white != null) {
             Texture $w = guard $white;
@@ -173,6 +176,45 @@ public class ModelBank
             Texture $f = guard $flat;
             $f->destroy();
             $this->flatNormal = null;
+        }
+    }
+
+    /**
+     * Destroy live models, forget their catalog ids and map textures, keep fallbacks.
+     */
+    private function dropAcquired() : void
+    {
+        array<string> $ids = array<string>();
+        array<string> $modelIds = $this->models->keys();
+        foreach ($modelIds as $id) {
+            $ids[] = $id;
+        }
+
+        foreach ($this->materials as $gpu) {
+            rememberMap($ids, $gpu->material->albedo);
+            rememberMap($ids, $gpu->material->normal);
+            rememberMap($ids, $gpu->material->roughness);
+            rememberMap($ids, $gpu->material->metal);
+            rememberMap($ids, $gpu->material->height);
+            rememberMap($ids, $gpu->material->ao);
+            rememberMap($ids, $gpu->material->emissive);
+            rememberMap($ids, $gpu->material->alpha);
+        }
+
+        array<Model> $live = array<Model>();
+        foreach ($this->models as $model) {
+            $live[] = $model;
+        }
+
+        $this->models->clear();
+        foreach ($live as $model) {
+            $model->destroy();
+        }
+
+        $this->materials->clear();
+        $this->byIndex->clear();
+        foreach ($ids as $id) {
+            $this->assets->forget($id);
         }
     }
 
@@ -283,6 +325,14 @@ public class ModelBank
         }
         return $sampler;
     }
+}
+
+internal function rememberMap(array<string>& $ids, AssetRef? $slot) : void
+{
+    AssetRef $ref = guard $slot else {
+        return;
+    }
+    $ids[] = $ref->id;
 }
 
 /**

@@ -1,6 +1,7 @@
 /**
  * One live scene and an optional pending replacement.
- * switch() queues; apply() runs after present (caller waitIdle()s first if the outgoing scene owns GPU objects).
+ * switch() queues; Host.adopt() unloads, reaps GPU, then loads after present.
+ * apply() is the same adopt without GPU (tests).
  * Never auto-ticks bound systems; the scene calls them in the order it wants.
  */
 
@@ -14,7 +15,7 @@ use visu::ui::Ui;
 public class Director
 {
     private Scene $current;
-    private Scene? $next;
+    private ScenePending $pending;
     private Dispatcher? $dispatcher;
     private int32? $switchId;
     private bool $loaded;
@@ -22,7 +23,7 @@ public class Director
     public constructor(Scene $initial)
     {
         $this->current = $initial;
-        $this->next = null;
+        $this->pending = .none;
         $this->dispatcher = null;
         $this->switchId = null;
         $this->loaded = false;
@@ -49,19 +50,32 @@ public class Director
         Director $director = $this;
         $this->dispatcher = $dispatcher;
         $this->switchId = $dispatcher->register<SwitchSignal>(function(const SwitchSignal& $signal) : Flow {
-            $director->switch($signal->next);
+            $director->switch($signal->next, $signal->built);
             return .proceed;
         });
     }
 
-    public function switch(Scene $scene) : void
+    /**
+     * Queue `$scene`. `$built` means it already owns GPU resources (a loader target) even though
+     * load() has not run. Replacing a built pending scene unloads it. A scene that was only
+     * constructed has nothing to free.
+     */
+    public function switch(Scene $scene, bool $built = false) : void
     {
-        $this->next = $scene;
+        $this->discardPending();
+        if ($built) {
+            $this->pending = .built($scene);
+        } else {
+            $this->pending = .constructed($scene);
+        }
     }
 
     public const function pending() : bool
     {
-        return $this->next != null;
+        return match ($this->pending) {
+            ScenePending::none => false,
+            else => true,
+        };
     }
 
     public function load() : void
@@ -92,29 +106,81 @@ public class Director
     }
 
     /**
-     * Unload the live scene, adopt the queued one, load it.
+     * Unload the live scene. Leaves the queued scene in place so loadIncoming can adopt it.
      * No-op when nothing is pending.
-     * Caller must not be in a recorded frame; waitIdle if the old scene holds GPU objects.
      */
-    public function apply() : void
+    public function unloadOutgoing() : void
     {
-        Scene $incoming = guard $this->next else {
+        if (!$this->pending()) {
             return;
         }
-        $this->next = null;
-        $this->unload();
-        $this->current = $incoming;
-        $this->load();
-    }
 
-    public function unload() : void
-    {
         if (!$this->loaded) {
             return;
         }
 
         $this->current->unload();
         $this->loaded = false;
+    }
+
+    /**
+     * Seat the queued scene and load it. No-op when nothing is pending.
+     */
+    public function loadIncoming() : void
+    {
+        ScenePending $held = $this->pending;
+        $this->pending = .none;
+        match ($held) {
+            ScenePending::none => {
+                return;
+            },
+            ScenePending::constructed($scene) => {
+                $this->current = $scene;
+            },
+            ScenePending::built($scene) => {
+                $this->current = $scene;
+            },
+        };
+        $this->load();
+    }
+
+    /**
+     * Unload the live scene, adopt the queued one, load it.
+     * Tests call this. The play path is Host.adopt, which reaps GPU between unload and load.
+     */
+    public function apply() : void
+    {
+        $this->unloadOutgoing();
+        $this->loadIncoming();
+    }
+
+    public function unload() : void
+    {
+        $this->discardPending();
+        if (!$this->loaded) {
+            return;
+        }
+
+        $this->current->unload();
+        $this->loaded = false;
+    }
+
+    /**
+     * Drop a queued scene. Unload it only when it was flagged built.
+     */
+    private function discardPending() : void
+    {
+        ScenePending $held = $this->pending;
+        $this->pending = .none;
+        match ($held) {
+            ScenePending::none => {
+            },
+            ScenePending::constructed($scene) => {
+            },
+            ScenePending::built($scene) => {
+                $scene->unload();
+            },
+        };
     }
 
     private function silence() : void

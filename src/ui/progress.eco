@@ -1,0 +1,42 @@
+/**
+ * Read-only bar. Value is 0..1; not interactive.
+ */
+
+namespace visu::ui;
+
+use visu::math::Vec2;
+
+internal function uiProgress(Ui $ui, float32 $value, const string& $id) : void
+{
+    float32 $v = $value;
+    if ($v < 0.0f) {
+        $v = 0.0f;
+    }
+
+    if ($v > 1.0f) {
+        $v = 1.0f;
+    }
+
+    int32 $p = $ui->bars->count() as int32;
+    $ui->bars[] = ProgressRun($v);
+    ProgressStyle $st = $ui->theme->progress;
+    Node $n = Node();
+    $n->kind = .progress;
+    $n->payload = $p;
+    $n->id = $ui->makeId($id, 'progress');
+    $n->h = .fill;
+    $n->measured = Vec2($st->width, $st->height);
+    $ui->push($n);
+}
+
+internal function emitProgressBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    ProgressRun $run = $ui->bars[$n->payload as usize];
+    ProgressStyle $st = $ui->theme->progress;
+    float32 $r = $st->radius;
+    fillBox($ui, $n->pos, $n->size, $r, $st->track, $pad);
+    float32 $fillW = $n->size->x * $run->value;
+    if ($fillW > 0.0f) {
+        fillBox($ui, $n->pos, Vec2($fillW, $n->size->y), $r, $st->fill, $pad);
+    }
+}

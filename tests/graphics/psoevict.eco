@@ -1,0 +1,50 @@
+/**
+ * The pipeline-state cache is keyed by "<program id>|..." and is otherwise grow-only.
+ * forgetProgram is what keeps a Menu -> Play -> Menu cycle from stranding one state
+ * object per transition, so it must drop that program's entries and nothing else.
+ */
+
+use visu::graphics::{Device, PipelineHandle};
+
+test forget_program_drops_only_its_own_pipelines
+{
+    Device $device = Device();
+    $device->psos['7|pos3uv2|0'] = PipelineHandle::none();
+    $device->psos['7|pos3uv2|1'] = PipelineHandle::none();
+    $device->psos['8|pos3uv2|0'] = PipelineHandle::none();
+    assert($device->psos->count() == 3, 'seeded');
+
+    uint32 $dead = 7;
+    $device->forgetProgram($dead);
+    assert(!$device->psos->has('7|pos3uv2|0'), 'first state dropped');
+    assert(!$device->psos->has('7|pos3uv2|1'), 'second state dropped');
+    assert($device->psos->has('8|pos3uv2|0'), 'another program is untouched');
+    assert($device->psos->count() == 1, 'only the dead program went');
+    $device->shutdown();
+}
+
+test forget_program_matches_the_whole_id
+{
+    Device $device = Device();
+    $device->psos['1|pos3uv2|0'] = PipelineHandle::none();
+    $device->psos['12|pos3uv2|0'] = PipelineHandle::none();
+    $device->psos['100|pos3uv2|0'] = PipelineHandle::none();
+
+    uint32 $dead = 1;
+    $device->forgetProgram($dead);
+    assert(!$device->psos->has('1|pos3uv2|0'), 'program 1 went');
+    assert($device->psos->has('12|pos3uv2|0'), 'program 12 is not program 1');
+    assert($device->psos->has('100|pos3uv2|0'), 'program 100 is not program 1');
+    $device->shutdown();
+}
+
+test forget_program_without_entries_is_a_noop
+{
+    Device $device = Device();
+    $device->psos['3|pos3uv2|0'] = PipelineHandle::none();
+
+    uint32 $absent = 9;
+    $device->forgetProgram($absent);
+    assert($device->psos->count() == 1, 'nothing dropped');
+    $device->shutdown();
+}

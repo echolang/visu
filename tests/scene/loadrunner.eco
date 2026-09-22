@@ -1,0 +1,357 @@
+/**
+ * LoadRunner: stage order, monotonic progress, failure, single-thread fallback.
+ */
+
+use std::thread;
+use visu::scene::{
+    LoadError, LoadJob, LoadLane, LoadPlan, LoadProgress, LoadRunner, LoadStep, loadJob
+};
+
+#[atomic]
+class LineBox
+{
+    public array<string> $items;
+
+    public constructor()
+    {
+        $this->items = array<string>();
+    }
+}
+
+#[atomic]
+class OrderLog
+{
+    private thread::mutex<LineBox> $lines;
+
+    public constructor()
+    {
+        $this->lines = thread::mutex<LineBox>(LineBox());
+    }
+
+    public function push(string $s) : void
+    {
+        thread::locked<LineBox> $g = $this->lines->lock();
+        $g->value->items[] = $s;
+    }
+
+    public function snapshot() : array<string>
+    {
+        thread::locked<LineBox> $g = $this->lines->lock();
+        return $g->value->items->clone();
+    }
+}
+
+#[atomic]
+class SliceJob : LoadJob
+{
+    public string $name;
+    public int32 $mass;
+    public LoadLane $kind;
+    public int32 $left;
+    public OrderLog $log;
+
+    public constructor(string $name, int32 $mass, LoadLane $kind, int32 $slices, OrderLog $log)
+    {
+        $this->name = $name;
+        $this->mass = $mass;
+        $this->kind = $kind;
+        $this->left = $slices;
+        $this->log = $log;
+    }
+
+    public const function label() : string
+    {
+        return $this->name;
+    }
+
+    public const function weight() : int32
+    {
+        return $this->mass;
+    }
+
+    public const function lane() : LoadLane
+    {
+        return $this->kind;
+    }
+
+    public function step() : result<LoadStep, LoadError>
+    {
+        $this->left = $this->left - 1;
+        if ($this->left > 0) {
+            return .ok(.again);
+        }
+
+        $this->log->push($this->name);
+        return .ok(.done);
+    }
+}
+
+#[atomic]
+class BoomJob : LoadJob
+{
+    public constructor()
+    {
+    }
+
+    public const function label() : string
+    {
+        return 'boom';
+    }
+
+    public const function weight() : int32
+    {
+        return 4;
+    }
+
+    public const function lane() : LoadLane
+    {
+        return .main;
+    }
+
+    public function step() : result<LoadStep, LoadError>
+    {
+        return .error(.job('boom', 'nope'));
+    }
+}
+
+internal function drain(LoadRunner $runner) : void
+{
+    $runner->begin();
+    int32 $n = 0;
+    while (!$runner->done() && $n < 10000) {
+        $runner->pump(1000000000);
+        $n = $n + 1;
+    }
+}
+
+test load_runner_ran_main_tracks_lane
+{
+    OrderLog $log = OrderLog();
+    LoadPlan $workers = LoadPlan();
+    $workers->add(SliceJob('w', 1, .worker, 1, $log));
+    LoadRunner $runner = LoadRunner($workers, LoadProgress());
+    $runner->capWorkers(0);
+    assert(!$runner->ranMain(), 'before');
+    drain($runner);
+    assert($runner->done(), 'worker done');
+    assert(!$runner->ranMain(), 'worker lane');
+
+    LoadPlan $mains = LoadPlan();
+    $mains->add(SliceJob('m', 1, .main, 2, $log));
+    LoadRunner $mainRunner = LoadRunner($mains, LoadProgress());
+    $mainRunner->capWorkers(0);
+    $mainRunner->begin();
+    $mainRunner->pump(0);
+    assert($mainRunner->ranMain(), 'first main slice');
+    drain($mainRunner);
+    assert($mainRunner->done(), 'main done');
+}
+
+test load_runner_stage_order
+{
+    OrderLog $log = OrderLog();
+    LoadPlan $plan = LoadPlan();
+    $plan->stage('first');
+    $plan->add(SliceJob('a', 1, .main, 1, $log));
+    $plan->stage('second');
+    $plan->add(SliceJob('b', 1, .main, 1, $log));
+    LoadRunner $runner = LoadRunner($plan, LoadProgress());
+    $runner->capWorkers(0);
+    drain($runner);
+    assert($runner->done(), 'done');
+    array<string> $got = $log->snapshot();
+    assert($got->count() == 2, 'two');
+    assert($got[0] == 'a', 'a first');
+    assert($got[1] == 'b', 'b second');
+}
+
+test load_runner_progress_is_monotonic
+{
+    OrderLog $log = OrderLog();
+    LoadPlan $plan = LoadPlan();
+    $plan->stage('all');
+    $plan->add(SliceJob('a', 2, .main, 3, $log));
+    $plan->add(SliceJob('b', 3, .main, 1, $log));
+    LoadProgress $cell = LoadProgress();
+    LoadRunner $runner = LoadRunner($plan, $cell);
+    $runner->capWorkers(0);
+    $runner->begin();
+    float32 $last = -1.0f;
+    int32 $n = 0;
+    while (!$runner->done() && $n < 10000) {
+        $runner->pump(1);
+        float32 $p = $runner->progress();
+        assert($p >= $last, 'mono');
+        $last = $p;
+        $n = $n + 1;
+    }
+
+    assert($runner->done(), 'done');
+    assert($runner->progress() == 1.0f, 'full');
+    assert($cell->weight() == 5, 'weight');
+}
+
+test load_runner_failure_surfaces
+{
+    LoadPlan $plan = LoadPlan();
+    $plan->add(BoomJob());
+    LoadRunner $runner = LoadRunner($plan, LoadProgress());
+    $runner->capWorkers(0);
+    drain($runner);
+    assert($runner->done(), 'stopped');
+    LoadError? $err = $runner->failure();
+    assert($err != null, 'failed');
+    LoadError $e = guard $err;
+    assert($e->message() == 'boom: nope', 'msg');
+}
+
+test load_runner_single_thread_matches_threaded
+{
+    OrderLog $serialLog = OrderLog();
+    LoadPlan $serialPlan = LoadPlan();
+    $serialPlan->stage('cpu');
+    $serialPlan->add(SliceJob('w', 1, .worker, 2, $serialLog));
+    $serialPlan->add(SliceJob('m', 1, .main, 1, $serialLog));
+    LoadRunner $serial = LoadRunner($serialPlan, LoadProgress());
+    $serial->capWorkers(0);
+    drain($serial);
+    assert($serial->done(), 'serial done');
+    assert($serial->failure() == null, 'serial ok');
+    assert($serial->progress() == 1.0f, 'serial full');
+
+    OrderLog $liveLog = OrderLog();
+    LoadPlan $livePlan = LoadPlan();
+    $livePlan->stage('cpu');
+    $livePlan->add(SliceJob('w', 1, .worker, 2, $liveLog));
+    $livePlan->add(SliceJob('m', 1, .main, 1, $liveLog));
+    LoadRunner $live = LoadRunner($livePlan, LoadProgress());
+    drain($live);
+    assert($live->done(), 'live done');
+    assert($live->failure() == null, 'live ok');
+    assert($live->progress() == 1.0f, 'live full');
+    array<string> $got = $liveLog->snapshot();
+    assert($got->count() == 2, 'both jobs');
+}
+
+#[atomic]
+class WorkerBoom : LoadJob
+{
+    public constructor()
+    {
+    }
+
+    public const function label() : string
+    {
+        return 'worker boom';
+    }
+
+    public const function weight() : int32
+    {
+        return 1;
+    }
+
+    public const function lane() : LoadLane
+    {
+        return .worker;
+    }
+
+    public function step() : result<LoadStep, LoadError>
+    {
+        return .error(.job('worker boom', 'nope'));
+    }
+}
+
+test load_runner_failure_does_not_start_the_rest
+{
+    OrderLog $log = OrderLog();
+    LoadPlan $plan = LoadPlan();
+    $plan->add(BoomJob());
+    $plan->add(SliceJob('later', 1, .worker, 1, $log));
+    LoadRunner $runner = LoadRunner($plan, LoadProgress());
+    $runner->capWorkers(0);
+    drain($runner);
+    assert($runner->done(), 'stopped');
+    assert($runner->failure() != null, 'failed');
+    assert($log->snapshot()->count() == 0, 'later did not run');
+}
+
+test load_runner_worker_failure_does_not_start_the_rest
+{
+    OrderLog $log = OrderLog();
+    LoadPlan $plan = LoadPlan();
+    $plan->stage('cpu');
+    $plan->add(WorkerBoom());
+    $plan->add(SliceJob('later', 1, .worker, 1, $log));
+    LoadRunner $runner = LoadRunner($plan, LoadProgress());
+    $runner->capWorkers(1);
+    drain($runner);
+    assert($runner->done(), 'stopped');
+    LoadError? $err = $runner->failure();
+    assert($err != null, 'failed');
+    LoadError $e = guard $err;
+    assert($e->message() == 'worker boom: nope', 'msg');
+    assert($log->snapshot()->count() == 0, 'later did not run');
+}
+
+test load_runner_cancel_stops_and_reports
+{
+    OrderLog $log = OrderLog();
+    LoadPlan $plan = LoadPlan();
+    $plan->add(SliceJob('a', 1, .main, 4, $log));
+    $plan->add(SliceJob('b', 1, .main, 4, $log));
+    LoadRunner $runner = LoadRunner($plan, LoadProgress());
+    $runner->capWorkers(0);
+    $runner->begin();
+    $runner->pump(0);
+    $runner->cancel();
+    assert($runner->done(), 'done');
+    LoadError? $err = $runner->failure();
+    assert($err != null, 'cancelled');
+    LoadError $e = guard $err;
+    assert($e->message() == 'loading cancelled', 'msg');
+    drain($runner);
+    assert($log->snapshot()->count() == 0, 'did not finish');
+}
+
+test load_job_closure_runs
+{
+    LoadPlan $plan = LoadPlan();
+    $plan->add(loadJob('one', 3, .main, function() : result<LoadStep, LoadError> {
+        return .ok(.done);
+    }));
+    LoadRunner $runner = LoadRunner($plan, LoadProgress());
+    $runner->capWorkers(0);
+    drain($runner);
+    assert($runner->done(), 'done');
+    assert($runner->failure() == null, 'ok');
+    assert($runner->progress() == 1.0f, 'full');
+}
+
+test load_runner_destructor_skips_unstarted_jobs
+{
+    OrderLog $log = OrderLog();
+    LoadPlan $plan = LoadPlan();
+    $plan->add(SliceJob('later', 1, .worker, 1, $log));
+    {
+        LoadRunner $runner = LoadRunner($plan, LoadProgress());
+        $runner->capWorkers(0);
+        $runner->begin();
+    }
+    assert($log->snapshot()->count() == 0, 'single thread did not step');
+
+    OrderLog $live = OrderLog();
+    LoadPlan $livePlan = LoadPlan();
+    $livePlan->add(SliceJob('first', 1, .worker, 1, $live));
+    $livePlan->add(SliceJob('second', 1, .worker, 1, $live));
+    {
+        LoadRunner $runner = LoadRunner($livePlan, LoadProgress());
+        $runner->capWorkers(1);
+        $runner->begin();
+    }
+    array<string> $got = $live->snapshot();
+    int32 $i = 0;
+    while ($i < ($got->count() as int32)) {
+        assert($got[$i as usize] != 'second', 'second stayed queued');
+        $i = $i + 1;
+    }
+}

@@ -1,0 +1,183 @@
+/**
+ * One slice of load work. The same type runs on a worker thread and, when no thread
+ * is available, on the main thread one `step()` at a time.
+ *
+ * A `.worker` job's class must be marked `#[atomic]`: the handle is copied onto
+ * another thread. That marks the reference count only. Workers may touch only their
+ * own preallocated output range. They never call into Device, Assets, Entities, or Pool.
+ */
+
+namespace visu::scene;
+
+public enum LoadLane
+{
+    case worker;
+    case main;
+}
+
+public enum LoadStep
+{
+    case done;
+    case again;
+}
+
+public interface LoadJob
+{
+    const function label() : string;
+    const function weight() : int32;
+    const function lane() : LoadLane;
+    function step() : result<LoadStep, LoadError>;
+}
+
+/**
+ * Closure job. Worker-lane instances still need the captured state to be `#[atomic]`.
+ */
+#[atomic]
+public class FnLoadJob : LoadJob
+{
+    private string $name;
+    private int32 $mass;
+    private LoadLane $kind;
+    private function<result<LoadStep, LoadError>()> $body;
+
+    public constructor(
+        string $name,
+        int32 $mass,
+        LoadLane $kind,
+        function<result<LoadStep, LoadError>()> $body
+    )
+    {
+        $this->name = $name;
+        $this->mass = $mass;
+        $this->kind = $kind;
+        $this->body = $body;
+    }
+
+    public const function label() : string
+    {
+        return $this->name;
+    }
+
+    public const function weight() : int32
+    {
+        return $this->mass;
+    }
+
+    public const function lane() : LoadLane
+    {
+        return $this->kind;
+    }
+
+    public function step() : result<LoadStep, LoadError>
+    {
+        $body = $this->body;
+        return $body();
+    }
+}
+
+/**
+ * One-shot or stepped job from a closure. Worker-lane closures may capture only
+ * `#[atomic]` mailboxes.
+ */
+public function loadJob(
+    string $label,
+    int32 $weight,
+    LoadLane $lane,
+    function<result<LoadStep, LoadError>()> $step
+) : LoadJob
+{
+    return FnLoadJob($label, $weight, $lane, $step);
+}
+
+/**
+ * Row-sliced cook. First `step` constructs `T`, later slices call `$tick` until it
+ * returns true, then `$finish`.
+ */
+#[atomic]
+public class CookLoadJob<T : class> : LoadJob
+{
+    private string $name;
+    private int32 $mass;
+    private LoadLane $kind;
+    private int32 $rows;
+    private T? $work;
+    private function<result<T, LoadError>()> $begin;
+    private function<bool(T, int32)> $tick;
+    private function<void(T)> $finish;
+
+    public constructor(
+        string $name,
+        int32 $mass,
+        LoadLane $lane,
+        int32 $rows,
+        function<result<T, LoadError>()> $begin,
+        function<bool(T, int32)> $tick,
+        function<void(T)> $finish
+    )
+    {
+        $this->name = $name;
+        $this->mass = $mass;
+        $this->kind = $lane;
+        $this->rows = $rows;
+        $this->work = null;
+        $this->begin = $begin;
+        $this->tick = $tick;
+        $this->finish = $finish;
+    }
+
+    public const function label() : string
+    {
+        return $this->name;
+    }
+
+    public const function weight() : int32
+    {
+        return $this->mass;
+    }
+
+    public const function lane() : LoadLane
+    {
+        return $this->kind;
+    }
+
+    public function step() : result<LoadStep, LoadError>
+    {
+        T $work = guard $this->work else {
+            return $this->beginCook();
+        }
+        $tickFn = $this->tick;
+        if (!$tickFn($work, $this->rows)) {
+            return .ok(.again);
+        }
+
+        $done = $this->finish;
+        $done($work);
+        $this->work = null;
+        return .ok(.done);
+    }
+
+    private function beginCook() : result<LoadStep, LoadError>
+    {
+        $start = $this->begin;
+        result<T, LoadError> $started = $start();
+        if ($started->failed()) {
+            return .error($started->failure());
+        }
+
+        $this->work = $started->unwrap();
+        return .ok(.again);
+    }
+}
+
+public function loadCook<T : class>(
+    string $label,
+    int32 $weight,
+    LoadLane $lane,
+    int32 $rows,
+    function<result<T, LoadError>()> $begin,
+    function<bool(T, int32)> $tick,
+    function<void(T)> $finish
+) : LoadJob
+{
+    return CookLoadJob<T>($label, $weight, $lane, $rows, $begin, $tick, $finish);
+}

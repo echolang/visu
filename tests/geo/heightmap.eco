@@ -2,7 +2,7 @@
  * Heightmap sample, set, bounds, and ray march.
  */
 
-use visu::geo::{AABB, Heightmap, Ray};
+use visu::geo::{AABB, Heightmap, HeightmapScale, Ray};
 use visu::math::{Vec2, Vec3, equal, length};
 
 test heightmap_flat_sample_origin
@@ -153,4 +153,32 @@ test heightmap_smoothed_preserves_interior_ramp
 
     Heightmap $out = $map->smoothed(1);
     assert(equal($out->at(2, 2), 2.0f), 'ramp');
+}
+
+test heightmap_scale_updates_bounds
+{
+    Heightmap $map = Heightmap::flat(2, 2, 1.0f, 1.0f);
+    $map->set(1, 1, 4.0f);
+    $map->scale(-1.0f);
+    assert(equal($map->at(0, 0), -1.0f), 'low');
+    assert(equal($map->at(1, 1), -4.0f), 'high');
+    assert(equal($map->min(), -4.0f), 'lo');
+    assert(equal($map->max(), -1.0f), 'hi');
+}
+
+test heightmap_scale_commits_bounds_when_finished
+{
+    Heightmap $map = Heightmap::flat(2, 2, 2.0f, 1.0f);
+    HeightmapScale $work = HeightmapScale($map, 3.0f);
+    bool $done = $work->step(1);
+    assert(!$done, 'one row');
+    assert(equal($map->at(0, 0), 6.0f), 'row0');
+    assert(equal($map->at(0, 1), 2.0f), 'row1');
+    assert(equal($map->min(), 2.0f), 'bounds wait');
+    assert(equal($map->max(), 2.0f), 'bounds wait hi');
+    bool $rest = $work->step(1);
+    assert($rest, 'done');
+    assert(equal($map->at(0, 1), 6.0f), 'row1 scaled');
+    assert(equal($map->min(), 6.0f), 'lo');
+    assert(equal($map->max(), 6.0f), 'hi');
 }

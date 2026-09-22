@@ -24,13 +24,14 @@ use visu::graphics::{
     Pool, RenderTarget, SceneTargetData, ShaderCollection, TargetRef, Texture,
     TextureOptions, TextureRef
 };
-use visu::console::{DCaptureConsole, FlagConsole, OverlayConsole, ProfileConsole};
+use visu::console::{DCaptureConsole, FlagConsole, GpuConsole, OverlayConsole, ProfileConsole};
 use visu::dcapture::{DCapture, DumpQueue};
-use visu::instrument::{DrawSource, Instruments, Overlay, Sample};
+use visu::instrument::{DrawSource, Instruments, Overlay, ResourceSource, Sample};
 use visu::math::Vec2;
 use visu::os::{Window, WindowHints};
 use visu::os::input::{ContextMap, InputHub};
 use visu::runtime::{DebugConsole, EventLoop};
+use visu::scene::Director;
 use visu::signal::Dispatcher;
 use visu::ui::Ui;
 
@@ -97,6 +98,7 @@ public class Host
         $this->events = EventLoop();
         $this->instruments = Instruments();
         $this->instruments->add(id: 'draw', DrawSource($this->device));
+        $this->instruments->add(id: 'resources', ResourceSource($this->device, $this->pool));
         profiler()->attach($this->device->draws, $this->device->gpuProfiler);
         $this->ui = null;
         $this->frameIndex = 0;
@@ -124,6 +126,14 @@ public class Host
         $this->bootOverlay();
         $this->bootUi();
         $this->bootConsole();
+        if ($this->config->deferAssets) {
+            if ($this->fail->failed()) {
+                return .error($this->fail);
+            }
+
+            return .ok;
+        }
+
         guard $this->scanShaders() else ($e) {
             return .error($e);
         }
@@ -198,6 +208,45 @@ public class Host
             return;
         }
 
+        bool $presented = $this->buildAndPresent($compensation, $scene, $ui);
+        if (!$presented) {
+            return;
+        }
+
+        function<void()> $after = guard $afterPresent else {
+            return;
+        }
+        $after();
+    }
+
+    /**
+     * Wait the GPU, unload the outgoing scene, reap the graph, drop the texture
+     * grave, then load the incoming scene. True when a switch ran.
+     */
+    public function adopt(Director $director) : bool
+    {
+        if (!$director->pending()) {
+            return false;
+        }
+
+        $this->device->waitIdle();
+        $director->unloadOutgoing();
+        $this->pool->reap();
+        $this->device->releaseRetired();
+        $director->loadIncoming();
+        return true;
+    }
+
+    /**
+     * Record and present one frame. Locals (pipeline, frame, texture refs) drop before
+     * the caller runs afterPresent, so a scene switch can destroy GPU objects.
+     */
+    private function buildAndPresent(
+        float32 $compensation,
+        function<void(RenderContext, TargetRef)> $scene,
+        function<void(Ui)>? $ui,
+    ) : bool
+    {
         profiler()->bindFrame($this->device->frameIndex(), $this->frameIndex);
         visu::profile::begin('build');
         Frame $frame = Frame();
@@ -213,7 +262,7 @@ public class Host
         $scene($ctx, $sceneTarget);
         $this->addUi($scenePipe, $sceneTarget, $ui);
         visu::profile::end();
-        $this->finishFrame($scenePipe, $frame, $color, $compensation, $afterPresent);
+        return $this->finishFrame($scenePipe, $frame, $color, $compensation);
     }
 
     public const function shouldStop() : bool
@@ -276,6 +325,7 @@ public class Host
         $this->shaders->destroy();
         $this->blit->destroy();
         $this->pool->destroy();
+        $this->device->releaseRetired();
         $this->window->destroy();
         $this->device->shutdown();
     }
@@ -320,8 +370,7 @@ public class Host
         Frame $frame,
         TextureRef $color,
         float32 $compensation,
-        function<void()>? $afterPresent,
-    ) : void
+    ) : bool
     {
         visu::profile::begin('render');
         float64 $t0 = visu::runtime::seconds();
@@ -329,8 +378,7 @@ public class Host
         visu::profile::end();
         guard $exec else {
             $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
-            $this->finishPresent($frame, $exec, $afterPresent, false);
-            return;
+            return $this->finishPresent($frame, $exec, false);
         }
 
         RenderTarget $windowRt = $this->window->renderTarget();
@@ -338,8 +386,7 @@ public class Host
         BackbufferData $back = $frame->get<BackbufferData>();
         Texture $sceneColor = guard $this->pool->getTexture($color) else ($e) {
             $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
-            $this->finishPresent($frame, .error(.pool($e)), $afterPresent, false);
-            return;
+            return $this->finishPresent($frame, .error(.pool($e)), false);
         }
         TextureRef $src = $presentPipe->importTexture($color->name, $sceneColor);
         $presentPipe->add(ClearPass($back->target, ClearPassOptions()));
@@ -362,15 +409,14 @@ public class Host
         visu::profile::begin('present');
         status<PipelineError> $presentExec = $presentPipe->execute($this->frameIndex, $compensation);
         $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
-        $this->finishPresent($frame, $presentExec, $afterPresent, true);
+        return $this->finishPresent($frame, $presentExec, true);
     }
 
     private function finishPresent(
         Frame $frame,
         status<PipelineError> $exec,
-        function<void()>? $afterPresent,
         bool $presentOpen,
-    ) : void
+    ) : bool
     {
         if (!$presentOpen) {
             visu::profile::begin('present');
@@ -384,22 +430,17 @@ public class Host
                 $this->fail = .pipeline($e);
             }
 
-            return;
+            return false;
         }
 
         if (!$presented) {
-            return;
+            return false;
         }
 
         $this->input->endFrame();
         $this->frameIndex = $this->frameIndex + 1;
-        // dumps before the app closure: a scene switch there may destroy what was drawn
         $this->dumps->afterPresent($frame, $this->pool, $this->window, $this->frameIndex - 1, $this->tickIndex);
-
-        function<void()> $after = guard $afterPresent else {
-            return;
-        }
-        $after();
+        return true;
     }
 
     /**
@@ -506,6 +547,8 @@ public class Host
 
         FlagConsole $flagVerbs = FlagConsole();
         $flagVerbs->registerConsoleCommands($console->registry);
+        GpuConsole $gpuVerbs = GpuConsole($this->device, $this->pool);
+        $gpuVerbs->registerConsoleCommands($console->registry);
         DCaptureConsole $verbs = DCaptureConsole($this->dumps, $this->script);
         $verbs->registerConsoleCommands($console->registry);
         ProfileConsole $profileVerbs = ProfileConsole(profiler(), $this->dumps);
@@ -520,7 +563,7 @@ public class Host
         $this->console = $console;
     }
 
-    private function scanShaders() : status<HostError>
+    public function scanShaders() : status<HostError>
     {
         string $dir = $this->shaders->loader->directory;
         bool $here = guard io::exists($dir) else ($e) {
@@ -538,7 +581,7 @@ public class Host
         return .ok;
     }
 
-    private function mountAssets() : status<HostError>
+    public function mountAssets() : status<HostError>
     {
         $this->assets->register(KIND_BYTES, function(Assets $a, Blob $b) : result<Blob, AssetError> {
             return decodeBytes($a, $b);

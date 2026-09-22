@@ -87,73 +87,72 @@ public class Heightmap
      */
     public const function smoothed(int32 $radius = 2) : Heightmap
     {
-        assert($radius >= 1, 'heightmap smooth radius');
-        int32 $degree = $radius * 2;
-        array<float32> $kernel = array<float32>();
-        $kernel->reserve(($degree + 1) as usize);
-        float64 $coeff = 1.0;
-        float64 $sum = 0.0;
-        for (int32 $k = 0; $k <= $degree; $k = $k + 1) {
-            $kernel[] = $coeff as float32;
-            $sum = $sum + $coeff;
-            $coeff = $coeff * (($degree - $k) as float64) / (($k + 1) as float64);
+        HeightmapSmooth $work = HeightmapSmooth($this, $radius);
+        while (!$work->step($this->height)) {
         }
 
-        float32 $inv = (1.0 / $sum) as float32;
-        usize $taps = $kernel->count();
-        for (usize $i = 0; $i < $taps; $i = $i + 1) {
-            $kernel[$i] = $kernel[$i] * $inv;
+        return $work->take();
+    }
+
+    /**
+     * Multiply every sample by `$s` and the cached min/max with it. One pass, no recount.
+     */
+    public function scale(float32 $s) : void
+    {
+        if ($s == 1.0f) {
+            return;
+        }
+
+        HeightmapScale $work = HeightmapScale($this, $s);
+        while (!$work->step($this->height)) {
+        }
+    }
+
+    /**
+     * Multiply samples in rows `[$z0, $z1)`. Bounds stay put until commitScale.
+     */
+    internal function scaleSlice(float32 $s, int32 $z0, int32 $z1) : void
+    {
+        if ($z0 < 0) {
+            $z0 = 0;
+        }
+
+        if ($z1 > $this->height) {
+            $z1 = $this->height;
         }
 
         int32 $w = $this->width;
-        int32 $h = $this->height;
-        usize $n = ($w * $h) as usize;
-        array<float32> $tmp = arr::room<float32>($n);
-        $tmp->commit($n);
-        array<float32> $out = arr::room<float32>($n);
-        $out->commit($n);
-        for (int32 $iz = 0; $iz < $h; $iz = $iz + 1) {
-            int32 $row = $iz * $w;
-            for (int32 $ix = 0; $ix < $w; $ix = $ix + 1) {
-                float32 $acc = 0.0f;
-                for (int32 $k = -$radius; $k <= $radius; $k = $k + 1) {
-                    int32 $sx = $ix + $k;
-                    if ($sx < 0) {
-                        $sx = 0;
-                    }
-
-                    if ($sx >= $w) {
-                        $sx = $w - 1;
-                    }
-
-                    $acc = $acc + $this->data[($row + $sx) as usize] * $kernel[($k + $radius) as usize];
-                }
-
-                $tmp[($row + $ix) as usize] = $acc;
+        int32 $iz = $z0;
+        while ($iz < $z1) {
+            usize $row = ($iz * $w) as usize;
+            usize $end = $row + ($w as usize);
+            usize $i = $row;
+            while ($i < $end) {
+                $this->data[$i] = $this->data[$i] * $s;
+                $i = $i + 1;
             }
+
+            $iz = $iz + 1;
         }
+    }
 
-        for (int32 $iz = 0; $iz < $h; $iz = $iz + 1) {
-            for (int32 $ix = 0; $ix < $w; $ix = $ix + 1) {
-                float32 $acc = 0.0f;
-                for (int32 $k = -$radius; $k <= $radius; $k = $k + 1) {
-                    int32 $sz = $iz + $k;
-                    if ($sz < 0) {
-                        $sz = 0;
-                    }
-
-                    if ($sz >= $h) {
-                        $sz = $h - 1;
-                    }
-
-                    $acc = $acc + $tmp[($sz * $w + $ix) as usize] * $kernel[($k + $radius) as usize];
-                }
-
-                $out[($iz * $w + $ix) as usize] = $acc;
-            }
+    /**
+     * Apply `$s` to the cached min/max once the samples are all scaled.
+     */
+    internal function commitScale(float32 $s) : void
+    {
+        $this->lo = $this->lo * $s;
+        $this->hi = $this->hi * $s;
+        if ($s < 0.0f) {
+            float32 $swap = $this->lo;
+            $this->lo = $this->hi;
+            $this->hi = $swap;
         }
+    }
 
-        return Heightmap($out, $w, $h, $this->ppu);
+    internal const function sampleData() : array<float32>
+    {
+        return $this->data;
     }
 
     /**

@@ -7,6 +7,98 @@ namespace visu::graphics;
 
 use visu::math::Vec4;
 
+/**
+ * PBR programs and the deferred blit for one Device.
+ * Releasing an MTLLibrary and compiling the same MSL again smashes the AGX compiler heap
+ * (Play, Menu, Play). The device owns this and drops it in shutdown.
+ */
+internal class DeferredCache
+{
+    private BakedShaderCache $programs;
+    private FullscreenTextureRenderer? $blit;
+    private bool $warmed;
+
+    public constructor()
+    {
+        $this->programs = BakedShaderCache();
+        $this->blit = null;
+        $this->warmed = false;
+    }
+
+    public function drop() : void
+    {
+        $this->programs->drop();
+        $this->warmed = false;
+        $this->dropBlit();
+    }
+
+    public function shaders(Device $device) : result<BakedShaders, ShaderError>
+    {
+        if ($this->warmed) {
+            return .ok($this->programs->shaders($device, function(string $name, ShaderKind $kind) : string? {
+                return pbrBytes($name, $kind);
+            }));
+        }
+
+        return $this->makeShaders($device);
+    }
+
+    public function blit(Device $device) : result<FullscreenTextureRenderer, ShaderError>
+    {
+        FullscreenTextureRenderer $have = guard $this->blit else {
+            FullscreenTextureRenderer $blit = FullscreenTextureRenderer();
+            guard $blit->load($device) else ($e) {
+                return .error($e);
+            }
+            $this->blit = $blit;
+            return .ok($blit);
+        }
+        return .ok($have);
+    }
+
+    private function dropBlit() : void
+    {
+        FullscreenTextureRenderer $blit = guard $this->blit else {
+            return;
+        }
+        $blit->destroy();
+        $this->blit = null;
+    }
+
+    private function makeShaders(Device $device) : result<BakedShaders, ShaderError>
+    {
+        BakedShaders $shaders = $this->programs->shaders($device, function(string $name, ShaderKind $kind) : string? {
+            return pbrBytes($name, $kind);
+        });
+        guard $shaders->program('gbuffer_instanced') else ($e) {
+            $this->programs->drop();
+            return .error($e);
+        }
+        guard $shaders->program('lightpass') else ($e) {
+            $this->programs->drop();
+            return .error($e);
+        }
+        guard $shaders->program('debug_view') else ($e) {
+            $this->programs->drop();
+            return .error($e);
+        }
+        guard $shaders->program('model') else ($e) {
+            $this->programs->drop();
+            return .error($e);
+        }
+        guard $shaders->program('debug_lines') else ($e) {
+            $this->programs->drop();
+            return .error($e);
+        }
+        guard $shaders->program('shadow') else ($e) {
+            $this->programs->drop();
+            return .error($e);
+        }
+        $this->warmed = true;
+        return .ok($shaders);
+    }
+}
+
 internal class DeferredGpu
 {
     public Device $device;
@@ -25,37 +117,10 @@ internal class DeferredGpu
 
     public static function load(Device $device) : result<DeferredGpu, ShaderError>
     {
-        BakedShaders $shaders = BakedShaders($device, function(string $name, ShaderKind $kind) : string? {
-            return pbrBytes($name, $kind);
-        });
-        guard $shaders->program('gbuffer_instanced') else ($e) {
-            $shaders->destroy();
+        BakedShaders $shaders = guard $device->deferred->shaders($device) else ($e) {
             return .error($e);
         }
-        guard $shaders->program('lightpass') else ($e) {
-            $shaders->destroy();
-            return .error($e);
-        }
-        guard $shaders->program('debug_view') else ($e) {
-            $shaders->destroy();
-            return .error($e);
-        }
-        guard $shaders->program('model') else ($e) {
-            $shaders->destroy();
-            return .error($e);
-        }
-        guard $shaders->program('debug_lines') else ($e) {
-            $shaders->destroy();
-            return .error($e);
-        }
-        guard $shaders->program('shadow') else ($e) {
-            $shaders->destroy();
-            return .error($e);
-        }
-        FullscreenTextureRenderer $blit = FullscreenTextureRenderer();
-        guard $blit->load($device) else ($e) {
-            $shaders->destroy();
-            $blit->destroy();
+        FullscreenTextureRenderer $blit = guard $device->deferred->blit($device) else ($e) {
             return .error($e);
         }
 
@@ -123,8 +188,6 @@ internal class DeferredGpu
         $this->white->destroy();
         $this->noise->destroy();
         $this->shadowDummy->destroy();
-        $this->blit->destroy();
-        $this->shaders->destroy();
     }
 }
 

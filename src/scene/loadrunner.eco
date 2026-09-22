@@ -1,0 +1,369 @@
+/**
+ * Pumps a LoadPlan across frames. One job steps on this thread until the slice
+ * budget is spent. When capWorkers is above 0, worker-lane jobs run on LoadWorkers
+ * and this thread only steps main-lane jobs. capWorkers(0) steps both lanes here.
+ */
+
+namespace visu::scene;
+
+use std::thread;
+use std::time;
+
+public class LoadRunner
+{
+    private LoadPlan $plan;
+    private LoadProgress $cell;
+    private int32 $total;
+    private int32 $stageIndex;
+    private int32 $maxWorkers;
+    private bool $started;
+    private bool $finished;
+    private LoadError? $fail;
+    private array<LoadJob> $mainQueue;
+    private array<LoadJob> $workerQueue;
+    private LoadJob? $current;
+    private LoadWorkers? $workers;
+    private bool $mainRan;
+
+    public constructor(LoadPlan $plan, LoadProgress $progress)
+    {
+        $this->plan = $plan;
+        $this->cell = $progress;
+        $this->total = $plan->totalWeight();
+        $this->stageIndex = 0;
+        int32 $n = (thread::concurrency() as int32) - 1;
+        if ($n < 0) {
+            $n = 0;
+        }
+
+        $this->maxWorkers = $n;
+        $this->started = false;
+        $this->finished = false;
+        $this->fail = null;
+        $this->mainQueue = array<LoadJob>();
+        $this->workerQueue = array<LoadJob>();
+        $this->current = null;
+        $this->workers = null;
+        $this->mainRan = false;
+    }
+
+    destructor()
+    {
+        $this->stopWorkers();
+    }
+
+    /**
+     * Cap worker threads. 0 forces the single-thread fallback. Call before begin.
+     */
+    public function capWorkers(int32 $n) : void
+    {
+        assert(!$this->started, 'load runner: capWorkers after begin');
+        if ($n < 0) {
+            $n = 0;
+        }
+
+        $this->maxWorkers = $n;
+    }
+
+    public function begin() : void
+    {
+        if ($this->started) {
+            return;
+        }
+
+        $this->started = true;
+        $this->openStage();
+    }
+
+    /**
+     * Run one slice of work, up to `$budgetNs` of main-thread stepping.
+     * The first slice always runs, so a 0 budget still moves.
+     */
+    public function pump(int64 $budgetNs) : void
+    {
+        if (!$this->started) {
+            $this->begin();
+        }
+
+        if ($this->finished) {
+            return;
+        }
+
+        time::instant $t0 = time::instant::now();
+        $this->drain();
+        if ($this->finished) {
+            return;
+        }
+
+        int32 $slices = 0;
+        while (!$this->finished) {
+            if ($slices > 0) {
+                int64 $spent = (time::instant::now() - $t0)->as_nanos();
+                if ($spent >= $budgetNs) {
+                    return;
+                }
+            }
+
+            if (!$this->stepOne()) {
+                $this->drain();
+                if ($this->stageIdle()) {
+                    $this->stopWorkers();
+                    $this->stageIndex = $this->stageIndex + 1;
+                    $this->openStage();
+                    $slices = $slices + 1;
+                    continue;
+                }
+
+                return;
+            }
+
+            $slices = $slices + 1;
+        }
+    }
+
+    public const function done() : bool
+    {
+        return $this->finished;
+    }
+
+    public function progress() : float32
+    {
+        if ($this->total <= 0) {
+            return 1.0f;
+        }
+
+        int32 $done = $this->cell->weight();
+        if ($done < 0) {
+            $done = 0;
+        }
+
+        if ($done > $this->total) {
+            $done = $this->total;
+        }
+
+        return ($done as float32) / ($this->total as float32);
+    }
+
+    public function hint() : string
+    {
+        return $this->cell->hint();
+    }
+
+    public const function failure() : LoadError?
+    {
+        return $this->fail;
+    }
+
+    /**
+     * Stop workers and mark the plan cancelled. LoadingScene.unload calls this
+     * before dropping a target that may still be filling slots.
+     */
+    public function cancel() : void
+    {
+        if ($this->fail == null) {
+            $this->fail = LoadError::cancelled;
+        }
+
+        $this->finished = true;
+        $this->stopWorkers();
+    }
+
+    /**
+     * A main-lane job has been stepped. Those jobs are the ones that touch the device.
+     */
+    public const function ranMain() : bool
+    {
+        return $this->mainRan;
+    }
+
+    private function openStage() : void
+    {
+        if ($this->fail != null) {
+            $this->finished = true;
+            return;
+        }
+
+        int32 $n = $this->plan->stageCount();
+        if ($this->stageIndex >= $n) {
+            $this->finished = true;
+            return;
+        }
+
+        LoadStage $stage = $this->plan->stages[$this->stageIndex as usize];
+        $this->cell->say($stage->name);
+        $this->mainQueue = array<LoadJob>();
+        $this->workerQueue = array<LoadJob>();
+        $this->current = null;
+        foreach ($stage->jobs as $job) {
+            LoadJob $j = $job;
+            if ($j->lane() == LoadLane::main) {
+                $this->mainQueue[] = $j;
+            } else {
+                $this->workerQueue[] = $j;
+            }
+        }
+
+        if ($this->workerQueue->empty() || $this->maxWorkers < 1) {
+            return;
+        }
+
+        LoadWorkers $pool = LoadWorkers();
+        bool $up = $pool->start($this->workerQueue, $this->maxWorkers);
+        if (!$up) {
+            return;
+        }
+
+        $this->workerQueue = array<LoadJob>();
+        $this->workers = $pool;
+    }
+
+    private function stepOne() : bool
+    {
+        LoadJob? $maybe = $this->takeMain();
+        if ($maybe == null) {
+            $maybe = $this->takeWorker();
+        }
+
+        LoadJob $job = guard $maybe else {
+            return false;
+        }
+
+        return $this->runSlice($job);
+    }
+
+    private function takeMain() : LoadJob?
+    {
+        LoadJob $held = guard $this->current else {
+            if ($this->mainQueue->empty()) {
+                return null;
+            }
+
+            LoadJob $next = $this->mainQueue->remove(0);
+            $this->cell->say($next->label());
+            $this->current = $next;
+            return $next;
+        }
+
+        return $held;
+    }
+
+    private function takeWorker() : LoadJob?
+    {
+        if ($this->workers != null) {
+            return null;
+        }
+
+        if ($this->workerQueue->empty()) {
+            return null;
+        }
+
+        LoadJob $next = $this->workerQueue->remove(0);
+        $this->cell->say($next->label());
+        $this->current = $next;
+        return $next;
+    }
+
+    private function runSlice(LoadJob $job) : bool
+    {
+        if ($job->lane() == LoadLane::main) {
+            $this->mainRan = true;
+        }
+
+        result<LoadStep, LoadError> $r = $job->step();
+        if ($r->failed()) {
+            $this->fail = $r->failure();
+            $this->current = null;
+            $this->finished = true;
+            $this->stopWorkers();
+            return false;
+        }
+
+        LoadStep $step = $r->unwrap();
+        if ($step == LoadStep::again) {
+            return true;
+        }
+
+        $this->cell->advance($job->weight());
+        $this->current = null;
+        return true;
+    }
+
+    private function drain() : void
+    {
+        LoadWorkers $pool = guard $this->workers else {
+            return;
+        }
+
+        while (true) {
+            LoadCompletion? $c = $pool->poll();
+            if ($c == null) {
+                return;
+            }
+
+            LoadCompletion $item = guard $c;
+            $this->apply($item);
+            if ($this->finished) {
+                $this->stopWorkers();
+                return;
+            }
+
+            $pool->refill();
+        }
+    }
+
+    private function apply(LoadCompletion $c) : void
+    {
+        LoadError? $err = $c->error;
+        if ($err != null) {
+            if ($this->fail == null) {
+                LoadError $e = guard $err;
+                $this->fail = $e;
+                $this->finished = true;
+            }
+
+            return;
+        }
+
+        $this->cell->advance($c->weight);
+    }
+
+    private function stageIdle() : bool
+    {
+        if ($this->current != null) {
+            return false;
+        }
+
+        if (!$this->mainQueue->empty()) {
+            return false;
+        }
+
+        if (!$this->workerQueue->empty()) {
+            return false;
+        }
+
+        LoadWorkers $pool = guard $this->workers else {
+            return true;
+        }
+        return $pool->idle();
+    }
+
+    private function stopWorkers() : void
+    {
+        LoadWorkers $pool = guard $this->workers else {
+            return;
+        }
+
+        array<LoadCompletion> $done = array<LoadCompletion>();
+        int32 $dropped = $pool->stop($done);
+        $this->workers = null;
+        foreach ($done as $c) {
+            LoadCompletion $item = $c;
+            $this->apply($item);
+        }
+
+        if ($dropped > 0 && $this->fail == null) {
+            $this->fail = LoadError::cancelled;
+            $this->finished = true;
+        }
+    }
+}

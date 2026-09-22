@@ -1,0 +1,37 @@
+/**
+ * Resources overlay tab: declared chip plus ResourceSource metrics.
+ */
+
+use visu::graphics::{Device, Pool};
+use visu::instrument::{Instruments, ResourceSource, Tab, Unit, findTab};
+
+test instruments_declared_tabs_include_resources
+{
+    Instruments $inst = Instruments();
+    $sample = $inst->sample();
+    Tab $r = guard findTab($sample, 'resources') else {
+        die('resources');
+    }
+    assert($r->title == 'Resources', 'title');
+    assert($r->order == 5, 'order');
+}
+
+test resource_source_fills_gpu_and_pool_sections
+{
+    Device $device = Device();
+    Pool $pool = Pool($device);
+    Instruments $inst = Instruments();
+    $inst->add(id: 'resources', ResourceSource($device, $pool));
+    $sample = $inst->sample();
+    Tab $tab = guard findTab($sample, 'resources') else {
+        die('resources');
+    }
+    assert($tab->sections->count() == 3, 'gpu pool memory');
+    assert($tab->sections[0]->id == 'gpu', 'gpu');
+    assert($tab->sections[0]->metrics[0]->name == 'textures', 'textures');
+    assert($tab->sections[0]->metrics[0]->unit == Unit::count, 'count');
+    assert($tab->sections[1]->id == 'pool', 'pool');
+    assert($tab->sections[1]->metrics[0]->value == 0.0, 'empty pool');
+    assert($tab->sections[2]->id == 'memory', 'memory');
+    $device->shutdown();
+}

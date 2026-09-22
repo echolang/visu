@@ -1,0 +1,164 @@
+/**
+ * Separable binomial smooth, sliced by output row so a loader can yield mid-pass.
+ */
+
+namespace visu::geo;
+
+public class HeightmapSmooth
+{
+    private Heightmap $src;
+    private array<float32> $kernel;
+    private array<float32> $tmp;
+    private array<float32> $out;
+    private int32 $radius;
+    private int32 $pass;
+    private int32 $row;
+    private bool $taken;
+
+    public constructor(Heightmap $src, int32 $radius = 2)
+    {
+        assert($radius >= 1, 'heightmap smooth radius');
+        $this->src = $src;
+        $this->radius = $radius;
+        $this->pass = 0;
+        $this->row = 0;
+        $this->taken = false;
+        int32 $degree = $radius * 2;
+        array<float32> $kernel = array<float32>();
+        $kernel->reserve(($degree + 1) as usize);
+        float64 $coeff = 1.0;
+        float64 $sum = 0.0;
+        for (int32 $k = 0; $k <= $degree; $k = $k + 1) {
+            $kernel[] = $coeff as float32;
+            $sum = $sum + $coeff;
+            $coeff = $coeff * (($degree - $k) as float64) / (($k + 1) as float64);
+        }
+
+        float32 $inv = (1.0 / $sum) as float32;
+        usize $taps = $kernel->count();
+        for (usize $i = 0; $i < $taps; $i = $i + 1) {
+            $kernel[$i] = $kernel[$i] * $inv;
+        }
+
+        $this->kernel = $kernel;
+        usize $n = ($src->width * $src->height) as usize;
+        array<float32> $tmp = arr::room<float32>($n);
+        $tmp->commit($n);
+        array<float32> $out = arr::room<float32>($n);
+        $out->commit($n);
+        $this->tmp = $tmp;
+        $this->out = $out;
+    }
+
+    /**
+     * Filter up to `$maxRows` of the current pass. True when both passes have finished.
+     */
+    public function step(int32 $maxRows) : bool
+    {
+        if ($this->pass >= 2) {
+            return true;
+        }
+
+        if ($maxRows < 1) {
+            $maxRows = 1;
+        }
+
+        int32 $h = $this->src->height;
+        int32 $end = $this->row + $maxRows;
+        if ($end > $h) {
+            $end = $h;
+        }
+
+        if ($this->pass == 0) {
+            $this->horiz($this->row, $end);
+        } else {
+            $this->vert($this->row, $end);
+        }
+
+        $this->row = $end;
+        if ($this->row >= $h) {
+            $this->pass = $this->pass + 1;
+            $this->row = 0;
+        }
+
+        return $this->pass >= 2;
+    }
+
+    public function take() : Heightmap
+    {
+        assert($this->pass >= 2, 'heightmap smooth still running');
+        assert(!$this->taken, 'heightmap smooth taken twice');
+        $this->taken = true;
+        array<float32> $out = $this->out;
+        $this->out = arr::room<float32>(0);
+        $this->tmp = arr::room<float32>(0);
+        return Heightmap($out, $this->src->width, $this->src->height, $this->src->ppu);
+    }
+
+    private function horiz(int32 $z0, int32 $z1) : void
+    {
+        array<float32> $src = $this->src->sampleData();
+        int32 $w = $this->src->width;
+        int32 $radius = $this->radius;
+        int32 $iz = $z0;
+        while ($iz < $z1) {
+            int32 $row = $iz * $w;
+            int32 $ix = 0;
+            while ($ix < $w) {
+                float32 $acc = 0.0f;
+                int32 $k = -$radius;
+                while ($k <= $radius) {
+                    int32 $sx = $ix + $k;
+                    if ($sx < 0) {
+                        $sx = 0;
+                    }
+
+                    if ($sx >= $w) {
+                        $sx = $w - 1;
+                    }
+
+                    $acc = $acc + $src[($row + $sx) as usize] * $this->kernel[($k + $radius) as usize];
+                    $k = $k + 1;
+                }
+
+                $this->tmp[($row + $ix) as usize] = $acc;
+                $ix = $ix + 1;
+            }
+
+            $iz = $iz + 1;
+        }
+    }
+
+    private function vert(int32 $z0, int32 $z1) : void
+    {
+        int32 $w = $this->src->width;
+        int32 $h = $this->src->height;
+        int32 $radius = $this->radius;
+        int32 $iz = $z0;
+        while ($iz < $z1) {
+            int32 $ix = 0;
+            while ($ix < $w) {
+                float32 $acc = 0.0f;
+                int32 $k = -$radius;
+                while ($k <= $radius) {
+                    int32 $sz = $iz + $k;
+                    if ($sz < 0) {
+                        $sz = 0;
+                    }
+
+                    if ($sz >= $h) {
+                        $sz = $h - 1;
+                    }
+
+                    $acc = $acc + $this->tmp[($sz * $w + $ix) as usize] * $this->kernel[($k + $radius) as usize];
+                    $k = $k + 1;
+                }
+
+                $this->out[($iz * $w + $ix) as usize] = $acc;
+                $ix = $ix + 1;
+            }
+
+            $iz = $iz + 1;
+        }
+    }
+}

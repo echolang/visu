@@ -1,7 +1,8 @@
 /**
- * Graph node minted by `QuadRenderer.pass`, or constructed with a ShaderRef directly.
+ * Graph node minted by `QuadRenderer.pass`, or constructed with a program directly.
  * Writes the target, `beginRender`, then draws the snapshotted payload T through GpuPass.
  * Mesh comes from the pool. Defaults are the fullscreen-quad shader (pos3uv2, no raster, slot 0).
+ * A ShaderRef is resolved in the constructor; the shader is already loaded.
  */
 
 namespace visu::graphics;
@@ -12,12 +13,22 @@ public class QuadPass<T> : Pass
     public const VertexLayout $layout;
     public const Raster $raster;
     public const uint32 $slot;
-    private ShaderRef $shader;
+    private ShaderProgram $program;
     private T $params;
 
     public constructor(ShaderRef $shader, TargetRef $target, T $params)
     {
-        $this->shader = $shader;
+        $this->program = $shader->program();
+        $this->target = $target;
+        $this->params = $params;
+        $this->layout = VertexLayout::pos3uv2();
+        $this->raster = Raster::none();
+        $this->slot = 0;
+    }
+
+    public constructor(ShaderProgram $program, TargetRef $target, T $params)
+    {
+        $this->program = $program;
         $this->target = $target;
         $this->params = $params;
         $this->layout = VertexLayout::pos3uv2();
@@ -34,7 +45,7 @@ public class QuadPass<T> : Pass
         slot: uint32 $slot = 0
     )
     {
-        $this->shader = $shader;
+        $this->program = $shader->program();
         $this->target = $target;
         $this->params = $params;
         $this->layout = $layout;
@@ -61,7 +72,7 @@ public class QuadPass<T> : Pass
         Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
             return .quad($device);
         });
-        GpuPass $pass = GpuPass($this->shader->program(), $this->layout, $this->raster, slot: $this->slot);
+        GpuPass $pass = GpuPass($this->program, $this->layout, $this->raster, slot: $this->slot);
         $pass->draw($enc, $mesh, $this->params);
         $enc->endRender();
         return .ok;

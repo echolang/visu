@@ -59,6 +59,9 @@ public class Device : DeviceProtocol
     internal bool $debugLabels;
     public DrawCounters $draws;
     public GpuProfiler $gpuProfiler;
+    internal GpuCounts $counts;
+    internal DeferredCache $deferred;
+    internal BakedShaderCache $sceneShaders;
 
     public constructor()
     {
@@ -114,6 +117,9 @@ public class Device : DeviceProtocol
         $this->debugLabels = false;
         $this->draws = DrawCounters();
         $this->gpuProfiler = GpuProfiler();
+        $this->counts = GpuCounts();
+        $this->deferred = DeferredCache();
+        $this->sceneShaders = BakedShaderCache();
     }
 
     destructor()
@@ -239,6 +245,51 @@ public class Device : DeviceProtocol
     public const function memoryStats() : MemoryStats
     {
         return vkMemoryStats($this);
+    }
+
+    public const function resourceStats() : ResourceStats
+    {
+        return $this->counts->snapshot(0);
+    }
+
+    public const function pipelineCount() : int32
+    {
+        return $this->psos->count() as int32;
+    }
+
+    public function retireTexture(TextureHandle $handle) : void
+    {
+    }
+
+    public function releaseRetired() : void
+    {
+    }
+
+    public function forgetProgram(uint32 $id) : void
+    {
+        string $prefix = "{$id}|";
+        array<string> $keys = $this->psos->keys();
+        array<PipelineHandle> $drop = array<PipelineHandle>();
+        foreach ($keys as $key) {
+            if (!$key->starts($prefix)) {
+                continue;
+            }
+
+            $drop[] = $this->psos[$key];
+            $this->psos->remove($key);
+        }
+
+        if ($drop->empty() || $this->logical->handle == 0) {
+            return;
+        }
+
+        // the GPU may still be inside one of these pipelines; program destroy has no frame guarantee
+        vk::DeviceWaitIdle($this->logical);
+        foreach ($drop as $handle) {
+            if ($handle->pipeline->handle != 0) {
+                vk::DestroyPipeline($this->logical, $handle->pipeline, null);
+            }
+        }
     }
 
     public function beginFrame(int32 $width, int32 $height) : result<FrameStatus, DeviceError>
@@ -662,6 +713,7 @@ public class Device : DeviceProtocol
 
         SamplerHandle $h = SamplerHandle($samp);
         $this->samplerHandles[$key] = $h;
+        $this->counts->noteSamplerCreated();
         return Sampler($this, $h, $desc);
     }
 
@@ -732,6 +784,8 @@ public class Device : DeviceProtocol
 
     public function shutdown() : void
     {
+        $this->deferred->drop();
+        $this->sceneShaders->drop();
         // headless construct never loaded vk; destroy stubs SIGSEGV
         if ($this->instance->handle == 0 && $this->logical->handle == 0) {
             $this->ready = false;
@@ -741,6 +795,7 @@ public class Device : DeviceProtocol
         $this->loseSurface();
         vkDestroyDrawStack($this);
         vkDestroySlots($this);
+        $this->releaseRetired();
 
         if ($this->logical->handle != 0) {
             vk::DestroyDevice($this->logical, null);
