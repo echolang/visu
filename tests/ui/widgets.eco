@@ -1127,3 +1127,49 @@ test ui_apply_generals_derives_widget_colours_and_keeps_pads_it_owns
     $ui->destroy();
     $device->shutdown();
 }
+
+function paintFloat(Ui $ui, float32 $x) : bool
+{
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginColumn();
+    $ui->space(10.0f, 10.0f);
+    $ui->end();
+    $ui->beginFloat(Vec2($x, 0.5f), pivot: Vec2(0.5f, 0.5f), id: 'tree.7');
+    $ui->beginCard(120.0f, solid: false);
+    bool $hit = $ui->button('Water', id: 'water');
+    $ui->end();
+    $ui->endFloat();
+    $ui->endFrame();
+    return $hit;
+}
+
+test ui_float_is_placed_on_the_frame_and_listed
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    paintFloat($ui, 0.5f);
+    assert($ui->floats->count() == 1, 'one float');
+    Node $float = $ui->nodes[$ui->floats[0] as usize];
+    assert($float->floating, 'flagged');
+    assert(equal($float->pos->x + $float->size->x * 0.5f, 200.0f), 'centred on x');
+    assert(equal($float->pos->y + $float->size->y * 0.5f, 100.0f), 'centred on y');
+    Node $card = $ui->nodes[($ui->floats[0] + 1) as usize];
+    assert(!$card->solid, 'a solid: false card lets the pointer through');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_float_button_clicks_where_it_was_drawn
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    assert(!paintFloat($ui, 0.25f), 'first');
+    Node $btn = firstKind($ui, Kind::button);
+    Vec2 $mid = Vec2($btn->pos->x + $btn->size->x * 0.5f, $btn->pos->y + $btn->size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    paintFloat($ui, 0.25f);
+    $ui->seed($mid, false, true, false);
+    assert(paintFloat($ui, 0.25f), 'clicked');
+    $ui->destroy();
+    $device->shutdown();
+}

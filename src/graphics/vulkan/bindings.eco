@@ -1,0 +1,91 @@
+/**
+ * Set 1 (combined image samplers) and set 2 (storage buffers) an encoder has bound since its last
+ * flush. A render and a compute encoder each hold one by value, so opening an encoder allocates
+ * nothing more; the flush mints a descriptor set only when something changed, at that encoder's
+ * bind point.
+ */
+
+namespace visu::graphics;
+
+internal struct VkBindings
+{
+    public TextureHandle[16] $texHandles;
+    public SamplerHandle[16] $sampHandles;
+    public bool[16] $texSet;
+    public bool $texturesDirty;
+    public vk::Buffer[8] $storage;
+    public uint64[8] $storageOff;
+    public bool[8] $storageSet;
+    public bool $storageDirty;
+
+    public constructor()
+    {
+        $this->texturesDirty = false;
+        $this->storageDirty = false;
+        TextureHandle[16] $texes;
+        SamplerHandle[16] $samps;
+        bool[16] $bound;
+        uint32 $i = 0;
+
+        while ($i < TEXTURE_SLOTS) {
+            $texes[$i] = TextureHandle::none();
+            $samps[$i] = SamplerHandle::none();
+            $bound[$i] = false;
+            $i = $i + 1;
+        }
+
+        $this->texHandles = mv $texes;
+        $this->sampHandles = mv $samps;
+        $this->texSet = mv $bound;
+        vk::Buffer[8] $bufs;
+        uint64[8] $offs;
+        bool[8] $used;
+        $i = 0;
+
+        while ($i < STORAGE_SLOTS) {
+            $bufs[$i] = vk::Buffer::none();
+            $offs[$i] = 0;
+            $used[$i] = false;
+            $i = $i + 1;
+        }
+
+        $this->storage = mv $bufs;
+        $this->storageOff = mv $offs;
+        $this->storageSet = mv $used;
+    }
+
+    public function texture(uint32 $slot, Texture $texture, Sampler $sampler) : void
+    {
+        assert($slot < TEXTURE_SLOTS, 'texture slot');
+        if ($texture->state != ResourceState::shaderRead) {
+            die("bindTexture: '{$texture->desc->label}' is not shaderRead");
+        }
+        // a repeat bind of the same pair must not mint another set 1
+        if ($this->texSet[$slot]
+            && $this->texHandles[$slot]->view->handle == $texture->handle->view->handle
+            && $this->sampHandles[$slot]->sampler->handle == $sampler->handle->sampler->handle) {
+            return;
+        }
+
+        $this->texHandles[$slot] = $texture->handle;
+        $this->sampHandles[$slot] = $sampler->handle;
+        $this->texSet[$slot] = true;
+        $this->texturesDirty = true;
+    }
+
+    public function buffer(uint32 $slot, Buffer $buffer, uint64 $offset) : void
+    {
+        assert($slot < STORAGE_SLOTS, 'storage slot');
+        vk::Buffer $buf = $buffer->handle->buffer;
+        if ($this->storageSet[$slot]
+            && $this->storage[$slot]->handle == $buf->handle
+            && $this->storageOff[$slot] == $offset) {
+            return;
+        }
+
+        $this->storage[$slot] = $buf;
+        $this->storageOff[$slot] = $offset;
+        $this->storageSet[$slot] = true;
+        $this->storageDirty = true;
+    }
+}

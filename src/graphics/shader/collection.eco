@@ -445,6 +445,7 @@ public class ShaderCollection
         }
 
         string $cs = '';
+        string $path = '';
         foreach ($ref->files as $file) {
             if ($file->kind != ShaderKind::compute) {
                 continue;
@@ -454,18 +455,57 @@ public class ShaderCollection
                 return .error($e);
             }
             $cs = $bytes;
+            $path = $file->path;
         }
 
         if ($cs->empty()) {
             return .error(.missing($ref->name));
         }
 
-        ComputeProgram $program = guard ComputeProgram::link($this->device, $ref->name, $cs) else ($e) {
+        WorkgroupSize $group = guard $this->workgroupOf($ref->name, $path, $cs) else ($e) {
+            return .error($e);
+        }
+        ComputeProgram $program = guard ComputeProgram::link($this->device, $ref->name, $cs, $group) else ($e) {
             return .error($e);
         }
         $ref->compiledCompute = $program;
         return .ok($program);
     }
+
+    /**
+     * The kernel's local size from its SPIR-V. On Metal the loaded module is MSL, so this reads
+     * the `.comp.spv` the shader tool writes beside every `.comp.metal`.
+     */
+    private function workgroupOf(const string& $name, const string& $path, const string& $loaded) : result<WorkgroupSize, ShaderError>
+    {
+        WorkgroupSize? $direct = spirvLocalSize($loaded);
+        if ($direct != null) {
+            WorkgroupSize $got = guard $direct;
+            return .ok($got);
+        }
+
+        string $spvPath = shaderSpirvSibling($path);
+        string $spv = guard $this->loader->read($spvPath) else {
+            return .error(.noWorkgroup($name));
+        }
+        WorkgroupSize $group = guard spirvLocalSize($spv) else {
+            return .error(.noWorkgroup($name));
+        }
+        return .ok($group);
+    }
+}
+
+/**
+ * `x.comp.metal` to `x.comp.spv`; a path already ending in `.spv` comes back as is.
+ */
+internal function shaderSpirvSibling(const string& $path) : string
+{
+    if ($path->ends('.metal')) {
+        string $stem = $path->sub(0, $path->size() - 6);
+        return "{$stem}.spv";
+    }
+
+    return $path;
 }
 
 internal function shaderFilesAreComputeOnly(const array<ShaderFile>& $files) : bool

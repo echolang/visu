@@ -1,0 +1,264 @@
+/**
+ * Skinned glTF: two joints listed child first, one triangle, one clip. Cooks to a skinned VMDL
+ * whose skeleton is reordered parent first, whose vertices carry remapped joints and quantized
+ * weights, and whose rest pose composes to an identity palette.
+ */
+
+use std::env;
+use std::io;
+use visu::asset::{
+    Assembly, AssemblyPart, Assets, Clip, CookedModel, Kitchen, MODEL_SKINNED_VERTEX_BYTES,
+    MODEL_VERTEX_P3N3T4UV2J4W4, PackItem, Skeleton, decodeAssembly, decodeCookedModel
+};
+use visu::components::SkinPose;
+use visu::graphics::Device;
+use visu::math::{Vec4, equal};
+
+internal function skinTmp(string $tag) : string
+{
+    $tmp = env::tmp();
+    string $ds = env::DS;
+    return "{$tmp}{$ds}visu-skin-{$tag}";
+}
+
+internal function skinMkdir(string $dir) : void
+{
+    guard io::mkdir($dir) else ($e) {
+        if ($e->exists()) {
+            return;
+        }
+
+        die($e->message());
+    }
+}
+
+internal function skinF32(string& $out, float32 $v) : void
+{
+    uint32 $bits = mem::bit_cast<uint32, float32>($v);
+    $out->push(($bits & 0xff) as uint8);
+    $out->push((($bits >> 8) & 0xff) as uint8);
+    $out->push((($bits >> 16) & 0xff) as uint8);
+    $out->push((($bits >> 24) & 0xff) as uint8);
+}
+
+internal function skinMat4(string& $out, float32 $ty) : void
+{
+    // column-major translate(0, ty, 0)
+    skinF32($out, 1.0f); skinF32($out, 0.0f); skinF32($out, 0.0f); skinF32($out, 0.0f);
+    skinF32($out, 0.0f); skinF32($out, 1.0f); skinF32($out, 0.0f); skinF32($out, 0.0f);
+    skinF32($out, 0.0f); skinF32($out, 0.0f); skinF32($out, 1.0f); skinF32($out, 0.0f);
+    skinF32($out, 0.0f); skinF32($out, $ty); skinF32($out, 0.0f); skinF32($out, 1.0f);
+}
+
+/**
+ * bin layout: positions (36 B), joints ubyte x4 (12 B), weights vec4 (48 B), indices u16 (6 B + 2
+ * pad), inverse binds (128 B), clip times (8 B), hip rotations (32 B), knee translations (24 B).
+ * Nodes: 0 Armature [1, 2], 1 body (mesh, skin 0), 2 hip at y 1 [3], 3 knee at y -0.5.
+ * The skin lists the knee first, so the cook has to put the hip ahead of it.
+ */
+internal function skinWriteFixture(const string& $dir) : void
+{
+    string $ds = env::DS;
+    string $bin = '';
+    skinF32($bin, 0.0f); skinF32($bin, 1.0f); skinF32($bin, 0.0f);
+    skinF32($bin, 1.0f); skinF32($bin, 0.5f); skinF32($bin, 0.0f);
+    skinF32($bin, 0.0f); skinF32($bin, 0.5f); skinF32($bin, 1.0f);
+    // joints in glTF order: 0 is the knee, 1 the hip
+    $bin->push(1); $bin->push(0); $bin->push(0); $bin->push(0);
+    $bin->push(0); $bin->push(0); $bin->push(0); $bin->push(0);
+    $bin->push(0); $bin->push(1); $bin->push(0); $bin->push(0);
+    skinF32($bin, 1.0f); skinF32($bin, 0.0f); skinF32($bin, 0.0f); skinF32($bin, 0.0f);
+    skinF32($bin, 1.0f); skinF32($bin, 0.0f); skinF32($bin, 0.0f); skinF32($bin, 0.0f);
+    skinF32($bin, 0.5f); skinF32($bin, 0.5f); skinF32($bin, 0.0f); skinF32($bin, 0.0f);
+    $bin->push(0); $bin->push(0); $bin->push(2); $bin->push(0); $bin->push(1); $bin->push(0);
+    $bin->push(0); $bin->push(0);
+    // knee global is y 0.5, hip global is y 1
+    skinMat4($bin, -0.5f);
+    skinMat4($bin, -1.0f);
+    skinF32($bin, 0.0f); skinF32($bin, 1.0f);
+    // hip: identity, then a quarter turn about z
+    skinF32($bin, 0.0f); skinF32($bin, 0.0f); skinF32($bin, 0.0f); skinF32($bin, 1.0f);
+    skinF32($bin, 0.0f); skinF32($bin, 0.0f); skinF32($bin, 0.70710677f); skinF32($bin, 0.70710677f);
+    // knee translation held at its rest value, which the cook drops
+    skinF32($bin, 0.0f); skinF32($bin, -0.5f); skinF32($bin, 0.0f);
+    skinF32($bin, 0.0f); skinF32($bin, -0.5f); skinF32($bin, 0.0f);
+    guard io::writefile("{$dir}{$ds}rig.bin", $bin) else ($e) {
+        die($e->message());
+    }
+
+    string $json = '';
+    $json->append('{"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],');
+    $json->append('"nodes":[');
+    $json->append('{"name":"Armature","children":[1,2]},');
+    $json->append('{"name":"body","mesh":0,"skin":0},');
+    $json->append('{"name":"hip","translation":[0,1,0],"children":[3]},');
+    $json->append('{"name":"knee","translation":[0,-0.5,0]}');
+    $json->append('],');
+    $json->append('"skins":[{"joints":[3,2],"inverseBindMatrices":4}],');
+    $json->append('"meshes":[{"primitives":[{"attributes":{"POSITION":0,"JOINTS_0":1,"WEIGHTS_0":2},"indices":3,"material":0}]}],');
+    $json->append('"materials":[{"name":"skin"}],');
+    $json->append('"animations":[{"name":"bend","channels":[');
+    $json->append('{"sampler":0,"target":{"node":2,"path":"rotation"}},');
+    $json->append('{"sampler":1,"target":{"node":3,"path":"translation"}}],');
+    $json->append('"samplers":[{"input":5,"output":6},{"input":5,"output":7}]}],');
+    $json->append('"accessors":[');
+    $json->append('{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},');
+    $json->append('{"bufferView":1,"componentType":5121,"count":3,"type":"VEC4"},');
+    $json->append('{"bufferView":2,"componentType":5126,"count":3,"type":"VEC4"},');
+    $json->append('{"bufferView":3,"componentType":5123,"count":3,"type":"SCALAR"},');
+    $json->append('{"bufferView":4,"componentType":5126,"count":2,"type":"MAT4"},');
+    $json->append('{"bufferView":5,"componentType":5126,"count":2,"type":"SCALAR"},');
+    $json->append('{"bufferView":6,"componentType":5126,"count":2,"type":"VEC4"},');
+    $json->append('{"bufferView":7,"componentType":5126,"count":2,"type":"VEC3"}');
+    $json->append('],');
+    $json->append('"bufferViews":[');
+    $json->append('{"buffer":0,"byteOffset":0,"byteLength":36},');
+    $json->append('{"buffer":0,"byteOffset":36,"byteLength":12},');
+    $json->append('{"buffer":0,"byteOffset":48,"byteLength":48},');
+    $json->append('{"buffer":0,"byteOffset":96,"byteLength":6},');
+    $json->append('{"buffer":0,"byteOffset":104,"byteLength":128},');
+    $json->append('{"buffer":0,"byteOffset":232,"byteLength":8},');
+    $json->append('{"buffer":0,"byteOffset":240,"byteLength":32},');
+    $json->append('{"buffer":0,"byteOffset":272,"byteLength":24}');
+    $json->append('],');
+    $json->append('"buffers":[{"byteLength":296,"uri":"rig.bin"}]}');
+    guard io::writefile("{$dir}{$ds}rig.gltf", $json) else ($e) {
+        die($e->message());
+    }
+}
+
+internal function skinCook(string $tag) : array<PackItem>
+{
+    string $src = skinTmp("src-{$tag}");
+    skinMkdir($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}chars";
+    skinMkdir($folder);
+    string $inner = "{$folder}{$ds}rig";
+    skinMkdir($inner);
+    skinWriteFixture($inner);
+    string $out = skinTmp("out-{$tag}");
+    skinMkdir($out);
+    Kitchen $k = Kitchen::defaults();
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+    return $items;
+}
+
+internal function skinItem(const array<PackItem>& $items, string $id) : PackItem
+{
+    foreach ($items as $item) {
+        if ($item->id->equals($id)) {
+            return $item;
+        }
+    }
+
+    die("pack item {$id} missing");
+}
+
+internal function skinClose(float32 $a, float32 $b) : bool
+{
+    float32 $d = $a - $b;
+    return $d < 0.001f && $d > -0.001f;
+}
+
+test skinned_gltf_cooks_ordered_skeleton_and_skinned_vertices
+{
+    array<PackItem> $items = skinCook('cook');
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    PackItem $blob = skinItem($items, 'chars/rig/body');
+    CookedModel $model = guard decodeCookedModel($assets, $blob->blob) else ($e) {
+        die($e->message());
+    }
+    assert($model->format == MODEL_VERTEX_P3N3T4UV2J4W4, 'skinned vertex format');
+    assert($model->vertexBytes() == MODEL_SKINNED_VERTEX_BYTES, 'skinned stride');
+    assert($model->vertexCount() == 3, 'three vertices');
+    Skeleton $skeleton = guard $model->skeleton else {
+        die('skeleton missing');
+    }
+    assert($skeleton->count() == 2, 'two joints');
+    assert($skeleton->names[0]->equals('hip'), 'parent first');
+    assert($skeleton->names[1]->equals('knee'), 'child second');
+    assert($skeleton->parents[0] == -1 && $skeleton->parents[1] == 0, 'parents');
+    assert($skeleton->ordered(), 'ordered');
+
+    // vertex 0 is bound to glTF joint 1 (the hip), cooked joint 0; vertex 1 to the knee, cooked 1
+    string $v = $model->vertices;
+    usize $second = MODEL_SKINNED_VERTEX_BYTES as usize;
+    assert($v->byte(48) == 0, 'hip remapped to 0');
+    assert($v->byte($second + 48) == 1, 'knee remapped to 1');
+    assert($v->byte(52) == 255, 'a single joint takes the full weight');
+    // vertex 2: glTF (knee, hip) half and half becomes cooked (1, 0), weights summing to 255
+    usize $third = (2 * MODEL_SKINNED_VERTEX_BYTES) as usize;
+    assert($v->byte($third + 48) == 1 && $v->byte($third + 49) == 0, 'pair remapped');
+    int32 $sum = ($v->byte($third + 52) as int32) + ($v->byte($third + 53) as int32);
+    assert($sum == 255, 'weights sum to 255');
+}
+
+test skinned_assembly_marks_part_and_prunes_rest_tracks
+{
+    array<PackItem> $items = skinCook('asm');
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    Assembly $tree = guard decodeAssembly($assets, skinItem($items, 'chars/rig')->blob) else ($e) {
+        die($e->message());
+    }
+    AssemblyPart $body = guard $tree->findPart('body') else {
+        die('body part');
+    }
+    assert($body->skinned, 'skinned part');
+    assert($tree->clips->count() == 1, 'one clip');
+    Clip $bend = $tree->clips[0];
+    assert($bend->tracks->count() == 1, 'the knee held at rest is dropped');
+    assert($bend->tracks[0]->node->equals('hip'), 'hip rotation kept');
+}
+
+test skin_pose_rest_is_identity_and_clip_bends_the_chain
+{
+    array<PackItem> $items = skinCook('pose');
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    CookedModel $model = guard decodeCookedModel($assets, skinItem($items, 'chars/rig/body')->blob) else ($e) {
+        die($e->message());
+    }
+    Assembly $tree = guard decodeAssembly($assets, skinItem($items, 'chars/rig')->blob) else ($e) {
+        die($e->message());
+    }
+    Skeleton $skeleton = guard $model->skeleton else {
+        die('skeleton');
+    }
+    SkinPose $pose = SkinPose($skeleton, $tree->clips);
+    $pose->rest();
+    $pose->compose();
+    int32 $row = 0;
+    while ($row < 6) {
+        Vec4 $r = $pose->palette[$row as usize];
+        int32 $axis = $row % 3;
+        Vec4 $want = Vec4(0.0f, 0.0f, 0.0f, 0.0f);
+        if ($axis == 0) {
+            $want = Vec4(1.0f, 0.0f, 0.0f, 0.0f);
+        } else if ($axis == 1) {
+            $want = Vec4(0.0f, 1.0f, 0.0f, 0.0f);
+        } else {
+            $want = Vec4(0.0f, 0.0f, 1.0f, 0.0f);
+        }
+        assert(equal($r, $want, 0.0001f), 'rest palette is identity');
+        $row = $row + 1;
+    }
+
+    // a quarter turn about z at the hip swings the knee from below the hip to its +x side
+    $pose->rest();
+    $pose->apply(0, $tree->clips[0], 1.0f, 1.0f);
+    $pose->compose();
+    assert(skinClose($pose->world[1]->c3->x, 0.5f), 'knee swung to +x');
+    assert(skinClose($pose->world[1]->c3->y, 1.0f), 'knee at hip height');
+
+    // half weight lands between rest and the turn
+    $pose->rest();
+    $pose->apply(0, $tree->clips[0], 1.0f, 0.5f);
+    $pose->compose();
+    float32 $x = $pose->world[1]->c3->x;
+    assert($x > 0.1f && $x < 0.45f, 'blend lands between');
+}

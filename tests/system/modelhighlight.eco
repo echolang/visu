@@ -1,0 +1,111 @@
+/**
+ * ModelSystem highlight bookkeeping: assembly roots expand to their model parts, restyling keeps
+ * one entry, the room caps, and a detached model leaves the list. GPU-free.
+ */
+
+use visu::asset::Assets;
+use visu::components::{AssemblyInstance, StaticModel};
+use visu::ecs::{Entities, Entity};
+use visu::geo::{AABB, Transform};
+use visu::graphics::{DeferredRenderer, Device, ModelBank};
+use visu::math::Vec3;
+use visu::system::{MODEL_HIGHLIGHTS, ModelSystem};
+
+internal function highlightModels(Device $device) : ModelSystem
+{
+    ModelBank $bank = ModelBank($device, Assets($device));
+    DeferredRenderer $renderer = DeferredRenderer($device);
+    return ModelSystem($bank, $renderer, AABB(Vec3(-100.0f), Vec3(100.0f)));
+}
+
+internal function staticAt(Entities $world, float32 $x) : Entity
+{
+    Entity $e = $world->create();
+    Transform $t = Transform();
+    $t->position = Vec3($x, 0.0f, 0.0f);
+    $world->attach($e, $t);
+    $world->attach($e, StaticModel('props/crate'));
+    return $e;
+}
+
+test model_highlight_marks_and_restyles_once
+{
+    Device $device = Device();
+    ModelSystem $models = highlightModels($device);
+    Entities $world = Entities();
+    Entity $tree = staticAt($world, 1.0f);
+    $models->highlight($world, $tree, 0);
+    $models->highlight($world, $tree, 2);
+    assert($models->highlightCount() == 1, 'restyle keeps one entry');
+    assert($models->highlighted($tree), 'marked');
+    $models->unhighlight($world, $tree);
+    assert($models->highlightCount() == 0, 'unmarked');
+    $device->shutdown();
+}
+
+test model_highlight_skips_an_entity_without_a_model
+{
+    Device $device = Device();
+    ModelSystem $models = highlightModels($device);
+    Entities $world = Entities();
+    Entity $bare = $world->create();
+    $world->attach($bare, Transform());
+    $models->highlight($world, $bare, 0);
+    assert($models->highlightCount() == 0, 'nothing to draw');
+    $device->shutdown();
+}
+
+test model_highlight_expands_an_assembly_root
+{
+    Device $device = Device();
+    ModelSystem $models = highlightModels($device);
+    Entities $world = Entities();
+    Entity $root = $world->create();
+    $world->attach($root, Transform());
+    AssemblyInstance $inst = AssemblyInstance('props/windmill');
+    Entity $tower = staticAt($world, 0.0f);
+    Entity $sails = staticAt($world, 0.0f);
+    Entity $pivot = $world->create();
+    map<string, Entity> $nodes = map<string, Entity>();
+    $nodes['tower'] = $tower;
+    $nodes['sails'] = $sails;
+    $nodes['pivot'] = $pivot;
+    $inst->nodes = $nodes;
+    $world->attach($root, $inst);
+    $models->highlight($world, $root, 1);
+    assert($models->highlightCount() == 2, 'two parts carry a model');
+    assert($models->highlighted($tower), 'tower');
+    assert($models->highlighted($sails), 'sails');
+    $models->unhighlight($world, $root);
+    assert($models->highlightCount() == 0, 'the root takes its parts with it');
+    $device->shutdown();
+}
+
+test model_highlight_room_caps
+{
+    Device $device = Device();
+    ModelSystem $models = highlightModels($device);
+    Entities $world = Entities();
+    int32 $i = 0;
+    while ($i < MODEL_HIGHLIGHTS + 4) {
+        $models->highlight($world, staticAt($world, $i as float32), 0);
+        $i = $i + 1;
+    }
+
+    assert($models->highlightCount() == MODEL_HIGHLIGHTS, 'capped');
+    $device->shutdown();
+}
+
+test model_highlight_leaves_with_its_model
+{
+    Device $device = Device();
+    ModelSystem $models = highlightModels($device);
+    Entities $world = Entities();
+    $models->register($world);
+    Entity $tree = staticAt($world, 1.0f);
+    $models->highlight($world, $tree, 0);
+    $world->destroy($tree);
+    assert($models->highlightCount() == 0, 'a felled tree stops glowing');
+    $models->unregister($world);
+    $device->shutdown();
+}

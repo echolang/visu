@@ -1,0 +1,156 @@
+/**
+ * Open compute encoder on the scene command buffer, outside dynamic rendering. endCompute()
+ * must run; the destructor asserts it did. Sets 0, 1 and 2 bind at the compute bind point.
+ * endCompute makes the kernel's writes visible to later vertex, fragment and compute reads.
+ */
+
+namespace visu::graphics;
+
+public class ComputeEncoder : ComputeEncoderProtocol
+{
+    private Device $device;
+    internal VkBindings $bindings;
+    private ComputeProgram? $kernel;
+    private bool $ended;
+
+    public constructor(Device $device)
+    {
+        $this->device = $device;
+        $this->bindings = VkBindings();
+        $this->kernel = null;
+        $this->ended = false;
+    }
+
+    destructor()
+    {
+        assert($this->ended, 'ComputeEncoder dropped without endCompute');
+    }
+
+    public function setKernel(ComputeProgram $kernel) : void
+    {
+        assert(!$this->ended, 'setKernel after endCompute');
+        assert(!$kernel->destroyed(), 'setKernel with a destroyed kernel');
+        vk::Pipeline $pso = vkComputePipeline($this->device, $kernel);
+        vk::CmdBindPipeline($this->device->currentCmd(), vk::PIPELINE_BIND_POINT_COMPUTE, $pso);
+        $this->kernel = $kernel;
+    }
+
+    public function bindUniform(uint32 $slot, TransientSlice $slice) : void
+    {
+        assert(!$this->ended, 'bindUniform after endCompute');
+        assert($slot < UNIFORM_SLOTS, 'uniform slot');
+        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
+        FrameSlot $fs = $this->device->slots[$this->device->slot];
+        $fs->dynOff[$slot] = $slice->offset as uint32;
+        $fs->uniformsDirty = true;
+    }
+
+    public function upload<T>(const T& $params, slot: uint32 $slot = 0) : void
+    {
+        $this->bindUniform($slot, transientOf($this->device, $params));
+    }
+
+    public function bindTexture(uint32 $slot, Texture $texture, Sampler $sampler) : void
+    {
+        assert(!$this->ended, 'bindTexture after endCompute');
+        $this->bindings->texture($slot, $texture, $sampler);
+    }
+
+    public function bindStorage(uint32 $slot, Buffer $buffer, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'bindStorage after endCompute');
+        $this->bindings->buffer($slot, $buffer, $offset);
+    }
+
+    public function dispatch(uint32 $x, uint32 $y = 1, uint32 $z = 1) : void
+    {
+        assert(!$this->ended, 'dispatch after endCompute');
+        ComputeProgram $kernel = guard $this->kernel else {
+            die('dispatch before setKernel');
+        }
+        if ($x == 0 || $y == 0 || $z == 0) {
+            return;
+        }
+
+        vkFlushUniforms($this->device, vk::PIPELINE_BIND_POINT_COMPUTE);
+        vkFlushTextures($this->device, $this->bindings, vk::PIPELINE_BIND_POINT_COMPUTE);
+        vkFlushStorage($this->device, $this->bindings, vk::PIPELINE_BIND_POINT_COMPUTE);
+        WorkgroupSize $g = $kernel->group;
+        vk::CmdDispatch(
+            $this->device->currentCmd(),
+            vkGroups($x, $g->x),
+            vkGroups($y, $g->y),
+            vkGroups($z, $g->z)
+        );
+    }
+
+    public function endCompute() : void
+    {
+        assert(!$this->ended, 'ComputeEncoder.endCompute twice');
+        $this->ended = true;
+        vkMemoryBarrier(
+            $this->device->currentCmd(),
+            vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk::PIPELINE_STAGE_VERTEX_INPUT_BIT
+                | vk::PIPELINE_STAGE_VERTEX_SHADER_BIT
+                | vk::PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                | vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk::ACCESS_SHADER_WRITE_BIT,
+            vk::ACCESS_SHADER_READ_BIT | vk::ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+        );
+        $this->device->encoderClosed();
+    }
+}
+
+internal function vkGroups(uint32 $threads, uint32 $size) : uint32
+{
+    uint32 $s = $size;
+    if ($s < 1) {
+        $s = 1;
+    }
+
+    return ($threads + $s - 1) / $s;
+}
+
+/**
+ * The compute pipeline for `$kernel` on the framework layout, minted once per kernel.
+ */
+internal function vkComputePipeline(Device $device, ComputeProgram $kernel) : vk::Pipeline
+{
+    if ($device->computePsos->has($kernel->id)) {
+        return $device->computePsos[$kernel->id];
+    }
+
+    string $entry = 'main';
+    vk::ComputePipelineCreateInfo $ci = vk::ComputePipelineCreateInfo();
+    $ci->stage->stage = vk::SHADER_STAGE_COMPUTE_BIT;
+    $ci->stage->module = $kernel->cs->module;
+    $ci->stage->pName:$ = $entry->cstr();
+    $ci->layout = $device->pipeLayout;
+    vk::Pipeline $pipeline = vk::Pipeline::none();
+    guard vkCheck(
+        vk::CreateComputePipelines($device->logical, vk::PipelineCache::none(), 1, &$ci, null, &$pipeline),
+        'CreateComputePipelines'
+    ) else ($e) {
+        die("vulkan: compute pipeline '{$kernel->name}': {$e->message()}");
+    }
+    $device->computePsos[$kernel->id] = $pipeline;
+    return $pipeline;
+}
+
+/**
+ * A global memory barrier: every `$srcAccess` in `$srcStage` before any `$dstAccess` in `$dstStage`.
+ */
+internal function vkMemoryBarrier(
+    vk::CommandBuffer $cmd,
+    uint32 $srcStage,
+    uint32 $dstStage,
+    uint32 $srcAccess,
+    uint32 $dstAccess
+) : void
+{
+    vk::MemoryBarrier $b = vk::MemoryBarrier();
+    $b->srcAccessMask = $srcAccess;
+    $b->dstAccessMask = $dstAccess;
+    vk::CmdPipelineBarrier($cmd, $srcStage, $dstStage, 0, 1, &$b, 0, null, 0, null);
+}

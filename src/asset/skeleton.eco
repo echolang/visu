@@ -1,0 +1,237 @@
+/**
+ * The joint hierarchy a skinned model deforms by: names, parents, the rest pose and the inverse
+ * bind matrices, cooked into the model blob beside the vertices. Joints are ordered parent before
+ * child, so one forward walk composes every joint's matrix. `bind` resolves a clip's tracks to
+ * joint indices once, so a pose never looks a name up while the frame runs.
+ */
+
+namespace visu::asset;
+
+use visu::math::{Mat4, Quat, Vec3, Vec4};
+
+/**
+ * Joints one skeleton may carry. A vertex stores its joint indices in bytes, and the frame palette
+ * is sized in joints, so the cap is a cook-time refusal rather than a runtime surprise.
+ */
+public const int32 SKIN_MAX_JOINTS = 128;
+
+public class Skeleton
+{
+    public const array<string> $names;
+
+    /**
+     * Parent joint index, or -1 for a root joint. Always lower than the joint's own index.
+     */
+    public const array<int32> $parents;
+    public const array<Vec3> $restPosition;
+    public const array<Quat> $restOrientation;
+    public const array<Vec3> $restScale;
+
+    /**
+     * Mesh space to joint space at bind time, one per joint.
+     */
+    public const array<Mat4> $inverseBind;
+
+    /**
+     * What sits above the root joints (an Armature node, say), relative to the part origin.
+     */
+    public const Mat4 $rootOffset;
+
+    public constructor(
+        array<string> $names,
+        array<int32> $parents,
+        array<Vec3> $restPosition,
+        array<Quat> $restOrientation,
+        array<Vec3> $restScale,
+        array<Mat4> $inverseBind,
+        Mat4 $rootOffset
+    )
+    {
+        $this->names = $names;
+        $this->parents = $parents;
+        $this->restPosition = $restPosition;
+        $this->restOrientation = $restOrientation;
+        $this->restScale = $restScale;
+        $this->inverseBind = $inverseBind;
+        $this->rootOffset = $rootOffset;
+    }
+
+    public const function count() : int32
+    {
+        return $this->names->count() as int32;
+    }
+
+    /**
+     * Joint index by name, or -1.
+     */
+    public const function find(const string& $name) : int32
+    {
+        int32 $i = 0;
+        while (($i as usize) < $this->names->count()) {
+            if ($this->names[$i as usize]->equals($name)) {
+                return $i;
+            }
+
+            $i = $i + 1;
+        }
+
+        return -1;
+    }
+
+    /**
+     * Joint index for each of `$clip`'s tracks, -1 where the track aims at something else.
+     * Load-time work: it walks every name per track.
+     */
+    public const function bind(const Clip& $clip) : array<int32>
+    {
+        array<int32> $out = arr::room<int32>($clip->tracks->count());
+        foreach ($clip->tracks as $track) {
+            $out[] = $this->find($track->node);
+        }
+
+        return $out;
+    }
+
+    /**
+     * True when every parent sits before its child and inside the joint list.
+     */
+    public const function ordered() : bool
+    {
+        int32 $i = 0;
+        while (($i as usize) < $this->parents->count()) {
+            int32 $p = $this->parents[$i as usize];
+            if ($p >= $i || $p < -1) {
+                return false;
+            }
+
+            $i = $i + 1;
+        }
+
+        return true;
+    }
+}
+
+internal function putSkeleton(string& $out, const Skeleton& $skeleton) : void
+{
+    int32 $n = $skeleton->count();
+    putU16($out, $n as uint16);
+    putMat4($out, $skeleton->rootOffset);
+    int32 $i = 0;
+    while ($i < $n) {
+        usize $k = $i as usize;
+        putStr($out, $skeleton->names[$k]);
+        putU16($out, ($skeleton->parents[$k] + 1) as uint16);
+        Vec3 $t = $skeleton->restPosition[$k];
+        Quat $r = $skeleton->restOrientation[$k];
+        Vec3 $s = $skeleton->restScale[$k];
+        putF32($out, $t->x);
+        putF32($out, $t->y);
+        putF32($out, $t->z);
+        putF32($out, $r->x);
+        putF32($out, $r->y);
+        putF32($out, $r->z);
+        putF32($out, $r->w);
+        putF32($out, $s->x);
+        putF32($out, $s->y);
+        putF32($out, $s->z);
+        putMat4($out, $skeleton->inverseBind[$k]);
+        $i = $i + 1;
+    }
+}
+
+internal function getSkeleton(const string& $s, usize& $i, const string& $id) : result<Skeleton, AssetError>
+{
+    uint16 $count = guard getU16($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    int32 $n = $count as int32;
+    if ($n < 1 || $n > SKIN_MAX_JOINTS) {
+        return .error(.corrupt($id, 'joint count'));
+    }
+
+    Mat4 $rootOffset = guard getMat4($s, $i, $id) else ($e) {
+        return .error($e);
+    }
+    array<string> $names = arr::room<string>($n as usize);
+    array<int32> $parents = arr::room<int32>($n as usize);
+    array<Vec3> $positions = arr::room<Vec3>($n as usize);
+    array<Quat> $orientations = arr::room<Quat>($n as usize);
+    array<Vec3> $scales = arr::room<Vec3>($n as usize);
+    array<Mat4> $inverseBind = arr::room<Mat4>($n as usize);
+    int32 $j = 0;
+    while ($j < $n) {
+        string $name = guard getStr($s, $i, $id) else ($e) {
+            return .error($e);
+        }
+        uint16 $parent = guard getU16($s, $i, $id) else ($e) {
+            return .error($e);
+        }
+        float32[10] $v;
+        int32 $k = 0;
+        while ($k < 10) {
+            float32 $f = guard getF32($s, $i, $id) else ($e) {
+                return .error($e);
+            }
+            $v[$k] = $f;
+            $k = $k + 1;
+        }
+
+        Mat4 $ibm = guard getMat4($s, $i, $id) else ($e) {
+            return .error($e);
+        }
+        int32 $p = ($parent as int32) - 1;
+        if ($p >= $j) {
+            return .error(.corrupt($id, 'joint parent after child'));
+        }
+
+        $names[] = $name;
+        $parents[] = $p;
+        $positions[] = Vec3($v[0], $v[1], $v[2]);
+        $orientations[] = Quat($v[3], $v[4], $v[5], $v[6]);
+        $scales[] = Vec3($v[7], $v[8], $v[9]);
+        $inverseBind[] = $ibm;
+        $j = $j + 1;
+    }
+
+    return .ok(Skeleton($names, $parents, $positions, $orientations, $scales, $inverseBind, $rootOffset));
+}
+
+internal function putMat4(string& $out, const Mat4& $m) : void
+{
+    putF32($out, $m->c0->x);
+    putF32($out, $m->c0->y);
+    putF32($out, $m->c0->z);
+    putF32($out, $m->c0->w);
+    putF32($out, $m->c1->x);
+    putF32($out, $m->c1->y);
+    putF32($out, $m->c1->z);
+    putF32($out, $m->c1->w);
+    putF32($out, $m->c2->x);
+    putF32($out, $m->c2->y);
+    putF32($out, $m->c2->z);
+    putF32($out, $m->c2->w);
+    putF32($out, $m->c3->x);
+    putF32($out, $m->c3->y);
+    putF32($out, $m->c3->z);
+    putF32($out, $m->c3->w);
+}
+
+internal function getMat4(const string& $s, usize& $i, const string& $id) : result<Mat4, AssetError>
+{
+    float32[16] $v;
+    int32 $k = 0;
+    while ($k < 16) {
+        float32 $f = guard getF32($s, $i, $id) else ($e) {
+            return .error($e);
+        }
+        $v[$k] = $f;
+        $k = $k + 1;
+    }
+
+    return .ok(Mat4(
+        Vec4($v[0], $v[1], $v[2], $v[3]),
+        Vec4($v[4], $v[5], $v[6], $v[7]),
+        Vec4($v[8], $v[9], $v[10], $v[11]),
+        Vec4($v[12], $v[13], $v[14], $v[15])
+    ));
+}

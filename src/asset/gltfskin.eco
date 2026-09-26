@@ -1,0 +1,372 @@
+/**
+ * glTF skins: the joint list and inverse bind matrices, the JOINTS_0 / WEIGHTS_0 reads a skinned
+ * primitive needs, and `gltfSkeleton`, which reorders one skin parent before child into a cooked
+ * `Skeleton` plus the remap its vertices take.
+ */
+
+namespace visu::asset;
+
+use json;
+use visu::math::{Mat4, Quat, Vec3, Vec4, inverse};
+
+internal struct GltfSkin
+{
+    /**
+     * Node index of each joint, in the order JOINTS_0 counts them.
+     */
+    public array<int32> $joints;
+    public array<Mat4> $inverseBind;
+
+    public constructor()
+    {
+        $this->joints = array<int32>();
+        $this->inverseBind = array<Mat4>();
+    }
+}
+
+/**
+ * One skin cooked for a part: the ordered skeleton and `$remap[glTF joint] = cooked joint`.
+ */
+internal class GltfSkinBuild
+{
+    public Skeleton $skeleton;
+    public array<int32> $remap;
+
+    public constructor(Skeleton $skeleton, array<int32> $remap)
+    {
+        $this->skeleton = $skeleton;
+        $this->remap = $remap;
+    }
+}
+
+internal function gltfParseSkins(json::Value $root, GltfFile $file) : result<array<GltfSkin>, GltfError>
+{
+    array<json::Value> $items = gltfArray($root, 'skins');
+    array<GltfSkin> $out = array<GltfSkin>();
+    int32 $nodeCount = $file->nodes->count() as int32;
+    foreach ($items as $item) {
+        GltfSkin $skin = GltfSkin();
+        array<json::Value> $ids = gltfArray($item, 'joints');
+        foreach ($ids as $id) {
+            int64? $n = $id->asInt();
+            int64 $node = guard $n else {
+                return .error(.json('skin joint is not a node index'));
+            }
+            if ($node < 0 || $node >= ($nodeCount as int64)) {
+                return .error(.json('skin joint node does not exist'));
+            }
+
+            $skin->joints[] = $node as int32;
+        }
+
+        if ($skin->joints->count() == 0) {
+            return .error(.json('skin has no joints'));
+        }
+
+        int64? $ibm = gltfInt($item, 'inverseBindMatrices');
+        if ($ibm == null) {
+            foreach ($skin->joints as $j) {
+                $skin->inverseBind[] = Mat4();
+            }
+        } else {
+            int32 $accessor = ($ibm ?? 0) as int32;
+            array<float32> $m = guard gltfReadFloats($file, $accessor, 16) else ($e) {
+                return .error($e);
+            }
+            if ($m->count() != $skin->joints->count() * 16) {
+                return .error(.accessor($accessor, 'inverseBindMatrices count does not match joints'));
+            }
+
+            usize $k = 0;
+            while ($k < $m->count()) {
+                $skin->inverseBind[] = Mat4(
+                    Vec4($m[$k], $m[$k + 1], $m[$k + 2], $m[$k + 3]),
+                    Vec4($m[$k + 4], $m[$k + 5], $m[$k + 6], $m[$k + 7]),
+                    Vec4($m[$k + 8], $m[$k + 9], $m[$k + 10], $m[$k + 11]),
+                    Vec4($m[$k + 12], $m[$k + 13], $m[$k + 14], $m[$k + 15])
+                );
+                $k = $k + 16;
+            }
+        }
+
+        $out[] = $skin;
+    }
+
+    return .ok($out);
+}
+
+/**
+ * JOINTS_0 as four indices per vertex. Unsigned byte or short, per the spec.
+ */
+internal function gltfReadJoints(GltfFile $file, int32 $index) : result<array<uint16>, GltfError>
+{
+    GltfAccessor $acc = guard gltfGetAccessor($file, $index) else ($e) {
+        return .error($e);
+    }
+    if ($acc->components != 4) {
+        return .error(.accessor($index, 'JOINTS_0 is not VEC4'));
+    }
+
+    if ($acc->componentType != GLTF_UBYTE && $acc->componentType != GLTF_USHORT) {
+        return .error(.accessor($index, 'JOINTS_0 must be unsigned byte or short'));
+    }
+
+    array<uint16> $out = arr::room<uint16>(($acc->count * 4) as usize);
+    int32 $i = 0;
+    while ($i < $acc->count) {
+        usize $at = $acc->offset + ($i as usize) * ($acc->stride as usize);
+        int32 $c = 0;
+        while ($c < 4) {
+            if ($acc->componentType == GLTF_UBYTE) {
+                $out[] = $file->bin->byte($at + ($c as usize)) as uint16;
+            } else {
+                $out[] = gltfU16($file->bin, $at + (($c * 2) as usize));
+            }
+
+            $c = $c + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    return .ok($out);
+}
+
+/**
+ * WEIGHTS_0 as four floats per vertex. Float, or normalized unsigned byte / short.
+ */
+internal function gltfReadWeights(GltfFile $file, int32 $index) : result<array<float32>, GltfError>
+{
+    GltfAccessor $acc = guard gltfGetAccessor($file, $index) else ($e) {
+        return .error($e);
+    }
+    if ($acc->components != 4) {
+        return .error(.accessor($index, 'WEIGHTS_0 is not VEC4'));
+    }
+
+    if ($acc->componentType == GLTF_FLOAT) {
+        return gltfReadFloats($file, $index, 4);
+    }
+
+    if ($acc->componentType != GLTF_UBYTE && $acc->componentType != GLTF_USHORT) {
+        return .error(.accessor($index, 'WEIGHTS_0 must be float or normalized byte / short'));
+    }
+
+    array<float32> $out = arr::room<float32>(($acc->count * 4) as usize);
+    int32 $i = 0;
+    while ($i < $acc->count) {
+        usize $at = $acc->offset + ($i as usize) * ($acc->stride as usize);
+        int32 $c = 0;
+        while ($c < 4) {
+            if ($acc->componentType == GLTF_UBYTE) {
+                $out[] = ($file->bin->byte($at + ($c as usize)) as float32) / 255.0f;
+            } else {
+                $out[] = (gltfU16($file->bin, $at + (($c * 2) as usize)) as float32) / 65535.0f;
+            }
+
+            $c = $c + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    return .ok($out);
+}
+
+/**
+ * The skin of the node that owns `$object`'s level 0 mesh, or -1.
+ */
+internal function gltfObjectSkin(GltfParts $object) : int32
+{
+    foreach ($object->parts as $part) {
+        if ($part->level == 0) {
+            return $part->skin;
+        }
+    }
+
+    return -1;
+}
+
+/**
+ * Cook skin `$index` for a part whose origin is `$origin`. Joints come out parent before child.
+ * Every root joint must hang under the same non-joint node; that node's world, relative to the
+ * part origin, becomes `rootOffset`.
+ */
+internal function gltfSkeleton(GltfFile $file, int32 $index, const Mat4& $origin) : result<GltfSkinBuild, GltfError>
+{
+    if ($index < 0 || ($index as usize) >= $file->skins->count()) {
+        return .error(.json("skin {$index} does not exist"));
+    }
+
+    GltfSkin $skin = $file->skins[$index as usize];
+    int32 $n = $skin->joints->count() as int32;
+    if ($n > SKIN_MAX_JOINTS) {
+        int32 $cap = SKIN_MAX_JOINTS;
+        return .error(.unsupported("a skin with {$n} joints; the cap is {$cap}"));
+    }
+
+    array<int32> $parentOf = gltfNodeParents($file);
+    array<Mat4> $worlds = gltfNodeWorlds($file, $parentOf);
+
+    // skin index of each node, -1 when the node is not a joint of this skin
+    array<int32> $jointOf = arr::room<int32>($file->nodes->count());
+    foreach ($file->nodes as $node) {
+        $jointOf[] = -1;
+    }
+
+    int32 $j = 0;
+    while ($j < $n) {
+        $jointOf[$skin->joints[$j as usize] as usize] = $j;
+        $j = $j + 1;
+    }
+
+    // joint parent by skin index; a joint whose node parent is not a joint is a root
+    array<int32> $skinParent = arr::room<int32>($n as usize);
+    array<int32> $depth = arr::room<int32>($n as usize);
+    int32 $rootAbove = -2;
+    $j = 0;
+    while ($j < $n) {
+        int32 $node = $skin->joints[$j as usize];
+        int32 $up = $parentOf[$node as usize];
+        int32 $p = -1;
+        if ($up >= 0) {
+            $p = $jointOf[$up as usize];
+        }
+
+        if ($p < 0) {
+            if ($rootAbove != -2 && $rootAbove != $up) {
+                return .error(.unsupported('skin root joints under different parents'));
+            }
+
+            $rootAbove = $up;
+        }
+
+        $skinParent[] = $p;
+        $depth[] = 0;
+        $j = $j + 1;
+    }
+
+    $j = 0;
+    while ($j < $n) {
+        int32 $d = 0;
+        int32 $walk = $skinParent[$j as usize];
+        while ($walk >= 0) {
+            $d = $d + 1;
+            if ($d > $n) {
+                return .error(.json('skin joint cycle'));
+            }
+
+            $walk = $skinParent[$walk as usize];
+        }
+
+        $depth[$j as usize] = $d;
+        $j = $j + 1;
+    }
+
+    // stable order by depth: every parent lands before its children
+    array<int32> $order = arr::room<int32>($n as usize);
+    int32 $level = 0;
+    while (($order->count() as int32) < $n) {
+        $j = 0;
+        while ($j < $n) {
+            if ($depth[$j as usize] == $level) {
+                $order[] = $j;
+            }
+
+            $j = $j + 1;
+        }
+
+        $level = $level + 1;
+    }
+
+    array<int32> $remap = arr::room<int32>($n as usize);
+    $j = 0;
+    while ($j < $n) {
+        $remap[] = 0;
+        $j = $j + 1;
+    }
+
+    int32 $k = 0;
+    while ($k < $n) {
+        $remap[$order[$k as usize] as usize] = $k;
+        $k = $k + 1;
+    }
+
+    array<string> $names = arr::room<string>($n as usize);
+    array<int32> $parents = arr::room<int32>($n as usize);
+    array<Vec3> $positions = arr::room<Vec3>($n as usize);
+    array<Quat> $orientations = arr::room<Quat>($n as usize);
+    array<Vec3> $scales = arr::room<Vec3>($n as usize);
+    array<Mat4> $inverseBind = arr::room<Mat4>($n as usize);
+    foreach ($order as $src) {
+        GltfNode $node = $file->nodes[$skin->joints[$src as usize] as usize];
+        int32 $p = $skinParent[$src as usize];
+        $names[] = $node->name;
+        if ($p < 0) {
+            $parents[] = -1;
+        } else {
+            $parents[] = $remap[$p as usize];
+        }
+
+        $positions[] = matTranslation($node->local);
+        $orientations[] = matRotation($node->local);
+        $scales[] = matScale($node->local);
+        $inverseBind[] = $skin->inverseBind[$src as usize];
+    }
+
+    Mat4 $above = Mat4();
+    if ($rootAbove >= 0) {
+        $above = $worlds[$rootAbove as usize];
+    }
+
+    Mat4 $rootOffset = inverse($origin) * $above;
+    Skeleton $skeleton = Skeleton($names, $parents, $positions, $orientations, $scales, $inverseBind, $rootOffset);
+    return .ok(GltfSkinBuild($skeleton, $remap));
+}
+
+/**
+ * Parent node index of every node, -1 for scene roots and orphans.
+ */
+internal function gltfNodeParents(GltfFile $file) : array<int32>
+{
+    array<int32> $out = arr::room<int32>($file->nodes->count());
+    foreach ($file->nodes as $node) {
+        $out[] = -1;
+    }
+
+    int32 $i = 0;
+    while (($i as usize) < $file->nodes->count()) {
+        GltfNode $node = $file->nodes[$i as usize];
+        foreach ($node->children as $child) {
+            $out[$child as usize] = $i;
+        }
+
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+/**
+ * World matrix of every node, composed up its parent chain.
+ */
+internal function gltfNodeWorlds(GltfFile $file, const array<int32>& $parentOf) : array<Mat4>
+{
+    array<Mat4> $out = arr::room<Mat4>($file->nodes->count());
+    int32 $i = 0;
+    while (($i as usize) < $file->nodes->count()) {
+        Mat4 $world = $file->nodes[$i as usize]->local;
+        int32 $up = $parentOf[$i as usize];
+        int32 $guard = 0;
+        while ($up >= 0 && $guard < 64) {
+            $world = $file->nodes[$up as usize]->local * $world;
+            $up = $parentOf[$up as usize];
+            $guard = $guard + 1;
+        }
+
+        $out[] = $world;
+        $i = $i + 1;
+    }
+
+    return $out;
+}

@@ -1,8 +1,10 @@
 /**
  * vmodel blob (`VMDL`): one model object as LOD levels over a shared vertex and index buffer.
  * `CookedModel` is the CPU form the cooker writes and `decodeCookedModel` reads back without a GPU;
- * `visu::graphics::decodeModel` turns it into buffers. Every vertex is `MODEL_VERTEX_BYTES`:
- * position, normal, tangent (w is handedness), uv. Indices are absolute into the vertex buffer.
+ * `visu::graphics::decodeModel` turns it into buffers. A rigid vertex is `MODEL_VERTEX_BYTES`:
+ * position, normal, tangent (w is handedness), uv. A skinned vertex adds four joint bytes and four
+ * weight bytes, and the blob then ends with the `Skeleton`. Indices are absolute into the vertex
+ * buffer. Version 1 blobs (rigid only) still decode.
  */
 
 namespace visu::asset;
@@ -12,7 +14,12 @@ use visu::graphics::{IndexType, indexWidth};
 use visu::math::Vec3;
 
 internal const string MODEL_MAGIC = 'VMDL';
-internal const uint16 MODEL_VERSION = 1;
+internal const uint16 MODEL_VERSION = 2;
+
+/**
+ * Header flag: the blob ends with a skeleton section.
+ */
+internal const uint16 MODEL_FLAG_SKINNED = 1;
 public const string KIND_MODEL = 'model';
 
 /**
@@ -21,9 +28,19 @@ public const string KIND_MODEL = 'model';
 public const int32 MODEL_VERTEX_BYTES = 48;
 
 /**
- * The one vertex format v1 writes. Header field kept so a later format can coexist.
+ * Bytes per skinned vertex: the rigid 48, then joints (uint8 x 4) and weights (unorm8 x 4).
+ */
+public const int32 MODEL_SKINNED_VERTEX_BYTES = 56;
+
+/**
+ * Rigid vertex format, the only one version 1 writes.
  */
 public const uint32 MODEL_VERTEX_P3N3T4UV2 = 1;
+
+/**
+ * Skinned vertex format: `MODEL_VERTEX_P3N3T4UV2` plus four joint indices and four weights.
+ */
+public const uint32 MODEL_VERTEX_P3N3T4UV2J4W4 = 2;
 public const int32 MODEL_MAX_LODS = 6;
 
 /**
@@ -75,6 +92,12 @@ public class CookedModel
     public string $vertices;
     public string $indices;
 
+    /**
+     * `MODEL_VERTEX_P3N3T4UV2`, or `MODEL_VERTEX_P3N3T4UV2J4W4` when `$skeleton` is set.
+     */
+    public uint32 $format;
+    public Skeleton? $skeleton;
+
     public constructor(
         array<string> $slots,
         array<ModelLodDesc> $lods,
@@ -94,11 +117,18 @@ public class CookedModel
         $this->indexType = $indexType;
         $this->vertices = $vertices;
         $this->indices = $indices;
+        $this->format = MODEL_VERTEX_P3N3T4UV2;
+        $this->skeleton = null;
+    }
+
+    public const function vertexBytes() : int32
+    {
+        return modelVertexBytes($this->format);
     }
 
     public const function vertexCount() : int32
     {
-        return ($this->vertices->size() as int32) / MODEL_VERTEX_BYTES;
+        return ($this->vertices->size() as int32) / $this->vertexBytes();
     }
 
     public const function indexCount() : int32
@@ -120,7 +150,17 @@ public function encodeModel(const CookedModel& $model) : result<Blob, AssetError
         return .error(.corrupt($id, 'lod count'));
     }
 
-    if ($model->vertices->empty() || ($model->vertices->size() as int32) % MODEL_VERTEX_BYTES != 0) {
+    int32 $stride = modelVertexBytes($model->format);
+    if ($stride == 0) {
+        return .error(.corrupt($id, 'vertex format'));
+    }
+
+    bool $skinned = $model->format == MODEL_VERTEX_P3N3T4UV2J4W4;
+    if ($skinned != ($model->skeleton != null)) {
+        return .error(.corrupt($id, 'a skinned vertex format needs a skeleton and only it'));
+    }
+
+    if ($model->vertices->empty() || ($model->vertices->size() as int32) % $stride != 0) {
         return .error(.corrupt($id, 'vertex bytes'));
     }
 
@@ -133,8 +173,13 @@ public function encodeModel(const CookedModel& $model) : result<Blob, AssetError
     string $out = '';
     putMagic($out, MODEL_MAGIC);
     putU16($out, MODEL_VERSION);
-    putU16($out, 0);
-    putU32($out, MODEL_VERTEX_P3N3T4UV2);
+    uint16 $flags = 0;
+    if ($skinned) {
+        $flags = MODEL_FLAG_SKINNED;
+    }
+
+    putU16($out, $flags);
+    putU32($out, $model->format);
     putU8($out, $width as uint8);
     putU8($out, $lods as uint8);
     putU16($out, $slots as uint16);
@@ -174,6 +219,16 @@ public function encodeModel(const CookedModel& $model) : result<Blob, AssetError
     putMagic($out, $model->vertices);
     putU32($out, $indexCount as uint32);
     putMagic($out, $model->indices);
+    if ($model->skeleton != null) {
+        Skeleton $skeleton = guard $model->skeleton;
+        int32 $joints = $skeleton->count();
+        if ($joints < 1 || $joints > SKIN_MAX_JOINTS || !$skeleton->ordered()) {
+            return .error(.corrupt($id, 'skeleton'));
+        }
+
+        putSkeleton($out, $skeleton);
+    }
+
     return .ok(Blob($out));
 }
 
@@ -192,7 +247,7 @@ public function decodeCookedModel(Assets $assets, Blob $blob) : result<CookedMod
     uint16 $ver = guard getU16($s, $i, $id) else ($e) {
         return .error($e);
     }
-    if ($ver != MODEL_VERSION) {
+    if ($ver != 1 && $ver != MODEL_VERSION) {
         return .error(.corrupt($id, 'unsupported version'));
     }
 
@@ -202,8 +257,14 @@ public function decodeCookedModel(Assets $assets, Blob $blob) : result<CookedMod
     uint32 $format = guard getU32($s, $i, $id) else ($e) {
         return .error($e);
     }
-    if ($format != MODEL_VERTEX_P3N3T4UV2) {
+    int32 $stride = modelVertexBytes($format);
+    if ($stride == 0 || ($ver == 1 && $format != MODEL_VERTEX_P3N3T4UV2)) {
         return .error(.corrupt($id, 'unknown vertex format'));
+    }
+
+    bool $skinned = ($flags & MODEL_FLAG_SKINNED) != 0;
+    if ($skinned != ($format == MODEL_VERTEX_P3N3T4UV2J4W4)) {
+        return .error(.corrupt($id, 'skinned flag and vertex format disagree'));
     }
 
     uint8 $width = guard getU8($s, $i, $id) else ($e) {
@@ -287,7 +348,7 @@ public function decodeCookedModel(Assets $assets, Blob $blob) : result<CookedMod
     uint32 $vertexCount = guard getU32($s, $i, $id) else ($e) {
         return .error($e);
     }
-    usize $vertexBytes = ($vertexCount as usize) * (MODEL_VERTEX_BYTES as usize);
+    usize $vertexBytes = ($vertexCount as usize) * ($stride as usize);
     if ($vertexCount == 0 || $i + $vertexBytes > $s->size()) {
         return .error(.corrupt($id, 'truncated vertices'));
     }
@@ -303,6 +364,7 @@ public function decodeCookedModel(Assets $assets, Blob $blob) : result<CookedMod
     }
 
     string $indices = $s->sub($i, $indexBytes)->clone();
+    $i = $i + $indexBytes;
     foreach ($lods as $lod) {
         foreach ($lod->primitives as $prim) {
             if ($prim->firstIndex + $prim->indexCount > ($indexCount as int32)) {
@@ -311,7 +373,32 @@ public function decodeCookedModel(Assets $assets, Blob $blob) : result<CookedMod
         }
     }
 
-    return .ok(CookedModel($slots, $lods, $bounds, $lodBias, $cullDistance, $indexType, $vertices, $indices));
+    CookedModel $model = CookedModel($slots, $lods, $bounds, $lodBias, $cullDistance, $indexType, $vertices, $indices);
+    $model->format = $format;
+    if ($skinned) {
+        Skeleton $skeleton = guard getSkeleton($s, $i, $id) else ($e) {
+            return .error($e);
+        }
+        $model->skeleton = $skeleton;
+    }
+
+    return .ok($model);
+}
+
+/**
+ * Bytes per vertex for a cooked vertex format, 0 for one this build does not know.
+ */
+public function modelVertexBytes(uint32 $format) : int32
+{
+    if ($format == MODEL_VERTEX_P3N3T4UV2) {
+        return MODEL_VERTEX_BYTES;
+    }
+
+    if ($format == MODEL_VERTEX_P3N3T4UV2J4W4) {
+        return MODEL_SKINNED_VERTEX_BYTES;
+    }
+
+    return 0;
 }
 
 internal function putAabb(string& $out, const AABB& $box) : void

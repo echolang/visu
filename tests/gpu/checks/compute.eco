@@ -1,0 +1,107 @@
+/**
+ * A kernel fills a storage buffer; a later draw reads it by instance. An 8 x 8 grid of quads
+ * shows the kernel's colours: red rises with the column, green with the row.
+ */
+
+use visu::graphics::{
+    Buffer, BufferDesc, CallbackPass, ClearPass, ClearPassOptions, ComputeEncoder, ComputeProgram,
+    Device, Frame, GpuPass, IoSink, Mesh, Pipeline, PipelineError, Raster, RenderContext,
+    RenderEncoder, ShaderCollection, TargetRef, VertexLayout
+};
+use visu::math::Vec4;
+
+public function checkComputeStorage(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    ComputeProgram $kernel = guard $shaders->compute('compute_fill') else ($e) {
+        die($e->message());
+    }
+    assert($kernel->group->x == 16 && $kernel->group->y == 1 && $kernel->group->z == 1, 'workgroup from local_size');
+    $ref = guard $shaders->shader('storage_quad') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    Device $device = $gpu->device;
+    Buffer $cells = Buffer($device, BufferDesc(.storage, (64 * 16) as uint64, 'cells'));
+    array<float32> $verts = [
+        0.0f, 0.0f, 0.0f,
+        0.25f, 0.0f, 0.0f,
+        0.25f, 0.25f, 0.0f,
+        0.0f, 0.0f, 0.0f,
+        0.25f, 0.25f, 0.0f,
+        0.0f, 0.25f, 0.0f
+    ];
+    Mesh $quad = Mesh($device, $verts, stride: 12);
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'compute');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'compute-fill',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+            },
+            execute: function(RenderContext $ctx) : status<PipelineError> {
+                ComputeEncoder $enc = $ctx->beginCompute();
+                $enc->setKernel($kernel);
+                $enc->bindStorage(0, $cells);
+                $enc->dispatch(64);
+                $enc->endCompute();
+                return .ok;
+            }
+        ));
+        $p->add(CallbackPass(
+            'compute-draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(RenderContext $ctx) : status<PipelineError> {
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3(), Raster::none());
+                $pass->bind($enc);
+                $enc->bindStorage(0, $cells);
+                $enc->setVertexBuffer(0, $quad->vertices);
+                $enc->draw(0, 6, 64);
+                $enc->endRender();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('compute');
+    $quad->destroy();
+    $cells->destroy();
+    $shaders->destroy();
+    int32 $col = 0;
+    while ($col < 8) {
+        usize $at = ((4 * 64 + $col * 8 + 4) * 4) as usize;
+        int32 $want = ($col * 255) / 7;
+        int32 $r = $pixels[$at] as int32;
+        assert($r >= $want - 3 && $r <= $want + 3, 'red follows the column');
+        assert($pixels[$at + 2] > 240, 'blue marks a written cell');
+        $col = $col + 1;
+    }
+
+    // rows may read top-down or bottom-up; either way the first and last differ fully
+    int32 $top = $pixels[((4 * 64 + 4) * 4 + 1) as usize] as int32;
+    int32 $bottom = $pixels[((60 * 64 + 4) * 4 + 1) as usize] as int32;
+    assert(($top < 4 && $bottom > 251) || ($top > 251 && $bottom < 4), 'green follows the row');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_compute_storage
+{
+    GpuContext $gpu = gpuHidden('compute');
+    checkComputeStorage($gpu);
+    $gpu->end();
+}
+#[end]

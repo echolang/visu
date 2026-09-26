@@ -1,0 +1,287 @@
+/**
+ * One vertex layout's share of `ModelSystem`: the main assembler, the cascade and outline
+ * assemblers that share its mesh table, and the GpuPasses that draw it (back-face culled,
+ * double-sided, each again with parallax occlusion, shadow, outline mask). Rigid models are one lane, skinned models another; the system decides what goes in,
+ * a lane only registers, batches and records.
+ */
+
+namespace visu::system;
+
+use visu::geo::Frustum;
+use visu::graphics::{
+    DeferredRenderer, Device, DrawCallAssembler, GpuPass, MaterialGpu, MeshHandle, Model, ModelBank,
+    Raster, RenderEncoder, SHADOW_CASCADES, ShaderProgram, ShadowCascade, VertexLayout
+};
+use visu::math::Vec3;
+
+internal class ModelLane<P>
+{
+    public DrawCallAssembler<P> $dca;
+    public array<DrawCallAssembler<P>> $shadowDca;
+
+    /**
+     * The highlighted instances this frame, drawn into the outline mask.
+     */
+    public DrawCallAssembler<P> $outlineDca;
+    public VertexLayout $layout;
+
+    /**
+     * Program names: `model` / `shadow`, or a variant such as `model+skinned`. The parallax
+     * program draws the materials that march a height map (`MaterialGpu.parallax`).
+     */
+    public string $program;
+    public string $parallaxProgram;
+    public string $shadowProgram;
+    public string $outlineProgram;
+    private GpuPass? $opaque;
+    private GpuPass? $doubleSided;
+    private GpuPass? $opaqueParallax;
+    private GpuPass? $doubleSidedParallax;
+    private GpuPass? $shadow;
+    private GpuPass? $outline;
+
+    public constructor(
+        Device $device,
+        VertexLayout $layout,
+        string $program,
+        string $parallaxProgram,
+        string $shadowProgram,
+        string $outlineProgram
+    )
+    {
+        $this->dca = DrawCallAssembler<P>($device);
+        $this->shadowDca = array<DrawCallAssembler<P>>();
+        int32 $s = 0;
+        while ($s < SHADOW_CASCADES) {
+            DrawCallAssembler<P> $shadow = DrawCallAssembler<P>($device);
+            $shadow->shareMeshes($this->dca);
+            $this->shadowDca[] = $shadow;
+            $s = $s + 1;
+        }
+
+        $this->outlineDca = DrawCallAssembler<P>($device);
+        $this->outlineDca->shareMeshes($this->dca);
+        $this->layout = $layout;
+        $this->program = $program;
+        $this->parallaxProgram = $parallaxProgram;
+        $this->shadowProgram = $shadowProgram;
+        $this->outlineProgram = $outlineProgram;
+        $this->opaque = null;
+        $this->doubleSided = null;
+        $this->opaqueParallax = null;
+        $this->doubleSidedParallax = null;
+        $this->shadow = null;
+        $this->outline = null;
+    }
+
+    public const function ready() : bool
+    {
+        return $this->opaque != null;
+    }
+
+    /**
+     * Build the passes once the renderer has linked the programs. A no-op when they exist.
+     */
+    public function ensure(DeferredRenderer $renderer, bool $wireframe) : void
+    {
+        if ($this->opaque != null) {
+            return;
+        }
+
+        ShaderProgram $program = guard $renderer->program($this->program) else {
+            return;
+        }
+        ShaderProgram $parallaxProgram = guard $renderer->program($this->parallaxProgram) else {
+            return;
+        }
+        ShaderProgram $shadowProgram = guard $renderer->program($this->shadowProgram) else {
+            return;
+        }
+        Raster $raster = Raster::opaque();
+        $raster->cull = .back;
+        if ($wireframe) {
+            $raster->fill = .lines;
+        }
+
+        $this->opaque = GpuPass($program, $this->layout, $raster);
+        Raster $open = $raster;
+        $open->cull = .none;
+        $this->doubleSided = GpuPass($program, $this->layout, $open);
+        $this->opaqueParallax = GpuPass($parallaxProgram, $this->layout, $raster);
+        $this->doubleSidedParallax = GpuPass($parallaxProgram, $this->layout, $open);
+        $this->shadow = GpuPass($shadowProgram, $this->layout, Raster::depth());
+        ShaderProgram $outlineProgram = guard $renderer->program($this->outlineProgram) else {
+            return;
+        }
+        // the mask's own depth keeps the front surface; no cull so two-sided cards outline too
+        Raster $mask = Raster();
+        $mask->depthTest = true;
+        $mask->depthWrite = true;
+        $mask->cull = .none;
+        $this->outline = GpuPass($outlineProgram, $this->layout, $mask);
+    }
+
+    /**
+     * Drop the passes so the next `ensure` rebuilds them, after a raster knob flipped.
+     */
+    public function reset() : void
+    {
+        $this->opaque = null;
+        $this->doubleSided = null;
+        $this->opaqueParallax = null;
+        $this->doubleSidedParallax = null;
+        $this->shadow = null;
+        $this->outline = null;
+    }
+
+    /**
+     * Register every (LOD, primitive) of `$model`, lod-major, into `$h`.
+     */
+    public function register(ModelBank $bank, Model $model, ModelHandles $h) : void
+    {
+        foreach ($model->lods as $lod) {
+            $h->lodStart[] = $h->handles->count() as int32;
+            foreach ($lod->primitives as $prim) {
+                MaterialGpu $m = $bank->materialOf($model, $prim->slot);
+                MeshHandle $handle = $this->dca->register(
+                    $model->mesh,
+                    $lod->bounds,
+                    firstIndex: $prim->firstIndex,
+                    indexCount: $prim->indexCount,
+                    material: $m->index
+                );
+                $h->handles[] = $handle;
+            }
+        }
+
+        $h->lodStart[] = $h->handles->count() as int32;
+    }
+
+    public function clearShadows() : void
+    {
+        foreach ($this->shadowDca as $shadow) {
+            $shadow->clearInstances();
+        }
+    }
+
+    public function buildShadows(const ShadowCascade[5]& $cascades, Vec3 $eye) : void
+    {
+        int32 $i = 0;
+        while ($i < SHADOW_CASCADES) {
+            $this->shadowDca[$i as usize]->build($cascades[$i]->frustum, $eye);
+            $i = $i + 1;
+        }
+    }
+
+    /**
+     * Record the main batches into an open GBuffer encoder, one GpuPass and material bind per
+     * material change. The caller has bound the camera and anything the programs share.
+     */
+    public function draw(RenderEncoder $enc, ModelBank $bank) : void
+    {
+        GpuPass $opaque = guard $this->opaque else {
+            return;
+        }
+        GpuPass $twoSided = guard $this->doubleSided else {
+            return;
+        }
+        GpuPass $opaqueParallax = guard $this->opaqueParallax else {
+            return;
+        }
+        GpuPass $twoSidedParallax = guard $this->doubleSidedParallax else {
+            return;
+        }
+        if ($this->dca->commandCount() == 0) {
+            return;
+        }
+
+        $this->dca->execute($enc, function(RenderEncoder $e, int32 $material) : void {
+            MaterialGpu $m = $bank->material($material);
+            if ($m->parallax) {
+                if ($m->doubleSided) {
+                    $twoSidedParallax->bind($e);
+                } else {
+                    $opaqueParallax->bind($e);
+                }
+            } else if ($m->doubleSided) {
+                $twoSided->bind($e);
+            } else {
+                $opaque->bind($e);
+            }
+
+            $m->bind($e);
+        });
+    }
+
+    public const function casts(int32 $index) : bool
+    {
+        if ($index < 0 || $index >= SHADOW_CASCADES) {
+            return false;
+        }
+
+        return $this->shadowDca[$index as usize]->commandCount() > 0;
+    }
+
+    /**
+     * Record cascade `$index` into an open shadow encoder. The cascade uniforms are bound.
+     */
+    public function cast(RenderEncoder $enc, ModelBank $bank, int32 $index) : void
+    {
+        GpuPass $pass = guard $this->shadow else {
+            return;
+        }
+        if (!$this->casts($index)) {
+            return;
+        }
+
+        DrawCallAssembler<P> $dca = $this->shadowDca[$index as usize];
+        $dca->execute($enc, function(RenderEncoder $e, int32 $material) : void {
+            $pass->bind($e);
+            MaterialGpu $m = $bank->material($material);
+            $m->bind($e);
+        });
+    }
+
+    /**
+     * Batch the highlighted instances submitted this frame, culled by the view.
+     */
+    public function buildOutline(const Frustum& $frustum, Vec3 $eye) : void
+    {
+        $this->outlineDca->build($frustum, $eye);
+    }
+
+    public const function outlines() : bool
+    {
+        return $this->outlineDca->commandCount() > 0;
+    }
+
+    /**
+     * Record the highlighted instances into the open outline mask encoder. The camera is bound;
+     * each material binds for its cut-out.
+     */
+    public function outline(RenderEncoder $enc, ModelBank $bank) : void
+    {
+        GpuPass $pass = guard $this->outline else {
+            return;
+        }
+        if (!$this->outlines()) {
+            return;
+        }
+
+        $this->outlineDca->execute($enc, function(RenderEncoder $e, int32 $material) : void {
+            $pass->bind($e);
+            MaterialGpu $m = $bank->material($material);
+            $m->bind($e);
+        });
+    }
+
+    /**
+     * Forget every registered mesh and this frame's instances. The bank keeps the models.
+     */
+    public function clear() : void
+    {
+        $this->dca->clearMeshes();
+        $this->clearShadows();
+        $this->outlineDca->clearInstances();
+    }
+}

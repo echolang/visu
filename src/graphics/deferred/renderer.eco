@@ -63,6 +63,8 @@ public class DeferredRenderer
     private Texture? $shadowMap;
     private array<RetiredShadow> $retiredShadows;
     private array<ShadowCaster> $casters;
+    private OutlineData $outline;
+    private OutlineStyle[4] $outlineStyles;
 
     public constructor(Device $device)
     {
@@ -82,6 +84,24 @@ public class DeferredRenderer
         $this->shadowMap = null;
         $this->retiredShadows = arr::room<RetiredShadow>(4);
         $this->casters = arr::room<ShadowCaster>(4);
+        $this->outline = OutlineData();
+        OutlineStyle[4] $styles;
+        int32 $i = 0;
+        while ($i < OUTLINE_STYLES) {
+            $styles[$i] = OutlineStyle();
+            $i = $i + 1;
+        }
+
+        $this->outlineStyles = mv $styles;
+    }
+
+    /**
+     * How highlight slot `$slot` glows. Casters tag instances with a slot; see `OutlineCaster`.
+     */
+    public function outlineStyle(int32 $slot, OutlineStyle $style) : void
+    {
+        assert($slot >= 0 && $slot < OUTLINE_STYLES, 'outline style slot out of range');
+        $this->outlineStyles[$slot] = $style;
     }
 
     /**
@@ -229,7 +249,18 @@ public class DeferredRenderer
             }
         }
 
+        if ($view->isScene()) {
+            $this->outline->reset();
+            $ctx->frame->set($this->outline);
+        }
+
         $fill($ctx, $gbuffer);
+
+        // only a frame with something highlighted pays for the mask and the composite
+        bool $outlining = $view->isScene() && $this->outline->active();
+        if ($outlining) {
+            $pipeline->add(OutlineMaskPass($gpu, $this->outline));
+        }
 
         bool $runSsao = $this->ssao != null && ($view->isScene() || $view->needsSsao());
 
@@ -259,6 +290,10 @@ public class DeferredRenderer
 
             LightPassData $light = $ctx->frame->get<LightPassData>();
             $gpu->blit->pass($pipeline, $output, $light->output);
+            if ($outlining) {
+                $pipeline->add(OutlinePass($gpu, $output, $this->outlineStyles, $this->outline->bounds));
+            }
+
             return;
         }
 
@@ -331,17 +366,6 @@ public class DeferredRenderer
         assert($this->gpu != null, 'DeferredRenderer.bindCamera before load');
         DeferredGpu $gpu = guard $this->gpu;
         $gpu->camera->bind($enc);
-    }
-
-    /**
-     * Depth-only pass casters bind. Same vertex layout as the GBuffer model program.
-     */
-    public function shadowPass(const VertexLayout& $layout) : GpuPass
-    {
-        assert($this->gpu != null, 'DeferredRenderer.shadowPass before load');
-        DeferredGpu $gpu = guard $this->gpu;
-        ShaderProgram $program = guard $gpu->shaders->program('shadow');
-        return GpuPass($program, $layout, Raster::depth());
     }
 
     private function ensureShadowMap(ShadowQuality $quality) : Texture

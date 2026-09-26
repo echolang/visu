@@ -164,6 +164,13 @@ public interface DeviceProtocol
     function beginRender(const RenderPassDesc& $desc) : RenderEncoder;
 
     /**
+     * Open a compute encoder on the scene command buffer. Must be inside a frame, and no encoder
+     * already open. Work it records runs after the passes recorded before it and before the ones
+     * after it; a later draw that reads what it wrote needs nothing else. Close it with endCompute.
+     */
+    function beginCompute() : ComputeEncoder;
+
+    /**
      * Open a debug label on the current command buffer. Encoder timestamps tag
      * `profiler().currentNode()`, not this label. Empty under VISU_RELEASE.
      */
@@ -247,9 +254,22 @@ public interface DeviceProtocol
     function generateMipmaps(Texture $texture) : void;
 
     /**
-     * Get-or-create a sampler. Cached by filter/wrap, so the same desc is the same GPU object.
+     * Get-or-create a sampler. Cached by desc key, so the same desc is the same Sampler instance.
      */
     function createSampler(const SamplerDesc& $desc) : Sampler;
+
+    /**
+     * Anisotropy level for every `SamplerDesc.anisotropic` sampler, clamped to
+     * `limits()->maxAnisotropy`. 1 is off. Applied at the next beginFrame, where the cached samplers
+     * are rebuilt in place (Vulkan waits idle first), so call it on a settings change, not per frame.
+     */
+    function setAnisotropy(int32 $level) : void;
+
+    /**
+     * The anisotropy level anisotropic samplers use now, after clamping.
+     * A pending setAnisotropy is not in it until the next beginFrame.
+     */
+    const function anisotropy() : int32;
 
     /**
      * Compile a shader stage from `$bytes` (SPIR-V or Metal source). Metal entry points are `vs` / `fs`.

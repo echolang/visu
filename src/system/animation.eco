@@ -1,12 +1,13 @@
 /**
- * Samples `AnimationPlayer` clips onto the named child `Transform`s. Runs in update so the
- * pose is ready before `ModelSystem.fill`. Dynamics pick the interpolated world matrix.
+ * Samples `AnimationPlayer` clips onto the named child `Transform`s, blending a live
+ * crossfade. Runs in update so the pose is ready before `ModelSystem.fill`. Dynamics pick the
+ * interpolated world matrix. Skinned joints are `SkinSystem`'s; their tracks cost nothing here.
  */
 
 namespace visu::system;
 
-use visu::asset::{Clip, applyTrack};
-use visu::components::{AnimationPlayer, AssemblyInstance};
+use visu::asset::{AnimTrack, Clip, blendTrack};
+use visu::components::{AnimationLayers, AnimationPlayer, AssemblyInstance};
 use visu::ecs::{Entities, Entity, Schedule, System};
 use visu::geo::Transform;
 use visu::graphics::RenderContext;
@@ -61,37 +62,65 @@ internal function samplePlayer(Entities $entities, Entity $id, AnimationPlayer& 
             return;
         }
 
-        foreach ($player->clips as $clip) {
-            applyClip($entities, $inst, $clip, $player->time);
+        int32 $c = 0;
+        while (($c as usize) < $player->clips->count()) {
+            applyClip($entities, $inst, $c, $player->clips[$c as usize], $player->time, 1.0f);
+            $c = $c + 1;
         }
 
         return;
     }
 
-    Clip $clip = guard $player->clip() else {
+    AnimationLayers $layers = guard $player->layers(0.0f) else {
         return;
     }
-    applyClip($entities, $inst, $clip, $player->time);
+    if ($layers->fade >= 0) {
+        applyClip($entities, $inst, $layers->fade, $player->clips[$layers->fade as usize], $layers->fadeTime, 1.0f);
+    }
+
+    applyClip($entities, $inst, $layers->index, $player->clips[$layers->index as usize], $layers->time, $layers->weight);
 }
 
+/**
+ * Sample clip `$index` onto its node entities. The spawn-time `targets` row is the fast path;
+ * a player whose clips are not the assembly's falls back to the name map. A clip that drives no
+ * node at all (a skin's joint tracks) costs one comparison.
+ */
 internal function applyClip(
     Entities $entities,
     AssemblyInstance& $inst,
+    int32 $index,
     const Clip& $clip,
-    float32 $time
+    float32 $time,
+    float32 $weight
 ) : void
 {
-    foreach ($clip->tracks as $track) {
-        Entity? $target = $inst->node($track->node);
-        Entity $e = guard $target else {
-            continue;
+    int32 $tracks = $clip->tracks->count() as int32;
+    bool $bound = $index >= 0
+        && ($index as usize) < $inst->targets->count()
+        && ($inst->targets[$index as usize]->count() as int32) == $tracks;
+    if ($bound && $inst->driven[$index as usize] == 0) {
+        return;
+    }
+
+    int32 $t = 0;
+    while ($t < $tracks) {
+        AnimTrack $track = $clip->tracks[$t as usize];
+        Entity $e = Entity::none();
+        if ($bound) {
+            $e = $inst->targets[$index as usize][$t as usize];
+        } else {
+            Entity? $named = $inst->node($track->node);
+            $e = $named ?? Entity::none();
         }
-        if (!$entities->has<Transform>($e)) {
+
+        $t = $t + 1;
+        if ($e == Entity::none() || !$entities->has<Transform>($e)) {
             continue;
         }
 
-        Transform& $t = $entities->get<Transform>($e);
-        $t->storePrevious();
-        applyTrack($track, $time, $t);
+        Transform& $target = $entities->get<Transform>($e);
+        $target->storePrevious();
+        blendTrack($track, $time, $weight, $target);
     }
 }

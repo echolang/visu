@@ -71,7 +71,10 @@ public class ModelCooker : Cooker
             return .error($e);
         }
 
-        $doc->clips = $file->clips;
+        array<Clip> $kept = guard keptClips($src->id, $file->clips, $doc->animations) else ($e) {
+            return .error($e);
+        }
+        $doc->clips = $kept;
         retargetClipNodes($file, $doc);
         if ($file->clips->count() > 0) {
             markAnimatedParts($doc);
@@ -95,7 +98,17 @@ public class ModelCooker : Cooker
                 return .error(.decode($src->id, "part '{$part->name}' has no mesh"));
             }
             Mat4 $origin = gltfPartOrigin($object);
-            CookedModel $model = guard gltfBuild($file, $object, $origin) else ($e) {
+            GltfSkinBuild? $skin = null;
+            int32 $skinIndex = gltfObjectSkin($object);
+            if ($skinIndex >= 0) {
+                GltfSkinBuild $build = guard gltfSkeleton($file, $skinIndex, $origin) else ($e) {
+                    return .error(gltfAssetError($src->id, $e));
+                }
+                $skin = $build;
+                $part->skinned = true;
+            }
+
+            CookedModel $model = guard gltfBuild($file, $object, $origin, $skin) else ($e) {
                 return .error(gltfAssetError($src->id, $e));
             }
             guard applyPartLod($model, $part, $src->id) else ($e) {
@@ -248,6 +261,31 @@ internal function markAnimatedParts(Assembly $doc) : void
 
         $i = $i + 1;
     }
+}
+
+/**
+ * The clips a `.vmod` `animations` list names, in that order, or every clip when it names none.
+ * A name the file does not have is a cook error, not a silent drop.
+ */
+internal function keptClips(
+    const string& $id,
+    const array<Clip>& $clips,
+    const array<string>& $names
+) : result<array<Clip>, AssetError>
+{
+    if ($names->count() == 0) {
+        return .ok($clips);
+    }
+
+    array<Clip> $out = array<Clip>();
+    foreach ($names as $name) {
+        Clip $clip = guard clipNamed($clips, $name) else {
+            return .error(.decode($id, "animation '{$name}' is not in the file"));
+        }
+        $out[] = $clip;
+    }
+
+    return .ok($out);
 }
 
 internal function nodeFromWorld(const string& $name, const string& $part, const Mat4& $world) : AssemblyNode

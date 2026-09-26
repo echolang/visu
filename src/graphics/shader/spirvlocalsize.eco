@@ -1,0 +1,65 @@
+/**
+ * A compute kernel's workgroup size, read from its SPIR-V `OpExecutionMode LocalSize`. The GLSL
+ * `local_size_*` is the one source of truth: Metal's dispatch needs it as threads per group and
+ * Vulkan's as the divisor for group counts. Runs once at kernel load.
+ */
+
+namespace visu::graphics;
+
+internal const uint32 SPIRV_MAGIC = 0x07230203;
+internal const uint32 SPIRV_OP_EXECUTION_MODE = 16;
+internal const uint32 SPIRV_MODE_LOCAL_SIZE = 17;
+
+public struct WorkgroupSize
+{
+    public uint32 $x;
+    public uint32 $y;
+    public uint32 $z;
+}
+
+/**
+ * The LocalSize of the first entry point that declares one, or null when the module is not
+ * SPIR-V or has none (a spec-constant size is not supported).
+ */
+public function spirvLocalSize(const string& $spv) : WorkgroupSize?
+{
+    usize $n = $spv->size();
+    if ($n < 20 || spirvWord($spv, 0) != SPIRV_MAGIC) {
+        return null;
+    }
+
+    usize $at = 20;
+    while ($at + 4 <= $n) {
+        uint32 $head = spirvWord($spv, $at);
+        uint32 $words = $head >> 16;
+        uint32 $op = $head & 0xFFFF;
+        if ($words == 0) {
+            return null;
+        }
+
+        usize $bytes = ($words as usize) * 4;
+        if ($at + $bytes > $n) {
+            return null;
+        }
+
+        if ($op == SPIRV_OP_EXECUTION_MODE && $words >= 6 && spirvWord($spv, $at + 8) == SPIRV_MODE_LOCAL_SIZE) {
+            return WorkgroupSize(
+                $x: spirvWord($spv, $at + 12),
+                $y: spirvWord($spv, $at + 16),
+                $z: spirvWord($spv, $at + 20)
+            );
+        }
+
+        $at = $at + $bytes;
+    }
+
+    return null;
+}
+
+internal function spirvWord(const string& $s, usize $off) : uint32
+{
+    return ($s->byte($off) as uint32)
+        | (($s->byte($off + 1) as uint32) << 8)
+        | (($s->byte($off + 2) as uint32) << 16)
+        | (($s->byte($off + 3) as uint32) << 24);
+}

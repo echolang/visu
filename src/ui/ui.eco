@@ -52,6 +52,11 @@ public class Ui
     internal array<SliderRun> $sliders;
     internal array<ImageRun> $images;
     internal array<IconRun> $iconButtons;
+    internal array<SlotRun> $slotRuns;
+    /**
+     * The slot drag in hand, across frames until the button comes up.
+     */
+    internal DragState $carry;
     internal TooltipState $tip;
     /**
      * Open `beginDisabled` scopes, innermost last; `disabledDepth` counts the ones that disable.
@@ -69,6 +74,10 @@ public class Ui
     internal map<uint64, Slot> $slots;
     internal FrameInput $io;
     internal array<int32> $overlays;
+    /**
+     * `beginFloat` layouts this frame in call order; each draws as its own layer.
+     */
+    internal array<int32> $floats;
     internal array<int32> $animated;
     internal bool $open;
     internal bool $hoverAny;
@@ -110,6 +119,8 @@ public class Ui
         $this->sliders = array<SliderRun>();
         $this->images = array<ImageRun>();
         $this->iconButtons = array<IconRun>();
+        $this->slotRuns = array<SlotRun>();
+        $this->carry = DragState();
         $this->tip = TooltipState();
         $this->disabledStack = array<bool>();
         $this->disabledStack->reserve(8);
@@ -125,6 +136,8 @@ public class Ui
         $this->slots = map<uint64, Slot>();
         $this->io = FrameInput();
         $this->overlays = array<int32>();
+        $this->floats = array<int32>();
+        $this->floats->reserve(32);
         $this->animated = array<int32>();
         $this->open = false;
         $this->hoverAny = false;
@@ -142,6 +155,7 @@ public class Ui
         $this->nodes->reserve(256);
         $this->skins->reserve(32);
         $this->iconButtons->reserve(32);
+        $this->slotRuns->reserve(64);
         $this->fields->reserve(16);
         $this->focusables->reserve(16);
         $this->batch->verts->reserve(4096);
@@ -267,6 +281,7 @@ public class Ui
         $this->sliders->clear();
         $this->images->clear();
         $this->iconButtons->clear();
+        $this->slotRuns->clear();
         $this->tip->seen = false;
         $this->tip->show = false;
         $this->disabledStack->clear();
@@ -279,6 +294,7 @@ public class Ui
         $this->parents->clear();
         $this->ids->clear();
         $this->overlays->clear();
+        $this->floats->clear();
         $this->animated->clear();
 
         Node $root = Node();
@@ -291,7 +307,7 @@ public class Ui
         $this->ids[] = 0 as uint64;
         $this->open = true;
         $this->hoverAny = false;
-        $this->dragging = false;
+        $this->dragging = $this->carry->live;
     }
 
     public function endFrame() : void
@@ -322,6 +338,7 @@ public class Ui
         animatePills($this, $dt);
         placeTooltip($this);
         dropUnseen($this->slots, $this->stamp, $this->stale);
+        $this->settleCarry();
         $this->claimHover();
         $this->open = false;
         $this->io->chars->clear();
@@ -423,6 +440,21 @@ public class Ui
         $this->begin($l);
     }
 
+    /**
+     * A row that fills its parent's width, children centred vertically from the left: one
+     * line of label and value text in a panel.
+     */
+    public function beginLine(float32? $spacing = null) : void
+    {
+        Layout $l = Layout();
+        $l->flow = .horizontal;
+        $l->h = .fill;
+        $l->v = .fit;
+        $l->align = Align::centerLeft;
+        $l->spacing = $spacing ?? $this->theme->spacing;
+        $this->begin($l);
+    }
+
     public function beginColumn(float32? $spacing = null) : void
     {
         Layout $l = Layout();
@@ -433,7 +465,15 @@ public class Ui
         $this->begin($l);
     }
 
-    public function beginCard(float32 $width = 0.0f, style: CardKind $style = .card) : void
+    /**
+     * `$solid` false lets the pointer through the card to the world: a plate that labels a
+     * thing never blocks the click on it. Null keeps the default, solid because it paints.
+     */
+    public function beginCard(
+        float32 $width = 0.0f,
+        style: CardKind $style = .card,
+        solid: bool? $solid = null
+    ) : void
     {
         CardStyle $st = $this->theme->card;
         if ($style == CardKind::panel) {
@@ -450,7 +490,41 @@ public class Ui
         $l->radius = $st->radius;
         $l->skin = $st->skin;
         $l->width = $width;
+        $l->solid = $solid;
         $this->begin($l);
+    }
+
+    /**
+     * Open a layout outside the flow, placed on the frame: `$at` is 0..1 of the frame from the
+     * top-left, `$pivot` the point of the float that sits there (0.5, 1 hangs it above `$at`).
+     * It keeps inside the frame. Floats draw under the main tree, in call order, each one's boxes
+     * and text together, so a caller that sorts far to near never has a far plate's text over a
+     * near plate's card, and the screen's panels always cover them. `$id` keys the float's
+     * widgets, so give each world thing its own.
+     */
+    public function beginFloat(Vec2 $at, pivot: Vec2 $pivot, id: string $id) : void
+    {
+        assert($this->open, 'ui beginFloat outside frame');
+        Node $n = Node();
+        $n->kind = .layout;
+        $n->flow = .vertical;
+        $n->h = .fit;
+        $n->v = .fit;
+        $n->floating = true;
+        $n->anchor = $at;
+        $n->pivot = $pivot;
+        int32 $i = $this->push($n);
+        $this->floats[] = $i;
+        $this->parents[] = $i;
+        $this->ids[] = hash::combine(0x666c6f6174 as uint64, hash::of($id));
+    }
+
+    public function endFloat() : void
+    {
+        assert($this->open, 'ui endFloat outside frame');
+        int32 $top = $this->peekParent();
+        assert($this->nodes[$top as usize]->floating, 'ui endFloat without beginFloat');
+        $this->end();
     }
 
     public function beginSection(string $title) : void
@@ -601,6 +675,34 @@ public class Ui
     ) : bool
     {
         return uiIconButton($this, $icon, $id, $selected, $size);
+    }
+
+    /**
+     * Inventory cell. `$drag` at or above 0 makes the slot a drag source carrying that payload;
+     * a live drag released over another slot returns `drop(payload)` there, and a press and
+     * release without travel returns `click`. `$size` 0 uses `theme.slot.size`. `$id` is
+     * required and must be stable per cell: build the ids once, not per frame.
+     */
+    public function slot(
+        const string& $id,
+        const SlotView& $view,
+        drag: int32 $drag = -1,
+        size: float32 $size = 0.0f
+    ) : SlotEvent
+    {
+        return uiSlot($this, $id, $view, $drag, $size);
+    }
+
+    /**
+     * The payload of the live slot drag, or null while nothing is being dragged.
+     */
+    public const function dragging() : int32?
+    {
+        if (!$this->carry->live) {
+            return null;
+        }
+
+        return $this->carry->payload;
     }
 
     /**
@@ -784,11 +886,12 @@ public class Ui
     }
 
     /**
-     * Read-only bar. `$value` is 0..1.
+     * Read-only bar. `$value` is 0..1. `$width` 0 takes the theme's bar width; a small card
+     * passes its own so the bar does not widen it.
      */
-    public function progress(float32 $value, id: string $id = '') : void
+    public function progress(float32 $value, id: string $id = '', width: float32 $width = 0.0f) : void
     {
-        uiProgress($this, $value, $id);
+        uiProgress($this, $value, $id, $width);
     }
 
     /**
@@ -886,7 +989,9 @@ public class Ui
         bool $over = contains($s->pos, $s->size, $this->io->pointer);
         bool $fire = false;
 
-        if ($over && $this->io->leftDown) {
+        // arm on the press edge only: a press that started elsewhere (a drag, a pan) never
+        // fires the button it is released over
+        if ($over && $this->io->leftPressed) {
             $s->pressed = true;
             $s->pressAt = visu::runtime::seconds();
         }
@@ -935,6 +1040,87 @@ public class Ui
         }
 
         return $held;
+    }
+
+    /**
+     * Slot input: a live drag released over this slot is a drop (even when an earlier widget
+     * consumed the frame, since the release belongs to the drag); otherwise the press edge arms
+     * a click, and on a source arms the drag. A drag never consumes, so every slot drawn after
+     * the source still sees the release.
+     */
+    internal function slotInput(uint64 $id, int32 $payload, Icon? $icon) : SlotEvent
+    {
+        touchSlot($this->slots, $id, $this->stamp);
+
+        if ($this->disabledDepth > 0) {
+            return .none;
+        }
+
+        Slot $s = $this->slots[$id];
+        bool $over = contains($s->pos, $s->size, $this->io->pointer);
+
+        if ($this->carry->live) {
+            if ($this->io->leftReleased && $over && $this->carry->source != $id) {
+                return .drop($this->carry->payload);
+            }
+
+            return .none;
+        }
+
+        if ($this->io->consumed) {
+            return .none;
+        }
+
+        SlotEvent $event = .none;
+
+        if ($over && $this->io->leftPressed) {
+            $s->pressed = true;
+            $s->pressAt = visu::runtime::seconds();
+
+            if ($payload >= 0) {
+                $this->carry = DragState($id, $payload, $icon, $this->io->pointer, true, false);
+            }
+        }
+
+        if ($s->pressed && $this->carry->armed && $this->carry->source == $id && $this->io->leftDown) {
+            float32 $dx = $this->io->pointer->x - $this->carry->from->x;
+            float32 $dy = $this->io->pointer->y - $this->carry->from->y;
+
+            if ($dx * $dx + $dy * $dy > DRAG_THRESHOLD * DRAG_THRESHOLD) {
+                $this->carry->live = true;
+                $this->dragging = true;
+                $s->pressed = false;
+            }
+        }
+
+        if ($s->pressed && $over && $this->io->leftReleased) {
+            $event = .click;
+            $s->pressed = false;
+        } else if ($this->io->leftReleased) {
+            $s->pressed = false;
+        }
+
+        $this->slots[$id] = $s;
+        return $event;
+    }
+
+    /**
+     * End of frame: the drag ends with the button, and with its source slot if that stopped
+     * being drawn. A live drag keeps the pointer claim, so its release never reaches the world.
+     */
+    internal function settleCarry() : void
+    {
+        if (!$this->carry->armed) {
+            return;
+        }
+
+        if ($this->carry->live) {
+            $this->dragging = true;
+        }
+
+        if ($this->io->leftReleased || !$this->io->leftDown || !$this->slots->has($this->carry->source)) {
+            $this->carry = DragState();
+        }
     }
 
     internal function consume() : void

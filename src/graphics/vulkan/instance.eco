@@ -265,10 +265,26 @@ internal function vkPickDevice(Device $device) : status<DeviceError>
     $device->limits->uniformAlign = $props->limits->minUniformBufferOffsetAlignment;
     $device->limits->maxUniformRange = $props->limits->maxUniformBufferRange as uint64;
     $device->limits->maxTessellationFactor = $props->limits->maxTessellationGenerationLevel as int32;
+    $device->limits->maxAnisotropy = vkMaxAnisotropy($device, $props->limits->maxSamplerAnisotropy);
     $device->timestampPeriod = $props->limits->timestampPeriod;
     $device->adapter = vkAdapterInfo($props, $major, $minor);
     $device->heapBudget = vkHeapBudget($device);
     return .ok;
+}
+
+/**
+ * Highest sampler anisotropy the device allows, or 1 when the samplerAnisotropy feature is missing.
+ */
+internal function vkMaxAnisotropy(Device $device, float32 $limit) : int32
+{
+    vk::PhysicalDeviceFeatures $features = vk::PhysicalDeviceFeatures();
+    vk::GetPhysicalDeviceFeatures($device->physical, &$features);
+
+    if ($features->samplerAnisotropy == 0 || $limit < 1.0f) {
+        return 1;
+    }
+
+    return $limit as int32;
 }
 
 internal function vkHeapBudget(Device $device) : uint64
@@ -399,6 +415,7 @@ internal function vkCreateDevice(Device $device) : status<DeviceError>
     vk::PhysicalDeviceFeatures $enable = vk::PhysicalDeviceFeatures();
     $enable->fillModeNonSolid = $available->fillModeNonSolid;
     $enable->tessellationShader = $available->tessellationShader;
+    $enable->samplerAnisotropy = $available->samplerAnisotropy;
 
     vk::DeviceCreateInfo $dci = vk::DeviceCreateInfo();
     $dci->pNext:$ = ptr<const uint8>(&$dyn);

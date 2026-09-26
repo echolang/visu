@@ -16,6 +16,11 @@ internal struct GltfNode
     public int32 $mesh;
     public int32 $camera;
     public int32 $light;
+
+    /**
+     * Index into `GltfFile.skins`, or -1. A skinned node's own transform does not move its mesh.
+     */
+    public int32 $skin;
     public array<int32> $children;
     public Mat4 $local;
 
@@ -25,6 +30,7 @@ internal struct GltfNode
         $this->mesh = -1;
         $this->camera = -1;
         $this->light = -1;
+        $this->skin = -1;
         $this->children = array<int32>();
         $this->local = Mat4();
     }
@@ -38,6 +44,8 @@ internal struct GltfPrim
     public int32 $normal;
     public int32 $tangent;
     public int32 $uv;
+    public int32 $joints;
+    public int32 $weights;
     public int32 $indices;
 
     public constructor()
@@ -48,6 +56,8 @@ internal struct GltfPrim
         $this->normal = -1;
         $this->tangent = -1;
         $this->uv = -1;
+        $this->joints = -1;
+        $this->weights = -1;
         $this->indices = -1;
     }
 }
@@ -74,6 +84,7 @@ public class GltfFile
     public array<string> $materials;
     public array<int32> $roots;
     public array<Clip> $clips;
+    public array<GltfSkin> $skins;
 
     public constructor(
         string $bin,
@@ -91,6 +102,7 @@ public class GltfFile
         $this->materials = $materials;
         $this->roots = $roots;
         $this->clips = array<Clip>();
+        $this->skins = array<GltfSkin>();
     }
 
     /**
@@ -204,6 +216,10 @@ internal function gltfDocument(json::Value $root, string $bin) : result<GltfFile
     array<string> $materials = gltfParseMaterials($root);
     array<int32> $roots = gltfSceneRoots($root, $nodes->count() as int32);
     GltfFile $file = GltfFile($bin, $nodes, $meshes, $accessors, $materials, $roots);
+    array<GltfSkin> $skins = guard gltfParseSkins($root, $file) else ($e) {
+        return .error($e);
+    }
+    $file->skins = $skins;
     array<Clip> $clips = guard gltfParseClips($root, $file) else ($e) {
         return .error($e);
     }
@@ -226,6 +242,7 @@ internal function gltfParseNodes(json::Value $root) : result<array<GltfNode>, Gl
         $parsed->mesh = (gltfInt($node, 'mesh') ?? -1) as int32;
         $parsed->camera = (gltfInt($node, 'camera') ?? -1) as int32;
         $parsed->light = gltfLightIndex($node);
+        $parsed->skin = (gltfInt($node, 'skin') ?? -1) as int32;
         $parsed->children = gltfChildIds($node, $items->count() as int32);
         $parsed->local = $local;
         $out[] = $parsed;
@@ -284,6 +301,8 @@ internal function gltfParsePrim(json::Value $prim) : GltfPrim
     $out->normal = (gltfInt($attributes, 'NORMAL') ?? -1) as int32;
     $out->tangent = (gltfInt($attributes, 'TANGENT') ?? -1) as int32;
     $out->uv = (gltfInt($attributes, 'TEXCOORD_0') ?? -1) as int32;
+    $out->joints = (gltfInt($attributes, 'JOINTS_0') ?? -1) as int32;
+    $out->weights = (gltfInt($attributes, 'WEIGHTS_0') ?? -1) as int32;
     return $out;
 }
 

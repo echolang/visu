@@ -8,6 +8,17 @@ namespace visu::graphics;
 
 use visu::math::{Vec2, Vec3, Vec4};
 
+/**
+ * How the GPU reads one attribute. `float32` is `$components` floats; the byte formats are four
+ * packed bytes, read as `uvec4` (`uint8x4`) or as `vec4` scaled to 0..1 (`unorm8x4`).
+ */
+public enum VertexFormat
+{
+    case float32;
+    case uint8x4;
+    case unorm8x4;
+}
+
 public struct VertexAttr
 {
     public uint32 $location = 0;
@@ -15,6 +26,7 @@ public struct VertexAttr
     public int32 $offset = 0;
     public int32 $stride = 0;
     public uint32 $divisor = 0;
+    public VertexFormat $format = VertexFormat::float32;
 }
 
 /**
@@ -88,6 +100,20 @@ public class VertexBuilder
     }
 
     /**
+     * Four packed bytes in one `uint32` field, read as `uint8x4` or `unorm8x4`. Byte 0 is x.
+     */
+    public function attr(
+        uint32 $location,
+        ptr<const uint32> $field,
+        VertexFormat $format,
+        divisor: uint32? $divisor = null
+    ) : void
+    {
+        assert($format != VertexFormat::float32, 'layout: a uint32 field is a byte format');
+        $this->pushField($location, $field:$ as ptr<const uint8>, 4, mem::size<uint32>() as int32, $divisor, $format);
+    }
+
+    /**
      * The `of<T>` probe. Field addresses come from this storage so padding matches the CPU struct.
      * A pointer, not a borrow: Echo refuses returning an address into alloc.
      */
@@ -134,24 +160,37 @@ public class VertexBuilder
         return VertexLayout($this->attrs);
     }
 
-    private function pushField(uint32 $location, ptr<const uint8> $fieldPtr, int32 $components, int32 $bytes, uint32? $divisor) : void
+    private function pushField(
+        uint32 $location,
+        ptr<const uint8> $fieldPtr,
+        int32 $components,
+        int32 $bytes,
+        uint32? $divisor,
+        VertexFormat $format = VertexFormat::float32
+    ) : void
     {
         assert($this->structMode, 'layout: field attr outside of<T>');
         isize $delta = $fieldPtr:$ - $this->base:$;
         int32 $off = $delta as int32;
         assert($off >= 0, 'layout: field offset');
         assert($off + $bytes <= $this->fixedStride, 'layout: field past stride');
-        $this->push($location, $components, $off, $divisor);
+        $this->push($location, $components, $off, $divisor, $format);
     }
 
-    private function push(uint32 $location, int32 $components, int32 $offset, uint32? $divisor) : void
+    private function push(
+        uint32 $location,
+        int32 $components,
+        int32 $offset,
+        uint32? $divisor,
+        VertexFormat $format = VertexFormat::float32
+    ) : void
     {
         foreach ($this->attrs as $attr) {
             assert($attr->location != $location, 'layout: duplicate location');
         }
 
         uint32 $div = $divisor ?? $this->divisor;
-        $this->attrs[] = VertexAttr($location, $components, $offset, $this->fixedStride, $div);
+        $this->attrs[] = VertexAttr($location, $components, $offset, $this->fixedStride, $div, $format);
     }
 
     private function closeStream() : void
@@ -209,7 +248,8 @@ public struct VertexLayout
         string $out = '';
 
         foreach ($this->attrs as $attr) {
-            $out = "{$out}{$attr->location}:{$attr->components}:{$attr->offset}:{$attr->stride}:{$attr->divisor};";
+            int32 $format = vertexFormatCode($attr->format);
+            $out = "{$out}{$attr->location}:{$attr->components}:{$attr->offset}:{$attr->stride}:{$attr->divisor}:{$format};";
         }
 
         $this->print = $out;
@@ -319,4 +359,13 @@ internal function componentsOf<T>() : int32
 
     assert(false, 'layout: attr type');
     return 0;
+}
+
+internal function vertexFormatCode(VertexFormat $format) : int32
+{
+    return match ($format) {
+        VertexFormat::float32 => 0,
+        VertexFormat::uint8x4 => 1,
+        VertexFormat::unorm8x4 => 2,
+    };
 }

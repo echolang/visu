@@ -1,0 +1,164 @@
+/**
+ * One skinned instance's pose: joint locals, joint worlds and the palette rows the GPU reads.
+ * Every array is sized once from the skeleton when `SkinSystem` prepares the instance, and
+ * refilled in place each frame. Clip bindings (track to joint) are resolved at the same time,
+ * so sampling never touches a name.
+ */
+
+namespace visu::components;
+
+use visu::asset::{Clip, Skeleton, blendSample};
+use visu::math::{Mat4, Quat, Vec3, Vec4};
+
+public class SkinPose
+{
+    public Skeleton $skeleton;
+    public array<Vec3> $position;
+    public array<Quat> $orientation;
+    public array<Vec3> $scale;
+
+    /**
+     * Joint to part space, `rootOffset` included.
+     */
+    public array<Mat4> $world;
+
+    /**
+     * Three rows per joint: the rows of `world * inverseBind`'s top 3x4. `ModelSystem` copies
+     * these into the frame palette.
+     */
+    public array<Vec4> $palette;
+
+    /**
+     * `binds[c][t]` is the joint clip `c`'s track `t` drives, or -1. Clip order is the animator's.
+     */
+    public array<array<int32>> $binds;
+
+    public constructor(Skeleton $skeleton, const array<Clip>& $clips)
+    {
+        $this->skeleton = $skeleton;
+        int32 $n = $skeleton->count();
+        $this->position = arr::room<Vec3>($n as usize);
+        $this->orientation = arr::room<Quat>($n as usize);
+        $this->scale = arr::room<Vec3>($n as usize);
+        $this->world = arr::room<Mat4>($n as usize);
+        $this->palette = arr::room<Vec4>(($n * 3) as usize);
+        int32 $j = 0;
+        while ($j < $n) {
+            $this->position[] = $skeleton->restPosition[$j as usize];
+            $this->orientation[] = $skeleton->restOrientation[$j as usize];
+            $this->scale[] = $skeleton->restScale[$j as usize];
+            $this->world[] = Mat4();
+            $this->palette[] = Vec4(1.0f, 0.0f, 0.0f, 0.0f);
+            $this->palette[] = Vec4(0.0f, 1.0f, 0.0f, 0.0f);
+            $this->palette[] = Vec4(0.0f, 0.0f, 1.0f, 0.0f);
+            $j = $j + 1;
+        }
+
+        $this->binds = array<array<int32>>();
+        $this->bind($clips);
+    }
+
+    public const function joints() : int32
+    {
+        return $this->skeleton->count();
+    }
+
+    /**
+     * Resolve every clip's tracks to joints. Load-time work; `SkinSystem` calls it again only
+     * when the animator's clip list changed length.
+     */
+    public function bind(const array<Clip>& $clips) : void
+    {
+        $this->binds->clear();
+        foreach ($clips as $clip) {
+            $this->binds[] = $this->skeleton->bind($clip);
+        }
+    }
+
+    /**
+     * Every joint back to its rest pose. Tracks the cooker dropped (constant at rest) then read
+     * right without being written.
+     */
+    public function rest() : void
+    {
+        int32 $n = $this->skeleton->count();
+        int32 $j = 0;
+        while ($j < $n) {
+            usize $k = $j as usize;
+            $this->position[$k] = $this->skeleton->restPosition[$k];
+            $this->orientation[$k] = $this->skeleton->restOrientation[$k];
+            $this->scale[$k] = $this->skeleton->restScale[$k];
+            $j = $j + 1;
+        }
+    }
+
+    /**
+     * Sample clip `$index` at `$time` onto the joint locals. `$weight` 1 overwrites; below 1
+     * blends from what the locals already hold, which is how a crossfade lands.
+     */
+    public function apply(int32 $index, const Clip& $clip, float32 $time, float32 $weight) : void
+    {
+        if ($index < 0 || ($index as usize) >= $this->binds->count()) {
+            return;
+        }
+
+        int32 $t = 0;
+        int32 $tracks = $clip->tracks->count() as int32;
+        while ($t < $tracks) {
+            int32 $j = $this->binds[$index as usize][$t as usize];
+            if ($j >= 0) {
+                usize $k = $j as usize;
+                blendSample(
+                    $clip->tracks[$t as usize],
+                    $time,
+                    $weight,
+                    $this->position[$k],
+                    $this->orientation[$k],
+                    $this->scale[$k]
+                );
+            }
+
+            $t = $t + 1;
+        }
+    }
+
+    /**
+     * Joint worlds down the ordered hierarchy, then the palette rows. Parents precede children,
+     * so one forward walk is enough.
+     */
+    public function compose() : void
+    {
+        int32 $n = $this->skeleton->count();
+        int32 $j = 0;
+        while ($j < $n) {
+            usize $k = $j as usize;
+            Mat4 $local = poseMatrix($this->position[$k], $this->orientation[$k], $this->scale[$k]);
+            int32 $parent = $this->skeleton->parents[$k];
+            if ($parent < 0) {
+                $this->world[$k] = $this->skeleton->rootOffset * $local;
+            } else {
+                $this->world[$k] = $this->world[$parent as usize] * $local;
+            }
+
+            Mat4 $skin = $this->world[$k] * $this->skeleton->inverseBind[$k];
+            usize $row = $k * 3;
+            $this->palette[$row] = Vec4($skin->c0->x, $skin->c1->x, $skin->c2->x, $skin->c3->x);
+            $this->palette[$row + 1] = Vec4($skin->c0->y, $skin->c1->y, $skin->c2->y, $skin->c3->y);
+            $this->palette[$row + 2] = Vec4($skin->c0->z, $skin->c1->z, $skin->c2->z, $skin->c3->z);
+            $j = $j + 1;
+        }
+    }
+}
+
+/**
+ * T * R * S without the two full matrix products: rotate, scale the columns, set the translation.
+ */
+internal function poseMatrix(Vec3 $t, Quat $r, Vec3 $s) : Mat4
+{
+    Mat4 $m = Mat4($r);
+    $m->c0 = $m->c0 * $s->x;
+    $m->c1 = $m->c1 * $s->y;
+    $m->c2 = $m->c2 * $s->z;
+    $m->c3 = Vec4($t->x, $t->y, $t->z, 1.0f);
+    return $m;
+}

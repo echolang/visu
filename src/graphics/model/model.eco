@@ -9,9 +9,7 @@
 namespace visu::graphics;
 
 use json;
-use visu::asset::{
-    AssetError, Assets, Blob, CookedModel, MODEL_VERTEX_BYTES, ModelLodDesc, Vmat, decodeCookedModel
-};
+use visu::asset::{AssetError, Assets, Blob, CookedModel, ModelLodDesc, Skeleton, Vmat, decodeCookedModel};
 use visu::geo::AABB;
 
 public class Model
@@ -36,6 +34,12 @@ public class Model
      * One per slot, in slot order. A missing material id gets an empty material.
      */
     public array<Material> $materials;
+
+    /**
+     * The joints a skinned model deforms by, or null for a rigid one. Its vertices then carry
+     * joints and weights and draw through the skinned programs.
+     */
+    public const Skeleton? $skeleton;
     private bool $dead;
 
     public constructor(string $id, Mesh $mesh, CookedModel $cooked, array<Material> $materials)
@@ -49,6 +53,7 @@ public class Model
         $this->lods = $cooked->lods;
         $this->slots = $cooked->slots;
         $this->materials = $materials;
+        $this->skeleton = $cooked->skeleton;
         $this->dead = false;
     }
 
@@ -71,6 +76,11 @@ public class Model
     {
         return $this->lods->count() as int32;
     }
+
+    public const function skinned() : bool
+    {
+        return $this->skeleton != null;
+    }
 }
 
 /**
@@ -84,7 +94,7 @@ public function decodeModel(Assets $assets, Blob $blob) : result<Model, AssetErr
     CookedModel $cooked = guard decodeCookedModel($assets, $blob) else ($e) {
         return .error($e);
     }
-    Mesh $mesh = Mesh($assets->device, bytes: $cooked->vertices, stride: MODEL_VERTEX_BYTES);
+    Mesh $mesh = Mesh($assets->device, bytes: $cooked->vertices, stride: $cooked->vertexBytes());
     $mesh->index(bytes: $cooked->indices, $cooked->indexType);
     array<Material> $materials = modelMaterials($assets, $id, $cooked->slots);
     return .ok(Model($id, $mesh, $cooked, $materials));

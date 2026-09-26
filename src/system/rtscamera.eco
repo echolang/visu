@@ -1,6 +1,7 @@
 /**
  * Drives the `RtsCamera` that also has `ActiveCamera`.
- * Bind after `CameraSystem`; only the marked camera consumes input.
+ * Bind after `CameraSystem`; only the marked camera consumes input. A held pan key releases a
+ * follow; otherwise the focus glides after the followed entity's world position each tick.
  */
 
 namespace visu::system;
@@ -58,6 +59,10 @@ public class RtsCameraSystem : System
         // keys stay live under a pointer-only claim (a hovered panel); Cmd/Ctrl chords are shortcuts, not movement
         if ($input->keysFree() && !$input->primaryDown()) {
             float32 $speed = $c * $rts->focusSpeed;
+            if ($input->down(.w) || $input->down(.a) || $input->down(.s) || $input->down(.d)) {
+                $rts->release();
+            }
+
             Vec3 $flat = projectOnPlane($transform->forward(), Transform::worldUp());
             if (length2(Vec3($flat->x, 0.0f, $flat->z)) > 0.0001f) {
                 if ($input->down(.w)) {
@@ -95,6 +100,16 @@ public class RtsCameraSystem : System
             Vec2 $wheel = $input->mouseScroll();
             if ($wheel->y != 0.0f) {
                 $rts->radius = $rts->radius - $wheel->y * $c * $rts->zoom;
+            }
+        }
+
+        if ($rts->target != null) {
+            Entity $target = guard $rts->target;
+            if ($entities->has<Transform>($target)) {
+                Vec3 $at = $entities->get<Transform>($target)->worldPosition($entities);
+                $rts->chase($at);
+            } else {
+                $rts->release();
             }
         }
 

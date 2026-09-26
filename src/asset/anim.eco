@@ -95,29 +95,61 @@ public function clipNamed(const array<Clip>& $clips, const string& $name) : Clip
  */
 public function applyTrack(const AnimTrack& $track, float32 $time, Transform& $t) : void
 {
-    if ($track->path == AnimPath::translation) {
-        Vec3? $v = sampleVec3($track, $time);
-        Vec3 $p = guard $v else {
-            return;
-        }
-        $t->position = $p;
-        return;
-    }
+    blendSample($track, $time, 1.0f, $t->position, $t->orientation, $t->scale);
+}
 
+/**
+ * Like `applyTrack`, but move `$weight` of the way from what `$t` holds to the sampled value.
+ */
+public function blendTrack(const AnimTrack& $track, float32 $time, float32 $weight, Transform& $t) : void
+{
+    blendSample($track, $time, $weight, $t->position, $t->orientation, $t->scale);
+}
+
+/**
+ * Sample `$track` at `$time` into whichever of the three channels it drives. `$weight` 1
+ * overwrites; below 1 it moves that far from the value the channel already holds. Missing
+ * keys leave the channel. Node transforms and skin joints both land here.
+ */
+public function blendSample(
+    const AnimTrack& $track,
+    float32 $time,
+    float32 $weight,
+    Vec3& $position,
+    Quat& $orientation,
+    Vec3& $scale
+) : void
+{
     if ($track->path == AnimPath::rotation) {
-        Quat? $q = sampleQuat($track, $time);
-        Quat $r = guard $q else {
+        Quat $r = guard sampleQuat($track, $time) else {
             return;
         }
-        $t->orientation = $r;
+        if ($weight >= 1.0f) {
+            $orientation = $r;
+        } else {
+            $orientation = slerp($orientation, $r, $weight);
+        }
         return;
     }
 
-    Vec3? $v = sampleVec3($track, $time);
-    Vec3 $s = guard $v else {
+    Vec3 $v = guard sampleVec3($track, $time) else {
         return;
     }
-    $t->scale = $s;
+    if ($track->path == AnimPath::translation) {
+        $position = blendVec3($position, $v, $weight);
+        return;
+    }
+
+    $scale = blendVec3($scale, $v, $weight);
+}
+
+internal function blendVec3(Vec3 $from, Vec3 $to, float32 $weight) : Vec3
+{
+    if ($weight >= 1.0f) {
+        return $to;
+    }
+
+    return mix($from, $to, $weight);
 }
 
 public function sampleVec3(const AnimTrack& $track, float32 $time) : Vec3?

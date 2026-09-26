@@ -1,0 +1,215 @@
+/**
+ * Composites the glow onto the finished scene. One quad covers the screen rect of everything
+ * highlighted, grown by the widest glow, and samples the mask in three rings around each pixel
+ * outside the silhouette. The work is the highlighted pixels, not the screen.
+ */
+
+namespace visu::graphics;
+
+use visu::geo::AABB;
+use visu::math::{Vec3, Vec4};
+
+/**
+ * Mirrors `OutlineUniforms` in pbr/outline.vert and outline.frag at slot 0.
+ */
+internal struct OutlineUniforms
+{
+    /**
+     * The quad in NDC: min x, min y, max x, max y.
+     */
+    public Vec4 $rect;
+
+    /**
+     * 1 / width, 1 / height of the mask, the widest glow in device pixels, unused.
+     */
+    public Vec4 $texel;
+    public Vec4[4] $colors;
+
+    /**
+     * Per style: glow width in device pixels, strength behind an occluder, unused, unused.
+     */
+    public Vec4[4] $params;
+
+    public constructor()
+    {
+        $this->rect = Vec4(0.0f);
+        $this->texel = Vec4(0.0f);
+        Vec4[4] $colors;
+        Vec4[4] $params;
+        int32 $i = 0;
+        while ($i < OUTLINE_STYLES) {
+            $colors[$i] = Vec4(0.0f);
+            $params[$i] = Vec4(0.0f);
+            $i = $i + 1;
+        }
+
+        $this->colors = mv $colors;
+        $this->params = mv $params;
+    }
+}
+
+public class OutlinePass : Pass
+{
+    private DeferredGpu $gpu;
+    private TargetRef $output;
+    private OutlineStyle[4] $styles;
+    private AABB $bounds;
+
+    public constructor(DeferredGpu $gpu, TargetRef $output, OutlineStyle[4] $styles, AABB $bounds)
+    {
+        $this->gpu = $gpu;
+        $this->output = $output;
+        $this->styles = $styles;
+        $this->bounds = $bounds;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.outline';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        OutlineMaskData $mask = $frame->get<OutlineMaskData>();
+        $io->reads($mask->mask);
+        $io->writes($this->output);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        OutlineMaskData $mask = $ctx->frame->get<OutlineMaskData>();
+        CameraData $camera = guard $ctx->frame->find<CameraData>() else {
+            return .ok;
+        }
+        float32 $scale = $this->output->contentScaleX;
+        if ($scale <= 0.0f) {
+            $scale = 1.0f;
+        }
+
+        OutlineUniforms $u = OutlineUniforms();
+        float32 $widest = 1.0f;
+        int32 $i = 0;
+        while ($i < OUTLINE_STYLES) {
+            OutlineStyle $style = $this->styles[$i];
+            float32 $px = $style->width * $scale;
+            if ($px < 1.0f) {
+                $px = 1.0f;
+            }
+
+            if ($px > $widest) {
+                $widest = $px;
+            }
+
+            $u->colors[$i] = $style->color;
+            $u->params[$i] = Vec4($px, $style->hidden, 0.0f, 0.0f);
+            $i = $i + 1;
+        }
+
+        float32 $w = $mask->target->width as float32;
+        float32 $h = $mask->target->height as float32;
+        $u->texel = Vec4(1.0f / $w, 1.0f / $h, $widest, 0.0f);
+        $u->rect = outlineRect($camera, $this->bounds, Vec3($widest * 2.0f / $w, $widest * 2.0f / $h, 0.0f));
+        if ($u->rect->x >= $u->rect->z || $u->rect->y >= $u->rect->w) {
+            // the highlighted boxes are all off screen
+            return .ok;
+        }
+
+        ShaderProgram $program = guard $this->gpu->shaders->program('outline') else ($e) {
+            return .error(.shader($e));
+        }
+        RenderEncoder $enc = guard $ctx->beginRender($this->output) else ($e) {
+            return .error($e);
+        }
+        Device $device = $ctx->device;
+        Mesh $quad = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($device);
+        });
+        Raster $raster = Raster::none();
+        $raster->depthWrite = false;
+        $raster->blend = .alpha;
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), $raster);
+        $pass->bind($enc);
+        $enc->upload($u, slot: 0);
+        guard bindPooled($ctx, $enc, 0, $mask->mask, $this->gpu->point) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        $quad->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+/**
+ * The NDC rect of `$bounds` on screen, grown by `$grow` (NDC units on x and y) and clamped to
+ * the screen. A corner behind the eye makes it the whole screen: the box straddles the camera.
+ * An empty rect (min past max) means nothing is on screen.
+ */
+internal function outlineRect(CameraData $camera, const AABB& $bounds, Vec3 $grow) : Vec4
+{
+    float32 $minX = 1.0f;
+    float32 $minY = 1.0f;
+    float32 $maxX = -1.0f;
+    float32 $maxY = -1.0f;
+    int32 $c = 0;
+    while ($c < 8) {
+        float32 $x = $bounds->min->x;
+        float32 $y = $bounds->min->y;
+        float32 $z = $bounds->min->z;
+        if (($c & 1) != 0) {
+            $x = $bounds->max->x;
+        }
+
+        if (($c & 2) != 0) {
+            $y = $bounds->max->y;
+        }
+
+        if (($c & 4) != 0) {
+            $z = $bounds->max->z;
+        }
+
+        Vec3 $screen = guard $camera->project(Vec3($x, $y, $z)) else {
+            return Vec4(-1.0f, -1.0f, 1.0f, 1.0f);
+        }
+        // project is top-left 0..1; back to NDC with y up
+        float32 $nx = $screen->x * 2.0f - 1.0f;
+        float32 $ny = 1.0f - $screen->y * 2.0f;
+        if ($c == 0 || $nx < $minX) {
+            $minX = $nx;
+        }
+
+        if ($c == 0 || $ny < $minY) {
+            $minY = $ny;
+        }
+
+        if ($c == 0 || $nx > $maxX) {
+            $maxX = $nx;
+        }
+
+        if ($c == 0 || $ny > $maxY) {
+            $maxY = $ny;
+        }
+
+        $c = $c + 1;
+    }
+
+    return Vec4(
+        outlineClamp($minX - $grow->x),
+        outlineClamp($minY - $grow->y),
+        outlineClamp($maxX + $grow->x),
+        outlineClamp($maxY + $grow->y)
+    );
+}
+
+internal function outlineClamp(float32 $v) : float32
+{
+    if ($v < -1.0f) {
+        return -1.0f;
+    }
+
+    if ($v > 1.0f) {
+        return 1.0f;
+    }
+
+    return $v;
+}

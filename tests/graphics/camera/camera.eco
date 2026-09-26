@@ -191,3 +191,39 @@ test camera_spawn_attaches_a_static_world_camera
     assert($camera->mode == Projection::orthographicStaticWorld, 'mode');
     assert($camera->staticWorldHeight == 100.0f, 'height');
 }
+
+test camera_project_puts_the_forward_point_at_the_centre
+{
+    Camera $camera = Camera(Projection::perspective);
+    CameraData $data = $camera->data(identityPose(), 64, 64, 1.0f, 1.0f, 0.0f);
+    Vec3 $screen = guard $data->project(Vec3(0.0f, 0.0f, -10.0f)) else {
+        assert(false, 'in front projects');
+        return;
+    }
+    assert($screen->x > 0.49f && $screen->x < 0.51f, 'centre x');
+    assert($screen->y > 0.49f && $screen->y < 0.51f, 'centre y');
+    assert($screen->z > 0.0f && $screen->z < 1.0f, 'depth in range');
+}
+
+test camera_project_is_the_inverse_of_ray
+{
+    Camera $camera = Camera(Projection::perspective);
+    CameraData $data = $camera->data(identityPose(), 128, 64, 1.0f, 1.0f, 0.0f);
+    // ndc (0.5, 0.5) is right and up, so screen x 0.75, y 0.25 from the top
+    Ray $ray = $data->ray(Vec2(0.5f, 0.5f));
+    Vec3 $point = $ray->origin + $ray->direction * 20.0f;
+    Vec3 $screen = guard $data->project($point) else {
+        assert(false, 'on the ray projects');
+        return;
+    }
+    assert($screen->x > 0.74f && $screen->x < 0.76f, 'right quarter');
+    assert($screen->y > 0.24f && $screen->y < 0.26f, 'upper quarter');
+}
+
+test camera_project_behind_the_eye_is_null
+{
+    Camera $camera = Camera(Projection::perspective);
+    CameraData $data = $camera->data(identityPose(), 64, 64, 1.0f, 1.0f, 0.0f);
+    Vec3? $behind = $data->project(Vec3(0.0f, 0.0f, 10.0f));
+    assert($behind == null, 'behind is null');
+}

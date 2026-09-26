@@ -28,6 +28,7 @@ internal function emitUi(Ui $ui) : void
         return;
     }
     $white = $g->white;
+    emitFloats($ui);
     beginRun($ui->batch);
     emitBoxes($ui, 0);
     endRun($ui->batch);
@@ -116,6 +117,7 @@ internal function outlineColor(Kind $kind) : Color
         Kind::separator => Color(0.7f, 0.7f, 0.7f, 0.7f),
         Kind::scroll => Color(0.55f, 0.4f, 0.95f, 0.95f),
         Kind::iconButton => Color(0.2f, 0.9f, 0.4f, 0.95f),
+        Kind::slot => Color(0.95f, 0.75f, 0.3f, 0.95f),
     };
 }
 
@@ -184,6 +186,9 @@ internal function emitBoxes(Ui $ui, int32 $i) : void
         Kind::iconButton => {
             emitIconButtonBox($ui, $n, $pad);
         },
+        Kind::slot => {
+            emitSlotBox($ui, $n, $pad);
+        },
         else => {
         },
     };
@@ -196,7 +201,10 @@ internal function emitBoxes(Ui $ui, int32 $i) : void
     int32 $c = $n->firstChild;
 
     while ($c >= 0) {
-        emitBoxes($ui, $c);
+        if (!$ui->nodes[$c as usize]->floating) {
+            emitBoxes($ui, $c);
+        }
+
         $c = $ui->nodes[$c as usize]->next;
     }
 
@@ -216,8 +224,35 @@ internal function emitGlyphs(Ui $ui, int32 $i) : void
     int32 $c = $n->firstChild;
 
     while ($c >= 0) {
-        emitGlyphs($ui, $c);
+        if (!$ui->nodes[$c as usize]->floating) {
+            emitGlyphs($ui, $c);
+        }
+
         $c = $ui->nodes[$c as usize]->next;
+    }
+
+    $ui->clip = $prev;
+}
+
+/**
+ * Each float is one layer, its boxes then its text, in call order, so a later float covers an
+ * earlier one whole. Floats hang in the world, so they draw first: the screen's panels, overlays
+ * and the tooltip all sit above them.
+ */
+internal function emitFloats(Ui $ui) : void
+{
+    usize $n = $ui->floats->count();
+    usize $i = 0;
+    Vec4 $prev = $ui->clip;
+    $ui->clip = noClip();
+
+    while ($i < $n) {
+        int32 $idx = $ui->floats[$i];
+        beginRun($ui->batch);
+        emitBoxes($ui, $idx);
+        emitGlyphs($ui, $idx);
+        endRun($ui->batch);
+        $i = $i + 1;
     }
 
     $ui->clip = $prev;
@@ -253,6 +288,7 @@ internal function emitOverlayGlyphs(Ui $ui) : void
     }
 
     emitTooltipGlyphs($ui);
+    emitDragGhost($ui);
 }
 
 internal function emitNodeGlyphs(Ui $ui, const Node& $n) : void
@@ -303,6 +339,11 @@ internal function emitNodeGlyphs(Ui $ui, const Node& $n) : void
 
     if ($n->kind == Kind::iconButton) {
         emitIconButton($ui, $n);
+        return;
+    }
+
+    if ($n->kind == Kind::slot) {
+        emitSlot($ui, $n);
         return;
     }
 }

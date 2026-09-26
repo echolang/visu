@@ -12,3 +12,17 @@ public struct TransientSlice
     public uint64 $bytes;
     public uint32 $frameSlot;
 }
+
+/**
+ * Copy `$value` into this frame's ring at uniform alignment. Every encoder's `upload` and
+ * `UniformBuffer.push` land here, so the ring alignment is decided in one place.
+ */
+public function transientOf<T>(Device $device, const T& $value) : TransientSlice
+{
+    uint64 $n = mem::size<T>() as uint64;
+    TransientSlice $slice = $device->allocTransient($n, $device->limits->uniformAlign);
+    T $local = $value;
+    ptr<const uint8> $src = ptr<const uint8>(&$local);
+    mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $n);
+    return $slice;
+}

@@ -1,0 +1,67 @@
+/**
+ * Draws every highlighted instance into an rgba8 mask the size of the GBuffer: r coverage,
+ * g whether the fragment is in front of the scene depth, b the style slot. The mask has a depth
+ * buffer of its own, so the front surface of the highlighted object wins even where the scene
+ * hides it; the dimmed glow behind an occluder needs exactly that surface.
+ * Added straight after `fill`, before the light and sky passes: the sky stores the GBuffer depth
+ * as don't-care, so a later reader would sample garbage on a tiled GPU.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+/**
+ * Texture slot the scene depth sits at while casters draw the mask. The material maps take
+ * 0 through 5.
+ */
+public const uint32 OUTLINE_DEPTH_SLOT = 8;
+
+public class OutlineMaskPass : Pass
+{
+    private DeferredGpu $gpu;
+    private OutlineData $data;
+
+    public constructor(DeferredGpu $gpu, OutlineData $data)
+    {
+        $this->gpu = $gpu;
+        $this->data = $data;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.outline.mask';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        GBufferData $gbuffer = $frame->get<GBufferData>();
+        $io->reads($gbuffer->depth);
+        TargetRef $target = $pipeline->createTarget('outline', $gbuffer->target->width, $gbuffer->target->height);
+        TextureRef $mask = $pipeline->createColor($target, 'mask', TextureOptions());
+        $pipeline->createDepth($target);
+        $frame->set(OutlineMaskData($target, $mask));
+        $io->writes($target);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        OutlineMaskData $out = $ctx->frame->get<OutlineMaskData>();
+        GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
+        $ctx->pipeline->requestClear($out->target, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 0.0f)));
+        RenderEncoder $enc = guard $ctx->beginRender($out->target) else ($e) {
+            return .error($e);
+        }
+        guard bindPooled($ctx, $enc, OUTLINE_DEPTH_SLOT, $gbuffer->depth, $this->gpu->point) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        $this->gpu->camera->bind($enc);
+        foreach ($this->data->casters as $caster) {
+            $caster->mask($ctx, $enc);
+        }
+
+        $enc->endRender();
+        return .ok;
+    }
+}

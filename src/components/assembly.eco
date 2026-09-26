@@ -1,6 +1,8 @@
 /**
  * Spawn a cooked assembly as a parented entity tree. The returned entity is the asset root;
- * each node gets a `Transform` and a `StaticModel` or `DynamicModel` pointing at its part.
+ * each node gets a `Transform` and a `StaticModel`, `DynamicModel` or `SkinnedModel` pointing
+ * at its part. The root's `AnimationPlayer` lands before the nodes, so whatever listens for a
+ * `SkinnedModel` already finds the clips it will play.
  */
 
 namespace visu::components;
@@ -16,6 +18,10 @@ public function spawnAssembly(Entities $world, Assembly $assembly, Transform $ro
 {
     Entity $rootId = $world->create();
     $world->attach($rootId, $root);
+    if ($assembly->clips->count() > 0) {
+        $world->attach($rootId, AnimationPlayer($assembly->clips));
+    }
+
     map<string, Entity> $ids = map<string, Entity>();
     $ids[''] = $rootId;
     int32 $guard = 0;
@@ -37,7 +43,7 @@ public function spawnAssembly(Entities $world, Assembly $assembly, Transform $ro
             $t->scale = $node->scale;
             $t->parent($world, $ids[$node->parent]);
             $world->attach($e, $t);
-            attachPartModel($world, $e, $assembly, $node->part);
+            attachPartModel($world, $e, $assembly, $node->part, $rootId);
             $ids[$node->name] = $e;
         }
 
@@ -46,15 +52,49 @@ public function spawnAssembly(Entities $world, Assembly $assembly, Transform $ro
 
     AssemblyInstance $inst = AssemblyInstance($assembly->id);
     $inst->nodes = $ids;
+    $inst->bind($assembly->clips);
     $world->attach($rootId, $inst);
-    if ($assembly->clips->count() > 0) {
-        $world->attach($rootId, AnimationPlayer($assembly->clips));
-    }
-
     return $rootId;
 }
 
-internal function attachPartModel(Entities $world, Entity $e, Assembly $assembly, const string& $partName) : void
+/**
+ * Destroy an assembly spawned by `spawnAssembly`: every node, then the root. Destroying the root
+ * alone would leave its parts drawing, because a destroy does not cascade down the Transform
+ * parents. Each part's model components detach on the way out, so the model system drops them
+ * through its detach hooks. A root without an `AssemblyInstance` is destroyed on its own.
+ */
+public function despawnAssembly(Entities $world, Entity $root) : void
+{
+    if (!$world->valid($root)) {
+        return;
+    }
+
+    if ($world->has<AssemblyInstance>($root)) {
+        AssemblyInstance& $inst = $world->get<AssemblyInstance>($root);
+        array<Entity> $nodes = arr::room<Entity>($inst->nodes->count());
+        foreach ($inst->nodes as $name => $node) {
+            if ($node != $root) {
+                $nodes[] = $node;
+            }
+        }
+
+        foreach ($nodes as $node) {
+            if ($world->valid($node)) {
+                $world->destroy($node);
+            }
+        }
+    }
+
+    $world->destroy($root);
+}
+
+internal function attachPartModel(
+    Entities $world,
+    Entity $e,
+    Assembly $assembly,
+    const string& $partName,
+    Entity $root
+) : void
 {
     if ($partName->empty()) {
         return;
@@ -64,7 +104,9 @@ internal function attachPartModel(Entities $world, Entity $e, Assembly $assembly
         return;
     }
 
-    if ($part->dynamic) {
+    if ($part->skinned) {
+        $world->attach($e, SkinnedModel($part->model, $root));
+    } else if ($part->dynamic) {
         $world->attach($e, DynamicModel($part->model));
     } else {
         $world->attach($e, StaticModel($part->model));

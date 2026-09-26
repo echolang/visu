@@ -43,11 +43,15 @@ public class Device : DeviceProtocol
     internal vk::PipelineLayout $pipeLayout;
     internal vk::DescriptorSetLayout $setLayout0;
     internal vk::DescriptorSetLayout $setLayout1;
+    internal vk::DescriptorSetLayout $setLayout2;
     internal vk::DescriptorPool $set0pool;
     internal vk::CommandPool $setupPool;
     internal vk::CommandBuffer $setupCmd;
     internal map<string, PipelineHandle> $psos;
-    internal map<string, SamplerHandle> $samplerHandles;
+    internal map<uint32, vk::Pipeline> $computePsos;
+    internal map<string, Sampler> $samplers;
+    internal int32 $anisoWanted;
+    internal int32 $anisoLevel;
     internal uint64 $uniformRange;
     internal TextureHandle $dummyImage;
     internal SamplerHandle $dummySampler;
@@ -101,11 +105,15 @@ public class Device : DeviceProtocol
         $this->pipeLayout = vk::PipelineLayout::none();
         $this->setLayout0 = vk::DescriptorSetLayout::none();
         $this->setLayout1 = vk::DescriptorSetLayout::none();
+        $this->setLayout2 = vk::DescriptorSetLayout::none();
         $this->set0pool = vk::DescriptorPool::none();
         $this->setupPool = vk::CommandPool::none();
         $this->setupCmd = vk::CommandBuffer::none();
         $this->psos = map<string, PipelineHandle>();
-        $this->samplerHandles = map<string, SamplerHandle>();
+        $this->computePsos = map<uint32, vk::Pipeline>();
+        $this->samplers = map<string, Sampler>();
+        $this->anisoWanted = 1;
+        $this->anisoLevel = 1;
         $this->uniformRange = RING_SLACK;
         $this->dummyImage = TextureHandle::none();
         $this->dummySampler = SamplerHandle::none();
@@ -302,6 +310,8 @@ public class Device : DeviceProtocol
             return .error(.surfaceLost);
         }
 
+        $this->applyAnisotropy();
+
         if ($this->pendingResize || $width != $this->extent->width as int32 || $height != $this->extent->height as int32) {
             $this->pendingResize = false;
             guard vkBootSwapchain($this, $width, $height) else ($e) {
@@ -327,6 +337,10 @@ public class Device : DeviceProtocol
 
         if ($slot->set1pool->handle != 0) {
             vk::ResetDescriptorPool($this->logical, $slot->set1pool, 0);
+        }
+
+        if ($slot->set2pool->handle != 0) {
+            vk::ResetDescriptorPool($this->logical, $slot->set2pool, 0);
         }
         uint32 $oi = 0;
 
@@ -539,6 +553,24 @@ public class Device : DeviceProtocol
         return RenderEncoder($this, $formats, $passWidth, $passHeight);
     }
 
+    public function beginCompute() : ComputeEncoder
+    {
+        assert($this->inFrame, 'beginCompute outside beginFrame');
+        assert(!$this->encoderOpen, 'beginCompute while an encoder is open');
+        FrameSlot $slot = $this->slots[$this->slot];
+        vkTimestampsOpen($slot);
+        // last frame's draws may still read what this dispatch overwrites
+        vkMemoryBarrier(
+            $slot->cmd,
+            vk::PIPELINE_STAGE_VERTEX_SHADER_BIT | vk::PIPELINE_STAGE_FRAGMENT_SHADER_BIT | vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk::ACCESS_SHADER_WRITE_BIT,
+            vk::ACCESS_SHADER_READ_BIT | vk::ACCESS_SHADER_WRITE_BIT
+        );
+        $this->encoderOpen = true;
+        return ComputeEncoder($this);
+    }
+
     public function transitionTexture(Texture $texture, ResourceState $to) : void
     {
         assert(!$this->encoderOpen, 'transitionTexture inside a render pass');
@@ -689,10 +721,57 @@ public class Device : DeviceProtocol
     {
         string $key = $desc->key();
 
-        if ($this->samplerHandles->has($key)) {
-            return Sampler($this, $this->samplerHandles[$key], $desc);
+        if ($this->samplers->has($key)) {
+            return $this->samplers[$key];
         }
 
+        Sampler $fresh = Sampler($this->samplerHandle($desc), $desc);
+        $this->samplers[$key] = $fresh;
+        $this->counts->noteSamplerCreated();
+        return $fresh;
+    }
+
+    public function setAnisotropy(int32 $level) : void
+    {
+        $this->anisoWanted = $level;
+    }
+
+    public const function anisotropy() : int32
+    {
+        return $this->anisoLevel;
+    }
+
+    /**
+     * Rebuild every anisotropic sampler at the wanted level, in place. Runs before the frame
+     * records anything, after a wait idle: descriptor sets of frames in flight still name the old ones.
+     */
+    private function applyAnisotropy() : void
+    {
+        int32 $level = anisotropyLevel($this->anisoWanted, $this->limits->maxAnisotropy);
+
+        if ($level == $this->anisoLevel) {
+            return;
+        }
+
+        $this->anisoLevel = $level;
+        vk::DeviceWaitIdle($this->logical);
+
+        foreach ($this->samplers as $sampler) {
+            if (!$sampler->desc->anisotropic) {
+                continue;
+            }
+
+            vk::Sampler $old = $sampler->handle->sampler;
+            $sampler->handle = $this->samplerHandle($sampler->desc);
+
+            if ($old->handle != 0) {
+                vk::DestroySampler($this->logical, $old, null);
+            }
+        }
+    }
+
+    private function samplerHandle(const SamplerDesc& $desc) : SamplerHandle
+    {
         vk::SamplerCreateInfo $ci = vk::SamplerCreateInfo();
         $ci->magFilter = vkFilter($desc->mag);
         $ci->minFilter = vkFilter($desc->min);
@@ -707,6 +786,12 @@ public class Device : DeviceProtocol
             $ci->maxLod = 0.25f;
         }
 
+        // limits.maxAnisotropy stays 1 unless the samplerAnisotropy feature is on
+        if ($desc->anisotropic && $this->anisoLevel > 1) {
+            $ci->anisotropyEnable = vk::TRUE;
+            $ci->maxAnisotropy = $this->anisoLevel as float32;
+        }
+
         vk::Sampler $samp = vk::Sampler::none();
         guard vkCheck(
             vk::CreateSampler($this->logical, &$ci, null, &$samp),
@@ -715,10 +800,7 @@ public class Device : DeviceProtocol
             die($e->message());
         }
 
-        SamplerHandle $h = SamplerHandle($samp);
-        $this->samplerHandles[$key] = $h;
-        $this->counts->noteSamplerCreated();
-        return Sampler($this, $h, $desc);
+        return SamplerHandle($samp);
     }
 
     public function createShaderModule(ShaderKind $kind, const string& $bytes, string $name) : result<ShaderModuleHandle, DeviceError>

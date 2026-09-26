@@ -9,6 +9,16 @@ use json;
 use visu::asset::{AssetError, AssetRef, Assets, Vmat, parentId, vmatBool, vmatF32, vmatMap, vmatRgb, vmatVec2};
 use visu::math::{Vec2, Vec3};
 
+/**
+ * March steps a grazing view takes when the sheet names none.
+ */
+public const float32 MATERIAL_PARALLAX_STEPS = 16.0f;
+
+/**
+ * Metres from the eye where the relief is gone when the sheet names none.
+ */
+public const float32 MATERIAL_PARALLAX_FADE = 30.0f;
+
 public class Material
 {
     public const string $id;
@@ -48,6 +58,24 @@ public class Material
 
     public bool $backfaceCull;
 
+    /**
+     * Parallax occlusion relief as a fraction of one texture tile, 0 turns it off. Tile units
+     * keep the relief in proportion when a consumer retiles the surface. JSON `parallaxDepth`.
+     */
+    public float32 $parallaxDepth;
+
+    /**
+     * Most march steps a grazing view takes; a head-on view takes a quarter. JSON
+     * `parallaxSteps`.
+     */
+    public float32 $parallaxSteps;
+
+    /**
+     * Metres from the eye where the relief has faded out and the march is skipped. JSON
+     * `parallaxFade`.
+     */
+    public float32 $parallaxFade;
+
     public AssetRef? $albedo;
     public AssetRef? $normal;
     public AssetRef? $roughness;
@@ -69,6 +97,9 @@ public class Material
         $this->metallicFactor = 0.0f;
         $this->alphaCutoff = 0.0f;
         $this->backfaceCull = true;
+        $this->parallaxDepth = 0.0f;
+        $this->parallaxSteps = MATERIAL_PARALLAX_STEPS;
+        $this->parallaxFade = MATERIAL_PARALLAX_FADE;
         $this->albedo = null;
         $this->normal = null;
         $this->roughness = null;
@@ -95,6 +126,9 @@ public class Material
         $this->metallicFactor = 0.0f;
         $this->alphaCutoff = 0.0f;
         $this->backfaceCull = true;
+        $this->parallaxDepth = 0.0f;
+        $this->parallaxSteps = MATERIAL_PARALLAX_STEPS;
+        $this->parallaxFade = MATERIAL_PARALLAX_FADE;
         $this->albedo = null;
         $this->normal = null;
         $this->roughness = null;
@@ -121,6 +155,9 @@ public class Material
         }
 
         $this->alphaCutoff = vmatF32($this->root, 'alphaCutoff', $cutoff);
+        $this->parallaxDepth = vmatF32($this->root, 'parallaxDepth', 0.0f);
+        $this->parallaxSteps = vmatF32($this->root, 'parallaxSteps', MATERIAL_PARALLAX_STEPS);
+        $this->parallaxFade = vmatF32($this->root, 'parallaxFade', MATERIAL_PARALLAX_FADE);
     }
 
     /**
@@ -169,6 +206,14 @@ public class Material
     public const function cutout() : bool
     {
         return $this->alphaCutoff > 0.0f;
+    }
+
+    /**
+     * Parallax occlusion needs relief and a height map to march.
+     */
+    public const function parallax() : bool
+    {
+        return $this->parallaxDepth > 0.0f && $this->height != null;
     }
 }
 

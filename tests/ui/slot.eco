@@ -1,0 +1,158 @@
+/**
+ * Slots: click, drag, drop, and the press-edge arming that keeps a drag from firing a button.
+ */
+
+use visu::graphics::Device;
+use visu::math::Vec2;
+use visu::ui::{Kind, Node, SlotEvent, SlotView, Ui};
+
+/**
+ * One frame of two slots side by side, `a` a drag source carrying 7, `b` a plain cell.
+ */
+function slotPairFrame(Ui $ui, SlotEvent& $a, SlotEvent& $b) : void
+{
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginRow();
+    $a = $ui->slot('a', SlotView(), drag: 7);
+    $b = $ui->slot('b', SlotView());
+    $ui->end();
+    $ui->endFrame();
+}
+
+function slotMid(const Node& $n) : Vec2
+{
+    return Vec2($n->pos->x + $n->size->x * 0.5f, $n->pos->y + $n->size->y * 0.5f);
+}
+
+function slotDropPayload(SlotEvent $e) : int32
+{
+    return match ($e) {
+        SlotEvent::drop($p) => $p,
+        else => -1,
+    };
+}
+
+function slotClicked(SlotEvent $e) : bool
+{
+    return match ($e) {
+        SlotEvent::click => true,
+        else => false,
+    };
+}
+
+function slotQuiet(SlotEvent $e) : bool
+{
+    return match ($e) {
+        SlotEvent::none => true,
+        else => false,
+    };
+}
+
+test ui_slot_press_and_release_in_place_is_a_click
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    SlotEvent $a = .none;
+    SlotEvent $b = .none;
+    slotPairFrame($ui, &$a, &$b);
+    Vec2 $at = slotMid(nthKind($ui, Kind::slot, 0));
+    $ui->seed($at, true, false, true);
+    slotPairFrame($ui, &$a, &$b);
+    $ui->seed($at, false, true, false);
+    slotPairFrame($ui, &$a, &$b);
+    assert(slotClicked($a), 'click');
+    assert($ui->dragging() == null, 'never dragged');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_slot_drag_drops_its_payload_on_the_slot_under_the_release
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    SlotEvent $a = .none;
+    SlotEvent $b = .none;
+    slotPairFrame($ui, &$a, &$b);
+    Vec2 $from = slotMid(nthKind($ui, Kind::slot, 0));
+    Vec2 $to = slotMid(nthKind($ui, Kind::slot, 1));
+    $ui->seed($from, true, false, true);
+    slotPairFrame($ui, &$a, &$b);
+    $ui->seed($to, false, false, true);
+    slotPairFrame($ui, &$a, &$b);
+    int32 $held = $ui->dragging() ?? -1;
+    assert($held == 7, 'live after the threshold, carrying the payload');
+    $ui->seed($to, false, true, false);
+    slotPairFrame($ui, &$a, &$b);
+    assert(slotDropPayload($b) == 7, 'dropped on b');
+    assert(slotQuiet($a), 'the source neither clicks nor receives');
+    $ui->seed($to, false, false, false);
+    slotPairFrame($ui, &$a, &$b);
+    assert($ui->dragging() == null, 'cleared');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_slot_release_over_nothing_cancels_the_drag
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    SlotEvent $a = .none;
+    SlotEvent $b = .none;
+    slotPairFrame($ui, &$a, &$b);
+    Vec2 $from = slotMid(nthKind($ui, Kind::slot, 0));
+    Vec2 $away = Vec2(390.0f, 190.0f);
+    $ui->seed($from, true, false, true);
+    slotPairFrame($ui, &$a, &$b);
+    $ui->seed($away, false, false, true);
+    slotPairFrame($ui, &$a, &$b);
+    $ui->seed($away, false, true, false);
+    slotPairFrame($ui, &$a, &$b);
+    assert(slotQuiet($a) && slotQuiet($b), 'no event');
+    $ui->seed($away, false, false, false);
+    slotPairFrame($ui, &$a, &$b);
+    assert($ui->dragging() == null, 'cleared');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_slot_without_a_payload_never_drags
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    SlotEvent $a = .none;
+    SlotEvent $b = .none;
+    slotPairFrame($ui, &$a, &$b);
+    Vec2 $from = slotMid(nthKind($ui, Kind::slot, 1));
+    $ui->seed($from, true, false, true);
+    slotPairFrame($ui, &$a, &$b);
+    $ui->seed(Vec2($from->x + 30.0f, $from->y), false, false, true);
+    slotPairFrame($ui, &$a, &$b);
+    assert($ui->dragging() == null, 'plain cell');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_button_does_not_fire_when_the_press_started_elsewhere
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Go');
+    $ui->endFrame();
+    Vec2 $mid = slotMid(firstKind($ui, Kind::button));
+    $ui->seed(Vec2(390.0f, 190.0f), true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Go');
+    $ui->endFrame();
+    $ui->seed($mid, false, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Go');
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    bool $hit = $ui->button('Go');
+    $ui->endFrame();
+    assert(!$hit, 'no stray click');
+    $ui->destroy();
+    $device->shutdown();
+}

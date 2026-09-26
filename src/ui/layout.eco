@@ -42,6 +42,13 @@ internal function measureNode(array<Node>& $nodes, int32 $i) : void
 
     while ($child >= 0) {
         Node $ch = $nodes[$child as usize];
+        $child = $ch->next;
+
+        if ($ch->floating) {
+            // a float sizes itself and never pushes its siblings
+            continue;
+        }
+
         bool $skipFlow = fillsFlow($ch, $n->flow);
 
         if ($n->flow == Flow::horizontal) {
@@ -63,7 +70,6 @@ internal function measureNode(array<Node>& $nodes, int32 $i) : void
         }
 
         $count = $count + 1;
-        $child = $ch->next;
     }
 
     float32 $gap = 0.0f;
@@ -147,6 +153,11 @@ internal function allocateNode(array<Node>& $nodes, int32 $i, Vec2 $container) :
     while ($c >= 0) {
         Node $ch = $nodes[$c as usize];
 
+        if ($ch->floating) {
+            $c = $ch->next;
+            continue;
+        }
+
         if (fillsFlow($ch, $n->flow)) {
             $fillN = $fillN + 1;
         } else if ($n->flow == Flow::horizontal) {
@@ -191,6 +202,12 @@ internal function allocateNode(array<Node>& $nodes, int32 $i, Vec2 $container) :
         float32 $cw = $ch->measured->x;
         float32 $chh = $ch->measured->y;
 
+        if ($ch->floating) {
+            allocateNode($nodes, $c, Vec2($cw, $chh));
+            $c = $ch->next;
+            continue;
+        }
+
         if ($n->flow == Flow::horizontal) {
             if (fillsFlow($ch, $n->flow)) {
                 $cw = $fillShare;
@@ -226,6 +243,11 @@ internal function placeNode(array<Node>& $nodes, int32 $i) : void
 
     while ($c >= 0) {
         Node $ch = $nodes[$c as usize];
+
+        if ($ch->floating) {
+            $c = $ch->next;
+            continue;
+        }
 
         if ($n->flow == Flow::horizontal) {
             $totalX = $totalX + $ch->size->x;
@@ -273,6 +295,14 @@ internal function placeNode(array<Node>& $nodes, int32 $i) : void
     while ($c >= 0) {
         int32 $next = $nodes[$c as usize]->next;
         Vec2 $sz = $nodes[$c as usize]->size;
+
+        if ($nodes[$c as usize]->floating) {
+            $nodes->at($c as usize)->pos = floatPos($nodes[$c as usize], $nodes[0]->size);
+            placeNode($nodes, $c);
+            $c = $next;
+            continue;
+        }
+
         float32 $cx = $x;
         float32 $cy = $y;
 
@@ -293,6 +323,36 @@ internal function placeNode(array<Node>& $nodes, int32 $i) : void
 
         $c = $next;
     }
+}
+
+/**
+ * A float's top-left: its anchor on the frame less its pivot share of its own size, kept
+ * inside the frame so a plate at the edge slides in rather than leaving the screen.
+ */
+internal function floatPos(const Node& $n, Vec2 $frame) : Vec2
+{
+    float32 $x = $n->anchor->x * $frame->x - $n->pivot->x * $n->size->x;
+    float32 $y = $n->anchor->y * $frame->y - $n->pivot->y * $n->size->y;
+    float32 $maxX = $frame->x - $n->size->x;
+    float32 $maxY = $frame->y - $n->size->y;
+
+    if ($x > $maxX) {
+        $x = $maxX;
+    }
+
+    if ($y > $maxY) {
+        $y = $maxY;
+    }
+
+    if ($x < 0.0f) {
+        $x = 0.0f;
+    }
+
+    if ($y < 0.0f) {
+        $y = 0.0f;
+    }
+
+    return Vec2($x, $y);
 }
 
 internal function packMain(Align $align, Flow $flow, Vec2 $content, Vec2 $inner) : float32

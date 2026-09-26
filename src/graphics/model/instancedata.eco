@@ -1,6 +1,8 @@
 /**
  * GPU-side shapes of the model path: the cooked vertex, the per-instance payload behind the model
- * matrix, and the per-material uniform at slot 0. The `model` program reads exactly these.
+ * matrix, and the per-material uniform at slot 0. The `model` program reads exactly these; the
+ * `model+skinned` and `shadow+skinned` variants add the skinned vertex, the palette base and
+ * the joint palette at slot 2.
  */
 
 namespace visu::graphics;
@@ -30,8 +32,9 @@ public struct ModelInstanceData
 /**
  * Slot 0 of the `model` program, one upload per material batch.
  * `baseColor` rgb is the albedo fallback, a the alpha cutoff (0 = opaque).
- * `factors` is roughness, metallic, the presence flags as a float, unused.
- * `uvScale` xy scales the uv.
+ * `factors` is roughness, metallic, the presence flags as a float, then the parallax relief in
+ * tiles (0 on a material that does not march).
+ * `uvScale` xy scales the uv, z is the parallax march's most steps, w its fade distance in metres.
  */
 public struct ModelMaterialData
 {
@@ -40,12 +43,54 @@ public struct ModelMaterialData
     public Vec4 $uvScale;
 }
 
+/**
+ * A cooked skinned vertex, `MODEL_SKINNED_VERTEX_BYTES` wide. Locations 0..3 as `ModelVertex`,
+ * then the four joint bytes at 9 and the four weight bytes (unorm) at 10.
+ */
+public struct SkinnedVertex
+{
+    public Vec3 $position;
+    public Vec3 $normal;
+    public Vec4 $tangent;
+    public Vec2 $uv;
+    public uint32 $joints;
+    public uint32 $weights;
+}
+
+/**
+ * The skinned instance payload: location 8 is the tint as for `ModelInstanceData`, location 11
+ * holds the instance's first palette row in x.
+ */
+public struct SkinInstanceData
+{
+    public Vec4 $tint;
+    public Vec4 $skin;
+}
+
+/**
+ * Uniform slot of the frame's joint palette. Slot 0 is the material, 1 the camera or cascade.
+ */
+public const uint32 SKIN_PALETTE_SLOT = 2;
+
+/**
+ * Rows in the frame's joint palette, three per joint (the top of a column-major 3x4 matrix,
+ * stored as rows). 3072 rows is 48 KiB: 1024 joints a frame, inside the 64 KiB a uniform range
+ * is guaranteed on every backend here. `skin.glsl` declares the same count.
+ */
+public const int32 SKIN_PALETTE_ROWS = 3072;
+
 public const int32 MODEL_MAP_ALBEDO = 1;
 public const int32 MODEL_MAP_NORMAL = 2;
 public const int32 MODEL_MAP_ROUGHNESS = 4;
 public const int32 MODEL_MAP_METALLIC = 8;
 public const int32 MODEL_MAP_AO = 16;
 public const int32 MODEL_MAP_ALPHA = 32;
+public const int32 MODEL_MAP_HEIGHT = 64;
+
+/**
+ * Texture slot of the height map in the `model+parallax` programs, after the six material maps.
+ */
+public const int32 MODEL_HEIGHT_SLOT = 6;
 
 public function modelVertexLayout() : VertexLayout
 {
@@ -66,6 +111,32 @@ public function modelLayout() : VertexLayout
     return modelVertexLayout()->join(
         instanceLayout<ModelInstanceData>(4, function(VertexBuilder $b, ptr<const ModelInstanceData> $p) : void {
             $b->attr(8, &$p->tint);
+        })
+    );
+}
+
+public function skinnedVertexLayout() : VertexLayout
+{
+    return VertexLayout::of<SkinnedVertex>(function(VertexBuilder $b) : void {
+        ptr<SkinnedVertex> $v = $b->vertex<SkinnedVertex>();
+        $b->attr(0, &$v->position);
+        $b->attr(1, &$v->normal);
+        $b->attr(2, &$v->tangent);
+        $b->attr(3, &$v->uv);
+        $b->attr(9, &$v->joints, VertexFormat::uint8x4);
+        $b->attr(10, &$v->weights, VertexFormat::unorm8x4);
+    });
+}
+
+/**
+ * Skinned vertex stream plus the `Instance<SkinInstanceData>` stream: twelve attributes.
+ */
+public function skinnedLayout() : VertexLayout
+{
+    return skinnedVertexLayout()->join(
+        instanceLayout<SkinInstanceData>(4, function(VertexBuilder $b, ptr<const SkinInstanceData> $p) : void {
+            $b->attr(8, &$p->tint);
+            $b->attr(11, &$p->skin);
         })
     );
 }

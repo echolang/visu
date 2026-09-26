@@ -1,5 +1,9 @@
 #version 450
 
+// a material with a height map and relief marches it: parallax occlusion on every map sample
+#pragma visu variant parallax MODEL_PARALLAX=1
+#pragma visu variant skinned_parallax SKINNED=1 MODEL_PARALLAX=1
+
 layout(location = 0) in vec3 v_position;
 layout(location = 1) in vec3 v_normal;
 layout(location = 2) in vec4 v_tangent;
@@ -10,8 +14,9 @@ layout(location = 4) in vec4 v_tint;
 layout(std140, set = 0, binding = 0) uniform ModelMaterialData {
     // rgb albedo fallback, a alpha cutoff (0 = opaque)
     vec4 u_base_color;
-    // roughness, metallic, map presence flags, unused
+    // roughness, metallic, map presence flags, parallax relief in tiles
     vec4 u_factors;
+    // uv scale, parallax most steps, parallax fade in metres
     vec4 u_uv_scale;
 };
 
@@ -24,6 +29,18 @@ layout(set = 1, binding = 5) uniform sampler2D map_alpha;
 
 #include "visu/gbuffer_layout.glsl"
 
+#ifdef MODEL_PARALLAX
+// visu::graphics::MODEL_HEIGHT_SLOT
+layout(set = 1, binding = 6) uniform sampler2D map_height;
+
+#include "visu/parallax.glsl"
+
+float parallax_height(vec2 uv, vec2 dx, vec2 dy)
+{
+    return textureGrad(map_height, uv, dx, dy).r;
+}
+#endif
+
 const int MAP_ALBEDO = 1;
 const int MAP_NORMAL = 2;
 const int MAP_ROUGHNESS = 4;
@@ -35,6 +52,25 @@ void main()
 {
     vec2 uv = v_uv * u_uv_scale.xy;
     int flags = int(u_factors.z + 0.5);
+
+    vec3 n = normalize(v_normal);
+    if (!gl_FrontFacing) {
+        n = -n;
+    }
+
+    vec3 t = normalize(v_tangent.xyz);
+    t = normalize(t - n * dot(n, t));
+    vec3 b = cross(n, t) * v_tangent.w;
+
+#ifdef MODEL_PARALLAX
+    vec3 to_eye = u_camera_position.xyz - v_position;
+    float depth = u_factors.w * parallax_fade(length(to_eye), u_uv_scale.w);
+    if (depth > 1e-5) {
+        vec2 dx = dFdx(uv);
+        vec2 dy = dFdy(uv);
+        uv = parallax_offset(uv, parallax_view(t, b, n, normalize(to_eye)), depth, u_uv_scale.z, dx, dy);
+    }
+#endif
 
     vec3 albedo = u_base_color.rgb;
     float alpha = 1.0;
@@ -55,15 +91,7 @@ void main()
 
     albedo *= v_tint.rgb;
 
-    vec3 n = normalize(v_normal);
-    if (!gl_FrontFacing) {
-        n = -n;
-    }
-
     if ((flags & MAP_NORMAL) != 0) {
-        vec3 t = normalize(v_tangent.xyz);
-        t = normalize(t - n * dot(n, t));
-        vec3 b = cross(n, t) * v_tangent.w;
         vec3 tn = texture(map_normal, uv).rgb * 2.0 - 1.0;
         n = normalize(mat3(t, b, n) * tn);
     }

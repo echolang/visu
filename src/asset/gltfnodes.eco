@@ -16,6 +16,11 @@ internal struct GltfPart
     public int32 $mesh;
     public Mat4 $world;
     public int32 $level;
+
+    /**
+     * The node's skin index, or -1. A skinned part keeps its vertices in mesh space.
+     */
+    public int32 $skin = -1;
 }
 
 internal class GltfParts
@@ -188,7 +193,7 @@ internal function gltfVisit(
         }
 
         GltfParts $object = GltfParts($node->name);
-        $object->parts[] = GltfPart($node->mesh, $world, 0);
+        $object->parts[] = GltfPart($node->mesh, $world, 0, $node->skin);
         foreach ($node->children as $child) {
             if ($child < 0 || ($child as usize) >= $file->nodes->count()) {
                 return .error(.json("node {$child} does not exist"));
@@ -273,7 +278,7 @@ internal function gltfAddSubtree(
     GltfNode $node = $file->nodes[$index as usize];
     Mat4 $world = $parent * $node->local;
     if ($node->mesh >= 0) {
-        $object->parts[] = GltfPart($node->mesh, $world, $level);
+        $object->parts[] = GltfPart($node->mesh, $world, $level, $node->skin);
     }
 
     foreach ($node->children as $child) {

@@ -2,10 +2,12 @@
  * Ground-focus RTS camera tunables.
  * An ECS component on a camera entity; `RtsCameraSystem` drives the one that also has `ActiveCamera`.
  * `place` sits at `$radius` looking at the focus. With `$ground`, the look-at is `$clearance` metres up so a close zoom stays a walk above the heightmap.
+ * `follow` glides the focus after an entity until a pan key breaks it; orbit and zoom stay live while following.
  */
 
 namespace visu::components;
 
+use visu::ecs::Entity;
 use visu::geo::{Heightmap, Transform};
 use visu::math::{EPS, Quat, Vec2, Vec3, dot, length, radians, sgn};
 
@@ -82,11 +84,56 @@ public struct RtsCamera
      */
     public Heightmap? $ground = null;
 
+    /**
+     * The entity the focus glides after, or null. `RtsCameraSystem` clears it when a pan key goes down.
+     */
+    public Entity? $target = null;
+
+    /**
+     * Fraction of the gap to the followed entity kept each tick. 0 snaps; closer to 1 is a softer glide.
+     */
+    public float32 $followDamp = 0.85f;
+
     init
     {
         $this->focus = Vec3(0.0f, 0.0f, 0.0f);
         $this->focusVelocity = Vec3(0.0f, 0.0f, 0.0f);
         $this->spin = Vec2(0.0f, 0.0f);
+    }
+
+    /**
+     * Glide the focus after `$e` from the next tick on.
+     */
+    public function follow(Entity $e) : void
+    {
+        $this->target = $e;
+    }
+
+    /**
+     * Stop following. The focus stays where it is.
+     */
+    public function release() : void
+    {
+        $this->target = null;
+    }
+
+    public const function following() : bool
+    {
+        return $this->target != null;
+    }
+
+    /**
+     * Move the focus `1 - $followDamp` of the way to `$at` over the ground. Y is the heightmap's
+     * when there is one, so only a camera without ground follows height.
+     */
+    public function chase(Vec3 $at) : void
+    {
+        float32 $k = 1.0f - $this->followDamp;
+        $this->focus->x = $this->focus->x + ($at->x - $this->focus->x) * $k;
+        $this->focus->z = $this->focus->z + ($at->z - $this->focus->z) * $k;
+        if ($this->ground == null) {
+            $this->focus->y = $this->focus->y + ($at->y - $this->focus->y) * $k;
+        }
     }
 
     /**

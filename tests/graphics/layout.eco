@@ -185,3 +185,30 @@ test vertex_stream_dies
     });
 }
 
+
+test skinned_layout_packs_joint_and_weight_bytes
+{
+    visu::graphics::VertexLayout $layout = visu::graphics::skinnedLayout();
+    int32 $bytes = 0;
+    int32 $weights = 0;
+    foreach ($layout->attrs as $a) {
+        if ($a->location == 9) {
+            assert($a->format == visu::graphics::VertexFormat::uint8x4, 'joints are uint8x4');
+            assert($a->offset == 48 && $a->stride == 56, 'joints after the rigid vertex');
+            $bytes = $bytes + 1;
+        }
+
+        if ($a->location == 10) {
+            assert($a->format == visu::graphics::VertexFormat::unorm8x4, 'weights are unorm8x4');
+            assert($a->offset == 52, 'weights after joints');
+            $weights = $weights + 1;
+        }
+
+        if ($a->location == 11) {
+            assert($a->divisor == 1, 'palette base rides the instance stream');
+        }
+    }
+
+    assert($bytes == 1 && $weights == 1, 'both byte attributes present');
+    assert($layout->fingerprint() != visu::graphics::modelLayout()->fingerprint(), 'distinct pipeline key');
+}

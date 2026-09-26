@@ -1,7 +1,8 @@
 /**
- * Playback state for node-TRS clips. Sit this on the assembly root next to `AssemblyInstance`.
- * `play()` with no name runs every clip together (Blender per-object actions); `play($name)`
- * selects one.
+ * Playback state for node-TRS and skinned clips. Sit this on the assembly root next to
+ * `AssemblyInstance`. `play()` with no name runs every clip together (Blender per-object
+ * actions); `play($name)` selects one; `fadeTo($name, $seconds)` selects one and blends the
+ * outgoing clip out over `$seconds`.
  */
 
 namespace visu::components;
@@ -24,6 +25,14 @@ public struct AnimationPlayer
     public bool $playing;
     public AnimationWrap $wrap;
 
+    /**
+     * The clip fading out, or -1. It keeps looping on its own playhead until the fade ends.
+     */
+    public int32 $fadeFrom;
+    public float32 $fadeTime;
+    public float32 $fadeElapsed;
+    public float32 $fadeLength;
+
     public constructor()
     {
         $this->clips = array<Clip>();
@@ -32,6 +41,10 @@ public struct AnimationPlayer
         $this->speed = 1.0f;
         $this->playing = false;
         $this->wrap = .loop;
+        $this->fadeFrom = -1;
+        $this->fadeTime = 0.0f;
+        $this->fadeElapsed = 0.0f;
+        $this->fadeLength = 0.0f;
     }
 
     public constructor(array<Clip> $clips)
@@ -42,6 +55,10 @@ public struct AnimationPlayer
         $this->speed = 1.0f;
         $this->playing = false;
         $this->wrap = .loop;
+        $this->fadeFrom = -1;
+        $this->fadeTime = 0.0f;
+        $this->fadeElapsed = 0.0f;
+        $this->fadeLength = 0.0f;
     }
 
     public const function clip() : Clip?
@@ -88,19 +105,128 @@ public struct AnimationPlayer
         $this->playing = true;
     }
 
+    /**
+     * The clip fading out, or null when no fade is live.
+     */
+    public const function fadeClip() : Clip?
+    {
+        if ($this->fadeFrom < 0 || ($this->fadeFrom as usize) >= $this->clips->count()) {
+            return null;
+        }
+
+        return $this->clips[$this->fadeFrom as usize];
+    }
+
+    /**
+     * Weight of the current clip against the fading one, 1 when nothing fades. `$lag` seconds
+     * are taken off the fade clock, so a render between two updates can ask for its own moment.
+     */
+    public const function weight(float32 $lag = 0.0f) : float32
+    {
+        if ($this->fadeFrom < 0 || $this->fadeLength <= 0.0f) {
+            return 1.0f;
+        }
+
+        float32 $w = ($this->fadeElapsed - $lag) / $this->fadeLength;
+        if ($w < 0.0f) {
+            return 0.0f;
+        }
+
+        if ($w > 1.0f) {
+            return 1.0f;
+        }
+
+        return $w;
+    }
+
+    /**
+     * The current clip's playhead `$lag` seconds of play ago, wrapped like `advance` wraps it.
+     * The render phase samples here so the pose trails the interpolated `Transform`.
+     */
+    public const function sampleTime(float32 $lag) : float32
+    {
+        if (!$this->playing || $lag == 0.0f) {
+            return $this->time;
+        }
+
+        return wrapTime($this->time - $lag * $this->speed, $this->duration(), $this->wrap);
+    }
+
+    /**
+     * The fading clip's playhead `$lag` seconds ago. It always loops.
+     */
+    public const function fadeSampleTime(float32 $lag) : float32
+    {
+        Clip $out = guard $this->fadeClip() else {
+            return 0.0f;
+        }
+        return loopTime($this->fadeTime - $lag * $this->speed, $out->duration);
+    }
+
+    /**
+     * The layers to sample `$lag` seconds ago, or null when no single clip is selected. A fade
+     * whose clip is gone reads as the current clip alone.
+     */
+    public const function layers(float32 $lag) : AnimationLayers?
+    {
+        if ($this->index < 0 || ($this->index as usize) >= $this->clips->count()) {
+            return null;
+        }
+
+        float32 $weight = $this->weight($lag);
+        int32 $fade = -1;
+        float32 $fadeTime = 0.0f;
+        if ($weight < 1.0f && $this->fadeFrom >= 0 && ($this->fadeFrom as usize) < $this->clips->count()) {
+            $fade = $this->fadeFrom;
+            $fadeTime = $this->fadeSampleTime($lag);
+        } else {
+            $weight = 1.0f;
+        }
+
+        return AnimationLayers($fade, $fadeTime, $this->index, $this->sampleTime($lag), $weight);
+    }
+
+    /**
+     * Switch to `$name` and blend the current clip out over `$seconds`. Asking for the clip
+     * that already plays does nothing, so a caller may repeat it every update. Zero seconds,
+     * or nothing playing yet, is a hard cut.
+     */
+    public function fadeTo(string $name, float32 $seconds) : void
+    {
+        int32 $i = $this->find($name);
+        if ($i < 0) {
+            return;
+        }
+
+        if ($i == $this->index && $this->playing) {
+            return;
+        }
+
+        if ($seconds > 0.0f && $this->index >= 0 && $this->playing) {
+            $this->fadeFrom = $this->index;
+            $this->fadeTime = $this->time;
+            $this->fadeElapsed = 0.0f;
+            $this->fadeLength = $seconds;
+        } else {
+            $this->fadeFrom = -1;
+        }
+
+        $this->index = $i;
+        $this->time = 0.0f;
+        $this->playing = true;
+    }
+
     public function play(string $name) : void
     {
-        int32 $i = 0;
-        while ($i < ($this->clips->count() as int32)) {
-            if ($this->clips[$i as usize]->name->equals($name)) {
-                $this->index = $i;
-                $this->time = 0.0f;
-                $this->playing = true;
-                return;
-            }
-
-            $i = $i + 1;
+        int32 $i = $this->find($name);
+        if ($i < 0) {
+            return;
         }
+
+        $this->index = $i;
+        $this->time = 0.0f;
+        $this->playing = true;
+        $this->fadeFrom = -1;
     }
 
     public function pause() : void
@@ -121,16 +247,7 @@ public struct AnimationPlayer
 
     public function seek(float32 $seconds) : void
     {
-        float32 $d = $this->duration();
-        if ($d <= 0.0f) {
-            $this->time = $seconds;
-            return;
-        }
-        $this->time = match ($this->wrap) {
-            AnimationWrap::once => clampTime($seconds, $d),
-            AnimationWrap::loop => loopTime($seconds, $d),
-            AnimationWrap::pingpong => pingpongTime($seconds, $d),
-        };
+        $this->time = wrapTime($seconds, $this->duration(), $this->wrap);
     }
 
     /**
@@ -142,6 +259,7 @@ public struct AnimationPlayer
             return;
         }
 
+        $this->advanceFade($dt);
         float32 $d = $this->duration();
         if ($d <= 0.0f) {
             return;
@@ -170,6 +288,50 @@ public struct AnimationPlayer
             },
         };
     }
+
+    private function advanceFade(float32 $dt) : void
+    {
+        Clip $out = guard $this->fadeClip() else {
+            return;
+        }
+        $this->fadeElapsed = $this->fadeElapsed + $dt;
+        if ($this->fadeElapsed >= $this->fadeLength) {
+            $this->fadeFrom = -1;
+            return;
+        }
+
+        $this->fadeTime = loopTime($this->fadeTime + $dt * $this->speed, $out->duration);
+    }
+
+    /**
+     * Index of the clip named `$name`, or -1 when this player has none.
+     */
+    private const function find(const string& $name) : int32
+    {
+        int32 $i = 0;
+        while ($i < ($this->clips->count() as int32)) {
+            if ($this->clips[$i as usize]->name->equals($name)) {
+                return $i;
+            }
+
+            $i = $i + 1;
+        }
+
+        return -1;
+    }
+}
+
+internal function wrapTime(float32 $time, float32 $duration, AnimationWrap $wrap) : float32
+{
+    if ($duration <= 0.0f) {
+        return $time;
+    }
+
+    return match ($wrap) {
+        AnimationWrap::once => clampTime($time, $duration),
+        AnimationWrap::loop => loopTime($time, $duration),
+        AnimationWrap::pingpong => pingpongTime($time, $duration),
+    };
 }
 
 internal function clampTime(float32 $time, float32 $duration) : float32

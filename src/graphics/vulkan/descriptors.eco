@@ -1,6 +1,7 @@
 /**
- * Framework pipeline layout: set 0 = dynamic UBOs, set 1 = combined image samplers.
- * One set 0 per frame slot, written against that slot's ring.
+ * Framework pipeline layout: set 0 = dynamic UBOs, set 1 = combined image samplers, set 2 =
+ * storage buffers. One layout for graphics and compute. One set 0 per frame slot, written
+ * against that slot's ring; sets 1 and 2 are minted per distinct binding tuple.
  */
 
 namespace visu::graphics;
@@ -9,6 +10,17 @@ namespace visu::graphics;
  * Set-1 allocations per frame slot. One set is minted per distinct texture tuple an encoder binds, not per draw.
  */
 internal const uint32 SET1_MAX_SETS = 1024;
+
+/**
+ * Set-2 allocations per frame slot, one per distinct storage tuple an encoder binds.
+ */
+internal const uint32 SET2_MAX_SETS = 1024;
+
+internal const uint32 VK_ALL_STAGES = vk::SHADER_STAGE_VERTEX_BIT
+    | vk::SHADER_STAGE_FRAGMENT_BIT
+    | vk::SHADER_STAGE_TESSELLATION_CONTROL_BIT
+    | vk::SHADER_STAGE_TESSELLATION_EVALUATION_BIT
+    | vk::SHADER_STAGE_COMPUTE_BIT;
 
 internal function vkCreateDrawStack(Device $device) : status<DeviceError>
 {
@@ -20,10 +32,7 @@ internal function vkCreateDrawStack(Device $device) : status<DeviceError>
         $ubo[$i]->binding = $i;
         $ubo[$i]->descriptorType = vk::DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         $ubo[$i]->descriptorCount = 1;
-        $ubo[$i]->stageFlags = vk::SHADER_STAGE_VERTEX_BIT
-            | vk::SHADER_STAGE_FRAGMENT_BIT
-            | vk::SHADER_STAGE_TESSELLATION_CONTROL_BIT
-            | vk::SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+        $ubo[$i]->stageFlags = VK_ALL_STAGES;
         $i = $i + 1;
     }
 
@@ -45,10 +54,7 @@ internal function vkCreateDrawStack(Device $device) : status<DeviceError>
         $tex[$i]->binding = $i;
         $tex[$i]->descriptorType = vk::DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         $tex[$i]->descriptorCount = 1;
-        $tex[$i]->stageFlags = vk::SHADER_STAGE_VERTEX_BIT
-            | vk::SHADER_STAGE_FRAGMENT_BIT
-            | vk::SHADER_STAGE_TESSELLATION_CONTROL_BIT
-            | vk::SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+        $tex[$i]->stageFlags = VK_ALL_STAGES;
         $i = $i + 1;
     }
 
@@ -62,11 +68,34 @@ internal function vkCreateDrawStack(Device $device) : status<DeviceError>
         return .error($e);
     }
 
-    vk::DescriptorSetLayout[2] $layouts;
+    vk::DescriptorSetLayoutBinding[8] $ssbo;
+    $i = 0;
+
+    while ($i < STORAGE_SLOTS) {
+        $ssbo[$i] = vk::DescriptorSetLayoutBinding();
+        $ssbo[$i]->binding = $i;
+        $ssbo[$i]->descriptorType = vk::DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        $ssbo[$i]->descriptorCount = 1;
+        $ssbo[$i]->stageFlags = VK_ALL_STAGES;
+        $i = $i + 1;
+    }
+
+    vk::DescriptorSetLayoutCreateInfo $s2 = vk::DescriptorSetLayoutCreateInfo();
+    $s2->bindingCount = STORAGE_SLOTS;
+    $s2->pBindings:$ = &$ssbo[0];
+    guard vkCheck(
+        vk::CreateDescriptorSetLayout($device->logical, &$s2, null, &$device->setLayout2),
+        'CreateDescriptorSetLayout'
+    ) else ($e) {
+        return .error($e);
+    }
+
+    vk::DescriptorSetLayout[3] $layouts;
     $layouts[0] = $device->setLayout0;
     $layouts[1] = $device->setLayout1;
+    $layouts[2] = $device->setLayout2;
     vk::PipelineLayoutCreateInfo $plci = vk::PipelineLayoutCreateInfo();
-    $plci->setLayoutCount = 2;
+    $plci->setLayoutCount = 3;
     $plci->pSetLayouts:$ = &$layouts[0];
     guard vkCheck(
         vk::CreatePipelineLayout($device->logical, &$plci, null, &$device->pipeLayout),
@@ -151,6 +180,20 @@ internal function vkCreateDrawStack(Device $device) : status<DeviceError>
             return .error($e);
         }
 
+        vk::DescriptorPoolSize $ps2 = vk::DescriptorPoolSize();
+        $ps2->type = vk::DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        $ps2->descriptorCount = STORAGE_SLOTS * SET2_MAX_SETS;
+        vk::DescriptorPoolCreateInfo $pci2 = vk::DescriptorPoolCreateInfo();
+        $pci2->maxSets = SET2_MAX_SETS;
+        $pci2->poolSizeCount = 1;
+        $pci2->pPoolSizes:$ = &$ps2;
+        guard vkCheck(
+            vk::CreateDescriptorPool($device->logical, &$pci2, null, &$slot->set2pool),
+            'CreateDescriptorPool'
+        ) else ($e) {
+            return .error($e);
+        }
+
         $i = $i + 1;
     }
 
@@ -222,13 +265,21 @@ internal function vkDestroyDrawStack(Device $device) : void
 
     $device->psos = map<string, PipelineHandle>();
 
-    foreach ($device->samplerHandles as $h) {
-        if ($h->sampler->handle != 0) {
-            vk::DestroySampler($device->logical, $h->sampler, null);
+    foreach ($device->computePsos as $pipeline) {
+        if ($pipeline->handle != 0) {
+            vk::DestroyPipeline($device->logical, $pipeline, null);
         }
     }
 
-    $device->samplerHandles = map<string, SamplerHandle>();
+    $device->computePsos = map<uint32, vk::Pipeline>();
+
+    foreach ($device->samplers as $s) {
+        if ($s->handle->sampler->handle != 0) {
+            vk::DestroySampler($device->logical, $s->handle->sampler, null);
+        }
+    }
+
+    $device->samplers = map<string, Sampler>();
 
     foreach ($device->slots as $slot) {
         $slot->ring->destroy($device);
@@ -237,6 +288,11 @@ internal function vkDestroyDrawStack(Device $device) : void
         if ($slot->set1pool->handle != 0) {
             vk::DestroyDescriptorPool($device->logical, $slot->set1pool, null);
             $slot->set1pool = vk::DescriptorPool::none();
+        }
+
+        if ($slot->set2pool->handle != 0) {
+            vk::DestroyDescriptorPool($device->logical, $slot->set2pool, null);
+            $slot->set2pool = vk::DescriptorPool::none();
         }
     }
 
@@ -260,6 +316,11 @@ internal function vkDestroyDrawStack(Device $device) : void
         $device->setLayout1 = vk::DescriptorSetLayout::none();
     }
 
+    if ($device->setLayout2->handle != 0) {
+        vk::DestroyDescriptorSetLayout($device->logical, $device->setLayout2, null);
+        $device->setLayout2 = vk::DescriptorSetLayout::none();
+    }
+
     if ($device->set0pool->handle != 0) {
         vk::DestroyDescriptorPool($device->logical, $device->set0pool, null);
         $device->set0pool = vk::DescriptorPool::none();
@@ -272,17 +333,22 @@ internal function vkDestroyDrawStack(Device $device) : void
     }
 }
 
-internal function vkFlushUniforms(Device $device) : void
+/**
+ * Bind set 0 with this slot's dynamic offsets at `$bindPoint`. Graphics skips a clean slot;
+ * a compute dispatch always binds, then leaves the slot dirty so the next draw rebinds too.
+ */
+internal function vkFlushUniforms(Device $device, uint32 $bindPoint = vk::PIPELINE_BIND_POINT_GRAPHICS) : void
 {
     FrameSlot $slot = $device->slots[$device->slot];
+    bool $compute = $bindPoint == vk::PIPELINE_BIND_POINT_COMPUTE;
 
-    if (!$slot->uniformsDirty) {
+    if (!$slot->uniformsDirty && !$compute) {
         return;
     }
 
     vk::CmdBindDescriptorSets(
         $slot->cmd,
-        vk::PIPELINE_BIND_POINT_GRAPHICS,
+        $bindPoint,
         $device->pipeLayout,
         0,
         1,
@@ -290,12 +356,12 @@ internal function vkFlushUniforms(Device $device) : void
         UNIFORM_SLOTS,
         &$slot->dynOff[0]
     );
-    $slot->uniformsDirty = false;
+    $slot->uniformsDirty = $compute;
 }
 
-internal function vkFlushTextures(Device $device, RenderEncoder $enc) : void
+internal function vkFlushTextures(Device $device, VkBindings& $b, uint32 $bindPoint) : void
 {
-    if (!$enc->texturesDirty) {
+    if (!$b->texturesDirty) {
         return;
     }
 
@@ -320,9 +386,9 @@ internal function vkFlushTextures(Device $device, RenderEncoder $enc) : void
         $infos[$i] = vk::DescriptorImageInfo();
         $infos[$i]->imageLayout = vk::IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        if ($enc->texSet[$i]) {
-            $infos[$i]->sampler = $enc->sampHandles[$i]->sampler;
-            $infos[$i]->imageView = $enc->texHandles[$i]->view;
+        if ($b->texSet[$i]) {
+            $infos[$i]->sampler = $b->sampHandles[$i]->sampler;
+            $infos[$i]->imageView = $b->texHandles[$i]->view;
         } else {
             $infos[$i]->sampler = $device->dummySampler->sampler;
             $infos[$i]->imageView = $device->dummyImage->view;
@@ -340,7 +406,7 @@ internal function vkFlushTextures(Device $device, RenderEncoder $enc) : void
     vk::UpdateDescriptorSets($device->logical, TEXTURE_SLOTS, &$writes[0], 0, null);
     vk::CmdBindDescriptorSets(
         $fs->cmd,
-        vk::PIPELINE_BIND_POINT_GRAPHICS,
+        $bindPoint,
         $device->pipeLayout,
         1,
         1,
@@ -348,5 +414,68 @@ internal function vkFlushTextures(Device $device, RenderEncoder $enc) : void
         0,
         null
     );
-    $enc->texturesDirty = false;
+    $b->texturesDirty = false;
+}
+
+/**
+ * Mint and bind set 2 for the storage buffers bound since the last flush. Only bound slots are
+ * written; a shader must not read a slot nothing was bound into.
+ */
+internal function vkFlushStorage(Device $device, VkBindings& $b, uint32 $bindPoint) : void
+{
+    if (!$b->storageDirty) {
+        return;
+    }
+
+    FrameSlot $fs = $device->slots[$device->slot];
+    vk::DescriptorSet $set = vk::DescriptorSet::none();
+    vk::DescriptorSetAllocateInfo $ai = vk::DescriptorSetAllocateInfo();
+    $ai->descriptorPool = $fs->set2pool;
+    $ai->descriptorSetCount = 1;
+    $ai->pSetLayouts:$ = &$device->setLayout2;
+    guard vkCheck(
+        vk::AllocateDescriptorSets($device->logical, &$ai, &$set),
+        'AllocateDescriptorSets'
+    ) else ($e) {
+        die($e->message());
+    }
+
+    vk::DescriptorBufferInfo[8] $infos;
+    vk::WriteDescriptorSet[8] $writes;
+    uint32 $n = 0;
+    uint32 $i = 0;
+
+    while ($i < STORAGE_SLOTS) {
+        if ($b->storageSet[$i]) {
+            $infos[$n] = vk::DescriptorBufferInfo();
+            $infos[$n]->buffer = $b->storage[$i];
+            $infos[$n]->offset = $b->storageOff[$i];
+            $infos[$n]->range = vk::WHOLE_SIZE;
+            $writes[$n] = vk::WriteDescriptorSet();
+            $writes[$n]->dstSet = $set;
+            $writes[$n]->dstBinding = $i;
+            $writes[$n]->descriptorCount = 1;
+            $writes[$n]->descriptorType = vk::DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            $writes[$n]->pBufferInfo:$ = &$infos[$n];
+            $n = $n + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    if ($n > 0) {
+        vk::UpdateDescriptorSets($device->logical, $n, &$writes[0], 0, null);
+    }
+
+    vk::CmdBindDescriptorSets(
+        $fs->cmd,
+        $bindPoint,
+        $device->pipeLayout,
+        2,
+        1,
+        &$set,
+        0,
+        null
+    );
+    $b->storageDirty = false;
 }

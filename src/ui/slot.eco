@@ -1,0 +1,249 @@
+/**
+ * Inventory slot: a square cell that holds an atlas icon, a count badge and a meter, and that
+ * an icon can be dragged out of and dropped onto. Drag and drop lives here, not in the caller:
+ * a slot with a payload arms on the press edge, goes live once the pointer travels
+ * `DRAG_THRESHOLD`, and every slot under the release of a live drag reports `drop(payload)`.
+ * The ghost follows the pointer in the overlay layer, above every panel.
+ */
+
+namespace visu::ui;
+
+use visu::graphics::Texture;
+use visu::math::{Vec2, Vec4};
+use visu::vg::Color;
+
+/**
+ * Layout units the pointer travels from the press before a press becomes a drag. Below it a
+ * release is a click.
+ */
+public const float32 DRAG_THRESHOLD = 4.0f;
+
+/**
+ * What one slot shows this frame. Built by the caller each frame; a copy is a texture refcount
+ * bump, never an allocation.
+ */
+public struct SlotView
+{
+    /**
+     * Null draws an empty cell.
+     */
+    public Icon? $icon = null;
+    /**
+     * Drawn as a badge in the bottom-right corner when above 1.
+     */
+    public int32 $count = 0;
+    /**
+     * 0..1 fill of the bar along the bottom edge; below 0 draws no bar.
+     */
+    public float32 $meter = -1.0f;
+    public bool $selected = false;
+}
+
+public enum SlotEvent
+{
+    case none;
+    case click;
+    /**
+     * A live drag was released over this slot. The payload is what the source slot passed as
+     * `$drag`. A slot never receives its own drop.
+     */
+    case drop(int32 $payload);
+}
+
+/**
+ * The drag in hand. Armed on a press over a source, live past the threshold, cleared at the end
+ * of the frame the button comes up.
+ */
+internal struct DragState
+{
+    public uint64 $source = 0 as uint64;
+    public int32 $payload = -1;
+    public Icon? $ghost = null;
+    public Vec2 $from = Vec2(0.0f);
+    public bool $armed = false;
+    public bool $live = false;
+}
+
+internal struct SlotRun
+{
+    public Icon? $icon;
+    public bool $selected;
+    public float32 $meter;
+    /**
+     * The badge digits are `Ui.arena[from, to)`, `badgeW` wide; empty when `from == to`.
+     */
+    public usize $from = 0;
+    public usize $to = 0;
+    public float32 $badgeW = 0.0f;
+    /**
+     * This slot is the source of the live drag: its icon draws faded.
+     */
+    public bool $left = false;
+}
+
+internal function uiSlot(Ui $ui, const string& $id, const SlotView& $view, int32 $drag, float32 $size) : SlotEvent
+{
+    uint64 $wid = $ui->makeId($id, '');
+    SlotEvent $event = $ui->slotInput($wid, $drag, $view->icon);
+    const SlotStyle& $st = &$ui->theme->slot;
+    float32 $edge = $size;
+
+    if ($edge <= 0.0f) {
+        $edge = $st->size;
+    }
+
+    SlotRun $run = SlotRun($view->icon, $view->selected, $view->meter);
+    $run->left = $ui->carry->live && $ui->carry->source == $wid;
+
+    if ($view->count > 1) {
+        $run->from = $ui->arena->size();
+        appendDigits($ui->arena, $view->count as int64, 1);
+        $run->to = $ui->arena->size();
+        $run->badgeW = $ui->measureTextRange($ui->arena, $run->from, $run->to, $st->badgeFontSize, true)->x;
+    }
+
+    int32 $p = $ui->slotRuns->count() as int32;
+    $ui->slotRuns[] = $run;
+    Node $n = Node();
+    $n->kind = .slot;
+    $n->payload = $p;
+    $n->id = $wid;
+    $n->radius = $st->radius;
+    $n->measured = Vec2($edge + $st->pad * 2.0f, $edge + $st->pad * 2.0f);
+    $ui->push($n);
+    return $event;
+}
+
+internal function emitSlotBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    SlotRun $run = $ui->slotRuns[$n->payload as usize];
+    const SlotStyle& $st = &$ui->theme->slot;
+    bool $hot = !$n->dim && contains($n, $ui->io->pointer);
+    bool $landing = $hot && $ui->carry->live && $ui->carry->source != $n->id;
+
+    if (!emitSkin($ui, $n->pos, $n->size, $st->skin) && $st->bg->a > 0.0f) {
+        fillBox($ui, $n->pos, $n->size, $st->radius, $st->bg, $pad);
+    }
+
+    if ($landing) {
+        fillBox($ui, $n->pos, $n->size, $st->radius, $st->dropBg, $pad);
+    } else if ($hot && !$ui->carry->live) {
+        fillBox($ui, $n->pos, $n->size, $st->radius, $st->hoverBg, $pad);
+    }
+
+    if ($run->selected || $landing) {
+        emitSlotRing($ui, $n, $st, $pad);
+    }
+
+    if ($run->meter >= 0.0f) {
+        float32 $inset = $st->pad * 0.5f;
+        float32 $w = $n->size->x - $inset * 2.0f;
+        float32 $f = $run->meter;
+
+        if ($f > 1.0f) {
+            $f = 1.0f;
+        }
+
+        Vec2 $at = Vec2($n->pos->x + $inset, $n->pos->y + $n->size->y - $inset - $st->meterHeight);
+        float32 $r = $st->meterHeight * 0.5f;
+        fillBox($ui, $at, Vec2($w, $st->meterHeight), $r, $st->meterBg, $pad);
+
+        if ($f > 0.0f) {
+            fillBox($ui, $at, Vec2($w * $f, $st->meterHeight), $r, $st->meterFill, $pad);
+        }
+    }
+}
+
+/**
+ * The selected (or landing) ring: `ringWidth` of stroke, drawn as nested one-unit rings so a
+ * wide ring keeps the slot's corner radius.
+ */
+internal function emitSlotRing(Ui $ui, const Node& $n, const SlotStyle& $st, float32 $pad) : void
+{
+    float32 $d = 0.0f;
+
+    while ($d < $st->ringWidth) {
+        Vec2 $at = Vec2($n->pos->x + $d, $n->pos->y + $d);
+        Vec2 $size = Vec2($n->size->x - $d * 2.0f, $n->size->y - $d * 2.0f);
+        float32 $r = $st->radius - $d;
+
+        if ($r < 0.0f) {
+            $r = 0.0f;
+        }
+
+        emitStrokeBox($ui->batch, $at, $size, $r, $st->ring, $ui->clip, $pad);
+        $d = $d + 1.0f;
+    }
+}
+
+internal function emitSlot(Ui $ui, const Node& $n) : void
+{
+    SlotRun $run = $ui->slotRuns[$n->payload as usize];
+    const SlotStyle& $st = &$ui->theme->slot;
+    Icon? $maybe = $run->icon;
+
+    if ($maybe != null) {
+        Icon $icon = guard $maybe;
+        Color $tint = $st->tint;
+
+        if ($run->left) {
+            $tint = $tint->withAlpha($tint->a * $st->leftAlpha);
+        }
+
+        Vec2 $at = Vec2($n->pos->x + $st->pad, $n->pos->y + $st->pad);
+        Vec2 $size = Vec2($n->size->x - $st->pad * 2.0f, $n->size->y - $st->pad * 2.0f);
+        emitSlotIcon($ui, $icon, $at, $size, $tint);
+    }
+
+    if ($run->to > $run->from) {
+        float32 $inset = $st->pad * 0.5f;
+        float32 $lift = 0.0f;
+
+        if ($run->meter >= 0.0f) {
+            $lift = $st->meterHeight + 1.0f;
+        }
+
+        float32 $h = $st->badgeFontSize * 1.2f;
+        Vec2 $at = Vec2(
+            $n->pos->x + $n->size->x - $inset - $run->badgeW,
+            $n->pos->y + $n->size->y - $inset - $lift - $h
+        );
+        paintTextRange($ui, $at, $ui->arena, $run->from, $run->to, $st->badgeFontSize, $st->badge, true, false);
+    }
+}
+
+internal function emitSlotIcon(Ui $ui, const Icon& $icon, Vec2 $at, Vec2 $size, Color $tint) : void
+{
+    Texture $tex = $icon->texture;
+
+    if ($tex->desc->width < 1 || $tex->desc->height < 1) {
+        return;
+    }
+
+    sampleable($ui, $tex);
+    bindAtlas($ui->batch, $tex);
+    emitImageQuad($ui->batch, $at, $size, $icon->uv0, $icon->uv1, $tint, $ui->clip);
+}
+
+/**
+ * The dragged icon, centred on the pointer, in the overlay layer so no panel covers it.
+ */
+internal function emitDragGhost(Ui $ui) : void
+{
+    if (!$ui->carry->live) {
+        return;
+    }
+
+    Icon $icon = guard $ui->carry->ghost else {
+        return;
+    }
+    const SlotStyle& $st = &$ui->theme->slot;
+    Color $tint = $st->tint->withAlpha($st->tint->a * $st->ghostAlpha);
+    float32 $half = $st->size * 0.5f;
+    Vec2 $at = Vec2($ui->io->pointer->x - $half, $ui->io->pointer->y - $half);
+    $ui->batch->fade = 1.0f;
+    Vec4 $prev = $ui->clip;
+    $ui->clip = noClip();
+    emitSlotIcon($ui, $icon, $at, Vec2($st->size, $st->size), $tint);
+    $ui->clip = $prev;
+}

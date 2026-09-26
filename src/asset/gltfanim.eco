@@ -128,8 +128,22 @@ internal function gltfChannel(
         return .error(.json("animation '{$node->name}' value count does not match keys"));
     }
 
-    if (gltfValuesConstant($values, $comp) && gltfTrackMatchesRest($node, $p, $values, $comp)) {
-        return .ok(null);
+    if (gltfValuesConstant($values, $comp)) {
+        if (gltfTrackMatchesRest($node, $p, $values, $comp)) {
+            return .ok(null);
+        }
+
+        // a held pose away from rest needs one key, not one per sampled frame
+        array<float32> $oneTime = array<float32>();
+        $oneTime[] = $times[0];
+        array<float32> $oneValue = array<float32>();
+        int32 $c = 0;
+        while ($c < $comp) {
+            $oneValue[] = $values[$c as usize];
+            $c = $c + 1;
+        }
+
+        return .ok(AnimTrack($node->name, $p, $interp, $oneTime, $oneValue));
     }
 
     return .ok(AnimTrack($node->name, $p, $interp, $times, $values));

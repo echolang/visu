@@ -40,7 +40,9 @@ public class Device : DeviceProtocol
     internal AdapterInfo $adapter;
     internal Texture? $bb;
     internal map<string, PipelineHandle> $psos;
-    internal map<string, SamplerHandle> $samplerHandles;
+    internal map<string, Sampler> $samplers;
+    internal int32 $anisoWanted;
+    internal int32 $anisoLevel;
     internal map<uint32, mtl::DepthStencilState> $depthStates;
     internal PixelFormat $bbFormat;
     public DrawCounters $draws;
@@ -87,7 +89,9 @@ public class Device : DeviceProtocol
         $this->adapter = $info;
         $this->bb = null;
         $this->psos = map<string, PipelineHandle>();
-        $this->samplerHandles = map<string, SamplerHandle>();
+        $this->samplers = map<string, Sampler>();
+        $this->anisoWanted = 1;
+        $this->anisoLevel = 1;
         $this->depthStates = map<uint32, mtl::DepthStencilState>();
         $this->bbFormat = .bgra8;
         $this->draws = DrawCounters();
@@ -143,6 +147,7 @@ public class Device : DeviceProtocol
         $this->limits->maxTessellationFactor = $gpu->maxTessellationFactor() as int32;
         $this->limits->tessFactorAlign = TESS_FACTOR_ALIGN;
         $this->limits->vertexTextures = true;
+        $this->limits->maxAnisotropy = 16;
         $this->ready = true;
         announceVersion();
         string $line = $info->line();
@@ -243,6 +248,7 @@ public class Device : DeviceProtocol
 
     public function beginFrame(int32 $width, int32 $height) : result<FrameStatus, DeviceError>
     {
+        $this->applyAnisotropy();
         return mtlBeginFrame($this, $width, $height);
     }
 
@@ -448,6 +454,29 @@ public class Device : DeviceProtocol
         }
 
         return $this->openEncoder($cmd, $pass, $formats, $depthFmt, $passWidth, $passHeight);
+    }
+
+    public function beginCompute() : ComputeEncoder
+    {
+        assert($this->inFrame, 'beginCompute outside beginFrame');
+        assert(!$this->encoderOpen, 'beginCompute while an encoder is open');
+        mtl::CommandBuffer $cmd = guard $this->cmd else {
+            die('beginCompute without a command buffer');
+        }
+        GpuTimestamps $stamps = $this->slots[$this->slot]->stamps;
+        mtl::ComputePassDescriptor $pass = mtl::ComputePassDescriptor();
+        mtlTimestampsAttachCompute($stamps, $pass);
+        mtl::ComputeCommandEncoder $enc = guard $cmd->computeCommandEncoder($pass) else {
+            die('metal: computeCommandEncoder failed');
+        }
+        bool $labelled = $stamps->gpuOpen && !$stamps->name->empty();
+        if ($labelled) {
+            $enc->setLabel($stamps->name);
+            $enc->pushDebugGroup($stamps->name);
+        }
+
+        $this->encoderOpen = true;
+        return ComputeEncoder($this, $enc, $labelled);
     }
 
     public function transitionTexture(Texture $texture, ResourceState $to) : void
@@ -723,10 +752,49 @@ public class Device : DeviceProtocol
     {
         string $key = $desc->key();
 
-        if ($this->samplerHandles->has($key)) {
-            return Sampler($this, $this->samplerHandles[$key], $desc);
+        if ($this->samplers->has($key)) {
+            return $this->samplers[$key];
         }
 
+        Sampler $fresh = Sampler($this->samplerHandle($desc), $desc);
+        $this->samplers[$key] = $fresh;
+        $this->counts->noteSamplerCreated();
+        return $fresh;
+    }
+
+    public function setAnisotropy(int32 $level) : void
+    {
+        $this->anisoWanted = $level;
+    }
+
+    public const function anisotropy() : int32
+    {
+        return $this->anisoLevel;
+    }
+
+    /**
+     * Rebuild every anisotropic sampler at the wanted level, in place. Runs before the frame
+     * records anything; a command buffer in flight retains the state it was encoded with.
+     */
+    private function applyAnisotropy() : void
+    {
+        int32 $level = anisotropyLevel($this->anisoWanted, $this->limits->maxAnisotropy);
+
+        if ($level == $this->anisoLevel) {
+            return;
+        }
+
+        $this->anisoLevel = $level;
+
+        foreach ($this->samplers as $sampler) {
+            if ($sampler->desc->anisotropic) {
+                $sampler->handle = $this->samplerHandle($sampler->desc);
+            }
+        }
+    }
+
+    private function samplerHandle(const SamplerDesc& $desc) : SamplerHandle
+    {
         mtl::Device $gpu = guard $this->gpu else {
             die('createSampler before initialize');
         }
@@ -737,13 +805,15 @@ public class Device : DeviceProtocol
         $sd->sAddressMode = mtlAddress($desc->wrapS);
         $sd->tAddressMode = mtlAddress($desc->wrapT);
         $sd->rAddressMode = mtlAddress($desc->wrapT);
+
+        if ($desc->anisotropic) {
+            $sd->maxAnisotropy = $this->anisoLevel as uint32;
+        }
+
         mtl::SamplerState $samp = guard $gpu->newSamplerState($sd) else {
             die('metal: newSamplerState failed');
         }
-        SamplerHandle $h = SamplerHandle($samp);
-        $this->samplerHandles[$key] = $h;
-        $this->counts->noteSamplerCreated();
-        return Sampler($this, $h, $desc);
+        return SamplerHandle($samp);
     }
 
     public function createShaderModule(ShaderKind $kind, const string& $bytes, string $name) : result<ShaderModuleHandle, DeviceError>
@@ -807,7 +877,7 @@ public class Device : DeviceProtocol
         mtlDestroySlots($this);
         $this->psos = map<string, PipelineHandle>();
         $this->computePsos = map<uint32, mtl::ComputePipelineState>();
-        $this->samplerHandles = map<string, SamplerHandle>();
+        $this->samplers = map<string, Sampler>();
         $this->depthStates = map<uint32, mtl::DepthStencilState>();
         $this->queue = null;
         $this->gpu = null;

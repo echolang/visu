@@ -1,10 +1,12 @@
 /**
- * Spawned assembly: catalog id and the node-name → entity map the clip player uses to find
- * targets. Attached to the asset root by `spawnAssembly`.
+ * Spawned assembly: catalog id, the node-name → entity map, and each clip's tracks resolved to
+ * their node entities once at spawn so the clip player never looks a name up per frame.
+ * Attached to the asset root by `spawnAssembly`.
  */
 
 namespace visu::components;
 
+use visu::asset::Clip;
 use visu::ecs::Entity;
 
 public struct AssemblyInstance
@@ -12,10 +14,23 @@ public struct AssemblyInstance
     public string $id;
     public map<string, Entity> $nodes;
 
+    /**
+     * `targets[c][t]` is the entity clip `c`'s track `t` drives, `Entity::none()` for a track
+     * aimed elsewhere (a skin joint, say). Clip order is the assembly's.
+     */
+    public array<array<Entity>> $targets;
+
+    /**
+     * How many of clip `c`'s tracks drive a node. Zero means the node path can skip the clip.
+     */
+    public array<int32> $driven;
+
     public constructor(string $id)
     {
         $this->id = $id;
         $this->nodes = map<string, Entity>();
+        $this->targets = array<array<Entity>>();
+        $this->driven = array<int32>();
     }
 
     public const function node(const string& $name) : Entity?
@@ -25,5 +40,29 @@ public struct AssemblyInstance
         }
 
         return $this->nodes[$name];
+    }
+
+    /**
+     * Resolve every clip's tracks against `$nodes`. Spawn-time work.
+     */
+    public function bind(const array<Clip>& $clips) : void
+    {
+        $this->targets->clear();
+        $this->driven->clear();
+        foreach ($clips as $clip) {
+            array<Entity> $row = arr::room<Entity>($clip->tracks->count());
+            int32 $hits = 0;
+            foreach ($clip->tracks as $track) {
+                if ($this->nodes->has($track->node)) {
+                    $row[] = $this->nodes[$track->node];
+                    $hits = $hits + 1;
+                } else {
+                    $row[] = Entity::none();
+                }
+            }
+
+            $this->targets[] = $row;
+            $this->driven[] = $hits;
+        }
     }
 }

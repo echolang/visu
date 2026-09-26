@@ -1,0 +1,112 @@
+/**
+ * Open compute encoder on the scene command buffer. endCompute() must run; the destructor asserts
+ * it did. Uniforms are the frame ring at buffer index 2+N, storage buffers at 6+N, textures and
+ * samplers at N. Buffers are hazard tracked, so a later encoder that reads a written buffer
+ * waits for this one without a barrier.
+ */
+
+namespace visu::graphics;
+
+public class ComputeEncoder : ComputeEncoderProtocol
+{
+    private Device $device;
+    internal mtl::ComputeCommandEncoder $enc;
+    private ComputeProgram? $kernel;
+    private bool $ended;
+    private bool $labelled;
+
+    public constructor(Device $device, mtl::ComputeCommandEncoder $enc, bool $labelled)
+    {
+        $this->device = $device;
+        $this->enc = $enc;
+        $this->kernel = null;
+        $this->ended = false;
+        $this->labelled = $labelled;
+    }
+
+    destructor()
+    {
+        assert($this->ended, 'ComputeEncoder dropped without endCompute');
+    }
+
+    public function setKernel(ComputeProgram $kernel) : void
+    {
+        assert(!$this->ended, 'setKernel after endCompute');
+        assert(!$kernel->destroyed(), 'setKernel with a destroyed kernel');
+        mtl::ComputePipelineState $pso = $this->device->computePipeline($kernel);
+        $this->enc->setComputePipelineState($pso);
+        $this->kernel = $kernel;
+    }
+
+    public function bindUniform(uint32 $slot, TransientSlice $slice) : void
+    {
+        assert(!$this->ended, 'bindUniform after endCompute');
+        assert($slot < UNIFORM_SLOTS, 'uniform slot');
+        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
+        mtl::Buffer $ring = guard $this->device->slots[$this->device->slot]->ring->buffer else {
+            die('metal: uniform ring is empty');
+        }
+        $this->enc->setBuffer($ring, $slice->offset as uint32, index: METAL_UNIFORM_BASE + $slot);
+    }
+
+    public function upload<T>(const T& $params, slot: uint32 $slot = 0) : void
+    {
+        $this->bindUniform($slot, transientOf($this->device, $params));
+    }
+
+    public function bindTexture(uint32 $slot, Texture $texture, Sampler $sampler) : void
+    {
+        assert(!$this->ended, 'bindTexture after endCompute');
+        assert($slot < TEXTURE_SLOTS, 'texture slot');
+        if ($texture->state != ResourceState::shaderRead) {
+            die("bindTexture: '{$texture->desc->label}' is not shaderRead");
+        }
+        mtl::Texture $mt = guard $texture->handle->texture else {
+            die('metal: compute texture handle is empty');
+        }
+        mtl::SamplerState $ss = guard $sampler->handle->sampler else {
+            die('metal: compute sampler handle is empty');
+        }
+        $this->enc->setTexture($mt, index: $slot);
+        $this->enc->setSamplerState($ss, index: $slot);
+    }
+
+    public function bindStorage(uint32 $slot, Buffer $buffer, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'bindStorage after endCompute');
+        assert($slot < STORAGE_SLOTS, 'storage slot');
+        mtl::Buffer $buf = guard $buffer->handle->buffer else {
+            die('metal: storage buffer handle is empty');
+        }
+        $this->enc->setBuffer($buf, $offset as uint32, index: METAL_STORAGE_BASE + $slot);
+    }
+
+    public function dispatch(uint32 $x, uint32 $y = 1, uint32 $z = 1) : void
+    {
+        assert(!$this->ended, 'dispatch after endCompute');
+        ComputeProgram $kernel = guard $this->kernel else {
+            die('dispatch before setKernel');
+        }
+        if ($x == 0 || $y == 0 || $z == 0) {
+            return;
+        }
+
+        WorkgroupSize $g = $kernel->group;
+        $this->enc->dispatchThreads(
+            mtl::Size($x as usize, $y as usize, $z as usize),
+            mtl::Size($g->x as usize, $g->y as usize, $g->z as usize)
+        );
+    }
+
+    public function endCompute() : void
+    {
+        assert(!$this->ended, 'ComputeEncoder.endCompute twice');
+        $this->ended = true;
+        if ($this->labelled) {
+            $this->enc->popDebugGroup();
+        }
+
+        $this->enc->endEncoding();
+        $this->device->encoderClosed();
+    }
+}

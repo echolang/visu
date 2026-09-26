@@ -1,5 +1,6 @@
 /**
- * One compute shader module. Metal mints a compute PSO lazily on first `tessellateWith`.
+ * One compute shader module and its workgroup size. Each backend mints its compute pipeline
+ * lazily on first use (`ComputeEncoder.setKernel`, or Metal's `tessellateWith`).
  */
 
 namespace visu::graphics;
@@ -14,15 +15,21 @@ public class ComputeProgram : GpuObject
     public Device $device;
     public const uint32 $id;
     public const string $name;
+
+    /**
+     * Threads per workgroup, from the kernel's `local_size`.
+     */
+    public const WorkgroupSize $group;
     internal ShaderModuleHandle $cs;
     private bool $dead;
 
-    public constructor(Device $device, string $name, ShaderModuleHandle $cs)
+    public constructor(Device $device, string $name, ShaderModuleHandle $cs, WorkgroupSize $group)
     {
         $this->device = $device;
         $this->id = ComputeProgramIds::$next;
         ComputeProgramIds::$next = ComputeProgramIds::$next + 1;
         $this->name = $name;
+        $this->group = $group;
         $this->cs = $cs;
         $this->dead = false;
     }
@@ -35,13 +42,14 @@ public class ComputeProgram : GpuObject
     public static function link(
         Device $device,
         string $name,
-        const string& $bytes
+        const string& $bytes,
+        WorkgroupSize $group
     ) : result<ComputeProgram, ShaderError>
     {
         ShaderModuleHandle $cs = guard $device->createShaderModule(.compute, $bytes, "{$name}.comp") else ($e) {
             return .error(.compile($e->message()));
         }
-        return .ok(ComputeProgram($device, $name, $cs));
+        return .ok(ComputeProgram($device, $name, $cs, $group));
     }
 
     public function destroy() : void

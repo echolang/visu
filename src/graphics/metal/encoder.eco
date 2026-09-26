@@ -1,6 +1,6 @@
 /**
  * Open render encoder. endRender() must run; the destructor asserts it did.
- * Uniforms are the frame ring at buffer index 2+N.
+ * Uniforms are the frame ring at buffer index 2+N, storage buffers at 6+N.
  */
 
 namespace visu::graphics;
@@ -217,12 +217,7 @@ public class RenderEncoder : RenderEncoderProtocol
 
     public function upload<T>(const T& $params, slot: uint32 $slot = 0) : void
     {
-        uint64 $n = mem::size<T>() as uint64;
-        TransientSlice $slice = $this->device->allocTransient($n, $this->device->limits->uniformAlign);
-        T $local = $params;
-        ptr<const uint8> $src = ptr<const uint8>(&$local);
-        mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $n);
-        $this->bindUniform($slot, $slice);
+        $this->bindUniform($slot, transientOf($this->device, $params));
     }
 
     public function bindTexture(uint32 $slot, Texture $texture, Sampler $sampler) : void
@@ -235,6 +230,18 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->texHandles[$slot] = $texture->handle;
         $this->sampHandles[$slot] = $sampler->handle;
         $this->texturesDirty = true;
+    }
+
+    public function bindStorage(uint32 $slot, Buffer $buffer, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'bindStorage after endRender');
+        assert($slot < STORAGE_SLOTS, 'storage slot');
+        mtl::Buffer $buf = guard $buffer->handle->buffer else {
+            die('metal: storage buffer handle is empty');
+        }
+        uint32 $index = METAL_STORAGE_BASE + $slot;
+        $this->enc->setVertexBuffer($buf, $offset as uint32, index: $index);
+        $this->enc->setFragmentBuffer($buf, $offset as uint32, index: $index);
     }
 
     public function tessellateWith(ComputeProgram $kernel, uint32 $patchCount) : void
@@ -259,8 +266,9 @@ public class RenderEncoder : RenderEncoderProtocol
         mtl::Buffer $ring = guard $fs->ring->buffer else {
             die('metal: ring is empty');
         }
-        $compute->setBuffer($ring, $this->vertexTransientOff as uint32, index: 0);
-        $compute->setBuffer($ring, $facts->offset as uint32, index: 1);
+        // the kernel's set 2 bindings 0 (patches in) and 1 (factors out)
+        $compute->setBuffer($ring, $this->vertexTransientOff as uint32, index: METAL_STORAGE_BASE);
+        $compute->setBuffer($ring, $facts->offset as uint32, index: METAL_STORAGE_BASE + 1);
         uint32 $i = 0;
         while ($i < UNIFORM_SLOTS) {
             if ($this->uniformSet[$i]) {
@@ -270,9 +278,10 @@ public class RenderEncoder : RenderEncoderProtocol
             $i = $i + 1;
         }
 
+        WorkgroupSize $g = $kernel->group;
         $compute->dispatchThreads(
             mtl::Size($patchCount as usize, 1 as usize, 1 as usize),
-            mtl::Size(64 as usize, 1 as usize, 1 as usize)
+            mtl::Size($g->x as usize, $g->y as usize, $g->z as usize)
         );
         $this->tessFactorOff = $facts->offset;
         $this->tessFactorSet = true;

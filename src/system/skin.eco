@@ -1,0 +1,153 @@
+/**
+ * Poses every `SkinnedModel` from its animator's `AnimationPlayer`. Runs in render, after
+ * `AnimationSystem` advanced the playheads in update and before `ModelSystem.fill` packs the
+ * palette, and samples each clip `(1 - compensation)` of a step back, so the pose trails the
+ * interpolated `Transform` exactly. Preparation (skeleton lookup, pose arrays, clip bindings)
+ * happens when the component arrives, never inside a displayed frame.
+ * Cost: one pass over each skinned instance's tracks plus one matrix walk over its joints.
+ */
+
+namespace visu::system;
+
+use visu::app::info;
+use visu::asset::{Clip, Skeleton};
+use visu::components::{AnimationLayers, AnimationPlayer, SkinPose, SkinnedModel};
+use visu::ecs::{Entities, Entity, Schedule, System};
+use visu::graphics::{Model, ModelBank, RenderContext};
+
+public class SkinSystem : System
+{
+    public ModelBank $bank;
+
+    /**
+     * Seconds per update, the same step `AnimationSystem` advances by.
+     */
+    public float32 $dt;
+
+    /**
+     * Instances posed by the last render, for the console and tests.
+     */
+    public int32 $posed;
+    private int32 $attachHook;
+
+    public constructor(ModelBank $bank, float32 $dt = 0.016666668f)
+    {
+        $this->bank = $bank;
+        $this->dt = $dt;
+        $this->posed = 0;
+        $this->attachHook = -1;
+    }
+
+    /**
+     * Prepare what is already spawned, then every `SkinnedModel` attached later.
+     */
+    public function register(Entities $entities) : void
+    {
+        foreach ($entities->view<SkinnedModel>() as $id => &$skin) {
+            $this->prepare($entities, $id);
+        }
+
+        SkinSystem $sys = $this;
+        $this->attachHook = $entities->onAttach<SkinnedModel>(function(Entities $w, Entity $e, const SkinnedModel& $c) : void {
+            $sys->prepare($w, $e);
+        });
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+        if ($this->attachHook >= 0) {
+            $entities->releaseOnAttach($this->attachHook);
+            $this->attachHook = -1;
+        }
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->update = false;
+    }
+
+    public function update(Entities $entities) : void
+    {
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+        visu::profile::begin('skin');
+        float32 $lag = (1.0f - $ctx->compensation) * $this->dt;
+        $this->posed = 0;
+        foreach ($entities->view<SkinnedModel>() as $id => &$skin) {
+            SkinPose $pose = guard $skin->pose else {
+                continue;
+            }
+            Entity $animator = $skin->animator;
+            $pose->rest();
+            if ($animator != Entity::none() && $entities->has<AnimationPlayer>($animator)) {
+                AnimationPlayer& $player = $entities->get<AnimationPlayer>($animator);
+                if ($pose->binds->count() != $player->clips->count()) {
+                    // the animator's clip list was swapped; rebinding allocates, so it is logged
+                    info('skin: animator clips changed, rebinding');
+                    $pose->bind($player->clips);
+                }
+
+                posePlayer($pose, $player, $lag);
+            }
+
+            $pose->compose();
+            $this->posed = $this->posed + 1;
+        }
+
+        visu::profile::end();
+    }
+
+    /**
+     * Size the pose from the model's skeleton and bind the animator's clips. A model without a
+     * skeleton is logged and left unposed; `ModelSystem` then skips the instance.
+     */
+    public function prepare(Entities $entities, Entity $e) : void
+    {
+        if (!$entities->has<SkinnedModel>($e)) {
+            return;
+        }
+
+        SkinnedModel& $skin = $entities->get<SkinnedModel>($e);
+        if ($skin->pose != null) {
+            return;
+        }
+
+        string $id = $skin->model;
+        Entity $animator = $skin->animator;
+        Model $model = guard $this->bank->acquire($id) else ($err) {
+            string $why = $err->message();
+            info("skin: '{$id}' could not be loaded: {$why}");
+            return;
+        }
+        Skeleton $skeleton = guard $model->skeleton else {
+            info("skin: '{$id}' has no skeleton");
+            return;
+        }
+        array<Clip> $clips = array<Clip>();
+        if ($animator != Entity::none() && $entities->has<AnimationPlayer>($animator)) {
+            $clips = $entities->get<AnimationPlayer>($animator)->clips;
+        }
+
+        SkinPose $pose = SkinPose($skeleton, $clips);
+        $pose->compose();
+        SkinnedModel& $again = $entities->get<SkinnedModel>($e);
+        $again->pose = $pose;
+    }
+}
+
+/**
+ * The fading clip at full weight, then the current clip over it by the fade weight.
+ */
+internal function posePlayer(SkinPose $pose, const AnimationPlayer& $player, float32 $lag) : void
+{
+    AnimationLayers $layers = guard $player->layers($lag) else {
+        return;
+    }
+    if ($layers->fade >= 0) {
+        $pose->apply($layers->fade, $player->clips[$layers->fade as usize], $layers->fadeTime, 1.0f);
+    }
+
+    $pose->apply($layers->index, $player->clips[$layers->index as usize], $layers->time, $layers->weight);
+}

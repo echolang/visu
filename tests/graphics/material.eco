@@ -2,6 +2,7 @@
  * Material fills named slots from a cooked `.vmat` sheet.
  */
 
+use json;
 use std::env;
 use std::io;
 use visu::graphics::{Device, Material, Pixels};
@@ -189,4 +190,58 @@ test material_empty_id
     assert($mat->id->equals('missing/rock'), 'id');
     assert($mat->albedo == null, 'no albedo');
     assert(equal($mat->textureScale->x, 1.0f), 'default scale');
+}
+
+test material_parallax_defaults
+{
+    Material $mat = Material(id: 'missing/rock');
+    assert(equal($mat->parallaxDepth, 0.0f), 'no relief');
+    assert(equal($mat->parallaxSteps, 16.0f), 'default steps');
+    assert(equal($mat->parallaxFade, 30.0f), 'default fade');
+    assert(!$mat->parallax(), 'off without relief');
+}
+
+test material_parallax_needs_height
+{
+    json::Value $root = guard json::parse('{"parallaxDepth":0.02,"parallaxSteps":24,"parallaxFade":12}') else {
+        die('json');
+    }
+    Material $mat = Material(Vmat('flat/flat', $root));
+    assert(equal($mat->parallaxDepth, 0.02f), 'depth');
+    assert(equal($mat->parallaxSteps, 24.0f), 'steps');
+    assert(equal($mat->parallaxFade, 12.0f), 'fade');
+    assert(!$mat->parallax(), 'no height map, no march');
+}
+
+test material_parallax_with_height
+{
+    string $src = matTmp('pom-src');
+    mkdirMat($src);
+    string $ds = env::DS;
+    string $folder = "{$src}{$ds}cobble";
+    mkdirMat($folder);
+    writeMatDot("{$folder}{$ds}albedo.png", 1, 1);
+    writeMatDot("{$folder}{$ds}height.png", 1, 1);
+    guard io::writefile(
+        "{$folder}{$ds}cobble.vmat",
+        '{"albedo":"albedo","height":"height","parallaxDepth":0.03}'
+    ) else ($e) {
+        die($e->message());
+    }
+
+    string $out = matTmp('pom-out');
+    mkdirMat($out);
+    Kitchen $k = Kitchen();
+    $k->add(TextureCooker());
+    $k->add(MaterialCooker());
+    guard $k->cook($src, $out) else ($e) {
+        die($e->message());
+    }
+
+    Assets $assets = mountMat($out);
+    Material $mat = guard Material::load($assets, 'cobble/cobble') else ($e) {
+        die($e->message());
+    }
+    assert(equal($mat->parallaxDepth, 0.03f), 'depth survives the cook');
+    assert($mat->parallax(), 'relief and a height map march');
 }

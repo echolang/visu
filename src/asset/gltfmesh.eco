@@ -36,10 +36,17 @@ internal class GltfPrimitive
     public array<float32> $normals;
     public array<float32> $tangents;
     public array<float32> $uvs;
+
+    /**
+     * Four joint indices (already remapped to the cooked skeleton) and four weights per vertex.
+     */
+    public array<uint16> $joints;
+    public array<float32> $weights;
     public array<uint32> $indices;
     public bool $hasNormals;
     public bool $hasTangents;
     public bool $hasUvs;
+    public bool $hasSkin;
     public AABB $bounds;
 
     public constructor()
@@ -49,10 +56,13 @@ internal class GltfPrimitive
         $this->normals = array<float32>();
         $this->tangents = array<float32>();
         $this->uvs = array<float32>();
+        $this->joints = array<uint16>();
+        $this->weights = array<float32>();
         $this->indices = array<uint32>();
         $this->hasNormals = false;
         $this->hasTangents = false;
         $this->hasUvs = false;
+        $this->hasSkin = false;
         $this->bounds = AABB(Vec3(0.0f), Vec3(0.0f));
     }
 }
@@ -71,6 +81,28 @@ internal function gltfBuild(GltfFile $file, GltfParts $object) : result<CookedMo
  */
 internal function gltfBuild(GltfFile $file, GltfParts $object, const Mat4& $origin) : result<CookedModel, GltfError>
 {
+    return gltfBuild($file, $object, $origin, null);
+}
+
+/**
+ * With `$skin`, the object is skinned: vertices stay in mesh space (glTF ignores a skinned node's
+ * own transform), carry remapped joints and weights, and the model takes the skeleton. The
+ * bounds grow by a quarter about their centre so a limb that swings past the bind pose stays in.
+ */
+internal function gltfBuild(
+    GltfFile $file,
+    GltfParts $object,
+    const Mat4& $origin,
+    GltfSkinBuild? $skin
+) : result<CookedModel, GltfError>
+{
+    bool $skinned = $skin != null;
+    array<int32> $remap = array<int32>();
+    if ($skinned) {
+        GltfSkinBuild $build = guard $skin;
+        $remap = $build->remap;
+    }
+
     array<string> $slots = array<string>();
     array<GltfChunk> $chunks = array<GltfChunk>();
     array<AABB> $levelBounds = array<AABB>();
@@ -109,7 +141,15 @@ internal function gltfBuild(GltfFile $file, GltfParts $object, const Mat4& $orig
                 return .error($e);
             }
             int32 $slot = gltfSlot($file->materials, $prim->material, $slots);
-            gltfBake($data, inverse($origin) * $part->world);
+            if ($skinned) {
+                guard gltfRemapJoints($data, $remap, $prim->joints) else ($e) {
+                    return .error($e);
+                }
+                gltfBake($data, Mat4());
+            } else {
+                gltfBake($data, inverse($origin) * $part->world);
+            }
+
             AABB $box = $levelBounds[$part->level as usize];
             if (!$levelSeen[$part->level as usize]) {
                 $box = $data->bounds;
@@ -119,7 +159,12 @@ internal function gltfBuild(GltfFile $file, GltfParts $object, const Mat4& $orig
             }
 
             $levelBounds[$part->level as usize] = $box;
-            gltfAppendVertices($vertices, $data);
+            if ($skinned) {
+                gltfAppendSkinnedVertices($vertices, $data);
+            } else {
+                gltfAppendVertices($vertices, $data);
+            }
+
             GltfChunk $chunk = gltfChunk($chunks, $part->level, $slot);
             foreach ($data->indices as $index) {
                 $chunk->indices[] = $index + $vertexCount;
@@ -172,7 +217,46 @@ internal function gltfBuild(GltfFile $file, GltfParts $object, const Mat4& $orig
         $level = $level + 1;
     }
 
-    return .ok(CookedModel($slots, $lods, $bounds, 1.0f, 0.0f, $indexType, $vertices, $indices));
+    if (!$skinned) {
+        return .ok(CookedModel($slots, $lods, $bounds, 1.0f, 0.0f, $indexType, $vertices, $indices));
+    }
+
+    int32 $i = 0;
+    while (($i as usize) < $lods->count()) {
+        ModelLodDesc $grown = $lods[$i as usize];
+        $grown->bounds = $grown->bounds->scaled(1.25f);
+        $lods[$i as usize] = $grown;
+        $i = $i + 1;
+    }
+
+    GltfSkinBuild $build = guard $skin;
+    CookedModel $model = CookedModel($slots, $lods, $bounds->scaled(1.25f), 1.0f, 0.0f, $indexType, $vertices, $indices);
+    $model->format = MODEL_VERTEX_P3N3T4UV2J4W4;
+    $model->skeleton = $build->skeleton;
+    return .ok($model);
+}
+
+/**
+ * Rewrite glTF joint indices to cooked ones. A joint past the skin is an error.
+ */
+internal function gltfRemapJoints(GltfPrimitive $p, const array<int32>& $remap, int32 $accessor) : status<GltfError>
+{
+    if (!$p->hasSkin) {
+        return .error(.json('a skinned node has a primitive without JOINTS_0 / WEIGHTS_0'));
+    }
+
+    usize $i = 0;
+    while ($i < $p->joints->count()) {
+        uint16 $j = $p->joints[$i];
+        if (($j as usize) >= $remap->count()) {
+            return .error(.accessor($accessor, 'joint index past the skin'));
+        }
+
+        $p->joints[$i] = $remap[$j as usize] as uint16;
+        $i = $i + 1;
+    }
+
+    return .ok;
 }
 
 internal function gltfPartOrigin(GltfParts $object) : Mat4
@@ -283,6 +367,22 @@ internal function gltfReadPrimitive(GltfFile $file, GltfPrim $prim) : result<Glt
 
         $out->uvs = $uvs;
         $out->hasUvs = true;
+    }
+
+    if ($prim->joints >= 0 && $prim->weights >= 0) {
+        array<uint16> $joints = guard gltfReadJoints($file, $prim->joints) else ($e) {
+            return .error($e);
+        }
+        array<float32> $weights = guard gltfReadWeights($file, $prim->weights) else ($e) {
+            return .error($e);
+        }
+        if ($joints->count() != ($out->count as usize) * 4 || $weights->count() != ($out->count as usize) * 4) {
+            return .error(.accessor($prim->joints, 'JOINTS_0 / WEIGHTS_0 count does not match POSITION'));
+        }
+
+        $out->joints = $joints;
+        $out->weights = $weights;
+        $out->hasSkin = true;
     }
 
     if ($prim->indices >= 0) {
@@ -572,23 +672,31 @@ internal function gltfAppendVertices(string& $out, GltfPrimitive $p) : void
     $out->reserve($out->size() + ($p->count as usize) * (MODEL_VERTEX_BYTES as usize));
     int32 $v = 0;
     while ($v < $p->count) {
-        usize $i3 = ($v * 3) as usize;
-        usize $i4 = ($v * 4) as usize;
-        usize $i2 = ($v * 2) as usize;
-        putF32($out, $p->positions[$i3]);
-        putF32($out, $p->positions[$i3 + 1]);
-        putF32($out, $p->positions[$i3 + 2]);
-        putF32($out, $p->normals[$i3]);
-        putF32($out, $p->normals[$i3 + 1]);
-        putF32($out, $p->normals[$i3 + 2]);
-        putF32($out, $p->tangents[$i4]);
-        putF32($out, $p->tangents[$i4 + 1]);
-        putF32($out, $p->tangents[$i4 + 2]);
-        putF32($out, $p->tangents[$i4 + 3]);
-        putF32($out, $p->uvs[$i2]);
-        putF32($out, $p->uvs[$i2 + 1]);
+        gltfPutRigidVertex($out, $p, $v);
         $v = $v + 1;
     }
+}
+
+/**
+ * Position, normal, tangent and uv of vertex `$v`, the part every cooked layout starts with.
+ */
+internal function gltfPutRigidVertex(string& $out, GltfPrimitive $p, int32 $v) : void
+{
+    usize $i3 = ($v * 3) as usize;
+    usize $i4 = ($v * 4) as usize;
+    usize $i2 = ($v * 2) as usize;
+    putF32($out, $p->positions[$i3]);
+    putF32($out, $p->positions[$i3 + 1]);
+    putF32($out, $p->positions[$i3 + 2]);
+    putF32($out, $p->normals[$i3]);
+    putF32($out, $p->normals[$i3 + 1]);
+    putF32($out, $p->normals[$i3 + 2]);
+    putF32($out, $p->tangents[$i4]);
+    putF32($out, $p->tangents[$i4 + 1]);
+    putF32($out, $p->tangents[$i4 + 2]);
+    putF32($out, $p->tangents[$i4 + 3]);
+    putF32($out, $p->uvs[$i2]);
+    putF32($out, $p->uvs[$i2 + 1]);
 }
 
 internal function gltfAppendIndices(string& $out, const array<uint32>& $indices, IndexType $type) : void
@@ -600,4 +708,93 @@ internal function gltfAppendIndices(string& $out, const array<uint32>& $indices,
             putU32($out, $i);
         }
     }
+}
+
+/**
+ * The rigid layout, then joints as four bytes and weights as four unorm bytes. Weights are
+ * renormalized and the rounding error goes to the heaviest so they still sum to 255.
+ */
+internal function gltfAppendSkinnedVertices(string& $out, GltfPrimitive $p) : void
+{
+    $out->reserve($out->size() + ($p->count as usize) * (MODEL_SKINNED_VERTEX_BYTES as usize));
+    int32 $v = 0;
+    while ($v < $p->count) {
+        gltfPutRigidVertex($out, $p, $v);
+        usize $i4 = ($v * 4) as usize;
+        int32 $c = 0;
+        while ($c < 4) {
+            putU8($out, $p->joints[$i4 + ($c as usize)] as uint8);
+            $c = $c + 1;
+        }
+
+        uint8[4] $w = gltfQuantizeWeights(
+            $p->weights[$i4],
+            $p->weights[$i4 + 1],
+            $p->weights[$i4 + 2],
+            $p->weights[$i4 + 3]
+        );
+        putU8($out, $w[0]);
+        putU8($out, $w[1]);
+        putU8($out, $w[2]);
+        putU8($out, $w[3]);
+        $v = $v + 1;
+    }
+}
+
+/**
+ * Four weights to unorm bytes summing to exactly 255. All zero binds fully to the first joint.
+ */
+internal function gltfQuantizeWeights(float32 $a, float32 $b, float32 $c, float32 $d) : uint8[4]
+{
+    float32[4] $f;
+    $f[0] = $a;
+    $f[1] = $b;
+    $f[2] = $c;
+    $f[3] = $d;
+    float32 $sum = 0.0f;
+    int32 $k = 0;
+    while ($k < 4) {
+        if ($f[$k] < 0.0f) {
+            $f[$k] = 0.0f;
+        }
+
+        $sum = $sum + $f[$k];
+        $k = $k + 1;
+    }
+
+    uint8[4] $out;
+    if ($sum <= 0.000001f) {
+        $out[0] = 255;
+        $out[1] = 0;
+        $out[2] = 0;
+        $out[3] = 0;
+        return $out;
+    }
+
+    int32 $total = 0;
+    int32 $heaviest = 0;
+    $k = 0;
+    while ($k < 4) {
+        float32 $scaled = $f[$k] / $sum * 255.0f + 0.5f;
+        int32 $q = $scaled as int32;
+        if ($q > 255) {
+            $q = 255;
+        }
+
+        $out[$k] = $q as uint8;
+        $total = $total + $q;
+        if ($f[$k] > $f[$heaviest]) {
+            $heaviest = $k;
+        }
+
+        $k = $k + 1;
+    }
+
+    int32 $fixed = ($out[$heaviest] as int32) + (255 - $total);
+    if ($fixed < 0) {
+        $fixed = 0;
+    }
+
+    $out[$heaviest] = $fixed as uint8;
+    return $out;
 }

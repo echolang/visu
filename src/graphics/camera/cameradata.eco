@@ -150,6 +150,26 @@ public class CameraData
     }
 
     /**
+     * Where a world point lands on screen: x and y in 0..1 from the top-left corner, z the 0..1
+     * depth. Null behind the eye. A point beside the frustum still projects, outside 0..1, so a
+     * caller can clamp or drop it. The inverse of `ray`.
+     */
+    public const function project(Vec3 $world) : Vec3?
+    {
+        Vec4 $clip = $this->projectionView * Vec4($world, 1.0f);
+        if ($clip->w <= 0.000001f) {
+            return null;
+        }
+
+        float32 $inv = 1.0f / $clip->w;
+        return Vec3(
+            $clip->x * $inv * 0.5f + 0.5f,
+            0.5f - $clip->y * $inv * 0.5f,
+            $clip->z * $inv
+        );
+    }
+
+    /**
      * Eight world corners of the cull volume. 0..3 is the near rectangle, 4..7 the far, in the
      * same NDC order as the shadow slice (top-left, top-right, bottom-right, bottom-left).
      */

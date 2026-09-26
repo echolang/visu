@@ -1,0 +1,27 @@
+/**
+ * SamplerDesc cache keys and the device anisotropy clamp, no GPU.
+ */
+
+use visu::graphics::{SamplerDesc, anisotropyLevel};
+
+test sampler_key_splits_anisotropic
+{
+    SamplerDesc $plain = SamplerDesc();
+    $plain->min = .linearMipmapLinear;
+    $plain->wrapS = .repeat;
+    $plain->wrapT = .repeat;
+    SamplerDesc $aniso = $plain;
+    $aniso->anisotropic = true;
+    string $a = $plain->key();
+    string $b = $aniso->key();
+    assert($a != $b, 'an anisotropic sampler is its own cache entry');
+}
+
+test anisotropy_level_clamps_to_device
+{
+    assert(anisotropyLevel(16, 16) == 16, '16x on a 16x device');
+    assert(anisotropyLevel(16, 8) == 8, 'capped at the device limit');
+    assert(anisotropyLevel(4, 1) == 1, 'a device without anisotropy stays 1');
+    assert(anisotropyLevel(0, 16) == 1, 'off is 1, never 0');
+    assert(anisotropyLevel(-3, 16) == 1, 'negative is off');
+}

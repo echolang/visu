@@ -82,6 +82,12 @@ public struct SamplerDesc
     public Wrap $wrapT = .clampToEdge;
 
     /**
+     * Filter at the device's anisotropy level (`Device.setAnisotropy`). For tiled surface
+     * textures seen at a grazing angle: model maps, terrain layers. Off for UI, blits and G-buffer reads.
+     */
+    public bool $anisotropic = false;
+
+    /**
      * Device sampler cache key. A call inside a string hole is plain text, so the filter and wrap codes are locals.
      */
     public const function key() : string
@@ -90,7 +96,13 @@ public struct SamplerDesc
         int32 $mag = filterCode($this->mag);
         int32 $wrapS = wrapCode($this->wrapS);
         int32 $wrapT = wrapCode($this->wrapT);
-        return "{$min}|{$mag}|{$wrapS}|{$wrapT}";
+        int32 $aniso = 0;
+
+        if ($this->anisotropic) {
+            $aniso = 1;
+        }
+
+        return "{$min}|{$mag}|{$wrapS}|{$wrapT}|{$aniso}";
     }
 }
 
@@ -282,6 +294,8 @@ public struct DeviceLimits
     public uint64 $tessFactorAlign = 256;
     // false on MoltenVK: layered vkCmdBlitImage segfaults, so cubes and 2D arrays stay one mip
     public bool $layeredMipgen = true;
+    // highest anisotropy level an anisotropic sampler may use; 1 when the device has none
+    public int32 $maxAnisotropy = 1;
 }
 
 public enum AdapterKind
@@ -371,6 +385,24 @@ public function mipCount(int32 $width, int32 $height) : int32
     }
 
     return $count;
+}
+
+/**
+ * The anisotropy level a device applies for a wanted one: at least 1, at most the device's `$max`.
+ */
+internal function anisotropyLevel(int32 $wanted, int32 $max) : int32
+{
+    int32 $level = $wanted;
+
+    if ($level > $max) {
+        $level = $max;
+    }
+
+    if ($level < 1) {
+        $level = 1;
+    }
+
+    return $level;
 }
 
 internal function kindCode(TextureKind $kind) : int32

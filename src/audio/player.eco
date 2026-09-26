@@ -13,7 +13,7 @@ use visu::runtime::{Timer, defer, hasMain};
 
 public class MusicPlayer
 {
-    public const ma::Engine $engine;
+    private ma::Engine $engine;
     public float32 $fadeDuration = 2.0f;
     private map<string, Track> $tracks;
     private Track? $currentTrack;
@@ -123,6 +123,23 @@ public class MusicPlayer
         $cur->unload();
         $this->currentTrack = null;
         return .ok;
+    }
+
+    /**
+     * Stop the track and the audio device for good, before the process tears down. The device
+     * thread keeps calling into the mixer until the engine stops, so an app that exits with it
+     * running can crash on that thread after its main thread is gone.
+     */
+    public function close() : void
+    {
+        // stop the track first; a failed stop must not keep the device running
+        if ($this->stop()->failed()) {
+            warn('music: stop on close failed');
+        }
+
+        if ($this->engine->stop()->failed()) {
+            warn('music: audio device did not stop');
+        }
     }
 
     public function switchTo(string $name) : status<PlayerError>

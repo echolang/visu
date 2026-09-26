@@ -1,0 +1,27 @@
+/**
+ * The host reads a kernel's workgroup from its SPIR-V LocalSize, and says so when there is none.
+ */
+
+use std::io;
+use visu::graphics::{WorkgroupSize, spirvLocalSize};
+
+test spirv_local_size_reads_the_kernel
+{
+    string $spv = guard io::readfile('tests/resources/shaders/compute_fill.comp.spv') else ($e) {
+        die('compute_fill.comp.spv');
+    }
+    WorkgroupSize $g = guard spirvLocalSize($spv) else {
+        die('no local size');
+    }
+    assert($g->x == 16 && $g->y == 1 && $g->z == 1, 'local_size_x = 16');
+}
+
+test spirv_local_size_is_null_without_one
+{
+    string $vert = guard io::readfile('tests/resources/shaders/storage_quad.vert.spv') else ($e) {
+        die('storage_quad.vert.spv');
+    }
+    assert(spirvLocalSize($vert) == null, 'a vertex module has no local size');
+    assert(spirvLocalSize('not spir-v at all') == null, 'not spir-v');
+    assert(spirvLocalSize('') == null, 'empty');
+}

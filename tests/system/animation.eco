@@ -131,3 +131,42 @@ test animation_system_samples_named_node
     Quat $mid = Quat(angleAxis: std::math::PI_F32 / 4.0f, Vec3(0.0f, 1.0f, 0.0f));
     assert(equal($t->orientation, $mid, 0.01f), 'sampled at 0.5s');
 }
+
+internal function walkIdleClips() : array<Clip>
+{
+    array<Clip> $clips = turnClips();
+    array<AnimTrack> $none = array<AnimTrack>();
+    $clips[] = Clip('idle', 2.0f, $none);
+    return $clips;
+}
+
+test animation_player_fade_to_blends_then_settles
+{
+    AnimationPlayer $p = AnimationPlayer(walkIdleClips());
+    $p->fadeTo('idle', 0.25f);
+    assert($p->index == 1 && $p->playing, 'first fade is a hard cut');
+    assert($p->fadeFrom == -1, 'nothing to fade from');
+    assert(equal($p->weight(), 1.0f), 'full weight');
+
+    $p->fadeTo('turn', 0.5f);
+    assert($p->index == 0 && $p->fadeFrom == 1, 'fading from idle');
+    assert(equal($p->weight(), 0.0f), 'starts at zero');
+    $p->advance(0.25f);
+    assert(equal($p->weight(), 0.5f), 'half way');
+    assert(equal($p->weight(0.25f), 0.0f), 'a render a step back sees the start');
+    $p->fadeTo('turn', 0.5f);
+    assert($p->fadeFrom == 1, 'asking for the playing clip keeps the fade');
+    $p->advance(0.3f);
+    assert($p->fadeFrom == -1, 'fade finished');
+    assert(equal($p->weight(), 1.0f), 'settled');
+}
+
+test animation_player_sample_time_trails_by_lag
+{
+    AnimationPlayer $p = AnimationPlayer(turnClips());
+    $p->play('turn');
+    $p->advance(0.5f);
+    assert(equal($p->sampleTime(0.0f), 0.5f), 'no lag');
+    assert(equal($p->sampleTime(0.25f), 0.25f), 'lagged');
+    assert(equal($p->sampleTime(0.75f), 0.75f), 'wraps back into the loop');
+}

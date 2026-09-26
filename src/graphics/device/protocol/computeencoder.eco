@@ -1,0 +1,45 @@
+/**
+ * Open compute encoder checklist.
+ * Both backends write `: ComputeEncoderProtocol` so a missing method fails at the class.
+ * Not a stored interface value.
+ */
+
+namespace visu::graphics;
+
+public interface ComputeEncoderProtocol
+{
+
+    /**
+     * The kernel the next dispatch runs. Mints or reuses its compute pipeline.
+     */
+    function setKernel(ComputeProgram $kernel) : void;
+
+    /**
+     * Bind a typed payload at `$slot`, the same slots as a render encoder.
+     * Slice must be this frame's transient.
+     */
+    function bindUniform(uint32 $slot, TransientSlice $slice) : void;
+
+    /**
+     * Bind a sampled texture at `$slot`. The texture must already be shaderRead.
+     */
+    function bindTexture(uint32 $slot, Texture $texture, Sampler $sampler) : void;
+
+    /**
+     * Bind a storage buffer at `$slot` (GLSL `set = 2, binding = $slot`) for reads and writes.
+     * `$offset` is bytes into that buffer.
+     */
+    function bindStorage(uint32 $slot, Buffer $buffer, uint64 $offset = 0) : void;
+
+    /**
+     * Run the kernel over `$x * $y * $z` threads, not groups: the backend divides by the
+     * kernel's workgroup size and the kernel bounds-checks the tail. Needs setKernel first.
+     */
+    function dispatch(uint32 $x, uint32 $y = 1, uint32 $z = 1) : void;
+
+    /**
+     * Close the encoder. The destructor asserts you called this.
+     * Device only allows one open encoder at a time. Pairs with Device.beginCompute.
+     */
+    function endCompute() : void;
+}
