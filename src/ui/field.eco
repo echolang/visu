@@ -1,0 +1,237 @@
+/**
+ * Labeled text and number fields. Focus lives on Ui; printable ASCII plus backspace.
+ */
+
+namespace visu::ui;
+
+use visu::math::Vec2;
+use visu::os::input::Key;
+use visu::vg::Color;
+
+internal function uiTextField(Ui $ui, const string& $label, string& $value, const string& $id) : bool
+{
+    uint64 $wid = focusField($ui, $id, $label);
+    bool $focused = $ui->focusId == $wid;
+    bool $changed = false;
+
+    if ($focused) {
+        $changed = applyFieldChars($ui, $value);
+        $ui->consume();
+    }
+
+    pushFieldNode($ui, $wid, $label, $value, $focused);
+    return $changed;
+}
+
+internal function uiNumberField(
+    Ui $ui,
+    const string& $label,
+    float32& $value,
+    const string& $id,
+    int32 $decimals = 2
+) : bool
+{
+    uint64 $wid = focusField($ui, $id, $label);
+    bool $focused = $ui->focusId == $wid;
+    bool $changed = false;
+    // read after the click, which wrote this slot's press state
+    Slot $slot = $ui->slots[$wid];
+    FieldPersist $fp = fieldData($slot);
+
+    if ($focused) {
+        if (!$fp->armed) {
+            $fp->edit = "{$value}";
+            $fp->armed = true;
+        }
+
+        applyFieldChars($ui, $fp->edit);
+        $ui->consume();
+    } else if ($fp->armed) {
+        float64 $n = guard str::float($fp->edit) else {
+            $fp->armed = false;
+            setField($slot, $fp);
+            $ui->slots[$wid] = $slot;
+            pushFieldNode($ui, $wid, $label, $fp->edit, false);
+            return false;
+        }
+        $value = $n as float32;
+        $fp->armed = false;
+        $changed = true;
+    }
+
+    setField($slot, $fp);
+    $ui->slots[$wid] = $slot;
+    if ($fp->armed) {
+        pushFieldNode($ui, $wid, $label, $fp->edit, $focused);
+        return $changed;
+    }
+
+    // idle: the value formats into the frame arena, no string per frame
+    usize $from = $ui->arena->size();
+    appendFixed($ui->arena, $value, $decimals);
+    pushFieldNode($ui, $wid, $label, '', $focused, $arena: true, $from: $from, $to: $ui->arena->size());
+    return $changed;
+}
+
+/**
+ * The prologue every field shares: its id, a tab stop, and focus on click. Returns the id.
+ */
+internal function focusField(Ui $ui, const string& $id, const string& $label) : uint64
+{
+    uint64 $wid = $ui->makeId($id, $label);
+    $ui->focusables[] = $wid;
+
+    if ($ui->click($wid)) {
+        $ui->focusId = $wid;
+    }
+
+    return $wid;
+}
+
+internal function applyFieldChars(Ui $ui, string& $value) : bool
+{
+    bool $changed = false;
+    foreach ($ui->io->chars as $cp) {
+        int32 $code = $cp;
+        if ($code >= 32 && $code < 127) {
+            $value->push($code as uint8);
+            $changed = true;
+        }
+    }
+
+    if ($ui->pressedKey(Key::backspace) && $value->size() > 0) {
+        $value = $value->sub(0, $value->size() - 1);
+        $changed = true;
+    }
+
+    if ($ui->pressedKey(Key::enter) || $ui->pressedKey(Key::escape)) {
+        $ui->focusId = 0 as uint64;
+    }
+
+    return $changed;
+}
+
+internal function pushFieldNode(
+    Ui $ui,
+    uint64 $wid,
+    const string& $label,
+    const string& $text,
+    bool $focused,
+    bool $arena = false,
+    usize $from = 0,
+    usize $to = 0
+) : void
+{
+    int32 $p = $ui->fields->count() as int32;
+    $ui->fields[] = FieldRun($label, $text, $focused, $arena, $from, $to);
+    Node $n = Node();
+    $n->kind = .field;
+    $n->payload = $p;
+    $n->id = $wid;
+    FieldStyle $st = $ui->theme->field;
+    float32 $h = $st->height;
+    if (!$label->empty()) {
+        $h = $h + $ui->theme->labelHeight;
+    }
+
+    $n->measured = Vec2($st->width, $h);
+    $n->h = .fill;
+    $ui->push($n);
+}
+
+internal function emitFieldBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    FieldRun $run = $ui->fields[$n->payload as usize];
+    FieldStyle $st = $ui->theme->field;
+    float32 $labelH = 0.0f;
+    if (!$run->label->empty()) {
+        $labelH = $ui->theme->labelHeight;
+    }
+
+    Vec2 $box = Vec2($n->pos->x, $n->pos->y + $labelH);
+    Vec2 $size = Vec2($n->size->x, $st->height);
+    fillBox($ui, $box, $size, $st->radius, $st->bg, $pad);
+    Color $border = $st->border;
+    if ($run->focused) {
+        $border = $st->focusBorder;
+    }
+    strokeRing($ui, $box, $size, $st->radius, $border, $pad);
+}
+
+internal function emitFieldText(Ui $ui, const Node& $n) : visu::graphics::Texture?
+{
+    FieldRun $run = $ui->fields[$n->payload as usize];
+    FieldStyle $st = $ui->theme->field;
+    float32 $labelH = 0.0f;
+    if (!$run->label->empty()) {
+        paintText(
+            $ui,
+            $n->pos,
+            $run->label,
+            $ui->theme->labelFontSize,
+            $ui->theme->labelTextColor,
+            true,
+            false
+        );
+        $labelH = $ui->theme->labelHeight;
+    }
+
+    Vec2 $pos = Vec2($n->pos->x + $st->pad, $n->pos->y + $labelH + 6.0f);
+    Vec4 $clip = clipBox(
+        Vec2($n->pos->x + $st->pad, $n->pos->y + $labelH),
+        Vec2($n->size->x - $st->pad * 2.0f, $st->height)
+    );
+
+    if ($run->arena) {
+        return paintTextRange(
+            $ui, $pos, $ui->arena, $run->from, $run->to, $ui->theme->fontSize, $st->text, false, false, $clip, false
+        );
+    }
+
+    float32 $size = $ui->theme->fontSize;
+    visu::graphics::Texture? $tex = paintText($ui, $pos, $run->text, $size, $st->text, false, false, $clip, false);
+
+    if (!$run->focused) {
+        return $tex;
+    }
+
+    // the caret paints at the measured end of the text, so focus builds no string per frame
+    Vec2 $caret = Vec2($pos->x + $ui->measureText($run->text, $size, false)->x, $pos->y);
+    return paintText($ui, $caret, '|', $size, $st->text, false, false, $clip, false);
+}
+
+internal function advanceFocus(Ui $ui) : void
+{
+    if ($ui->focusId != (0 as uint64) && $ui->io->leftPressed) {
+        Slot $s = $ui->slots[$ui->focusId];
+        if (!contains($s->pos, $s->size, $ui->io->pointer)) {
+            $ui->focusId = 0 as uint64;
+        }
+    }
+
+    if (!$ui->pressedKey(Key::tab) || $ui->focusables->count() == 0) {
+        return;
+    }
+
+    usize $n = $ui->focusables->count();
+    usize $i = 0;
+    usize $found = $n;
+    while ($i < $n) {
+        if ($ui->focusables[$i] == $ui->focusId) {
+            $found = $i;
+            break;
+        }
+
+        $i = $i + 1;
+    }
+
+    usize $next = 0;
+    if ($found < $n) {
+        $next = $found + 1;
+        if ($next >= $n) {
+            $next = 0;
+        }
+    }
+
+    $ui->focusId = $ui->focusables[$next];
+}

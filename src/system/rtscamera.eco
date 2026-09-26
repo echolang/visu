@@ -48,13 +48,15 @@ public class RtsCameraSystem : System
         Transform& $transform = $entities->get<Transform>($active);
         InputHub $input = $this->input;
 
-        if ($input->unclaimed()) {
-            float32 $span = $rts->max;
-            if ($span < $rts->min) {
-                $span = $rts->min;
-            }
+        float32 $span = $rts->max;
+        if ($span < $rts->min) {
+            $span = $rts->min;
+        }
 
-            float32 $c = $rts->radius / $span;
+        float32 $c = $rts->radius / $span;
+
+        // keys stay live under a pointer-only claim (a hovered panel); Cmd/Ctrl chords are shortcuts, not movement
+        if ($input->keysFree() && !$input->primaryDown()) {
             float32 $speed = $c * $rts->focusSpeed;
             Vec3 $flat = projectOnPlane($transform->forward(), Transform::worldUp());
             if (length2(Vec3($flat->x, 0.0f, $flat->z)) > 0.0001f) {
@@ -79,10 +81,12 @@ public class RtsCameraSystem : System
             } else if ($input->down(.e)) {
                 $rts->spin->x = $rts->spin->x - $rts->keySpeed;
             }
+        }
 
-            bool $left = $input->down(button: .left) && !$input->hasBeenPressed(button: .left);
+        if ($input->unclaimed()) {
+            bool $right = $input->down(button: .right) && !$input->hasBeenPressed(button: .right);
             bool $middle = $input->down(button: .middle) && !$input->hasBeenPressed(button: .middle);
-            if ($left || $middle) {
+            if ($right || $middle) {
                 Vec2 $delta = $input->mouseDelta();
                 $rts->spin->x = $rts->spin->x + $delta->x * $rts->lookSpeed;
                 $rts->spin->y = $rts->spin->y + $delta->y * $rts->lookSpeed;

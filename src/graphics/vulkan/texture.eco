@@ -143,6 +143,10 @@ internal function vkDestroyTexture(Device $device, TextureHandle $handle) : void
 internal function vkUploadTexture(
     Device $device,
     Texture $texture,
+    int32 $x,
+    int32 $y,
+    int32 $width,
+    int32 $height,
     int32 $mip,
     int32 $layer,
     ptr<const uint8> $src,
@@ -152,17 +156,62 @@ internal function vkUploadTexture(
 {
     assert($device->logical->handle != 0, 'uploadTexture before initialize');
     assert(!$device->encoderOpen, 'uploadTexture with an open encoder');
-    assert($bytes > 0, 'uploadTexture size');
-    assert($layer >= 0 && $layer < $texture->layers(), 'uploadTexture layer');
     PixelFormat $fmt = $texture->desc->format;
     uint32 $bpp = pixelByteCount($fmt);
-    int32 $w = mipSize($texture->desc->width, $mip);
     uint64 $row = $bytesPerRow as uint64;
 
     if ($row == 0) {
-        $row = mipRowBytes($fmt, $w);
+        $row = mipRowBytes($fmt, $width);
     }
 
+    if ($device->inFrame) {
+        vkUploadRectInFrame(
+            $device,
+            $texture,
+            $x,
+            $y,
+            $width,
+            $height,
+            $mip,
+            $layer,
+            $src,
+            $row,
+            $bpp
+        );
+        return;
+    }
+
+    vkUploadRectOneShot(
+        $device,
+        $texture,
+        $x,
+        $y,
+        $width,
+        $height,
+        $mip,
+        $layer,
+        $src,
+        $bytes,
+        $row,
+        $bpp
+    );
+}
+
+internal function vkUploadRectOneShot(
+    Device $device,
+    Texture $texture,
+    int32 $x,
+    int32 $y,
+    int32 $width,
+    int32 $height,
+    int32 $mip,
+    int32 $layer,
+    ptr<const uint8> $src,
+    uint64 $bytes,
+    uint64 $row,
+    uint32 $bpp
+) : void
+{
     BufferHandle $staging = guard vkCreateBoundBuffer(
         $device,
         $bytes,
@@ -182,10 +231,103 @@ internal function vkUploadTexture(
 
     mem::copy<uint8>($mapped, ptr<uint8>($src:$), $bytes);
     vk::UnmapMemory($device->logical, $staging->memory);
-    vkOneShotCopyBufferToImage($device, $staging, $texture, $mip, $layer, $row, $bpp);
+    vkOneShotCopyBufferToImage(
+        $device,
+        $staging,
+        $texture,
+        $x,
+        $y,
+        $width,
+        $height,
+        $mip,
+        $layer,
+        $row,
+        $bpp
+    );
     $texture->state = .shaderRead;
     vk::DestroyBuffer($device->logical, $staging->buffer, null);
     vk::FreeMemory($device->logical, $staging->memory, null);
+}
+
+/**
+ * Staging from the frame host ring, recorded on the scene command buffer. No QueueWaitIdle.
+ * Bands that do not fit the remaining ring die the same way a uniform overflow does.
+ */
+internal function vkUploadRectInFrame(
+    Device $device,
+    Texture $texture,
+    int32 $x,
+    int32 $y,
+    int32 $width,
+    int32 $height,
+    int32 $mip,
+    int32 $layer,
+    ptr<const uint8> $src,
+    uint64 $srcRow,
+    uint32 $bpp
+) : void
+{
+    FrameSlot $slot = $device->slots[$device->slot];
+    HostRing $ring = $slot->ring;
+    vk::CommandBuffer $cmd = $device->currentCmd();
+    uint32 $aspect = vkAspect($texture->desc->format);
+    uint64 $tight = ($width as uint64) * ($bpp as uint64);
+    vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferDst, $aspect);
+    int32 $row0 = 0;
+    while ($row0 < $height) {
+        uint64 $left = $ring->remaining();
+        assert($left >= $tight, 'upload ring overflow');
+        int32 $rows = ($left / $tight) as int32;
+        int32 $want = $height - $row0;
+        if ($rows > $want) {
+            $rows = $want;
+        }
+
+        uint64 $bandBytes = ($rows as uint64) * $tight;
+        TransientSlice $slice = $ring->bump($bandBytes, 4, $device->slot);
+        // tightly packed rows are one run in the source too, so the band is one copy
+        int32 $r = 0;
+        if ($srcRow == $tight) {
+            ptr<uint8> $from = ptr<uint8>($src:$);
+            $from:$ = $from:$ + ((($row0 as uint64) * $tight) as isize);
+            mem::copy<uint8>($slice->data, $from, $bandBytes);
+            $r = $rows;
+        }
+
+        while ($r < $rows) {
+            ptr<uint8> $dst = $slice->data;
+            $dst:$ = $dst:$ + ((($r as uint64) * $tight) as isize);
+            ptr<uint8> $from = ptr<uint8>($src:$);
+            $from:$ = $from:$ + (((($row0 + $r) as uint64) * $srcRow) as isize);
+            mem::copy<uint8>($dst, $from, $tight);
+            $r = $r + 1;
+        }
+
+        vk::BufferImageCopy $region = vkFillBufferImageCopy(
+            $texture,
+            $x,
+            $y + $row0,
+            $width,
+            $rows,
+            $mip,
+            $layer,
+            $tight,
+            $bpp
+        );
+        $region->bufferOffset = $slice->offset;
+        vk::CmdCopyBufferToImage(
+            $cmd,
+            $ring->buffer,
+            $texture->handle->image,
+            vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &$region
+        );
+        $row0 = $row0 + $rows;
+    }
+
+    vkRecordBarrier($cmd, $texture->handle->image, .transferDst, .shaderRead, $aspect);
+    $texture->state = .shaderRead;
 }
 
 internal function vkReadbackTexture(

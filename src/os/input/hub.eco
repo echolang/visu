@@ -29,6 +29,7 @@ public class InputHub : WindowEventHandler
     private Window $window;
     private Dispatcher $dispatcher;
     private string? $context;
+    private ClaimScope $scope;
     private Vec2 $pointerPos;
     private bool $pointerSeeded;
     private Vec2 $pointerDownAt;
@@ -40,6 +41,11 @@ public class InputHub : WindowEventHandler
     private bool $pointerPressFrame;
     private bool $pointerReleaseFrame;
     private int32 $pointerMods;
+    /**
+     * One bit per held modifier key, left side in the low nibble and right side in the high
+     * one, so `mods()` answers without a lookup per key.
+     */
+    private int32 $modKeys;
     private map<int32, bool> $keyHeld;
     private map<int32, bool> $keyPress;
     private map<int32, bool> $keyRelease;
@@ -68,6 +74,7 @@ public class InputHub : WindowEventHandler
         $this->window = $window;
         $this->dispatcher = $dispatcher;
         $this->context = null;
+        $this->scope = .all;
         $this->pointerPos = Vec2(0.0f);
         $this->pointerSeeded = false;
         $this->pointerDownAt = Vec2(0.0f);
@@ -79,6 +86,7 @@ public class InputHub : WindowEventHandler
         $this->pointerPressFrame = false;
         $this->pointerReleaseFrame = false;
         $this->pointerMods = 0;
+        $this->modKeys = 0;
         $this->keyHeld = map<int32, bool>();
         $this->keyPress = map<int32, bool>();
         $this->keyRelease = map<int32, bool>();
@@ -115,6 +123,23 @@ public class InputHub : WindowEventHandler
     public const function down(button: MouseButton $button) : bool
     {
         return $this->buttonHeld->has($button->value());
+    }
+
+    /**
+     * Shift / Control / Alt / Super bits from the held modifier keys, same layout as `MOD_*`.
+     */
+    public const function mods() : int32
+    {
+        return ($this->modKeys | ($this->modKeys >> 4)) & MOD_CHORD_MASK;
+    }
+
+    /**
+     * The shortcut modifier is held (Command on macOS, Control elsewhere). Movement keys skip
+     * while it is, so Cmd+S does not also walk the camera back.
+     */
+    public const function primaryDown() : bool
+    {
+        return ($this->mods() & MOD_PRIMARY) == MOD_PRIMARY;
     }
 
     public const function up(Key $key) : bool
@@ -379,9 +404,26 @@ public class InputHub : WindowEventHandler
         $this->wheelFrame = Vec2(0.0f);
     }
 
+    /**
+     * Nothing holds the input. World pointer consumers (cameras, brushes) gate on this.
+     */
     public const function unclaimed() : bool
     {
         return $this->context == null;
+    }
+
+    /**
+     * Keys are free: nothing is claimed, or the holder took the pointer only. Keyboard
+     * consumers (camera keys, action maps) gate on this so a hovered panel does not eat
+     * hotkeys.
+     */
+    public const function keysFree() : bool
+    {
+        if ($this->context == null) {
+            return true;
+        }
+
+        return $this->scope == ClaimScope::pointer;
     }
 
     public const function holds(string $name) : bool
@@ -398,10 +440,20 @@ public class InputHub : WindowEventHandler
         return $this->context;
     }
 
-    public function claim(string $name) : status<InputError>
+    public const function claimScope() : ClaimScope?
+    {
+        if ($this->context == null) {
+            return null;
+        }
+
+        return $this->scope;
+    }
+
+    public function claim(string $name, scope: ClaimScope $scope = .all) : status<InputError>
     {
         string $by = guard $this->context else {
             $this->context = $name;
+            $this->scope = $scope;
             return .ok;
         }
 
@@ -409,13 +461,32 @@ public class InputHub : WindowEventHandler
     }
 
     /**
-     * Take the mutex from whoever holds it. Null when it was free or already ours.
+     * Widen or narrow a claim already held by `$name`.
+     */
+    public function rescope(string $name, ClaimScope $scope) : status<InputError>
+    {
+        string $held = guard $this->context else {
+            return .error(.notHeld($name, null));
+        }
+
+        if ($held != $name) {
+            return .error(.notHeld($name, $held));
+        }
+
+        $this->scope = $scope;
+        return .ok;
+    }
+
+    /**
+     * Take the mutex, pointer and keyboard both, from whoever holds it. Null when it was free
+     * or already ours.
      * FlyUI re-claims on the next hover once we release.
      */
     public function steal(string $name) : string?
     {
         string? $prev = $this->context;
         $this->context = $name;
+        $this->scope = .all;
         string $held = guard $prev else {
             return null;
         }
@@ -517,8 +588,10 @@ public class InputHub : WindowEventHandler
     private function applyKey(Key $key, int32 $scancode, KeyPhase $phase, int32 $mods) : void
     {
         int32 $id = $key->value();
+        int32 $modBit = modifierBit($key);
         if ($phase->down()) {
             $this->keyHeld[$id] = true;
+            $this->modKeys = $this->modKeys | $modBit;
         }
 
         if ($phase == KeyPhase::press) {
@@ -529,6 +602,7 @@ public class InputHub : WindowEventHandler
                 $this->keyHeld->remove($id);
             }
 
+            $this->modKeys = $this->modKeys & ($modBit ^ 0xFF);
             $this->keyRelease[$id] = true;
             $this->keyReleaseFrame[$id] = true;
         }
@@ -795,6 +869,25 @@ public class InputHub : WindowEventHandler
 
         return distance($posA, $posB);
     }
+}
+
+/**
+ * The `modKeys` bit for a modifier key: its `MOD_*` bit, shifted up a nibble for the right
+ * side. Zero for every other key.
+ */
+internal function modifierBit(Key $key) : int32
+{
+    return match ($key) {
+        Key::leftShift => MOD_SHIFT,
+        Key::leftControl => MOD_CONTROL,
+        Key::leftAlt => MOD_ALT,
+        Key::leftSuper => MOD_SUPER,
+        Key::rightShift => MOD_SHIFT << 4,
+        Key::rightControl => MOD_CONTROL << 4,
+        Key::rightAlt => MOD_ALT << 4,
+        Key::rightSuper => MOD_SUPER << 4,
+        else => 0,
+    };
 }
 
 internal function keyCodes(const array<int32>& $ids) : array<Key>

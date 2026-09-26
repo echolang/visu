@@ -1,0 +1,132 @@
+/**
+ * Clipped column with a wheel-driven offset stored on the slot.
+ */
+
+namespace visu::ui;
+
+use visu::math::Vec2;
+use visu::vg::Color;
+
+internal function uiBeginScroll(Ui $ui, float32 $maxHeight, const string& $id) : void
+{
+    uint64 $wid = $ui->makeId($id, 'scroll');
+    Slot $slot = $ui->slots[$wid];
+    ScrollPersist $sc = scrollData($slot);
+    bool $over = contains($slot->pos, $slot->size, $ui->io->pointer);
+    if ($over && $ui->io->scroll->y != 0.0f) {
+        $sc->offset = $sc->offset - $ui->io->scroll->y * 24.0f;
+        if ($sc->offset < 0.0f) {
+            $sc->offset = 0.0f;
+        }
+    }
+
+    setScroll($slot, $sc);
+    $ui->slots[$wid] = $slot;
+    Layout $l = Layout();
+    $l->flow = .vertical;
+    $l->h = .fill;
+    $l->v = .fixed;
+    $l->height = $maxHeight;
+    $ui->begin($l);
+    int32 $i = $ui->nodes->count() as int32 - 1;
+    $ui->nodes->at($i as usize)->kind = Kind::scroll;
+    $ui->nodes->at($i as usize)->id = $wid;
+}
+
+internal function uiEndScroll(Ui $ui) : void
+{
+    $ui->end();
+}
+
+internal function applyScroll(Ui $ui) : void
+{
+    usize $n = $ui->nodes->count();
+    usize $i = 0;
+    while ($i < $n) {
+        Node $node = $ui->nodes[$i];
+        if ($node->kind == Kind::scroll && $node->id != (0 as uint64)) {
+            Slot $s = $ui->slots[$node->id];
+            ScrollPersist $sc = scrollData($s);
+            float32 $content = scrollContentHeight($ui->nodes, $i as int32);
+            float32 $max = $content - $node->size->y;
+            if ($max < 0.0f) {
+                $max = 0.0f;
+            }
+
+            if ($sc->offset > $max) {
+                $sc->offset = $max;
+            }
+
+            if ($sc->offset < 0.0f) {
+                $sc->offset = 0.0f;
+            }
+
+            setScroll($s, $sc);
+            $ui->slots[$node->id] = $s;
+            if ($sc->offset != 0.0f) {
+                offsetSubtree($ui->nodes, $i as int32, 0.0f, -$sc->offset);
+            }
+        }
+
+        $i = $i + 1;
+    }
+}
+
+internal function scrollContentHeight(const array<Node>& $nodes, int32 $root) : float32
+{
+    Node $n = $nodes[$root as usize];
+    float32 $bottom = $n->pos->y;
+    int32 $c = $n->firstChild;
+    while ($c >= 0) {
+        Node $ch = $nodes[$c as usize];
+        float32 $b = $ch->pos->y + $ch->size->y;
+        if ($b > $bottom) {
+            $bottom = $b;
+        }
+
+        $c = $ch->next;
+    }
+
+    return $bottom - $n->pos->y;
+}
+
+internal function offsetSubtree(array<Node>& $nodes, int32 $root, float32 $dx, float32 $dy) : void
+{
+    int32 $c = $nodes[$root as usize]->firstChild;
+    while ($c >= 0) {
+        Node& $ch = $nodes->at($c as usize);
+        $ch->pos = Vec2($ch->pos->x + $dx, $ch->pos->y + $dy);
+        offsetSubtree($nodes, $c, $dx, $dy);
+        $c = $ch->next;
+    }
+}
+
+internal function emitScrollBox(Ui $ui, const Node& $n, int32 $index, float32 $pad) : void
+{
+    ScrollStyle $st = $ui->theme->scroll;
+    Slot $s = $ui->slots[$n->id];
+    ScrollPersist $sc = scrollData($s);
+    float32 $content = scrollContentHeight($ui->nodes, $index);
+    if ($content <= $n->size->y + 0.5f) {
+        return;
+    }
+
+    float32 $barW = $st->bar;
+    Vec2 $track = Vec2($n->pos->x + $n->size->x - $barW, $n->pos->y);
+    Vec2 $trackSize = Vec2($barW, $n->size->y);
+    fillBox($ui, $track, $trackSize, $barW * 0.5f, $st->track, $pad);
+    float32 $ratio = $n->size->y / $content;
+    float32 $thumbH = $n->size->y * $ratio;
+    if ($thumbH < 12.0f) {
+        $thumbH = 12.0f;
+    }
+
+    float32 $maxOff = $content - $n->size->y;
+    float32 $t = 0.0f;
+    if ($maxOff > 0.0f) {
+        $t = $sc->offset / $maxOff;
+    }
+
+    float32 $thumbY = $n->pos->y + ($n->size->y - $thumbH) * $t;
+    fillBox($ui, Vec2($track->x, $thumbY), Vec2($barW, $thumbH), $barW * 0.5f, $st->thumb, $pad);
+}

@@ -5,9 +5,19 @@
 
 namespace visu::ui;
 
-use visu::graphics::Texture;
+use visu::graphics::{ResourceState, Texture};
 use visu::math::{Vec2, Vec4};
 use visu::vg::{Color, Font, fontHandleOverflow, fontPack, quantizePx, snapPt, utf8Next};
+
+/**
+ * Move `$tex` to shader-read before it is bound; every textured emitter samples through this.
+ */
+internal function sampleable(Ui $ui, Texture $tex) : void
+{
+    if ($tex->state != ResourceState::shaderRead) {
+        $ui->device->transitionTexture($tex, .shaderRead);
+    }
+}
 
 internal function emitUi(Ui $ui) : void
 {
@@ -18,21 +28,21 @@ internal function emitUi(Ui $ui) : void
         return;
     }
     $white = $g->white;
-    int32 $first = $ui->batch->indices->count() as int32;
+    beginRun($ui->batch);
     emitBoxes($ui, 0);
-    closeDraw($ui->batch, $first, $white);
+    endRun($ui->batch);
     beginRun($ui->batch);
     emitGlyphs($ui, 0);
     endRun($ui->batch);
-    $first = $ui->batch->indices->count() as int32;
+    beginRun($ui->batch);
     emitOverlayBoxes($ui);
-    closeDraw($ui->batch, $first, $white);
+    endRun($ui->batch);
     beginRun($ui->batch);
     emitOverlayGlyphs($ui);
     endRun($ui->batch);
 
     if ($ui->outline) {
-        $first = $ui->batch->indices->count() as int32;
+        int32 $first = $ui->batch->indices->count() as int32;
         emitOutlines($ui, 0);
         closeDraw($ui->batch, $first, $white);
     }
@@ -72,7 +82,7 @@ internal function clipBox(Vec2 $pos, Vec2 $size) : Vec4
 
 internal function fillBox(Ui $ui, Vec2 $pos, Vec2 $size, float32 $r, Color $color, float32 $pad) : void
 {
-    emitBox($ui->batch, $pos, $size, $r, $color, noClip(), $pad);
+    emitBox($ui->batch, $pos, $size, $r, $color, $ui->clip, $pad);
 }
 
 internal function strokeRing(
@@ -102,6 +112,10 @@ internal function outlineColor(Kind $kind) : Color
         Kind::image => Color(0.95f, 0.55f, 0.2f, 0.95f),
         Kind::progress => Color(0.3f, 0.75f, 0.45f, 0.95f),
         Kind::spinner => Color(0.95f, 0.8f, 0.2f, 0.95f),
+        Kind::field => Color(0.2f, 0.75f, 0.95f, 0.95f),
+        Kind::separator => Color(0.7f, 0.7f, 0.7f, 0.7f),
+        Kind::scroll => Color(0.55f, 0.4f, 0.95f, 0.95f),
+        Kind::iconButton => Color(0.2f, 0.9f, 0.4f, 0.95f),
     };
 }
 
@@ -125,8 +139,11 @@ internal function emitBoxes(Ui $ui, int32 $i) : void
 {
     Node $n = $ui->nodes[$i as usize];
     float32 $pad = aaPad($ui);
+    fadeFor($ui, $n);
 
-    if ($n->bg->a > 0.0f) {
+    if ($n->skin >= 0) {
+        emitNineSlice($ui, $n->pos, $n->size, $ui->skins[$n->skin as usize]);
+    } else if ($n->bg->a > 0.0f) {
         fillBox($ui, $n->pos, $n->size, $n->radius, $n->bg, $pad);
     }
 
@@ -155,9 +172,26 @@ internal function emitBoxes(Ui $ui, int32 $i) : void
         Kind::spinner => {
             emitSpinnerBox($ui, $n, $pad);
         },
+        Kind::field => {
+            emitFieldBox($ui, $n, $pad);
+        },
+        Kind::separator => {
+            emitSeparatorBox($ui, $n, $pad);
+        },
+        Kind::scroll => {
+            emitScrollBox($ui, $n, $i, $pad);
+        },
+        Kind::iconButton => {
+            emitIconButtonBox($ui, $n, $pad);
+        },
         else => {
         },
     };
+
+    Vec4 $prev = $ui->clip;
+    if ($n->kind == Kind::scroll) {
+        $ui->clip = clipBox($n->pos, $n->size);
+    }
 
     int32 $c = $n->firstChild;
 
@@ -165,18 +199,28 @@ internal function emitBoxes(Ui $ui, int32 $i) : void
         emitBoxes($ui, $c);
         $c = $ui->nodes[$c as usize]->next;
     }
+
+    $ui->clip = $prev;
 }
 
 internal function emitGlyphs(Ui $ui, int32 $i) : void
 {
     Node $n = $ui->nodes[$i as usize];
+    fadeFor($ui, $n);
     emitNodeGlyphs($ui, $n);
+    Vec4 $prev = $ui->clip;
+    if ($n->kind == Kind::scroll) {
+        $ui->clip = clipBox($n->pos, $n->size);
+    }
+
     int32 $c = $n->firstChild;
 
     while ($c >= 0) {
         emitGlyphs($ui, $c);
         $c = $ui->nodes[$c as usize]->next;
     }
+
+    $ui->clip = $prev;
 }
 
 internal function emitOverlayBoxes(Ui $ui) : void
@@ -184,6 +228,7 @@ internal function emitOverlayBoxes(Ui $ui) : void
     usize $n = $ui->overlays->count();
     usize $i = 0;
     float32 $pad = aaPad($ui);
+    $ui->batch->fade = 1.0f;
 
     while ($i < $n) {
         int32 $idx = $ui->overlays[$i];
@@ -191,6 +236,8 @@ internal function emitOverlayBoxes(Ui $ui) : void
         emitSelectOverlayBox($ui, $node, $pad);
         $i = $i + 1;
     }
+
+    emitTooltipBox($ui, $pad);
 }
 
 internal function emitOverlayGlyphs(Ui $ui) : void
@@ -204,6 +251,8 @@ internal function emitOverlayGlyphs(Ui $ui) : void
         emitSelectOverlayGlyphs($ui, $node);
         $i = $i + 1;
     }
+
+    emitTooltipGlyphs($ui);
 }
 
 internal function emitNodeGlyphs(Ui $ui, const Node& $n) : void
@@ -246,12 +295,52 @@ internal function emitNodeGlyphs(Ui $ui, const Node& $n) : void
     if ($n->kind == Kind::progress || $n->kind == Kind::spinner) {
         return;
     }
+
+    if ($n->kind == Kind::field) {
+        emitFieldText($ui, $n);
+        return;
+    }
+
+    if ($n->kind == Kind::iconButton) {
+        emitIconButton($ui, $n);
+        return;
+    }
+}
+
+/**
+ * Disabled nodes emit faded. Set per node, so a sibling after a disabled run is back to full.
+ */
+internal function fadeFor(Ui $ui, const Node& $n) : void
+{
+    if ($n->dim) {
+        $ui->batch->fade = $ui->theme->disabledAlpha;
+    } else {
+        $ui->batch->fade = 1.0f;
+    }
 }
 
 internal function emitTextRun(Ui $ui, const Node& $n) : Texture?
 {
     TextRun $run = $ui->texts[$n->payload as usize];
-    return paintText($ui, $n->pos, $run->text, $run->size, $run->color, $run->bold, false);
+
+    if ($run->arena) {
+        return paintTextRange(
+            $ui, $n->pos, $ui->arena, $run->from, $run->to, $run->size, $run->color, $run->bold, false
+        );
+    }
+
+    return paintTextRange(
+        $ui,
+        $n->pos,
+        $run->text,
+        0,
+        $run->text->size(),
+        $run->size,
+        $run->color,
+        $run->bold,
+        false,
+        upper: $run->upper
+    );
 }
 
 internal function paintText(
@@ -266,18 +355,40 @@ internal function paintText(
     bool $middle = false
 ) : Texture?
 {
+    return paintTextRange($ui, $pos, $s, 0, $s->size(), $size, $color, $bold, $center, $clip, $middle);
+}
+
+/**
+ * `paintText` over the bytes `[from, to)` of `$s`: arena runs (numbers, readouts) share one
+ * buffer per frame.
+ */
+internal function paintTextRange(
+    Ui $ui,
+    Vec2 $pos,
+    const string& $s,
+    usize $from,
+    usize $to,
+    float32 $size,
+    Color $color,
+    bool $bold,
+    bool $center,
+    Vec4 $clip = Vec4(0.0f),
+    bool $middle = false,
+    upper: bool $upper = false
+) : Texture?
+{
     Font $font = guard uiFont($ui, $bold) else {
         return null;
     }
 
-    if ($s->size() == 0) {
+    if ($to <= $from) {
         return null;
     }
 
     float32 $scale = $ui->scale;
     float32 $px = quantizePx($size * $scale);
     float32 $inv = 1.0f / $scale;
-    float32 $widthPx = visu::vg::textWidth($font, $px, $s);
+    float32 $widthPx = visu::vg::textWidthRange($font, $px, $s, $from, $to, $upper);
     float32 $originX = $pos->x;
     float32 $originY = $pos->y;
 
@@ -300,8 +411,8 @@ internal function paintText(
     float32 $fs = visu::vg::fontScale($font, $px);
     float32 $pen = 0.0f;
     int32 $prev = -1;
-    usize $i = 0;
-    usize $n = $s->size();
+    usize $i = $from;
+    usize $n = $to;
     float32 $aw = $font->atlasW as float32;
     float32 $ah = $font->atlasH as float32;
 
@@ -315,6 +426,10 @@ internal function paintText(
 
     while ($i < $n) {
         int32 $cp = utf8Next($s, $i);
+
+        if ($upper) {
+            $cp = visu::vg::asciiUpper($cp);
+        }
 
         if ($cp <= 0) {
             continue;

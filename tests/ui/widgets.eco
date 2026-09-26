@@ -4,7 +4,7 @@
 
 use visu::graphics::Device;
 use visu::math::{Vec2, equal};
-use visu::ui::{Choice, Kind, Node, Ui, mixId, selectData, selectIsOpen};
+use visu::ui::{Choice, Kind, Layout, Node, Ui, appendFixed, mixId, selectData, selectIsOpen};
 use visu::vg::Color;
 
 test ui_begin_frame_maps_pointer_into_layout_space
@@ -700,6 +700,430 @@ test ui_spinner_is_square
     Node $spin = firstKind($ui, Kind::spinner);
     assert(equal($spin->measured->x, $spin->measured->y), 'square');
     assert($spin->measured->x == $ui->theme->spinner->size, 'size');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_text_field_appends_seeded_chars
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    string $name = 'ab';
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->textField('Name', &$name);
+    $ui->endFrame();
+    Node $field = firstKind($ui, Kind::field);
+    Vec2 $mid = Vec2($field->pos->x + $field->size->x * 0.5f, $field->pos->y + $field->size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->textField('Name', &$name);
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    array<int32> $chars = array<int32>();
+    $chars[] = 99;
+    $ui->seedChars($chars);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    bool $changed = $ui->textField('Name', &$name);
+    $ui->endFrame();
+    assert($changed, 'changed');
+    assert($name == 'abc', 'appended');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_number_field_focuses_on_click_and_commits_on_blur
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    float32 $v = 1.5f;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->numberField('Radius', &$v);
+    $ui->endFrame();
+    Node $field = firstKind($ui, Kind::field);
+    assert($ui->fields[0]->arena, 'idle shows the arena readout');
+    Vec2 $mid = Vec2($field->pos->x + $field->size->x * 0.5f, $field->pos->y + $field->size->y * 0.5f);
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->numberField('Radius', &$v);
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->numberField('Radius', &$v);
+    $ui->endFrame();
+    assert($ui->fields[0]->focused, 'click focuses');
+    assert(!$ui->fields[0]->arena, 'focused edits the raw text');
+    $ui->seed(Vec2(390.0f, 190.0f), true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->numberField('Radius', &$v);
+    $ui->endFrame();
+    $ui->seed(Vec2(390.0f, 190.0f), false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    bool $changed = $ui->numberField('Radius', &$v);
+    $ui->endFrame();
+    assert($changed, 'blur commits');
+    assert(equal($v, 1.5f), 'value kept');
+    assert($ui->fields[0]->arena, 'idle again');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_modal_closed_skips_contents
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    bool $open = false;
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    if ($ui->beginModal('New map', &$open)) {
+        $ui->button('Create');
+        $ui->endModal();
+    }
+
+    $ui->endFrame();
+    assert($ui->nodes->count() == 1, 'root only');
+    $open = true;
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    if ($ui->beginModal('New map', &$open)) {
+        $ui->button('Create');
+        $ui->endModal();
+    }
+
+    $ui->endFrame();
+    firstKind($ui, Kind::button);
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_separator_is_a_node
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginColumn();
+    $ui->separator();
+    $ui->end();
+    $ui->endFrame();
+    Node $sep = firstKind($ui, Kind::separator);
+    assert($sep->size->x > 0.0f, 'wide');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_solid_card_padding_hovers
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->beginCard(200.0f);
+    $ui->text('Tools');
+    $ui->end();
+    $ui->endFrame();
+    Node $card = $ui->nodes[1];
+    assert($card->solid, 'card is solid');
+    Vec2 $pad = Vec2($card->pos->x + 2.0f, $card->pos->y + 2.0f);
+    $ui->seed($pad, false, false, false);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->beginCard(200.0f);
+    $ui->text('Tools');
+    $ui->end();
+    $ui->endFrame();
+    assert($ui->hoverAny, 'padding takes the pointer');
+    $ui->seed(Vec2(390.0f, 390.0f), false, false, false);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->beginCard(200.0f);
+    $ui->text('Tools');
+    $ui->end();
+    $ui->endFrame();
+    assert(!$ui->hoverAny, 'outside is free');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_bare_layout_is_not_solid
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->seed(Vec2(10.0f, 10.0f), false, false, false);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    Layout $l = Layout();
+    $l->v = .fill;
+    $ui->begin($l);
+    $ui->text('hud');
+    $ui->end();
+    $ui->endFrame();
+    assert(!$ui->nodes[1]->solid, 'no bg, no skin');
+    assert(!$ui->hoverAny, 'full-screen root does not block the world');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_explicit_solid_overrides_bg
+{
+    Layout $l = Layout();
+    assert(!$l->blocks(), 'bare');
+    $l->bg = Color(0.0f, 0.0f, 0.0f, 0.5f);
+    assert($l->blocks(), 'bg');
+    $l->solid = false;
+    assert(!$l->blocks(), 'forced off');
+}
+
+test ui_slider_drag_holds_hover_off_the_widget
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    float32 $value = 0.5f;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->slider('', &$value, min: 0.0f, max: 1.0f, id: 's');
+    $ui->endFrame();
+    Node $sl = firstKind($ui, Kind::slider);
+    Vec2 $at = Vec2($sl->pos->x + 4.0f, $sl->pos->y + $sl->size->y * 0.5f);
+    $ui->seed($at, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->slider('', &$value, min: 0.0f, max: 1.0f, id: 's');
+    $ui->endFrame();
+    $ui->seed(Vec2(390.0f, 190.0f), false, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->slider('', &$value, min: 0.0f, max: 1.0f, id: 's');
+    $ui->endFrame();
+    assert($ui->hoverAny, 'drag keeps the pointer');
+    $ui->seed(Vec2(390.0f, 190.0f), false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->slider('', &$value, min: 0.0f, max: 1.0f, id: 's');
+    $ui->endFrame();
+    assert($ui->hoverAny, 'the release frame still belongs to the drag');
+    $ui->seed(Vec2(390.0f, 190.0f), false, false, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->slider('', &$value, min: 0.0f, max: 1.0f, id: 's');
+    $ui->endFrame();
+    assert(!$ui->hoverAny, 'released');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+function fixed(float32 $v, int32 $d) : string
+{
+    string $s = '';
+    appendFixed($s, $v, $d);
+    return $s;
+}
+
+test ui_append_fixed_formats_without_rounding_drift
+{
+    assert(fixed(0.0f, 0) == '0', 'zero');
+    assert(fixed(12.345f, 1) == '12.3', 'one place');
+    assert(fixed(12.35f, 1) == '12.4', 'half up');
+    assert(fixed(-3.5f, 2) == '-3.50', 'negative padded');
+    assert(fixed(-0.001f, 1) == '0.0', 'negative zero drops the sign');
+    assert(fixed(0.05f, 2) == '0.05', 'leading zero in the fraction');
+    assert(fixed(1204.0f, 0) == '1204', 'integer');
+    assert(fixed(7.0f, 9) == '7.000000', 'decimals capped');
+    assert(fixed(1000000000000000000000.0f, 1) == 'inf', 'overflow');
+}
+
+test ui_number_measures_like_text
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->number(20.25f, decimals: 1, unit: ' m');
+    $ui->text('20.3 m');
+    $ui->endFrame();
+    assert(equal($ui->nodes[1]->measured->x, $ui->nodes[2]->measured->x), 'same width');
+    assert($ui->arena == '20.3 m', 'arena');
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->endFrame();
+    assert($ui->arena->empty(), 'cleared per frame');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_slider_readout_and_fill
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    float32 $r = 20.0f;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginColumn();
+    $ui->slider('', &$r, min: 2.0f, max: 200.0f, id: 'r', readout: 1, unit: ' m', fill: true);
+    $ui->end();
+    $ui->endFrame();
+    Node $sl = firstKind($ui, Kind::slider);
+    assert(equal($sl->size->x, 400.0f), 'fills the column');
+    assert($sl->size->y > $ui->theme->slider->height, 'readout adds the label row');
+    assert($ui->arena == '20.0 m', 'readout text');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_button_group_pools_choices
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $a = array<Choice>();
+    $a[] = Choice('raise', 'Raise');
+    $a[] = Choice('lower', 'Lower');
+    string $sel = 'raise';
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->buttonGroup('A', $a, &$sel);
+    $ui->buttonGroup('B', $a, &$sel);
+    $ui->endFrame();
+    assert($ui->choicePool->count() == 4, 'both groups in one pool');
+    assert($ui->groups[1]->first == 2, 'second range');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_disabled_button_never_clicks_and_fades
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginDisabled(true);
+    $ui->button('Undo');
+    $ui->endDisabled();
+    $ui->button('Save');
+    $ui->endFrame();
+    Node $undo = firstKind($ui, Kind::button);
+    assert($undo->dim, 'dim');
+    assert(!$ui->nodes[2]->dim, 'scope ends');
+    Vec2 $mid = Vec2($undo->pos->x + 4.0f, $undo->pos->y + 4.0f);
+    bool $hit = false;
+    $ui->seed($mid, true, false, true);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginDisabled(true);
+    $hit = $hit || $ui->button('Undo');
+    $ui->endDisabled();
+    $ui->button('Save');
+    $ui->endFrame();
+    $ui->seed($mid, false, true, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginDisabled(true);
+    $hit = $hit || $ui->button('Undo');
+    $ui->endDisabled();
+    $ui->button('Save');
+    $ui->endFrame();
+    assert(!$hit, 'no click');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_separator_turns_vertical_in_a_row
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->beginRow();
+    $ui->space(20.0f, 30.0f);
+    $ui->separator();
+    $ui->space(20.0f, 30.0f);
+    $ui->end();
+    $ui->endFrame();
+    Node $sep = firstKind($ui, Kind::separator);
+    assert(equal($sep->size->y, 30.0f), 'spans the row height');
+    assert($sep->size->x < 12.0f, 'thin');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_tooltip_waits_for_the_delay
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->theme->tooltip->delay = 0.0f;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Save');
+    $ui->tooltip('Save map', shortcut: 'Cmd+S');
+    $ui->endFrame();
+    assert(!$ui->tip->show, 'no hover yet');
+    Node $btn = firstKind($ui, Kind::button);
+    $ui->seed(Vec2($btn->pos->x + 2.0f, $btn->pos->y + 2.0f), false, false, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Save');
+    $ui->tooltip('Save map', shortcut: 'Cmd+S');
+    $ui->endFrame();
+    assert($ui->tip->show, 'shown after the delay');
+    assert($ui->tip->size->x > 0.0f, 'placed');
+    $ui->theme->tooltip->delay = 60.0f;
+    $ui->seed(Vec2(390.0f, 190.0f), false, false, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Save');
+    $ui->tooltip('Save map');
+    $ui->endFrame();
+    $ui->seed(Vec2($btn->pos->x + 2.0f, $btn->pos->y + 2.0f), false, false, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Save');
+    $ui->tooltip('Save map');
+    $ui->endFrame();
+    assert(!$ui->tip->show, 'leaving resets the rest timer');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_tooltip_remeasures_when_its_text_changes
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->theme->tooltip->delay = 0.0f;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Save');
+    $ui->endFrame();
+    Node $btn = firstKind($ui, Kind::button);
+    $ui->seed(Vec2($btn->pos->x + 2.0f, $btn->pos->y + 2.0f), false, false, false);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Save');
+    $ui->tooltip('Save the map');
+    $ui->endFrame();
+    float32 $long = $ui->tip->size->x;
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Save');
+    $ui->tooltip('Save');
+    $ui->endFrame();
+    assert($ui->tip->size->x < $long, 'same widget, shorter text');
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Save');
+    $ui->tooltip('Save', shortcut: 'Cmd+S');
+    $ui->endFrame();
+    assert($ui->tip->keyW > 0.0f, 'shortcut measured');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_panel_card_uses_the_panel_style
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->theme->card->pad = visu::ui::Edges::all(20.0f);
+    $ui->theme->panel->pad = visu::ui::Edges::all(3.0f);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->beginCard();
+    $ui->space(10.0f, 10.0f);
+    $ui->end();
+    $ui->beginCard(style: .panel);
+    $ui->space(10.0f, 10.0f);
+    $ui->end();
+    $ui->endFrame();
+    Node $card = $ui->nodes[1];
+    Node $panel = $ui->nodes[3];
+    assert(equal($card->size->x, 50.0f) && equal($card->size->y, 50.0f), 'card pads 20');
+    assert(equal($panel->size->x, 16.0f) && equal($panel->size->y, 16.0f), 'panel pads 3');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_apply_generals_derives_widget_colours_and_keeps_pads_it_owns
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    Color $paper = Color(0.9f, 0.85f, 0.7f, 1.0f);
+    Color $wine = Color(0.5f, 0.1f, 0.15f, 1.0f);
+    $ui->theme->surface = $paper;
+    $ui->theme->accent = $wine;
+    $ui->theme->applyGenerals();
+    assert(equal($ui->theme->checkbox->knob->r, 0.9f), 'knob is the surface');
+    assert(equal($ui->theme->checkbox->activeTrack->r, 0.5f), 'on track is the accent');
+    assert(equal($ui->theme->card->bg->g, 0.85f), 'card is the surface');
+    assert(equal($ui->theme->panel->bg->g, 0.85f), 'panel is the surface');
+    assert(equal($ui->theme->iconButton->selectedBg->b, 0.15f), 'selected icon is the accent');
+    assert($ui->theme->panel->pad->left < $ui->theme->card->pad->left, 'panel is tighter');
     $ui->destroy();
     $device->shutdown();
 }

@@ -743,17 +743,36 @@ internal function utf8Next(const string& $s, usize& $i) : int32
 
 internal function textWidth(Font $font, float32 $px, const string& $s) : float32
 {
+    return textWidthRange($font, $px, $s, 0, $s->size());
+}
+
+/**
+ * Width of the bytes `[from, to)`. `to` must end on a character boundary.
+ */
+internal function textWidthRange(
+    Font $font,
+    float32 $px,
+    const string& $s,
+    usize $from,
+    usize $to,
+    bool $upper = false
+) : float32
+{
     float32 $scale = fontScale($font, $px);
     float32 $pen = 0.0f;
     int32 $prev = -1;
-    usize $i = 0;
-    usize $n = $s->size();
+    usize $i = $from;
+    usize $n = $to;
 
     while ($i < $n) {
         int32 $cp = utf8Next($s, $i);
 
         if ($cp <= 0) {
             continue;
+        }
+
+        if ($upper) {
+            $cp = asciiUpper($cp);
         }
 
         int32 $g = fontIndex($font, $cp);
@@ -965,4 +984,17 @@ internal function emitGlyphQuad(
     $mesh->indices[] = $base;
     $mesh->indices[] = ($base + 2) as uint32;
     $mesh->indices[] = ($base + 3) as uint32;
+}
+
+/**
+ * ASCII a-z to A-Z, anything else unchanged. Section headers draw upper case per glyph, so the
+ * title never needs an uppercased copy.
+ */
+internal function asciiUpper(int32 $cp) : int32
+{
+    if ($cp >= 97 && $cp <= 122) {
+        return $cp - 32;
+    }
+
+    return $cp;
 }

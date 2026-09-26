@@ -135,6 +135,23 @@ internal class HostRing
         $p:$ = $this->mapped:$ + ($off as isize);
         return TransientSlice($p, $off, $bytes, $frameSlot);
     }
+
+    /**
+     * Bytes left after RING_SLACK, so a large upload cannot starve uniforms.
+     */
+    public const function remaining() : uint64
+    {
+        if ($this->bytes <= RING_SLACK) {
+            return 0;
+        }
+
+        uint64 $cap = $this->bytes - RING_SLACK;
+        if ($this->bump >= $cap) {
+            return 0;
+        }
+
+        return $cap - $this->bump;
+    }
 }
 
 internal function alignUp(uint64 $v, uint64 $a) : uint64
@@ -334,6 +351,10 @@ internal function vkBeginSetup(Device $device) : vk::CommandBuffer
 
 internal function vkFillBufferImageCopy(
     Texture $texture,
+    int32 $x,
+    int32 $y,
+    int32 $width,
+    int32 $height,
     int32 $mip,
     int32 $layer,
     uint64 $rowBytes,
@@ -341,10 +362,9 @@ internal function vkFillBufferImageCopy(
 ) : vk::BufferImageCopy
 {
     vk::BufferImageCopy $region = vk::BufferImageCopy();
-    int32 $w = mipSize($texture->desc->width, $mip);
 
     if (!$texture->desc->format->isCompressed() && $bpp > 0) {
-        uint64 $tight = ($w as uint64) * ($bpp as uint64);
+        uint64 $tight = ($width as uint64) * ($bpp as uint64);
 
         if ($rowBytes > $tight) {
             $region->bufferRowLength = ($rowBytes / ($bpp as uint64)) as uint32;
@@ -355,8 +375,11 @@ internal function vkFillBufferImageCopy(
     $region->imageSubresource->mipLevel = $mip as uint32;
     $region->imageSubresource->baseArrayLayer = $layer as uint32;
     $region->imageSubresource->layerCount = 1;
-    $region->imageExtent->width = $w as uint32;
-    $region->imageExtent->height = mipSize($texture->desc->height, $mip) as uint32;
+    $region->imageOffset->x = $x;
+    $region->imageOffset->y = $y;
+    $region->imageOffset->z = 0;
+    $region->imageExtent->width = $width as uint32;
+    $region->imageExtent->height = $height as uint32;
     $region->imageExtent->depth = 1;
     return $region;
 }
@@ -373,7 +396,9 @@ internal function vkOneShotCopyImageToBuffer(
 {
     vk::CommandBuffer $cmd = vkBeginSetup($device);
     vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferSrc, vkAspect($texture->desc->format));
-    vk::BufferImageCopy $region = vkFillBufferImageCopy($texture, $mip, $layer, $rowBytes, $bpp);
+    int32 $w = mipSize($texture->desc->width, $mip);
+    int32 $h = mipSize($texture->desc->height, $mip);
+    vk::BufferImageCopy $region = vkFillBufferImageCopy($texture, 0, 0, $w, $h, $mip, $layer, $rowBytes, $bpp);
     vk::CmdCopyImageToBuffer(
         $cmd,
         $texture->handle->image,
@@ -393,6 +418,10 @@ internal function vkOneShotCopyBufferToImage(
     Device $device,
     BufferHandle $src,
     Texture $texture,
+    int32 $x,
+    int32 $y,
+    int32 $width,
+    int32 $height,
     int32 $mip,
     int32 $layer,
     uint64 $rowBytes,
@@ -401,7 +430,17 @@ internal function vkOneShotCopyBufferToImage(
 {
     vk::CommandBuffer $cmd = vkBeginSetup($device);
     vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferDst, vkAspect($texture->desc->format));
-    vk::BufferImageCopy $region = vkFillBufferImageCopy($texture, $mip, $layer, $rowBytes, $bpp);
+    vk::BufferImageCopy $region = vkFillBufferImageCopy(
+        $texture,
+        $x,
+        $y,
+        $width,
+        $height,
+        $mip,
+        $layer,
+        $rowBytes,
+        $bpp
+    );
     vk::CmdCopyBufferToImage(
         $cmd,
         $src->buffer,

@@ -62,6 +62,10 @@ internal function emitButtonBox(Ui $ui, const Node& $n, float32 $pad) : void
     ButtonRun $run = $ui->buttons[$n->payload as usize];
     ButtonStyle $st = uiButtonStyle($ui, $run->style);
     bool $hot = contains($n, $ui->io->pointer);
+    if (emitSkin($ui, $n->pos, $n->size, buttonSkin($st->skin, $hot, $hot && $ui->io->leftDown))) {
+        return;
+    }
+
     Color $bg = $st->bg;
 
     if ($hot) {
@@ -96,6 +100,22 @@ internal function emitButtonBox(Ui $ui, const Node& $n, float32 $pad) : void
     }
 
     fillBox($ui, $n->pos, $n->size, $st->radius, $bg, $pad);
+}
+
+/**
+ * The slice for this state, falling back to `normal`. Null keeps the SDF box.
+ */
+internal function buttonSkin(const ButtonSkin& $skin, bool $hot, bool $down) : NineSlice?
+{
+    if ($down && $skin->down != null) {
+        return $skin->down;
+    }
+
+    if ($hot && $skin->hover != null) {
+        return $skin->hover;
+    }
+
+    return $skin->normal;
 }
 
 internal function emitButtonText(Ui $ui, const Node& $n) : visu::graphics::Texture?

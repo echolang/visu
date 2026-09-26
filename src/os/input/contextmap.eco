@@ -3,7 +3,8 @@
  * Switch when the UI or a vehicle takes over.
  * Forwards KeySignal / MouseButtonSignal / ClickSignal to the active map.
  * Inactive maps still update held state so down() cannot stick across a switch.
- * When constructed with InputHub, handle is skipped while claimed (track still runs).
+ * When constructed with InputHub, handle is skipped while claimed (track still runs). Key
+ * bindings stay live under a pointer-only claim, so a hovered panel does not eat hotkeys.
  * Dispatcher closures capture a slot, not this.
  */
 
@@ -35,13 +36,24 @@ internal class ActionSlot
         return !$input->unclaimed();
     }
 
+    public const function keysClaimed() : bool
+    {
+        InputHub? $held = $this->input;
+        if ($held == null) {
+            return false;
+        }
+
+        InputHub $input = guard $held;
+        return !$input->keysFree();
+    }
+
     public function handle(const KeySignal& $signal) : Flow
     {
         foreach ($this->maps as $map) {
             $map->track($signal);
         }
 
-        if ($this->claimed()) {
+        if ($this->keysClaimed()) {
             return .proceed;
         }
 

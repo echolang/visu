@@ -7,8 +7,8 @@
 namespace visu::ui;
 
 use visu::graphics::{Device, Pipeline, TargetRef, Texture};
-use visu::math::Vec2;
-use visu::os::input::{InputHub, Key};
+use visu::math::{Vec2, Vec4};
+use visu::os::input::{ClaimScope, InputHub, Key};
 use visu::vg::{Canvas, Color, Font};
 
 public const string UI_CLAIM = 'flyui';
@@ -37,13 +37,33 @@ public class Ui
     internal Device $device;
     internal array<Node> $nodes;
     internal array<TextRun> $texts;
+    /**
+     * Per-frame bytes for number text (`number`, slider readouts). Cleared, never freed.
+     */
+    internal string $arena;
     internal array<ButtonRun> $buttons;
     internal array<CheckRun> $checks;
     internal array<ListRun> $lists;
     internal array<GroupRun> $groups;
+    /**
+     * Per-frame copies of every group's options. Cleared, never freed.
+     */
+    internal array<Choice> $choicePool;
     internal array<SliderRun> $sliders;
     internal array<ImageRun> $images;
+    internal array<IconRun> $iconButtons;
+    internal TooltipState $tip;
+    /**
+     * Open `beginDisabled` scopes, innermost last; `disabledDepth` counts the ones that disable.
+     */
+    internal array<bool> $disabledStack;
+    internal int32 $disabledDepth;
+    internal array<NineSlice> $skins;
     internal array<ProgressRun> $bars;
+    internal array<FieldRun> $fields;
+    internal array<uint64> $focusables;
+    internal uint64 $focusId;
+    internal Vec4 $clip;
     internal array<int32> $parents;
     internal array<uint64> $ids;
     internal map<uint64, Slot> $slots;
@@ -53,6 +73,11 @@ public class Ui
     internal bool $open;
     internal bool $hoverAny;
     internal bool $holdsClaim;
+    /**
+     * A drag owned the pointer this frame. The claim holds for the whole drag, even once the
+     * pointer leaves the widget.
+     */
+    internal bool $dragging;
     internal Vec2 $frame;
     internal float32 $scale;
     internal float64 $tick;
@@ -74,13 +99,27 @@ public class Ui
         $this->theme = Theme();
         $this->nodes = array<Node>();
         $this->texts = array<TextRun>();
+        $this->arena = '';
+        $this->arena->reserve(4096);
         $this->buttons = array<ButtonRun>();
         $this->checks = array<CheckRun>();
         $this->lists = array<ListRun>();
         $this->groups = array<GroupRun>();
+        $this->choicePool = array<Choice>();
+        $this->choicePool->reserve(256);
         $this->sliders = array<SliderRun>();
         $this->images = array<ImageRun>();
+        $this->iconButtons = array<IconRun>();
+        $this->tip = TooltipState();
+        $this->disabledStack = array<bool>();
+        $this->disabledStack->reserve(8);
+        $this->disabledDepth = 0;
+        $this->skins = array<NineSlice>();
         $this->bars = array<ProgressRun>();
+        $this->fields = array<FieldRun>();
+        $this->focusables = array<uint64>();
+        $this->focusId = 0 as uint64;
+        $this->clip = Vec4(0.0f);
         $this->parents = array<int32>();
         $this->ids = array<uint64>();
         $this->slots = map<uint64, Slot>();
@@ -90,6 +129,7 @@ public class Ui
         $this->open = false;
         $this->hoverAny = false;
         $this->holdsClaim = false;
+        $this->dragging = false;
         $this->frame = Vec2(1.0f);
         $this->scale = 1.0f;
         $this->tick = 0.0;
@@ -100,6 +140,10 @@ public class Ui
         $this->batch = UiBatch();
         $this->gpu = null;
         $this->nodes->reserve(256);
+        $this->skins->reserve(32);
+        $this->iconButtons->reserve(32);
+        $this->fields->reserve(16);
+        $this->focusables->reserve(16);
         $this->batch->verts->reserve(4096);
         $this->batch->indices->reserve(6144);
     }
@@ -161,6 +205,10 @@ public class Ui
      */
     public const function capturesKeyboard() : bool
     {
+        if ($this->focusId != (0 as uint64)) {
+            return true;
+        }
+
         foreach ($this->slots as $s) {
             if (selectIsOpen($s)) {
                 return true;
@@ -210,13 +258,24 @@ public class Ui
         $this->stamp = $this->stamp + 1;
         $this->nodes->clear();
         $this->texts->clear();
+        $this->arena->clear();
         $this->buttons->clear();
         $this->checks->clear();
         $this->lists->clear();
         $this->groups->clear();
+        $this->choicePool->clear();
         $this->sliders->clear();
         $this->images->clear();
+        $this->iconButtons->clear();
+        $this->tip->seen = false;
+        $this->tip->show = false;
+        $this->disabledStack->clear();
+        $this->disabledDepth = 0;
+        $this->skins->clear();
         $this->bars->clear();
+        $this->fields->clear();
+        $this->focusables->clear();
+        $this->clip = Vec4(0.0f);
         $this->parents->clear();
         $this->ids->clear();
         $this->overlays->clear();
@@ -232,14 +291,18 @@ public class Ui
         $this->ids[] = 0 as uint64;
         $this->open = true;
         $this->hoverAny = false;
+        $this->dragging = false;
     }
 
     public function endFrame() : void
     {
         assert($this->open, 'ui endFrame without beginFrame');
         assert($this->parents->count() == 1, 'ui endFrame with unclosed begin');
+        assert($this->disabledStack->count() == 0, 'ui endFrame with unclosed beginDisabled');
         layoutTree($this->nodes, $this->frame);
+        applyScroll($this);
         writeRects($this);
+        advanceFocus($this);
         float64 $now = visu::runtime::seconds();
         float32 $dt = 1.0f / 60.0f;
 
@@ -257,6 +320,7 @@ public class Ui
 
         $this->tick = $now;
         animatePills($this, $dt);
+        placeTooltip($this);
         dropUnseen($this->slots, $this->stamp, $this->stale);
         $this->claimHover();
         $this->open = false;
@@ -300,6 +364,8 @@ public class Ui
             return .error($e);
         }
         $this->gpu = $gpu;
+        // new fonts measure differently
+        $this->tip->measuredScale = 0.0f;
         return .ok;
     }
 
@@ -323,6 +389,13 @@ public class Ui
         $n->prefH = $layout->height;
         $n->radius = $layout->radius;
         $n->bg = $layout->bg;
+        $n->solid = $layout->blocks();
+
+        if ($layout->skin != null) {
+            NineSlice $skin = guard $layout->skin;
+            $n->skin = $this->skins->count() as int32;
+            $this->skins[] = $skin;
+        }
 
         if ($layout->width > 0.0f) {
             $n->h = .fixed;
@@ -337,7 +410,7 @@ public class Ui
         int32 $sib = $this->nodes[$parent as usize]->childCount;
         $this->parents[] = $i;
         uint64 $pid = $this->peekId();
-        $this->ids[] = mixId($pid, "l{$sib}");
+        $this->ids[] = layoutId($pid, $sib);
     }
 
     public function beginRow(float32? $spacing = null) : void
@@ -360,17 +433,22 @@ public class Ui
         $this->begin($l);
     }
 
-    public function beginCard(float32 $width = 0.0f) : void
+    public function beginCard(float32 $width = 0.0f, style: CardKind $style = .card) : void
     {
-        Theme $t = $this->theme;
+        CardStyle $st = $this->theme->card;
+        if ($style == CardKind::panel) {
+            $st = $this->theme->panel;
+        }
+
         Layout $l = Layout();
         $l->flow = .vertical;
         $l->h = .fit;
         $l->v = .fit;
-        $l->pad = $t->cardPad;
-        $l->spacing = $t->cardSpacing;
-        $l->bg = $t->cardBg;
-        $l->radius = $t->cardRadius;
+        $l->pad = $st->pad;
+        $l->spacing = $st->spacing;
+        $l->bg = $st->bg;
+        $l->radius = $st->radius;
+        $l->skin = $st->skin;
         $l->width = $width;
         $this->begin($l);
     }
@@ -385,7 +463,10 @@ public class Ui
         $l->spacing = $t->sectionSpacing;
         $l->pad = Edges(0.0f, 0.0f, 0.0f, $t->sectionBottomSpace);
         $this->begin($l);
-        $this->text(str::upper($title), size: $t->sectionHeaderFontSize, color: $t->sectionHeaderTextColor, bold: true);
+        // upper case is drawn per glyph, so the title is never copied
+        $this->pushText(
+            TextRun($title, $t->sectionHeaderFontSize, $t->sectionHeaderTextColor, true, $upper: true)
+        );
     }
 
     public function end() : void
@@ -449,22 +530,40 @@ public class Ui
         bold: bool $bold = false
     ) : void
     {
-        Theme $t = $this->theme;
         float32 $sz = $size;
 
         if ($sz <= 0.0f) {
-            $sz = $t->fontSize;
+            $sz = $this->theme->fontSize;
         }
 
-        Color $c = $color ?? $t->textColor;
+        $this->pushText(TextRun($s, $sz, $color ?? $this->theme->textColor, $bold));
+    }
 
-        int32 $p = $this->texts->count() as int32;
-        $this->texts[] = TextRun($s, $sz, $c, $bold);
-        Node $n = Node();
-        $n->kind = .text;
-        $n->payload = $p;
-        $n->measured = $this->measureText($s, $sz, $bold);
-        $this->push($n);
+    /**
+     * A number as text, `$decimals` after the point, then `$unit` verbatim (`' m'`). Formats
+     * into the frame arena: no string per call, so a live readout costs nothing on the heap.
+     */
+    public function number(
+        float32 $v,
+        decimals: int32 $decimals = 0,
+        unit: string $unit = '',
+        size: float32 $size = 0.0f,
+        color: Color? $color = null,
+        bold: bool $bold = false
+    ) : void
+    {
+        float32 $sz = $size;
+
+        if ($sz <= 0.0f) {
+            $sz = $this->theme->fontSize;
+        }
+
+        usize $from = $this->arena->size();
+        appendFixed($this->arena, $v, $decimals);
+        $this->arena->append($unit);
+        $this->pushText(
+            TextRun('', $sz, $color ?? $this->theme->textColor, $bold, true, $from, $this->arena->size())
+        );
     }
 
     public function label(string $s) : void
@@ -488,6 +587,54 @@ public class Ui
     ) : bool
     {
         return uiButton($this, $label, $id, $fill, $kind);
+    }
+
+    /**
+     * Square atlas icon button. `$selected` draws the tool-strip active state; `$size` 0 uses
+     * `theme.iconButton.size`. `$id` is required: an icon has no label to fall back on.
+     */
+    public function iconButton(
+        const Icon& $icon,
+        id: string $id,
+        selected: bool $selected = false,
+        size: float32 $size = 0.0f
+    ) : bool
+    {
+        return uiIconButton($this, $icon, $id, $selected, $size);
+    }
+
+    /**
+     * Tooltip for the widget just pushed, shown after the pointer rests on it. `$shortcut` draws
+     * bold after the text (`'Ctrl+S'`). Pass cached or literal strings.
+     */
+    public function tooltip(string $text, shortcut: string $shortcut = '') : void
+    {
+        uiTooltip($this, $text, $shortcut);
+    }
+
+    /**
+     * Widgets until `endDisabled` draw faded and never click when `$on`. Nests; `false` is a
+     * no-op scope so call sites stay balanced.
+     */
+    public function beginDisabled(bool $on = true) : void
+    {
+        $this->disabledStack[] = $on;
+
+        if ($on) {
+            $this->disabledDepth = $this->disabledDepth + 1;
+        }
+    }
+
+    public function endDisabled() : void
+    {
+        usize $n = $this->disabledStack->count();
+        assert($n > 0, 'ui endDisabled without beginDisabled');
+        bool $on = $this->disabledStack[$n - 1];
+        $this->disabledStack->truncate($n - 1);
+
+        if ($on) {
+            $this->disabledDepth = $this->disabledDepth - 1;
+        }
     }
 
     public function checkbox(string $label, bool& $on, id: string $id = '') : bool
@@ -518,16 +665,97 @@ public class Ui
         return $changed;
     }
 
+    /**
+     * `$readout` draws the value right of the label with that many decimals (-1 hides it),
+     * then `$unit`. `$fill` stretches the track across the parent instead of the theme width.
+     */
     public function slider(
         string $label,
         float32& $value,
         min: float32 $min,
         max: float32 $max,
         step: float32 $step = 0.0f,
-        id: string $id = ''
+        id: string $id = '',
+        readout: int32 $readout = -1,
+        unit: string $unit = '',
+        fill: bool $fill = false
     ) : bool
     {
-        return uiSlider($this, $label, $value, $min, $max, $step, $id);
+        return uiSlider($this, $label, $value, $min, $max, $step, $id, $readout, $unit, $fill);
+    }
+
+    public function slider(
+        string $label,
+        int32& $value,
+        min: int32 $min,
+        max: int32 $max,
+        id: string $id = '',
+        readout: bool $readout = false,
+        unit: string $unit = '',
+        fill: bool $fill = false
+    ) : bool
+    {
+        int32 $cur = $value;
+        float32 $f = $cur as float32;
+        int32 $digits = -1;
+
+        if ($readout) {
+            $digits = 0;
+        }
+
+        bool $changed = uiSlider(
+            $this, $label, $f, $min as float32, $max as float32, 1.0f, $id, $digits, $unit, $fill
+        );
+        int32 $n = std::math::round($f as float64) as int32;
+        if ($n != $value) {
+            $value = $n;
+            return true;
+        }
+
+        return $changed;
+    }
+
+    /**
+     * `$decimals` is how an idle field shows the value; typing edits the raw text.
+     */
+    public function numberField(
+        string $label,
+        float32& $value,
+        id: string $id = '',
+        decimals: int32 $decimals = 2
+    ) : bool
+    {
+        return uiNumberField($this, $label, $value, $id, $decimals);
+    }
+
+    public function textField(string $label, string& $value, id: string $id = '') : bool
+    {
+        return uiTextField($this, $label, $value, $id);
+    }
+
+    public function beginModal(string $title, bool& $open) : bool
+    {
+        return uiBeginModal($this, $title, $open);
+    }
+
+    public function endModal() : void
+    {
+        uiEndModal($this);
+    }
+
+    public function beginScroll(float32 $maxHeight, id: string $id = '') : void
+    {
+        uiBeginScroll($this, $maxHeight, $id);
+    }
+
+    public function endScroll() : void
+    {
+        uiEndScroll($this);
+    }
+
+    public function separator() : void
+    {
+        uiSeparator($this);
     }
 
     public function select(
@@ -591,7 +819,32 @@ public class Ui
 
     internal function push(Node $n) : int32
     {
+        if ($this->disabledDepth > 0) {
+            $n->dim = true;
+        }
+
         return appendNode($this->nodes, $this->peekParent(), $n);
+    }
+
+    /**
+     * Push a `.text` node for `$run`, measured over its own bytes or its arena range.
+     */
+    private function pushText(mv TextRun $run) : void
+    {
+        Node $n = Node();
+        $n->kind = .text;
+        $n->payload = $this->texts->count() as int32;
+
+        if ($run->arena) {
+            $n->measured = $this->measureTextRange($this->arena, $run->from, $run->to, $run->size, $run->bold);
+        } else {
+            $n->measured = $this->measureTextRange(
+                $run->text, 0, $run->text->size(), $run->size, $run->bold, upper: $run->upper
+            );
+        }
+
+        $this->texts[] = mv $run;
+        $this->push($n);
     }
 
     internal function peekParent() : int32
@@ -624,7 +877,7 @@ public class Ui
 
     internal function click(uint64 $id) : bool
     {
-        if ($this->io->consumed) {
+        if ($this->io->consumed || $this->disabledDepth > 0) {
             return false;
         }
 
@@ -655,7 +908,7 @@ public class Ui
      */
     internal function drag(uint64 $id) : bool
     {
-        if ($this->io->consumed) {
+        if ($this->io->consumed || $this->disabledDepth > 0) {
             return false;
         }
 
@@ -678,6 +931,7 @@ public class Ui
 
         if ($held) {
             $this->consume();
+            $this->dragging = true;
         }
 
         return $held;
@@ -713,37 +967,53 @@ public class Ui
         return $in->hasBeenPressedThisFrame($code);
     }
 
-    internal function measureText(const string& $s, float32 $size, bool $bold) : Vec2
+    internal const function measureText(const string& $s, float32 $size, bool $bold) : Vec2
+    {
+        return $this->measureTextRange($s, 0, $s->size(), $size, $bold);
+    }
+
+    internal const function measureTextRange(
+        const string& $s,
+        usize $from,
+        usize $to,
+        float32 $size,
+        bool $bold,
+        upper: bool $upper = false
+    ) : Vec2
     {
         Font $font = guard uiFont($this, $bold) else {
-            float32 $stub = ($s->size() as float32) * $size * 0.5f;
+            float32 $stub = (($to - $from) as float32) * $size * 0.5f;
             return Vec2($stub, $size * 1.2f);
         }
         float32 $px = visu::vg::quantizePx($size * $this->scale);
         float32 $inv = 1.0f / $this->scale;
-        float32 $w = visu::vg::textWidth($font, $px, $s) * $inv;
+        float32 $w = visu::vg::textWidthRange($font, $px, $s, $from, $to, $upper) * $inv;
         visu::vg::FontMetrics $m = visu::vg::fontMetrics($font, $px);
         return Vec2($w, $m->lineh * $inv);
     }
 
+    /**
+     * Claim the pointer while it is over a widget or a solid panel, or a drag is live; widen
+     * to the keyboard while a field has focus. Released as soon as none holds.
+     */
     internal function claimHover() : void
     {
-        $this->hoverAny = $this->overlays->count() > 0;
+        $this->hoverAny = $this->overlays->count() > 0 || $this->dragging;
         usize $n = $this->nodes->count();
         usize $i = 0;
+        bool $pointerIn = $this->io->leftDown || $this->io->hovering;
 
-        while (!$this->hoverAny && $i < $n) {
+        while (!$this->hoverAny && $pointerIn && $i < $n) {
             Node $node = $this->nodes[$i];
 
-            if (interactive($node->kind) && contains($node, $this->io->pointer)
-                && ($this->io->leftDown || $this->io->hovering)
-            ) {
+            if ((interactive($node->kind) || $node->solid) && contains($node, $this->io->pointer)) {
                 $this->hoverAny = true;
             }
 
             $i = $i + 1;
         }
 
+        bool $keys = $this->focusId != (0 as uint64);
         InputHub? $maybe = $this->input;
 
         if ($maybe == null) {
@@ -752,15 +1022,36 @@ public class Ui
 
         InputHub $in = guard $maybe;
 
-        if ($this->hoverAny) {
-            if (!$in->holds(UI_CLAIM)) {
-                guard $in->claim(UI_CLAIM) else {
-                    return;
-                }
-                $this->holdsClaim = true;
-            }
-        } else {
+        if (!$this->hoverAny && !$keys) {
             $this->releaseClaim();
+            return;
+        }
+
+        ClaimScope $want = .pointer;
+
+        if ($keys) {
+            $want = .all;
+        }
+
+        if (!$in->holds(UI_CLAIM)) {
+            // someone else (the console) holds it; retry next frame once they let go
+            guard $in->claim(UI_CLAIM, scope: $want) else {
+                $this->holdsClaim = false;
+                return;
+            }
+            $this->holdsClaim = true;
+            return;
+        }
+
+        $this->holdsClaim = true;
+        ClaimScope $held = guard $in->claimScope() else {
+            return;
+        }
+
+        if ($held != $want) {
+            guard $in->rescope(UI_CLAIM, $want) else {
+                return;
+            }
         }
     }
 

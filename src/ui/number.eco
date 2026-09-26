@@ -1,0 +1,95 @@
+/**
+ * Allocation-free number text. Digits go into the frame's text arena on `Ui` (cleared, never
+ * freed, each `beginFrame`); a run keeps the byte range, so a readout that changes every frame
+ * never builds a string.
+ */
+
+namespace visu::ui;
+
+internal const int32 NUMBER_MAX_DECIMALS = 6;
+
+/**
+ * Fixed-point decimal of `$v` with `$decimals` digits after the point, rounded half away from
+ * zero. `-0.0` prints as `0`. Out-of-range magnitudes print `inf` rather than wrap.
+ */
+internal function appendFixed(string& $out, float32 $v, int32 $decimals) : void
+{
+    if ($v != $v) {
+        $out->append('nan');
+        return;
+    }
+
+    int32 $d = $decimals;
+
+    if ($d < 0) {
+        $d = 0;
+    }
+
+    if ($d > NUMBER_MAX_DECIMALS) {
+        $d = NUMBER_MAX_DECIMALS;
+    }
+
+    float64 $x = $v as float64;
+    bool $neg = $x < 0.0;
+
+    if ($neg) {
+        $x = 0.0 - $x;
+    }
+
+    int64 $scale = 1;
+    int32 $k = 0;
+
+    while ($k < $d) {
+        $scale = $scale * 10;
+        $k = $k + 1;
+    }
+
+    float64 $scaled = $x * ($scale as float64);
+
+    if ($scaled >= 900000000000000000.0) {
+        if ($neg) {
+            $out->push(45 as uint8);
+        }
+
+        $out->append('inf');
+        return;
+    }
+
+    int64 $n = std::math::round($scaled) as int64;
+
+    if ($neg && $n != 0) {
+        $out->push(45 as uint8);
+    }
+
+    appendDigits($out, $n / $scale, 1);
+
+    if ($d > 0) {
+        $out->push(46 as uint8);
+        appendDigits($out, $n % $scale, $d);
+    }
+}
+
+/**
+ * Decimal digits of a non-negative `$v`, left-padded with zeros to `$width`.
+ */
+internal function appendDigits(string& $out, int64 $v, int32 $width) : void
+{
+    int64 $div = 1;
+    int32 $digits = 1;
+
+    while ($v / $div >= 10) {
+        $div = $div * 10;
+        $digits = $digits + 1;
+    }
+
+    while ($digits < $width) {
+        $out->push(48 as uint8);
+        $width = $width - 1;
+    }
+
+    while ($div > 0) {
+        int64 $digit = ($v / $div) % 10;
+        $out->push((48 + $digit) as uint8);
+        $div = $div / 10;
+    }
+}

@@ -16,6 +16,7 @@ struct vs_out
     float4 vShape [[user(locn2)]];
     float4 vColor [[user(locn3)]];
     float4 vClip [[user(locn4)]];
+    float4 vRegion [[user(locn5)]];
     float4 gl_Position [[position]];
 };
 
@@ -26,9 +27,10 @@ struct vs_in
     float4 aShape [[attribute(2)]];
     float4 aColor [[attribute(3)]];
     float4 aClip [[attribute(4)]];
+    float4 aRegion [[attribute(5)]];
 };
 
-vertex vs_out vs(vs_in in [[stage_in]], constant UiFrame& _32 [[buffer(2)]])
+vertex vs_out vs(vs_in in [[stage_in]], constant UiFrame& _35 [[buffer(2)]])
 {
     vs_out out = {};
     out.vPos = in.aPos;
@@ -36,7 +38,8 @@ vertex vs_out vs(vs_in in [[stage_in]], constant UiFrame& _32 [[buffer(2)]])
     out.vShape = in.aShape;
     out.vColor = in.aColor;
     out.vClip = in.aClip;
-    float2 vp = _32.view.xy;
+    out.vRegion = in.aRegion;
+    float2 vp = _35.view.xy;
     out.gl_Position = float4(((2.0 * in.aPos.x) / vp.x) - 1.0, 1.0 - ((2.0 * in.aPos.y) / vp.y), 0.0, 1.0);
     return out;
 }

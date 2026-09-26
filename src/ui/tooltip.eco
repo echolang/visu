@@ -1,0 +1,169 @@
+/**
+ * Hover tooltips. `Ui.tooltip` names the widget just pushed; once the pointer has rested on it
+ * for `TooltipStyle.delay`, the text draws in the overlay layer beside the pointer, clamped to
+ * the frame. One tooltip per frame; the strings are the caller's, never copied into a new one.
+ */
+
+namespace visu::ui;
+
+use visu::math::Vec2;
+use visu::vg::Color;
+
+internal struct TooltipState
+{
+    public uint64 $id = 0 as uint64;
+    public float64 $since = 0.0;
+    public bool $seen = false;
+    public bool $show = false;
+    public string $text = '';
+    public string $shortcut = '';
+    public Vec2 $pos = Vec2(0.0f);
+    public Vec2 $size = Vec2(0.0f);
+    /**
+     * Measured text and shortcut, kept while the strings, the font size and the draw scale
+     * stay what they were measured at. A `measuredScale` of 0 forces a new measure.
+     */
+    public Vec2 $textSize = Vec2(0.0f);
+    public float32 $keyW = 0.0f;
+    public float32 $measuredScale = 0.0f;
+    public float32 $measuredFont = 0.0f;
+}
+
+internal function uiTooltip(Ui $ui, const string& $text, const string& $shortcut) : void
+{
+    usize $count = $ui->nodes->count();
+
+    if ($count < 2 || $ui->io->leftDown) {
+        return;
+    }
+
+    Node $last = $ui->nodes[$count - 1];
+
+    if ($last->id == (0 as uint64) || !$ui->slots->has($last->id)) {
+        return;
+    }
+
+    Slot $s = $ui->slots[$last->id];
+
+    if (!$ui->io->hovering || !contains($s->pos, $s->size, $ui->io->pointer)) {
+        return;
+    }
+
+    float64 $now = visu::runtime::seconds();
+
+    if ($ui->tip->id != $last->id) {
+        $ui->tip->id = $last->id;
+        $ui->tip->since = $now;
+    }
+
+    $ui->tip->seen = true;
+
+    if ($now - $ui->tip->since < ($ui->theme->tooltip->delay as float64)) {
+        return;
+    }
+
+    $ui->tip->show = true;
+
+    if ($ui->tip->text != $text || $ui->tip->shortcut != $shortcut) {
+        // copied and measured once per change, not every frame the tip shows
+        $ui->tip->text = $text;
+        $ui->tip->shortcut = $shortcut;
+        $ui->tip->measuredScale = 0.0f;
+    }
+}
+
+/**
+ * Size and place the frame's tooltip after layout. A widget that was not hovered this frame
+ * resets the rest timer.
+ */
+internal function placeTooltip(Ui $ui) : void
+{
+    if (!$ui->tip->seen) {
+        $ui->tip->id = 0 as uint64;
+    }
+
+    if (!$ui->tip->show) {
+        return;
+    }
+
+    TooltipStyle $st = $ui->theme->tooltip;
+
+    if ($ui->tip->measuredScale != $ui->scale || $ui->tip->measuredFont != $st->fontSize) {
+        $ui->tip->textSize = $ui->measureText($ui->tip->text, $st->fontSize, false);
+        $ui->tip->keyW = 0.0f;
+
+        if (!$ui->tip->shortcut->empty()) {
+            $ui->tip->keyW = $ui->measureText($ui->tip->shortcut, $st->fontSize, true)->x;
+        }
+
+        $ui->tip->measuredScale = $ui->scale;
+        $ui->tip->measuredFont = $st->fontSize;
+    }
+
+    Vec2 $t = $ui->tip->textSize;
+    float32 $w = $t->x;
+
+    if (!$ui->tip->shortcut->empty()) {
+        $w = $w + $st->gap + $ui->tip->keyW;
+    }
+
+    Vec2 $size = Vec2($w + $st->pad * 2.0f, $t->y + $st->pad * 2.0f);
+    float32 $x = $ui->io->pointer->x + $st->offset->x;
+    float32 $y = $ui->io->pointer->y + $st->offset->y;
+
+    if ($x + $size->x > $ui->frame->x) {
+        $x = $ui->frame->x - $size->x;
+    }
+
+    if ($y + $size->y > $ui->frame->y) {
+        // no room below: sit above the pointer instead
+        $y = $ui->io->pointer->y - $size->y - 4.0f;
+    }
+
+    if ($x < 0.0f) {
+        $x = 0.0f;
+    }
+
+    if ($y < 0.0f) {
+        $y = 0.0f;
+    }
+
+    $ui->tip->pos = Vec2($x, $y);
+    $ui->tip->size = $size;
+}
+
+internal function emitTooltipBox(Ui $ui, float32 $pad) : void
+{
+    if (!$ui->tip->show) {
+        return;
+    }
+
+    TooltipStyle $st = $ui->theme->tooltip;
+    if (emitSkin($ui, $ui->tip->pos, $ui->tip->size, $st->skin)) {
+        return;
+    }
+
+    fillBox($ui, $ui->tip->pos, $ui->tip->size, $st->radius, $st->bg, $pad);
+
+    if ($st->border->a > 0.0f) {
+        strokeRing($ui, $ui->tip->pos, $ui->tip->size, $st->radius, $st->border, $pad);
+    }
+}
+
+internal function emitTooltipGlyphs(Ui $ui) : void
+{
+    if (!$ui->tip->show) {
+        return;
+    }
+
+    TooltipStyle $st = $ui->theme->tooltip;
+    Vec2 $at = Vec2($ui->tip->pos->x + $st->pad, $ui->tip->pos->y + $st->pad);
+    paintText($ui, $at, $ui->tip->text, $st->fontSize, $st->text, false, false);
+
+    if ($ui->tip->shortcut->empty()) {
+        return;
+    }
+
+    Vec2 $key = Vec2($at->x + $ui->tip->textSize->x + $st->gap, $at->y);
+    paintText($ui, $key, $ui->tip->shortcut, $st->fontSize, $st->shortcut, true, false);
+}

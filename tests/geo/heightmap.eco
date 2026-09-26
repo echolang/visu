@@ -3,7 +3,7 @@
  */
 
 use visu::geo::{AABB, Heightmap, HeightmapScale, Ray};
-use visu::math::{Vec2, Vec3, equal, length};
+use visu::math::{Vec2, Vec3, equal, length, normalize};
 
 test heightmap_flat_sample_origin
 {
@@ -59,15 +59,35 @@ test heightmap_min_max
     assert(equal($map->max(), 5.0f), 'max');
 }
 
-test heightmap_min_max_follow_set_that_loses_an_extreme
+test heightmap_set_that_loses_an_extreme_is_conservative
 {
     Heightmap $map = Heightmap::flat(2, 2, 1.0f, 1.0f);
     $map->set(0, 0, -4.0f);
     $map->set(1, 1, 8.0f);
     $map->set(0, 0, 2.0f);
-    assert(equal($map->min(), 1.0f), 'raised unique min');
+    assert(equal($map->min(), -4.0f), 'conservative min');
+    assert($map->loose(), 'loose after vacating min');
+    $map->recount();
+    assert(equal($map->min(), 1.0f), 'recount min');
+    assert(!$map->loose(), 'tight after recount');
     $map->set(1, 1, 0.0f);
-    assert(equal($map->max(), 2.0f), 'lowered unique max');
+    assert(equal($map->max(), 8.0f), 'conservative max');
+    $map->recount();
+    assert(equal($map->max(), 2.0f), 'recount max');
+}
+
+test heightmap_flat_sets_are_linear
+{
+    Heightmap $map = Heightmap::flat(4097, 4097, 0.0f, 1.0f);
+    int32 $n = 256;
+    int32 $i = 0;
+    while ($i < $n) {
+        $map->set($i, 0, 1.0f);
+        $i = $i + 1;
+    }
+
+    assert(equal($map->max(), 1.0f), 'widened');
+    assert($map->loose(), 'vacated the flat extreme');
 }
 
 test heightmap_region_range_and_bounds
@@ -120,6 +140,26 @@ test heightmap_cast_hits_plateau
     assert(equal($p->x, 0.0f, 0.05f), 'x');
 }
 
+test heightmap_cast_hits_from_a_distant_eye
+{
+    Heightmap $map = Heightmap::flat(65, 65, 0.0f, 1.0f);
+    Vec3 $eye = Vec3(0.0f, 40.0f, 80.0f);
+    Vec3 $dir = normalize(Vec3(0.0f, 0.0f, 0.0f) - $eye);
+    Vec3? $hit = $map->cast(Ray($eye, $dir), 65536.0f, 24);
+    assert($hit != null, 'hit');
+    Vec3 $p = $hit ?? Vec3(0.0f, 1.0f, 0.0f);
+    assert(equal($p->y, 0.0f, 0.05f), 'ground');
+    assert(equal($p->x, 0.0f, 0.5f), 'x');
+    assert(equal($p->z, 0.0f, 0.5f), 'z');
+}
+
+test heightmap_cast_misses_the_sky
+{
+    Heightmap $map = Heightmap::flat(8, 8, 0.0f, 1.0f);
+    Ray $up = Ray(Vec3(0.0f, 10.0f, 0.0f), Vec3(0.0f, 1.0f, 0.0f));
+    assert($map->cast($up, 65536.0f, 16) == null, 'sky');
+}
+
 test heightmap_smoothed_keeps_size_ppu_and_flat
 {
     Heightmap $map = Heightmap::flat(5, 5, 3.0f, 2.0f);
@@ -128,6 +168,15 @@ test heightmap_smoothed_keeps_size_ppu_and_flat
     assert($out->height == 5, 'h');
     assert(equal($out->ppu, 2.0f), 'ppu');
     assert(equal($out->at(2, 2), 3.0f), 'flat');
+}
+
+test heightmap_samples_borrow_the_grid
+{
+    Heightmap $map = Heightmap::flat(3, 2, 0.0f, 1.0f);
+    $map->set(2, 1, 4.0f);
+    const array<float32>& $s = $map->samples();
+    assert($s->count() == 6, 'width * height');
+    assert(equal($s[5], 4.0f), 'row-major in z');
 }
 
 test heightmap_smoothed_spreads_spike_and_leaves_source

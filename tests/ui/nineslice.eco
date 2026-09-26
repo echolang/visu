@@ -1,0 +1,198 @@
+/**
+ * 9-slice grid math, theme skins, and skinned layout nodes.
+ */
+
+use visu::graphics::{Device, Texture, TextureDesc, TextureHandle};
+use visu::math::{Vec2, Vec4, equal};
+use visu::ui::{ButtonSkin, Edges, Layout, NineSlice, NODE_NONE, SliceFill, Ui, buttonSkin, centerTile, sliceStops};
+use visu::vg::Color;
+
+/**
+ * Imported with no handle so the grid math runs without a GPU.
+ */
+internal function skinTexture(Device $device, int32 $w, int32 $h) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .rgba8, $width: $w, $height: $h);
+    return Texture(imported: $device, TextureHandle::none(), $desc);
+}
+
+test nineslice_whole_texture_stops
+{
+    Device $device = Device();
+    Texture $tex = skinTexture($device, 48, 48);
+    NineSlice $s = NineSlice($tex, Edges::all(16.0f));
+    $g = sliceStops(Vec2(10.0f, 20.0f), Vec2(100.0f, 60.0f), $s, 48.0f, 48.0f, 1.0f);
+    assert(equal($g->x[0], 10.0f) && equal($g->x[1], 26.0f), 'x left');
+    assert(equal($g->x[2], 94.0f) && equal($g->x[3], 110.0f), 'x right');
+    assert(equal($g->y[1], 36.0f) && equal($g->y[2], 64.0f), 'y inner');
+    assert(equal($g->u[0], 0.0f) && equal($g->u[1], 1.0f / 3.0f), 'u left');
+    assert(equal($g->u[2], 2.0f / 3.0f) && equal($g->u[3], 1.0f), 'u right');
+    $tex->destroy();
+    $device->shutdown();
+}
+
+test nineslice_atlas_rect_maps_sub_uvs
+{
+    Device $device = Device();
+    Texture $tex = skinTexture($device, 48, 64);
+    NineSlice $s = NineSlice($tex, Edges::all(4.0f), $rect: Vec4(0.0f, 16.0f, 48.0f, 16.0f));
+    $g = sliceStops(Vec2(0.0f), Vec2(80.0f, 30.0f), $s, 48.0f, 64.0f, 1.0f);
+    assert(equal($g->v[0], 16.0f / 64.0f) && equal($g->v[1], 20.0f / 64.0f), 'v top');
+    assert(equal($g->v[2], 28.0f / 64.0f) && equal($g->v[3], 32.0f / 64.0f), 'v bottom');
+    assert(equal($g->u[1], 4.0f / 48.0f) && equal($g->u[2], 44.0f / 48.0f), 'u inner');
+    $tex->destroy();
+    $device->shutdown();
+}
+
+test nineslice_borders_shrink_in_a_small_box
+{
+    Device $device = Device();
+    Texture $tex = skinTexture($device, 48, 48);
+    NineSlice $s = NineSlice($tex, Edges::all(16.0f), $scale: 2.0f);
+    $g = sliceStops(Vec2(0.0f), Vec2(40.0f, 100.0f), $s, 48.0f, 48.0f, 1.0f);
+    assert(equal($g->x[1], 20.0f) && equal($g->x[2], 20.0f), 'x shrinks to meet');
+    assert(equal($g->y[1], 32.0f) && equal($g->y[2], 68.0f), 'y keeps scaled border');
+    $tex->destroy();
+    $device->shutdown();
+}
+
+test nineslice_inner_stops_snap_to_device_pixels
+{
+    Device $device = Device();
+    Texture $tex = skinTexture($device, 12, 12);
+    NineSlice $s = NineSlice($tex, Edges::all(3.0f));
+    $g = sliceStops(Vec2(0.3f, 0.0f), Vec2(20.0f, 20.0f), $s, 12.0f, 12.0f, 2.0f);
+    assert(equal($g->x[0], 0.3f), 'outer edge stays on the box');
+    assert(equal($g->x[1], 3.5f), 'inner snaps to half points at 2x');
+    $tex->destroy();
+    $device->shutdown();
+}
+
+test nineslice_button_skin_falls_back_to_normal
+{
+    Device $device = Device();
+    Texture $tex = skinTexture($device, 16, 48);
+    ButtonSkin $skin = ButtonSkin();
+    assert(buttonSkin($skin, true, true) == null, 'no skin keeps sdf');
+    $skin->normal = NineSlice($tex, Edges::all(4.0f), $rect: Vec4(0.0f, 0.0f, 16.0f, 16.0f));
+    $skin->down = NineSlice($tex, Edges::all(4.0f), $rect: Vec4(0.0f, 32.0f, 16.0f, 16.0f));
+    NineSlice $hover = guard buttonSkin($skin, true, false);
+    assert(equal($hover->rect->y, 0.0f), 'hover falls back to normal');
+    NineSlice $down = guard buttonSkin($skin, true, true);
+    assert(equal($down->rect->y, 32.0f), 'down');
+    $skin = ButtonSkin();
+    $tex->destroy();
+    $device->shutdown();
+}
+
+test nineslice_apply_generals_keeps_skins
+{
+    Device $device = Device();
+    Texture $tex = skinTexture($device, 16, 16);
+    Ui $ui = Ui($device);
+    $ui->theme->primaryButton->skin->normal = NineSlice($tex, Edges::all(4.0f));
+    $ui->theme->accent = Color(1.0f, 0.0f, 0.0f, 1.0f);
+    $ui->theme->applyGenerals();
+    assert($ui->theme->primaryButton->skin->normal != null, 'skin survives');
+    assert(equal($ui->theme->primaryButton->bg->r, 1.0f), 'colours still derive');
+    $ui->theme->primaryButton->skin = ButtonSkin();
+    $ui->destroy();
+    $tex->destroy();
+    $device->shutdown();
+}
+
+test nineslice_skinned_button_measures_like_plain
+{
+    Device $device = Device();
+    Texture $tex = skinTexture($device, 16, 16);
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Save');
+    $ui->endFrame();
+    Vec2 $plain = $ui->nodes[1]->measured;
+    $ui->theme->primaryButton->skin->normal = NineSlice($tex, Edges::all(6.0f), $scale: 3.0f);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->button('Save');
+    $ui->endFrame();
+    Vec2 $skinned = $ui->nodes[1]->measured;
+    assert(equal($plain->x, $skinned->x) && equal($plain->y, $skinned->y), 'same size');
+    $ui->theme->primaryButton->skin = ButtonSkin();
+    $ui->destroy();
+    $tex->destroy();
+    $device->shutdown();
+}
+
+test nineslice_card_and_layout_record_skin_index
+{
+    Device $device = Device();
+    Texture $tex = skinTexture($device, 16, 16);
+    Ui $ui = Ui($device);
+    $ui->theme->card->skin = NineSlice($tex, Edges::all(4.0f));
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->beginCard();
+    $ui->begin();
+    $ui->end();
+    Layout $boxed = Layout();
+    $boxed->skin = NineSlice($tex, Edges::all(2.0f));
+    $ui->begin($boxed);
+    $ui->end();
+    $ui->end();
+    $ui->endFrame();
+    assert($ui->skins->count() == 2, 'two skins this frame');
+    assert($ui->nodes[1]->skin == 0, 'card');
+    assert($ui->nodes[2]->skin == NODE_NONE, 'plain layout');
+    assert($ui->nodes[3]->skin == 1, 'layout skin');
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->endFrame();
+    assert($ui->skins->count() == 0, 'cleared per frame');
+    $ui->theme->card->skin = null;
+    $ui->destroy();
+    $tex->destroy();
+    $device->shutdown();
+}
+
+test nineslice_layout_bg_and_tint_survive_a_copy
+{
+    Device $device = Device();
+    Texture $tex = skinTexture($device, 16, 16);
+    Layout $l = Layout();
+    $l->bg = Color(0.9f, 0.9f, 0.9f, 1.0f);
+    $l->skin = NineSlice($tex, Edges::all(4.0f));
+    Layout $copy = $l;
+    assert(equal($copy->bg->a, 1.0f), 'bg survives a copy');
+    NineSlice $s = NineSlice($tex, Edges::all(4.0f));
+    $s->tint = Color(0.5f, 0.5f, 0.5f, 1.0f);
+    NineSlice $t = $s;
+    assert(equal($t->tint->r, 0.5f), 'tint survives a copy');
+    $l->skin = null;
+    $copy->skin = null;
+    $tex->destroy();
+    $device->shutdown();
+}
+
+test nineslice_center_stretches_by_default
+{
+    Device $device = Device();
+    Texture $tex = skinTexture($device, 16, 16);
+    NineSlice $s = NineSlice($tex, Edges::all(4.0f));
+    assert($s->center == SliceFill::stretch, 'stretch default');
+    $tex->destroy();
+    $device->shutdown();
+}
+
+test nineslice_center_tile_is_source_centre_times_scale
+{
+    Device $device = Device();
+    Texture $tex = skinTexture($device, 128, 128);
+    NineSlice $s = NineSlice($tex, Edges(44.0f, 40.0f, 30.0f, 34.0f), $scale: 0.5f, $center: .repeat);
+    Vec2 $t = centerTile($s, 128.0f, 128.0f);
+    assert(equal($t->x, 22.0f) && equal($t->y, 32.0f), 'whole texture');
+    $s->rect = Vec4(0.0f, 0.0f, 100.0f, 80.0f);
+    $t = centerTile($s, 128.0f, 128.0f);
+    assert(equal($t->x, 8.0f) && equal($t->y, 8.0f), 'atlas rect');
+    $s->border = Edges::all(60.0f);
+    $t = centerTile($s, 128.0f, 128.0f);
+    assert(equal($t->x, 0.0f), 'no centre area falls back to stretch');
+    $tex->destroy();
+    $device->shutdown();
+}

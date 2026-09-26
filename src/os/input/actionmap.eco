@@ -1,6 +1,8 @@
 /**
- * Named actions bound to a key, a mouse button, or a virtual click (press then release without travelling far).
+ * Named actions bound to a key, a key chord, a mouse button, or a virtual click (press then release without travelling far).
  * A matching handle consumes the signal (`Flow::stop`).
+ * A plain `.key` fires only while no Control, Alt or Super is held (Shift is allowed), so `S` and
+ * `Cmd+S` are two actions. A chord matches its modifiers exactly.
  * Analog (composite WASD, virtual stick, control schemes) is the next layer; putting `evaluate(const InputHub&)` on this type currently trips an Echo `size<T>` instantiation limit.
  */
 
@@ -11,6 +13,7 @@ use visu::signal::{ClickSignal, Flow, KeySignal, MouseButtonSignal};
 public enum Binding
 {
     case key(Key $code);
+    case chord(Key $code, int32 $mods);
     case button(MouseButton $code);
     case click;
 
@@ -18,6 +21,7 @@ public enum Binding
     {
         return match ($this) {
             .key($code) => "key {$code->value()}",
+            .chord($code, $mods) => "key {$code->value()} mods {$mods}",
             .button($code) => "button {$code->value()}",
             .click => 'click',
         };
@@ -27,6 +31,7 @@ public enum Binding
 public class ActionMap
 {
     private map<int32, string> $keys;
+    private map<int32, string> $keyAction;
     private map<int32, string> $buttons;
     private string? $click;
     private map<string, bool> $didPress;
@@ -36,6 +41,7 @@ public class ActionMap
     public constructor()
     {
         $this->keys = map<int32, string>();
+        $this->keyAction = map<int32, string>();
         $this->buttons = map<int32, string>();
         $this->click = null;
         $this->didPress = map<string, bool>();
@@ -46,7 +52,8 @@ public class ActionMap
     public function bind(string $action, Binding $binding) : status<InputError>
     {
         return match ($binding) {
-            .key($code) => $this->bindKey($action, $code),
+            .key($code) => $this->bindKey($action, $code, 0),
+            .chord($code, $mods) => $this->bindKey($action, $code, $mods & MOD_CHORD_MASK),
             .button($code) => $this->bindButton($action, $code),
             .click => $this->bindClick($action),
         };
@@ -96,12 +103,10 @@ public class ActionMap
 
     public function handle(const KeySignal& $signal) : Flow
     {
-        int32 $id = $signal->key->value();
-        if (!$this->keys->has($id)) {
+        string $action = guard $this->resolve($signal) else {
             return .proceed;
         }
 
-        string $action = $this->keys->get($id);
         $this->note($action, $signal->phase);
         return .stop;
     }
@@ -111,13 +116,50 @@ public class ActionMap
      */
     internal function track(const KeySignal& $signal) : void
     {
-        int32 $id = $signal->key->value();
-        if (!$this->keys->has($id)) {
+        string $action = guard $this->resolve($signal) else {
             return;
         }
 
-        string $action = $this->keys->get($id);
         $this->held[$action] = $signal->phase->down();
+    }
+
+    /**
+     * The action a key signal drives. A press looks up the chord first, then the plain key
+     * when no command modifier is down, and remembers the answer per key: the release then
+     * ends the same action even if the modifier came up first.
+     */
+    private function resolve(const KeySignal& $signal) : string?
+    {
+        int32 $id = $signal->key->value();
+
+        if ($signal->phase == KeyPhase::release) {
+            if (!$this->keyAction->has($id)) {
+                return null;
+            }
+
+            return $this->keyAction->get($id);
+        }
+
+        int32 $mods = $signal->mods & MOD_CHORD_MASK;
+        int32 $chord = chordId($id, $mods);
+
+        if ($this->keys->has($chord)) {
+            string $hit = $this->keys->get($chord);
+            $this->keyAction[$id] = $hit;
+            return $hit;
+        }
+
+        if (($mods & (MOD_CONTROL | MOD_ALT | MOD_SUPER)) == 0 && $this->keys->has($id)) {
+            string $plain = $this->keys->get($id);
+            $this->keyAction[$id] = $plain;
+            return $plain;
+        }
+
+        if ($this->keyAction->has($id)) {
+            $this->keyAction->remove($id);
+        }
+
+        return null;
     }
 
     public function handle(const MouseButtonSignal& $signal) : Flow
@@ -152,11 +194,15 @@ public class ActionMap
         return .stop;
     }
 
-    private function bindKey(string $action, Key $code) : status<InputError>
+    private function bindKey(string $action, Key $code, int32 $mods) : status<InputError>
     {
-        int32 $id = $code->value();
+        int32 $id = chordId($code->value(), $mods);
         if ($this->keys->has($id)) {
-            return .error(.taken(.key($code), $this->keys->get($id)));
+            if ($mods == 0) {
+                return .error(.taken(.key($code), $this->keys->get($id)));
+            }
+
+            return .error(.taken(.chord($code, $mods), $this->keys->get($id)));
         }
 
         $this->keys[$id] = $action;
@@ -194,4 +240,13 @@ public class ActionMap
 
         $this->held[$action] = $phase->down();
     }
+}
+
+/**
+ * One map key per key plus modifier set. Key ids are dense and small, so the modifier bits
+ * sit above them.
+ */
+internal function chordId(int32 $key, int32 $mods) : int32
+{
+    return $key | ($mods << 12);
 }

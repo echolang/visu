@@ -1,0 +1,225 @@
+/**
+ * 9-slice skin: corners keep their size, edges stretch along one axis, the centre stretches both.
+ * The texture is a shared GPU handle; the theme or layout that holds the slice does not own it.
+ */
+
+namespace visu::ui;
+
+use visu::graphics::Texture;
+use visu::math::{Vec2, Vec4};
+use visu::vg::{Color, snapPt};
+
+/**
+ * How the centre cell fills the box: stretched to fit, or repeated at its source size.
+ */
+public enum SliceFill
+{
+    case stretch;
+    case repeat;
+}
+
+public struct NineSlice
+{
+    public Texture $texture;
+    /**
+     * Fixed corner insets in source texels: left, right, top, bottom.
+     */
+    public Edges $border;
+    /**
+     * Source region in texels as x, y, w, h. A width of 0 or less uses the whole texture,
+     * so several slices can share one atlas and stay one draw.
+     */
+    public Vec4 $rect = Vec4(0.0f);
+    /**
+     * Layout points per source texel. Only the borders scale; the rest stretches to the box.
+     */
+    public float32 $scale = 1.0f;
+    public Color $tint;
+    /**
+     * Sample with nearest filtering, for pixel art drawn at 2x or 3x.
+     */
+    public bool $nearest = false;
+    /**
+     * `.repeat` tiles the centre at its source size times `scale`, anchored top left, so a
+     * paper or wood grain keeps its grain on a large box. Still one quad; the shader wraps.
+     */
+    public SliceFill $center = .stretch;
+
+    init
+    {
+        $this->tint = Color::white();
+    }
+}
+
+/**
+ * Four x, y, u, v stops each. Cell (i, j) spans stop i to i + 1 on x and j to j + 1 on y.
+ */
+internal struct SliceStops
+{
+    public fixed_array<float32, 4> $x;
+    public fixed_array<float32, 4> $y;
+    public fixed_array<float32, 4> $u;
+    public fixed_array<float32, 4> $v;
+}
+
+/**
+ * Place the grid on a box. Borders larger than the box shrink in proportion so corners never cross.
+ * Inner stops snap to device pixels at `$scale` so corners stay crisp.
+ */
+internal function sliceStops(
+    Vec2 $pos,
+    Vec2 $size,
+    const NineSlice& $s,
+    float32 $texW,
+    float32 $texH,
+    float32 $scale
+) : SliceStops
+{
+    float32 $rx = $s->rect->x;
+    float32 $ry = $s->rect->y;
+    float32 $rw = $s->rect->z;
+    float32 $rh = $s->rect->w;
+
+    if ($rw <= 0.0f || $rh <= 0.0f) {
+        $rx = 0.0f;
+        $ry = 0.0f;
+        $rw = $texW;
+        $rh = $texH;
+    }
+
+    float32 $l = $s->border->left * $s->scale;
+    float32 $r = $s->border->right * $s->scale;
+    float32 $t = $s->border->top * $s->scale;
+    float32 $b = $s->border->bottom * $s->scale;
+    float32 $bx = $l + $r;
+    float32 $by = $t + $b;
+
+    if ($bx > $size->x && $bx > 0.0f) {
+        float32 $k = $size->x / $bx;
+        $l = $l * $k;
+        $r = $r * $k;
+    }
+
+    if ($by > $size->y && $by > 0.0f) {
+        float32 $k = $size->y / $by;
+        $t = $t * $k;
+        $b = $b * $k;
+    }
+
+    float32 $x0 = $pos->x;
+    float32 $y0 = $pos->y;
+    float32 $x3 = $pos->x + $size->x;
+    float32 $y3 = $pos->y + $size->y;
+    fixed_array<float32, 4> $xs = [$x0, snapPt($x0 + $l, $scale), snapPt($x3 - $r, $scale), $x3];
+    fixed_array<float32, 4> $ys = [$y0, snapPt($y0 + $t, $scale), snapPt($y3 - $b, $scale), $y3];
+    float32 $iw = 1.0f / $texW;
+    float32 $ih = 1.0f / $texH;
+    fixed_array<float32, 4> $us = [
+        $rx * $iw,
+        ($rx + $s->border->left) * $iw,
+        ($rx + $rw - $s->border->right) * $iw,
+        ($rx + $rw) * $iw,
+    ];
+    fixed_array<float32, 4> $vs = [
+        $ry * $ih,
+        ($ry + $s->border->top) * $ih,
+        ($ry + $rh - $s->border->bottom) * $ih,
+        ($ry + $rh) * $ih,
+    ];
+    return SliceStops($xs, $ys, $us, $vs);
+}
+
+/**
+ * The centre's repeat period in layout points, or zero when the centre has no source area.
+ */
+internal function centerTile(const NineSlice& $s, float32 $texW, float32 $texH) : Vec2
+{
+    float32 $rw = $s->rect->z;
+    float32 $rh = $s->rect->w;
+
+    if ($rw <= 0.0f || $rh <= 0.0f) {
+        $rw = $texW;
+        $rh = $texH;
+    }
+
+    float32 $w = ($rw - $s->border->left - $s->border->right) * $s->scale;
+    float32 $h = ($rh - $s->border->top - $s->border->bottom) * $s->scale;
+
+    if ($w <= 0.0f || $h <= 0.0f) {
+        return Vec2(0.0f);
+    }
+
+    return Vec2($w, $h);
+}
+
+/**
+ * Draw `$skin` over the box when there is one. Returns whether it drew, so an emitter can fall
+ * back to its flat fill with `if (!emitSkin(...))`.
+ */
+internal function emitSkin(Ui $ui, Vec2 $pos, Vec2 $size, NineSlice? $skin) : bool
+{
+    NineSlice $use = guard $skin else {
+        return false;
+    }
+
+    emitNineSlice($ui, $pos, $size, $use);
+    return true;
+}
+
+internal function emitNineSlice(Ui $ui, Vec2 $pos, Vec2 $size, const NineSlice& $s) : void
+{
+    if ($size->x <= 0.0f || $size->y <= 0.0f || $s->tint->a <= 0.0f) {
+        return;
+    }
+
+    Texture $tex = $s->texture;
+    int32 $tw = $tex->desc->width;
+    int32 $th = $tex->desc->height;
+
+    if ($tw <= 0 || $th <= 0) {
+        return;
+    }
+
+    sampleable($ui, $tex);
+
+    SliceStops $g = sliceStops($pos, $size, $s, $tw as float32, $th as float32, $ui->scale);
+    Vec2 $tile = Vec2(0.0f);
+
+    if ($s->center == SliceFill::repeat) {
+        $tile = centerTile($s, $tw as float32, $th as float32);
+    }
+
+    bindAtlas($ui->batch, $tex, $s->nearest);
+    usize $j = 0;
+
+    while ($j < 3) {
+        usize $i = 0;
+
+        while ($i < 3) {
+            Vec2 $p0 = Vec2($g->x[$i], $g->y[$j]);
+            Vec2 $p1 = Vec2($g->x[$i + 1], $g->y[$j + 1]);
+            Vec2 $cell = Vec2($p1->x - $p0->x, $p1->y - $p0->y);
+
+            if ($i == 1 && $j == 1 && $tile->x > 0.0f) {
+                Vec4 $region = Vec4($g->u[1], $g->v[1], $g->u[2] - $g->u[1], $g->v[2] - $g->v[1]);
+                Vec2 $tiles = Vec2($cell->x / $tile->x, $cell->y / $tile->y);
+                emitTiledQuad($ui->batch, $p0, $cell, $tiles, $region, $s->tint, $ui->clip);
+                $i = $i + 1;
+                continue;
+            }
+
+            emitImageQuad(
+                $ui->batch,
+                $p0,
+                $cell,
+                Vec2($g->u[$i], $g->v[$j]),
+                Vec2($g->u[$i + 1], $g->v[$j + 1]),
+                $s->tint,
+                $ui->clip
+            );
+            $i = $i + 1;
+        }
+
+        $j = $j + 1;
+    }
+}

@@ -634,6 +634,10 @@ public class Device : DeviceProtocol
 
     public function uploadTexture(
         Texture $texture,
+        int32 $x,
+        int32 $y,
+        int32 $width,
+        int32 $height,
         int32 $mip,
         int32 $layer,
         ptr<const uint8> $src,
@@ -643,20 +647,21 @@ public class Device : DeviceProtocol
     {
         assert($this->gpu != null, 'uploadTexture before initialize');
         assert(!$this->encoderOpen, 'uploadTexture with an open encoder');
-        assert($bytes > 0, 'uploadTexture size');
-        assert($layer >= 0 && $layer < $texture->layers(), 'uploadTexture layer');
         mtl::Texture $mt = guard $texture->handle->texture else {
             die('uploadTexture handle is empty');
         }
-        int32 $w = mipSize($texture->desc->width, $mip);
-        int32 $h = mipSize($texture->desc->height, $mip);
         uint64 $row = $bytesPerRow as uint64;
 
         if ($row == 0) {
-            $row = mipRowBytes($texture->desc->format, $w);
+            $row = mipRowBytes($texture->desc->format, $width);
         }
 
-        mtl::Region $region = mtl::Region(mtl::Origin(), mtl::Size($w as usize, $h as usize));
+        // colour textures are .shared, so this is a memcpy into the texture's own backing.
+        // frames N-1/N-2 may still be sampling; a brush texel can tear for a frame.
+        mtl::Region $region = mtl::Region(
+            mtl::Origin($x as usize, $y as usize),
+            mtl::Size($width as usize, $height as usize)
+        );
         ptr<uint8> $p = ptr<uint8>($src:$);
         $mt->replace(
             $region,
@@ -664,7 +669,7 @@ public class Device : DeviceProtocol
             $row as usize,
             $mip as uint32,
             slice: $layer as uint32,
-            bytesPerImage: mipByteCount($texture->desc->format, $w, $h) as usize
+            bytesPerImage: 0
         );
         $texture->state = .shaderRead;
     }

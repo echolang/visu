@@ -5,6 +5,7 @@ layout(location = 1) in vec2 vUv;
 layout(location = 2) in vec4 vShape;
 layout(location = 3) in vec4 vColor;
 layout(location = 4) in vec4 vClip;
+layout(location = 5) in vec4 vRegion;
 
 layout(location = 0) out vec4 FragColor;
 
@@ -25,7 +26,15 @@ void main()
 {
     vec4 color = vColor;
     float cover = 1.0;
-    if (vShape.w > 3.5) {
+    if (vShape.w > 4.5) {
+        // tiled: vUv counts tiles, vRegion is the source rect (u, v, w, h) to wrap inside;
+        // half a texel in so linear filtering never reaches past the rect, lod 0 so the wrap
+        // seam cannot pick a coarser mip
+        vec2 half_texel = 0.5 / vec2(textureSize(uTex, 0));
+        vec2 inside = clamp(fract(vUv) * vRegion.zw, half_texel, vRegion.zw - half_texel);
+        vec4 tex = textureLod(uTex, vRegion.xy + inside, 0.0);
+        color = vColor * vec4(tex.rgb, 1.0) * tex.a;
+    } else if (vShape.w > 3.5) {
         vec4 tex = texture(uTex, vUv);
         color = vColor * vec4(tex.rgb, 1.0) * tex.a;
     } else if (vShape.w > 2.5) {

@@ -24,11 +24,24 @@ internal struct SelectPersist
     public Vec2 $dropSize = Vec2(0.0f);
 }
 
+internal struct FieldPersist
+{
+    public string $edit = '';
+    public bool $armed = false;
+}
+
+internal struct ScrollPersist
+{
+    public float32 $offset = 0.0f;
+}
+
 internal enum Persist
 {
     case none;
     case group(GroupPersist $g);
     case select(SelectPersist $s);
+    case field(FieldPersist $f);
+    case scroll(ScrollPersist $s);
 }
 
 internal struct Slot
@@ -44,6 +57,15 @@ internal struct Slot
 internal function mixId(uint64 $parent, const string& $label) : uint64
 {
     return hash::combine($parent, hash::of($label));
+}
+
+/**
+ * A layout's id from its parent and sibling index. Integer mix, no label string: `begin`
+ * runs for every container every frame.
+ */
+internal function layoutId(uint64 $parent, int32 $sibling) : uint64
+{
+    return hash::combine($parent, hash::combine(0x6c61796f7574 as uint64, hash::of($sibling)));
 }
 
 internal function touchSlot(map<uint64, Slot>& $slots, uint64 $id, int32 $stamp) : void
@@ -102,6 +124,40 @@ internal function selectData(const Slot& $s) : SelectPersist
 internal function setSelect(Slot& $s, SelectPersist $p) : void
 {
     $s->data = .select($p);
+}
+
+internal function fieldData(const Slot& $s) : FieldPersist
+{
+    match ($s->data) {
+        Persist::field($f) => {
+            return $f;
+        },
+        else => {
+            return FieldPersist();
+        },
+    };
+}
+
+internal function setField(Slot& $s, FieldPersist $f) : void
+{
+    $s->data = .field($f);
+}
+
+internal function scrollData(const Slot& $s) : ScrollPersist
+{
+    match ($s->data) {
+        Persist::scroll($p) => {
+            return $p;
+        },
+        else => {
+            return ScrollPersist();
+        },
+    };
+}
+
+internal function setScroll(Slot& $s, ScrollPersist $p) : void
+{
+    $s->data = .scroll($p);
 }
 
 internal function selectIsOpen(const Slot& $s) : bool

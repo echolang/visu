@@ -219,5 +219,28 @@ internal function shadowDummy(Device $device) : Texture
     $desc->kind = .array2D;
     $desc->arrayLength = 1;
     $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET;
+    $desc->label = 'deferred.shadowDummy';
     return Texture($device, 'deferred.shadowDummy', $desc);
+}
+
+/**
+ * Depth is device-private, so the dummy cannot be CPU-uploaded. One 1x1 clear to 1.0
+ * (unshadowed) then a shaderRead transition, the same dance as a real cascade.
+ * Load cannot do this: beginRender needs an open frame.
+ */
+internal function ensureShadowDummy(Device $device, Texture $dummy) : void
+{
+    if ($dummy->state == ResourceState::shaderRead) {
+        return;
+    }
+
+    DepthTarget $depth = DepthTarget($dummy);
+    $depth->load = .clear;
+    $depth->store = .store;
+    $depth->clearDepth = 1.0f;
+    RenderPassDesc $desc = RenderPassDesc();
+    $desc->depth = $depth;
+    RenderEncoder $enc = $device->beginRender($desc);
+    $enc->endRender();
+    $device->transitionTexture($dummy, .shaderRead);
 }

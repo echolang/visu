@@ -4,7 +4,7 @@
 
 namespace visu::geo;
 
-use visu::math::{Mat4, Vec3, Vec4, clamp, max, min};
+use visu::math::{Mat4, Vec2, Vec3, Vec4, clamp, max, min};
 
 public struct AABB
 {
@@ -159,7 +159,10 @@ public struct AABB
         return $ray->at($d);
     }
 
-    public const function hitDistance(const Ray& $ray) : float32?
+    /**
+     * Enter and exit distances along `$ray`. Origin inside the box starts at 0.
+     */
+    public const function hitInterval(const Ray& $ray) : Vec2?
     {
         float32 $tmin = 0.0f;
         float32 $tmax = 0.0f;
@@ -178,18 +181,32 @@ public struct AABB
         }
 
         if (!$started) {
-            return 0.0f;
+            return Vec2(0.0f, 0.0f);
         }
 
         if ($tmax < 0.0f) {
             return null;
         }
 
-        if ($tmin < 0.0f) {
-            return 0.0f;
+        float32 $enter = $tmin;
+        if ($enter < 0.0f) {
+            $enter = 0.0f;
         }
 
-        return $tmin;
+        if ($enter > $tmax) {
+            return null;
+        }
+
+        return Vec2($enter, $tmax);
+    }
+
+    public const function hitDistance(const Ray& $ray) : float32?
+    {
+        Vec2 $span = guard $this->hitInterval($ray) else {
+            return null;
+        }
+
+        return $span->x;
     }
 
     public const function corners() : array<Vec3>

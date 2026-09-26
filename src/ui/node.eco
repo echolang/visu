@@ -25,6 +25,10 @@ public enum Kind
     case image;
     case progress;
     case spinner;
+    case field;
+    case separator;
+    case scroll;
+    case iconButton;
 }
 
 public enum Flow
@@ -59,6 +63,12 @@ public enum ButtonKind
     case secondary;
 }
 
+public enum CardKind
+{
+    case card;
+    case panel;
+}
+
 /**
  * Config for `Ui.begin`.
  * Field defaults; assign what you need.
@@ -75,10 +85,31 @@ public struct Layout
     public float32 $height = 0.0f;
     public Color $bg;
     public float32 $radius = 0.0f;
+    /**
+     * 9-slice drawn in place of `bg`. The texture is shared, not owned by the layout.
+     */
+    public NineSlice? $skin = null;
+    /**
+     * The layout's rect takes the pointer, so clicks and the wheel over a panel's padding or
+     * labels never reach the world. Null means solid when the layout paints a `bg` or a `skin`.
+     */
+    public bool? $solid = null;
 
     init
     {
         $this->bg = Color::transparent();
+    }
+
+    public const function blocks() : bool
+    {
+        bool? $explicit = $this->solid;
+
+        if ($explicit != null) {
+            bool $on = guard $explicit;
+            return $on;
+        }
+
+        return $this->bg->a > 0.0f || $this->skin != null;
     }
 }
 
@@ -105,6 +136,19 @@ public struct Node
     public Vec2 $pos = Vec2(0.0f);
     public uint64 $id = 0 as uint64;
     public int32 $payload = NODE_NONE;
+    /**
+     * Index into `Ui.skins` for this frame, or `NODE_NONE`. An index keeps the texture
+     * refcount off every node copy.
+     */
+    public int32 $skin = NODE_NONE;
+    /**
+     * A layout that takes the pointer (`Layout.blocks`).
+     */
+    public bool $solid = false;
+    /**
+     * Pushed inside `beginDisabled(true)`: drawn faded, never clicks.
+     */
+    public bool $dim = false;
 
     init
     {
@@ -118,7 +162,9 @@ internal function interactive(Kind $kind) : bool
         || $kind == Kind::checkbox
         || $kind == Kind::group
         || $kind == Kind::select
-        || $kind == Kind::slider;
+        || $kind == Kind::slider
+        || $kind == Kind::field
+        || $kind == Kind::iconButton;
 }
 
 internal function appendNode(array<Node>& $nodes, int32 $parent, Node $n) : int32

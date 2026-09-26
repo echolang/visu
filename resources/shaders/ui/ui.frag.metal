@@ -23,6 +23,7 @@ struct fs_in
     float4 vShape [[user(locn2)]];
     float4 vColor [[user(locn3)]];
     float4 vClip [[user(locn4)]];
+    float4 vRegion [[user(locn5)]];
 };
 
 static inline __attribute__((always_inline))
@@ -37,51 +38,61 @@ fragment fs_out fs(fs_in in [[stage_in]], texture2d<float> uTex [[texture(0)]], 
     fs_out out = {};
     float4 color = in.vColor;
     float cover = 1.0;
-    if (in.vShape.w > 3.5)
+    if (in.vShape.w > 4.5)
     {
-        float4 tex = uTex.sample(uTexSmplr, in.vUv);
+        float2 half_texel = float2(0.5) / float2(int2(uTex.get_width(), uTex.get_height()));
+        float2 inside = fast::clamp(fract(in.vUv) * in.vRegion.zw, half_texel, in.vRegion.zw - half_texel);
+        float4 tex = uTex.sample(uTexSmplr, (in.vRegion.xy + inside), level(0.0));
         color = (in.vColor * float4(tex.xyz, 1.0)) * tex.w;
     }
     else
     {
-        if (in.vShape.w > 2.5)
+        if (in.vShape.w > 3.5)
         {
-            float2 param = in.vUv;
-            float2 param_1 = in.vShape.xy;
-            float param_2 = in.vShape.z;
-            float d = abs(sdRoundBox(param, param_1, param_2)) - 1.0;
-            cover = fast::clamp(0.5 - (d / fast::max(fwidth(d), 9.9999997473787516355514526367188e-05)), 0.0, 1.0);
+            float4 tex_1 = uTex.sample(uTexSmplr, in.vUv);
+            color = (in.vColor * float4(tex_1.xyz, 1.0)) * tex_1.w;
         }
         else
         {
-            if (in.vShape.w > 1.5)
+            if (in.vShape.w > 2.5)
             {
-                color = in.vColor * uTex.sample(uTexSmplr, in.vUv).x;
+                float2 param = in.vUv;
+                float2 param_1 = in.vShape.xy;
+                float param_2 = in.vShape.z;
+                float d = abs(sdRoundBox(param, param_1, param_2)) - 1.0;
+                cover = fast::clamp(0.5 - (d / fast::max(fwidth(d), 9.9999997473787516355514526367188e-05)), 0.0, 1.0);
             }
             else
             {
-                if (in.vShape.w > 0.5)
+                if (in.vShape.w > 1.5)
                 {
-                    float2 param_3 = in.vUv;
-                    float2 param_4 = in.vShape.xy;
-                    float param_5 = in.vShape.z;
-                    float d_1 = sdRoundBox(param_3, param_4, param_5);
-                    cover = fast::clamp(0.5 - (d_1 / fast::max(fwidth(d_1), 9.9999997473787516355514526367188e-05)), 0.0, 1.0);
+                    color = in.vColor * uTex.sample(uTexSmplr, in.vUv).x;
+                }
+                else
+                {
+                    if (in.vShape.w > 0.5)
+                    {
+                        float2 param_3 = in.vUv;
+                        float2 param_4 = in.vShape.xy;
+                        float param_5 = in.vShape.z;
+                        float d_1 = sdRoundBox(param_3, param_4, param_5);
+                        cover = fast::clamp(0.5 - (d_1 / fast::max(fwidth(d_1), 9.9999997473787516355514526367188e-05)), 0.0, 1.0);
+                    }
                 }
             }
         }
     }
-    bool _152 = in.vClip.z > 0.5;
-    bool _159;
-    if (!_152)
+    bool _200 = in.vClip.z > 0.5;
+    bool _207;
+    if (!_200)
     {
-        _159 = in.vClip.w > 0.5;
+        _207 = in.vClip.w > 0.5;
     }
     else
     {
-        _159 = _152;
+        _207 = _200;
     }
-    if (_159)
+    if (_207)
     {
         float2 p = in.vPos - in.vClip.xy;
         float2 param_6 = p;

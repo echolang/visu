@@ -1,6 +1,6 @@
 /**
  * CPU height grid in XZ, origin at the centre.
- * `sample` is bilinear in world units; `cast` is the PHP binary-search ray march.
+ * `sample` is bilinear in world units; `cast` clips to `bounds()` then binary-searches the span.
  * One texel is `1 / ppu` world units. `smoothed` is a binomial low-pass copy.
  */
 
@@ -16,6 +16,7 @@ public class Heightmap
     private array<float32> $data;
     private float32 $lo;
     private float32 $hi;
+    private bool $loose;
 
     /**
      * `$data` is row-major in Z, `width * height` samples. `$ppu` must be > 0.
@@ -30,6 +31,9 @@ public class Heightmap
         $this->height = $height;
         $this->ppu = $ppu;
         $this->data = $data;
+        $this->lo = 0.0f;
+        $this->hi = 0.0f;
+        $this->loose = false;
         $this->recount();
     }
 
@@ -65,8 +69,6 @@ public class Heightmap
         assert($iz >= 0 && $iz < $this->height, 'heightmap z');
         usize $i = ($iz * $this->width + $ix) as usize;
         float32 $old = $this->data[$i];
-        float32 $oldLo = $this->lo;
-        float32 $oldHi = $this->hi;
         $this->data[$i] = $h;
         if ($h < $this->lo) {
             $this->lo = $h;
@@ -76,8 +78,10 @@ public class Heightmap
             $this->hi = $h;
         }
 
-        if (($old == $oldLo && $h > $oldLo) || ($old == $oldHi && $h < $oldHi)) {
-            $this->recount();
+        // a vacated extreme leaves the old bound standing. a wider AABB never culls a
+        // visible patch; exactness is for range() and a later recount()
+        if (($old == $this->lo && $h > $this->lo) || ($old == $this->hi && $h < $this->hi)) {
+            $this->loose = true;
         }
     }
 
@@ -150,9 +154,12 @@ public class Heightmap
         }
     }
 
-    internal const function sampleData() : array<float32>
+    /**
+     * Row-major samples, `width * height`, borrowed in place. No copy; writes go through `set`.
+     */
+    public const function samples() : const array<float32>&
     {
-        return $this->data;
+        return &$this->data;
     }
 
     /**
@@ -241,31 +248,60 @@ public class Heightmap
     }
 
     /**
-     * Approximate intersection by halving `$maxDistance` `$lookups` times.
-     * Outside the grid counts as below the ray so the march can walk off the map.
+     * Surface hit along `$ray`, or null if the ray misses the heightfield.
+     * Clips to `bounds()` first, then binary-searches that interval `$lookups` times.
      */
     public const function cast(const Ray& $ray, float32 $maxDistance = 1000.0f, int32 $lookups = 16) : Vec3?
     {
-        Ray $r = $ray;
-        float32 $span = $maxDistance;
-        Vec3 $test = $ray->origin;
-
-        for (int32 $i = 0; $i < $lookups; $i = $i + 1) {
-            $span = $span * 0.5f;
-            $test = $r->at($span);
-            float32? $sampled = $this->sample($test->x, $test->z);
-            float32 $height = $sampled ?? ($test->y - 1.0f);
-
-            if ($height < $test->y) {
-                $r->origin = $test;
-            }
+        AABB $box = $this->bounds();
+        Vec2 $span = guard $box->hitInterval($ray) else {
+            return null;
         }
 
-        return $test;
+        float32 $t0 = $span->x;
+        float32 $t1 = $span->y;
+        if ($t1 > $maxDistance) {
+            $t1 = $maxDistance;
+        }
+
+        if ($t0 > $t1) {
+            return null;
+        }
+
+        int32 $n = $lookups;
+        if ($n < 1) {
+            $n = 1;
+        }
+
+        int32 $i = 0;
+        while ($i < $n) {
+            float32 $t = ($t0 + $t1) * 0.5f;
+            Vec3 $p = $ray->at($t);
+            float32? $sampled = $this->sample($p->x, $p->z);
+            float32 $height = $sampled ?? ($p->y - 1.0f);
+            if ($p->y > $height) {
+                $t0 = $t;
+            } else {
+                $t1 = $t;
+            }
+
+            $i = $i + 1;
+        }
+
+        Vec3 $hit = $ray->at($t1);
+        float32 $h = guard $this->sample($hit->x, $hit->z) else {
+            return null;
+        }
+
+        if ($hit->y > $h + 0.5f) {
+            return null;
+        }
+
+        return Vec3($hit->x, $h, $hit->z);
     }
 
     /**
-     * Lowest sample. Cached; `set` keeps it in sync.
+     * Lowest sample. Cached; `set` widens it and leaves it standing when an extreme is vacated.
      */
     public const function min() : float32
     {
@@ -273,14 +309,25 @@ public class Heightmap
     }
 
     /**
-     * Highest sample. Cached; `set` keeps it in sync.
+     * Highest sample. Cached; `set` widens it and leaves it standing when an extreme is vacated.
      */
     public const function max() : float32
     {
         return $this->hi;
     }
 
-    private function recount() : void
+    /**
+     * True when min/max may be wider than the samples. `recount` clears it.
+     */
+    public const function loose() : bool
+    {
+        return $this->loose;
+    }
+
+    /**
+     * Walk every sample and store exact min/max. For save/load and a console verb, never a stroke.
+     */
+    public function recount() : void
     {
         float32 $lo = $this->data[0];
         float32 $hi = $lo;
@@ -296,14 +343,18 @@ public class Heightmap
 
         $this->lo = $lo;
         $this->hi = $hi;
+        $this->loose = false;
     }
 
     /**
-     * World AABB covering every grid vertex, Y from min sample to max sample.
+     * World AABB covering every grid vertex. Y uses the cached min/max, never a full recount.
      */
     public const function bounds() : AABB
     {
-        return $this->bounds(0, 0, $this->width - 1, $this->height - 1);
+        return AABB(
+            Vec3($this->worldX(0), $this->lo, $this->worldZ(0)),
+            Vec3($this->worldX($this->width - 1), $this->hi, $this->worldZ($this->height - 1))
+        );
     }
 
     /**

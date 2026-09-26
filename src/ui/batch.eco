@@ -19,6 +19,10 @@ internal struct UiVertex
     public Vec4 $shape;
     public Vec4 $color;
     public Vec4 $clip;
+    /**
+     * Source rect (u, v, w, h) a tiled quad wraps inside. Zero for every other shape.
+     */
+    public Vec4 $region;
 }
 
 internal struct UiFrag
@@ -31,6 +35,7 @@ internal struct UiDraw
     public int32 $first;
     public int32 $count;
     public Texture? $texture;
+    public bool $nearest = false;
 }
 
 internal class UiBatch
@@ -40,6 +45,11 @@ internal class UiBatch
     public array<UiDraw> $draws;
     internal int32 $runFirst;
     internal Texture? $runTex;
+    internal bool $runNearest;
+    /**
+     * Opacity applied to every quad; below 1 while a disabled node emits.
+     */
+    internal float32 $fade = 1.0f;
 
     public constructor()
     {
@@ -48,6 +58,8 @@ internal class UiBatch
         $this->draws = array<UiDraw>();
         $this->runFirst = 0;
         $this->runTex = null;
+        $this->runNearest = false;
+        $this->fade = 1.0f;
     }
 
     public function clear() : void
@@ -57,6 +69,7 @@ internal class UiBatch
         $this->draws->clear();
         $this->runFirst = 0;
         $this->runTex = null;
+        $this->runNearest = false;
     }
 }
 
@@ -146,8 +159,46 @@ internal function emitImageQuad(
     UiBatch $b,
     Vec2 $pos,
     Vec2 $size,
+    Vec2 $uv0,
+    Vec2 $uv1,
     Color $tint,
     Vec4 $clip
+) : void
+{
+    emitTexturedQuad($b, $pos, $size, $uv0, $uv1, 4.0f, $tint, $clip, Vec4(0.0f));
+}
+
+/**
+ * One quad that repeats a source rect. `$tiles` is how many copies fit along each axis; the
+ * shader wraps inside `$region`, so any box is still four vertices.
+ */
+internal function emitTiledQuad(
+    UiBatch $b,
+    Vec2 $pos,
+    Vec2 $size,
+    Vec2 $tiles,
+    Vec4 $region,
+    Color $tint,
+    Vec4 $clip
+) : void
+{
+    emitTexturedQuad($b, $pos, $size, Vec2(0.0f), $tiles, 5.0f, $tint, $clip, $region);
+}
+
+/**
+ * Axis-aligned textured quad from `$uv0` (top-left) to `$uv1`; `$shape` is the shader's
+ * sampling mode (4 plain image, 5 tiled inside `$region`).
+ */
+internal function emitTexturedQuad(
+    UiBatch $b,
+    Vec2 $pos,
+    Vec2 $size,
+    Vec2 $uv0,
+    Vec2 $uv1,
+    float32 $shape,
+    Color $tint,
+    Vec4 $clip,
+    Vec4 $region
 ) : void
 {
     if ($size->x <= 0.0f || $size->y <= 0.0f || $tint->a <= 0.0f) {
@@ -158,21 +209,20 @@ internal function emitImageQuad(
     float32 $y0 = $pos->y;
     float32 $x1 = $pos->x + $size->x;
     float32 $y1 = $pos->y + $size->y;
-    Vec4 $shape = Vec4(0.0f, 0.0f, 0.0f, 4.0f);
-    Vec4 $col = $tint->premultiplied();
     pushQuad(
         $b,
         Vec2($x0, $y0),
         Vec2($x1, $y0),
         Vec2($x1, $y1),
         Vec2($x0, $y1),
-        Vec2(0.0f, 0.0f),
-        Vec2(1.0f, 0.0f),
-        Vec2(1.0f, 1.0f),
-        Vec2(0.0f, 1.0f),
-        $shape,
-        $col,
-        $clip
+        $uv0,
+        Vec2($uv1->x, $uv0->y),
+        $uv1,
+        Vec2($uv0->x, $uv1->y),
+        Vec4(0.0f, 0.0f, 0.0f, $shape),
+        $tint->premultiplied(),
+        $clip,
+        $region
     );
 }
 
@@ -219,14 +269,21 @@ internal function pushQuad(
     Vec2 $t3,
     Vec4 $shape,
     Vec4 $color,
-    Vec4 $clip
+    Vec4 $clip,
+    Vec4 $region = Vec4(0.0f)
 ) : void
 {
     uint32 $base = $b->verts->count() as uint32;
-    $b->verts[] = UiVertex($p0, $t0, $shape, $color, $clip);
-    $b->verts[] = UiVertex($p1, $t1, $shape, $color, $clip);
-    $b->verts[] = UiVertex($p2, $t2, $shape, $color, $clip);
-    $b->verts[] = UiVertex($p3, $t3, $shape, $color, $clip);
+
+    if ($b->fade < 1.0f) {
+        // colours are premultiplied, so fading scales all four
+        $color = $color * $b->fade;
+    }
+
+    $b->verts[] = UiVertex($p0, $t0, $shape, $color, $clip, $region);
+    $b->verts[] = UiVertex($p1, $t1, $shape, $color, $clip, $region);
+    $b->verts[] = UiVertex($p2, $t2, $shape, $color, $clip, $region);
+    $b->verts[] = UiVertex($p3, $t3, $shape, $color, $clip, $region);
     $b->indices[] = $base;
     $b->indices[] = ($base + 1) as uint32;
     $b->indices[] = ($base + 2) as uint32;
@@ -235,7 +292,7 @@ internal function pushQuad(
     $b->indices[] = ($base + 3) as uint32;
 }
 
-internal function closeDraw(UiBatch $b, int32 $first, Texture? $tex) : void
+internal function closeDraw(UiBatch $b, int32 $first, Texture? $tex, bool $nearest = false) : void
 {
     int32 $count = ($b->indices->count() as int32) - $first;
 
@@ -243,33 +300,40 @@ internal function closeDraw(UiBatch $b, int32 $first, Texture? $tex) : void
         return;
     }
 
-    $b->draws[] = UiDraw($first, $count, $tex);
+    $b->draws[] = UiDraw($first, $count, $tex, $nearest);
 }
 
+/**
+ * Open a run. SDF boxes never sample, so until a quad binds a texture the run takes
+ * whichever texture comes next and a flat box costs no draw split.
+ */
 internal function beginRun(UiBatch $b) : void
 {
     $b->runFirst = $b->indices->count() as int32;
     $b->runTex = null;
+    $b->runNearest = false;
 }
 
-internal function bindAtlas(UiBatch $b, Texture? $tex) : void
+internal function bindAtlas(UiBatch $b, Texture? $tex, bool $nearest = false) : void
 {
     if ($tex == null) {
         return;
     }
 
-    if ($b->runTex != null && $tex != $b->runTex) {
-        closeDraw($b, $b->runFirst, $b->runTex);
+    if ($b->runTex != null && ($tex != $b->runTex || $nearest != $b->runNearest)) {
+        closeDraw($b, $b->runFirst, $b->runTex, $b->runNearest);
         $b->runFirst = $b->indices->count() as int32;
     }
 
     $b->runTex = $tex;
+    $b->runNearest = $nearest;
 }
 
 internal function endRun(UiBatch $b) : void
 {
-    closeDraw($b, $b->runFirst, $b->runTex);
+    closeDraw($b, $b->runFirst, $b->runTex, $b->runNearest);
     $b->runTex = null;
+    $b->runNearest = false;
 }
 
 internal class UiGpu
@@ -278,6 +342,7 @@ internal class UiGpu
     public GpuPass $pass;
     public Texture $white;
     public Sampler $sampler;
+    public Sampler $nearest;
     public Canvas $canvas;
     public Font $regular;
     public Font $semibold;
@@ -287,6 +352,7 @@ internal class UiGpu
         GpuPass $pass,
         Texture $white,
         Sampler $sampler,
+        Sampler $nearest,
         Canvas $canvas,
         Font $regular,
         Font $semibold
@@ -296,6 +362,7 @@ internal class UiGpu
         $this->pass = $pass;
         $this->white = $white;
         $this->sampler = $sampler;
+        $this->nearest = $nearest;
         $this->canvas = $canvas;
         $this->regular = $regular;
         $this->semibold = $semibold;
@@ -337,6 +404,7 @@ internal function uiMakeGpu(
         $b->attr(2, &$v->shape);
         $b->attr(3, &$v->color);
         $b->attr(4, &$v->clip);
+        $b->attr(5, &$v->region);
     }), $raster);
     TextureDesc $desc = TextureDesc($format: .rgba8, $width: 1, $height: 1);
     Texture $tex = Texture($device, 'ui-white', $desc);
@@ -347,7 +415,19 @@ internal function uiMakeGpu(
     $px[] = 255;
     $tex->upload(0, $px->data(), 4, 4);
     $device->transitionTexture($tex, ResourceState::shaderRead);
-    return .ok(UiGpu($prog, $pass, $tex, $device->createSampler(SamplerDesc()), $canvas, $regular, $semibold));
+    SamplerDesc $point = SamplerDesc();
+    $point->min = .nearest;
+    $point->mag = .nearest;
+    return .ok(UiGpu(
+        $prog,
+        $pass,
+        $tex,
+        $device->createSampler(SamplerDesc()),
+        $device->createSampler($point),
+        $canvas,
+        $regular,
+        $semibold,
+    ));
 }
 
 internal function uiFont(Ui $ui, bool $bold) : Font?
@@ -393,6 +473,7 @@ internal function flushBatch(Ui $ui, RenderEncoder $enc) : void
     $frag->view = Vec4($ui->frame->x, $ui->frame->y, 0.0f, 0.0f);
     $enc->upload($frag, slot: 0);
     Texture $bound = $white;
+    bool $boundNearest = false;
     $enc->bindTexture(0, $white, $samp);
 
     foreach ($batch->draws as $draw) {
@@ -408,9 +489,16 @@ internal function flushBatch(Ui $ui, RenderEncoder $enc) : void
             $tex = $callTex;
         }
 
-        if ($tex != $bound) {
-            $enc->bindTexture(0, $tex, $samp);
+        if ($tex != $bound || $draw->nearest != $boundNearest) {
+            Sampler $use = $samp;
+
+            if ($draw->nearest) {
+                $use = $gpu->nearest;
+            }
+
+            $enc->bindTexture(0, $tex, $use);
             $bound = $tex;
+            $boundNearest = $draw->nearest;
         }
 
         $enc->drawIndexed($draw->first, $draw->count);

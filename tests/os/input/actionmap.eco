@@ -4,7 +4,7 @@
 
 use visu::math::Vec2;
 use visu::os::{Window, WindowHints};
-use visu::os::input::{ActionMap, ContextMap, InputError, InputHub};
+use visu::os::input::{ActionMap, ContextMap, InputError, InputHub, MOD_CAPS_LOCK, MOD_PRIMARY, MOD_SHIFT};
 use visu::signal::{ClickSignal, Dispatcher, Flow, KeySignal, MouseButtonSignal};
 
 class MapHits
@@ -308,4 +308,62 @@ test context_map_duplicate_and_missing
     assert($dup->failed(), 'dup');
     status<InputError> $miss = $ctx->switch('missing');
     assert($miss->failed(), 'miss');
+}
+
+test context_map_keys_live_under_pointer_claim
+{
+    Dispatcher $d = Dispatcher();
+    Window $w = Window('ctx', 64, 64, WindowHints());
+    InputHub $in = InputHub($w, $d);
+    ContextMap $ctx = ContextMap($d, $in);
+    ActionMap $game = ActionMap();
+    guard $game->bind('tool', .key(.num1)) else ($e) {
+        die($e->message());
+    }
+    guard $game->bind('fire', .button(.left)) else ($e) {
+        die($e->message());
+    }
+    guard $ctx->activate('game', $game) else ($e) {
+        die($e->message());
+    }
+    guard $in->claim('flyui', scope: .pointer) else ($e) {
+        die($e->message());
+    }
+    $d->dispatch(KeySignal(.num1, 0, .press, 0));
+    $d->dispatch(MouseButtonSignal(.left, .press, 0));
+    assert($game->hasBeenPressed('tool'), 'hotkey over a panel');
+    assert(!$game->hasBeenPressed('fire'), 'pointer stays with the panel');
+}
+
+test action_map_chord_needs_its_modifiers
+{
+    ActionMap $m = ActionMap();
+    guard $m->bind('back', .key(.s)) else ($e) {
+        die($e->message());
+    }
+    guard $m->bind('save', .chord(.s, MOD_PRIMARY)) else ($e) {
+        die($e->message());
+    }
+    guard $m->bind('redo', .chord(.z, MOD_PRIMARY | MOD_SHIFT)) else ($e) {
+        die($e->message());
+    }
+    guard $m->bind('undo', .chord(.z, MOD_PRIMARY)) else ($e) {
+        die($e->message());
+    }
+    $m->handle(KeySignal(.s, 0, .press, MOD_PRIMARY));
+    assert($m->hasBeenPressed('save'), 'chord');
+    assert(!$m->hasBeenPressed('back'), 'plain key skips under a command modifier');
+    $m->reset();
+    $m->handle(KeySignal(.s, 0, .release, 0));
+    assert($m->hasBeenReleased('save'), 'release follows the press even after the modifier lifts');
+    assert(!$m->down('save'), 'up');
+    $m->reset();
+    $m->handle(KeySignal(.s, 0, .press, MOD_SHIFT));
+    assert($m->hasBeenPressed('back'), 'shift keeps the plain key');
+    $m->reset();
+    $m->handle(KeySignal(.z, 0, .press, MOD_PRIMARY | MOD_SHIFT | MOD_CAPS_LOCK));
+    assert($m->hasBeenPressed('redo'), 'exact set, lock bits ignored');
+    assert(!$m->hasBeenPressed('undo'), 'no looser match');
+    status<InputError> $dup = $m->bind('again', .chord(.s, MOD_PRIMARY));
+    assert($dup->failed(), 'taken');
 }

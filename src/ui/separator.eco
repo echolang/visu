@@ -1,0 +1,47 @@
+/**
+ * Rule across the parent: horizontal in a vertical flow, vertical in a horizontal one (toolbar
+ * groups).
+ */
+
+namespace visu::ui;
+
+use visu::math::Vec2;
+
+internal function uiSeparator(Ui $ui) : void
+{
+    Node $n = Node();
+    $n->kind = .separator;
+    Node $parent = $ui->nodes[$ui->peekParent() as usize];
+
+    if ($parent->flow == Flow::horizontal) {
+        $n->v = .fill;
+        $n->flow = .horizontal;
+        $n->measured = Vec2($ui->theme->separator->height, 1.0f);
+    } else {
+        $n->h = .fill;
+        $n->measured = Vec2(1.0f, $ui->theme->separator->height);
+    }
+
+    $ui->push($n);
+}
+
+internal function emitSeparatorBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    SeparatorStyle $st = $ui->theme->separator;
+
+    if ($n->flow == Flow::horizontal) {
+        float32 $x = $n->pos->x + ($n->size->x - $st->thickness) * 0.5f;
+        fillBox($ui, Vec2($x, $n->pos->y), Vec2($st->thickness, $n->size->y), 0.0f, $st->color, $pad);
+        return;
+    }
+
+    float32 $y = $n->pos->y + ($n->size->y - $st->thickness) * 0.5f;
+    fillBox(
+        $ui,
+        Vec2($n->pos->x, $y),
+        Vec2($n->size->x, $st->thickness),
+        0.0f,
+        $st->color,
+        $pad
+    );
+}

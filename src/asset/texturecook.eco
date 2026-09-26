@@ -1,6 +1,10 @@
 /**
  * png → vtex. Cook knobs come from the folder `.vtex` view on `Source.$meta`.
- * `mip: "max"` keeps cutout coverage through the chain; box average is the default.
+ * `mip: "max"` keeps cutout coverage through the chain; box average is the default,
+ * in linear light for an sRGB format. `premultiplied: true` divides rgb by alpha first.
+ * `bleed: "self"` (own alpha) or `bleed: "<sibling png stem>"` (its red channel) marks the
+ * covered texels and refills every other texel's rgb with the nearest covered colour, so a
+ * cutout authored on black does not mip to black.
  */
 
 namespace visu::asset;
@@ -39,6 +43,20 @@ public class TextureCooker : Cooker
         PixelFormat $fmt = guard cookPixelFormat($src->meta, $srgb) else ($e) {
             return .error($e);
         }
+        bool $premultiplied = guard vmatBool($src->meta, 'premultiplied', false) else ($e) {
+            return .error($e);
+        }
+        if ($premultiplied) {
+            unpremultiply($px);
+        }
+        string $bleedFrom = vmatStr($src->meta, 'bleed', '');
+        if (!$bleedFrom->empty()) {
+            array<uint8> $cover = guard bleedCoverage($src, $px, $bleedFrom) else ($e) {
+                return .error($e);
+            }
+            bleed($px, $cover);
+        }
+
         Blob $blob = guard encodeTexture($px, $fmt, $mips, $filter->equals('max')) else ($e) {
             return .error($e);
         }
@@ -46,6 +64,30 @@ public class TextureCooker : Cooker
         $items[] = PackItem($src->id, KIND_TEXTURE, $blob);
         return .ok($items);
     }
+}
+
+/**
+ * Covered texels for `bleed`: the texture's own alpha for `self`, else the red
+ * channel of a same-size sibling png in the source folder.
+ */
+internal function bleedCoverage(const Source& $src, const Pixels& $px, const string& $from) : result<array<uint8>, AssetError>
+{
+    if ($from->equals('self')) {
+        return .ok(coverageOf($px, 3));
+    }
+
+    string $base = dirBase($src->path);
+    string $path = $src->path->sub(0, $src->path->size() - $base->size())->clone();
+    $path->append($from);
+    $path->append('.png');
+    Pixels $mask = guard Pixels::load($path) else ($e) {
+        return .error(.io($path, $e->message()));
+    }
+    if ($mask->width != $px->width || $mask->height != $px->height) {
+        return .error(.decode($src->id, "bleed mask '{$from}' is not the texture's size"));
+    }
+
+    return .ok(coverageOf($mask, 0));
 }
 
 internal function cookPixelFormat(json::Value $meta, bool $srgb) : result<PixelFormat, AssetError>

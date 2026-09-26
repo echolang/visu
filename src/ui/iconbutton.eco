@@ -1,0 +1,92 @@
+/**
+ * Square icon button for toolbars: an atlas cell tinted by state, with a selected state for
+ * tool strips. Construct, emit.
+ */
+
+namespace visu::ui;
+
+use visu::graphics::Texture;
+use visu::math::Vec2;
+use visu::vg::Color;
+
+internal function uiIconButton(
+    Ui $ui,
+    const Icon& $icon,
+    const string& $id,
+    bool $selected,
+    float32 $size
+) : bool
+{
+    uint64 $wid = $ui->makeId($id, '');
+    bool $hit = $ui->click($wid);
+    const IconButtonStyle& $st = &$ui->theme->iconButton;
+    float32 $glyph = $size;
+
+    if ($glyph <= 0.0f) {
+        $glyph = $st->size;
+    }
+
+    int32 $p = $ui->iconButtons->count() as int32;
+    $ui->iconButtons[] = IconRun($icon, $selected);
+    Node $n = Node();
+    $n->kind = .iconButton;
+    $n->payload = $p;
+    $n->id = $wid;
+    $n->radius = $st->radius;
+    $n->measured = Vec2($glyph + $st->pad * 2.0f, $glyph + $st->pad * 2.0f);
+    $ui->push($n);
+    return $hit;
+}
+
+internal function emitIconButtonBox(Ui $ui, const Node& $n, float32 $pad) : void
+{
+    IconRun $run = $ui->iconButtons[$n->payload as usize];
+    const IconButtonStyle& $st = &$ui->theme->iconButton;
+    bool $hot = !$n->dim && contains($n, $ui->io->pointer);
+
+    if ($run->selected) {
+        if (emitSkin($ui, $n->pos, $n->size, $st->selectedSkin)) {
+            return;
+        }
+    } else if (emitSkin($ui, $n->pos, $n->size, buttonSkin($st->skin, $hot, $hot && $ui->io->leftDown))) {
+        return;
+    }
+
+    Color $bg = $st->bg;
+
+    if ($run->selected) {
+        $bg = $st->selectedBg;
+    } else if ($hot && $ui->io->leftDown) {
+        $bg = $st->downBg;
+    } else if ($hot) {
+        $bg = $st->hoverBg;
+    }
+
+    if ($bg->a > 0.0f) {
+        fillBox($ui, $n->pos, $n->size, $st->radius, $bg, $pad);
+    }
+}
+
+internal function emitIconButton(Ui $ui, const Node& $n) : void
+{
+    IconRun $run = $ui->iconButtons[$n->payload as usize];
+    const IconButtonStyle& $st = &$ui->theme->iconButton;
+    Texture $tex = $run->icon->texture;
+
+    if ($tex->desc->width < 1 || $tex->desc->height < 1) {
+        return;
+    }
+
+    sampleable($ui, $tex);
+
+    Color $tint = $st->tint;
+
+    if ($run->selected) {
+        $tint = $st->selectedTint;
+    }
+
+    Vec2 $pos = Vec2($n->pos->x + $st->pad, $n->pos->y + $st->pad);
+    Vec2 $size = Vec2($n->size->x - $st->pad * 2.0f, $n->size->y - $st->pad * 2.0f);
+    bindAtlas($ui->batch, $tex);
+    emitImageQuad($ui->batch, $pos, $size, $run->icon->uv0, $run->icon->uv1, $tint, $ui->clip);
+}

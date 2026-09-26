@@ -4,6 +4,7 @@
 
 namespace visu::asset;
 
+use std::math;
 use visu::graphics::{
     Device, PixelFormat, Pixels, Texture, TextureDesc, compressRgba, mipByteCount, mipRowBytes,
     mipSize, pixelCode, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST, TEXTURE_TRANSFER_SRC
@@ -101,7 +102,7 @@ public function encodeTexture(const Pixels& $pixels, PixelFormat $fmt, bool $mip
     string $rgba = rgbaToBytes($pixels->rgba);
     int32 $levels = 1;
     if ($mips) {
-        $levels = appendMips($rgba, $pixels->width, $pixels->height, $maxFilter);
+        $levels = appendMips($rgba, $pixels->width, $pixels->height, $maxFilter, $fmt->isSrgb());
     }
 
     string $texels = $rgba;
@@ -282,12 +283,19 @@ internal function rgbaToBytes(const array<uint8>& $rgba) : string
     return $out;
 }
 
-internal function appendMips(string& $texels, int32 $width, int32 $height, bool $maxFilter) : int32
+/**
+ * Append every mip below the last level to $texels. A box level of an sRGB
+ * texture averages in linear light: averaging the gamma bytes darkens every
+ * mip where bright and dark texels meet, and foliage on a dark ground goes
+ * black at distance.
+ */
+internal function appendMips(string& $texels, int32 $width, int32 $height, bool $maxFilter, bool $srgb) : int32
 {
     int32 $levels = 1;
     int32 $w = $width;
     int32 $h = $height;
     usize $srcOff = 0;
+    array<float32> $decode = srgbDecodeTable();
 
     while ($w > 1 || $h > 1) {
         int32 $nw = $w / 2;
@@ -299,7 +307,7 @@ internal function appendMips(string& $texels, int32 $width, int32 $height, bool 
             $nh = 1;
         }
 
-        string $mip = boxMip($texels, $srcOff, $w, $h, $nw, $nh, $maxFilter);
+        string $mip = boxMip($texels, $srcOff, $w, $h, $nw, $nh, $maxFilter, $srgb, $decode);
         $srcOff = $texels->size();
         putMagic($texels, $mip);
         $w = $nw;
@@ -317,7 +325,9 @@ internal function boxMip(
     int32 $h,
     int32 $nw,
     int32 $nh,
-    bool $maxFilter
+    bool $maxFilter,
+    bool $srgb,
+    const array<float32>& $decode
 ) : string
 {
     string $out = '';
@@ -333,6 +343,9 @@ internal function boxMip(
             uint32 $g = 0;
             uint32 $b = 0;
             uint32 $a = 0;
+            float32 $lr = 0.0f;
+            float32 $lg = 0.0f;
+            float32 $lb = 0.0f;
             int32 $n = 0;
             int32 $oy = 0;
 
@@ -366,6 +379,9 @@ internal function boxMip(
                             $g = $g + $pg;
                             $b = $b + $pb;
                             $a = $a + $pa;
+                            $lr = $lr + $decode[$pr as usize];
+                            $lg = $lg + $decode[$pg as usize];
+                            $lb = $lb + $decode[$pb as usize];
                         }
                         $n = $n + 1;
                     }
@@ -386,9 +402,16 @@ internal function boxMip(
                     $n = 1;
                 }
 
-                $out->push(($r / ($n as uint32)) as uint8);
-                $out->push(($g / ($n as uint32)) as uint8);
-                $out->push(($b / ($n as uint32)) as uint8);
+                if ($srgb) {
+                    float32 $inv = 1.0f / ($n as float32);
+                    $out->push(srgbEncode($lr * $inv));
+                    $out->push(srgbEncode($lg * $inv));
+                    $out->push(srgbEncode($lb * $inv));
+                } else {
+                    $out->push(($r / ($n as uint32)) as uint8);
+                    $out->push(($g / ($n as uint32)) as uint8);
+                    $out->push(($b / ($n as uint32)) as uint8);
+                }
                 $out->push(($a / ($n as uint32)) as uint8);
             }
             $x = $x + 1;
@@ -398,4 +421,45 @@ internal function boxMip(
     }
 
     return $out;
+}
+
+/**
+ * Linear value of every sRGB byte, the IEC 61966-2-1 curve the sampler uses.
+ */
+internal function srgbDecodeTable() : array<float32>
+{
+    array<float32> $table = arr::room<float32>(256);
+    int32 $i = 0;
+
+    while ($i < 256) {
+        float64 $c = ($i as float64) / 255.0;
+        float64 $l = $c / 12.92;
+        if ($c > 0.04045) {
+            $l = math::pow(($c + 0.055) / 1.055, 2.4);
+        }
+        $table[] = $l as float32;
+        $i = $i + 1;
+    }
+
+    return $table;
+}
+
+/**
+ * Nearest sRGB byte for a linear value in 0..1.
+ */
+internal function srgbEncode(float32 $linear) : uint8
+{
+    float64 $l = $linear as float64;
+    if ($l <= 0.0) {
+        return 0;
+    }
+    if ($l >= 1.0) {
+        return 255;
+    }
+
+    float64 $c = $l * 12.92;
+    if ($l > 0.0031308) {
+        $c = 1.055 * math::pow($l, 1.0 / 2.4) - 0.055;
+    }
+    return math::round($c * 255.0) as uint8;
 }

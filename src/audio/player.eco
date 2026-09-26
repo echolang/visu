@@ -104,6 +104,27 @@ public class MusicPlayer
         return .ok;
     }
 
+    /**
+     * Stop the current track, rewind it, and drop its sound. A cross-fade in flight is
+     * cancelled. Nothing plays until the next play or switchTo.
+     */
+    public function stop() : status<PlayerError>
+    {
+        if ($this->switching) {
+            $this->cancelSwitch();
+        }
+
+        Track $cur = guard $this->currentTrack else {
+            return .ok;
+        }
+        guard $this->stopCurrent() else ($e) {
+            return .error($e);
+        }
+        $cur->unload();
+        $this->currentTrack = null;
+        return .ok;
+    }
+
     public function switchTo(string $name) : status<PlayerError>
     {
         Track $next = guard $this->findTrack($name) else ($e) {

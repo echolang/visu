@@ -7,7 +7,8 @@ use visu::graphics::Device;
 use visu::math::Vec2;
 use visu::os::{Window, WindowHints, init, terminate};
 use visu::os::input::{
-    ActionMap, ContextMap, InputError, InputHub, Pinch, PointerSource
+    ActionMap, ClaimScope, ContextMap, InputError, InputHub, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+    MOD_SUPER, Pinch, PointerSource
 };
 use visu::signal::{
     CharSignal, ClickSignal, CursorSignal, Dispatcher, DropSignal, Flow, FocusSignal,
@@ -599,3 +600,61 @@ test input_poll_seeds_pointer_from_window_cursor
     terminate();
 }
 #[end]
+
+test input_pointer_claim_leaves_keys_free
+{
+    InputHub $in = harness();
+    assert($in->keysFree(), 'free');
+    guard $in->claim('flyui', scope: .pointer) else ($e) {
+        die($e->message());
+    }
+    assert(!$in->unclaimed(), 'pointer taken');
+    assert($in->keysFree(), 'keys still free');
+    guard $in->rescope('flyui', .all) else ($e) {
+        die($e->message());
+    }
+    assert(!$in->keysFree(), 'widened');
+    string? $prev = $in->steal('console');
+    assert(!$in->keysFree(), 'steal takes all');
+    guard $in->release('console') else ($e) {
+        die($e->message());
+    }
+    assert($in->keysFree(), 'released');
+}
+
+test input_mods_follow_held_modifier_keys_on_either_side
+{
+    Window $w = Window('tap', 64, 64, WindowHints());
+    InputHub $in = InputHub($w, Dispatcher());
+    assert($in->mods() == 0, 'none held');
+    $in->handle($w, .key(.leftShift, 0, .press, 0));
+    $in->handle($w, .key(.rightShift, 0, .press, 0));
+    $in->handle($w, .key(.rightSuper, 0, .press, 0));
+    assert($in->mods() == (MOD_SHIFT | MOD_SUPER), 'shift and super');
+    $in->handle($w, .key(.leftShift, 0, .release, 0));
+    assert($in->mods() == (MOD_SHIFT | MOD_SUPER), 'right shift still held');
+    $in->handle($w, .key(.rightShift, 0, .release, 0));
+    $in->handle($w, .key(.a, 0, .press, 0));
+    assert($in->mods() == MOD_SUPER, 'shift gone, a is no modifier');
+    $in->handle($w, .key(.leftControl, 0, .press, 0));
+    $in->handle($w, .key(.leftAlt, 0, .press, 0));
+    assert($in->mods() == (MOD_SUPER | MOD_CONTROL | MOD_ALT), 'control and alt');
+    assert($in->primaryDown(), 'primary is super or control');
+    $in->handle($w, .key(.rightSuper, 0, .release, 0));
+    $in->handle($w, .key(.leftControl, 0, .release, 0));
+    assert($in->mods() == MOD_ALT, 'alt only');
+    assert(!$in->primaryDown(), 'primary released');
+}
+
+test input_claim_scope_reads_the_holder_scope
+{
+    InputHub $in = harness();
+    assert($in->claimScope() == null, 'free');
+    guard $in->claim('flyui', scope: .pointer) else ($e) {
+        die($e->message());
+    }
+    ClaimScope $s = guard $in->claimScope() else {
+        die('claimed');
+    }
+    assert($s == ClaimScope::pointer, 'pointer');
+}

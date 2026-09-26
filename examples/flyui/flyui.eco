@@ -4,11 +4,13 @@
  *
  *   echoc run -m examples --target flyui
  *   echoc run -m examples --target flyui --define VISU_FINITE
+ *   echoc run -m examples --target flyui -- --flag flyui.skins=true
  */
 
+use visu::graphics::{Pixels, Texture};
 use visu::math::Vec4;
 use visu::quickstart::{App, Options, Quickstart};
-use visu::ui::{Align, Choice, Edges, Flow, Layout, Sizing, Ui};
+use visu::ui::{Align, ButtonSkin, Choice, Edges, Flow, Layout, NineSlice, Sizing, Ui};
 use visu::vg::Color;
 
 internal class FlyUiDemo
@@ -32,6 +34,8 @@ internal class FlyUiDemo
     public float32 $radius;
     public bool $vsync;
     public string $quality;
+    public Texture? $skin;
+    public bool $skinned;
 
     public constructor()
     {
@@ -54,6 +58,8 @@ internal class FlyUiDemo
         $this->radius = 70.0f;
         $this->vsync = true;
         $this->quality = 'medium';
+        $this->skin = null;
+        $this->skinned = false;
     }
 }
 
@@ -65,8 +71,32 @@ Quickstart $qs = Quickstart(function(Options $opt) : void {
     $opt->windowHeight = 720;
     $opt->clearColor = Vec4(1.0f, 1.0f, 1.0f, 1.0f);
 
+    $opt->ready = function(App $app) : void {
+        Texture $tex = Texture($app->device, 'flyui-skin', skinPixels());
+        $demo->skin = $tex;
+
+        // `--flag flyui.skins=true` opens the skin tab themed, for dcapture
+        if (!visu::app::flags()->bool('flyui.skins', false)) {
+            return;
+        }
+
+        Ui $ui = guard $app->host->ui else {
+            return;
+        }
+        $demo->current = 'skins';
+        $demo->skinned = true;
+        skinTheme($ui, $tex, true);
+    };
+
     $opt->ui = function(App $app, Ui $ui) : void {
         paint($demo, $ui);
+    };
+
+    $opt->teardown = function(App $app) : void {
+        Texture $tex = guard $demo->skin else {
+            return;
+        }
+        $tex->destroy();
     };
 });
 $qs->run();
@@ -120,6 +150,10 @@ internal function paint(FlyUiDemo $demo, Ui $ui) : void
         $demo->current = 'tabs';
     }
 
+    if ($ui->button('Components - Skins', fill: true)) {
+        $demo->current = 'skins';
+    }
+
     if ($ui->button('Settings', fill: true)) {
         $demo->current = 'settings';
     }
@@ -147,6 +181,8 @@ internal function paint(FlyUiDemo $demo, Ui $ui) : void
         demoSliders($demo, $ui);
     } else if ($demo->current == 'tabs') {
         demoTabs($demo, $ui);
+    } else if ($demo->current == 'skins') {
+        demoSkins($demo, $ui);
     } else if ($demo->current == 'settings') {
         demoSettings($demo, $ui);
     } else {
@@ -248,6 +284,155 @@ internal function demoButtons(Ui $ui) : void
     $ui->beginSection('Fill');
     $ui->button('Full width', fill: true);
     $ui->end();
+}
+
+/**
+ * Buttons read the theme when they emit, so the skin is a whole-theme switch, not a per-call one.
+ */
+internal function demoSkins(FlyUiDemo $demo, Ui $ui) : void
+{
+    Texture $tex = guard $demo->skin else {
+        $ui->text('Skin texture missing');
+        return;
+    }
+
+    $ui->beginSection('Theme');
+
+    if ($ui->checkbox('9-slice buttons and cards', &$demo->skinned)) {
+        skinTheme($ui, $tex, $demo->skinned);
+    }
+
+    $ui->end();
+    $ui->beginSection('Buttons');
+    $ui->beginRow();
+    $ui->button('Primary');
+    $ui->button('Secondary', style: .secondary);
+    $ui->end();
+    $ui->button('Full width', fill: true);
+    $ui->end();
+    $ui->beginSection('Skinned layout');
+    Layout $box = Layout();
+    $box->pad = Edges::all(16.0f);
+    $box->skin = skinCell($tex, 3);
+    $ui->begin($box);
+    $ui->text('Any begin() box takes Layout.skin.');
+    $ui->end();
+    $ui->end();
+}
+
+internal const int32 SKIN_CELL = 16;
+
+/**
+ * Cell `$i` of the demo atlas: 0 normal, 1 hover, 2 down, 3 card. Cells sit 1 px apart.
+ */
+internal function skinCell(Texture $tex, int32 $i) : NineSlice
+{
+    float32 $y = ($i * (SKIN_CELL + 1)) as float32;
+    float32 $c = SKIN_CELL as float32;
+    return NineSlice($tex, Edges::all(4.0f), $rect: Vec4(0.0f, $y, $c, $c), $scale: 2.0f, $nearest: true);
+}
+
+internal function skinTheme(Ui $ui, Texture $tex, bool $on) : void
+{
+    if (!$on) {
+        $ui->theme->primaryButton->skin = ButtonSkin();
+        $ui->theme->secondaryButton->skin = ButtonSkin();
+        $ui->theme->card->skin = null;
+        return;
+    }
+
+    ButtonSkin $skin = ButtonSkin();
+    $skin->normal = skinCell($tex, 0);
+    $skin->hover = skinCell($tex, 1);
+    $skin->down = skinCell($tex, 2);
+    $ui->theme->primaryButton->skin = $skin;
+    $ui->theme->primaryButton->text = Color(0.16f, 0.1f, 0.06f, 1.0f);
+    $ui->theme->primaryButton->hoverText = $ui->theme->primaryButton->text;
+    ButtonSkin $dark = $skin;
+    NineSlice $n = skinCell($tex, 0);
+    $n->tint = Color(0.55f, 0.6f, 0.7f, 1.0f);
+    $dark->normal = $n;
+    $ui->theme->secondaryButton->skin = $dark;
+    $ui->theme->card->skin = skinCell($tex, 3);
+}
+
+/**
+ * Four 16 px bevelled cells stacked with a 1 px gap: normal, hover, down, card.
+ */
+internal function skinPixels() : Pixels
+{
+    int32 $w = SKIN_CELL;
+    int32 $h = SKIN_CELL * 4 + 3;
+    array<uint8> $px = array<uint8>();
+    $px->reserve(($w * $h * 4) as usize);
+    int32 $y = 0;
+
+    while ($y < $h) {
+        int32 $x = 0;
+
+        while ($x < $w) {
+            Color $c = skinTexel($x, $y);
+            $px[] = ($c->r * 255.0f) as uint8;
+            $px[] = ($c->g * 255.0f) as uint8;
+            $px[] = ($c->b * 255.0f) as uint8;
+            $px[] = ($c->a * 255.0f) as uint8;
+            $x = $x + 1;
+        }
+
+        $y = $y + 1;
+    }
+
+    return Pixels($w, $h, $px);
+}
+
+internal function skinTexel(int32 $x, int32 $y) : Color
+{
+    int32 $cell = $y / (SKIN_CELL + 1);
+    int32 $cy = $y - $cell * (SKIN_CELL + 1);
+    int32 $last = SKIN_CELL - 1;
+
+    if ($cy >= SKIN_CELL) {
+        return Color::transparent();
+    }
+
+    bool $cornerX = $x == 0 || $x == $last;
+    bool $cornerY = $cy == 0 || $cy == $last;
+
+    if ($cornerX && $cornerY) {
+        return Color::transparent();
+    }
+
+    if ($x == 0 || $cy == 0 || $x == $last || $cy == $last) {
+        return Color(0.16f, 0.1f, 0.06f, 1.0f);
+    }
+
+    Color $fill = Color(0.95f, 0.91f, 0.82f, 1.0f);
+
+    if ($cell == 0) {
+        $fill = Color(0.75f, 0.59f, 0.35f, 1.0f);
+    } else if ($cell == 1) {
+        $fill = Color(0.84f, 0.69f, 0.43f, 1.0f);
+    } else if ($cell == 2) {
+        $fill = Color(0.59f, 0.45f, 0.27f, 1.0f);
+    }
+    bool $lit = $x == 1 || $cy == 1;
+    bool $shade = $x == $last - 1 || $cy == $last - 1;
+
+    if ($cell == 2) {
+        bool $swap = $lit;
+        $lit = $shade;
+        $shade = $swap;
+    }
+
+    if ($lit) {
+        return $fill->lighten(0.25f);
+    }
+
+    if ($shade) {
+        return $fill->darken(0.25f);
+    }
+
+    return $fill;
 }
 
 internal function demoGroups(FlyUiDemo $demo, Ui $ui) : void

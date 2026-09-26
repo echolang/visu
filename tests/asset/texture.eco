@@ -189,3 +189,123 @@ test vtex_cook_vmat_linear
     }
     assert($img->format == PixelFormat::rgba8, 'linear');
 }
+
+function cookOneTex(string $tag, const Pixels& $px, string $vtex) : result<CookedImage, AssetError>
+{
+    string $src = texTmp("{$tag}-src");
+    mkdirTex($src);
+    string $ds = env::DS;
+    guard $px->write("{$src}{$ds}leaf.png") else ($e) {
+        die($e->message());
+    }
+    guard io::writefile("{$src}{$ds}leaf.vtex", $vtex) else ($e) {
+        die($e->message());
+    }
+
+    string $out = texTmp("{$tag}-out");
+    mkdirTex($out);
+    Kitchen $k = Kitchen();
+    $k->add(TextureCooker());
+    array<PackItem> $items = guard $k->cook($src, $out) else ($e) {
+        return .error($e);
+    }
+    DirectoryStore $store = guard DirectoryStore::open($out) else ($e) {
+        die($e->message());
+    }
+    Device $device = Device();
+    Assets $assets = Assets($device);
+    $assets->register(KIND_TEXTURE, function(Assets $a, Blob $b) : result<CookedImage, AssetError> {
+        return decodeTexture($a, $b);
+    });
+    guard $assets->mount($store) else ($e) {
+        die($e->message());
+    }
+    return $assets->load<CookedImage>('leaf');
+}
+
+function texel(array<uint8>& $rgba, uint8 $r, uint8 $g, uint8 $b, uint8 $a) : void
+{
+    $rgba[] = $r;
+    $rgba[] = $g;
+    $rgba[] = $b;
+    $rgba[] = $a;
+}
+
+test vtex_srgb_mips_average_in_linear_light
+{
+    array<uint8> $rgba = array<uint8>();
+    texel($rgba, 255, 255, 255, 255);
+    texel($rgba, 0, 0, 0, 255);
+    texel($rgba, 0, 0, 0, 255);
+    texel($rgba, 255, 255, 255, 255);
+    CookedImage $img = guard cookOneTex('lin', Pixels(2, 2, $rgba), '{}') else ($e) {
+        die($e->message());
+    }
+    // half linear light is sRGB 188; averaging the bytes would give 127
+    assert($img->texels->byte(16) == 188, 'linear average');
+    assert($img->texels->byte(19) == 255, 'alpha stays a plain average');
+}
+
+test vtex_linear_format_mips_average_bytes
+{
+    array<uint8> $rgba = array<uint8>();
+    texel($rgba, 255, 255, 255, 255);
+    texel($rgba, 0, 0, 0, 255);
+    texel($rgba, 0, 0, 0, 255);
+    texel($rgba, 255, 255, 255, 255);
+    CookedImage $img = guard cookOneTex('bytes', Pixels(2, 2, $rgba), '{"srgb":false}') else ($e) {
+        die($e->message());
+    }
+    assert($img->texels->byte(16) == 127, 'byte average');
+}
+
+test vtex_bleed_self_fills_uncovered_texels
+{
+    array<uint8> $rgba = array<uint8>();
+    int32 $i = 0;
+    while ($i < 16) {
+        if ($i == 5) {
+            texel($rgba, 200, 100, 50, 255);
+        } else {
+            texel($rgba, 0, 0, 0, 0);
+        }
+        $i = $i + 1;
+    }
+    CookedImage $img = guard cookOneTex('bleed', Pixels(4, 4, $rgba), '{"srgb":false,"bleed":"self"}') else ($e) {
+        die($e->message());
+    }
+    usize $t = 0;
+    while ($t < 16) {
+        assert($img->texels->byte($t * 4) == 200, 'r filled');
+        assert($img->texels->byte($t * 4 + 1) == 100, 'g filled');
+        assert($img->texels->byte($t * 4 + 2) == 50, 'b filled');
+        $t = $t + 1;
+    }
+    assert($img->texels->byte(3) == 0, 'alpha untouched');
+    // 4x4 = 64 bytes; mip 1 is 2x2 and stays the leaf colour instead of a quarter of it
+    assert($img->texels->byte(64) == 200, 'mip keeps the hue');
+}
+
+test vtex_premultiplied_restores_colour
+{
+    array<uint8> $rgba = array<uint8>();
+    texel($rgba, 64, 32, 16, 128);
+    CookedImage $img = guard cookOneTex('premul', Pixels(1, 1, $rgba), '{"srgb":false,"premultiplied":true}') else ($e) {
+        die($e->message());
+    }
+    assert($img->texels->byte(0) == 128, 'r');
+    assert($img->texels->byte(1) == 64, 'g');
+    assert($img->texels->byte(2) == 32, 'b');
+    assert($img->texels->byte(3) == 128, 'alpha kept');
+}
+
+test vtex_bleed_missing_mask_is_an_error
+{
+    array<uint8> $rgba = array<uint8>();
+    texel($rgba, 0, 0, 0, 0);
+    result<CookedImage, AssetError> $got = cookOneTex('nomask', Pixels(1, 1, $rgba), '{"bleed":"nothere"}');
+    guard $got else ($e) {
+        return;
+    }
+    assert(false, 'a missing bleed mask must fail the cook');
+}

@@ -141,7 +141,26 @@ public class Texture : GpuObject
 
     public function upload(int32 $mip, ptr<const uint8> $src, uint64 $bytes, int32 $bytesPerRow = 0) : void
     {
-        $this->device->uploadTexture($this, $mip, 0, $src, $bytes, $bytesPerRow);
+        int32 $w = mipSize($this->desc->width, $mip);
+        int32 $h = mipSize($this->desc->height, $mip);
+        $this->upload(rect: 0, 0, $w, $h, $mip, $src, $bytes, $bytesPerRow);
+    }
+
+    /**
+     * Write a texel rectangle of mip `$mip`, slice 0.
+     */
+    public function upload(
+        rect: int32 $x,
+        int32 $y,
+        int32 $width,
+        int32 $height,
+        int32 $mip,
+        ptr<const uint8> $src,
+        uint64 $bytes,
+        int32 $bytesPerRow = 0
+    ) : void
+    {
+        $this->upload(rect: $x, $y, $width, $height, face: 0, $mip, $src, $bytes, $bytesPerRow);
     }
 
     /**
@@ -155,8 +174,35 @@ public class Texture : GpuObject
         int32 $bytesPerRow = 0
     ) : void
     {
+        int32 $w = mipSize($this->desc->width, $mip);
+        int32 $h = mipSize($this->desc->height, $mip);
+        $this->upload(rect: 0, 0, $w, $h, face: $face, $mip, $src, $bytes, $bytesPerRow);
+    }
+
+    /**
+     * Write a texel rectangle of one cube face or array slice. Every other upload lands here,
+     * so the rect, face and size checks live here once and the backends only copy.
+     */
+    public function upload(
+        rect: int32 $x,
+        int32 $y,
+        int32 $width,
+        int32 $height,
+        face: int32 $face,
+        int32 $mip,
+        ptr<const uint8> $src,
+        uint64 $bytes,
+        int32 $bytesPerRow = 0
+    ) : void
+    {
         assert($face >= 0 && $face < $this->layers(), 'Texture.upload: face out of range');
-        $this->device->uploadTexture($this, $mip, $face, $src, $bytes, $bytesPerRow);
+        assert($bytes > 0, 'Texture.upload: size');
+        assert($x >= 0 && $y >= 0 && $width > 0 && $height > 0, 'Texture.upload: rect');
+        assert(
+            $x + $width <= mipSize($this->desc->width, $mip) && $y + $height <= mipSize($this->desc->height, $mip),
+            'Texture.upload: rect past the mip'
+        );
+        $this->device->uploadTexture($this, $x, $y, $width, $height, $mip, $face, $src, $bytes, $bytesPerRow);
     }
 
     /**

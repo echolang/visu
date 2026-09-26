@@ -35,8 +35,12 @@ internal function uiButtonGroup(
         $i = $i + 1;
     }
 
+    // options go into the frame pool: a run holds a range, never its own array
+    usize $first = $ui->choicePool->count();
+    $ui->choicePool->extend($choices);
+
     int32 $p = $ui->groups->count() as int32;
-    $ui->groups[] = GroupRun($name, $choices, $selected, $st);
+    $ui->groups[] = GroupRun($name, $first, $n, $selected, $st);
     Node $node = Node();
     $node->kind = .group;
     $node->payload = $p;
@@ -79,10 +83,10 @@ internal function writeGroupRects(Ui $ui, const Node& $node) : void
     float32 $y = $node->pos->y + $labelH + $st->innerOffset;
     float32 $bh = $node->size->y - $labelH - $st->innerOffset * 2.0f;
     usize $i = 0;
-    usize $n = $run->choices->count();
+    usize $n = $run->count;
 
     while ($i < $n) {
-        Choice $ch = $run->choices[$i];
+        Choice $ch = $ui->choicePool[$run->first + $i];
         Vec2 $ts = $ui->measureText($ch->label, $st->fontSize, true);
         float32 $bw = groupOptionWidth($ts->x, $st);
         uint64 $oid = mixId($node->id, $ch->id);
@@ -172,7 +176,7 @@ internal function emitGroupBox(Ui $ui, const Node& $n, float32 $pad) : void
         );
     }
 
-    if (!$ui->slots->has($n->id) || $run->choices->count() == 0) {
+    if (!$ui->slots->has($n->id) || $run->count == 0) {
         return;
     }
 
@@ -183,7 +187,7 @@ internal function emitGroupBox(Ui $ui, const Node& $n, float32 $pad) : void
         return;
     }
 
-    uint64 $oid0 = mixId($n->id, $run->choices[0]->id);
+    uint64 $oid0 = mixId($n->id, $ui->choicePool[$run->first + 0]->id);
 
     if (!$ui->slots->has($oid0)) {
         return;
@@ -245,10 +249,10 @@ internal function emitGroupText(Ui $ui, const Node& $n) : Texture?
         );
     }
     usize $i = 0;
-    usize $nch = $run->choices->count();
+    usize $nch = $run->count;
 
     while ($i < $nch) {
-        Choice $ch = $run->choices[$i];
+        Choice $ch = $ui->choicePool[$run->first + $i];
         uint64 $oid = mixId($n->id, $ch->id);
         Slot $s = Slot();
 
@@ -285,7 +289,7 @@ internal function emitGroupText(Ui $ui, const Node& $n) : Texture?
         return $atlas;
     }
 
-    uint64 $oid0 = mixId($n->id, $run->choices[0]->id);
+    uint64 $oid0 = mixId($n->id, $ui->choicePool[$run->first + 0]->id);
 
     if (!$ui->slots->has($oid0)) {
         return $atlas;
@@ -298,7 +302,7 @@ internal function emitGroupText(Ui $ui, const Node& $n) : Texture?
     $i = 0;
 
     while ($i < $nch) {
-        Choice $ch = $run->choices[$i];
+        Choice $ch = $ui->choicePool[$run->first + $i];
         uint64 $oid = mixId($n->id, $ch->id);
         Slot $s = Slot();
 

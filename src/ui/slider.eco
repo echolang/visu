@@ -15,7 +15,10 @@ internal function uiSlider(
     float32 $min,
     float32 $max,
     float32 $step,
-    const string& $id
+    const string& $id,
+    int32 $readout = -1,
+    string $unit = '',
+    bool $fill = false
 ) : bool
 {
     uint64 $wid = $ui->makeId($id, $label);
@@ -74,8 +77,16 @@ internal function uiSlider(
         $changed = true;
     }
 
+    usize $from = $ui->arena->size();
+
+    if ($readout >= 0) {
+        appendFixed($ui->arena, $value, $readout);
+        $ui->arena->append($unit);
+    }
+
+    usize $to = $ui->arena->size();
     int32 $p = $ui->sliders->count() as int32;
-    $ui->sliders[] = SliderRun($label, $value, $lo, $hi);
+    $ui->sliders[] = SliderRun($label, $value, $lo, $hi, $from, $to);
     SliderStyle $st = $ui->theme->slider;
     Node $n = Node();
     $n->kind = .slider;
@@ -84,11 +95,16 @@ internal function uiSlider(
     float32 $h = $st->height;
     float32 $labelH = 0.0f;
 
-    if (!$label->empty()) {
+    if (!$label->empty() || $to > $from) {
         $labelH = $ui->theme->labelHeight;
     }
 
     $n->measured = Vec2($st->width, $h + $labelH);
+
+    if ($fill) {
+        $n->h = .fill;
+    }
+
     $ui->push($n);
     return $changed;
 }
@@ -99,7 +115,7 @@ internal function emitSliderBox(Ui $ui, const Node& $n, float32 $pad) : void
     SliderStyle $st = $ui->theme->slider;
     float32 $labelH = 0.0f;
 
-    if (!$run->label->empty()) {
+    if (!$run->label->empty() || $run->to > $run->from) {
         $labelH = $ui->theme->labelHeight;
     }
 
@@ -143,18 +159,29 @@ internal function emitSliderBox(Ui $ui, const Node& $n, float32 $pad) : void
 internal function emitSliderText(Ui $ui, const Node& $n) : visu::graphics::Texture?
 {
     SliderRun $run = $ui->sliders[$n->payload as usize];
+    visu::graphics::Texture? $atlas = null;
 
-    if ($run->label->empty()) {
-        return null;
+    if (!$run->label->empty()) {
+        $atlas = paintText(
+            $ui,
+            $n->pos,
+            $run->label,
+            $ui->theme->labelFontSize,
+            $ui->theme->labelTextColor,
+            true,
+            false
+        );
     }
 
-    return paintText(
-        $ui,
-        $n->pos,
-        $run->label,
-        $ui->theme->labelFontSize,
-        $ui->theme->labelTextColor,
-        true,
-        false
-    );
+    if ($run->to > $run->from) {
+        // readout sits flush right on the label row, regular weight so it reads as the value
+        float32 $size = $ui->theme->labelFontSize;
+        Vec2 $w = $ui->measureTextRange($ui->arena, $run->from, $run->to, $size, false);
+        Vec2 $at = Vec2($n->pos->x + $n->size->x - $w->x, $n->pos->y);
+        $atlas = paintTextRange(
+            $ui, $at, $ui->arena, $run->from, $run->to, $size, $ui->theme->labelTextColor, false, false
+        );
+    }
+
+    return $atlas;
 }

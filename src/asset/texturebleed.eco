@@ -1,0 +1,239 @@
+/**
+ * Cook-time colour repair for cutout textures. A cutout authored on black
+ * (foliage, grass cards) keeps black behind its alpha, and every mip averages
+ * that black into the leaves. Bleed replaces the colour of every uncovered
+ * texel with the nearest covered colour so the chain stays the leaf's hue.
+ */
+
+namespace visu::asset;
+
+use visu::graphics::Pixels;
+
+/**
+ * One level of the push-pull pyramid: rgb as floats, and whether the texel
+ * holds a colour yet.
+ */
+internal struct BleedLevel
+{
+    public int32 $width = 0;
+    public int32 $height = 0;
+    public array<float32> $rgb = array<float32>();
+    public array<uint8> $filled = array<uint8>();
+}
+
+/**
+ * Divide rgb by alpha where the texture was stored premultiplied. Texels at
+ * zero alpha keep their bytes; bleed decides their colour.
+ */
+internal function unpremultiply(Pixels& $px) : void
+{
+    usize $n = $px->rgba->count();
+    usize $i = 0;
+
+    while ($i + 3 < $n) {
+        uint32 $a = $px->rgba[$i + 3] as uint32;
+        if ($a > 0 && $a < 255) {
+            $px->rgba[$i] = unpremultiplied($px->rgba[$i] as uint32, $a);
+            $px->rgba[$i + 1] = unpremultiplied($px->rgba[$i + 1] as uint32, $a);
+            $px->rgba[$i + 2] = unpremultiplied($px->rgba[$i + 2] as uint32, $a);
+        }
+        $i = $i + 4;
+    }
+}
+
+internal function unpremultiplied(uint32 $c, uint32 $a) : uint8
+{
+    uint32 $v = ($c * 255 + $a / 2) / $a;
+    if ($v > 255) {
+        $v = 255;
+    }
+    return $v as uint8;
+}
+
+/**
+ * Covered texels from one channel of a mask: at or above half is leaf.
+ * Channel 3 reads the alpha of the texture itself; 0 reads a grey alpha map.
+ */
+internal function coverageOf(const Pixels& $mask, usize $channel) : array<uint8>
+{
+    usize $texels = ($mask->width as usize) * ($mask->height as usize);
+    array<uint8> $cover = arr::room<uint8>($texels);
+    usize $i = 0;
+
+    while ($i < $texels) {
+        uint8 $on = 0;
+        if ($mask->rgba[$i * 4 + $channel] >= 128) {
+            $on = 1;
+        }
+        $cover[] = $on;
+        $i = $i + 1;
+    }
+
+    return $cover;
+}
+
+/**
+ * Push-pull fill: average covered colour up a half-size pyramid, then hand
+ * each uncovered texel its parent's colour on the way down. Alpha is left
+ * untouched. A mask with nothing covered leaves the texture as it was.
+ */
+internal function bleed(Pixels& $px, const array<uint8>& $cover) : void
+{
+    usize $texels = ($px->width as usize) * ($px->height as usize);
+    assert($cover->count() == $texels, 'bleed: mask size');
+
+    BleedLevel $base = BleedLevel();
+    $base->width = $px->width;
+    $base->height = $px->height;
+    $base->rgb = arr::room<float32>($texels * 3);
+    $base->filled = arr::room<uint8>($texels);
+    bool $any = false;
+    usize $i = 0;
+
+    while ($i < $texels) {
+        $base->rgb[] = $px->rgba[$i * 4] as float32;
+        $base->rgb[] = $px->rgba[$i * 4 + 1] as float32;
+        $base->rgb[] = $px->rgba[$i * 4 + 2] as float32;
+        $base->filled[] = $cover[$i];
+        if ($cover[$i] != 0) {
+            $any = true;
+        }
+        $i = $i + 1;
+    }
+
+    if (!$any) {
+        return;
+    }
+
+    array<BleedLevel> $levels = array<BleedLevel>();
+    $levels[] = $base;
+    usize $top = 0;
+
+    while ($levels[$top]->width > 1 || $levels[$top]->height > 1) {
+        BleedLevel $parent = bleedPull($levels[$top]);
+        $levels[] = $parent;
+        $top = $top + 1;
+    }
+
+    while ($top > 0) {
+        bleedPush($levels[$top - 1], $levels[$top]);
+        $top = $top - 1;
+    }
+
+    $i = 0;
+    while ($i < $texels) {
+        if ($cover[$i] == 0) {
+            $px->rgba[$i * 4] = bleedByte($levels[0]->rgb[$i * 3]);
+            $px->rgba[$i * 4 + 1] = bleedByte($levels[0]->rgb[$i * 3 + 1]);
+            $px->rgba[$i * 4 + 2] = bleedByte($levels[0]->rgb[$i * 3 + 2]);
+        }
+        $i = $i + 1;
+    }
+}
+
+/**
+ * Half-size level: each texel is the mean of its filled children.
+ */
+internal function bleedPull(const BleedLevel& $child) : BleedLevel
+{
+    int32 $w = ($child->width + 1) / 2;
+    int32 $h = ($child->height + 1) / 2;
+    usize $texels = ($w as usize) * ($h as usize);
+    BleedLevel $out = BleedLevel();
+    $out->width = $w;
+    $out->height = $h;
+    $out->rgb = arr::room<float32>($texels * 3);
+    $out->filled = arr::room<uint8>($texels);
+    int32 $y = 0;
+
+    while ($y < $h) {
+        int32 $x = 0;
+
+        while ($x < $w) {
+            float32 $r = 0.0f;
+            float32 $g = 0.0f;
+            float32 $b = 0.0f;
+            int32 $n = 0;
+            int32 $oy = 0;
+
+            while ($oy < 2) {
+                int32 $ox = 0;
+
+                while ($ox < 2) {
+                    int32 $cx = $x * 2 + $ox;
+                    int32 $cy = $y * 2 + $oy;
+                    if ($cx < $child->width && $cy < $child->height) {
+                        usize $c = (($cy * $child->width) + $cx) as usize;
+                        if ($child->filled[$c] != 0) {
+                            $r = $r + $child->rgb[$c * 3];
+                            $g = $g + $child->rgb[$c * 3 + 1];
+                            $b = $b + $child->rgb[$c * 3 + 2];
+                            $n = $n + 1;
+                        }
+                    }
+
+                    $ox = $ox + 1;
+                }
+
+                $oy = $oy + 1;
+            }
+
+            if ($n > 0) {
+                float32 $inv = 1.0f / ($n as float32);
+                $out->rgb[] = $r * $inv;
+                $out->rgb[] = $g * $inv;
+                $out->rgb[] = $b * $inv;
+                $out->filled[] = 1;
+            } else {
+                $out->rgb[] = 0.0f;
+                $out->rgb[] = 0.0f;
+                $out->rgb[] = 0.0f;
+                $out->filled[] = 0;
+            }
+            $x = $x + 1;
+        }
+
+        $y = $y + 1;
+    }
+
+    return $out;
+}
+
+/**
+ * Give every unfilled child its parent's colour. The parent level is
+ * already filled everywhere once the level above it was pushed.
+ */
+internal function bleedPush(BleedLevel& $child, const BleedLevel& $parent) : void
+{
+    int32 $y = 0;
+
+    while ($y < $child->height) {
+        int32 $x = 0;
+
+        while ($x < $child->width) {
+            usize $c = (($y * $child->width) + $x) as usize;
+            if ($child->filled[$c] == 0) {
+                usize $p = ((($y / 2) * $parent->width) + ($x / 2)) as usize;
+                $child->rgb[$c * 3] = $parent->rgb[$p * 3];
+                $child->rgb[$c * 3 + 1] = $parent->rgb[$p * 3 + 1];
+                $child->rgb[$c * 3 + 2] = $parent->rgb[$p * 3 + 2];
+                $child->filled[$c] = 1;
+            }
+            $x = $x + 1;
+        }
+
+        $y = $y + 1;
+    }
+}
+
+internal function bleedByte(float32 $v) : uint8
+{
+    float32 $r = $v + 0.5f;
+    if ($r <= 0.0f) {
+        return 0;
+    }
+    if ($r >= 255.0f) {
+        return 255;
+    }
+    return $r as uint8;
+}
