@@ -61,7 +61,6 @@ public class DeferredRenderer
     private DeferredGpu? $gpu;
     private Environment? $environment;
     private Texture? $shadowMap;
-    private array<RetiredShadow> $retiredShadows;
     private array<ShadowCaster> $casters;
     private OutlineData $outline;
     private OutlineStyle[4] $outlineStyles;
@@ -82,7 +81,6 @@ public class DeferredRenderer
         $this->gpu = null;
         $this->environment = null;
         $this->shadowMap = null;
-        $this->retiredShadows = arr::room<RetiredShadow>(4);
         $this->casters = arr::room<ShadowCaster>(4);
         $this->outline = OutlineData();
         OutlineStyle[4] $styles;
@@ -370,7 +368,6 @@ public class DeferredRenderer
 
     private function ensureShadowMap(ShadowQuality $quality) : Texture
     {
-        $this->flushRetiredShadows();
         Texture $have = guard $this->shadowMap else {
             Texture $fresh = makeShadowMap($this->device, $quality);
             $this->shadowMap = $fresh;
@@ -382,47 +379,11 @@ public class DeferredRenderer
             return $have;
         }
 
-        $this->retiredShadows[] = RetiredShadow($have, $this->device->frameIndex());
+        // the device buries the old map until no frame in flight samples it
+        $have->destroy();
         Texture $resized = makeShadowMap($this->device, $quality);
         $this->shadowMap = $resized;
         return $resized;
-    }
-
-    private function flushRetiredShadows() : void
-    {
-        usize $n = $this->retiredShadows->count();
-        if ($n == 0) {
-            return;
-        }
-
-        uint64 $now = $this->device->frameIndex();
-        usize $keep = 0;
-        usize $i = 0;
-        while ($i < $n) {
-            RetiredShadow $item = $this->retiredShadows[$i];
-            if ($now <= $item->frame + (FRAMES_IN_FLIGHT as uint64)) {
-                if ($keep != $i) {
-                    $this->retiredShadows[$keep] = $item;
-                }
-
-                $keep = $keep + 1;
-            } else {
-                $item->tex->destroy();
-            }
-
-            $i = $i + 1;
-        }
-
-        $this->retiredShadows->truncate($keep);
-    }
-
-    private function dropRetiredShadows() : void
-    {
-        foreach ($this->retiredShadows as $item) {
-            $item->tex->destroy();
-        }
-
-        $this->retiredShadows->clear();
     }
 
     private function dropEnvironment() : void
@@ -437,7 +398,6 @@ public class DeferredRenderer
     public function destroy() : void
     {
         $this->dropEnvironment();
-        $this->dropRetiredShadows();
         $this->shadowMap = dropTexture($this->shadowMap);
         DeferredGpu $gpu = guard $this->gpu else {
             return;
@@ -445,12 +405,6 @@ public class DeferredRenderer
         $gpu->destroy();
         $this->gpu = null;
     }
-}
-
-internal struct RetiredShadow
-{
-    public Texture $tex;
-    public uint64 $frame;
 }
 
 internal function makeShadowMap(Device $device, ShadowQuality $quality) : Texture

@@ -245,3 +245,25 @@ test material_parallax_with_height
     assert(equal($mat->parallaxDepth, 0.03f), 'depth survives the cook');
     assert($mat->parallax(), 'relief and a height map march');
 }
+
+test material_reads_shadow_and_depth_bias
+{
+    json::Value $root = guard json::parse('{"shadow":false,"depthBias":-4.0,"depthSlope":-1.5}') else {
+        die('json');
+    }
+    Material $mat = Material(Vmat('roads/asphalt', $root));
+    assert(!$mat->castShadow, 'shadow off');
+    assert(equal($mat->depthBias, -4.0f), 'constant bias');
+    assert(equal($mat->depthSlope, -1.5f), 'slope bias');
+    assert($mat->biased(), 'biased');
+}
+
+test material_casts_and_is_unbiased_by_default
+{
+    json::Value $root = guard json::parse('{}') else {
+        die('json');
+    }
+    Material $mat = Material(Vmat('props/crate', $root));
+    assert($mat->castShadow, 'casts');
+    assert(!$mat->biased(), 'unbiased');
+}

@@ -4,7 +4,7 @@
 
 use visu::graphics::Device;
 use visu::math::{Vec2, equal};
-use visu::ui::{Choice, Kind, Layout, Node, Ui, appendFixed, mixId, selectData, selectIsOpen};
+use visu::ui::{Choice, Kind, Layout, Node, Ui, appendFixed, appendScaled, mixId, selectData, selectIsOpen};
 use visu::vg::Color;
 
 test ui_begin_frame_maps_pointer_into_layout_space
@@ -919,6 +919,46 @@ test ui_append_fixed_formats_without_rounding_drift
     assert(fixed(1000000000000000000000.0f, 1) == 'inf', 'overflow');
 }
 
+function scaled(int64 $v, int32 $d, pad: int32 $pad = 1, group: string $group = '', sign: bool $sign = false) : string
+{
+    string $s = '';
+    appendScaled($s, $v, $d, $pad, $group, $sign);
+    return $s;
+}
+
+test ui_append_scaled_is_exact_fixed_point
+{
+    assert(scaled(0, 0) == '0', 'zero');
+    assert(scaled(0, 2) == '0.00', 'zero cents');
+    assert(scaled(-1250, 2) == '-12.50', 'negative cents');
+    assert(scaled(5, 2) == '0.05', 'leading zero in the fraction');
+    assert(scaled(5000000, 2, group: ',') == '50,000.00', 'grouped');
+    assert(scaled(123456789, 0, group: ',') == '123,456,789', 'three groups');
+    assert(scaled(-100000, 0, group: ',') == '-100,000', 'negative grouped');
+    assert(scaled(999, 0, group: ',') == '999', 'no group under a thousand');
+    assert(scaled(5, 0, pad: 2) == '05', 'padded');
+    assert(scaled(5, 0, pad: 5, group: ',') == '00,005', 'padded and grouped');
+    assert(scaled(1250, 2, sign: true) == '+12.50', 'signed');
+    assert(scaled(0, 0, sign: true) == '0', 'zero takes no sign');
+    assert(scaled(1677721601, 2, group: ',') == '16,777,216.01', 'past float32 precision');
+    assert(scaled(1000000000000000000, 0) == 'inf', 'overflow');
+    assert(scaled(-1000000000000000000, 0) == '-inf', 'negative overflow');
+}
+
+test ui_fixed_measures_like_text
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->fixed(-1250, decimals: 2, unit: ' EUR');
+    $ui->text('-12.50 EUR');
+    $ui->endFrame();
+    assert(equal($ui->nodes[1]->measured->x, $ui->nodes[2]->measured->x), 'same width');
+    assert($ui->arena == '-12.50 EUR', 'arena');
+    $ui->destroy();
+    $device->shutdown();
+}
+
 test ui_number_measures_like_text
 {
     Device $device = Device();
@@ -968,6 +1008,26 @@ test ui_button_group_pools_choices
     $ui->endFrame();
     assert($ui->choicePool->count() == 4, 'both groups in one pool');
     assert($ui->groups[1]->first == 2, 'second range');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_unnamed_button_group_reserves_no_label
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    array<Choice> $a = array<Choice>();
+    $a[] = Choice('0', 'II');
+    $a[] = Choice('1', '1x');
+    string $sel = '1';
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->buttonGroup('Speed', $a, &$sel, id: 'named');
+    $ui->buttonGroup('', $a, &$sel, id: 'bare');
+    $ui->endFrame();
+    Node $named = nthKind($ui, Kind::group, 0);
+    Node $bare = nthKind($ui, Kind::group, 1);
+    float32 $label = $ui->theme->buttonGroup->labelHeight;
+    assert(equal($named->measured->y - $bare->measured->y, $label), 'no label row without a name');
     $ui->destroy();
     $device->shutdown();
 }
@@ -1109,6 +1169,23 @@ test ui_panel_card_uses_the_panel_style
     $device->shutdown();
 }
 
+test ui_fill_card_spans_its_parent
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    $ui->theme->panel->pad = visu::ui::Edges::all(3.0f);
+    $ui->beginFrame(Vec2(400.0f, 400.0f));
+    $ui->beginCard(style: .panel, fill: true);
+    $ui->space(10.0f, 10.0f);
+    $ui->end();
+    $ui->endFrame();
+    Node $bar = $ui->nodes[1];
+    assert(equal($bar->size->x, 400.0f), 'as wide as the frame');
+    assert(equal($bar->size->y, 16.0f), 'as tall as what it holds');
+    $ui->destroy();
+    $device->shutdown();
+}
+
 test ui_apply_generals_derives_widget_colours_and_keeps_pads_it_owns
 {
     Device $device = Device();
@@ -1124,6 +1201,33 @@ test ui_apply_generals_derives_widget_colours_and_keeps_pads_it_owns
     assert(equal($ui->theme->panel->bg->g, 0.85f), 'panel is the surface');
     assert(equal($ui->theme->iconButton->selectedBg->b, 0.15f), 'selected icon is the accent');
     assert($ui->theme->panel->pad->left < $ui->theme->card->pad->left, 'panel is tighter');
+    $ui->destroy();
+    $device->shutdown();
+}
+
+test ui_bar_tier_is_a_size_down_and_keeps_its_skins
+{
+    Device $device = Device();
+    Ui $ui = Ui($device);
+    visu::ui::Theme $t = $ui->theme;
+    $t->bar->skin = $t->panel->skin;
+    $t->compactButton->skin->normal = $t->bar->skin;
+    $t->applyGenerals();
+    assert($t->bar->pad->top < $t->panel->pad->top, 'bar is tighter than a panel');
+    assert($t->compactButton->fontSize < $t->primaryButton->fontSize, 'compact button text');
+    assert($t->compactButton->pad->top < $t->primaryButton->pad->top, 'compact button pad');
+    assert($t->compactGroup->fontSize < $t->buttonGroup->fontSize, 'compact group text');
+    array<Choice> $a = array<Choice>();
+    $a[] = Choice('1', '1x');
+    string $sel = '1';
+    $ui->beginFrame(Vec2(400.0f, 200.0f));
+    $ui->buttonGroup('', $a, &$sel, id: 'full');
+    $ui->buttonGroup('', $a, &$sel, id: 'small', compact: true);
+    $ui->button('Menu', id: 'm1');
+    $ui->button('Menu', id: 'm2', style: .compact);
+    $ui->endFrame();
+    assert(nthKind($ui, Kind::group, 1)->measured->y < nthKind($ui, Kind::group, 0)->measured->y, 'compact group is shorter');
+    assert(nthKind($ui, Kind::button, 1)->measured->y < nthKind($ui, Kind::button, 0)->measured->y, 'compact button is shorter');
     $ui->destroy();
     $device->shutdown();
 }

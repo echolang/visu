@@ -201,3 +201,58 @@ test systems_tick_keeps_bind_order
     assert($order->names[2] == 'first', 'and on the next pass');
     assert($order->names[3] == 'second', 'and on the next pass');
 }
+
+class BeginningSystem : System
+{
+    public TickOrder $order;
+
+    public constructor(TickOrder $order)
+    {
+        $this->order = $order;
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->update = false;
+        $schedule->render = false;
+        BeginningSystem $self = $this;
+        $schedule->begin(function(Entities $entities) : void {
+            $self->order->names[] = 'begin';
+        });
+        $schedule->every(1, function(Entities $entities, int64 $pass) : void {
+            $self->order->names[] = 'tick';
+        });
+    }
+
+    public function update(Entities $entities) : void
+    {
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+    }
+}
+
+test systems_begin_runs_once_before_the_passes_even_with_none
+{
+    Systems $systems = Systems();
+    TickOrder $order = TickOrder();
+    $systems->bind(BeginningSystem($order));
+    Entities $world = Entities();
+    $systems->begin($world);
+    $systems->tick($world);
+    $systems->tick($world);
+    $systems->begin($world);
+    assert($order->names->count() == 4, 'begin, two ticks, begin');
+    assert($order->names[0] == 'begin', 'begin first');
+    assert($order->names[1] == 'tick', 'then the passes');
+    assert($order->names[3] == 'begin', 'a paused update still begins');
+}

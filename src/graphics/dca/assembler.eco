@@ -20,6 +20,11 @@ use visu::math::{Mat4, Vec3, Vec4, length};
  */
 internal const uint64 DCA_DEPTH_MAX = 1048575;
 
+/**
+ * Mesh table slots a sort key can name: 16 bits sit between the depth and the material.
+ */
+internal const int32 DCA_MESH_MAX = 65536;
+
 public class DrawCallAssembler<P>
 {
 
@@ -43,6 +48,7 @@ public class DrawCallAssembler<P>
      */
     private array<uint32> $visible;
     private array<uint64> $keys;
+    private array<uint32> $sortScratch;
     private int32 $culled;
 
     /**
@@ -63,6 +69,7 @@ public class DrawCallAssembler<P>
         $this->commands = array<DrawCommand>();
         $this->visible = array<uint32>();
         $this->keys = array<uint64>();
+        $this->sortScratch = array<uint32>();
         $this->culled = 0;
         ptr<uint8> $none;
         $none:$ = null;
@@ -90,6 +97,32 @@ public class DrawCallAssembler<P>
     public function shareMeshes(DrawCallAssembler<P> $source) : void
     {
         $this->table = $source->table;
+    }
+
+    /**
+     * Free a registered range. Assemblers sharing this table lose it too. Only after the frame's
+     * submissions are built and recorded: a pending submission of the handle is a bug.
+     */
+    public function unregister(MeshHandle $handle) : void
+    {
+        if (!$handle->valid()) {
+            return;
+        }
+
+        $this->table->remove($handle->index);
+    }
+
+    /**
+     * Registered slots, freed ones included.
+     */
+    public const function meshSlots() : int32
+    {
+        return $this->table->count();
+    }
+
+    public const function freeMeshSlots() : int32
+    {
+        return $this->table->freeCount();
     }
 
     /**
@@ -187,7 +220,7 @@ public class DrawCallAssembler<P>
             return 0;
         }
 
-        sortByKey($this->visible, $this->keys);
+        sortByKey($this->visible, $this->keys, $this->sortScratch);
         $this->merge();
         return $this->commands->count() as int32;
     }
@@ -395,7 +428,7 @@ internal function maxAxisScale(const Mat4& $model) : float32
  * Bottom-up merge sort; stable, so equal keys keep submit order.
  * `$keys` is indexed by the stored value, not by its position; a sparse `$values` still reads `$keys[$values[$i]]`.
  */
-internal function sortByKey(array<uint32>& $values, const array<uint64>& $keys) : void
+internal function sortByKey(array<uint32>& $values, const array<uint64>& $keys, array<uint32>& $scratch) : void
 {
     usize $n = $values->count();
 
@@ -403,7 +436,9 @@ internal function sortByKey(array<uint32>& $values, const array<uint64>& $keys) 
         return;
     }
 
-    array<uint32> $scratch = arr::room<uint32>($n);
+    // the caller keeps the scratch, so a frame only allocates when the count outgrows it
+    $scratch->clear();
+    $scratch->reserve($n);
     $scratch->commit($n);
     usize $i = 0;
 

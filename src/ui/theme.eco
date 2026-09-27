@@ -377,6 +377,12 @@ public class Theme
     public Color $accent;
     public Color $border;
     /**
+     * Text for a gain and a loss (a balance going up or down, a stat improving or failing).
+     * Semantic, not derived from the palette, so `applyGenerals` leaves them alone.
+     */
+    public Color $positiveColor;
+    public Color $negativeColor;
+    /**
      * `beginCard` and the modal card.
      */
     public CardStyle $card;
@@ -384,9 +390,24 @@ public class Theme
      * `beginCard(style: .panel)`: a tighter frame for tool strips and status lines.
      */
     public CardStyle $panel;
+
+    /**
+     * `beginCard(style: .bar)`: the tightest frame, for a strip along a screen edge.
+     */
+    public CardStyle $bar;
     public ButtonStyle $primaryButton;
     public ButtonStyle $secondaryButton;
+
+    /**
+     * `button(style: .compact)`: the primary button a size down, to sit in a bar.
+     */
+    public ButtonStyle $compactButton;
     public GroupStyle $buttonGroup;
+
+    /**
+     * `buttonGroup(compact: true)`: the group a size down, to sit in a bar.
+     */
+    public GroupStyle $compactGroup;
     public GroupStyle $tabBar;
     public SelectStyle $select;
     public SliderStyle $slider;
@@ -415,19 +436,24 @@ public class Theme
         $this->onSurface = Color::black();
         $this->accent = Color(0.256f, 0.271f, 0.906f, 1.0f);
         $this->border = Color::black()->withAlpha(0.16f);
+        $this->positiveColor = Color(0.18f, 0.55f, 0.24f, 1.0f);
+        $this->negativeColor = Color(0.8f, 0.2f, 0.18f, 1.0f);
         $this->textColor = $z;
         $this->mutedTextColor = $z;
         $this->sectionHeaderTextColor = $z;
         $this->labelTextColor = $z;
         $this->card = CardStyle();
         $this->panel = CardStyle();
+        $this->bar = CardStyle();
         $this->checkbox = CheckboxStyle();
         $this->primaryButton = ButtonStyle(Edges(), 0.0f, 0.0f, $z, $z, $z, $z);
         $this->secondaryButton = $this->primaryButton;
+        $this->compactButton = $this->primaryButton;
         $this->buttonGroup = GroupStyle(
             Edges(), 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
             $z, $z, $z, $z, $z, $z
         );
+        $this->compactGroup = $this->buttonGroup;
         $this->tabBar = $this->buttonGroup;
         $this->slider = SliderStyle();
         $this->progress = ProgressStyle();
@@ -469,8 +495,12 @@ public class Theme
         $panel->pad = Edges::all($this->padding * 0.6f);
         $card->skin = $this->card->skin;
         $panel->skin = $this->panel->skin;
+        CardStyle $strip = $panel;
+        $strip->pad = Edges::xy($this->padding * 0.6f, $this->padding * 0.3f);
+        $strip->skin = $this->bar->skin;
         $this->card = $card;
         $this->panel = $panel;
+        $this->bar = $strip;
         float32 $bp = $this->padding * 1.2f;
         float32 $bv = $this->padding * 0.6f;
         ButtonSkin $primarySkin = $this->primaryButton->skin;
@@ -489,6 +519,11 @@ public class Theme
         $this->secondaryButton->hoverBg = $on->lighten(0.2f);
         $this->primaryButton->skin = $primarySkin;
         $this->secondaryButton->skin = $secondarySkin;
+        ButtonSkin $compactSkin = $this->compactButton->skin;
+        $this->compactButton = $this->primaryButton;
+        $this->compactButton->pad = Edges($bp * 0.7f, $bp * 0.7f, $bv * 0.5f, $bv * 0.5f);
+        $this->compactButton->fontSize = $this->smallFontSize + 1.0f;
+        $this->compactButton->skin = $compactSkin;
         CheckboxStyle $check = CheckboxStyle();
         $check->track = $on->withAlpha(0.1f);
         $check->hoverTrack = $on->withAlpha(0.07f);
@@ -513,6 +548,11 @@ public class Theme
         );
         $group->labelHeight = $this->labelHeight;
         $this->buttonGroup = $group;
+        GroupStyle $compact = $group;
+        $compact->fontSize = $this->smallFontSize + 1.0f;
+        $compact->buttonSpacing = 12.0f;
+        $compact->innerOffset = 2.0f;
+        $this->compactGroup = $compact;
         GroupStyle $tabs = $group;
         $tabs->bg = Color::transparent();
         $tabs->border = Color::transparent();

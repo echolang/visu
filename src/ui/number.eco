@@ -93,3 +93,114 @@ internal function appendDigits(string& $out, int64 $v, int32 $width) : void
         $div = $div / 10;
     }
 }
+
+/**
+ * Integer magnitudes past this print `inf`, the same ceiling `appendFixed` keeps, so the
+ * negation below can never overflow.
+ */
+internal const int64 SCALED_MAX = 900000000000000000;
+
+/**
+ * An integer in minor units as fixed point: `-1250` with `$decimals` 2 reads `-12.50`, exactly,
+ * with no float between. The whole part is left-padded with zeros to `$pad` digits (`05`), and a
+ * non-empty `$group` goes between every three whole digits (`50,000.00`). `$sign` prints `+` in
+ * front of a positive value; zero never takes a sign.
+ */
+internal function appendScaled(
+    string& $out,
+    int64 $v,
+    int32 $decimals,
+    int32 $pad,
+    const string& $group,
+    bool $sign
+) : void
+{
+    if ($v > SCALED_MAX || $v < 0 - SCALED_MAX) {
+        if ($v < 0) {
+            $out->push(45 as uint8);
+        }
+
+        $out->append('inf');
+        return;
+    }
+
+    int32 $d = $decimals;
+
+    if ($d < 0) {
+        $d = 0;
+    }
+
+    if ($d > NUMBER_MAX_DECIMALS) {
+        $d = NUMBER_MAX_DECIMALS;
+    }
+
+    int64 $n = $v;
+
+    if ($n < 0) {
+        $out->push(45 as uint8);
+        $n = 0 - $n;
+    } else if ($sign && $n > 0) {
+        $out->push(43 as uint8);
+    }
+
+    int64 $scale = 1;
+    int32 $k = 0;
+
+    while ($k < $d) {
+        $scale = $scale * 10;
+        $k = $k + 1;
+    }
+
+    appendGrouped($out, $n / $scale, $pad, $group);
+
+    if ($d > 0) {
+        $out->push(46 as uint8);
+        appendDigits($out, $n % $scale, $d);
+    }
+}
+
+/**
+ * Decimal digits of a non-negative `$v`, zero-padded to `$width`, with `$group` between every
+ * three digits counted from the right. An empty `$group` is `appendDigits`.
+ */
+internal function appendGrouped(string& $out, int64 $v, int32 $width, const string& $group) : void
+{
+    if ($group->empty()) {
+        appendDigits($out, $v, $width);
+        return;
+    }
+
+    int64 $div = 1;
+    int32 $digits = 1;
+
+    while ($v / $div >= 10) {
+        $div = $div * 10;
+        $digits = $digits + 1;
+    }
+
+    int32 $left = $digits;
+
+    if ($width > $left) {
+        $left = $width;
+    }
+
+    while ($left > $digits) {
+        $out->push(48 as uint8);
+        $left = $left - 1;
+
+        if ($left % 3 == 0) {
+            $out->append($group);
+        }
+    }
+
+    while ($div > 0) {
+        int64 $digit = ($v / $div) % 10;
+        $out->push((48 + $digit) as uint8);
+        $div = $div / 10;
+        $left = $left - 1;
+
+        if ($left > 0 && $left % 3 == 0) {
+            $out->append($group);
+        }
+    }
+}

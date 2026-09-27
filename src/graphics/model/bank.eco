@@ -95,6 +95,12 @@ public class ModelBank
     public Device $device;
     public Assets $assets;
     private map<string, Model> $models;
+
+    /**
+     * Ids `adopt` put in `$models`: built at runtime, never catalog entries, so `release` destroys
+     * them without asking the catalog to forget them.
+     */
+    private map<string, bool> $adopted;
     private map<string, MaterialGpu> $materials;
     private array<MaterialGpu> $byIndex;
     private Texture? $white;
@@ -106,6 +112,7 @@ public class ModelBank
         $this->device = $device;
         $this->assets = $assets;
         $this->models = map<string, Model>();
+        $this->adopted = map<string, bool>();
         $this->materials = map<string, MaterialGpu>();
         $this->byIndex = array<MaterialGpu>();
         $this->white = null;
@@ -136,6 +143,53 @@ public class ModelBank
     public const function has(string $id) : bool
     {
         return $this->models->has($id);
+    }
+
+    /**
+     * Load a material's textures now, at a load step, so the first model that draws with it
+     * later does not pay for them in a frame.
+     */
+    public function prepare(Material $material) : void
+    {
+        $this->materialGpu($material);
+    }
+
+    /**
+     * Take a model built at runtime (`buildModel`) under its own id, so `acquire` hands it out
+     * like a catalog model. Its materials are the cooked ones, shared by id with every other
+     * model. The id must be new: an edit adopts a fresh id and drops the old one, so a mesh a
+     * frame in flight reads is never rewritten.
+     */
+    public function adopt(Model $model) : void
+    {
+        assert(!$this->models->has($model->id), 'bank: adopt needs a new id');
+        foreach ($model->materials as $material) {
+            $this->materialGpu($material);
+        }
+
+        $this->models[$model->id] = $model;
+        $this->adopted[$model->id] = true;
+    }
+
+    /**
+     * Destroy an adopted model's mesh. Its materials stay: other models share them. Evict the id
+     * from every `ModelSystem` first; the device keeps the buffers until no frame reads them.
+     */
+    public function drop(const string& $id) : void
+    {
+        if (!$this->adopted->has($id)) {
+            return;
+        }
+
+        Model $model = $this->models[$id];
+        $this->models->remove($id);
+        $this->adopted->remove($id);
+        $model->destroy();
+    }
+
+    public const function adoptedCount() : int32
+    {
+        return $this->adopted->count() as int32;
     }
 
     /**
@@ -205,7 +259,9 @@ public class ModelBank
         array<string> $ids = array<string>();
         array<string> $modelIds = $this->models->keys();
         foreach ($modelIds as $id) {
-            $ids[] = $id;
+            if (!$this->adopted->has($id)) {
+                $ids[] = $id;
+            }
         }
 
         foreach ($this->materials as $gpu) {
@@ -225,6 +281,7 @@ public class ModelBank
         }
 
         $this->models->clear();
+        $this->adopted->clear();
         foreach ($live as $model) {
             $model->destroy();
         }

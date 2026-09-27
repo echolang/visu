@@ -25,6 +25,16 @@ public class Device : DeviceProtocol
     internal array<FrameSlot> $slots;
     internal uint32 $slot;
     internal uint64 $frames;
+
+    /**
+     * Buffers and textures destroyed while a frame may still read them, each with the frame
+     * counter at its destroy. `beginFrame` frees the ones its fence wait proved idle;
+     * `releaseRetired` after a waitIdle frees them all.
+     */
+    internal array<BufferHandle> $graveBuffers;
+    internal array<uint64> $graveBufferFrames;
+    internal array<TextureHandle> $graveTextures;
+    internal array<uint64> $graveTextureFrames;
     internal uint32 $imageIndex;
     internal bool $ready;
     internal bool $lostFlag;
@@ -85,6 +95,10 @@ public class Device : DeviceProtocol
         $this->slots = array<FrameSlot>();
         $this->slot = 0;
         $this->frames = 0;
+        $this->graveBuffers = array<BufferHandle>();
+        $this->graveBufferFrames = array<uint64>();
+        $this->graveTextures = array<TextureHandle>();
+        $this->graveTextureFrames = array<uint64>();
         $this->imageIndex = 0;
         $this->ready = false;
         $this->lostFlag = false;
@@ -269,8 +283,60 @@ public class Device : DeviceProtocol
     {
     }
 
+    /**
+     * Free every buried buffer and texture. The caller waited idle (scene swap, shutdown).
+     */
     public function releaseRetired() : void
     {
+        $this->sweepGraves(true);
+    }
+
+    /**
+     * Free the graves no frame in flight can still read: one destroyed at frame counter `f` is
+     * idle once the fence of frame `f` has been waited, which `beginFrame` of frame
+     * `f + FRAMES_IN_FLIGHT` does. `$all` frees everything.
+     */
+    internal function sweepGraves(bool $all) : void
+    {
+        uint64 $horizon = $this->frames;
+        usize $keep = 0;
+        usize $n = $this->graveBuffers->count();
+        usize $i = 0;
+        while ($i < $n) {
+            BufferHandle $b = $this->graveBuffers[$i];
+            uint64 $at = $this->graveBufferFrames[$i];
+            if ($all || $at + (FRAMES_IN_FLIGHT as uint64) <= $horizon) {
+                $this->freeBuffer($b);
+            } else {
+                $this->graveBuffers[$keep] = $b;
+                $this->graveBufferFrames[$keep] = $at;
+                $keep = $keep + 1;
+            }
+
+            $i = $i + 1;
+        }
+
+        $this->graveBuffers->truncate($keep);
+        $this->graveBufferFrames->truncate($keep);
+        $keep = 0;
+        $n = $this->graveTextures->count();
+        $i = 0;
+        while ($i < $n) {
+            TextureHandle $t = $this->graveTextures[$i];
+            uint64 $at = $this->graveTextureFrames[$i];
+            if ($all || $at + (FRAMES_IN_FLIGHT as uint64) <= $horizon) {
+                vkDestroyTexture($this, $t);
+            } else {
+                $this->graveTextures[$keep] = $t;
+                $this->graveTextureFrames[$keep] = $at;
+                $keep = $keep + 1;
+            }
+
+            $i = $i + 1;
+        }
+
+        $this->graveTextures->truncate($keep);
+        $this->graveTextureFrames->truncate($keep);
     }
 
     public function forgetProgram(uint32 $id) : void
@@ -332,6 +398,7 @@ public class Device : DeviceProtocol
         }
 
         vkTimestampsResolve($this, $slot, $this->gpuProfiler);
+        $this->sweepGraves(false);
         $slot->ring->reset();
         $slot->uniformsDirty = true;
 
@@ -641,7 +708,21 @@ public class Device : DeviceProtocol
         return .ok($handle);
     }
 
+    /**
+     * A frame in flight may still read the buffer, so it is buried until `beginFrame` proves it
+     * idle (or `releaseRetired` after a waitIdle).
+     */
     public function destroyBuffer(BufferHandle $handle) : void
+    {
+        if ($this->logical->handle == 0) {
+            return;
+        }
+
+        $this->graveBuffers[] = $handle;
+        $this->graveBufferFrames[] = $this->frames;
+    }
+
+    internal function freeBuffer(BufferHandle $handle) : void
     {
         if ($this->logical->handle == 0) {
             return;
@@ -691,9 +772,17 @@ public class Device : DeviceProtocol
         return vkCreateTexture($this, $desc);
     }
 
+    /**
+     * Buried like `destroyBuffer`: the image may still be sampled by a frame in flight.
+     */
     public function destroyTexture(TextureHandle $handle) : void
     {
-        vkDestroyTexture($this, $handle);
+        if ($this->logical->handle == 0 || $handle->imported) {
+            return;
+        }
+
+        $this->graveTextures[] = $handle;
+        $this->graveTextureFrames[] = $this->frames;
     }
 
     public function uploadTexture(

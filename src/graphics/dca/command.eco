@@ -33,16 +33,48 @@ internal class MeshTable
 {
     private array<RegisteredMesh> $meshes;
 
+    /**
+     * Slots `remove` gave back, reused by the next `add` so a scene that keeps rebuilding
+     * runtime models never walks the mesh index out of its sort-key bits.
+     */
+    private array<int32> $free;
+
     public constructor()
     {
         $this->meshes = array<RegisteredMesh>();
+        $this->free = array<int32>();
     }
 
     public function add(RegisteredMesh $mesh) : int32
     {
+        if ($this->free->count() > 0) {
+            usize $last = $this->free->count() - 1;
+            int32 $reused = $this->free[$last];
+            $this->free->pop();
+            $this->meshes[$reused as usize] = $mesh;
+            return $reused;
+        }
+
         int32 $index = $this->meshes->count() as int32;
+        // sortKey gives the mesh 16 bits (20..35); past that it would bleed into the material
+        assert($index < DCA_MESH_MAX, 'dca: mesh table full');
         $this->meshes[] = $mesh;
         return $index;
+    }
+
+    /**
+     * Give a slot back. Nothing may submit its handle afterwards; the stale entry is overwritten
+     * by the next `add`.
+     */
+    public function remove(int32 $index) : void
+    {
+        assert($index >= 0 && $index < ($this->meshes->count() as int32), 'dca: remove handle');
+        $this->free[] = $index;
+    }
+
+    public const function freeCount() : int32
+    {
+        return $this->free->count() as int32;
     }
 
     public const function get(int32 $index) : RegisteredMesh
@@ -58,6 +90,7 @@ internal class MeshTable
     public function clear() : void
     {
         $this->meshes->clear();
+        $this->free->clear();
     }
 }
 

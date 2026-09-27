@@ -94,10 +94,20 @@ public function decodeModel(Assets $assets, Blob $blob) : result<Model, AssetErr
     CookedModel $cooked = guard decodeCookedModel($assets, $blob) else ($e) {
         return .error($e);
     }
+    return .ok(buildModel($assets, $id, $cooked));
+}
+
+/**
+ * Upload a `CookedModel` into a live `Model` named `$id`. Each slot is a material catalog id,
+ * loaded like a cooked model's. The catalog decoder goes through here, and so does a model the
+ * game builds at runtime, which it then hands to `ModelBank.adopt`.
+ */
+public function buildModel(Assets $assets, const string& $id, CookedModel $cooked) : Model
+{
     Mesh $mesh = Mesh($assets->device, bytes: $cooked->vertices, stride: $cooked->vertexBytes());
     $mesh->index(bytes: $cooked->indices, $cooked->indexType);
     array<Material> $materials = modelMaterials($assets, $id, $cooked->slots);
-    return .ok(Model($id, $mesh, $cooked, $materials));
+    return Model($id, $mesh, $cooked, $materials);
 }
 
 /**

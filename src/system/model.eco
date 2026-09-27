@@ -43,13 +43,39 @@ internal class ModelHandles
     public array<visu::graphics::MeshHandle> $handles;
     public array<int32> $lodStart;
 
+    /**
+     * Per handle: its material casts a shadow. `$anyCast` is false when none does, so the
+     * cascades skip the model before its LOD is even picked.
+     */
+    public array<bool> $casts;
+    public bool $anyCast;
+
+    /**
+     * Placed statics, dynamics and skins drawing this model. `evict` waits for zero.
+     */
+    public int32 $users;
+
+    /**
+     * Evicted: the handles went back to the mesh table and the slot waits for reuse.
+     */
+    public bool $dead;
+
     public constructor(Model $model)
     {
         $this->model = $model;
         $this->handles = array<visu::graphics::MeshHandle>();
         $this->lodStart = array<int32>();
+        $this->casts = array<bool>();
+        $this->anyCast = false;
+        $this->users = 0;
+        $this->dead = false;
     }
 }
+
+/**
+ * Evictions `drainEvictions` may hold at once before the queue grows.
+ */
+internal const int32 MODEL_EVICT_RESERVE = 64;
 
 /**
  * One skin this frame: where it stands and where its joints start in the frame palette.
@@ -64,6 +90,19 @@ internal struct SkinDraw
     public Vec4 $tint;
     public float32 $lodBias;
     public float32 $base;
+}
+
+/**
+ * One dynamic this frame: its handles, interpolated world and bounds. `fill` packs these once;
+ * the cascades and the GBuffer pass both read the list, so no parent chain is walked twice.
+ */
+internal struct DynamicDraw
+{
+    public int32 $handles;
+    public Mat4 $world;
+    public AABB $bounds;
+    public Vec4 $tint;
+    public float32 $lodBias;
 }
 
 /**
@@ -128,6 +167,17 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
     private ModelLane<SkinInstanceData> $skinned;
     private map<string, int32> $modelIndex;
     private array<ModelHandles> $models;
+
+    /**
+     * Handle slots an eviction freed, reused by the next `acquire`.
+     */
+    private array<int32> $freeModels;
+
+    /**
+     * Model ids `evict` queued. Drained at the top of the next `fill`: this frame's cascade and
+     * outline lists, built in `fill`, still name their handles until the pipeline has run.
+     */
+    private array<string> $evictions;
     private map<Entity, int32> $dynamicOf;
     private map<Entity, int32> $skinnedOf;
 
@@ -135,6 +185,7 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
      * This frame's skins and their palette rows, kept across frames so the capacity survives.
      */
     private array<SkinDraw> $skinDraws;
+    private array<DynamicDraw> $dynamicDraws;
     private array<Vec4> $palette;
 
     /**
@@ -195,9 +246,12 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
         );
         $this->modelIndex = map<string, int32>();
         $this->models = array<ModelHandles>();
+        $this->freeModels = array<int32>();
+        $this->evictions = arr::room<string>(MODEL_EVICT_RESERVE as usize);
         $this->dynamicOf = map<Entity, int32>();
         $this->skinnedOf = map<Entity, int32>();
         $this->skinDraws = array<SkinDraw>();
+        $this->dynamicDraws = array<DynamicDraw>();
         $this->palette = array<Vec4>();
         $this->palette->reserve(SKIN_PALETTE_ROWS as usize);
         $this->highlights = arr::room<ModelHighlight>(MODEL_HIGHLIGHTS as usize);
@@ -261,11 +315,14 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
         $this->rigid->clear();
         $this->skinned->clear();
         $this->models->clear();
+        $this->freeModels->clear();
+        $this->evictions->clear();
         $this->modelIndex->clear();
         $this->statics->clear();
         $this->dynamicOf->clear();
         $this->skinnedOf->clear();
         $this->skinDraws->clear();
+        $this->dynamicDraws->clear();
         $this->palette->clear();
         $this->highlights->clear();
         $this->lines->clear();
@@ -406,12 +463,33 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
     }
 
     /**
+     * Stop drawing a model and give its mesh ranges back, so the bank may drop it. Detach every
+     * component that draws it first. Queued until the next `fill`, which is also when a model
+     * adopted under a fresh id is picked up, so a rebuilt road chunk swaps in one frame. A model
+     * that still has users stays queued; an id that failed to load forgets its cached miss.
+     */
+    public function evict(const string& $id) : void
+    {
+        $this->evictions[] = $id;
+    }
+
+    /**
+     * Ids evicted but not yet drained. The bank must not drop these yet.
+     */
+    public const function evicting() : int32
+    {
+        return $this->evictions->count() as int32;
+    }
+
+    /**
      * Acquire new components, then one pass that writes the GBuffer with every visible instance.
      */
     public function fill(Entities $entities, RenderContext $ctx, GBufferData $gbuffer) : void
     {
         $this->ensurePasses();
+        $this->drainEvictions();
         $this->acquireAll($entities);
+        $this->packDynamics($entities, $ctx->compensation);
         $this->packSkins($entities, $ctx);
         ModelSystem $sys = $this;
         Entities $world = $entities;
@@ -591,33 +669,35 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
                 }
 
                 ModelHandles $h = $this->models[$inst->handles as usize];
-                $this->submitVisible($dca, $h, $inst->world, $inst->bounds, ModelInstanceData($inst->tint), $inst->lodBias, $eye, false);
+                if (!$h->anyCast) {
+                    continue;
+                }
+
+                $this->submitVisible($dca, $h, $inst->world, $inst->bounds, ModelInstanceData($inst->tint), $inst->lodBias, $eye, false, shadow: true);
             }
 
             $i = $i + 1;
         }
 
-        foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
-            if (!$this->dynamicOf->has($id)) {
+        foreach ($this->dynamicDraws as $dyn) {
+            ModelHandles $h = $this->models[$dyn->handles as usize];
+            if (!$h->anyCast) {
                 continue;
             }
 
-            ModelHandles $h = $this->models[$this->dynamicOf[$id] as usize];
-            Transform& $t = $entities->get<Transform>($id);
-            Mat4 $world = $t->world($entities, $alpha);
-            AABB $bounds = $h->model->bounds->transformed($world);
             $i = 0;
             while ($i < SHADOW_CASCADES) {
-                if ($cascades[$i]->frustum->contains($bounds)) {
+                if ($cascades[$i]->frustum->contains($dyn->bounds)) {
                     $this->submitVisible(
                         $this->rigid->shadowDca[$i as usize],
                         $h,
-                        $world,
-                        $bounds,
-                        ModelInstanceData($dynamic->tint),
-                        $dynamic->lodBias,
+                        $dyn->world,
+                        $dyn->bounds,
+                        ModelInstanceData($dyn->tint),
+                        $dyn->lodBias,
                         $eye,
-                        false
+                        false,
+                        shadow: true
                     );
                 }
 
@@ -639,7 +719,8 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
                         $payload,
                         $skin->lodBias,
                         $eye,
-                        false
+                        false,
+                        shadow: true
                     );
                 }
 
@@ -822,6 +903,7 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
 
             Transform& $t = $entities->get<Transform>($id);
             ModelHandles $h = $this->models[$handles as usize];
+            $h->users = $h->users + 1;
             Mat4 $world = $t->world($entities);
             $this->statics->place(
                 $id,
@@ -844,6 +926,7 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
             }
 
             $this->dynamicOf[$id] = $handles;
+            $this->addUser($handles);
         }
 
         foreach ($entities->view<SkinnedModel>() as $id => &$skin) {
@@ -863,7 +946,36 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
             }
 
             $this->skinnedOf[$id] = $handles;
+            $this->addUser($handles);
         }
+    }
+
+    /**
+     * This frame's dynamics: each visible one's interpolated world and bounds, once. The
+     * cascades and the GBuffer pass read the list instead of walking the parent chains again.
+     * O(dynamics); the array keeps its capacity.
+     */
+    private function packDynamics(Entities $entities, float32 $alpha) : void
+    {
+        $this->dynamicDraws->clear();
+        if ($this->dynamicOf->count() == 0) {
+            return;
+        }
+
+        visu::profile::begin('dynamics');
+        foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
+            if ($dynamic->hidden || !$this->dynamicOf->has($id)) {
+                continue;
+            }
+
+            int32 $handles = $this->dynamicOf[$id];
+            ModelHandles $h = $this->models[$handles as usize];
+            Transform& $t = $entities->get<Transform>($id);
+            Mat4 $world = $t->world($entities, $alpha);
+            $this->dynamicDraws[] = DynamicDraw($handles, $world, $h->model->bounds->transformed($world), $dynamic->tint, $dynamic->lodBias);
+        }
+
+        visu::profile::end();
     }
 
     /**
@@ -975,17 +1087,10 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
             $this->submitVisible($this->rigid->dca, $h, $inst->world, $inst->bounds, ModelInstanceData($inst->tint), $inst->lodBias, $eye, true);
         }
 
-        foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
-            if (!$this->dynamicOf->has($id)) {
-                continue;
-            }
-
+        foreach ($this->dynamicDraws as $dyn) {
             $this->dynamicCount = $this->dynamicCount + 1;
-            ModelHandles $h = $this->models[$this->dynamicOf[$id] as usize];
-            Transform& $t = $entities->get<Transform>($id);
-            Mat4 $world = $t->world($entities, $alpha);
-            AABB $bounds = $h->model->bounds->transformed($world);
-            $this->submitVisible($this->rigid->dca, $h, $world, $bounds, ModelInstanceData($dynamic->tint), $dynamic->lodBias, $eye, true);
+            ModelHandles $h = $this->models[$dyn->handles as usize];
+            $this->submitVisible($this->rigid->dca, $h, $dyn->world, $dyn->bounds, ModelInstanceData($dyn->tint), $dyn->lodBias, $eye, true);
         }
 
         foreach ($this->skinDraws as $skin) {
@@ -1003,7 +1108,8 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
         P $payload,
         float32 $lodBias,
         Vec3 $eye,
-        bool $record
+        bool $record,
+        shadow: bool $shadow = false
     ) : void
     {
         float32 $dist = length($bounds->closest($eye) - $eye);
@@ -1043,7 +1149,10 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
         int32 $end = $h->lodStart[($level + 1) as usize];
         int32 $n = $start;
         while ($n < $end) {
-            $dca->submit($h->handles[$n as usize], $world, $payload, 0.0f);
+            if (!$shadow || $h->casts[$n as usize]) {
+                $dca->submit($h->handles[$n as usize], $world, $payload, 0.0f);
+            }
+
             $n = $n + 1;
         }
     }
@@ -1071,20 +1180,110 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
             $this->rigid->register($this->bank, $model, $h);
         }
 
+        if ($this->freeModels->count() > 0) {
+            usize $last = $this->freeModels->count() - 1;
+            int32 $reused = $this->freeModels[$last];
+            $this->freeModels->pop();
+            $this->models[$reused as usize] = $h;
+            $this->modelIndex[$id] = $reused;
+            return $reused;
+        }
+
         int32 $index = $this->models->count() as int32;
         $this->models[] = $h;
         $this->modelIndex[$id] = $index;
         return $index;
     }
 
+    /**
+     * Unregister each queued model with no users left and free its slot. O(queued); a model
+     * still drawn by something stays queued for the next frame.
+     */
+    private function drainEvictions() : void
+    {
+        usize $n = $this->evictions->count();
+        if ($n == 0) {
+            return;
+        }
+
+        usize $keep = 0;
+        usize $i = 0;
+        while ($i < $n) {
+            string $id = $this->evictions[$i];
+            if (!$this->evictNow($id)) {
+                $this->evictions[$keep] = $id;
+                $keep = $keep + 1;
+            }
+
+            $i = $i + 1;
+        }
+
+        $this->evictions->truncate($keep);
+    }
+
+    /**
+     * True once `$id` is gone (or was never here); false while something still draws it.
+     */
+    private function evictNow(const string& $id) : bool
+    {
+        if (!$this->modelIndex->has($id)) {
+            return true;
+        }
+
+        int32 $index = $this->modelIndex[$id];
+        if ($index < 0) {
+            $this->modelIndex->remove($id);
+            return true;
+        }
+
+        ModelHandles $h = $this->models[$index as usize];
+        if ($h->users > 0) {
+            return false;
+        }
+
+        if ($h->model->skinned()) {
+            $this->skinned->unregister($h);
+        } else {
+            $this->rigid->unregister($h);
+        }
+
+        $h->dead = true;
+        $this->modelIndex->remove($id);
+        $this->freeModels[] = $index;
+        return true;
+    }
+
+    private function addUser(int32 $handles) : void
+    {
+        if ($handles < 0) {
+            return;
+        }
+
+        ModelHandles $h = $this->models[$handles as usize];
+        $h->users = $h->users + 1;
+    }
+
+    private function dropUser(int32 $handles) : void
+    {
+        if ($handles < 0) {
+            return;
+        }
+
+        ModelHandles $h = $this->models[$handles as usize];
+        if ($h->users > 0) {
+            $h->users = $h->users - 1;
+        }
+    }
+
     internal function release(Entity $e) : void
     {
-        $this->statics->release($e);
+        $this->dropUser($this->statics->release($e));
     }
 
     internal function forgetDynamic(Entity $e) : void
     {
         if ($this->dynamicOf->has($e)) {
+            $this->dropUser($this->dynamicOf[$e]);
             $this->dynamicOf->remove($e);
         }
     }
@@ -1140,6 +1339,7 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
     internal function forgetSkinned(Entity $e) : void
     {
         if ($this->skinnedOf->has($e)) {
+            $this->dropUser($this->skinnedOf[$e]);
             $this->skinnedOf->remove($e);
         }
     }

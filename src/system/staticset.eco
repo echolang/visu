@@ -127,23 +127,24 @@ internal class StaticSet
     }
 
     /**
-     * Take a static out of the octree and free its record.
+     * Take a static out of the octree and free its record. The model handle index it held, or
+     * -1 when it was not placed.
      */
-    public function release(Entity $e) : void
+    public function release(Entity $e) : int32
     {
         if (!$this->of->has($e)) {
-            return;
+            return -1;
         }
 
         int32 $slot = $this->of[$e];
         $this->of->remove($e);
         if ($slot < 0 || ($slot as usize) >= $this->items->count()) {
-            return;
+            return -1;
         }
 
         StaticInstance $inst = $this->items[$slot as usize];
         if (!$inst->live) {
-            return;
+            return -1;
         }
 
         $this->octree->remove($inst->octree);
@@ -152,6 +153,7 @@ internal class StaticSet
         $this->items[$slot as usize] = $inst;
         $this->free[] = $slot;
         $this->count = $this->count - 1;
+        return $inst->handles;
     }
 
     /**

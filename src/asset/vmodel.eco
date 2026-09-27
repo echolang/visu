@@ -11,7 +11,7 @@ namespace visu::asset;
 
 use visu::geo::AABB;
 use visu::graphics::{IndexType, indexWidth};
-use visu::math::Vec3;
+use visu::math::{Vec2, Vec3, Vec4};
 
 internal const string MODEL_MAGIC = 'VMDL';
 internal const uint16 MODEL_VERSION = 2;
@@ -399,6 +399,40 @@ public function modelVertexBytes(uint32 $format) : int32
     }
 
     return 0;
+}
+
+/**
+ * Append one rigid vertex (`MODEL_VERTEX_P3N3T4UV2`) to a `CookedModel.vertices` string. A
+ * model built at runtime (a road chunk) writes its vertices through this, then hands the
+ * `CookedModel` to `visu::graphics::buildModel`.
+ */
+public function putModelVertex(string& $out, Vec3 $position, Vec3 $normal, Vec4 $tangent, Vec2 $uv) : void
+{
+    putF32($out, $position->x);
+    putF32($out, $position->y);
+    putF32($out, $position->z);
+    putF32($out, $normal->x);
+    putF32($out, $normal->y);
+    putF32($out, $normal->z);
+    putF32($out, $tangent->x);
+    putF32($out, $tangent->y);
+    putF32($out, $tangent->z);
+    putF32($out, $tangent->w);
+    putF32($out, $uv->x);
+    putF32($out, $uv->y);
+}
+
+/**
+ * Append one index of `$type` width to a `CookedModel.indices` string.
+ */
+public function putModelIndex(string& $out, uint32 $index, IndexType $type) : void
+{
+    if ($type == IndexType::uint16) {
+        putU16($out, $index as uint16);
+        return;
+    }
+
+    putU32($out, $index);
 }
 
 internal function putAabb(string& $out, const AABB& $box) : void

@@ -36,6 +36,7 @@ public class Systems
     private array<System> $updaters;
     private array<System> $renderers;
     private array<Ticker> $tickers;
+    private array<function<void(Entities)>> $begins;
 
     /**
      * Simulation passes run so far. Starts at zero, so the first tick() is pass one and a ticker
@@ -57,6 +58,7 @@ public class Systems
         $this->updaters = array<System>();
         $this->renderers = array<System>();
         $this->tickers = array<Ticker>();
+        $this->begins = array<function<void(Entities)>>();
         $this->passes = 0;
         $this->handlers = array<ConsoleCommandHandler>();
         $this->console = null;
@@ -79,6 +81,10 @@ public class Systems
 
         foreach ($schedule->tickers as $ticker) {
             $this->tickers->push($ticker);
+        }
+
+        foreach ($schedule->begins as $fn) {
+            $this->begins->push($fn);
         }
     }
 
@@ -126,6 +132,19 @@ public class Systems
         $this->removeConsole();
         foreach ($this->bound as $system) {
             $system->unregister($entities);
+        }
+    }
+
+    /**
+     * Once per update, before its `tick` passes (there may be none). Bind order.
+     */
+    public function begin(Entities $entities) : void
+    {
+        foreach ($this->begins as $begin) {
+            // a foreach binding over closures is untyped in echoc (see COMPILER_BUGS.md), so
+            // the call goes through a typed local, as tick does with its tickers
+            function<void(Entities)> $fn = $begin;
+            $fn($entities);
         }
     }
 

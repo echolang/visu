@@ -40,6 +40,12 @@ internal class ModelLane<P>
     private GpuPass? $shadow;
     private GpuPass? $outline;
 
+    /**
+     * Depth-biased passes, one per biased material index, built the first time that material
+     * draws. The programs they use are the lane's.
+     */
+    private map<int32, GpuPass> $biased;
+
     public constructor(
         Device $device,
         VertexLayout $layout,
@@ -72,6 +78,7 @@ internal class ModelLane<P>
         $this->doubleSidedParallax = null;
         $this->shadow = null;
         $this->outline = null;
+        $this->biased = map<int32, GpuPass>();
     }
 
     public const function ready() : bool
@@ -132,6 +139,34 @@ internal class ModelLane<P>
         $this->doubleSidedParallax = null;
         $this->shadow = null;
         $this->outline = null;
+        $this->biased->clear();
+    }
+
+    /**
+     * The biased pass for a material with `Material.biased()`, built on its first draw from the
+     * lane's plain or parallax pass with that material's bias.
+     */
+    internal function biasedPass(MaterialGpu $m, GpuPass $plain, GpuPass $parallax) : GpuPass
+    {
+        if ($this->biased->has($m->index)) {
+            return $this->biased[$m->index];
+        }
+
+        GpuPass $from = $plain;
+        if ($m->parallax) {
+            $from = $parallax;
+        }
+
+        Raster $raster = $from->raster;
+        if ($m->doubleSided) {
+            $raster->cull = .none;
+        }
+
+        $raster->depthBias = $m->material->depthBias;
+        $raster->depthSlope = $m->material->depthSlope;
+        GpuPass $pass = GpuPass($from->program, $this->layout, $raster);
+        $this->biased[$m->index] = $pass;
+        return $pass;
     }
 
     /**
@@ -151,10 +186,30 @@ internal class ModelLane<P>
                     material: $m->index
                 );
                 $h->handles[] = $handle;
+                $h->casts[] = $m->material->castShadow;
+                if ($m->material->castShadow) {
+                    $h->anyCast = true;
+                }
             }
         }
 
         $h->lodStart[] = $h->handles->count() as int32;
+    }
+
+    /**
+     * Give every handle of `$h` back to the shared mesh table (the cascades and the outline share
+     * it). `ModelSystem` calls this between frames' fills, never with a submission pending.
+     */
+    public function unregister(ModelHandles $h) : void
+    {
+        foreach ($h->handles as $handle) {
+            $this->dca->unregister($handle);
+        }
+
+        $h->handles->clear();
+        $h->lodStart->clear();
+        $h->casts->clear();
+        $h->anyCast = false;
     }
 
     public function clearShadows() : void
@@ -195,8 +250,16 @@ internal class ModelLane<P>
             return;
         }
 
+        ModelLane<P> $lane = $this;
         $this->dca->execute($enc, function(RenderEncoder $e, int32 $material) : void {
             MaterialGpu $m = $bank->material($material);
+            if ($m->material->biased()) {
+                GpuPass $biased = $lane->biasedPass($m, $opaque, $opaqueParallax);
+                $biased->bind($e);
+                $m->bind($e);
+                return;
+            }
+
             if ($m->parallax) {
                 if ($m->doubleSided) {
                     $twoSidedParallax->bind($e);

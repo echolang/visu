@@ -468,16 +468,21 @@ public class Ui
     /**
      * `$solid` false lets the pointer through the card to the world: a plate that labels a
      * thing never blocks the click on it. Null keeps the default, solid because it paints.
+     * `$fill` stretches the card across its parent's width (a top bar, a status strip) instead of
+     * fitting what it holds; `$width` then does nothing.
      */
     public function beginCard(
         float32 $width = 0.0f,
         style: CardKind $style = .card,
-        solid: bool? $solid = null
+        solid: bool? $solid = null,
+        fill: bool $fill = false
     ) : void
     {
         CardStyle $st = $this->theme->card;
         if ($style == CardKind::panel) {
             $st = $this->theme->panel;
+        } else if ($style == CardKind::bar) {
+            $st = $this->theme->bar;
         }
 
         Layout $l = Layout();
@@ -491,6 +496,12 @@ public class Ui
         $l->skin = $st->skin;
         $l->width = $width;
         $l->solid = $solid;
+
+        if ($fill) {
+            $l->h = .fill;
+            $l->width = 0.0f;
+        }
+
         $this->begin($l);
     }
 
@@ -640,6 +651,38 @@ public class Ui
         );
     }
 
+    /**
+     * An integer readout, exact at any size: `$v` in minor units with `$decimals` after the point
+     * (cents: `fixed($cents, decimals: 2)`), the whole part zero-padded to `$pad` digits (a
+     * clock's `05`), `$group` between every three whole digits, `$sign` a `+` on a positive value,
+     * then `$unit` verbatim. Formats into the frame arena like `number`, so it builds no string.
+     */
+    public function fixed(
+        int64 $v,
+        decimals: int32 $decimals = 0,
+        pad: int32 $pad = 1,
+        group: string $group = '',
+        sign: bool $sign = false,
+        unit: string $unit = '',
+        size: float32 $size = 0.0f,
+        color: Color? $color = null,
+        bold: bool $bold = false
+    ) : void
+    {
+        float32 $sz = $size;
+
+        if ($sz <= 0.0f) {
+            $sz = $this->theme->fontSize;
+        }
+
+        usize $from = $this->arena->size();
+        appendScaled($this->arena, $v, $decimals, $pad, $group, $sign);
+        $this->arena->append($unit);
+        $this->pushText(
+            TextRun('', $sz, $color ?? $this->theme->textColor, $bold, true, $from, $this->arena->size())
+        );
+    }
+
     public function label(string $s) : void
     {
         Theme $t = $this->theme;
@@ -744,13 +787,22 @@ public class Ui
         return uiCheckbox($this, $label, $on, $id);
     }
 
+    /**
+     * Segmented choice: one of `$choices` is `$selected`. `$compact` draws it from
+     * `theme.compactGroup`, a size down, for a bar along a screen edge.
+     */
     public function buttonGroup(
         string $name,
         const array<Choice>& $choices,
         string& $selected,
-        id: string $id = ''
+        id: string $id = '',
+        compact: bool $compact = false
     ) : bool
     {
+        if ($compact) {
+            return uiButtonGroup($this, $name, $choices, $selected, $id, $this->theme->compactGroup);
+        }
+
         return uiButtonGroup($this, $name, $choices, $selected, $id, $this->theme->buttonGroup);
     }
 
