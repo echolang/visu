@@ -1,0 +1,145 @@
+/**
+ * The bind path's pipeline lookup. A pass key names everything but the targets, and an encoder
+ * resolves its targets to a format set once when it opens, so a bind is one hash of a key the
+ * pass already holds and a scan of a short row: no string is built per bind. The backend keeps
+ * its own string-keyed store for creation and teardown and clears this cache whenever it drops
+ * a pipeline.
+ */
+
+namespace visu::graphics;
+
+public class PipelineCache<H>
+{
+    private map<string, PipelineRow<H>> $rows;
+    private array<TargetFormats> $sets;
+
+    /**
+     * Backend depth code per set, for a backend whose depth format is not in `TargetFormats`.
+     */
+    private array<uint32> $depths;
+
+    public constructor()
+    {
+        $this->rows = map<string, PipelineRow<H>>();
+        $this->sets = array<TargetFormats>();
+        $this->depths = array<uint32>();
+    }
+
+    /**
+     * The set index for these targets, added the first time they are seen. There are a handful
+     * of distinct target layouts in a frame, so a linear compare is the whole cost.
+     */
+    public function formatSet(const TargetFormats& $formats, uint32 $depth) : int32
+    {
+        usize $n = $this->sets->count();
+        usize $i = 0;
+        while ($i < $n) {
+            if ($this->depths[$i] == $depth && $this->sets[$i]->same($formats)) {
+                return $i as int32;
+            }
+
+            $i = $i + 1;
+        }
+
+        $this->sets[] = $formats;
+        $this->depths[] = $depth;
+        return $n as int32;
+    }
+
+    /**
+     * The pipeline built for `$key` on format set `$set`, into `$out`. False on a miss.
+     */
+    public const function find(const string& $key, int32 $set, H& $out) : bool
+    {
+        if (!$this->rows->has($key)) {
+            return false;
+        }
+
+        PipelineRow<H> $row = $this->rows[$key];
+        return $row->find($set, $out);
+    }
+
+    public function put(const string& $key, int32 $set, H $handle) : void
+    {
+        if (!$this->rows->has($key)) {
+            $this->rows[$key] = PipelineRow<H>();
+        }
+
+        PipelineRow<H> $row = $this->rows[$key];
+        $row->put($set, $handle);
+    }
+
+    /**
+     * Forget every pipeline. The format sets stay: they describe targets, not GPU objects.
+     */
+    public function clear() : void
+    {
+        $this->rows->clear();
+    }
+}
+
+/**
+ * One pass key's pipelines, one per format set it was bound on.
+ */
+internal class PipelineRow<H>
+{
+    private array<int32> $sets;
+    private array<H> $handles;
+
+    public constructor()
+    {
+        $this->sets = array<int32>();
+        $this->handles = array<H>();
+    }
+
+    public const function find(int32 $set, H& $out) : bool
+    {
+        usize $n = $this->sets->count();
+        usize $i = 0;
+        while ($i < $n) {
+            if ($this->sets[$i] == $set) {
+                $out = $this->handles[$i];
+                return true;
+            }
+
+            $i = $i + 1;
+        }
+
+        return false;
+    }
+
+    public function put(int32 $set, H $handle) : void
+    {
+        $this->sets[] = $set;
+        $this->handles[] = $handle;
+    }
+}
+
+test pipeline_cache_sets_and_rows
+{
+    PipelineCache<int32> $cache = PipelineCache<int32>();
+    TargetFormats $a = TargetFormats();
+    $a->colorCount = 2;
+    $a->colors[0] = .rgba16f;
+    TargetFormats $b = $a;
+    $b->colors[1] = .rgba16f;
+    TargetFormats $c = $a;
+    // a colour past the count and a depth format without depth are not part of the targets
+    $c->colors[5] = .rgba16f;
+    $c->depth = .depth32fStencil8;
+    assert($cache->formatSet($a, 0) == 0);
+    assert($cache->formatSet($b, 0) == 1);
+    assert($cache->formatSet($c, 0) == 0);
+    assert($cache->formatSet($a, 7) == 2);
+
+    int32 $out = -1;
+    assert(!$cache->find('pass', 0, $out));
+    $cache->put('pass', 0, 11);
+    $cache->put('pass', 1, 12);
+    assert($cache->find('pass', 1, $out) && $out == 12);
+    assert($cache->find('pass', 0, $out) && $out == 11);
+    assert(!$cache->find('pass', 2, $out));
+    $cache->clear();
+    assert(!$cache->find('pass', 0, $out));
+    assert($cache->formatSet($b, 0) == 1);
+}

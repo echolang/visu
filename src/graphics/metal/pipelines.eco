@@ -115,6 +115,7 @@ internal function metalPipelineFromPass(
 internal function mtlForgetProgram(Device $device, uint32 $id) : void
 {
     string $prefix = "{$id}|";
+    $device->psoCache->clear();
     array<string> $keys = $device->psos->keys();
     foreach ($keys as $key) {
         if ($key->starts($prefix)) {
@@ -127,20 +128,30 @@ internal function metalGetPipeline(
     Device $device,
     const GpuPass& $pass,
     const TargetFormats& $formats,
-    mtl::PixelFormat $depthFmt
+    mtl::PixelFormat $depthFmt,
+    int32 $formatSet
 ) : PipelineHandle
 {
+    PipelineHandle $hit = PipelineHandle::none();
+    if ($device->psoCache->find($pass->key(), $formatSet, $hit)) {
+        return $hit;
+    }
+
+    // first bind of this pass on these targets: the string-keyed store builds or shares it
     uint32 $df = $depthFmt->value();
     string $key = "{$pass->key()}|{$formats->fingerprint()}|{$df}";
-
+    PipelineHandle $made = PipelineHandle::none();
     if ($device->psos->has($key)) {
-        return $device->psos[$key];
+        $made = $device->psos[$key];
+    } else {
+        PipelineHandle $fresh = guard metalPipelineFromPass($device, $pass, $formats, $depthFmt) else ($e) {
+            die($e->message());
+        }
+        $device->psos[$key] = $fresh;
+        $made = $fresh;
     }
 
-    PipelineHandle $made = guard metalPipelineFromPass($device, $pass, $formats, $depthFmt) else ($e) {
-        die($e->message());
-    }
-    $device->psos[$key] = $made;
+    $device->psoCache->put($pass->key(), $formatSet, $made);
     return $made;
 }
 

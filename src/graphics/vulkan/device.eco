@@ -58,6 +58,11 @@ public class Device : DeviceProtocol
     internal vk::CommandPool $setupPool;
     internal vk::CommandBuffer $setupCmd;
     internal map<string, PipelineHandle> $psos;
+
+    /**
+     * The bind path's view of `psos`, cleared whenever a pipeline is dropped.
+     */
+    internal PipelineCache<PipelineHandle> $psoCache;
     internal map<uint32, vk::Pipeline> $computePsos;
     internal map<string, Sampler> $samplers;
     internal int32 $anisoWanted;
@@ -124,6 +129,7 @@ public class Device : DeviceProtocol
         $this->setupPool = vk::CommandPool::none();
         $this->setupCmd = vk::CommandBuffer::none();
         $this->psos = map<string, PipelineHandle>();
+        $this->psoCache = PipelineCache<PipelineHandle>();
         $this->computePsos = map<uint32, vk::Pipeline>();
         $this->samplers = map<string, Sampler>();
         $this->anisoWanted = 1;
@@ -342,6 +348,7 @@ public class Device : DeviceProtocol
     public function forgetProgram(uint32 $id) : void
     {
         string $prefix = "{$id}|";
+        $this->psoCache->clear();
         array<string> $keys = $this->psos->keys();
         array<PipelineHandle> $drop = array<PipelineHandle>();
         foreach ($keys as $key) {

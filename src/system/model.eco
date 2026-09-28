@@ -677,12 +677,13 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->skinned->clearShadows();
         Vec3 $eye = $view->cullPosition;
         float32 $alpha = $ctx->compensation;
+        visu::profile::begin('statics');
         int32 $i = 0;
         while ($i < SHADOW_CASCADES) {
             ShadowCascade $cascade = $cascades[$i];
             DrawCallAssembler<ModelInstanceData> $dca = $this->rigid->shadowDca[$i as usize];
             $this->statics->query($cascade->frustum);
-            array<uint32> $ids = $this->statics->visible();
+            const array<uint32>& $ids = $this->statics->visible();
             foreach ($ids as $id) {
                 StaticInstance $inst = $this->statics->get($id);
                 if (!$inst->live) {
@@ -700,6 +701,8 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             $i = $i + 1;
         }
 
+        visu::profile::end();
+        visu::profile::begin('movers');
         foreach ($this->dynamicDraws as $dyn) {
             ModelHandles $h = $this->models[$dyn->handles as usize];
             if (!$h->anyCast) {
@@ -749,8 +752,11 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             }
         }
 
+        visu::profile::end();
+        visu::profile::begin('batch');
         $this->rigid->buildShadows($cascades, $eye);
         $this->skinned->buildShadows($cascades, $eye);
+        visu::profile::end();
         visu::profile::end();
     }
 
@@ -781,7 +787,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             Vec3 $extent = Vec3($radius, $radius, $radius);
             AABB $box = AABB($center - $extent, $center + $extent);
             $this->statics->query($box);
-            array<uint32> $ids = $this->statics->visible();
+            const array<uint32>& $ids = $this->statics->visible();
             foreach ($ids as $id) {
                 StaticInstance $inst = $this->statics->get($id);
                 if (!$inst->live) {
@@ -853,7 +859,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         Plane $plane = $chosen->plane;
         Frustum $frustum = $water->camera->cullFrustum;
         $this->statics->query($frustum);
-        array<uint32> $ids = $this->statics->visible();
+        const array<uint32>& $ids = $this->statics->visible();
         foreach ($ids as $id) {
             StaticInstance $inst = $this->statics->get($id);
             if (!$inst->live || !waterAbove($inst->bounds, $plane)) {
@@ -1314,7 +1320,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         }
 
         $this->statics->query($frustum);
-        array<uint32> $ids = $this->statics->visible();
+        const array<uint32>& $ids = $this->statics->visible();
         foreach ($ids as $id) {
             StaticInstance $inst = $this->statics->get($id);
             if (!$inst->live) {

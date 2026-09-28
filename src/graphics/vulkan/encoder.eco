@@ -8,6 +8,11 @@ public class RenderEncoder : RenderEncoderProtocol
 {
     private Device $device;
     private TargetFormats $formats;
+
+    /**
+     * These targets' index in the device pipeline cache, resolved once at open.
+     */
+    private int32 $formatSet;
     private int32 $width;
     private int32 $height;
     private bool $ended;
@@ -31,6 +36,8 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->bindings = VkBindings();
         $this->topology = .triangles;
         $this->patchControlPoints = 0;
+        // the depth format is part of `TargetFormats` here
+        $this->formatSet = $device->psoCache->formatSet($formats, 0);
     }
 
     destructor()
@@ -56,7 +63,7 @@ public class RenderEncoder : RenderEncoderProtocol
     public function setGpuPass(const GpuPass& $pass) : void
     {
         assert(!$this->ended, 'setGpuPass after endRender');
-        PipelineHandle $pso = vkGetPipeline($this->device, $pass, $this->formats);
+        PipelineHandle $pso = vkGetPipeline($this->device, $pass, $this->formats, $this->formatSet);
         vk::CmdBindPipeline(
             $this->device->currentCmd(),
             vk::PIPELINE_BIND_POINT_GRAPHICS,

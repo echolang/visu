@@ -17,6 +17,11 @@ public class RenderEncoder : RenderEncoderProtocol
     private bool $pipelineSet;
     internal mtl::RenderCommandEncoder $enc;
     internal mtl::PixelFormat $depthFmt;
+
+    /**
+     * These targets' index in the device pipeline cache, resolved once at open.
+     */
+    private int32 $formatSet;
     private Topology $topology;
     private Buffer? $indexBuffer;
     private mtl::Buffer? $indexTransient;
@@ -53,6 +58,7 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->pipelineSet = false;
         $this->enc = $enc;
         $this->depthFmt = $depthFmt;
+        $this->formatSet = $device->psoCache->formatSet($formats, $depthFmt->value());
         $this->topology = .triangles;
         $this->patchControlPoints = 0;
         $this->tessFactorOff = 0;
@@ -114,7 +120,7 @@ public class RenderEncoder : RenderEncoderProtocol
     public function setGpuPass(const GpuPass& $pass) : void
     {
         assert(!$this->ended, 'setGpuPass after endRender');
-        PipelineHandle $pso = metalGetPipeline($this->device, $pass, $this->formats, $this->depthFmt);
+        PipelineHandle $pso = metalGetPipeline($this->device, $pass, $this->formats, $this->depthFmt, $this->formatSet);
         mtl::RenderPipelineState $state = guard $pso->pipeline else {
             die('metal: pipeline handle is empty');
         }

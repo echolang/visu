@@ -323,18 +323,28 @@ internal function vkPipelineFromPass(
 internal function vkGetPipeline(
     Device $device,
     const GpuPass& $pass,
-    const TargetFormats& $formats
+    const TargetFormats& $formats,
+    int32 $formatSet
 ) : PipelineHandle
 {
+    PipelineHandle $hit = PipelineHandle::none();
+    if ($device->psoCache->find($pass->key(), $formatSet, $hit)) {
+        return $hit;
+    }
+
+    // first bind of this pass on these targets: the string-keyed store builds or shares it
     string $key = "{$pass->key()}|{$formats->fingerprint()}";
-
+    PipelineHandle $made = PipelineHandle::none();
     if ($device->psos->has($key)) {
-        return $device->psos[$key];
+        $made = $device->psos[$key];
+    } else {
+        PipelineHandle $fresh = guard vkPipelineFromPass($device, $pass, $formats) else ($e) {
+            die($e->message());
+        }
+        $device->psos[$key] = $fresh;
+        $made = $fresh;
     }
 
-    PipelineHandle $made = guard vkPipelineFromPass($device, $pass, $formats) else ($e) {
-        die($e->message());
-    }
-    $device->psos[$key] = $made;
+    $device->psoCache->put($pass->key(), $formatSet, $made);
     return $made;
 }
