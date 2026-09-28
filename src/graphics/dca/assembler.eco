@@ -49,6 +49,11 @@ public class DrawCallAssembler<P>
     private array<uint32> $visible;
     private array<uint64> $keys;
     private array<uint32> $sortScratch;
+
+    /**
+     * Per mesh slot: the visible count, then the next write position. `bucket` scratch.
+     */
+    private array<uint32> $meshAt;
     private int32 $culled;
 
     /**
@@ -70,6 +75,7 @@ public class DrawCallAssembler<P>
         $this->visible = array<uint32>();
         $this->keys = array<uint64>();
         $this->sortScratch = array<uint32>();
+        $this->meshAt = array<uint32>();
         $this->culled = 0;
         ptr<uint8> $none;
         $none:$ = null;
@@ -206,7 +212,9 @@ public class DrawCallAssembler<P>
             }
 
             // one key per submission, culled included: sortByKey looks them up by submission index, not by position in $visible
-            $this->keys[] = sortKey($mesh->material, $sub->mesh, $this->depthBucket($centre, $cameraPosition, $sub->sortBias));
+            if ($this->sortFrontToBack) {
+                $this->keys[] = sortKey($mesh->material, $sub->mesh, $this->depthBucket($centre, $cameraPosition, $sub->sortBias));
+            }
 
             if ($this->cull) {
                 float32 $radius = $mesh->radius * maxAxisScale($sub->model);
@@ -226,7 +234,12 @@ public class DrawCallAssembler<P>
             return 0;
         }
 
-        sortByKey($this->visible, $this->keys, $this->sortScratch);
+        if ($this->sortFrontToBack) {
+            sortByKey($this->visible, $this->keys, $this->sortScratch);
+        } else {
+            bucketByMesh($this->visible, $this->pending, $this->table->order(), $this->meshAt, $this->sortScratch);
+        }
+
         $this->merge();
         return $this->commands->count() as int32;
     }
@@ -491,6 +504,75 @@ internal function sortByKey(array<uint32>& $values, const array<uint64>& $keys, 
 
     $i = 0;
 
+    while ($i < $n) {
+        $values[$i] = $scratch[$i];
+        $i = $i + 1;
+    }
+}
+
+/**
+ * The order `sortByKey` gives a list without depth, in linear time. Every key is then
+ * (material, mesh), so a stable counting sort over the mesh slots, walked in `$order` (every
+ * slot in key order), puts each submission exactly where the merge sort would.
+ * `$meshAt` and `$scratch` are the caller's, so a frame only allocates when a count outgrows them.
+ */
+internal function bucketByMesh<P>(
+    array<uint32>& $values,
+    const array<Submission<P>>& $pending,
+    const array<uint32>& $order,
+    array<uint32>& $meshAt,
+    array<uint32>& $scratch
+) : void
+{
+    usize $n = $values->count();
+    if ($n < 2) {
+        return;
+    }
+
+    usize $meshes = $order->count();
+    $meshAt->clear();
+    $meshAt->reserve($meshes);
+    $meshAt->commit($meshes);
+    usize $m = 0;
+    while ($m < $meshes) {
+        $meshAt[$m] = 0;
+        $m = $m + 1;
+    }
+
+    usize $i = 0;
+    while ($i < $n) {
+        const Submission<P>& $sub = $pending[$values[$i] as usize];
+        usize $slot = $sub->mesh as usize;
+        assert($slot < $meshes, 'bucketByMesh: every slot is in the order');
+        $meshAt[$slot] = $meshAt[$slot] + 1;
+        $i = $i + 1;
+    }
+
+    // counts become each slot's first write position, slots laid out in key order
+    uint32 $run = 0;
+    $m = 0;
+    while ($m < $meshes) {
+        usize $slot = $order[$m] as usize;
+        uint32 $count = $meshAt[$slot];
+        $meshAt[$slot] = $run;
+        $run = $run + $count;
+        $m = $m + 1;
+    }
+
+    $scratch->clear();
+    $scratch->reserve($n);
+    $scratch->commit($n);
+    $i = 0;
+    while ($i < $n) {
+        uint32 $value = $values[$i];
+        const Submission<P>& $sub = $pending[$value as usize];
+        usize $slot = $sub->mesh as usize;
+        $scratch[$meshAt[$slot] as usize] = $value;
+        $meshAt[$slot] = $meshAt[$slot] + 1;
+        $i = $i + 1;
+    }
+
+    $i = 0;
     while ($i < $n) {
         $values[$i] = $scratch[$i];
         $i = $i + 1;

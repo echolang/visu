@@ -39,10 +39,23 @@ internal class MeshTable
      */
     private array<int32> $free;
 
+    /**
+     * Every slot in sort-key order (material, then slot), rebuilt by `order` after a change.
+     * A depth-free list buckets its submissions in this order instead of sorting them.
+     */
+    private array<uint32> $sorted;
+    private array<uint64> $sortKeys;
+    private array<uint32> $sortScratch;
+    private bool $dirty;
+
     public constructor()
     {
         $this->meshes = array<RegisteredMesh>();
         $this->free = array<int32>();
+        $this->sorted = array<uint32>();
+        $this->sortKeys = array<uint64>();
+        $this->sortScratch = array<uint32>();
+        $this->dirty = true;
     }
 
     public function add(RegisteredMesh $mesh) : int32
@@ -52,6 +65,7 @@ internal class MeshTable
             int32 $reused = $this->free[$last];
             $this->free->pop();
             $this->meshes[$reused as usize] = $mesh;
+            $this->dirty = true;
             return $reused;
         }
 
@@ -59,6 +73,7 @@ internal class MeshTable
         // sortKey gives the mesh 16 bits (20..35); past that it would bleed into the material
         assert($index < DCA_MESH_MAX, 'dca: mesh table full');
         $this->meshes[] = $mesh;
+        $this->dirty = true;
         return $index;
     }
 
@@ -70,6 +85,7 @@ internal class MeshTable
     {
         assert($index >= 0 && $index < ($this->meshes->count() as int32), 'dca: remove handle');
         $this->free[] = $index;
+        $this->dirty = true;
     }
 
     public const function freeCount() : int32
@@ -99,6 +115,34 @@ internal class MeshTable
     {
         $this->meshes->clear();
         $this->free->clear();
+        $this->dirty = true;
+    }
+
+    /**
+     * Slots ordered by `sortKey(material, slot, 0)`. Freed slots stay in; nothing submits them.
+     * Rebuilt only after an `add`, `remove` or `clear`, so a steady scene never sorts here.
+     */
+    public function order() : const array<uint32>&
+    {
+        if (!$this->dirty) {
+            return $this->sorted;
+        }
+
+        usize $n = $this->meshes->count();
+        $this->sorted->clear();
+        $this->sortKeys->clear();
+        $this->sorted->reserve($n);
+        $this->sortKeys->reserve($n);
+        usize $i = 0;
+        while ($i < $n) {
+            $this->sorted[] = $i as uint32;
+            $this->sortKeys[] = sortKey($this->meshes[$i]->material, $i as int32, 0);
+            $i = $i + 1;
+        }
+
+        sortByKey($this->sorted, $this->sortKeys, $this->sortScratch);
+        $this->dirty = false;
+        return $this->sorted;
     }
 }
 

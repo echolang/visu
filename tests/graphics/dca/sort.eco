@@ -3,7 +3,7 @@
  * No GPU calls; the assembler itself needs real meshes, so it is covered by the `drawcalls` pixel check.
  */
 
-use visu::graphics::{maxAxisScale, sortByKey, sortKey, worldPoint};
+use visu::graphics::{Submission, bucketByMesh, maxAxisScale, sortByKey, sortKey, worldPoint};
 use visu::math::{Mat4, Vec3, scale, translate};
 
 test dca_sort_key_groups_by_mesh_then_depth
@@ -88,4 +88,44 @@ test dca_sort_reads_keys_by_value_not_position
     assert($values[0] == 4, 'smallest key of the visible set');
     assert($values[1] == 5, 'middle');
     assert($values[2] == 1, 'largest');
+}
+
+test dca_bucket_matches_sort_without_depth
+{
+    // five mesh slots; the material per slot puts slot 3 first and slot 0 after slot 4
+    array<int32> $material = [2, 1, 1, 0, 1];
+    array<uint64> $slotKeys = array<uint64>();
+    array<uint32> $order = [0, 1, 2, 3, 4];
+    int32 $s = 0;
+    while ($s < 5) {
+        $slotKeys[] = sortKey($material[$s as usize], $s, 0);
+        $s = $s + 1;
+    }
+    array<uint32> $orderScratch = array<uint32>();
+    sortByKey($order, $slotKeys, $orderScratch);
+
+    array<int32> $meshOf = [4, 0, 3, 1, 4, 2, 0, 3, 3, 1, 2, 4];
+    array<Submission<int32>> $pending = array<Submission<int32>>();
+    array<uint64> $keys = array<uint64>();
+    int32 $i = 0;
+    while ($i < 12) {
+        int32 $mesh = $meshOf[$i as usize];
+        $pending[] = Submission<int32>($mesh, Mat4(), $i, 0.0f);
+        $keys[] = sortKey($material[$mesh as usize], $mesh, 0);
+        $i = $i + 1;
+    }
+
+    // a sparse visible list, as after a cull
+    array<uint32> $sorted = [0, 1, 2, 4, 5, 6, 7, 9, 10, 11];
+    array<uint32> $bucketed = [0, 1, 2, 4, 5, 6, 7, 9, 10, 11];
+    array<uint32> $scratch = array<uint32>();
+    array<uint32> $meshAt = array<uint32>();
+    sortByKey($sorted, $keys, $scratch);
+    bucketByMesh($bucketed, $pending, $order, $meshAt, $scratch);
+    assert($order[0] == 3, 'order: material first');
+    int32 $k = 0;
+    while ($k < 10) {
+        assert($sorted[$k as usize] == $bucketed[$k as usize], 'bucket order is the sort order');
+        $k = $k + 1;
+    }
 }
