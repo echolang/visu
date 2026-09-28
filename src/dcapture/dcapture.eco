@@ -11,11 +11,8 @@
 namespace visu::dcapture;
 
 use std::io;
-use visu::app::{Flags, HostConfig, flags, info};
-use visu::graphics::{CameraOverrideData, FRAMES_IN_FLIGHT};
-use visu::math::{Quat, Vec3};
-use visu::os::{HostEvent, Window};
-use visu::os::input::{InputHub, KeyPhase, MouseButton};
+use visu::app::{Flags, HostConfig};
+use visu::graphics::FRAMES_IN_FLIGHT;
 use visu::runtime::DebugConsole;
 
 internal const ARG_NAME = '--dcapture';
@@ -26,30 +23,16 @@ public class DCapture
     public const Script $script;
     public DumpQueue $dumps;
     private StepQueue $steps;
-    private CameraOverrideData? $camera;
-    private int32 $frame;
+    private StepRunner? $runner;
     private int32 $tick;
-
-    /**
-     * Frame a scripted click was pressed on, or -1. Released on a later frame.
-     */
-    private int32 $clickFrame;
-    private bool $pendingClick;
-    private float64 $pendingX;
-    private float64 $pendingY;
 
     public constructor(Script $script)
     {
         $this->script = $script;
         $this->dumps = DumpQueue($script->out);
         $this->steps = StepQueue($script->steps);
-        $this->camera = null;
-        $this->frame = 0;
+        $this->runner = null;
         $this->tick = 0;
-        $this->clickFrame = -1;
-        $this->pendingClick = false;
-        $this->pendingX = 0.0;
-        $this->pendingY = 0.0;
         if ($script->list) {
             $this->dumps->queueList();
         }
@@ -161,60 +144,32 @@ public class DCapture
     }
 
     /**
-     * Fire every step due at this frame and tick. Idempotent; the Host calls it from poll
-     * and again at the top of renderFrame so a step lands even when no tick ran in between.
+     * Fire every step due at this frame and tick through `$runner`, the Host's one step runner.
+     * Idempotent; the Host calls it from poll and again at the top of renderFrame so a step
+     * lands even when no tick ran in between.
      */
-    public function advance(int32 $frame, int32 $tick, DebugConsole? $console) : void
+    public function advance(int32 $frame, int32 $tick, DebugConsole? $console, StepRunner $runner) : void
     {
-        $this->frame = $frame;
         $this->tick = $tick;
+        $this->runner = $runner;
         array<Step> $due = $this->steps->advance($frame, $tick);
         foreach ($due as $step) {
-            $this->apply($step, $console);
+            $runner->apply($step, $console, $this->dumps);
         }
-    }
-
-    /**
-     * Feed scripted clicks into `$input` as the window would: the release of a pending click
-     * once its press frame is over, then the cursor move and press of every click due now.
-     * The Host calls it next to `advance`, before the frame's systems read input.
-     */
-    public function feed(InputHub $input, Window $window) : void
-    {
-        if ($this->clickFrame >= 0 && $this->frame > $this->clickFrame) {
-            $input->handle($window, HostEvent::button(MouseButton::left, KeyPhase::release, 0));
-            $this->clickFrame = -1;
-            $this->dumps->note('click released');
-        }
-
-        if (!$this->pendingClick) {
-            return;
-        }
-
-        $this->pendingClick = false;
-        $input->handle($window, HostEvent::cursor($this->pendingX, $this->pendingY));
-        $input->handle($window, HostEvent::button(MouseButton::left, KeyPhase::press, 0));
-        $this->clickFrame = $this->frame;
-        $this->dumps->note("click pressed at {$this->pendingX:.0f} {$this->pendingY:.0f}");
-    }
-
-    private function press(Step $step) : void
-    {
-        $this->pendingClick = true;
-        $this->pendingX = $step->clickX;
-        $this->pendingY = $step->clickY;
-    }
-
-    public const function cameraOverride() : CameraOverrideData?
-    {
-        return $this->camera;
     }
 
     public const function status() : string
     {
+        int32 $frame = 0;
+        StepRunner? $maybe = $this->runner;
+        if ($maybe != null) {
+            StepRunner $runner = guard $maybe;
+            $frame = $runner->frame();
+        }
+
         int32 $pending = $this->steps->pending();
         int32 $queued = $this->dumps->queued();
-        return "dcapture active: frame {$this->frame} tick {$this->tick}, {$pending} steps pending, {$queued} dumps queued, out {$this->script->out}";
+        return "dcapture active: frame {$frame} tick {$this->tick}, {$pending} steps pending, {$queued} dumps queued, out {$this->script->out}";
     }
 
     /**
@@ -224,73 +179,5 @@ public class DCapture
     {
         $this->dumps->skip($this->steps->remaining());
         $this->dumps->finish($framesRun, $this->tick, true);
-    }
-
-    private function apply(Step $step, DebugConsole? $console) : void
-    {
-        string $when = $step->describe();
-        $this->dumps->note("frame {$this->frame} tick {$this->tick}: {$when}");
-        Flags $bag = flags();
-        foreach ($step->flags as $assign) {
-            $bag->set($assign->name, $assign->value);
-            string $shown = $assign->value->label();
-            $this->dumps->note("flag {$assign->name} = {$shown}");
-        }
-
-        CameraSpec $spec = $step->camera;
-        match ($spec) {
-            CameraSpec::none => {
-            },
-            CameraSpec::clear => {
-                $this->camera = null;
-                $this->dumps->note('camera released');
-            },
-            CameraSpec::pose($position, $orientation, $fov) => {
-                $this->pinCamera($position, $orientation, $fov);
-            },
-        }
-
-        if ($step->click) {
-            $this->press($step);
-        }
-
-        foreach ($step->console as $line) {
-            DebugConsole $target = guard $console else {
-                $this->dumps->fail("console line '{$line}' dropped: no debug console");
-                continue;
-            }
-            $target->submit($line);
-            $this->dumps->note("console: {$line}");
-        }
-
-        if (!$step->log->empty()) {
-            info("dcapture: {$step->log}");
-            $this->dumps->note($step->log);
-        }
-
-        foreach ($step->dump as $pattern) {
-            $this->dumps->queue($pattern, $step->label);
-        }
-
-        if ($step->profile) {
-            $this->dumps->queueProfile($step->label);
-        }
-
-        if ($step->list) {
-            $this->dumps->queueList();
-        }
-
-        if ($step->stop) {
-            $this->dumps->queueStop();
-        }
-    }
-
-    private function pinCamera(Vec3 $position, Quat $orientation, float32 $fov) : void
-    {
-        $this->camera = CameraOverrideData($position, $orientation, $fov);
-        float32 $x = $position->x;
-        float32 $y = $position->y;
-        float32 $z = $position->z;
-        $this->dumps->note("camera at {$x:.2f} {$y:.2f} {$z:.2f}");
     }
 }

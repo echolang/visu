@@ -1,0 +1,186 @@
+/**
+ * Applies dcapture steps to the running app: flags, the camera pin, a click, console lines, and
+ * the dumps and profiles they queue. The Host owns one for the whole process, so a scripted run
+ * and a live debug client (`visu::debughttp`) share one camera pin and one click feed. Each
+ * caller names the `DumpQueue` its step reports into, so a live client never writes into the
+ * manifest of a script running beside it.
+ */
+
+namespace visu::dcapture;
+
+use visu::app::{Flags, flags, info};
+use visu::graphics::CameraOverrideData;
+use visu::math::{Quat, Vec3};
+use visu::os::{HostEvent, Window};
+use visu::os::input::{InputHub, KeyPhase, MouseButton};
+use visu::runtime::DebugConsole;
+
+// clicks waiting their turn; room is reserved once, a click past it is dropped with a note
+internal const usize CLICK_QUEUE = 8;
+
+public class StepRunner
+{
+    private CameraOverrideData? $camera;
+    private int32 $frame;
+    private int32 $tick;
+
+    /**
+     * Frame the held click was pressed on, or -1. Released on a later frame; the next queued
+     * click is pressed only once it is up, so every click gets both edges.
+     */
+    private int32 $clickFrame;
+    private array<float64> $clickXs;
+    private array<float64> $clickYs;
+    private DumpQueue? $clickNotes;
+
+    public constructor()
+    {
+        $this->camera = null;
+        $this->frame = 0;
+        $this->tick = 0;
+        $this->clickFrame = -1;
+        $this->clickXs = array<float64>();
+        $this->clickYs = array<float64>();
+        $this->clickXs->reserve(CLICK_QUEUE);
+        $this->clickYs->reserve(CLICK_QUEUE);
+        $this->clickNotes = null;
+    }
+
+    /**
+     * Frame and tick the next applied step is noted at. The Host sets it before any step fires.
+     */
+    public function at(int32 $frame, int32 $tick) : void
+    {
+        $this->frame = $frame;
+        $this->tick = $tick;
+    }
+
+    public const function frame() : int32
+    {
+        return $this->frame;
+    }
+
+    public const function tick() : int32
+    {
+        return $this->tick;
+    }
+
+    public const function cameraOverride() : CameraOverrideData?
+    {
+        return $this->camera;
+    }
+
+    /**
+     * Apply every action of `$step` now. Its timing is the caller's business. Notes, dumps and
+     * profiles go to `$dumps`.
+     */
+    public function apply(Step $step, DebugConsole? $console, DumpQueue $dumps) : void
+    {
+        string $when = $step->describe();
+        $dumps->note("frame {$this->frame} tick {$this->tick}: {$when}");
+        Flags $bag = flags();
+        foreach ($step->flags as $assign) {
+            $bag->set($assign->name, $assign->value);
+            string $shown = $assign->value->label();
+            $dumps->note("flag {$assign->name} = {$shown}");
+        }
+
+        CameraSpec $spec = $step->camera;
+        match ($spec) {
+            CameraSpec::none => {
+            },
+            CameraSpec::clear => {
+                $this->camera = null;
+                $dumps->note('camera released');
+            },
+            CameraSpec::pose($position, $orientation, $fov) => {
+                $this->pinCamera($position, $orientation, $fov, $dumps);
+            },
+        }
+
+        if ($step->click) {
+            if ($this->clickXs->count() >= CLICK_QUEUE) {
+                $dumps->fail("click at {$step->clickX:.0f} {$step->clickY:.0f} dropped: {$this->clickXs->count()} clicks already waiting");
+            } else {
+                $this->clickXs[] = $step->clickX;
+                $this->clickYs[] = $step->clickY;
+                $this->clickNotes = $dumps;
+            }
+        }
+
+        foreach ($step->console as $line) {
+            DebugConsole $target = guard $console else {
+                $dumps->fail("console line '{$line}' dropped: no debug console");
+                continue;
+            }
+            $target->submit($line);
+            $dumps->note("console: {$line}");
+        }
+
+        if (!$step->log->empty()) {
+            info("dcapture: {$step->log}");
+            $dumps->note($step->log);
+        }
+
+        foreach ($step->dump as $pattern) {
+            $dumps->queue($pattern, $step->label);
+        }
+
+        if ($step->profile) {
+            $dumps->queueProfile($step->label);
+        }
+
+        if ($step->list) {
+            $dumps->queueList();
+        }
+
+        if ($step->stop) {
+            $dumps->queueStop();
+        }
+    }
+
+    /**
+     * Feed queued clicks into `$input` as the window would: the release of the held click once
+     * its press frame is over, then the cursor move and press of the next queued click while no
+     * click is held. The Host calls it next to the step advance, before the frame's systems read
+     * input.
+     */
+    public function feed(InputHub $input, Window $window) : void
+    {
+        if ($this->clickFrame >= 0 && $this->frame > $this->clickFrame) {
+            $input->handle($window, HostEvent::button(MouseButton::left, KeyPhase::release, 0));
+            $this->clickFrame = -1;
+            $this->noteClick('click released');
+            // the next click presses on a later frame, so this frame reads only the release
+            return;
+        }
+
+        if ($this->clickFrame >= 0 || $this->clickXs->empty()) {
+            return;
+        }
+
+        float64 $x = $this->clickXs->remove(0);
+        float64 $y = $this->clickYs->remove(0);
+        $input->handle($window, HostEvent::cursor($x, $y));
+        $input->handle($window, HostEvent::button(MouseButton::left, KeyPhase::press, 0));
+        $this->clickFrame = $this->frame;
+        $this->noteClick("click pressed at {$x:.0f} {$y:.0f}");
+    }
+
+    private function noteClick(string $text) : void
+    {
+        DumpQueue $dumps = guard $this->clickNotes else {
+            return;
+        }
+        $dumps->note($text);
+    }
+
+    private function pinCamera(Vec3 $position, Quat $orientation, float32 $fov, DumpQueue $dumps) : void
+    {
+        $this->camera = CameraOverrideData($position, $orientation, $fov);
+        float32 $x = $position->x;
+        float32 $y = $position->y;
+        float32 $z = $position->z;
+        $dumps->note("camera at {$x:.2f} {$y:.2f} {$z:.2f}");
+    }
+}

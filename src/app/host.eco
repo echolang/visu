@@ -26,7 +26,10 @@ use visu::graphics::{
     TextureOptions, TextureRef
 };
 use visu::console::{DCaptureConsole, FlagConsole, GpuConsole, OverlayConsole, ProfileConsole};
-use visu::dcapture::{DCapture, DumpQueue};
+use visu::dcapture::{DCapture, DumpQueue, StepRunner};
+#[if: os != windows && os != ios && !VISU_RELEASE]
+use visu::debughttp::{DebugContext, DebugServer};
+#[end]
 use visu::instrument::{DrawSource, Instruments, Overlay, ResourceSource, Sample};
 use visu::math::Vec2;
 use visu::os::{Window, WindowHints};
@@ -60,8 +63,16 @@ public class Host
     public int32 $tickIndex;
     public HostError $fail;
     public DumpQueue $dumps;
+
+    /**
+     * Applies dcapture steps, scripted or live: the one camera pin and click feed of the process.
+     */
+    public StepRunner $steps;
     public float32 $uiScale;
     private DCapture? $script;
+    #[if: os != windows && os != ios && !VISU_RELEASE]
+    private DebugServer? $debugHttp;
+    #[end]
     private FullscreenTextureRenderer $blit;
     private Overlay? $overlay;
 
@@ -74,10 +85,15 @@ public class Host
             $dcapture->configure($config);
         }
 
+        applyDebugHttpFlags($config);
         $services->once(function(Services $s) : DumpQueue {
             return DumpQueue('var/dcapture');
         });
         $this->dumps = $services->get<DumpQueue>();
+        $this->steps = StepRunner();
+        #[if: os != windows && os != ios && !VISU_RELEASE]
+        $this->debugHttp = null;
+        #[end]
         $this->tickIndex = 0;
         $this->config = $config;
         $this->uiScale = $config->uiScale;
@@ -127,6 +143,7 @@ public class Host
         $this->bootOverlay();
         $this->bootUi();
         $this->bootConsole();
+        $this->bootDebugHttp();
         if ($this->config->deferAssets) {
             if ($this->fail->failed()) {
                 return .error($this->fail);
@@ -284,6 +301,16 @@ public class Host
 
     public function destroy() : void
     {
+        #[if: os != windows && os != ios && !VISU_RELEASE]
+        // every request in flight answers 503 before anything it could touch goes away
+        DebugServer? $maybeHttp = $this->debugHttp;
+        if ($maybeHttp != null) {
+            DebugServer $http = guard $maybeHttp;
+            $http->stop();
+            $this->debugHttp = null;
+        }
+        #[end]
+
         $this->device->waitIdle();
         // frames still waiting for GPU spans complete without them so a dcapture profile step is never lost
         Profiler $prof = profiler();
@@ -445,6 +472,13 @@ public class Host
         $this->inputContext->endFrame();
         $this->frameIndex = $this->frameIndex + 1;
         $this->dumps->afterPresent($frame, $this->pool, $this->window, $this->frameIndex - 1, $this->tickIndex);
+        #[if: os != windows && os != ios && !VISU_RELEASE]
+        DebugServer? $maybeHttp = $this->debugHttp;
+        if ($maybeHttp != null) {
+            DebugServer $http = guard $maybeHttp;
+            $http->afterPresent($frame, $this->pool, $this->window, $this->frameIndex - 1, $this->tickIndex);
+        }
+        #[end]
         return true;
     }
 
@@ -461,25 +495,78 @@ public class Host
             FrameProfile $f = guard $done;
             $this->instruments->noteProfile($f, $prof->stats);
             $this->dumps->noteProfile($f, $prof->stats);
+            #[if: os != windows && os != ios && !VISU_RELEASE]
+            DebugServer? $maybeHttp = $this->debugHttp;
+            if ($maybeHttp != null) {
+                DebugServer $http = guard $maybeHttp;
+                $http->noteProfile($f, $prof->stats);
+            }
+            #[end]
             $done = $prof->complete();
         }
     }
 
+    /**
+     * Fire the script's due steps, answer the live debug requests, then feed a pending click.
+     */
     private function advanceDCapture() : void
     {
-        DCapture $dcapture = guard $this->script else {
+        $this->steps->at($this->frameIndex, $this->tickIndex);
+        DCapture? $maybeScript = $this->script;
+        if ($maybeScript != null) {
+            DCapture $dcapture = guard $maybeScript;
+            $dcapture->advance($this->frameIndex, $this->tickIndex, $this->console, $this->steps);
+        }
+
+        $this->drainDebugHttp();
+        $this->steps->feed($this->input, $this->window);
+    }
+
+    private function drainDebugHttp() : void
+    {
+        #[if: os != windows && os != ios && !VISU_RELEASE]
+        DebugServer $http = guard $this->debugHttp else {
             return;
         }
-        $dcapture->advance($this->frameIndex, $this->tickIndex, $this->console);
-        $dcapture->feed($this->input, $this->window);
+        if ($http->parked()) {
+            $http->expire();
+        }
+
+        if (!$http->pending()) {
+            return;
+        }
+
+        visu::profile::begin('debughttp');
+        DebugContext $ctx = DebugContext($this->console, $this->steps, $this->frameIndex, $this->tickIndex);
+        $ctx->width = $this->window->framebufferWidth();
+        $ctx->height = $this->window->framebufferHeight();
+        $ctx->windowWidth = $this->config->width;
+        $ctx->windowHeight = $this->config->height;
+        $ctx->scripted = $this->script != null;
+        $http->drain($ctx);
+        visu::profile::end();
+        #[end]
+    }
+
+    private function bootDebugHttp() : void
+    {
+        #[if: os != windows && os != ios && !VISU_RELEASE]
+        if ($this->config->debugHttpPort <= 0) {
+            return;
+        }
+
+        DebugServer $http = DebugServer($this->config->debugHttpHost, $this->config->debugHttpPort, $this->dumps);
+        guard $http->start() else ($e) {
+            info($e->message());
+            return;
+        }
+        $this->debugHttp = $http;
+        #[end]
     }
 
     private function publishCameraOverride(Frame $frame) : void
     {
-        DCapture $dcapture = guard $this->script else {
-            return;
-        }
-        CameraOverrideData $override = guard $dcapture->cameraOverride() else {
+        CameraOverrideData $override = guard $this->steps->cameraOverride() else {
             return;
         }
         $frame->set($override);
@@ -674,6 +761,26 @@ public class Host
         }
         return .ok;
     }
+}
+
+/**
+ * `--flag debug.http=<port>` and `debug.http.host` onto the config. A port turns the console on,
+ * since most of what a debug client does is a console line.
+ */
+internal function applyDebugHttpFlags(HostConfig $config) : void
+{
+    #[if: os != windows && os != ios && !VISU_RELEASE]
+    Flags $bag = flags();
+    int64 $port = $bag->int('debug.http', $config->debugHttpPort as int64);
+    if ($port > 0 && $port < 65536) {
+        $config->debugHttpPort = $port as int32;
+    }
+
+    $config->debugHttpHost = $bag->str('debug.http.host', $config->debugHttpHost);
+    if ($config->debugHttpPort > 0) {
+        $config->debugConsole = true;
+    }
+    #[end]
 }
 
 internal function loadConsoleOverlay(DebugConsole $console, Device $device) : void

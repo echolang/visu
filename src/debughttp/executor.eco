@@ -1,0 +1,360 @@
+/**
+ * Answers debug requests on the main thread. The Host drains the mailbox once a poll: console,
+ * flag and step requests are answered at once; snapshots, the dump catalog and profiles wait on
+ * the server's own `DumpQueue` (as its `DumpSink`), and `wait` answers once enough frames were
+ * presented. Nothing here runs while no request is in flight.
+ */
+
+namespace visu::debughttp;
+
+use visu::app::{Flags, FlagValue, flags};
+use visu::dcapture::{DumpQueue, DumpRecord, DumpSink, StepRunner};
+use std::time;
+use visu::runtime::{DebugConsole, clockPinned};
+
+internal const int64 DEBUG_HTTP_DEADLINE_SECONDS = 120;
+
+public class DebugExecutor : DumpSink
+{
+    private DumpQueue $dumps;
+
+    /**
+     * Jobs answered after a present: snapshots, the catalog, profiles and waits. Keyed by
+     * `DebugJob.id`, which is also their dump ticket.
+     */
+    private array<DebugJob> $waiting;
+    private array<bool> $wantsJson;
+    private int32 $frame;
+
+    public constructor(DumpQueue $dumps)
+    {
+        $this->dumps = $dumps;
+        $this->waiting = array<DebugJob>();
+        $this->wantsJson = array<bool>();
+        $this->frame = 0;
+    }
+
+    /**
+     * Answer `$job` now or park it until its dump, profile or frame count lands.
+     */
+    public function run(DebugJob $job, DebugContext $ctx) : void
+    {
+        $this->frame = $ctx->frame;
+        $job->startFrame = $ctx->frame;
+        DebugRequest $request = $job->request;
+        match ($request) {
+            DebugRequest::status => {
+                $job->answer($this->status($ctx));
+            },
+            DebugRequest::console($commands) => {
+                $job->answer($this->console($commands, $ctx->console));
+            },
+            DebugRequest::verbs => {
+                $job->answer($this->verbs($ctx->console));
+            },
+            DebugRequest::flags => {
+                $job->answer($this->flagList());
+            },
+            DebugRequest::setFlag($name, $raw) => {
+                Flags $bag = flags();
+                $bag->parse($name, $raw);
+                json::Value $o = json::object();
+                $o['name'] = $name;
+                FlagValue $now = guard $bag->get($name) else {
+                    $job->answer(DebugReply(500, error: "flag {$name} did not stick"));
+                    return;
+                }
+                $o['value'] = flagJson($now);
+                $job->answer(DebugReply(json: json::dump($o)));
+            },
+            DebugRequest::step($step) => {
+                $ctx->steps->apply($step, $ctx->console, $this->dumps);
+                json::Value $o = json::object();
+                $o['applied'] = true;
+                $o['frame'] = $ctx->frame;
+                $o['out'] = json::str($this->dumps->out);
+                $job->answer(DebugReply(json: json::dump($o)));
+            },
+            DebugRequest::snapshot($pattern, $json) => {
+                $this->park($job, $json);
+                // the ticket in the file name: two snapshots of one name in one frame never share a file
+                $this->dumps->queue($pattern, "http{$job->id}", $job->id);
+            },
+            DebugRequest::dumps => {
+                $this->park($job, true);
+                $this->dumps->queueList($job->id);
+            },
+            DebugRequest::profile => {
+                $this->park($job, true);
+                $this->dumps->queueProfile("http{$job->id}", $job->id);
+            },
+            DebugRequest::wait($frames) => {
+                if ($frames <= 0) {
+                    $job->answer($this->frameReply($ctx->frame));
+                    return;
+                }
+
+                $this->park($job, true);
+            },
+        }
+    }
+
+    /**
+     * Answer every `wait` whose frame count has been presented. Cheap when nothing waits.
+     */
+    public function tick(int32 $frame) : void
+    {
+        $this->frame = $frame;
+        if ($this->waiting->empty()) {
+            return;
+        }
+
+        usize $i = 0;
+        while ($i < $this->waiting->count()) {
+            DebugJob $job = $this->waiting[$i];
+            bool $done = false;
+            match ($job->request) {
+                DebugRequest::wait($frames) => {
+                    $done = $frame - $job->startFrame >= $frames;
+                },
+                else => {
+                },
+            }
+
+            if ($done) {
+                $this->unpark($i);
+                $job->answer($this->frameReply($frame));
+                continue;
+            }
+
+            $i = $i + 1;
+        }
+    }
+
+    /**
+     * True while a job waits on a present, a profile or a frame count.
+     */
+    public const function parked() : bool
+    {
+        return !$this->waiting->empty();
+    }
+
+    /**
+     * Answer 504 to every parked job past the deadline. From every poll while one is parked, so
+     * it runs even when no frame is presented.
+     */
+    public function expire() : void
+    {
+        time::duration $limit = time::duration::secs(DEBUG_HTTP_DEADLINE_SECONDS);
+        usize $i = 0;
+        while ($i < $this->waiting->count()) {
+            DebugJob $job = $this->waiting[$i];
+            if ($job->parkedAt->elapsed() < $limit) {
+                $i = $i + 1;
+                continue;
+            }
+
+            $this->unpark($i);
+            $job->answer(DebugReply(504, error: 'no frame was presented in time (window minimized, or the frame never completed)'));
+        }
+    }
+
+    /**
+     * Answer every parked job with a 503. Main side, before the server stops.
+     */
+    public function close() : void
+    {
+        array<DebugJob> $left = $this->waiting;
+        $this->waiting = array<DebugJob>();
+        $this->wantsJson = array<bool>();
+        foreach ($left as $job) {
+            $job->answer(DebugReply(503, error: 'the app is shutting down'));
+        }
+    }
+
+    public function dumped(
+        int32 $ticket,
+        usize $matched,
+        const array<DumpRecord>& $records,
+        const array<string>& $errors
+    ) : void
+    {
+        usize $at = guard $this->find($ticket) else {
+            return;
+        }
+        DebugJob $job = $this->waiting[$at];
+        bool $json = $this->wantsJson[$at];
+        $this->unpark($at);
+        if ($records->empty()) {
+            string $why = 'nothing was dumped';
+            if (!$errors->empty()) {
+                $why = $errors[0];
+            }
+
+            // an unknown name is the client's mistake; a matched name that failed to write is ours
+            int32 $status = 500;
+            if ($matched == 0) {
+                $status = 404;
+            }
+
+            $job->answer(DebugReply($status, error: $why));
+            return;
+        }
+
+        if ($records->count() == 1 && $errors->empty() && !$json) {
+            $job->answer(DebugReply(file: $records[0]->path));
+            return;
+        }
+
+        json::Value $files = json::arr();
+        foreach ($records as $record) {
+            json::Value $row = json::object();
+            $row['name'] = json::str($record->name);
+            $row['path'] = json::str($record->path);
+            $row['frame'] = json::int($record->frame as int64);
+            $files[] = $row;
+        }
+
+        json::Value $o = json::object();
+        $o['files'] = $files;
+        $o['errors'] = stringsJson($errors);
+        $job->answer(DebugReply(json: json::dump($o)));
+    }
+
+    public function profiled(int32 $ticket, const string& $path) : void
+    {
+        usize $at = guard $this->find($ticket) else {
+            return;
+        }
+        DebugJob $job = $this->waiting[$at];
+        $this->unpark($at);
+        if ($path->empty()) {
+            $job->answer(DebugReply(500, error: 'the profile frame never completed'));
+            return;
+        }
+
+        DebugReply $reply = DebugReply(file: $path);
+        $reply->type = 'application/json';
+        $job->answer($reply);
+    }
+
+    public function listed(int32 $ticket, const array<string>& $names) : void
+    {
+        usize $at = guard $this->find($ticket) else {
+            return;
+        }
+        DebugJob $job = $this->waiting[$at];
+        $this->unpark($at);
+        json::Value $o = json::object();
+        $o['names'] = stringsJson($names);
+        $job->answer(DebugReply(json: json::dump($o)));
+    }
+
+    private function park(DebugJob $job, bool $json) : void
+    {
+        $job->parkedAt = time::instant::now();
+        $this->waiting[] = $job;
+        $this->wantsJson[] = $json;
+    }
+
+    private function unpark(usize $at) : void
+    {
+        $this->waiting->remove($at);
+        $this->wantsJson->remove($at);
+    }
+
+    private function find(int32 $ticket) : usize?
+    {
+        usize $i = 0;
+        while ($i < $this->waiting->count()) {
+            if ($this->waiting[$i]->id == $ticket) {
+                return $i;
+            }
+
+            $i = $i + 1;
+        }
+
+        return null;
+    }
+
+    private function frameReply(int32 $frame) : DebugReply
+    {
+        json::Value $o = json::object();
+        $o['frame'] = $frame;
+        return DebugReply(json: json::dump($o));
+    }
+
+    private function status(DebugContext $ctx) : DebugReply
+    {
+        json::Value $o = json::object();
+        $o['frame'] = $ctx->frame;
+        $o['tick'] = $ctx->tick;
+        json::Value $size = json::arr();
+        $size[] = $ctx->width;
+        $size[] = $ctx->height;
+        $o['framebuffer'] = $size;
+        json::Value $window = json::arr();
+        $window[] = $ctx->windowWidth;
+        $window[] = $ctx->windowHeight;
+        $o['window'] = $window;
+        $o['fixedStep'] = clockPinned();
+        $o['script'] = $ctx->scripted;
+        $o['console'] = $ctx->console != null;
+        $o['cameraPinned'] = $ctx->steps->cameraOverride() != null;
+        $o['out'] = json::str($this->dumps->out);
+        return DebugReply(json: json::dump($o));
+    }
+
+    private function console(const array<string>& $commands, DebugConsole? $maybe) : DebugReply
+    {
+        DebugConsole $console = guard $maybe else {
+            return DebugReply(409, error: 'no debug console in this app');
+        }
+        json::Value $results = json::arr();
+        foreach ($commands as $command) {
+            array<string> $lines = $console->run($command);
+            json::Value $row = json::object();
+            $row['command'] = $command;
+            $row['lines'] = stringsJson($lines);
+            $results[] = $row;
+        }
+
+        json::Value $o = json::object();
+        $o['results'] = $results;
+        return DebugReply(json: json::dump($o));
+    }
+
+    private function verbs(DebugConsole? $maybe) : DebugReply
+    {
+        DebugConsole $console = guard $maybe else {
+            return DebugReply(409, error: 'no debug console in this app');
+        }
+        json::Value $list = json::arr();
+        foreach ($console->registry->names() as $name) {
+            json::Value $row = json::object();
+            $row['name'] = $name;
+            $row['usage'] = $console->registry->usage($name);
+            $list[] = $row;
+        }
+
+        json::Value $o = json::object();
+        $o['verbs'] = $list;
+        return DebugReply(json: json::dump($o));
+    }
+
+    private function flagList() : DebugReply
+    {
+        Flags $bag = flags();
+        json::Value $values = json::object();
+        foreach ($bag->names() as $name) {
+            FlagValue $value = guard $bag->get($name) else {
+                continue;
+            }
+            $values[$name] = flagJson($value);
+        }
+
+        json::Value $o = json::object();
+        $o['flags'] = $values;
+        return DebugReply(json: json::dump($o));
+    }
+}

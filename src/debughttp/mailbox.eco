@@ -1,0 +1,110 @@
+/**
+ * The hand-off between the server workers and the main thread. A worker posts a request and
+ * sleeps until the main thread answers it; the main thread takes jobs once a poll. `pending` is
+ * an atomic, so an idle poll costs one load and never takes the lock.
+ */
+
+namespace visu::debughttp;
+
+use std::thread;
+
+internal struct MailboxState
+{
+    public bool $closed;
+    public int32 $next;
+    public array<DebugJob> $jobs;
+}
+
+#[atomic]
+public class DebugMailbox
+{
+    private thread::mutex<MailboxState> $state;
+    private atomic<int32> $pending;
+
+    public constructor()
+    {
+        MailboxState $empty = MailboxState(false, 1, array<DebugJob>());
+        $this->state = thread::mutex<MailboxState>($empty);
+        $this->pending = atomic<int32>(0);
+    }
+
+    /**
+     * Worker side: queue `$request` and sleep until the main thread answers. 503 once the
+     * mailbox closed, or when the job was dropped unanswered.
+     */
+    public function post(DebugRequest $request) : DebugReply
+    {
+        thread::channel<DebugReply> $ch = thread::channel<DebugReply>(1);
+        thread::receiver<DebugReply> $rx = $ch->rx();
+        if (!$this->push($request, $ch->tx())) {
+            return DebugReply(503, error: 'the app is shutting down');
+        }
+
+        DebugReply $answer = guard $rx->recv() else {
+            return DebugReply(503, error: 'the app dropped the request');
+        }
+        return $answer;
+    }
+
+    /**
+     * True while a job is queued. One atomic load.
+     */
+    public const function waiting() : bool
+    {
+        return $this->pending->load() > 0;
+    }
+
+    /**
+     * Main side: the oldest queued job, or null. No lock while nothing is queued.
+     */
+    public function take() : DebugJob?
+    {
+        if ($this->pending->load() <= 0) {
+            return null;
+        }
+
+        thread::locked<MailboxState> $held = $this->state->lock();
+        if ($held->value->jobs->empty()) {
+            return null;
+        }
+
+        DebugJob $job = $held->value->jobs->remove(0);
+        $this->pending->store($held->value->jobs->count() as int32);
+        return $job;
+    }
+
+    /**
+     * Refuse every later post and drop what is queued, which wakes each waiting worker with
+     * a 503. Main side, before the server stops.
+     */
+    public function close() : void
+    {
+        array<DebugJob> $dropped = array<DebugJob>();
+        {
+            thread::locked<MailboxState> $held = $this->state->lock();
+            $held->value->closed = true;
+            $dropped = $held->value->jobs;
+            $held->value->jobs = array<DebugJob>();
+            $this->pending->store(0);
+        }
+
+        foreach ($dropped as $job) {
+            $job->answer(DebugReply(503, error: 'the app is shutting down'));
+        }
+    }
+
+    private function push(DebugRequest $request, thread::sender<DebugReply> $reply) : bool
+    {
+        thread::locked<MailboxState> $held = $this->state->lock();
+        if ($held->value->closed) {
+            return false;
+        }
+
+        int32 $id = $held->value->next;
+        $held->value->next = $id + 1;
+        DebugJob $job = DebugJob($id, $request, $reply);
+        $held->value->jobs[] = $job;
+        $this->pending->store($held->value->jobs->count() as int32);
+        return true;
+    }
+}

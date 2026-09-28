@@ -1,0 +1,50 @@
+/**
+ * One request in flight: what was asked and where the answer goes. The worker that posted it
+ * sleeps on the other end of `reply`; dropping the job unanswered closes that end and the worker
+ * answers 503, so no path leaves a worker waiting.
+ */
+
+namespace visu::debughttp;
+
+use std::thread;
+use std::time;
+
+#[atomic]
+public class DebugJob
+{
+    public const int32 $id;
+    public const DebugRequest $request;
+
+    /**
+     * Presented frame the job was taken on. `wait` counts from here.
+     */
+    public int32 $startFrame;
+
+    /**
+     * When the executor parked it. A parked job past `DEBUG_HTTP_DEADLINE_SECONDS` is answered 504,
+     * so a minimized window or a frame that never completes cannot hold a worker forever.
+     */
+    public time::instant $parkedAt;
+    private thread::sender<DebugReply>? $reply;
+
+    public constructor(int32 $id, DebugRequest $request, thread::sender<DebugReply> $reply)
+    {
+        $this->id = $id;
+        $this->request = $request;
+        $this->startFrame = 0;
+        $this->parkedAt = time::instant::now();
+        $this->reply = $reply;
+    }
+
+    /**
+     * Hand `$answer` to the waiting worker. Only the first answer counts.
+     */
+    public function answer(DebugReply $answer) : void
+    {
+        thread::sender<DebugReply> $tx = guard $this->reply else {
+            return;
+        }
+        $this->reply = null;
+        $tx->send($answer);
+    }
+}

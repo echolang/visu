@@ -1,0 +1,305 @@
+/**
+ * The debug HTTP surface: request text to a `DebugRequest`, and a `DebugReply` back to an HTTP
+ * response. The parsers are pure so tests drive them without a socket. Handlers run on server
+ * workers and touch nothing but the mailbox.
+ */
+
+namespace visu::debughttp;
+
+use http::{Next, Request, Response, Server};
+use visu::dcapture::{CameraSpec, FlagAssign, Step, StepAt, parseCamera, parseLiveStep};
+
+internal const ROUTE_INDEX = 'visu debug http. GET /status, POST /console, GET /console/verbs, GET /flags, PUT /flags/{name}, POST /step, POST /camera, DELETE /camera, POST /click, GET /wait?frames=N, GET /dumps, GET /snapshot?name=<glob>[&format=json], GET /profile, POST /quit';
+
+/**
+ * Console lines from a body: `{"commands": [..]}`, `{"command": ".."}`, or plain text with one
+ * command a line. Blank lines are skipped.
+ */
+internal function parseConsoleBody(const string& $body) : result<array<string>, string>
+{
+    string $text = str::trim($body);
+    if ($text->empty()) {
+        return .error('empty body: send {"commands": [..]} or one command a line');
+    }
+
+    array<string> $out = array<string>();
+    if (!$text->starts('{')) {
+        array<string> $lines = str::split($text, "\n")->owned();
+        foreach ($lines as $line) {
+            string $one = str::trim($line);
+            if (!$one->empty()) {
+                $out[] = $one;
+            }
+        }
+
+        return .ok($out);
+    }
+
+    json::Value $v = guard json::parse($text) else ($e) {
+        return .error("bad json: {$e->message()}");
+    }
+    json::Value? $single = $v->get('command');
+    if ($single != null) {
+        json::Value $sv = guard $single;
+        string $line = guard $sv->asStr() else {
+            return .error('command must be a string');
+        }
+        $out[] = $line;
+        return .ok($out);
+    }
+
+    json::Value $list = guard $v->get('commands') else {
+        return .error('expected "commands": [..] or "command": ".."');
+    }
+    array<json::Value> $items = guard $list->asArray() else {
+        return .error('commands must be an array of strings');
+    }
+    foreach ($items as $item) {
+        string $line = guard $item->asStr() else {
+            return .error('commands must be an array of strings');
+        }
+        $out[] = $line;
+    }
+
+    if ($out->empty()) {
+        return .error('no commands');
+    }
+
+    return .ok($out);
+}
+
+internal function parseStepBody(const string& $body) : result<Step, string>
+{
+    json::Value $v = guard json::parse($body) else ($e) {
+        return .error("bad json: {$e->message()}");
+    }
+    Step $step = guard parseLiveStep($v) else ($e) {
+        return .error($e->message());
+    }
+    return .ok($step);
+}
+
+/**
+ * A dcapture camera object (`position` with `lookAt`, `euler` or `orientation`, and `fov`) as a
+ * step that pins it.
+ */
+internal function parseCameraBody(const string& $body) : result<Step, string>
+{
+    json::Value $v = guard json::parse($body) else ($e) {
+        return .error("bad json: {$e->message()}");
+    }
+    CameraSpec $camera = guard parseCamera($v, 'camera') else ($e) {
+        return .error($e->message());
+    }
+    return .ok(liveStep($camera, false, 0.0, 0.0));
+}
+
+/**
+ * `{"x": .., "y": ..}` or `[x, y]` in window points as a step that clicks there.
+ */
+internal function parseClickBody(const string& $body) : result<Step, string>
+{
+    json::Value $v = guard json::parse($body) else ($e) {
+        return .error("bad json: {$e->message()}");
+    }
+    string $shape = 'expected {"x": .., "y": ..} or [x, y] in window points';
+    json::Value $xv = json::nil();
+    json::Value $yv = json::nil();
+    if ($v->isArray()) {
+        if ($v->count() != 2) {
+            return .error($shape);
+        }
+
+        $xv = $v[0];
+        $yv = $v[1];
+    } else {
+        $xv = $v['x'];
+        $yv = $v['y'];
+    }
+
+    float64 $x = guard $xv->asFloat() else {
+        return .error($shape);
+    }
+    float64 $y = guard $yv->asFloat() else {
+        return .error($shape);
+    }
+    return .ok(liveStep(.none, true, $x, $y));
+}
+
+internal function liveStep(CameraSpec $camera, bool $click, float64 $x, float64 $y, bool $stop = false) : Step
+{
+    return Step(
+        0,
+        StepAt::after(0),
+        '',
+        array<FlagAssign>(),
+        $camera,
+        array<string>(),
+        array<string>(),
+        false,
+        false,
+        '',
+        $stop,
+        $click,
+        $x,
+        $y,
+    );
+}
+
+internal function parseFrames(const Request& $req) : result<int32, string>
+{
+    string $raw = $req->query->get('frames') ?? '1';
+    int64 $n = guard str::int($raw) else {
+        return .error('frames must be a whole number');
+    }
+    if ($n < 0 || $n > 3600) {
+        return .error('frames must be 0 to 3600');
+    }
+
+    return .ok($n as int32);
+}
+
+internal function toResponse(DebugReply $reply) : Response
+{
+    if (!$reply->file->empty()) {
+        Response $file = Response(file: $reply->file);
+        if (!$reply->type->empty()) {
+            $file->header('Content-Type', $reply->type);
+        }
+
+        $file->header('X-Visu-File', $reply->file);
+        return $file;
+    }
+
+    Response $res = Response($reply->status, $reply->body);
+    $res->header('Content-Type', $reply->type);
+    return $res;
+}
+
+internal function badRequest(const string& $why) : Response
+{
+    return toResponse(DebugReply(400, error: $why));
+}
+
+internal function ask(DebugMailbox $mail, DebugRequest $request) : Response
+{
+    return toResponse($mail->post($request));
+}
+
+/**
+ * True when a Host header names the loopback or the bound address, so a page that rebound its
+ * own domain name to 127.0.0.1 is refused.
+ */
+internal function localHost(const string& $header, const string& $bound) : bool
+{
+    string $name = $header;
+    if ($name->starts('[')) {
+        usize $close = $name->find(']');
+        if ($close < $name->size()) {
+            $name = $name->sub(0, $close + 1);
+        }
+    } else {
+        usize $colon = $name->find(':');
+        if ($colon < $name->size()) {
+            $name = $name->sub(0, $colon);
+        }
+    }
+
+    return $name == '127.0.0.1' || $name == 'localhost' || $name == '[::1]' || $name == $bound;
+}
+
+/**
+ * Refuse anything a browser sent. A page cannot drop the Origin header on a cross-site request
+ * and cannot forge a loopback Host after a DNS rebind, so the console stays out of reach of the
+ * web while curl and agents, which send neither, go through.
+ */
+internal function addDebugGuard(Server $srv, string $bound) : void
+{
+    $srv->wrap(function(Request $req, Next $next) : Response {
+        if ($req->header('Origin') != null) {
+            return toResponse(DebugReply(403, error: 'browser requests are refused'));
+        }
+
+        string $host = $req->header('Host') ?? '';
+        if (!$host->empty() && !localHost($host, $bound)) {
+            return toResponse(DebugReply(403, error: 'the Host header is not a loopback address'));
+        }
+
+        return $next->run($req);
+    });
+}
+
+/**
+ * Every route onto `$srv`. Each handler parses on its worker and posts to `$mail`.
+ */
+internal function addDebugRoutes(Server $srv, DebugMailbox $mail) : void
+{
+    $srv->get('/', function(Request $req) : Response {
+        return Response(text: ROUTE_INDEX);
+    });
+    $srv->get('/status', function(Request $req) : Response {
+        return ask($mail, .status);
+    });
+    $srv->post('/console', function(Request $req) : Response {
+        array<string> $commands = guard parseConsoleBody($req->body) else ($e) {
+            return badRequest($e);
+        }
+        return ask($mail, .console($commands));
+    });
+    $srv->get('/console/verbs', function(Request $req) : Response {
+        return ask($mail, .verbs);
+    });
+    $srv->get('/flags', function(Request $req) : Response {
+        return ask($mail, .flags);
+    });
+    $srv->put('/flags/{name}', function(Request $req) : Response {
+        string $name = $req->param('name') ?? '';
+        string $raw = str::trim($req->body);
+        if ($name->empty() || $raw->empty()) {
+            return badRequest('PUT /flags/<name> with the raw value as the body');
+        }
+
+        return ask($mail, .setFlag($name, $raw));
+    });
+    $srv->post('/step', function(Request $req) : Response {
+        Step $step = guard parseStepBody($req->body) else ($e) {
+            return badRequest($e);
+        }
+        return ask($mail, .step($step));
+    });
+    $srv->post('/camera', function(Request $req) : Response {
+        Step $step = guard parseCameraBody($req->body) else ($e) {
+            return badRequest($e);
+        }
+        return ask($mail, .step($step));
+    });
+    $srv->del('/camera', function(Request $req) : Response {
+        return ask($mail, .step(liveStep(.clear, false, 0.0, 0.0)));
+    });
+    $srv->post('/click', function(Request $req) : Response {
+        Step $step = guard parseClickBody($req->body) else ($e) {
+            return badRequest($e);
+        }
+        return ask($mail, .step($step));
+    });
+    $srv->get('/wait', function(Request $req) : Response {
+        int32 $frames = guard parseFrames($req) else ($e) {
+            return badRequest($e);
+        }
+        return ask($mail, .wait($frames));
+    });
+    $srv->get('/dumps', function(Request $req) : Response {
+        return ask($mail, .dumps);
+    });
+    $srv->get('/snapshot', function(Request $req) : Response {
+        string $name = $req->query->get('name') ?? 'scene';
+        string $format = $req->query->get('format') ?? '';
+        return ask($mail, .snapshot($name, $format == 'json'));
+    });
+    $srv->get('/profile', function(Request $req) : Response {
+        return ask($mail, .profile);
+    });
+    $srv->post('/quit', function(Request $req) : Response {
+        return ask($mail, .step(liveStep(.none, false, 0.0, 0.0, $stop: true)));
+    });
+}

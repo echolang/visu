@@ -40,6 +40,13 @@ public class DebugConsole
     private bool $loaded;
     private bool $dead;
 
+    /**
+     * Lines written while `run` dispatches (`capturing`). Errors carry a `! ` prefix so a caller
+     * reading plain text can still tell them apart.
+     */
+    private array<string> $capture;
+    private bool $capturing;
+
     public constructor(Dispatcher $dispatcher, InputHub $input)
     {
         $this->registry = ConsoleCommandRegistry();
@@ -59,6 +66,8 @@ public class DebugConsole
         $this->vg = null;
         $this->loaded = false;
         $this->dead = false;
+        $this->capture = array<string>();
+        $this->capturing = false;
         $this->keyId = $this->dispatcher->register<KeySignal>(function(const KeySignal& $signal) : Flow {
             return $this->handleKey($signal);
         }, -1000);
@@ -213,16 +222,47 @@ public class DebugConsole
         }
 
         $this->remember($raw);
-        $this->pushLog("> {$raw}", ConsoleLogKind::input);
         $this->line = '';
         $this->caret = 0;
         $this->draft = '';
         $this->commandIndex = $this->commands->count() as int32;
-        $this->logOffset = 0;
         $this->dropCompletions();
+        $this->execute($raw);
+    }
+
+    /**
+     * Echo `$raw` into the log and dispatch it. Leaves the typed line and the history alone.
+     */
+    private function execute(string $raw) : void
+    {
+        $this->pushLog("> {$raw}", ConsoleLogKind::input);
+        $this->logOffset = 0;
         ConsoleCommandSignal $cmd = ConsoleCommandSignal($raw);
         $this->dispatcher->dispatch($cmd);
         $this->route($cmd);
+    }
+
+    /**
+     * Run `$raw` and return the lines the command wrote, in order. It dispatches like `submit`
+     * but leaves the line being typed and the up-arrow history alone, so a remote client never
+     * disturbs a developer at the console. The capture does not read the log, so the history
+     * cap and `clear` never cut it short. The echoed input line is left out. A nested run inside
+     * a verb captures into its own buffer.
+     */
+    public function run(string $raw) : array<string>
+    {
+        array<string> $outer = $this->capture;
+        bool $wasCapturing = $this->capturing;
+        $this->capture = array<string>();
+        $this->capturing = true;
+        if (!$raw->empty()) {
+            $this->execute($raw);
+        }
+
+        array<string> $lines = $this->capture;
+        $this->capture = $outer;
+        $this->capturing = $wasCapturing;
+        return $lines;
     }
 
     internal function handleKey(const KeySignal& $signal) : Flow
@@ -605,6 +645,14 @@ public class DebugConsole
     {
         ConsoleLogLine $row = ConsoleLogLine($text, $kind);
         $this->log[] = $row;
+        if ($this->capturing && $kind != ConsoleLogKind::input) {
+            if ($kind == ConsoleLogKind::error) {
+                $this->capture[] = "! {$text}";
+            } else {
+                $this->capture[] = $text;
+            }
+        }
+
         if (($this->log->count() as int32) > (HISTORY_LIMIT as int32)) {
             $this->log->remove(0);
         }

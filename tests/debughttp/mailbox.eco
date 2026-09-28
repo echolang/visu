@@ -1,0 +1,59 @@
+/**
+ * The worker to main-thread hand-off: a posting thread sleeps until the main side answers,
+ * and closing the mailbox wakes it with a 503.
+ */
+
+use std::thread;
+use visu::debughttp::{DebugJob, DebugMailbox, DebugReply};
+
+test debughttp_mailbox_idle_takes_nothing
+{
+    DebugMailbox $mail = DebugMailbox();
+    assert(!$mail->waiting(), 'idle');
+    assert($mail->take() == null, 'nothing queued');
+}
+
+test debughttp_mailbox_post_answers_across_threads
+{
+    DebugMailbox $mail = DebugMailbox();
+    thread::task<int32> $client = guard thread::spawn(function() : int32 {
+        DebugReply $reply = $mail->post(.status);
+        return $reply->status;
+    }) else ($e) {
+        assert(false, "spawn failed");
+        return;
+    }
+    int32 $tries = 0;
+    DebugJob? $got = $mail->take();
+    while ($got == null && $tries < 2000) {
+        thread::sleep(1);
+        $got = $mail->take();
+        $tries = $tries + 1;
+    }
+    DebugJob $job = guard $got else {
+        assert(false, 'the post never arrived');
+        return;
+    }
+    assert(!$mail->waiting(), 'taken');
+    $job->answer(DebugReply(json: '{"ok":true}'));
+    assert($client->wait() == 200, 'the worker got the answer');
+}
+
+test debughttp_mailbox_dropped_job_is_503
+{
+    DebugMailbox $mail = DebugMailbox();
+    thread::task<int32> $client = guard thread::spawn(function() : int32 {
+        DebugReply $reply = $mail->post(.verbs);
+        return $reply->status;
+    }) else ($e) {
+        assert(false, "spawn failed");
+        return;
+    }
+    while (!$mail->waiting()) {
+        thread::sleep(1);
+    }
+    $mail->close();
+    assert($client->wait() == 503, 'a closed mailbox answers 503');
+    DebugReply $late = $mail->post(.status);
+    assert($late->status == 503, 'a post after close is refused');
+}

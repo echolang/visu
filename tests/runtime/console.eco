@@ -276,3 +276,37 @@ test console_unknown_guesses
     array<string> $h = $c->history();
     assert($h[$h->count() - 1] == 'unknown command: hepl. did you mean help?', 'guess');
 }
+
+test console_run_captures_command_output
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    array<string> $lines = $c->run('nosuchverb');
+    assert($lines->count() == 1, 'one line for an unknown verb');
+    assert($lines[0]->starts('! '), 'the unknown verb is an error line');
+    int32 $i = 0;
+    while ($i < 150) {
+        $c->writeLine('filler');
+        $i = $i + 1;
+    }
+    array<string> $cleared = $c->run('clear');
+    assert($cleared->count() == 1, 'clear still reports through the capture');
+    assert($cleared[0] == 'cleared', 'the clear line');
+    $c->writeLine('outside');
+    array<string> $empty = $c->run('');
+    assert($empty->empty(), 'an empty line writes nothing');
+}
+
+test console_run_leaves_typed_line_and_history
+{
+    Dispatcher $d = Dispatcher();
+    DebugConsole $c = consolePair($d);
+    consoleToggle($d);
+    $d->dispatch(CharSignal(116));
+    $d->dispatch(CharSignal(105));
+    assert($c->line() == 'ti', 'typed');
+    array<string> $lines = $c->run('help');
+    assert(!$lines->empty(), 'help wrote lines');
+    assert($c->line() == 'ti', 'the typed line survives a remote run');
+    assert($c->caret() == 2, 'the caret too');
+}
