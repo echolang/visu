@@ -13,6 +13,7 @@ use visu::profile::{FrameProfile, Profiler, profiler};
 
 use std::env;
 use std::io;
+use std::time;
 use visu::asset::{
     Assembly, AssetError, Assets, AudioClip, Blob, DirectoryStore, KIND_ASSEMBLY, KIND_BYTES,
     KIND_MODEL, KIND_SOUND, KIND_TEXTURE, KIND_VMAT, PackStore, Vmat, decodeAssembly, decodeBytes,
@@ -253,7 +254,7 @@ public class Host
         Pipeline $scenePipe = Pipeline($this->pool, $frame);
         RenderContext $ctx = RenderContext($this->device, $scenePipe, $frame, $this->pool, $compensation);
         TargetRef $sceneTarget = $this->sceneTarget($scenePipe);
-        $sceneTarget->depthStencil = true;
+        $sceneTarget->depthStencil = $this->config->sceneDepth;
         TextureRef $color = $scenePipe->createColor($sceneTarget, $this->config->colorName, TextureOptions());
         $frame->set(HostPassData($sceneTarget, $color));
         $frame->set(SceneTargetData($sceneTarget));
@@ -375,11 +376,12 @@ public class Host
     ) : bool
     {
         visu::profile::begin('render');
-        float64 $t0 = visu::runtime::seconds();
+        // wall time: the presentation clock pins under dcapture fixedStep
+        time::instant $t0 = time::instant::now();
         status<PipelineError> $exec = $scenePipe->execute($this->frameIndex, $compensation, collect: false);
         visu::profile::end();
         guard $exec else {
-            $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
+            $this->instruments->noteRender((time::instant::now() - $t0)->as_nanos() as float64);
             return $this->finishPresent($frame, $exec, false);
         }
 
@@ -387,7 +389,7 @@ public class Host
         Pipeline $presentPipe = Pipeline($this->pool, $frame, $windowRt);
         BackbufferData $back = $frame->get<BackbufferData>();
         Texture $sceneColor = guard $this->pool->getTexture($color) else ($e) {
-            $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
+            $this->instruments->noteRender((time::instant::now() - $t0)->as_nanos() as float64);
             return $this->finishPresent($frame, .error(.pool($e)), false);
         }
         TextureRef $src = $presentPipe->importTexture($color->name, $sceneColor);
@@ -410,7 +412,7 @@ public class Host
 
         visu::profile::begin('present');
         status<PipelineError> $presentExec = $presentPipe->execute($this->frameIndex, $compensation);
-        $this->instruments->noteRender((visu::runtime::seconds() - $t0) * 1000000000.0);
+        $this->instruments->noteRender((time::instant::now() - $t0)->as_nanos() as float64);
         return $this->finishPresent($frame, $presentExec, true);
     }
 
@@ -440,6 +442,7 @@ public class Host
         }
 
         $this->input->endFrame();
+        $this->inputContext->endFrame();
         $this->frameIndex = $this->frameIndex + 1;
         $this->dumps->afterPresent($frame, $this->pool, $this->window, $this->frameIndex - 1, $this->tickIndex);
         return true;
@@ -468,6 +471,7 @@ public class Host
             return;
         }
         $dcapture->advance($this->frameIndex, $this->tickIndex, $this->console);
+        $dcapture->feed($this->input, $this->window);
     }
 
     private function publishCameraOverride(Frame $frame) : void

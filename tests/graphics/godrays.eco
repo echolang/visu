@@ -1,0 +1,91 @@
+/**
+ * Light shafts: target size, history reuse, jitter, the elevation band and the fog packing.
+ */
+
+use visu::graphics::{
+    DirectionalLight, GodRaySize, GodRays, Moon, godRayFogLight, godRayFogPhase, godRayFogShafts,
+    godRayHistoryKept, godRayJitter, godRaySize, godRayStrength
+};
+use visu::math::Vec3;
+
+test god_rays_default_off
+{
+    GodRays $rays = GodRays();
+    assert(!$rays->enabled, 'off until an app opts in');
+    assert($rays == GodRays(), 'defaults equal');
+    $rays->steps = 20;
+    assert($rays != GodRays(), 'steps differ');
+}
+
+test god_ray_size_scales_and_never_hits_zero
+{
+    GodRaySize $half = godRaySize(2560, 1440, 0.5f);
+    assert($half->width == 1280 && $half->height == 720, 'half');
+    GodRaySize $quarter = godRaySize(2560, 1440, 0.25f);
+    assert($quarter->width == 640 && $quarter->height == 360, 'quarter');
+    GodRaySize $tiny = godRaySize(1, 1, 0.25f);
+    assert($tiny->width == 1 && $tiny->height == 1, 'one texel at least');
+}
+
+test god_ray_history_drops_on_a_cut
+{
+    Vec3 $eye = Vec3(0.0f, 10.0f, 0.0f);
+    assert(godRayHistoryKept(true, false, false, $eye, Vec3(1.0f, 10.0f, 0.0f)), 'a small step keeps it');
+    assert(!godRayHistoryKept(false, false, false, $eye, $eye), 'nothing written yet');
+    assert(!godRayHistoryKept(true, false, true, $eye, $eye), 'the moon took the cascades');
+    assert(!godRayHistoryKept(true, true, false, $eye, $eye), 'the sun took them back');
+    assert(!godRayHistoryKept(true, false, false, $eye, Vec3(50.0f, 10.0f, 0.0f)), 'camera jump');
+}
+
+test god_ray_jitter_stays_in_the_unit_range
+{
+    int64 $frame = 0;
+    while ($frame < 64) {
+        float32 $j = godRayJitter($frame);
+        assert($j >= 0.0f && $j < 1.0f, 'in [0, 1)');
+        $frame = $frame + 1;
+    }
+    assert(godRayJitter(1) != godRayJitter(2), 'moves every frame');
+}
+
+// the way light travels for a light at `degrees` of elevation
+function godRayLightAt(float32 $degrees) : Vec3
+{
+    float32 $r = $degrees * 0.017453292f;
+    return Vec3(-(std::math::cos($r as float64) as float32), -(std::math::sin($r as float64) as float32), 0.0f);
+}
+
+test god_ray_strength_follows_the_low_sun_band
+{
+    GodRays $rays = GodRays();
+    assert(godRayStrength($rays, godRayLightAt(5.0f)) == 1.0f, 'full below the low angle');
+    assert(godRayStrength($rays, godRayLightAt(60.0f)) == 0.0f, 'none above the high angle');
+    float32 $mid = godRayStrength($rays, godRayLightAt(23.5f));
+    assert($mid > 0.0f && $mid < 1.0f, 'a fade in between');
+    assert(godRayStrength($rays, godRayLightAt(15.0f)) > godRayStrength($rays, godRayLightAt(30.0f)), 'lower is stronger');
+}
+
+test god_ray_fog_packing_fades_to_the_plain_fog
+{
+    GodRays $rays = GodRays();
+    assert(godRayFogShafts($rays, 1.0f)->w == 1.0f, 'on flag');
+    assert(godRayFogShafts($rays, 1.0f)->x == $rays->scatter, 'full scatter');
+    assert(godRayFogShafts($rays, 0.0f)->x == 0.0f, 'no inscatter at zero strength');
+    assert(godRayFogShafts($rays, 0.0f)->y == 0.0f, 'no glow occlusion at zero strength');
+    assert(godRayFogPhase($rays, false)->z == $rays->wideWeight, 'sun wide lobe');
+    assert(godRayFogPhase($rays, true)->z == $rays->moonWideWeight, 'moon wide lobe');
+}
+
+test god_ray_fog_light_follows_the_key_light
+{
+    GodRays $rays = GodRays();
+    DirectionalLight $sun = DirectionalLight(Vec3(0.0f, -1.0f, 0.0f), Vec3(1.0f, 0.5f, 0.25f), 2.0f);
+    Moon $moon = Moon();
+    assert(godRayFogLight($rays, $sun, $moon)->w == 0.0f, 'sun keyed');
+    assert(godRayFogLight($rays, $sun, $moon)->x == 2.0f, 'sun radiance');
+    $sun->intensity = 0.0f;
+    $moon->light = DirectionalLight(Vec3(0.0f, -1.0f, 0.0f), Vec3(1.0f, 1.0f, 1.0f), 0.1f);
+    Vec3 $expect = Vec3(0.1f, 0.1f, 0.1f) * $rays->moonBoost;
+    assert(godRayFogLight($rays, $sun, $moon)->w == 1.0f, 'moon keyed');
+    assert(godRayFogLight($rays, $sun, $moon)->x == $expect->x, 'moon radiance boosted');
+}

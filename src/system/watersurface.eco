@@ -1,0 +1,500 @@
+/**
+ * Publishes `WaterFrame` for the deferred renderer. One reflected camera for the surface
+ * under the view center, or the closest visible one. Point lights are not gathered again:
+ * the mirror splats the pack `PointLightSystem` already built.
+ * Bind this after `CameraSystem` and `PointLightSystem`.
+ */
+
+namespace visu::system;
+
+use visu::components::WaterSurface;
+use visu::ecs::{Entities, Schedule, System};
+use visu::geo::{AABB, Plane, Ray, Transform};
+use visu::graphics::{
+    CameraData, Device, PointLightFrame, RenderContext, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST,
+    Texture, TextureDesc, WATER_MAX, WATER_MIRROR_SCALE, WaterDraw, WaterFrame, WaterUniforms,
+    mirrorCamera, pointSplat, pointTiles, reflectPoint
+};
+use visu::math::{Mat4, Vec2, Vec3, Vec4, dot, inverse, length};
+
+public class WaterSurfaceSystem : System
+{
+    private Device $device;
+    private WaterFrame $frame;
+    /**
+     * Presentation-clock seconds at construction; ripples run from here.
+     */
+    private float64 $origin;
+    private bool $enabled;
+    private float32 $scale;
+    private float32 $radiusOverride;
+    private Texture? $fallback;
+    private array<uint8> $tileBytes;
+    private Texture? $tiles0;
+    private Texture? $tiles1;
+    private int32 $tileW;
+    private int32 $tileH;
+
+    public constructor(Device $device)
+    {
+        $this->device = $device;
+        $this->frame = WaterFrame();
+        $this->frame->draws->reserve(WATER_MAX as usize);
+        $this->frame->casters->reserve(4 as usize);
+        $this->origin = visu::runtime::seconds();
+        $this->enabled = true;
+        $this->scale = WATER_MIRROR_SCALE;
+        $this->radiusOverride = 0.0f;
+        $this->fallback = null;
+        $this->tileBytes = array<uint8>();
+        $this->tiles0 = null;
+        $this->tiles1 = null;
+        $this->tileW = 0;
+        $this->tileH = 0;
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->update = false;
+    }
+
+    public function update(Entities $entities) : void
+    {
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+        $this->frame->draws->clear();
+        $this->frame->casters->clear();
+        $this->frame->active = false;
+        $this->frame->mirror = false;
+        $this->frame->mirrorIndex = -1;
+        $this->frame->gbuffer = null;
+        $this->frame->color = null;
+        $this->frame->colorTarget = null;
+        $this->frame->presented = null;
+        $this->frame->outputTarget = null;
+        $this->frame->tiles = null;
+        $this->frame->tilesX = 0;
+        $this->frame->tilesY = 0;
+        $this->ensureTextures();
+        $this->frame->fallbackCube = $this->fallback;
+        $this->frame->time = waterTime($this->origin);
+
+        CameraData? $found = $ctx->frame->find<CameraData>();
+        if ($found == null) {
+            $ctx->frame->set($this->frame);
+            return;
+        }
+
+        CameraData $camera = guard $found;
+        float32 $alpha = $ctx->compensation;
+        foreach ($entities->view<WaterSurface>() as $id => &$surface) {
+            if ($this->frame->draws->count() >= WATER_MAX as usize) {
+                break;
+            }
+
+            if (!$entities->has<Transform>($id)) {
+                continue;
+            }
+
+            Transform& $transform = $entities->get<Transform>($id);
+            Mat4 $world = $transform->world($entities, $alpha);
+            Vec3 $origin = ($world * Vec4(0.0f, 0.0f, 0.0f, 1.0f))->xyz();
+            Vec3 $up = ($world * Vec4(0.0f, 1.0f, 0.0f, 0.0f))->xyz();
+            float32 $len = length($up);
+            if ($len < 0.00001f) {
+                continue;
+            }
+
+            Vec3 $normal = $up / $len;
+            Plane $plane = Plane($normal, -dot($normal, $origin));
+            AABB $bounds = waterBounds($world);
+            if (!$camera->cullFrustum->contains($bounds)) {
+                continue;
+            }
+
+            float32 $radius = $surface->radius;
+            if ($this->radiusOverride > 0.0f) {
+                $radius = $this->radiusOverride;
+            }
+
+            if ($radius < 1.0f) {
+                $radius = 1.0f;
+            }
+
+            WaterUniforms $uniforms = WaterUniforms();
+            $uniforms->world = $world;
+            $uniforms->plane = Vec4($normal->x, $normal->y, $normal->z, $plane->distance);
+            $uniforms->absorption = Vec4($surface->absorption->x, $surface->absorption->y, $surface->absorption->z, $surface->density);
+            $uniforms->ripple = Vec4($surface->rippleScale, $surface->rippleSpeed, $surface->normalStrength, $surface->roughness);
+            float32 $round = 0.0f;
+            if ($surface->round) {
+                $round = 1.0f;
+            }
+
+            $uniforms->flow = Vec4($surface->flow->x, $surface->flow->y, $surface->distortion, $round);
+            $uniforms->extra = Vec4(0.0f, $this->frame->time, 0.0f, 0.0f);
+            $uniforms->body = Vec4($surface->scatter->x, $surface->scatter->y, $surface->scatter->z, $surface->turbidity);
+            $this->frame->draws[] = WaterDraw($world, $plane, $origin, $bounds, $uniforms, $radius);
+        }
+
+        if ($this->frame->draws->count() == 0) {
+            $ctx->frame->set($this->frame);
+            return;
+        }
+
+        $this->frame->active = true;
+        int32 $mirror = waterPick($camera, $this->frame->draws);
+        $this->frame->mirrorIndex = $mirror;
+        if ($this->enabled && $mirror >= 0) {
+            WaterDraw $chosen = $this->frame->draws[$mirror as usize];
+            $chosen->uniforms->extra = Vec4(1.0f, $this->frame->time, 0.0f, 0.0f);
+            $this->frame->draws[$mirror as usize] = $chosen;
+            int32 $w = waterPixels($camera->resolutionX, $this->scale);
+            int32 $h = waterPixels($camera->resolutionY, $this->scale);
+            Vec3 $mirrorEye = reflectPoint($camera->position, $chosen->plane);
+            float32 $reach = length($mirrorEye - $chosen->origin) + $chosen->radius;
+            $this->frame->camera = mirrorCamera($camera, $chosen->plane, $reach, $w, $h);
+            $this->frame->mirror = true;
+            $this->splat($ctx, $this->frame->camera);
+        }
+
+        $ctx->frame->set($this->frame);
+    }
+
+    public function setEnabled(bool $on) : void
+    {
+        $this->enabled = $on;
+    }
+
+    public function setScale(float32 $scale) : void
+    {
+        float32 $s = $scale;
+        if ($s < 0.25f) {
+            $s = 0.25f;
+        }
+
+        if ($s > 1.0f) {
+            $s = 1.0f;
+        }
+
+        $this->scale = $s;
+    }
+
+    public function setRadius(float32 $radius) : void
+    {
+        if ($radius <= 0.0f) {
+            $this->radiusOverride = 0.0f;
+            return;
+        }
+
+        float32 $r = $radius;
+        if ($r < 4.0f) {
+            $r = 4.0f;
+        }
+
+        if ($r > 200.0f) {
+            $r = 200.0f;
+        }
+
+        $this->radiusOverride = $r;
+    }
+
+    public const function enabled() : bool
+    {
+        return $this->enabled;
+    }
+
+    public const function scale() : float32
+    {
+        return $this->scale;
+    }
+
+    public const function radiusOverride() : float32
+    {
+        return $this->radiusOverride;
+    }
+
+    public const function surfaceCount() : int32
+    {
+        return $this->frame->draws->count() as int32;
+    }
+
+    private function splat(RenderContext $ctx, CameraData $camera) : void
+    {
+        visu::profile::begin('reflect/tiles');
+        PointLightFrame? $points = $ctx->frame->find<PointLightFrame>();
+        if ($points == null || !$this->enabled) {
+            visu::profile::end();
+            return;
+        }
+
+        PointLightFrame $packed = guard $points;
+        int32 $tx = pointTiles($camera->resolutionX);
+        int32 $ty = pointTiles($camera->resolutionY);
+        if ($packed->pack->count <= 0 || $tx <= 0 || $ty <= 0) {
+            visu::profile::end();
+            return;
+        }
+
+        $this->ensureTiles($tx, $ty);
+        pointSplat($camera, $packed->pack, $this->tileBytes, $tx, $ty);
+        $this->frame->tiles = $this->uploadTiles();
+        $this->frame->tilesX = $tx;
+        $this->frame->tilesY = $ty;
+        visu::profile::end();
+    }
+
+    private function ensureTextures() : void
+    {
+        if ($this->fallback == null) {
+            $this->fallback = waterFallbackCube($this->device);
+        }
+    }
+
+    private function ensureTiles(int32 $tilesX, int32 $tilesY) : void
+    {
+        int32 $bytes = $tilesX * $tilesY * 9;
+        if ($this->tileBytes->count() != $bytes as usize) {
+            array<uint8> $fresh = array<uint8>();
+            $fresh->reserve($bytes as usize);
+            int32 $i = 0;
+            while ($i < $bytes) {
+                $fresh[] = 0;
+                $i = $i + 1;
+            }
+
+            $this->tileBytes = mv $fresh;
+        }
+
+        if ($this->tileW == $tilesX && $this->tileH == $tilesY && $this->tiles0 != null) {
+            return;
+        }
+
+        $this->dropTiles();
+        int32 $height = $tilesY * 9;
+        $this->tiles0 = waterTileTexture($this->device, $tilesX, $height, 0);
+        $this->tiles1 = waterTileTexture($this->device, $tilesX, $height, 1);
+        $this->tileW = $tilesX;
+        $this->tileH = $tilesY;
+    }
+
+    private function uploadTiles() : Texture
+    {
+        uint32 $slot = $this->device->frameSlot() % 2;
+        Texture $tex = guard $this->tiles0 else {
+            return waterTileTexture($this->device, 1, 1, 0);
+        }
+        if ($slot == 1) {
+            Texture $alt = guard $this->tiles1 else {
+                return $tex;
+            }
+            $tex = $alt;
+        }
+
+        uint64 $bytes = $this->tileBytes->count() as uint64;
+        if ($bytes > 0) {
+            $tex->upload(0, ptr<const uint8>(&$this->tileBytes[0]), $bytes, $this->tileW);
+        }
+
+        return $tex;
+    }
+
+    private function dropTiles() : void
+    {
+        Texture $a = guard $this->tiles0 else {
+            $this->tiles0 = null;
+            $this->tiles1 = null;
+            return;
+        }
+        $a->destroy();
+        $this->tiles0 = null;
+        Texture $b = guard $this->tiles1 else {
+            $this->tiles1 = null;
+            return;
+        }
+        $b->destroy();
+        $this->tiles1 = null;
+    }
+}
+
+internal function waterTime(float64 $origin) : float32
+{
+    float32 $seconds = (visu::runtime::seconds() - $origin) as float32;
+    float32 $wrap = 1000.0f;
+    float32 $turns = std::math::floor(($seconds / $wrap) as float64) as float32;
+    return $seconds - $turns * $wrap;
+}
+
+internal function waterPixels(int32 $full, float32 $scale) : int32
+{
+    int32 $n = ($full as float32 * $scale) as int32;
+    if ($n < 1) {
+        return 1;
+    }
+
+    return $n;
+}
+
+internal function waterBounds(const Mat4& $world) : AABB
+{
+    Vec3 $a = ($world * Vec4(-0.5f, 0.0f, -0.5f, 1.0f))->xyz();
+    Vec3 $b = ($world * Vec4(-0.5f, 0.0f, 0.5f, 1.0f))->xyz();
+    Vec3 $c = ($world * Vec4(0.5f, 0.0f, -0.5f, 1.0f))->xyz();
+    Vec3 $d = ($world * Vec4(0.5f, 0.0f, 0.5f, 1.0f))->xyz();
+    Vec3 $min = $a;
+    Vec3 $max = $a;
+    $min = waterMin($min, $b);
+    $min = waterMin($min, $c);
+    $min = waterMin($min, $d);
+    $max = waterMax($max, $b);
+    $max = waterMax($max, $c);
+    $max = waterMax($max, $d);
+    $min = Vec3($min->x, $min->y - 0.05f, $min->z);
+    $max = Vec3($max->x, $max->y + 0.05f, $max->z);
+    return AABB($min, $max);
+}
+
+internal function waterMin(Vec3 $a, Vec3 $b) : Vec3
+{
+    float32 $x = $a->x;
+    if ($b->x < $x) {
+        $x = $b->x;
+    }
+
+    float32 $y = $a->y;
+    if ($b->y < $y) {
+        $y = $b->y;
+    }
+
+    float32 $z = $a->z;
+    if ($b->z < $z) {
+        $z = $b->z;
+    }
+
+    return Vec3($x, $y, $z);
+}
+
+internal function waterMax(Vec3 $a, Vec3 $b) : Vec3
+{
+    float32 $x = $a->x;
+    if ($b->x > $x) {
+        $x = $b->x;
+    }
+
+    float32 $y = $a->y;
+    if ($b->y > $y) {
+        $y = $b->y;
+    }
+
+    float32 $z = $a->z;
+    if ($b->z > $z) {
+        $z = $b->z;
+    }
+
+    return Vec3($x, $y, $z);
+}
+
+/**
+ * The surface the view center lands in, else the closest.
+ */
+internal function waterPick(const CameraData& $camera, const array<WaterDraw>& $draws) : int32
+{
+    Ray $ray = $camera->ray(Vec2(0.0f, 0.0f));
+    int32 $best = -1;
+    float32 $bestT = 1000000000.0f;
+    int32 $i = 0;
+    int32 $n = $draws->count() as int32;
+    while ($i < $n) {
+        WaterDraw $draw = $draws[$i as usize];
+        float32 $denom = dot($draw->plane->normal, $ray->direction);
+        float32 $ad = $denom;
+        if ($ad < 0.0f) {
+            $ad = -$ad;
+        }
+
+        if ($ad >= 0.00001f) {
+            float32 $t = -(dot($draw->plane->normal, $ray->origin) + $draw->plane->distance) / $denom;
+            if ($t > 0.0f && $t < $bestT && waterInside($draw, $ray->at($t))) {
+                $best = $i;
+                $bestT = $t;
+            }
+        }
+
+        $i = $i + 1;
+    }
+
+    if ($best >= 0) {
+        return $best;
+    }
+
+    float32 $bestD = 1000000000.0f;
+    $i = 0;
+    while ($i < $n) {
+        float32 $d = length($draws[$i as usize]->origin - $camera->position);
+        if ($d < $bestD) {
+            $bestD = $d;
+            $best = $i;
+        }
+
+        $i = $i + 1;
+    }
+
+    return $best;
+}
+
+internal function waterInside(const WaterDraw& $draw, Vec3 $world) : bool
+{
+    Vec3 $local = (inverse($draw->world) * Vec4($world, 1.0f))->xyz();
+    if ($draw->uniforms->flow->w > 0.5f) {
+        float32 $r = $local->x * $local->x + $local->z * $local->z;
+        return $r <= 0.25f;
+    }
+
+    float32 $ax = $local->x;
+    if ($ax < 0.0f) {
+        $ax = -$ax;
+    }
+
+    float32 $az = $local->z;
+    if ($az < 0.0f) {
+        $az = -$az;
+    }
+
+    return $ax <= 0.5f && $az <= 0.5f;
+}
+
+internal function waterTileTexture(Device $device, int32 $width, int32 $height, int32 $slot) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .r8, $width: $width, $height: $height);
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_DST;
+    $desc->label = "reflect.tiles.{$slot}";
+    return Texture($device, "reflect.tiles.{$slot}", $desc);
+}
+
+internal function waterFallbackCube(Device $device) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .rgba8, $width: 1, $height: 1);
+    $desc->kind = .cube;
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_DST;
+    $desc->label = 'water.fallback';
+    Texture $tex = Texture($device, 'water.fallback', $desc);
+    array<uint8> $black = [0, 0, 0, 255];
+    int32 $face = 0;
+    while ($face < 6) {
+        $tex->upload(face: $face, 0, ptr<const uint8>(&$black[0]), 4, 4);
+        $face = $face + 1;
+    }
+
+    return $tex;
+}
+

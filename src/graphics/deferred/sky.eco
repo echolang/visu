@@ -95,6 +95,40 @@ public struct Sky
         // keep the colour normalised and move the attenuation into the intensity
         return DirectionalLight($this->direction, $tint / $peak, $this->sunIntensity * $peak);
     }
+
+    /**
+     * The directional light `$moon` casts through this atmosphere: its tint times the
+     * transmittance towards it, scaled by how much of the disc is lit. Zero below the horizon
+     * and while the moon is disabled.
+     */
+    public const function moonLight(const Moon& $moon, float32 $altitude = 0.0f) : DirectionalLight
+    {
+        Vec3 $toMoon = normalize(-$moon->direction);
+        Vec3 $tint = skyTransmittance($toMoon, $altitude, $this);
+        float32 $peak = $tint->x;
+
+        if ($tint->y > $peak) {
+            $peak = $tint->y;
+        }
+
+        if ($tint->z > $peak) {
+            $peak = $tint->z;
+        }
+
+        float32 $lit = $moon->illumination;
+
+        if ($lit < 0.0f) {
+            $lit = 0.0f;
+        }
+
+        if (!$moon->enabled || $peak <= 0.0f || $lit <= 0.0f) {
+            return DirectionalLight($moon->direction, $moon->color, 0.0f);
+        }
+
+        // a thin crescent is dimmer than its area: the lit limb is seen at a grazing angle
+        float32 $phase = $lit * $lit;
+        return DirectionalLight($moon->direction, $moon->color * ($tint / $peak), $moon->intensity * $peak * $phase);
+    }
 }
 
 operator (Sky $a) == (Sky $b) : bool
@@ -142,17 +176,34 @@ public struct SkyUniforms
      * View samples in x, light samples in y, planet radius in z, atmosphere radius in w.
      */
     public Vec4 $params;
+
+    /**
+     * Unit vector towards the moon in xyz, the moon light the atmosphere scatters in w (0 none).
+     */
+    public Vec4 $moon;
+
+    /**
+     * Moon illumination in x, earthshine in y, cosine of the disc radius in z, star brightness in w.
+     */
+    public Vec4 $moonParams;
+
+    /**
+     * Moon tint in rgb, 1 in w draws the moon disc and the stars.
+     */
+    public Vec4 $moonColor;
 }
 
 /**
- * Packs a sky for one draw. `$origin` is where the viewer stands; the disk only belongs in the visible sky.
+ * Packs a sky for one draw. `$origin` is where the viewer stands; the disks only belong in the
+ * visible sky. `$moon` null packs a sunlit-only sky, the probe bake's: no moon light, no stars.
  */
 public function skyUniforms(
     const Sky& $sky,
     Vec3 $origin,
     bool $sunDisk,
     float32 $viewSamples,
-    float32 $lightSamples
+    float32 $lightSamples,
+    Moon? $moon = null
 ) : SkyUniforms
 {
     Vec3 $toSun = normalize(-$sky->direction);
@@ -160,6 +211,19 @@ public function skyUniforms(
 
     if ($sunDisk) {
         $disk = 1.0f;
+    }
+
+    Vec4 $moonAt = Vec4(0.0f, -1.0f, 0.0f, 0.0f);
+    Vec4 $moonParams = Vec4(0.0f, 0.0f, 1.0f, 0.0f);
+    Vec4 $moonColor = Vec4(0.0f);
+
+    Moon $held = $moon ?? Moon();
+
+    if ($held->enabled) {
+        Vec3 $toMoon = normalize(-$held->direction);
+        $moonAt = Vec4($toMoon->x, $toMoon->y, $toMoon->z, $held->light->intensity);
+        $moonParams = Vec4($held->illumination, $held->earthshine, math::cos($held->discRadius), $held->stars);
+        $moonColor = Vec4($held->color->x, $held->color->y, $held->color->z, $disk);
     }
 
     return SkyUniforms(
@@ -178,7 +242,10 @@ public function skyUniforms(
             SKY_MIE_HEIGHT
         ),
         Vec4($sky->groundAlbedo->x, $sky->groundAlbedo->y, $sky->groundAlbedo->z, $sky->exposure),
-        Vec4($viewSamples, $lightSamples, SKY_PLANET_RADIUS, SKY_ATMOSPHERE_RADIUS)
+        Vec4($viewSamples, $lightSamples, SKY_PLANET_RADIUS, SKY_ATMOSPHERE_RADIUS),
+        $moonAt,
+        $moonParams,
+        $moonColor
     );
 }
 

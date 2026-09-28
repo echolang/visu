@@ -1,9 +1,9 @@
 /**
  * The dcapture script: JSON text to typed steps.
  *
- * Top level: `out`, `headless`, `window: [w, h]`, `frames`, `flags`, `list`, `gpuLog`, `steps`.
+ * Top level: `out`, `headless`, `fixedStep`, `window: [w, h]`, `frames`, `flags`, `list`, `gpuLog`, `steps`.
  * A step carries exactly one timing key (`frame`, `tick`, `after`) and any of the actions
- * `label`, `flags`, `camera`, `console`, `dump`, `profile`, `list`, `log`, `stop`. Parsing is strict: a
+ * `label`, `flags`, `camera`, `console`, `click`, `dump`, `profile`, `list`, `log`, `stop`. Parsing is strict: a
  * wrong shape names the JSON path it tripped on, so an agent can fix the script blind.
  */
 
@@ -59,6 +59,14 @@ public class Step
     public const string $log;
     public const bool $stop;
 
+    /**
+     * A left click at `clickX`, `clickY` in window points: pressed on this step's frame and
+     * released on the next, the way a hand clicks, so the action map sees both edges.
+     */
+    public const bool $click;
+    public const float64 $clickX;
+    public const float64 $clickY;
+
     public constructor(
         int32 $index,
         StepAt $at,
@@ -71,6 +79,9 @@ public class Step
         bool $list,
         string $log,
         bool $stop,
+        bool $click = false,
+        float64 $clickX = 0.0,
+        float64 $clickY = 0.0,
     )
     {
         $this->index = $index;
@@ -84,6 +95,9 @@ public class Step
         $this->list = $list;
         $this->log = $log;
         $this->stop = $stop;
+        $this->click = $click;
+        $this->clickX = $clickX;
+        $this->clickY = $clickY;
     }
 
     public const function describe() : string
@@ -97,6 +111,13 @@ public class Script
 {
     public string $out;
     public bool $headless;
+
+    /**
+     * Pin the presentation clock: every displayed frame runs exactly one tick and animation
+     * time steps with it, so two runs of one script render the same pixels. CPU and GPU
+     * timings stay wall time.
+     */
+    public bool $fixedStep;
     public int32? $width;
     public int32? $height;
     public int32? $frames;
@@ -112,6 +133,7 @@ public class Script
     {
         $this->out = 'var/dcapture';
         $this->headless = false;
+        $this->fixedStep = false;
         $this->width = null;
         $this->height = null;
         $this->frames = null;
@@ -211,6 +233,10 @@ public class Script
             return .error($e);
         }
         $script->headless = $headless;
+        bool $fixedStep = guard optBool($root, 'fixedStep', 'fixedStep', false) else ($e) {
+            return .error($e);
+        }
+        $script->fixedStep = $fixedStep;
         bool $list = guard optBool($root, 'list', 'list', false) else ($e) {
             return .error($e);
         }

@@ -162,18 +162,43 @@ public struct FogUniforms
      * Sky view samples in x, sky light samples in y.
      */
     public Vec4 $samples;
+
+    /**
+     * Directional inscattering towards the moon (already moon tinted) in rgb, exponent in w.
+     */
+    public Vec4 $moon;
+
+    /**
+     * Light shafts: scatter in x, glow occlusion in y, 1 in w when the resolved shafts are
+     * bound. Zero leaves `fog_apply_rays` on the plain fog path.
+     */
+    public Vec4 $shafts;
+
+    /**
+     * Key light radiance for the shafts in rgb, 1 in w when the moon is the key light.
+     */
+    public Vec4 $shaftLight;
+
+    /**
+     * Shaft phase: core anisotropy in x, wide anisotropy in y, wide lobe share in z.
+     */
+    public Vec4 $shaftPhase;
 }
 
 /**
  * Packs fog for one draw. `$camera` is where the viewer stands; `$sunTint` is
- * `fogSunTint` of the current sun so the glow reddens and vanishes at night.
+ * `fogSunTint` of the current sun so the glow reddens and vanishes at night, and
+ * `$moonTint` is `fogMoonTint`, the same glow around the moon. `$colorScale` is
+ * `fogLight`: a constant fog colour is a radiance, so it has to dim with the light.
  */
 public function fogUniforms(
     const HeightFog& $fog,
     Vec3 $camera,
     Vec3 $sunTint,
     float32 $viewSamples,
-    float32 $lightSamples
+    float32 $lightSamples,
+    Vec3 $moonTint = Vec3(0.0f, 0.0f, 0.0f),
+    Vec3 $colorScale = Vec3(1.0f, 1.0f, 1.0f)
 ) : FogUniforms
 {
     float32 $enabled = 0.0f;
@@ -189,12 +214,26 @@ public function fogUniforms(
     }
 
     Vec3 $sun = $fog->sunColor * $sunTint;
+    Vec3 $color = $fog->color;
+
+    // the sky's horizon already carries the light; only a constant colour is scaled
+    if (!$fog->fromSky) {
+        $color = $color * $colorScale;
+    }
+
+    // the fog's warm sun colour would turn the moon amber; keep only its strength
+    float32 $glow = ($fog->sunColor->x + $fog->sunColor->y + $fog->sunColor->z) / 3.0f;
+    Vec3 $moon = $moonTint * $glow;
     return FogUniforms(
         Vec4(fogDensityAtCamera($fog, $camera), $fog->heightFalloff, $fog->maxOpacity, $enabled),
-        Vec4($fog->color->x, $fog->color->y, $fog->color->z, $fromSky),
+        Vec4($color->x, $color->y, $color->z, $fromSky),
         Vec4($fog->startDistance, $fog->cutoffDistance, $fog->skyDistance, $fog->sunStartDistance),
         Vec4($sun->x, $sun->y, $sun->z, $fog->sunExponent),
-        Vec4($viewSamples, $lightSamples, 0.0f, 0.0f)
+        Vec4($viewSamples, $lightSamples, 0.0f, 0.0f),
+        Vec4($moon->x, $moon->y, $moon->z, $fog->sunExponent),
+        Vec4(0.0f),
+        Vec4(0.0f),
+        Vec4(0.0f)
     );
 }
 

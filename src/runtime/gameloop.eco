@@ -195,7 +195,7 @@ public class GameLoop
      */
     public function prepare() : void
     {
-        $this->lastNs = $this->nowNs();
+        $this->lastNs = $this->frameNs();
     }
 
     /**
@@ -206,7 +206,7 @@ public class GameLoop
     {
         $this->prepare();
         while (!$this->delegate->shouldStop() && !$this->forceStop) {
-            $this->advance($this->nowNs());
+            $this->pulse();
         }
     }
 
@@ -216,7 +216,21 @@ public class GameLoop
      */
     public function pulse() : void
     {
-        $this->advance($this->nowNs());
+        // a pinned clock moves one tick per displayed frame, so every frame runs exactly one update
+        stepClock($this->timestepNs);
+        $this->advance($this->frameNs());
+    }
+
+    /**
+     * Frame time: the wall, or the pinned presentation clock under dcapture `fixedStep`.
+     */
+    private function frameNs() : int64
+    {
+        if (clockPinned()) {
+            return pinnedNs();
+        }
+
+        return $this->nowNs();
     }
 
     private function nowNs() : int64

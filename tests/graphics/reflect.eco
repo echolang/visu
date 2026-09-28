@@ -1,0 +1,115 @@
+/**
+ * Planar mirror: point and direction reflection, the mirrored camera, and the oblique near plane.
+ */
+
+use visu::geo::{Plane, Pose, Transform};
+use visu::graphics::{Camera, mirrorCamera, obliqueProjection, reflectDirection, reflectPoint, viewPlane};
+use visu::math::{Mat4, Vec3, Vec4, clipZeroOne, lookAt, perspective};
+
+test reflect_point_through_horizontal
+{
+    Plane $plane = Plane(Vec3(0.0f, 1.0f, 0.0f), 0.0f);
+    Vec3 $above = reflectPoint(Vec3(2.0f, 3.0f, -4.0f), $plane);
+    assert(near($above->x, 2.0f) && near($above->y, -3.0f) && near($above->z, -4.0f), 'across y = 0');
+    Vec3 $back = reflectPoint($above, $plane);
+    assert(near($back->y, 3.0f), 'twice is identity');
+}
+
+test reflect_direction_ignores_distance
+{
+    Plane $plane = Plane(Vec3(0.0f, 1.0f, 0.0f), -5.0f);
+    Vec3 $down = reflectDirection(Vec3(0.0f, -1.0f, 0.0f), $plane);
+    assert(near($down->x, 0.0f) && near($down->y, 1.0f) && near($down->z, 0.0f), 'vertical flips');
+}
+
+test oblique_clips_below_the_plane
+{
+    Plane $water = Plane(Vec3(0.0f, 1.0f, 0.0f), 0.0f);
+    Mat4 $view = lookAt(eye: Vec3(0.0f, -5.0f, 10.0f), center: Vec3(0.0f, 0.0f, 0.0f), up: Vec3(0.0f, 1.0f, 0.0f));
+    Mat4 $projection = clipZeroOne(perspective(fovY: 0.7f, aspect: 1.5f, near: 0.05f, far: 40.0f));
+    Mat4 $oblique = obliqueProjection($projection, viewPlane($view, $water));
+
+    Vec4 $on = $oblique * $view * Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    assert($on->w > 0.0f, 'the plane point is in front');
+    assert(abs($on->z) < 0.002f * abs($on->w) + 0.002f, 'a point on the plane is the near boundary');
+
+    Vec4 $above = $oblique * $view * Vec4(0.0f, 2.0f, 0.0f, 1.0f);
+    assert($above->w > 0.0f, 'above is in front');
+    assert($above->z >= -0.001f, 'above stays on the kept side');
+    assert($above->z <= $above->w + 0.001f, 'above stays inside the far clip');
+
+    Vec4 $below = $oblique * $view * Vec4(0.0f, -1.0f, 2.0f, 1.0f);
+    assert($below->w > 0.0f, 'the below sample is still in front of the eye');
+    assert($below->z < 0.0f, 'below the plane is outside');
+}
+
+test mirror_camera_eye_and_clip
+{
+    Transform $pose = Transform();
+    $pose->position = Vec3(0.0f, 8.0f, 12.0f);
+    $pose->lookAt(Vec3(0.0f, 0.0f, 0.0f));
+    Camera $camera = Camera(.perspective);
+    $camera->fov = 50.0f;
+    $camera->near = 0.1f;
+    $camera->far = 200.0f;
+    Pose $shot = Pose($pose->position, $pose->orientation, $pose->scale);
+    visu::graphics::CameraData $main = $camera->data($shot, 1280, 720, 1.0f, 1.0f, 0.0f);
+    Plane $water = Plane(Vec3(0.0f, 1.0f, 0.0f), 0.0f);
+    visu::graphics::CameraData $mirror = mirrorCamera($main, $water, 40.0f);
+
+    assert(near($mirror->position->x, 0.0f), 'eye x');
+    assert(near($mirror->position->y, -8.0f), 'eye under the plane');
+    assert(near($mirror->position->z, 12.0f), 'eye z');
+
+    Vec4 $on = $mirror->projectionView * Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    assert($on->w > 0.0f, 'origin in front of the mirror');
+    assert(abs($on->z) < 0.002f * abs($on->w) + 0.002f, 'origin sits on the clip');
+
+    Vec4 $bed = $mirror->projectionView * Vec4(0.0f, -1.0f, 0.0f, 1.0f);
+    assert($bed->z < 0.0f, 'the bed is clipped');
+}
+
+test mirror_camera_keeps_the_world_from_high_up
+{
+    Transform $pose = Transform();
+    $pose->position = Vec3(0.0f, 80.0f, 20.0f);
+    $pose->lookAt(Vec3(0.0f, 0.0f, 0.0f));
+    Camera $camera = Camera(.perspective);
+    $camera->fov = 50.0f;
+    $camera->near = 0.1f;
+    $camera->far = 200.0f;
+    Pose $shot = Pose($pose->position, $pose->orientation, $pose->scale);
+    visu::graphics::CameraData $main = $camera->data($shot, 1280, 720, 1.0f, 1.0f, 0.0f);
+    Plane $water = Plane(Vec3(0.0f, 1.0f, 0.0f), 0.0f);
+    visu::graphics::CameraData $mirror = mirrorCamera($main, $water, 40.0f);
+
+    Vec4 $above = $mirror->projectionView * Vec4(0.0f, 5.0f, 0.0f, 1.0f);
+    assert($above->w > 0.0f, 'above is in front');
+    assert($above->z >= -0.001f, 'above stays on the kept side');
+    assert($above->z <= $above->w + 0.001f, 'above stays inside the far clip');
+}
+
+/**
+ * Absolute difference under a millimetre, for positions in this file's scenes.
+ */
+function near(float32 $got, float32 $want) : bool
+{
+    float32 $d = $got - $want;
+    if ($d < 0.0f) {
+        $d = -$d;
+    }
+
+    return $d < 0.001f;
+}
+
+/**
+ * `abs` for the clip test. std::math::fabs is float64.
+ */
+function abs(float32 $v) : float32
+{
+    if ($v < 0.0f) {
+        return -$v;
+    }
+
+    return $v;
+}

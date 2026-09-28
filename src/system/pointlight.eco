@@ -1,0 +1,284 @@
+/**
+ * Packs `PointLight` entities and console lamps into `PointLightFrame` before
+ * the deferred renderer builds its passes. The tile grid and the shadow faces
+ * are reserved storage: the frame resets counts and fills.
+ */
+
+namespace visu::system;
+
+use visu::components::PointLight;
+use visu::ecs::{Entities, Schedule, System};
+use visu::geo::Transform;
+use visu::graphics::{
+    CameraData, Device, POINT_SHADOW_LAYERS, POINT_SHADOW_RES, POINT_TILE_STRIDE, PointCandidate,
+    PointLightFrame, PointList, PointPack, RenderContext, TEXTURE_RENDER_TARGET, TEXTURE_SAMPLED,
+    TEXTURE_TRANSFER_DST, Texture, TextureDesc, pointConsider, pointFinish, pointSplat, pointTiles,
+    pointWriteFaces
+};
+use visu::math::{Mat4, Vec3, Vec4, length};
+
+public const int32 POINT_DEBUG_MAX = 64;
+
+public class PointLightSystem : System
+{
+    public Device $device;
+    public bool $debugShadow;
+    public int32 $debugCount;
+    private PointCandidate[64] $debug;
+    private PointLightFrame $frame;
+    private array<uint8> $tileBytes;
+    private int32 $tileW;
+    private int32 $tileH;
+    private Texture? $tiles0;
+    private Texture? $tiles1;
+    private Texture? $shadowMap;
+
+    /**
+     * The list packed last render, for the `light` console.
+     */
+    public PointPack $packed;
+
+    public constructor(Device $device)
+    {
+        $this->device = $device;
+        $this->debugShadow = true;
+        $this->debugCount = 0;
+        PointCandidate $blank = PointCandidate(
+            Vec3(0.0f, 0.0f, 0.0f),
+            0.0f,
+            Vec3(1.0f, 1.0f, 1.0f),
+            0.0f,
+            0.05f,
+            true
+        );
+        PointCandidate[64] $debug;
+        int32 $i = 0;
+        while ($i < POINT_DEBUG_MAX) {
+            $debug[$i] = $blank;
+            $i = $i + 1;
+        }
+
+        $this->debug = $debug;
+
+        $this->frame = PointLightFrame();
+        $this->tileBytes = array<uint8>();
+        $this->tileW = 0;
+        $this->tileH = 0;
+        $this->tiles0 = null;
+        $this->tiles1 = null;
+        $this->shadowMap = null;
+        $this->packed = PointPack();
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->update = false;
+    }
+
+    public function update(Entities $entities) : void
+    {
+    }
+
+    /**
+     * Append a console lamp. Past `POINT_DEBUG_MAX` the add is ignored.
+     * Returns false when the list is full.
+     */
+    public function debugAdd(PointCandidate $lamp) : bool
+    {
+        if ($this->debugCount >= POINT_DEBUG_MAX) {
+            return false;
+        }
+
+        $lamp->castShadow = $this->debugShadow;
+        int32 $at = $this->debugCount;
+        $this->debug[$at] = $lamp;
+        $this->debugCount = $at + 1;
+        return true;
+    }
+
+    public function debugClear() : void
+    {
+        $this->debugCount = 0;
+    }
+
+    /**
+     * Whether lamps added from the console cast, and the ones already added.
+     */
+    public function debugSetShadow(bool $on) : void
+    {
+        $this->debugShadow = $on;
+        int32 $i = 0;
+        while ($i < $this->debugCount) {
+            PointCandidate $lamp = $this->debug[$i];
+            $lamp->castShadow = $on;
+            $this->debug[$i] = $lamp;
+            $i = $i + 1;
+        }
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+        visu::profile::begin('render/pointlights');
+        PointLightFrame $frame = $this->frame;
+        CameraData? $found = $ctx->frame->find<CameraData>();
+        CameraData $cam = guard $found else {
+            $frame->count = 0;
+            $frame->pack = PointPack();
+            $frame->tiles = null;
+            $this->packed = $frame->pack;
+            $ctx->frame->set($frame);
+            visu::profile::end();
+            return;
+        }
+        PointList $list = PointList();
+        float32 $alpha = $ctx->compensation;
+        foreach ($entities->view<PointLight>() as $id => &$light) {
+            if (!$entities->has<Transform>($id)) {
+                continue;
+            }
+
+            Transform& $transform = $entities->get<Transform>($id);
+            Mat4 $world = $transform->world($entities, $alpha);
+            Vec3 $pos = ($world * Vec4($light->offset, 1.0f))->xyz();
+            if (!$cam->frustum->contains($pos, $light->radius)) {
+                continue;
+            }
+
+            PointCandidate $lamp = PointCandidate(
+                $pos,
+                $light->radius,
+                $light->color,
+                $light->intensity,
+                $light->sourceRadius,
+                $light->castShadow
+            );
+            pointConsider($list, $lamp, length($pos - $cam->position));
+        }
+
+        int32 $d = 0;
+        while ($d < $this->debugCount) {
+            PointCandidate $lamp = $this->debug[$d];
+            if ($cam->frustum->contains($lamp->position, $lamp->radius)) {
+                pointConsider($list, $lamp, length($lamp->position - $cam->position));
+            }
+
+            $d = $d + 1;
+        }
+
+        PointPack $pack = pointFinish($list);
+        $frame->pack = $pack;
+        $frame->count = $pack->count;
+        $frame->tilesX = pointTiles($cam->resolutionX);
+        $frame->tilesY = pointTiles($cam->resolutionY);
+        if ($pack->shadows > 0) {
+            pointWriteFaces($pack, $frame);
+            $frame->shadowMap = $this->ensureShadow();
+        }
+
+        if ($pack->count > 0 && $frame->tilesX > 0 && $frame->tilesY > 0) {
+            $this->ensureTiles($frame->tilesX, $frame->tilesY);
+            pointSplat($cam, $pack, $this->tileBytes, $frame->tilesX, $frame->tilesY);
+            $frame->tiles = $this->uploadTiles();
+        } else {
+            $frame->tiles = null;
+        }
+
+        $this->packed = $pack;
+        $ctx->frame->set($frame);
+        visu::profile::end();
+    }
+
+    private function ensureShadow() : Texture
+    {
+        Texture $have = guard $this->shadowMap else {
+            Texture $fresh = pointShadowMap($this->device);
+            $this->shadowMap = $fresh;
+            return $fresh;
+        }
+        return $have;
+    }
+
+    private function ensureTiles(int32 $tilesX, int32 $tilesY) : void
+    {
+        int32 $bytes = $tilesX * $tilesY * POINT_TILE_STRIDE;
+        if ($this->tileBytes->count() != $bytes as usize) {
+            array<uint8> $fresh = array<uint8>();
+            $fresh->reserve($bytes as usize);
+            int32 $i = 0;
+            while ($i < $bytes) {
+                $fresh[] = 0;
+                $i = $i + 1;
+            }
+
+            $this->tileBytes = mv $fresh;
+        }
+
+        if ($this->tileW == $tilesX && $this->tileH == $tilesY && $this->tiles0 != null) {
+            return;
+        }
+
+        $this->tiles0 = dropPointTexture($this->tiles0);
+        $this->tiles1 = dropPointTexture($this->tiles1);
+        int32 $height = $tilesY * POINT_TILE_STRIDE;
+        $this->tiles0 = pointTileTexture($this->device, $tilesX, $height, 0);
+        $this->tiles1 = pointTileTexture($this->device, $tilesX, $height, 1);
+        $this->tileW = $tilesX;
+        $this->tileH = $tilesY;
+    }
+
+    private function uploadTiles() : Texture
+    {
+        uint32 $slot = $this->device->frameSlot() % 2;
+        Texture $tex = guard $this->tiles0 else {
+            return pointTileTexture($this->device, 1, 1, 0);
+        }
+        if ($slot == 1) {
+            Texture $alt = guard $this->tiles1 else {
+                return $tex;
+            }
+            $tex = $alt;
+        }
+
+        uint64 $bytes = $this->tileBytes->count() as uint64;
+        if ($bytes > 0) {
+            $tex->upload(0, ptr<const uint8>(&$this->tileBytes[0]), $bytes, $this->tileW);
+        }
+
+        return $tex;
+    }
+}
+
+internal function pointTileTexture(Device $device, int32 $width, int32 $height, int32 $slot) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .r8, $width: $width, $height: $height);
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_DST;
+    $desc->label = "point.tiles.{$slot}";
+    return Texture($device, "point.tiles.{$slot}", $desc);
+}
+
+internal function pointShadowMap(Device $device) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .depth32f, $width: POINT_SHADOW_RES, $height: POINT_SHADOW_RES);
+    $desc->kind = .array2D;
+    $desc->arrayLength = POINT_SHADOW_LAYERS;
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET;
+    $desc->label = 'point.shadow';
+    return Texture($device, 'point.shadow', $desc);
+}
+
+internal function dropPointTexture(Texture? $texture) : Texture?
+{
+    Texture $held = guard $texture else {
+        return null;
+    }
+    $held->destroy();
+    return null;
+}

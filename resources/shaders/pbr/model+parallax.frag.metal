@@ -22,6 +22,7 @@ struct ModelMaterialData
     float4 u_base_color;
     float4 u_factors;
     float4 u_uv_scale;
+    float4 u_emissive;
 };
 
 struct fs_out
@@ -130,7 +131,7 @@ void gbuffer_write(thread const float3& position, thread const float3& normal, t
     gbuffer_write(param, param_1, param_2, param_3, param_4, param_5, param_6, param_7, gbuffer_out_position, _79, gbuffer_out_normal, gbuffer_out_albedo, gbuffer_out_material, gbuffer_out_emissive, gbuffer_out_id);
 }
 
-fragment fs_out fs(fs_in in [[stage_in]], constant ModelMaterialData& _295 [[buffer(2)]], constant CameraUniforms& _79 [[buffer(3)]], texture2d<float> map_albedo [[texture(0)]], texture2d<float> map_normal [[texture(1)]], texture2d<float> map_roughness [[texture(2)]], texture2d<float> map_metallic [[texture(3)]], texture2d<float> map_ao [[texture(4)]], texture2d<float> map_alpha [[texture(5)]], texture2d<float> map_height [[texture(6)]], sampler map_albedoSmplr [[sampler(0)]], sampler map_normalSmplr [[sampler(1)]], sampler map_roughnessSmplr [[sampler(2)]], sampler map_metallicSmplr [[sampler(3)]], sampler map_aoSmplr [[sampler(4)]], sampler map_alphaSmplr [[sampler(5)]], sampler map_heightSmplr [[sampler(6)]], bool gl_FrontFacing [[front_facing]])
+fragment fs_out fs(fs_in in [[stage_in]], constant ModelMaterialData& _295 [[buffer(2)]], constant CameraUniforms& _79 [[buffer(3)]], texture2d<float> map_albedo [[texture(0)]], texture2d<float> map_normal [[texture(1)]], texture2d<float> map_roughness [[texture(2)]], texture2d<float> map_metallic [[texture(3)]], texture2d<float> map_ao [[texture(4)]], texture2d<float> map_alpha [[texture(5)]], texture2d<float> map_height [[texture(6)]], texture2d<float> map_emissive [[texture(7)]], sampler map_albedoSmplr [[sampler(0)]], sampler map_normalSmplr [[sampler(1)]], sampler map_roughnessSmplr [[sampler(2)]], sampler map_metallicSmplr [[sampler(3)]], sampler map_aoSmplr [[sampler(4)]], sampler map_alphaSmplr [[sampler(5)]], sampler map_heightSmplr [[sampler(6)]], sampler map_emissiveSmplr [[sampler(7)]], bool gl_FrontFacing [[front_facing]])
 {
     fs_out out = {};
     float2 uv = in.v_uv * _295.u_uv_scale.xy;
@@ -210,12 +211,17 @@ fragment fs_out fs(fs_in in [[stage_in]], constant ModelMaterialData& _295 [[buf
     {
         ao = map_ao.sample(map_aoSmplr, uv).x;
     }
+    float3 emissive = float3(0.0);
+    if (dot(_295.u_emissive.xyz, float3(1.0)) > 0.0)
+    {
+        emissive = _295.u_emissive.xyz * map_emissive.sample(map_emissiveSmplr, uv).xyz;
+    }
     float3 param_12 = in.v_position;
     float3 param_13 = n;
     float3 param_14 = albedo;
     float param_15 = metallic;
     float param_16 = roughness;
-    float3 param_17 = float3(0.0);
+    float3 param_17 = emissive;
     float param_18 = ao;
     gbuffer_write(param_12, param_13, param_14, param_15, param_16, param_17, param_18, out.gbuffer_out_position, _79, out.gbuffer_out_normal, out.gbuffer_out_albedo, out.gbuffer_out_material, out.gbuffer_out_emissive, out.gbuffer_out_id);
     return out;

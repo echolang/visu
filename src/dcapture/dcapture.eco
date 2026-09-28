@@ -14,6 +14,8 @@ use std::io;
 use visu::app::{Flags, HostConfig, flags, info};
 use visu::graphics::{CameraOverrideData, FRAMES_IN_FLIGHT};
 use visu::math::{Quat, Vec3};
+use visu::os::{HostEvent, Window};
+use visu::os::input::{InputHub, KeyPhase, MouseButton};
 use visu::runtime::DebugConsole;
 
 internal const ARG_NAME = '--dcapture';
@@ -28,6 +30,14 @@ public class DCapture
     private int32 $frame;
     private int32 $tick;
 
+    /**
+     * Frame a scripted click was pressed on, or -1. Released on a later frame.
+     */
+    private int32 $clickFrame;
+    private bool $pendingClick;
+    private float64 $pendingX;
+    private float64 $pendingY;
+
     public constructor(Script $script)
     {
         $this->script = $script;
@@ -36,6 +46,10 @@ public class DCapture
         $this->camera = null;
         $this->frame = 0;
         $this->tick = 0;
+        $this->clickFrame = -1;
+        $this->pendingClick = false;
+        $this->pendingX = 0.0;
+        $this->pendingY = 0.0;
         if ($script->list) {
             $this->dumps->queueList();
         }
@@ -115,6 +129,10 @@ public class DCapture
             $config->headless = true;
         }
 
+        if ($this->script->fixedStep) {
+            visu::runtime::pinClock();
+        }
+
         int32? $width = $this->script->width;
         if ($width != null) {
             int32 $w = guard $width;
@@ -154,6 +172,37 @@ public class DCapture
         foreach ($due as $step) {
             $this->apply($step, $console);
         }
+    }
+
+    /**
+     * Feed scripted clicks into `$input` as the window would: the release of a pending click
+     * once its press frame is over, then the cursor move and press of every click due now.
+     * The Host calls it next to `advance`, before the frame's systems read input.
+     */
+    public function feed(InputHub $input, Window $window) : void
+    {
+        if ($this->clickFrame >= 0 && $this->frame > $this->clickFrame) {
+            $input->handle($window, HostEvent::button(MouseButton::left, KeyPhase::release, 0));
+            $this->clickFrame = -1;
+            $this->dumps->note('click released');
+        }
+
+        if (!$this->pendingClick) {
+            return;
+        }
+
+        $this->pendingClick = false;
+        $input->handle($window, HostEvent::cursor($this->pendingX, $this->pendingY));
+        $input->handle($window, HostEvent::button(MouseButton::left, KeyPhase::press, 0));
+        $this->clickFrame = $this->frame;
+        $this->dumps->note("click pressed at {$this->pendingX:.0f} {$this->pendingY:.0f}");
+    }
+
+    private function press(Step $step) : void
+    {
+        $this->pendingClick = true;
+        $this->pendingX = $step->clickX;
+        $this->pendingY = $step->clickY;
     }
 
     public const function cameraOverride() : CameraOverrideData?
@@ -199,6 +248,10 @@ public class DCapture
             CameraSpec::pose($position, $orientation, $fov) => {
                 $this->pinCamera($position, $orientation, $fov);
             },
+        }
+
+        if ($step->click) {
+            $this->press($step);
         }
 
         foreach ($step->console as $line) {

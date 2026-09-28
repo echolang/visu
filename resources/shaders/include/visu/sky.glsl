@@ -1,7 +1,8 @@
 /**
  * Procedural atmosphere at uniform slot 2: single-scattering Rayleigh
- * and Mie along the view ray, a ground hemisphere below the horizon,
- * and an optional sun disk. Mirrors visu::graphics::SkyUniforms.
+ * and Mie along the view ray under the sun and the moon, a ground
+ * hemisphere below the horizon, an optional sun disk, and an optional
+ * moon disc and star field. Mirrors visu::graphics::SkyUniforms.
  *
  * The same function feeds the per-pixel background, the probe bake
  * and any forward-lit geometry drawn into the probe, so they agree.
@@ -27,6 +28,12 @@ layout(std140, set = 0, binding = VISU_SKY_SLOT) uniform SkyUniforms {
     vec4 u_sky_ground;
     // x view samples, y light samples, z planet radius, w atmosphere radius (m)
     vec4 u_sky_params;
+    // xyz unit vector towards the moon, w moon light the atmosphere scatters (0 none)
+    vec4 u_sky_moon;
+    // x illumination, y earthshine, z cos of the disc radius, w star brightness
+    vec4 u_sky_moon_params;
+    // rgb moon tint, w 1 draws the moon disc and the stars
+    vec4 u_sky_moon_color;
 };
 
 const float SKY_PI = 3.14159265359;
@@ -37,6 +44,21 @@ const float SKY_SUN_EDGE = 0.00087;
 // single scattering alone leaves the dome about a quarter as bright as a real sky
 // against the same sun; this stands in for the missing multiple scattering
 const float SKY_MULTIPLE_SCATTERING = 4.0;
+// radiance of the fully lit moon disc before transmittance; tonemaps close to white
+const float SKY_MOON_RADIANCE = 2.2;
+// soft edge on the moon disc as a fraction of its radius
+const float SKY_MOON_EDGE = 0.06;
+// angular falloff of the glow around the moon, radians, and its strength per unit moon light
+const float SKY_MOON_HALO_WIDTH = 0.045;
+const float SKY_MOON_HALO = 0.35;
+// star grid cells across a unit direction; a cell is about eight pixels at 1440p
+const float SKY_STAR_CELLS = 180.0;
+// share of cells that hold a star
+const float SKY_STAR_DENSITY = 0.045;
+// sine of the sun elevation where night starts to fall and where it is complete;
+// mirrors MOON_DUSK_START / MOON_DUSK_END in visu::graphics (moon.eco)
+const float SKY_DUSK_START = 0.035;
+const float SKY_DUSK_END = -0.14;
 
 /**
  * Ray against a sphere at the origin: (entry, exit) distances, both
@@ -144,12 +166,26 @@ vec3 sky_inscatter_n(vec3 dir, int view_samples, int light_samples, out vec3 tra
     vec3 sum_r = vec3(0.0);
     vec3 sum_m = vec3(0.0);
     vec2 depth_view = vec2(0.0);
+    // the moon shares the view march; its light loop only runs while it is up and lit,
+    // which is the same for every pixel of the draw
+    bool moon_on = u_sky_moon.w > 0.0;
+    vec3 to_moon = u_sky_moon.xyz;
+    vec3 moon_r = vec3(0.0);
+    vec3 moon_m = vec3(0.0);
 
     for (int i = 0; i < view_samples; i++) {
         vec3 p = o + dir * ((float(i) + 0.5) * step_len);
         float h = max(length(p) - rg, 0.0);
         vec2 dens = exp(-h / scale) * step_len;
         depth_view += dens;
+
+        if (moon_on && sky_ray_sphere(p, to_moon, rg).x <= 0.0) {
+            vec2 moon_atmo = sky_ray_sphere(p, to_moon, rt);
+            vec2 moon_depth = sky_optical_depth(p, to_moon, max(moon_atmo.y, 0.0), light_samples);
+            vec3 tm = sky_extinction(depth_view + moon_depth);
+            moon_r += tm * dens.x;
+            moon_m += tm * dens.y;
+        }
 
         // the planet shadows this sample
         vec2 sun_ground = sky_ray_sphere(p, to_sun, rg);
@@ -165,8 +201,19 @@ vec3 sky_inscatter_n(vec3 dir, int view_samples, int light_samples, out vec3 tra
     }
 
     transmittance = sky_extinction(depth_view);
-    return (u_sky_sun.w * SKY_MULTIPLE_SCATTERING)
+    vec3 color = (u_sky_sun.w * SKY_MULTIPLE_SCATTERING)
         * (sum_r * u_sky_rayleigh.xyz * phase_r + sum_m * vec3(u_sky_mie.x) * phase_m);
+
+    if (moon_on) {
+        float mu_m = dot(dir, to_moon);
+        float moon_phase_r = 3.0 / (16.0 * SKY_PI) * (1.0 + mu_m * mu_m);
+        float moon_phase_m = 3.0 / (8.0 * SKY_PI) * ((1.0 - gg) * (1.0 + mu_m * mu_m))
+            / ((2.0 + gg) * pow(1.0 + gg - 2.0 * g * mu_m, 1.5));
+        color += (u_sky_moon.w * SKY_MULTIPLE_SCATTERING) * u_sky_moon_color.rgb
+            * (moon_r * u_sky_rayleigh.xyz * moon_phase_r + moon_m * vec3(u_sky_mie.x) * moon_phase_m);
+    }
+
+    return color;
 }
 
 vec3 sky_inscatter(vec3 dir, out vec3 transmittance, out float t_ground)
@@ -198,6 +245,125 @@ vec3 sky_sun_disk(vec3 dir, vec3 transmittance)
     return transmittance * (u_sky_sun.w * 500.0 * disk * limb);
 }
 
+float sky_hash(vec3 p)
+{
+    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yxz + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+vec3 sky_hash3(vec3 p)
+{
+    return vec3(sky_hash(p), sky_hash(p + 17.13), sky_hash(p + 41.71));
+}
+
+float sky_value_noise(vec2 x)
+{
+    vec2 i = floor(x);
+    vec2 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = sky_hash(vec3(i, 0.0));
+    float b = sky_hash(vec3(i + vec2(1.0, 0.0), 0.0));
+    float c = sky_hash(vec3(i + vec2(0.0, 1.0), 0.0));
+    float d = sky_hash(vec3(i + vec2(1.0, 1.0), 0.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+/**
+ * Moon disc seen through `transmittance`. The disc is a sphere lit from the sun
+ * direction, so the terminator follows the true phase; the unlit side keeps a
+ * little earthshine. Zero off the disc.
+ */
+vec3 sky_moon_disk(vec3 dir, vec3 transmittance)
+{
+    vec3 m = u_sky_moon.xyz;
+    float c = dot(dir, m);
+    float cr = u_sky_moon_params.z;
+
+    if (c <= cr) {
+        return vec3(0.0);
+    }
+
+    vec3 side = cross(m, vec3(0.0, 1.0, 0.0));
+
+    if (dot(side, side) < 1e-6) {
+        side = vec3(1.0, 0.0, 0.0);
+    }
+
+    vec3 right = normalize(side);
+    vec3 up = cross(right, m);
+    float radius = sqrt(max(1.0 - cr * cr, 1e-8));
+    vec2 q = vec2(dot(dir, right), dot(dir, up)) / radius;
+    float rr = dot(q, q);
+
+    if (rr >= 1.0) {
+        return vec3(0.0);
+    }
+
+    float edge = 1.0 - smoothstep(1.0 - SKY_MOON_EDGE, 1.0, sqrt(rr));
+    // the face turned towards the observer, lit from where the sun is
+    vec3 n = right * q.x + up * q.y - m * sqrt(1.0 - rr);
+    float lit = max(dot(n, u_sky_sun.xyz), 0.0);
+    float maria = sky_value_noise(q * 2.2 + 3.1) * 0.6 + sky_value_noise(q * 6.0 + 11.7) * 0.3
+        + sky_value_noise(q * 15.0 + 5.3) * 0.1;
+    float albedo = mix(0.45, 1.0, smoothstep(0.38, 0.62, maria));
+    float limb = 0.75 + 0.25 * sqrt(1.0 - rr);
+    vec3 tint = mix(vec3(1.0), u_sky_moon_color.rgb, 0.35);
+    float light = lit * limb + u_sky_moon_params.y;
+    return transmittance * tint * (SKY_MOON_RADIANCE * albedo * light * edge);
+}
+
+/**
+ * Soft glow around the moon, scaled by the light it casts, so a full moon lights the
+ * haze around it and a thin crescent barely does. One dot product a pixel.
+ */
+vec3 sky_moon_halo(vec3 dir, vec3 transmittance)
+{
+    float c = clamp(dot(dir, u_sky_moon.xyz), -1.0, 1.0);
+
+    if (c <= 0.0 || u_sky_moon.w <= 0.0) {
+        return vec3(0.0);
+    }
+
+    float angle = sqrt(max(2.0 * (1.0 - c), 0.0));
+    return transmittance * u_sky_moon_color.rgb * (u_sky_moon.w * SKY_MOON_HALO * exp(-angle / SKY_MOON_HALO_WIDTH));
+}
+
+/**
+ * Fixed stars: one hashed point per grid cell on the view direction, a few
+ * percent of cells lit. They come out as the sun sets and
+ * drown in a bright sky, so a moonlit dome keeps only the brightest. The fade
+ * band is the renderer's night band, the one the night ambient uses.
+ */
+vec3 sky_stars(vec3 dir, vec3 transmittance, vec3 sky)
+{
+    // smoothstep needs edge0 < edge1, so fade in as one minus the rise
+    float fade = (1.0 - smoothstep(SKY_DUSK_END, SKY_DUSK_START, u_sky_sun.y)) * u_sky_moon_params.w;
+
+    if (fade <= 0.0 || dir.y <= 0.0) {
+        return vec3(0.0);
+    }
+
+    vec3 p = dir * SKY_STAR_CELLS;
+    vec3 cell = floor(p);
+    float h = sky_hash(cell);
+
+    if (h > SKY_STAR_DENSITY) {
+        return vec3(0.0);
+    }
+
+    vec3 at = cell + 0.2 + 0.6 * sky_hash3(cell + 5.0);
+    float d = length(p - at);
+    float core = exp(-d * d * 60.0);
+    // brightness follows a steep power law: many faint stars, a few bright ones
+    float mag = pow(h / SKY_STAR_DENSITY, 6.0) * 3.5 + 0.12;
+    float warm = sky_hash(cell + 9.0);
+    vec3 color = mix(vec3(0.75, 0.85, 1.0), vec3(1.0, 0.85, 0.65), warm);
+    float lum = dot(sky, vec3(0.2126, 0.7152, 0.0722));
+    float drown = exp(-lum * 60.0);
+    return transmittance * color * (core * mag * fade * drown);
+}
+
 /**
  * Radiance arriving from `dir`: sky, or sunlit ground with aerial perspective
  * below the horizon. Multiplied by the exposure knob.
@@ -213,6 +379,13 @@ vec3 sky_radiance(vec3 dir)
             color += sky_sun_disk(dir, transmittance);
         }
 
+        if (u_sky_moon_color.w > 0.5) {
+            vec3 sky = color;
+            color += sky_moon_halo(dir, transmittance);
+            color += sky_moon_disk(dir, transmittance);
+            color += sky_stars(dir, transmittance, sky);
+        }
+
         return color * u_sky_ground.w;
     }
 
@@ -221,6 +394,12 @@ vec3 sky_radiance(vec3 dir)
     vec3 n = normalize(p);
     vec3 to_sun = u_sky_sun.xyz;
     vec3 sun = sky_transmittance_from(p, to_sun) * (u_sky_sun.w * max(dot(n, to_sun), 0.0) / SKY_PI);
+
+    if (u_sky_moon.w > 0.0) {
+        vec3 to_moon = u_sky_moon.xyz;
+        sun += sky_transmittance_from(p, to_moon) * u_sky_moon_color.rgb
+            * (u_sky_moon.w * max(dot(n, to_moon), 0.0) / SKY_PI);
+    }
     vec3 up_transmittance;
     float up_ground;
     vec3 mirrored = reflect(dir, n);

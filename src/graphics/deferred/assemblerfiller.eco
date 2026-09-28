@@ -1,0 +1,36 @@
+/**
+ * `DeferredRenderer.draw`'s filler: culls and sorts one draw-call assembler, then records it with
+ * the instanced geometry program.
+ */
+
+namespace visu::graphics;
+
+internal class AssemblerFiller<P> : GeometryFiller
+{
+    private DrawCallAssembler<P> $dca;
+    private GpuPass $pass;
+
+    public constructor(DrawCallAssembler<P> $dca, GpuPass $pass)
+    {
+        $this->dca = $dca;
+        $this->pass = $pass;
+    }
+
+    public function name() : string
+    {
+        return 'assembler';
+    }
+
+    public function record(RenderContext $ctx, RenderEncoder $enc) : status<PipelineError>
+    {
+        CameraData $camera = $ctx->frame->get<CameraData>();
+        $this->dca->build($camera->cullFrustum, $camera->cullPosition);
+        if ($this->dca->commandCount() == 0) {
+            return .ok;
+        }
+
+        $this->pass->bind($enc);
+        $this->dca->execute($enc, $this->pass);
+        return .ok;
+    }
+}

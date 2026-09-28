@@ -2,7 +2,7 @@
  * Exponential height fog at uniform slot VISU_FOG_SLOT (3 unless a caller
  * overrides it). Density falls off with height, colour is either a constant
  * radiance or the atmosphere's horizon in the pixel's azimuth, and a
- * directional term glows towards the sun. Applied in linear HDR before
+ * directional term glows towards the sun and the moon. Applied in linear HDR before
  * tonemap. Mirrors visu::graphics::FogUniforms. D0 (density at the camera)
  * is collapsed on the CPU.
  */
@@ -26,6 +26,14 @@ layout(std140, set = 0, binding = VISU_FOG_SLOT) uniform FogUniforms {
     vec4 u_fog_sun;
     // x sky view samples, y sky light samples
     vec4 u_fog_samples;
+    // rgb directional inscattering towards the moon (already moon tinted), w exponent
+    vec4 u_fog_moon;
+    // x shaft scatter, y glow occlusion, w 1 when the resolved shafts are bound
+    vec4 u_fog_shafts;
+    // rgb key light radiance for the shafts, w 1 when the moon is the key light
+    vec4 u_fog_shaft_light;
+    // x core anisotropy, y wide anisotropy, z wide lobe share
+    vec4 u_fog_shaft_phase;
 };
 
 /**
@@ -124,7 +132,9 @@ vec3 fog_apply(vec3 color, vec3 relative)
     float t = max(exp(-(optical - fog_integral(dy, min(len, start)))), 1.0 - u_fog_density.z);
     float td = exp(-(optical - fog_integral(dy, min(len, start + u_fog_params.w))));
     float sun = pow(max(dot(dir, u_sky_sun.xyz), 0.0), u_fog_sun.w);
-    vec3 fog = fog_color(dir) * (1.0 - t) + u_fog_sun.rgb * sun * (1.0 - td);
+    float moon = pow(max(dot(dir, u_sky_moon.xyz), 0.0), max(u_fog_moon.w, 1.0));
+    vec3 glow = u_fog_sun.rgb * sun + u_fog_moon.rgb * moon;
+    vec3 fog = fog_color(dir) * (1.0 - t) + glow * (1.0 - td);
     return color * t + fog;
 }
 
@@ -136,5 +146,80 @@ vec3 fog_apply_sky(vec3 color, vec3 dir)
     vec3 d = normalize(dir);
     return fog_apply(color, d * u_fog_params.z);
 }
+
+#ifdef VISU_FOG_RAYS
+#include "visu/godrays.glsl"
+
+/**
+ * `fog_apply` with this frame's light shafts at screen `uv`. Without them bound it is
+ * `fog_apply` itself, so a frame with god rays off shades exactly as before. With them, the
+ * directional glow dims by the shadowed share of its ray and the key light's shadowed
+ * inscatter is added on top.
+ */
+vec3 fog_apply_rays_at(vec3 color, vec3 relative, vec2 uv, float fetchDist);
+
+vec3 fog_apply_rays(vec3 color, vec3 relative, vec2 uv)
+{
+    if (u_fog_shafts.w < 0.5) {
+        return fog_apply(color, relative);
+    }
+
+    return fog_apply_rays_at(color, relative, uv, length(relative));
+}
+
+/**
+ * The shaft path proper. `fetchDist` is the distance the shaft texels were marched to for
+ * this pixel: its own for geometry, the march's sky sentinel for the sky.
+ */
+vec3 fog_apply_rays_at(vec3 color, vec3 relative, vec2 uv, float fetchDist)
+{
+
+    if (u_fog_density.w < 0.5) {
+        return color;
+    }
+
+    float len = length(relative);
+
+    if (len < 1e-3) {
+        return color;
+    }
+
+    float cutoff = u_fog_params.y;
+
+    if (cutoff > 0.0 && len > cutoff) {
+        return color;
+    }
+
+    vec3 dir = relative / len;
+    float dy = dir.y;
+    float start = u_fog_params.x;
+    float optical = fog_integral(dy, len);
+    float t = max(exp(-(optical - fog_integral(dy, min(len, start)))), 1.0 - u_fog_density.z);
+    float td = exp(-(optical - fog_integral(dy, min(len, start + u_fog_params.w))));
+    vec2 shaft = godrays_fetch(uv, fetchDist);
+    float occlude = mix(1.0, shaft.y, u_fog_shafts.y);
+    float sun = pow(max(dot(dir, u_sky_sun.xyz), 0.0), u_fog_sun.w);
+    float moon = pow(max(dot(dir, u_sky_moon.xyz), 0.0), max(u_fog_moon.w, 1.0));
+    vec3 glow = (u_fog_sun.rgb * sun + u_fog_moon.rgb * moon) * occlude;
+    vec3 fog = fog_color(dir) * (1.0 - t) + glow * (1.0 - td);
+    vec3 toLight = u_fog_shaft_light.w > 0.5 ? u_sky_moon.xyz : u_sky_sun.xyz;
+    float phase = godrays_phase2(dot(dir, toLight), u_fog_shaft_phase.xyz);
+    vec3 rays = u_fog_shaft_light.rgb * (phase * shaft.x * u_fog_shafts.x);
+    return color * t + fog + rays;
+}
+
+/**
+ * `fog_apply_sky` with the shafts.
+ */
+vec3 fog_apply_sky_rays(vec3 color, vec3 dir, vec2 uv)
+{
+    if (u_fog_shafts.w < 0.5) {
+        return fog_apply_sky(color, dir);
+    }
+
+    vec3 d = normalize(dir);
+    return fog_apply_rays_at(color, d * u_fog_params.z, uv, GODRAY_SKY_DEPTH);
+}
+#endif
 
 #endif

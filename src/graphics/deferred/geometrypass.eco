@@ -1,0 +1,90 @@
+/**
+ * The GBuffer fill: one render encoder for every `GeometryFiller` that joined this frame. On a
+ * tiled GPU each encoder loads and stores all seven attachments, so one encoder instead of one
+ * per system saves that traffic twice over.
+ *
+ * `--flag gbuffer.split=true` opens one encoder per filler inside its own profile scope, for
+ * per-system GPU times (`render/deferred.geometry/terrain`). Merged, the GPU time is on
+ * `render/deferred.geometry` and the filler scopes carry CPU only.
+ */
+
+namespace visu::graphics;
+
+public class GeometryPass : Pass
+{
+    private GBufferData $gbuffer;
+    private GeometryFillers $fillers;
+    private UniformBuffer $camera;
+    private bool $split;
+
+    public constructor(GBufferData $gbuffer, GeometryFillers $fillers, UniformBuffer $camera, bool $split)
+    {
+        $this->gbuffer = $gbuffer;
+        $this->fillers = $fillers;
+        $this->camera = $camera;
+        $this->split = $split;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.geometry';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        $io->writes($this->gbuffer->target);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        if ($this->split) {
+            return $this->executeSplit($ctx);
+        }
+
+        // opened even with no filler: the encoder is what performs the GBuffer clear
+        RenderEncoder $enc = guard $ctx->beginRender($this->gbuffer->target) else ($e) {
+            return .error($e);
+        }
+        foreach ($this->fillers->list as $filler) {
+            $this->camera->bind($enc);
+            visu::profile::begin($filler->name());
+            status<PipelineError> $done = $filler->record($ctx, $enc);
+            visu::profile::end();
+            guard $done else ($e) {
+                $enc->endRender();
+                return .error($e);
+            }
+        }
+
+        $enc->endRender();
+        return .ok;
+    }
+
+    private function executeSplit(RenderContext $ctx) : status<PipelineError>
+    {
+        if ($this->fillers->list->empty()) {
+            RenderEncoder $clear = guard $ctx->beginRender($this->gbuffer->target) else ($e) {
+                return .error($e);
+            }
+            $clear->endRender();
+            return .ok;
+        }
+
+        foreach ($this->fillers->list as $filler) {
+            visu::profile::begin($filler->name());
+            RenderEncoder $enc = guard $ctx->beginRender($this->gbuffer->target) else ($e) {
+                visu::profile::end();
+                return .error($e);
+            }
+            $this->camera->bind($enc);
+            status<PipelineError> $done = $filler->record($ctx, $enc);
+            $enc->endRender();
+            visu::profile::end();
+            guard $done else ($e) {
+                return .error($e);
+            }
+        }
+
+        return .ok;
+    }
+}

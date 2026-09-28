@@ -8,7 +8,7 @@ namespace visu::dcapture;
 use visu::app::HostPassData;
 use visu::graphics::{
     DeferredView, EnvironmentData, Frame, GBufferData, IblData, LightPassData, Pool,
-    SsaoData, SsaoRawData, TextureRef
+    SsaoData, SsaoRawData, TextureRef, WaterFrame
 };
 
 public function builtinProviders() : array<DumpProvider>
@@ -88,6 +88,15 @@ public class DeferredProvider : DumpProvider
             $out->add('pbr.ibl.irradiance', .texture($maps->irradiance, .color));
             $out->add('pbr.ibl.prefilter', .texture($maps->prefilter, .color));
             $out->add('pbr.ibl.brdf', .texture($maps->brdfLut, .color));
+        }
+
+        WaterFrame? $water = $frame->find<WaterFrame>();
+        if ($water != null) {
+            WaterFrame $held = guard $water;
+            TextureRef $color = guard $held->color else {
+                return;
+            }
+            $out->add('reflect.color', .texture($color, .color));
         }
     }
 

@@ -52,7 +52,7 @@ public class SsaoPass : Pass
             return .error(.shader($e));
         }
 
-        RenderEncoder $enc = guard $ctx->beginRender($data->target) else ($e) {
+        RenderEncoder $enc = guard $ctx->beginRender($data->target, overwrite: true) else ($e) {
             return .error($e);
         }
         Device $device = $ctx->device;
@@ -101,11 +101,44 @@ public class SsaoBlurPass : Pass
     {
         SsaoRawData $raw = $frame->get<SsaoRawData>();
         $io->reads($raw->output);
-        TargetRef $target = $pipeline->createTarget(
-            'ssaoBlur',
-            $raw->target->width,
-            $raw->target->height
-        );
+        // full float between the halves, so the two passes sum like the 7 x 7 box did
+        TargetRef $target = $pipeline->createTarget('ssaoBlurH', $raw->target->width, $raw->target->height);
+        TextureRef $output = $pipeline->createColor($target, 'output', TextureOptions($format: .r32f));
+        $frame->set(SsaoAcrossData($target, $output));
+        $io->writes($target);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        SsaoRawData $raw = $ctx->frame->get<SsaoRawData>();
+        SsaoAcrossData $data = $ctx->frame->get<SsaoAcrossData>();
+        return ssaoBlur($ctx, $this->gpu, 'ssao_blur', $data->target, $raw->output);
+    }
+}
+
+/**
+ * The vertical half of the separable blur: the horizontal result in, the occlusion the light
+ * pass reads out.
+ */
+public class SsaoBlurVerticalPass : Pass
+{
+    private DeferredGpu $gpu;
+
+    public constructor(DeferredGpu $gpu)
+    {
+        $this->gpu = $gpu;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.ssao.blur.v';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        SsaoAcrossData $across = $frame->get<SsaoAcrossData>();
+        $io->reads($across->output);
+        TargetRef $target = $pipeline->createTarget('ssaoBlur', $across->target->width, $across->target->height);
         TextureRef $output = $pipeline->createColor($target, 'output', occlusionOptions());
         $frame->set(SsaoData($target, $output));
         $io->writes($target);
@@ -113,30 +146,59 @@ public class SsaoBlurPass : Pass
 
     public function execute(RenderContext $ctx) : status<PipelineError>
     {
-        SsaoRawData $raw = $ctx->frame->get<SsaoRawData>();
+        SsaoAcrossData $across = $ctx->frame->get<SsaoAcrossData>();
         SsaoData $data = $ctx->frame->get<SsaoData>();
-        ShaderProgram $program = guard $this->gpu->shaders->program('ssao_blur') else ($e) {
-            return .error(.shader($e));
-        }
-
-        RenderEncoder $enc = guard $ctx->beginRender($data->target) else ($e) {
-            return .error($e);
-        }
-        Device $device = $ctx->device;
-        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
-            return .quad($device);
-        });
-        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
-        $pass->bind($enc);
-
-        guard bindPooled($ctx, $enc, 0, $raw->output, $this->gpu->linear) else ($e) {
-            $enc->endRender();
-            return .error($e);
-        }
-        $mesh->draw($enc);
-        $enc->endRender();
-        return .ok;
+        return ssaoBlur($ctx, $this->gpu, 'ssao_blur+vertical', $data->target, $across->output);
     }
+}
+
+/**
+ * The horizontal half of the SSAO blur, before the vertical pass.
+ */
+internal class SsaoAcrossData
+{
+    public const TargetRef $target;
+    public const TextureRef $output;
+
+    public constructor(TargetRef $target, TextureRef $output)
+    {
+        $this->target = $target;
+        $this->output = $output;
+    }
+}
+
+/**
+ * One 7-tap half of the box blur: `$source` into `$target`, every pixel written.
+ */
+internal function ssaoBlur(
+    RenderContext $ctx,
+    DeferredGpu $gpu,
+    const string& $name,
+    TargetRef $target,
+    TextureRef $source
+) : status<PipelineError>
+{
+    ShaderProgram $program = guard $gpu->shaders->program($name) else ($e) {
+        return .error(.shader($e));
+    }
+
+    RenderEncoder $enc = guard $ctx->beginRender($target, overwrite: true) else ($e) {
+        return .error($e);
+    }
+    Device $device = $ctx->device;
+    Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+        return .quad($device);
+    });
+    GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+    $pass->bind($enc);
+
+    guard bindPooled($ctx, $enc, 0, $source, $gpu->linear) else ($e) {
+        $enc->endRender();
+        return .error($e);
+    }
+    $mesh->draw($enc);
+    $enc->endRender();
+    return .ok;
 }
 
 /**
