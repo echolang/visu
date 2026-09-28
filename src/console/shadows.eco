@@ -11,7 +11,7 @@ use visu::graphics::{
 use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
 use visu::signal::ConsoleCommandSignal;
 
-internal const SHADOWS_USAGE = 'usage: shadows [on|off|toggle|debug|splits [d0 d1 d2 d3 d4]]';
+internal const SHADOWS_USAGE = 'usage: shadows [on|off|toggle|debug|step <deg>|splits [d0 d1 d2 d3 d4]]';
 
 public class ShadowConsole : ConsoleCommandHandler
 {
@@ -30,7 +30,7 @@ public class ShadowConsole : ConsoleCommandHandler
 
     public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
     {
-        $registry->add('shadows', $this, 'on|off|toggle|debug|splits [d0 d1 d2 d3 d4]');
+        $registry->add('shadows', $this, 'on|off|toggle|debug|step <deg>|splits [d0 d1 d2 d3 d4]');
         array<string> $names = array<string>();
         $names[] = 'shadows';
         return $names;
@@ -51,6 +51,11 @@ public class ShadowConsole : ConsoleCommandHandler
         string $verb = $cmd->parts[1];
         if ($verb == 'splits') {
             $this->onSplits($cmd, $console);
+            return;
+        }
+
+        if ($verb == 'step') {
+            $this->onStep($cmd, $console);
             return;
         }
 
@@ -126,6 +131,36 @@ public class ShadowConsole : ConsoleCommandHandler
 
         applyShadowSplits($quality, $splits);
         $console->writeLine(shadowsSplitsLine($quality));
+    }
+
+    /**
+     * `shadows step <deg>`: how far the key light turns before the cascades follow it, 0 to
+     * follow it every frame.
+     */
+    private function onStep(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        ShadowQuality $quality = $this->quality();
+        if ($cmd->parts->count() == 2) {
+            $console->writeLine("shadows step: {$quality->directionStep:.2f} deg");
+            return;
+        }
+
+        if ($cmd->parts->count() != 3) {
+            $console->writeLine(SHADOWS_USAGE);
+            return;
+        }
+
+        float64 $raw = guard str::float($cmd->parts[2]) else {
+            $console->writeLine(SHADOWS_USAGE);
+            return;
+        }
+        if ($raw < 0.0) {
+            $console->writeLine('shadows: step must be 0 or more');
+            return;
+        }
+
+        $quality->directionStep = $raw as float32;
+        $console->writeLine("shadows step: {$quality->directionStep:.2f} deg");
     }
 
     private function enable() : void

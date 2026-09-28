@@ -7,7 +7,8 @@
 
 namespace visu::graphics;
 
-use visu::math::{Vec3, Vec4};
+use std::math;
+use visu::math::{Vec3, Vec4, dot, normalize};
 
 public class DeferredRenderer
 {
@@ -90,6 +91,13 @@ public class DeferredRenderer
     private Texture? $shadowMap;
     private GodRayHistory? $godRayHistory;
     private SkyViewLut? $skyViewMain;
+
+    /**
+     * The key light direction the cascades were last fitted to, valid while `shadowHeldSet`.
+     * See `ShadowQuality.directionStep`.
+     */
+    private Vec3 $shadowHeld;
+    private bool $shadowHeldSet;
     private SkyViewLut? $skyViewMirror;
     private array<ShadowCaster> $casters;
     private GeometryFillers $geometry;
@@ -120,6 +128,8 @@ public class DeferredRenderer
         $this->splitGeometry = visu::app::flags()->bool('gbuffer.split', false);
         $this->skyView = visu::app::flags()->bool('sky.view', true);
         $this->skyViewMain = null;
+        $this->shadowHeld = Vec3(0.0f, -1.0f, 0.0f);
+        $this->shadowHeldSet = false;
         $this->skyViewMirror = null;
         $this->outline = OutlineData();
         OutlineStyle[4] $styles;
@@ -281,7 +291,7 @@ public class DeferredRenderer
                 ShadowQuality $quality = guard $shadows;
                 $pipeline->add(ShadowMapPass(
                     $this->ensureShadowMap($quality),
-                    $key,
+                    $this->shadowLight($key, $quality),
                     $quality,
                     $this->casters
                 ));
@@ -536,6 +546,29 @@ public class DeferredRenderer
             return $fresh->prepare($pipeline, $gpu, $this->skyViewUniforms($eye, MIRROR_SKY_VIEW_SAMPLES, MIRROR_SKY_LIGHT_SAMPLES));
         }
         return $lut->prepare($pipeline, $gpu, $this->skyViewUniforms($eye, MIRROR_SKY_VIEW_SAMPLES, MIRROR_SKY_LIGHT_SAMPLES));
+    }
+
+    /**
+     * `$key` with the direction the cascades hold: the light's own until it has turned more
+     * than `directionStep` away from the held one, then the held one moves to it in one step.
+     */
+    private function shadowLight(DirectionalLight $key, const ShadowQuality& $quality) : DirectionalLight
+    {
+        Vec3 $dir = normalize($key->direction);
+        if ($quality->directionStep <= 0.0f) {
+            $this->shadowHeldSet = false;
+            return $key;
+        }
+
+        float32 $limit = math::cos((($quality->directionStep as float64) * math::PI / 180.0)) as float32;
+        if (!$this->shadowHeldSet || dot($dir, $this->shadowHeld) < $limit) {
+            $this->shadowHeld = $dir;
+            $this->shadowHeldSet = true;
+        }
+
+        DirectionalLight $held = $key;
+        $held->direction = $this->shadowHeld;
+        return $held;
     }
 
     private function skyViewUniforms(Vec3 $eye, float32 $viewSamples, float32 $lightSamples) : SkyUniforms
