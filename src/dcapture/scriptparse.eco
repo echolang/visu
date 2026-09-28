@@ -306,9 +306,22 @@ internal function parseCamera(json::Value $v, const string& $path) : result<Came
     return .ok(.pose($position, $orientation, $fov));
 }
 
-internal function parseStep(json::Value $item, int32 $index) : result<Step, DCaptureError>
+/**
+ * A step with no timing key, applied the moment it arrives: a live debug client's step. Any
+ * `frame`, `tick` or `after` it carries is ignored.
+ */
+internal function parseLiveStep(json::Value $item) : result<Step, DCaptureError>
+{
+    return parseStep($item, 0, $timed: false);
+}
+
+internal function parseStep(json::Value $item, int32 $index, bool $timed = true) : result<Step, DCaptureError>
 {
     string $path = "steps[{$index}]";
+    if (!$timed) {
+        $path = 'step';
+    }
+
     if (!$item->isObject()) {
         return .error(.notObject($path));
     }
@@ -337,7 +350,9 @@ internal function parseStep(json::Value $item, int32 $index) : result<Step, DCap
         $timings = $timings + 1;
         $at = StepAt::after($n as int32);
     }
-    if ($timings != 1) {
+    if (!$timed) {
+        $at = StepAt::after(0);
+    } else if ($timings != 1) {
         return .error(.timing($index));
     }
 

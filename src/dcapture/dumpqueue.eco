@@ -18,8 +18,8 @@ use visu::profile::{FrameProfile, StatsBook, writeProfile};
  */
 internal enum QueuedWork
 {
-    case dump(string $pattern, string $label);
-    case profile(int32 $frame, string $label);
+    case dump(string $pattern, string $label, int32 $ticket);
+    case profile(int32 $frame, string $label, int32 $ticket);
 }
 
 public class DumpQueue
@@ -27,9 +27,22 @@ public class DumpQueue
     public const string $out;
     private Dumper $dumper;
     private Manifest $manifest;
-    private array<DumpProvider> $providers;
+    private DumpProviders $providers;
+
+    /**
+     * Keep the run's manifest (events, records) and rewrite manifest.json. Off for a queue
+     * that lives as long as the process, so nothing grows without bound.
+     */
+    private bool $journal;
     private array<QueuedWork> $queue;
     private bool $listQueued;
+    private array<int32> $listTickets;
+
+    /**
+     * Told when ticketed work completes. A ticket is any positive number the caller picks;
+     * zero is untracked work, which only reaches the manifest.
+     */
+    public DumpSink? $sink;
     private bool $stopQueued;
     private bool $wroteAnything;
     private int32 $tick;
@@ -41,9 +54,12 @@ public class DumpQueue
         $this->out = $out;
         $this->dumper = Dumper($out);
         $this->manifest = Manifest();
-        $this->providers = builtinProviders();
+        $this->providers = DumpProviders(builtinProviders());
+        $this->journal = true;
         $this->queue = array<QueuedWork>();
         $this->listQueued = false;
+        $this->listTickets = array<int32>();
+        $this->sink = null;
         $this->stopQueued = false;
         $this->wroteAnything = false;
         $this->tick = 0;
@@ -59,9 +75,32 @@ public class DumpQueue
         $this->gpuLog = true;
     }
 
+    /**
+     * A second queue under `$out` that reads the same providers as `$shared`, so a provider added
+     * to either reaches both. Without a manifest: it is for a long-lived client that is told
+     * each result through the sink.
+     */
+    public constructor(string $out, sharing: DumpQueue $shared)
+    {
+        $this->out = $out;
+        $this->dumper = Dumper($out);
+        $this->manifest = Manifest();
+        $this->providers = $shared->providers;
+        $this->journal = false;
+        $this->queue = array<QueuedWork>();
+        $this->listQueued = false;
+        $this->listTickets = array<int32>();
+        $this->sink = null;
+        $this->stopQueued = false;
+        $this->wroteAnything = false;
+        $this->tick = 0;
+        $this->gpuLog = false;
+        $this->gpuFrames = 0;
+    }
+
     public function addProvider(DumpProvider $provider) : void
     {
-        $this->providers[] = $provider;
+        $this->providers->add($provider);
     }
 
     public function queue(const string& $pattern) : void
@@ -70,24 +109,27 @@ public class DumpQueue
         $this->queue($pattern, $empty);
     }
 
-    public function queue(const string& $pattern, const string& $label) : void
+    public function queue(const string& $pattern, const string& $label, int32 $ticket = 0) : void
     {
-        QueuedWork $dump = QueuedWork::dump($pattern, $label);
+        QueuedWork $dump = QueuedWork::dump($pattern, $label, $ticket);
         $this->queue[] = $dump;
     }
 
     /**
      * Write the profile tree of the frame being presented next, once its GPU spans landed.
      */
-    public function queueProfile(const string& $label) : void
+    public function queueProfile(const string& $label, int32 $ticket = 0) : void
     {
-        QueuedWork $item = QueuedWork::profile(-1, $label);
+        QueuedWork $item = QueuedWork::profile(-1, $label, $ticket);
         $this->queue[] = $item;
     }
 
-    public function queueList() : void
+    public function queueList(int32 $ticket = 0) : void
     {
         $this->listQueued = true;
+        if ($ticket > 0) {
+            $this->listTickets[] = $ticket;
+        }
     }
 
     public function queueStop() : void
@@ -107,12 +149,16 @@ public class DumpQueue
     public function afterPresent(Frame $frame, Pool $pool, Window $window, int32 $presented, int32 $tick) : void
     {
         $this->tick = $tick;
+        if ($this->queue->empty() && !$this->listQueued && !$this->stopQueued) {
+            return;
+        }
+
         $this->stampProfiles($presented);
         array<QueuedWork> $dumps = array<QueuedWork>();
         array<QueuedWork> $kept = array<QueuedWork>();
         foreach ($this->queue as $item) {
             match ($item) {
-                QueuedWork::dump($pattern, $label) => {
+                QueuedWork::dump($pattern, $label, $ticket) => {
                     $dumps[] = $item;
                 },
                 else => {
@@ -130,15 +176,15 @@ public class DumpQueue
         DumpCatalog $catalog = DumpCatalog();
         if ($needCatalog) {
             $pool->device->waitIdle();
-            foreach ($this->providers as $provider) {
+            foreach ($this->providers->all as $provider) {
                 $provider->describe($frame, $pool, $catalog);
             }
         }
 
         foreach ($dumps as $item) {
             match ($item) {
-                QueuedWork::dump($pattern, $label) => {
-                    $this->writeDump($catalog, $pool, $pattern, $label, $presented);
+                QueuedWork::dump($pattern, $label, $ticket) => {
+                    $this->writeDump($catalog, $pool, $pattern, $label, $ticket, $presented);
                 },
                 else => {
                 },
@@ -148,10 +194,22 @@ public class DumpQueue
         if ($this->listQueued) {
             $this->listQueued = false;
             array<string> $names = $catalog->names();
-            $this->manifest->catalog = $names;
+            if ($this->journal) {
+                $this->manifest->catalog = $names;
+            }
+
             int32 $count = $names->count() as int32;
             info("dcapture: {$count} dumpable names at frame {$presented}, see manifest.json");
             $this->wroteAnything = true;
+            array<int32> $tickets = $this->listTickets;
+            $this->listTickets = array<int32>();
+            DumpSink? $maybeSink = $this->sink;
+            if ($maybeSink != null) {
+                DumpSink $sink = guard $maybeSink;
+                foreach ($tickets as $ticket) {
+                    $sink->listed($ticket, $names);
+                }
+            }
         }
 
         if ($this->stopQueued) {
@@ -185,9 +243,10 @@ public class DumpQueue
         foreach ($have as $item) {
             bool $keep = true;
             match ($item) {
-                QueuedWork::profile($frame, $label) => {
+                QueuedWork::profile($frame, $label, $ticket) => {
                     if ($frame == $profile->frame) {
-                        $this->writeProfileFile($profile, $stats, $frame, $label);
+                        string $path = $this->writeProfileFile($profile, $stats, $frame, $label);
+                        $this->tellProfile($ticket, $path);
                         $wrote = true;
                         $keep = false;
                     }
@@ -224,18 +283,30 @@ public class DumpQueue
         $this->queue = array<QueuedWork>();
         foreach ($left as $item) {
             match ($item) {
-                QueuedWork::profile($frame, $label) => {
+                QueuedWork::profile($frame, $label, $ticket) => {
                     if ($frame < 0) {
                         $this->fail('profile: run ended before the step frame was presented');
                     } else {
                         $this->fail("profile f{$frame}: run ended before the frame completed");
                     }
+
+                    $this->tellProfile($ticket, '');
                 },
                 else => {
                 },
             }
         }
 
+        DumpSink? $endSink = $this->sink;
+        if ($endSink != null) {
+            DumpSink $sink = guard $endSink;
+            array<string> $none = array<string>();
+            foreach ($this->listTickets as $ticket) {
+                $sink->listed($ticket, $none);
+            }
+        }
+
+        $this->listTickets = array<int32>();
         if ($this->gpuLog) {
             string $ds = env::DS;
             info("dcapture: wrote {$this->out}{$ds}gpu.jsonl ({$this->gpuFrames} frames)");
@@ -250,12 +321,20 @@ public class DumpQueue
 
     public function note(string $text) : void
     {
+        if (!$this->journal) {
+            return;
+        }
+
         $this->manifest->events[] = $text;
     }
 
     public function fail(string $text) : void
     {
         info("dcapture: {$text}");
+        if (!$this->journal) {
+            return;
+        }
+
         $this->manifest->errors[] = $text;
     }
 
@@ -264,27 +343,56 @@ public class DumpQueue
         Pool $pool,
         string $pattern,
         string $label,
+        int32 $ticket,
         int32 $presented
     ) : void
     {
+        array<DumpRecord> $wrote = array<DumpRecord>();
+        array<string> $errors = array<string>();
         array<DumpEntry> $entries = $catalog->resolve($pattern);
         if ($entries->empty()) {
             DumpFailure $miss = .unknown($pattern);
             $this->fail($miss->message());
-            return;
+            $errors[] = $miss->message();
         }
 
         foreach ($entries as $entry) {
             array<DumpRecord> $records = guard $this->dumper->write($pool, $entry, $presented, $label) else ($e) {
                 $this->fail($e->message());
+                $errors[] = $e->message();
                 continue;
             }
             foreach ($records as $record) {
-                $this->manifest->dumps[] = $record;
+                if ($this->journal) {
+                    $this->manifest->dumps[] = $record;
+                }
+
+                $wrote[] = $record;
                 info("dcapture: wrote {$record->path}");
             }
             $this->wroteAnything = true;
         }
+
+        if ($ticket <= 0) {
+            return;
+        }
+
+        DumpSink $sink = guard $this->sink else {
+            return;
+        }
+        $sink->dumped($ticket, $entries->count(), $wrote, $errors);
+    }
+
+    private function tellProfile(int32 $ticket, const string& $path) : void
+    {
+        if ($ticket <= 0) {
+            return;
+        }
+
+        DumpSink $sink = guard $this->sink else {
+            return;
+        }
+        $sink->profiled($ticket, $path);
     }
 
     private function stampProfiles(int32 $presented) : void
@@ -292,9 +400,9 @@ public class DumpQueue
         int32 $i = 0;
         while ($i < ($this->queue->count() as int32)) {
             match ($this->queue[$i as usize]) {
-                QueuedWork::profile($frame, $label) => {
+                QueuedWork::profile($frame, $label, $ticket) => {
                     if ($frame < 0) {
-                        QueuedWork $stamped = QueuedWork::profile($presented, $label);
+                        QueuedWork $stamped = QueuedWork::profile($presented, $label, $ticket);
                         $this->queue[$i as usize] = $stamped;
                     }
                 },
@@ -310,19 +418,22 @@ public class DumpQueue
         const StatsBook& $stats,
         int32 $frame,
         string $label
-    ) : void
+    ) : string
     {
         guard ensureDir($this->out) else ($e) {
             $this->fail($e->message());
-            return;
+            return '';
         }
         string $ds = env::DS;
         string $path = "{$this->out}{$ds}profile.f{$frame}.json";
         guard writeProfile($path, $profile, $stats) else ($e) {
             $this->fail($e->message());
-            return;
+            return '';
         }
-        $this->manifest->profiles[] = ProfileRecord($frame, $path, $label);
+        if ($this->journal) {
+            $this->manifest->profiles[] = ProfileRecord($frame, $path, $label);
+        }
+
         string $gpu = 'gpu resolved';
 
         if (!$profile->gpuResolved) {
@@ -332,6 +443,7 @@ public class DumpQueue
         $this->note("frame {$frame}: profile written, {$gpu}");
         info("dcapture: wrote {$path}");
         $this->wroteAnything = true;
+        return $path;
     }
 
     private function appendGpuLog(const string& $line) : void
@@ -360,6 +472,10 @@ public class DumpQueue
 
     private function writeManifest() : void
     {
+        if (!$this->journal) {
+            return;
+        }
+
         guard ensureDir($this->out) else ($e) {
             info("dcapture: {$e->message()}");
             return;

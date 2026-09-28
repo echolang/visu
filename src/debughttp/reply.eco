@@ -1,0 +1,41 @@
+/**
+ * The main thread's answer to a `DebugRequest`. A worker turns it into the HTTP response, and
+ * streams `file` from disk when it is set, so the main thread never reads an image back in.
+ */
+
+namespace visu::debughttp;
+
+public struct DebugReply
+{
+    public int32 $status;
+    public string $type;
+    public string $body;
+    public string $file;
+
+    public constructor(json: const string& $body)
+    {
+        $this->status = 200;
+        $this->type = 'application/json';
+        $this->body = $body;
+        $this->file = '';
+    }
+
+    public constructor(file: const string& $path)
+    {
+        $this->status = 200;
+        $this->type = '';
+        $this->body = '';
+        $this->file = $path;
+    }
+
+    /**
+     * A failure carried as `{"error": ...}` JSON with its HTTP status.
+     */
+    public constructor(int32 $status, error: const string& $message)
+    {
+        $this->status = $status;
+        $this->type = 'application/json';
+        $this->body = errorJson($message);
+        $this->file = '';
+    }
+}
