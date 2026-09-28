@@ -51,4 +51,32 @@ vec3 pbr_shade_wrapped(in PBRSurface s, vec3 L, vec3 radiance, float wrap)
     return pbr_lit(s, L, radiance, NdotL);
 }
 
+/**
+ * Specular direction for a spherical source: the representative point on the
+ * sphere of `sourceRadius` around the light, as seen along the reflection.
+ * `toLight` is the vector from the surface to the light center. A zero radius
+ * falls back to that center.
+ */
+vec3 pbr_sphere_l(vec3 toLight, vec3 V, vec3 N, float sourceRadius)
+{
+    vec3 R = reflect(-V, N);
+    vec3 centerToRay = dot(toLight, R) * R - toLight;
+    float rayDist = length(centerToRay);
+    vec3 closest = toLight;
+    if (rayDist > 1e-4) {
+        closest = toLight + centerToRay * clamp(sourceRadius / rayDist, 0.0, 1.0);
+    }
+    return normalize(closest);
+}
+
+/**
+ * Diffuse from `centerDir` (surface toward the light center), specular from
+ * `specDir`. `wrap` is the foliage term the sun uses.
+ */
+vec3 pbr_shade_sphere(in PBRSurface s, vec3 centerDir, vec3 specDir, vec3 radiance, float wrap)
+{
+    float NdotL = max(dot(s.N, centerDir), 0.0) + wrap * max(dot(-s.N, centerDir), 0.0);
+    return pbr_lit(s, specDir, radiance, NdotL);
+}
+
 #endif

@@ -1,0 +1,177 @@
+/**
+ * Planar mirror: reflect a camera through a plane and clip the projection on that plane.
+ * The mirror is one view of the world from the reflected eye, so lights stay in world space.
+ * The basis is the reflected camera basis, which reverses winding. Draw it with cull flipped.
+ */
+
+namespace visu::graphics;
+
+use visu::geo::{Frustum, Plane};
+use visu::math::{
+    Mat4, Vec3, Vec4, clipZeroOne, dot, inverse, perspective
+};
+
+/**
+ * Reflect `$point` through `$plane`. The plane keeps `dot(normal, p) + distance = 0`.
+ */
+public function reflectPoint(Vec3 $point, const Plane& $plane) : Vec3
+{
+    float32 $signed = dot($plane->normal, $point) + $plane->distance;
+    return $point - $plane->normal * (2.0f * $signed);
+}
+
+/**
+ * Reflect a direction through `$plane`. Translation of the plane does not change it.
+ */
+public function reflectDirection(Vec3 $direction, const Plane& $plane) : Vec3
+{
+    return $direction - $plane->normal * (2.0f * dot($plane->normal, $direction));
+}
+
+/**
+ * View matrix of `$view` after reflecting its eye and its basis through `$plane`.
+ * `$eye` is the camera position that `$view` was built from.
+ */
+public function mirrorView(const Mat4& $view, Vec3 $eye, const Plane& $plane) : Mat4
+{
+    Vec3 $side = Vec3($view->c0->x, $view->c1->x, $view->c2->x);
+    Vec3 $up = Vec3($view->c0->y, $view->c1->y, $view->c2->y);
+    Vec3 $forward = -Vec3($view->c0->z, $view->c1->z, $view->c2->z);
+    return mirrorBasis(
+        reflectPoint($eye, $plane),
+        reflectDirection($side, $plane),
+        reflectDirection($up, $plane),
+        reflectDirection($forward, $plane)
+    );
+}
+
+/**
+ * `$plane` in the view space of `$view`. xyz is the normal, w the distance, same equation as `Plane`.
+ * The normal points at the side `Plane` keeps.
+ */
+public function viewPlane(const Mat4& $view, const Plane& $plane) : Vec4
+{
+    Vec3 $normal = ($view * Vec4($plane->normal, 0.0f))->xyz();
+    Vec3 $on = $plane->normal * (-$plane->distance);
+    Vec3 $viewOn = ($view * Vec4($on, 1.0f))->xyz();
+    return Vec4($normal, -dot($normal, $viewOn));
+}
+
+/**
+ * Replace the near plane of a zero-to-one projection with `$viewPlane`.
+ * `$viewPlane` is in view space and points at the half that stays.
+ * A point on the plane lands on clip z = 0. A point on the kept side stays at z >= 0.
+ */
+public function obliqueProjection(const Mat4& $projection, Vec4 $viewPlane) : Mat4
+{
+    float32 $sx = 1.0f;
+    if ($viewPlane->x < 0.0f) {
+        $sx = -1.0f;
+    }
+
+    float32 $sy = 1.0f;
+    if ($viewPlane->y < 0.0f) {
+        $sy = -1.0f;
+    }
+
+    Vec4 $corner = inverse($projection) * Vec4($sx, $sy, 1.0f, 1.0f);
+    float32 $denom = dot($viewPlane, $corner);
+    if ($denom > -0.00001f && $denom < 0.00001f) {
+        return $projection;
+    }
+
+    Vec4 $row = $viewPlane * (1.0f / $denom);
+    Mat4 $out = $projection;
+    $out->c0 = Vec4($out->c0->x, $out->c0->y, $row->x, $out->c0->w);
+    $out->c1 = Vec4($out->c1->x, $out->c1->y, $row->y, $out->c1->w);
+    $out->c2 = Vec4($out->c2->x, $out->c2->y, $row->z, $out->c2->w);
+    $out->c3 = Vec4($out->c3->x, $out->c3->y, $row->w, $out->c3->w);
+    return $out;
+}
+
+/**
+ * The main camera reflected through `$plane`. Field of view and aspect stay.
+ * The far clip is `$far` metres. The near plane of the projection is the water plane.
+ */
+public function mirrorCamera(
+    const CameraData& $camera,
+    const Plane& $plane,
+    float32 $far,
+    int32 $width = 0,
+    int32 $height = 0
+) : CameraData
+{
+    Mat4 $view = mirrorView($camera->view, $camera->position, $plane);
+    Vec3 $eye = reflectPoint($camera->position, $plane);
+    float32 $focal = $camera->projection->c1->y;
+    float32 $aspect = 1.0f;
+    if ($camera->projection->c0->x != 0.0f) {
+        $aspect = $focal / $camera->projection->c0->x;
+    }
+
+    float32 $fovY = 2.0f * (std::math::atan((1.0f / $focal) as float64) as float32);
+    float32 $near = 0.05f;
+    float32 $eyeSide = dot($plane->normal, $eye) + $plane->distance;
+    if ($eyeSide < 0.0f) {
+        $eyeSide = -$eyeSide;
+    }
+
+    // `$far` is the cull radius around the surface. A reflected eye farther from
+    // the plane than that radius would flip the oblique clip and keep the bed.
+    float32 $clipFar = $far;
+    if ($clipFar < $eyeSide + 1.0f) {
+        $clipFar = $eyeSide + $far;
+    }
+
+    if ($clipFar < $near + 1.0f) {
+        $clipFar = $near + 1.0f;
+    }
+
+    int32 $w = $width;
+    int32 $h = $height;
+    if ($w < 1) {
+        $w = $camera->resolutionX;
+    }
+
+    if ($h < 1) {
+        $h = $camera->resolutionY;
+    }
+
+    Mat4 $projection = clipZeroOne(perspective(
+        fovY: $fovY,
+        aspect: $aspect,
+        near: $near,
+        far: $clipFar
+    ));
+    $projection = obliqueProjection($projection, viewPlane($view, $plane));
+    Mat4 $projectionView = $projection * $view;
+    return CameraData(
+        $projection,
+        $view,
+        $projectionView,
+        inverse($projection),
+        inverse($projectionView),
+        Frustum(zeroOne: $projectionView),
+        $eye,
+        $camera->compensation,
+        $w,
+        $h,
+        $camera->contentScaleX,
+        $camera->contentScaleY,
+        $camera->viewport,
+        $camera->hasViewport
+    );
+}
+
+/**
+ * Same layout as `lookAt`, with the axes handed in. A mirrored basis keeps its reversed winding.
+ */
+internal function mirrorBasis(Vec3 $eye, Vec3 $side, Vec3 $up, Vec3 $forward) : Mat4
+{
+    return Mat4(
+        Vec4($side->x, $up->x, -$forward->x, 0.0f),
+        Vec4($side->y, $up->y, -$forward->y, 0.0f),
+        Vec4($side->z, $up->z, -$forward->z, 0.0f),
+        Vec4(-dot($side, $eye), -dot($up, $eye), dot($forward, $eye), 1.0f)
+    );
+}

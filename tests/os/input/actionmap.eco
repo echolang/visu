@@ -367,3 +367,45 @@ test action_map_chord_needs_its_modifiers
     status<InputError> $dup = $m->bind('again', .chord(.s, MOD_PRIMARY));
     assert($dup->failed(), 'taken');
 }
+
+test action_map_click_survives_a_second_poll_in_the_same_frame
+{
+    ActionMap $map = ActionMap();
+    guard $map->bind('move', .click) else ($e) {
+        die($e->message());
+    }
+    $map->handle(ClickSignal(0, Vec2(0.0f), Vec2(0.0f), 0.0f));
+    // a slow frame polls again before the render phase reads the click
+    $map->reset();
+    assert(!$map->hasBeenReleased('move'), 'the poll edge is gone');
+    assert($map->hasBeenReleasedThisFrame('move'), 'the frame edge is not');
+    assert($map->take('move'), 'a render reader still gets it');
+    assert(!$map->take('move'), 'once');
+    assert(!$map->hasBeenReleasedThisFrame('move'), 'taken from the frame too');
+}
+
+test action_map_take_consumes_both_edges
+{
+    ActionMap $map = ActionMap();
+    guard $map->bind('move', .click) else ($e) {
+        die($e->message());
+    }
+    $map->handle(ClickSignal(0, Vec2(0.0f), Vec2(0.0f), 0.0f));
+    assert($map->take('move'), 'first reader');
+    assert(!$map->hasBeenReleased('move'), 'poll edge consumed');
+    assert(!$map->hasBeenReleasedThisFrame('move'), 'frame edge consumed');
+}
+
+test action_map_end_frame_drops_frame_edges
+{
+    ActionMap $map = ActionMap();
+    guard $map->bind('bag', .key(.i)) else ($e) {
+        die($e->message());
+    }
+    $map->handle(KeySignal(.i, 0, .press, 0));
+    $map->reset();
+    assert($map->hasBeenPressedThisFrame('bag'), 'kept across the poll');
+    $map->endFrame();
+    assert(!$map->hasBeenPressedThisFrame('bag'), 'gone after the frame');
+    assert($map->down('bag'), 'held state stays');
+}

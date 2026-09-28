@@ -190,3 +190,17 @@ test script_profile_step_is_a_flag_not_a_frame_pad
     assert(!$plain->steps[0]->profile, 'profile defaults off');
     assert(($plain->impliedFrames() ?? 0) == 42, 'plain cap unchanged');
 }
+
+test script_click_takes_a_window_point
+{
+    Script $s = parsed('{"steps":[{"frame":5,"click":[640.5,360]},{"frame":6,"dump":"scene"}]}');
+    Step $click = $s->steps[0];
+    assert($click->click, 'a click');
+    assert($click->clickX == 640.5 && $click->clickY == 360.0, 'the point');
+    assert(!$s->steps[1]->click, 'no click unless asked');
+    bool $bad = match (failure('{"steps":[{"frame":5,"click":[1]}]}')) {
+        DCaptureError::field($path, $want) => $path == 'steps[0].click',
+        else => false,
+    };
+    assert($bad, 'one number is refused with its path');
+}

@@ -1,0 +1,172 @@
+/**
+ * The sky-view LUT: the procedural atmosphere marched once per table texel instead of once
+ * per sky pixel. The table depends only on the sun, the moon, the atmosphere knobs and the
+ * observer height, so it is refilled only when one of those moved; a paused clock and a still
+ * eye cost nothing. Layout and mapping live in resources/shaders/include/visu/sky_view.glsl.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Vec3, Vec4};
+
+/**
+ * Table size in texels: azimuth by elevation, the elevation split at the horizon. Mirrors
+ * SKY_VIEW_WIDTH / SKY_VIEW_HEIGHT in sky_view.glsl.
+ */
+public const int32 SKY_VIEW_WIDTH = 256;
+public const int32 SKY_VIEW_HEIGHT = 128;
+
+/**
+ * Slices of the table: sun Rayleigh, sun Mie, moon Rayleigh, moon Mie, lit ground.
+ */
+internal const int32 SKY_VIEW_LAYERS = 5;
+
+/**
+ * Texture binding the table sits at in the `sky+lut` program.
+ */
+internal const uint32 SKY_VIEW_SLOT = 1;
+
+/**
+ * One sky-view table and the atmosphere it was last filled under. The renderer keeps one for
+ * the main view and one for the water mirror, whose eye stands elsewhere. `$name` is the
+ * table's graph resource, `$label` the refill pass.
+ */
+internal class SkyViewLut
+{
+    private Texture $texture;
+    private string $name;
+    private string $label;
+    private bool $filled;
+    private SkyUniforms $built;
+
+    public constructor(Device $device, string $name, string $label)
+    {
+        TextureDesc $desc = TextureDesc(
+            $format: .rgba16f,
+            $kind: .array2D,
+            $width: SKY_VIEW_WIDTH,
+            $height: SKY_VIEW_HEIGHT
+        );
+        $desc->arrayLength = SKY_VIEW_LAYERS;
+        // transfer so dcapture can read the table back; the play path never copies it
+        $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC;
+        $desc->label = $name;
+        $this->texture = Texture($device, $name, $desc);
+        $this->name = $name;
+        $this->label = $label;
+        $this->filled = false;
+        // a placeholder until the first fill; `filled` false never compares against it
+        $this->built = skyUniforms(Sky(), Vec3(0.0f, 0.0f, 0.0f), false, 0.0f, 0.0f);
+    }
+
+    /**
+     * Imports the table into this frame's graph and, when the atmosphere moved since it was
+     * last filled, adds the pass that refills it. `$uniforms` is the sky the table stands for;
+     * its sample counts are the table's quality.
+     */
+    public function prepare(Pipeline $pipeline, DeferredGpu $gpu, const SkyUniforms& $uniforms) : TextureRef
+    {
+        TextureRef $ref = $pipeline->importTexture($this->name, $this->texture);
+        SkyUniforms $key = skyViewKey($uniforms);
+
+        if ($this->filled && $key == $this->built) {
+            return $ref;
+        }
+
+        $this->built = $key;
+        $this->filled = true;
+        $pipeline->add(SkyViewPass($gpu, $this->texture, $ref, $key, $this->label));
+        return $ref;
+    }
+
+    public function destroy() : void
+    {
+        $this->texture->destroy();
+    }
+}
+
+/**
+ * The part of a packed sky the table depends on: the observer height and not where it stands
+ * on the map, and no disc switches, which only the per-pixel lights read.
+ */
+internal function skyViewKey(const SkyUniforms& $sky) : SkyUniforms
+{
+    SkyUniforms $key = $sky;
+    $key->origin = Vec4(0.0f, $sky->origin->y, 0.0f, 0.0f);
+    $key->moonColor = Vec4($sky->moonColor->x, $sky->moonColor->y, $sky->moonColor->z, 0.0f);
+    return $key;
+}
+
+operator (SkyUniforms $a) == (SkyUniforms $b) : bool
+{
+    return $a->sun == $b->sun
+        && $a->origin == $b->origin
+        && $a->rayleigh == $b->rayleigh
+        && $a->mie == $b->mie
+        && $a->ground == $b->ground
+        && $a->params == $b->params
+        && $a->moon == $b->moon
+        && $a->moonParams == $b->moonParams
+        && $a->moonColor == $b->moonColor;
+}
+
+/**
+ * Fills every slice of a sky-view table in one draw, one march per texel.
+ */
+internal class SkyViewPass : Pass
+{
+    private DeferredGpu $gpu;
+    private Texture $texture;
+    private TextureRef $ref;
+    private SkyUniforms $sky;
+    private string $label;
+
+    public constructor(DeferredGpu $gpu, Texture $texture, TextureRef $ref, SkyUniforms $sky, string $label)
+    {
+        $this->gpu = $gpu;
+        $this->texture = $texture;
+        $this->ref = $ref;
+        $this->sky = $sky;
+        $this->label = $label;
+    }
+
+    public function name() : string
+    {
+        return $this->label;
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        $io->writes($this->ref);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        ShaderProgram $program = guard $this->gpu->shaders->program('sky_view') else ($e) {
+            return .error(.shader($e));
+        }
+        RenderPassDesc $desc = RenderPassDesc();
+        int32 $layer = 0;
+
+        while ($layer < SKY_VIEW_LAYERS) {
+            ColorTarget $color = ColorTarget($this->texture, face: $layer);
+            // every texel is written
+            $color->load = .dontCare;
+            $color->store = .store;
+            $desc->colors[] = $color;
+            $layer = $layer + 1;
+        }
+
+        RenderEncoder $enc = $ctx->device->beginRender($desc);
+        Device $device = $ctx->device;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        $pass->bind($enc);
+        $enc->upload($this->sky, slot: 2);
+        $mesh->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+}

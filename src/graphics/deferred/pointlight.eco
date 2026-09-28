@@ -1,0 +1,525 @@
+/**
+ * Colored point lights for the deferred light pass. A frame packs at most
+ * `POINT_LIGHT_MAX` spheres, the closest to the eye, and builds a 16 pixel
+ * tile grid so a pixel only shades the lamps that cover its tile. The first
+ * `POINT_SHADOW_MAX` shadow casters in that list get a perspective cube.
+ * Nothing here allocates: callers hand reserved storage and fixed arrays.
+ */
+
+namespace visu::graphics;
+
+use std::math;
+use visu::geo::{Frustum, AABB};
+use visu::math::{
+    Mat4, Vec2, Vec3, Vec4, clipZeroOne, dot, inverse, length, perspective, radians
+};
+
+public const int32 POINT_LIGHT_MAX = 64;
+public const int32 POINT_SHADOW_MAX = 4;
+public const int32 POINT_TILE = 16;
+public const int32 POINT_TILE_MAX = 8;
+
+/**
+ * Count byte plus one index byte per lamp the tile keeps.
+ */
+public const int32 POINT_TILE_STRIDE = 9;
+public const int32 CUBE_FACE_COUNT = 6;
+public const int32 POINT_SHADOW_LAYERS = 24;
+public const int32 POINT_SHADOW_RES = 256;
+public const float32 POINT_SHADOW_NEAR = 0.1f;
+public const float32 POINT_NORMAL_OFFSET = 0.02f;
+public const float32 POINT_SHADOW_BIAS = 0.002f;
+
+/**
+ * One lamp in the light uniform. std140: three vec4s, 48 bytes.
+ * `sourceShadow` is source radius, shadow slot (-1 when unshadowed),
+ * normal offset in metres, and the slope bias floor.
+ */
+public struct PointGpu
+{
+    public Vec4 $positionRadius;
+    public Vec4 $colorIntensity;
+    public Vec4 $sourceShadow;
+}
+
+/**
+ * A lamp before packing. World position, metres.
+ */
+public struct PointCandidate
+{
+    public Vec3 $position;
+    public float32 $radius;
+    public Vec3 $color;
+    public float32 $intensity;
+    public float32 $sourceRadius;
+    public bool $castShadow;
+}
+
+/**
+ * The kept set, closest first, ready for the uniform and the tile splat.
+ */
+public struct PointPack
+{
+    public int32 $count;
+    public PointGpu[64] $gpu;
+    public int32 $shadows;
+    public Vec3[4] $shadowAt;
+    public float32[4] $shadowFar;
+
+    public constructor()
+    {
+        $this->count = 0;
+        $this->shadows = 0;
+        PointGpu $zero = PointGpu(Vec4(0.0f), Vec4(0.0f), Vec4(0.0f, -1.0f, 0.0f, 0.0f));
+        PointGpu[64] $gpu;
+        int32 $i = 0;
+        while ($i < POINT_LIGHT_MAX) {
+            $gpu[$i] = $zero;
+            $i = $i + 1;
+        }
+
+        $this->gpu = $gpu;
+        Vec3[4] $at;
+        float32[4] $far;
+        $i = 0;
+        while ($i < POINT_SHADOW_MAX) {
+            $at[$i] = Vec3(0.0f, 0.0f, 0.0f);
+            $far[$i] = 0.0f;
+            $i = $i + 1;
+        }
+
+        $this->shadowAt = $at;
+        $this->shadowFar = $far;
+    }
+}
+
+internal struct PointList
+{
+    public int32 $count;
+    public PointCandidate[64] $items;
+    public float32[64] $dist;
+
+    public constructor()
+    {
+        $this->count = 0;
+        PointCandidate $blank = PointCandidate(
+            Vec3(0.0f, 0.0f, 0.0f),
+            0.0f,
+            Vec3(0.0f, 0.0f, 0.0f),
+            0.0f,
+            0.0f,
+            false
+        );
+        PointCandidate[64] $items;
+        float32[64] $dist;
+        int32 $i = 0;
+        while ($i < POINT_LIGHT_MAX) {
+            $items[$i] = $blank;
+            $dist[$i] = 0.0f;
+            $i = $i + 1;
+        }
+
+        $this->items = $items;
+        $this->dist = $dist;
+    }
+}
+
+/**
+ * Screen rect of one sphere in the light pass's uv space (y down, pixels).
+ * `$full` is the whole target: the eye is inside the sphere, or the center
+ * is behind the eye while the sphere still reaches the camera.
+ */
+public struct PointRect
+{
+    public float32 $x0;
+    public float32 $y0;
+    public float32 $x1;
+    public float32 $y1;
+    public bool $full;
+}
+
+/**
+ * One cube face of a lamp shadow: the light-space matrix the shader samples
+ * and the camera the casters draw with. No Y flip. `shadow.glsl` flips v
+ * itself, the same way the sun cascades do.
+ */
+public struct PointFace
+{
+    public int32 $layer;
+    public Mat4 $lightSpace;
+    public Frustum $frustum;
+    public CameraUniforms $uniforms;
+}
+
+/**
+ * Keep `$c` when it is closer than the farthest lamp already held.
+ * Radius or intensity at or below zero contributes nothing.
+ */
+public function pointConsider(PointList& $list, PointCandidate $c, float32 $dist) : void
+{
+    if ($c->radius <= 0.0f || $c->intensity <= 0.0f) {
+        return;
+    }
+
+    if ($list->count < POINT_LIGHT_MAX) {
+        int32 $at = $list->count;
+        $list->items[$at] = $c;
+        $list->dist[$at] = $dist;
+        $list->count = $at + 1;
+        return;
+    }
+
+    int32 $far = 0;
+    int32 $i = 1;
+    while ($i < POINT_LIGHT_MAX) {
+        if ($list->dist[$i] > $list->dist[$far]) {
+            $far = $i;
+        }
+
+        $i = $i + 1;
+    }
+
+    if ($dist >= $list->dist[$far]) {
+        return;
+    }
+
+    $list->items[$far] = $c;
+    $list->dist[$far] = $dist;
+}
+
+/**
+ * Frustum-cull, keep the closest 64, sort nearest first, then hand the first
+ * four shadow casters a slot. A sphere that misses `$frustum` is dropped,
+ * including one that sits entirely behind the camera.
+ */
+public function pointGather(const array<PointCandidate>& $in, Vec3 $eye, const Frustum& $frustum) : PointPack
+{
+    PointList $list = PointList();
+    foreach ($in as $c) {
+        if (!$frustum->contains($c->position, $c->radius)) {
+            continue;
+        }
+
+        pointConsider($list, $c, length($c->position - $eye));
+    }
+
+    return pointFinish($list);
+}
+
+/**
+ * Sort `$list` nearest first and write the uniform records.
+ */
+public function pointFinish(PointList& $list) : PointPack
+{
+    int32 $i = 1;
+    while ($i < $list->count) {
+        float32 $dist = $list->dist[$i];
+        PointCandidate $item = $list->items[$i];
+        int32 $j = $i;
+        while ($j > 0 && $list->dist[$j - 1] > $dist) {
+            $list->dist[$j] = $list->dist[$j - 1];
+            $list->items[$j] = $list->items[$j - 1];
+            $j = $j - 1;
+        }
+
+        $list->dist[$j] = $dist;
+        $list->items[$j] = $item;
+        $i = $i + 1;
+    }
+
+    PointPack $pack = PointPack();
+    $pack->count = $list->count;
+    int32 $slot = 0;
+    $i = 0;
+    while ($i < $list->count) {
+        PointCandidate $c = $list->items[$i];
+        float32 $shadow = -1.0f;
+        if ($c->castShadow && $c->radius > POINT_SHADOW_NEAR && $slot < POINT_SHADOW_MAX) {
+            $pack->shadowAt[$slot] = $c->position;
+            $pack->shadowFar[$slot] = $c->radius;
+            $shadow = $slot as float32;
+            $slot = $slot + 1;
+        }
+
+        $pack->gpu[$i] = PointGpu(
+            Vec4($c->position, $c->radius),
+            Vec4($c->color, $c->intensity),
+            Vec4($c->sourceRadius, $shadow, POINT_NORMAL_OFFSET, POINT_SHADOW_BIAS)
+        );
+        $i = $i + 1;
+    }
+
+    $pack->shadows = $slot;
+    return $pack;
+}
+
+/**
+ * How many tiles cover `$pixels` at `POINT_TILE`.
+ */
+public function pointTiles(int32 $pixels) : int32
+{
+    if ($pixels <= 0) {
+        return 0;
+    }
+
+    return ($pixels + POINT_TILE - 1) / POINT_TILE;
+}
+
+/**
+ * Project the sphere's silhouette through `$cam`. Y matches `CameraData.project`
+ * (0 at the top). The points `center ± radius` along the camera axes sit inside
+ * the tangent cone, so they under-cover a lamp that is close to the eye.
+ */
+public function pointRect(const CameraData& $cam, Vec3 $center, float32 $radius) : PointRect
+{
+    float32 $w = $cam->resolutionX as float32;
+    float32 $h = $cam->resolutionY as float32;
+    PointRect $full = PointRect(0.0f, 0.0f, $w, $h, true);
+    Vec3 $eye = $cam->position;
+    if (length($center - $eye) <= $radius) {
+        return $full;
+    }
+
+    Mat4 $view = $cam->view;
+    Vec3 $forward = -Vec3($view->c0->z, $view->c1->z, $view->c2->z);
+    if (dot($center - $eye, $forward) <= $radius) {
+        return $full;
+    }
+
+    Vec4 $viewPos = $view * Vec4($center, 1.0f);
+    float32 $depth = -$viewPos->z;
+    Vec2? $xs = pointAxisNdc($viewPos->x, $depth, $radius, $cam->projection->c0->x);
+    Vec2? $ys = pointAxisNdc($viewPos->y, $depth, $radius, $cam->projection->c1->y);
+    Vec2 $xNdc = guard $xs else {
+        return $full;
+    }
+    Vec2 $yNdc = guard $ys else {
+        return $full;
+    }
+    float32 $u0 = $xNdc->x * 0.5f + 0.5f;
+    float32 $u1 = $xNdc->y * 0.5f + 0.5f;
+    float32 $v0 = 0.5f - $yNdc->y * 0.5f;
+    float32 $v1 = 0.5f - $yNdc->x * 0.5f;
+    float32 $x0 = $u0 * $w;
+    float32 $x1 = $u1 * $w;
+    float32 $y0 = $v0 * $h;
+    float32 $y1 = $v1 * $h;
+    if ($x0 > $x1) {
+        float32 $swap = $x0;
+        $x0 = $x1;
+        $x1 = $swap;
+    }
+
+    if ($y0 > $y1) {
+        float32 $swap = $y0;
+        $y0 = $y1;
+        $y1 = $swap;
+    }
+
+    if ($x0 < 0.0f) {
+        $x0 = 0.0f;
+    }
+
+    if ($y0 < 0.0f) {
+        $y0 = 0.0f;
+    }
+
+    if ($x1 > $w) {
+        $x1 = $w;
+    }
+
+    if ($y1 > $h) {
+        $y1 = $h;
+    }
+
+    return PointRect($x0, $y0, $x1, $y1, false);
+}
+
+/**
+ * NDC extents of the tangent cone in one view axis. Null when the cone leaves
+ * the forward half-space and the caller should use the whole target.
+ * `$proj` is the projection scale for that axis (`cot(fov/2)`).
+ */
+internal function pointAxisNdc(float32 $axis, float32 $depth, float32 $radius, float32 $proj) : Vec2?
+{
+    if ($depth <= 0.0f) {
+        return null;
+    }
+
+    float32 $d2 = $axis * $axis + $depth * $depth;
+    float32 $r2 = $radius * $radius;
+    if ($d2 <= $r2) {
+        return null;
+    }
+
+    float32 $span = math::sqrt(($d2 - $r2) as float64) as float32;
+    float32 $tanA = $radius / $span;
+    float32 $tanP = $axis / $depth;
+    float32 $denLo = 1.0f + $tanP * $tanA;
+    float32 $denHi = 1.0f - $tanP * $tanA;
+    if ($denLo <= 0.0001f || $denHi <= 0.0001f) {
+        return null;
+    }
+
+    float32 $n0 = (($tanP - $tanA) / $denLo) * $proj;
+    float32 $n1 = (($tanP + $tanA) / $denHi) * $proj;
+    return Vec2($n0, $n1);
+}
+
+/**
+ * Clear `$tiles` and splat each packed lamp's rect. `$tiles` is
+ * `tilesX * tilesY * POINT_TILE_STRIDE` bytes, row `(ty * stride + slot) * tilesX + tx`.
+ * Slot 0 is the count. Later slots are lamp indices. A full tile keeps the
+ * lamps splatted first, which are the closest.
+ */
+public function pointSplat(
+    const CameraData& $cam,
+    const PointPack& $pack,
+    array<uint8>& $tiles,
+    int32 $tilesX,
+    int32 $tilesY
+) : void
+{
+    if ($tiles->count() > 0) {
+        mem::zero<uint8>(ptr<uint8>(&$tiles[0]), $tiles->count());
+    }
+
+    if ($tilesX <= 0 || $tilesY <= 0 || $pack->count <= 0) {
+        return;
+    }
+
+    int32 $i = 0;
+    while ($i < $pack->count) {
+        Vec4 $pr = $pack->gpu[$i]->positionRadius;
+        PointRect $rect = pointRect($cam, $pr->xyz(), $pr->w);
+        int32 $tx0 = pointTileFloor($rect->x0, $tilesX);
+        int32 $ty0 = pointTileFloor($rect->y0, $tilesY);
+        int32 $tx1 = pointTileCeil($rect->x1, $tilesX);
+        int32 $ty1 = pointTileCeil($rect->y1, $tilesY);
+        int32 $ty = $ty0;
+        while ($ty < $ty1) {
+            int32 $tx = $tx0;
+            while ($tx < $tx1) {
+                int32 $head = ($ty * POINT_TILE_STRIDE) * $tilesX + $tx;
+                int32 $have = $tiles[$head as usize] as int32;
+                if ($have < POINT_TILE_MAX) {
+                    int32 $at = ($ty * POINT_TILE_STRIDE + $have + 1) * $tilesX + $tx;
+                    $tiles[$at as usize] = $i as uint8;
+                    $tiles[$head as usize] = ($have + 1) as uint8;
+                }
+
+                $tx = $tx + 1;
+            }
+
+            $ty = $ty + 1;
+        }
+
+        $i = $i + 1;
+    }
+}
+
+/**
+ * Lamps stored in tile `($tx, $ty)`. Zero when the pixel's tile shades nothing.
+ */
+public function pointTileCount(const array<uint8>& $tiles, int32 $tilesX, int32 $tx, int32 $ty) : int32
+{
+    int32 $head = ($ty * POINT_TILE_STRIDE) * $tilesX + $tx;
+    return $tiles[$head as usize] as int32;
+}
+
+/**
+ * Perspective face `$face` (+X -X +Y -Y +Z -Z) at `$eye`. Far is the lamp radius.
+ */
+public function pointFace(int32 $face, Vec3 $eye, float32 $near, float32 $far, int32 $size) : PointFace
+{
+    Mat4 $projection = clipZeroOne(perspective(
+        fovY: radians(90.0f),
+        aspect: 1.0f,
+        near: $near,
+        far: $far
+    ));
+    Mat4 $view = captureView($face, $eye);
+    Mat4 $projectionView = $projection * $view;
+    float32 $pixels = $size as float32;
+    CameraUniforms $uniforms = CameraUniforms(
+        $projection,
+        $view,
+        $projectionView,
+        inverse($projection),
+        inverse($projectionView),
+        Vec4($eye->x, $eye->y, $eye->z, 1.0f),
+        Vec4($pixels, $pixels, 1.0f / $pixels, 1.0f / $pixels)
+    );
+    return PointFace($face, $projectionView, Frustum(zeroOne: $projectionView), $uniforms);
+}
+
+/**
+ * Write the six faces of every shadow lamp onto `$frame`. Layer is
+ * `slot * 6 + face`. The matrices are what the light uniform uploads.
+ */
+public function pointWriteFaces(const PointPack& $pack, PointLightFrame $frame) : void
+{
+    int32 $s = 0;
+    while ($s < $pack->shadows) {
+        int32 $f = 0;
+        while ($f < CUBE_FACE_COUNT) {
+            int32 $layer = $s * CUBE_FACE_COUNT + $f;
+            PointFace $face = pointFace(
+                $f,
+                $pack->shadowAt[$s],
+                POINT_SHADOW_NEAR,
+                $pack->shadowFar[$s],
+                POINT_SHADOW_RES
+            );
+            $face->layer = $layer;
+            $frame->cameras[$layer] = $face;
+            $frame->space[$layer] = $face->lightSpace;
+            $f = $f + 1;
+        }
+
+        $s = $s + 1;
+    }
+}
+
+/**
+ * True when `$bounds` meets the sphere.
+ */
+public function pointSphereHits(const AABB& $bounds, Vec3 $center, float32 $radius) : bool
+{
+    return length($bounds->closest($center) - $center) <= $radius;
+}
+
+internal function pointTileFloor(float32 $pixel, int32 $tiles) : int32
+{
+    // a boundary that float error pulled back by a fraction of a pixel stays on its tile
+    float32 $shifted = $pixel + 0.05f;
+    int32 $t = math::floor(($shifted / (POINT_TILE as float32)) as float64) as int32;
+    if ($t < 0) {
+        return 0;
+    }
+
+    if ($t > $tiles) {
+        return $tiles;
+    }
+
+    return $t;
+}
+
+internal function pointTileCeil(float32 $pixel, int32 $tiles) : int32
+{
+    float32 $shifted = $pixel - 0.05f;
+    if ($shifted < 0.0f) {
+        $shifted = 0.0f;
+    }
+
+    int32 $t = math::ceil(($shifted / (POINT_TILE as float32)) as float64) as int32;
+    if ($t < 0) {
+        return 0;
+    }
+
+    if ($t > $tiles) {
+        return $tiles;
+    }
+
+    return $t;
+}

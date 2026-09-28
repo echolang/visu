@@ -1,0 +1,337 @@
+/**
+ * The two light-shaft passes and the history they share. `GodRayPass` marches the key light's
+ * cascades at reduced resolution into a pooled target; `GodRayResolvePass` blends it with last
+ * frame's history, reprojected, into the other history texture. Both histories belong to the
+ * renderer and live across frames; the pool never sees them.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Mat4, Vec3};
+
+/**
+ * Two rgba16f textures at the shaft size, written in turn, and what the next frame needs to
+ * reproject into the one just written.
+ */
+internal class GodRayHistory
+{
+    private Device $device;
+    private Texture $a;
+    private Texture $b;
+    public GodRaySize $size;
+
+    /**
+     * 0 when this frame writes `a`.
+     */
+    public int32 $current;
+
+    /**
+     * The texture this frame will read holds a resolve from the frame before.
+     */
+    public bool $filled;
+    public Mat4 $prevProjectionView;
+    public Vec3 $prevEye;
+
+    /**
+     * The moon, not the sun, lit the history last written.
+     */
+    public bool $moonKey;
+    public int64 $frame;
+
+    public constructor(Device $device, GodRaySize $size)
+    {
+        $this->device = $device;
+        $this->a = godRayHistoryTexture($device, $size, 'deferred.godrays.a');
+        $this->b = godRayHistoryTexture($device, $size, 'deferred.godrays.b');
+        $this->size = $size;
+        $this->current = 0;
+        $this->filled = false;
+        $this->prevProjectionView = Mat4();
+        $this->prevEye = Vec3(0.0f, 0.0f, 0.0f);
+        $this->moonKey = false;
+        $this->frame = 0;
+    }
+
+    /**
+     * Recreate both textures when the size changed. The device buries the old ones until no
+     * frame in flight samples them.
+     */
+    public function fit(GodRaySize $size) : void
+    {
+        if ($size == $this->size) {
+            return;
+        }
+
+        $this->a->destroy();
+        $this->b->destroy();
+        $this->a = godRayHistoryTexture($this->device, $size, 'deferred.godrays.a');
+        $this->b = godRayHistoryTexture($this->device, $size, 'deferred.godrays.b');
+        $this->size = $size;
+        $this->filled = false;
+    }
+
+    /**
+     * Swap which texture is written; the one written last frame becomes the one read.
+     */
+    public function flip() : void
+    {
+        $this->current = 1 - $this->current;
+    }
+
+    public function written() : Texture
+    {
+        if ($this->current == 0) {
+            return $this->a;
+        }
+
+        return $this->b;
+    }
+
+    public function read() : Texture
+    {
+        if ($this->current == 0) {
+            return $this->b;
+        }
+
+        return $this->a;
+    }
+
+    public function destroy() : void
+    {
+        $this->a->destroy();
+        $this->b->destroy();
+    }
+}
+
+internal function godRayHistoryTexture(Device $device, GodRaySize $size, string $label) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .rgba16f, $width: $size->width, $height: $size->height);
+    // transfer so dcapture can read a history back; the play path never copies it
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC;
+    $desc->label = $label;
+    return Texture($device, $label, $desc);
+}
+
+/**
+ * Marches every shaft texel: out `(S, visible share, distance, 1)`, where `S` is the
+ * shadowed, transmitted optical depth of the marched segment and the visible share is the
+ * lit fraction of that segment.
+ */
+public class GodRayPass : Pass
+{
+    private DeferredGpu $gpu;
+    private GodRayHistory $history;
+    private GodRays $rays;
+    private HeightFog $fog;
+    private DirectionalLight $sun;
+    private Moon $moon;
+    private float32 $strength;
+
+    internal constructor(
+        DeferredGpu $gpu,
+        GodRayHistory $history,
+        GodRays $rays,
+        HeightFog $fog,
+        DirectionalLight $sun,
+        Moon $moon,
+        float32 $strength
+    )
+    {
+        $this->strength = $strength;
+        $this->gpu = $gpu;
+        $this->history = $history;
+        $this->rays = $rays;
+        $this->fog = $fog;
+        $this->sun = $sun;
+        $this->moon = $moon;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.godrays';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        GBufferData $gbuffer = $frame->get<GBufferData>();
+        ShadowMapData $shadows = $frame->get<ShadowMapData>();
+        CameraData $camera = $frame->get<CameraData>();
+        $io->reads($gbuffer->position);
+        $io->reads($shadows->map);
+
+        GodRayHistory $history = $this->history;
+        GodRaySize $size = $history->size;
+        bool $moonKey = moonKeyed($this->sun, $this->moon);
+        bool $kept = godRayHistoryKept($history->filled, $history->moonKey, $moonKey, $history->prevEye, $camera->position);
+        GodRayUniforms $uniforms = godRayUniforms(
+            $this->rays,
+            $shadows->cascades,
+            keyLight($this->sun, $this->moon)->direction,
+            $this->fog,
+            $camera->position,
+            $size,
+            $history->frame,
+            $kept,
+            $history->prevProjectionView,
+            $history->prevEye
+        );
+        $history->flip();
+        $history->prevProjectionView = $camera->projectionView;
+        $history->prevEye = $camera->position;
+        $history->moonKey = $moonKey;
+        $history->frame = $history->frame + 1;
+        $history->filled = true;
+
+        TargetRef $target = $pipeline->createTarget('godrays', $size->width, $size->height);
+        TextureRef $raw = $pipeline->createColor($target, 'raw', TextureOptions($format: .rgba16f));
+        TextureRef $resolved = $pipeline->importTexture('godrays.history', $history->written());
+        TextureRef $previous = $pipeline->importTexture('godrays.previous', $history->read());
+        $frame->set(GodRayData(
+            $target,
+            $raw,
+            $resolved,
+            $previous,
+            $uniforms,
+            godRayFogShafts($this->rays, $this->strength),
+            godRayFogLight($this->rays, $this->sun, $this->moon),
+            godRayFogPhase($this->rays, $moonKey)
+        ));
+        $io->writes($target);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        GodRayData $data = $ctx->frame->get<GodRayData>();
+        GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
+        ShaderProgram $program = guard $this->gpu->shaders->program('godrays') else ($e) {
+            return .error(.shader($e));
+        }
+
+        RenderEncoder $enc = guard $ctx->beginRender($data->target, overwrite: true) else ($e) {
+            return .error($e);
+        }
+        Device $device = $ctx->device;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        $pass->bind($enc);
+        $this->gpu->camera->bind($enc);
+        $enc->upload($data->uniforms, slot: 0);
+        guard bindPooled($ctx, $enc, 0, $gbuffer->position, $this->gpu->point) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        guard bindShadowOrDummy($ctx, $enc, $this->gpu) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        $mesh->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+/**
+ * Blends the raw march with the reprojected history, clamped to the raw neighbourhood, into
+ * this frame's history texture.
+ */
+public class GodRayResolvePass : Pass
+{
+    private DeferredGpu $gpu;
+
+    internal constructor(DeferredGpu $gpu)
+    {
+        $this->gpu = $gpu;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.godrays.resolve';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        GodRayData $data = $frame->get<GodRayData>();
+        $io->reads($data->raw);
+        $io->reads($data->previous);
+        $io->writes($data->resolved);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        GodRayData $data = $ctx->frame->get<GodRayData>();
+        ShaderProgram $program = guard $this->gpu->shaders->program('godrays_resolve') else ($e) {
+            return .error(.shader($e));
+        }
+        Texture $out = guard $ctx->pool->getTexture($data->resolved) else ($e) {
+            return .error(.pool($e));
+        }
+
+        ColorTarget $color = ColorTarget($out);
+        $color->load = .dontCare;
+        $color->store = .store;
+        RenderPassDesc $desc = RenderPassDesc();
+        $desc->colors[] = $color;
+        RenderEncoder $enc = $ctx->device->beginRender($desc);
+        Device $device = $ctx->device;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        $pass->bind($enc);
+        $this->gpu->camera->bind($enc);
+        $enc->upload($data->uniforms, slot: 0);
+        guard bindPooled($ctx, $enc, 0, $data->raw, $this->gpu->point) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        guard bindPooled($ctx, $enc, 1, $data->previous, $this->gpu->linear) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        $mesh->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+/**
+ * Declares the resolved shafts as a read when this frame has them.
+ */
+internal function readGodRays(IoSink $io, Frame $frame) : void
+{
+    GodRayData? $rays = $frame->find<GodRayData>();
+    if ($rays != null) {
+        GodRayData $found = guard $rays;
+        $io->reads($found->resolved);
+    }
+}
+
+/**
+ * Binds the resolved shafts at `GODRAY_SLOT` and turns them on in `$fog` when `$wanted` and
+ * the frame has them. Otherwise binds white and leaves `$fog` alone, so the fog runs its
+ * plain path.
+ */
+internal function bindGodRays(
+    RenderContext $ctx,
+    RenderEncoder $enc,
+    DeferredGpu $gpu,
+    FogUniforms& $fog,
+    bool $wanted
+) : status<PipelineError>
+{
+    if ($wanted) {
+        GodRayData? $rays = $ctx->frame->find<GodRayData>();
+        if ($rays != null) {
+            GodRayData $found = guard $rays;
+            $fog->shafts = $found->fogShafts;
+            $fog->shaftLight = $found->fogLight;
+            $fog->shaftPhase = $found->fogPhase;
+            return bindPooled($ctx, $enc, GODRAY_SLOT, $found->resolved, $gpu->linear);
+        }
+    }
+
+    $enc->bindTexture(GODRAY_SLOT, $gpu->white, $gpu->linear);
+    return .ok;
+}

@@ -14,6 +14,13 @@ public class DeferredRenderer
     public DirectionalLight $sun;
 
     /**
+     * The night light: a second directional light, a disc and stars in the sky, a fog glow and
+     * the night hemisphere ambient. Apps with a calendar set its direction, illumination and
+     * `light` every frame; the brighter of sun and moon owns the shadow cascades.
+     */
+    public Moon $moon;
+
+    /**
      * The procedural sky: drawn per pixel behind the scene and, with `setEnvironment(probe:)`, the
      * atmosphere every probe state is rendered under. Only read when the environment is a probe.
      */
@@ -24,6 +31,12 @@ public class DeferredRenderer
      * frames with `renderSkybox = false` leave the cleared background unfogged.
      */
     public HeightFog $fog;
+
+    /**
+     * Light shafts from the key light through the height fog. Off by default. Runs only with
+     * shadows on, fog on and a key light up; any other frame adds no pass and drops the history.
+     */
+    public GodRays $godRays;
 
     /**
      * Which two probe states light the scene and how far towards the second. Apps that drive a
@@ -57,19 +70,39 @@ public class DeferredRenderer
      * `.scene` runs light + skybox. Any other case skips shading and blits that buffer.
      */
     public DeferredView $view;
+
+    /**
+     * One GBuffer encoder per filler instead of one for all, so each system gets its own GPU
+     * time. A profiling aid (`--flag gbuffer.split=true`); the merged pass is the fast one.
+     */
+    public bool $splitGeometry;
+
+    /**
+     * Read the analytic sky from a sky-view table instead of marching it per pixel: the table
+     * is refilled only when the sun, the moon, the atmosphere or the eye height moved, and the
+     * sky pass keeps the disc, the moon and the stars per pixel. Off draws the per-pixel march
+     * exactly as before. Seeded from `--flag sky.view`.
+     */
+    public bool $skyView;
     public Device $device;
     private DeferredGpu? $gpu;
     private Environment? $environment;
     private Texture? $shadowMap;
+    private GodRayHistory? $godRayHistory;
+    private SkyViewLut? $skyViewMain;
+    private SkyViewLut? $skyViewMirror;
     private array<ShadowCaster> $casters;
+    private GeometryFillers $geometry;
     private OutlineData $outline;
     private OutlineStyle[4] $outlineStyles;
 
     public constructor(Device $device)
     {
         $this->sun = DirectionalLight();
+        $this->moon = Moon();
         $this->sky = Sky();
         $this->fog = HeightFog();
+        $this->godRays = GodRays();
         $this->iblBlend = IblBlend();
         $this->background = Vec4(0.05f, 0.05f, 0.06f, 1.0f);
         $this->renderSkybox = true;
@@ -81,7 +114,13 @@ public class DeferredRenderer
         $this->gpu = null;
         $this->environment = null;
         $this->shadowMap = null;
+        $this->godRayHistory = null;
         $this->casters = arr::room<ShadowCaster>(4);
+        $this->geometry = GeometryFillers();
+        $this->splitGeometry = visu::app::flags()->bool('gbuffer.split', false);
+        $this->skyView = visu::app::flags()->bool('sky.view', false);
+        $this->skyViewMain = null;
+        $this->skyViewMirror = null;
         $this->outline = OutlineData();
         OutlineStyle[4] $styles;
         int32 $i = 0;
@@ -236,14 +275,26 @@ public class DeferredRenderer
         DeferredView $view = $this->view;
         if ($view->isScene()) {
             ShadowQuality? $shadows = $this->shadows;
-            if ($shadows != null && $ctx->frame->find<CameraData>() != null) {
+            // with neither sun nor moon up the cascades would shade nothing: skip all five
+            DirectionalLight $key = keyLight($this->sun, $this->moon);
+            if ($shadows != null && $key->intensity > 0.0f && $ctx->frame->find<CameraData>() != null) {
                 ShadowQuality $quality = guard $shadows;
                 $pipeline->add(ShadowMapPass(
                     $this->ensureShadowMap($quality),
-                    $this->sun,
+                    $key,
                     $quality,
                     $this->casters
                 ));
+            }
+
+            PointLightFrame? $points = $ctx->frame->find<PointLightFrame>();
+            if ($points != null) {
+                PointLightFrame $packed = guard $points;
+                Texture? $map = $packed->shadowMap;
+                if ($packed->pack->shadows > 0 && $map != null) {
+                    Texture $held = guard $map;
+                    $pipeline->add(PointShadowPass($held));
+                }
             }
         }
 
@@ -252,7 +303,18 @@ public class DeferredRenderer
             $ctx->frame->set($this->outline);
         }
 
+        WaterFrame? $water = $ctx->frame->find<WaterFrame>();
+        if ($water != null && $view->isScene()) {
+            WaterFrame $held = guard $water;
+            if ($held->active && $held->mirror) {
+                $pipeline->add(MirrorGBufferPass($held));
+            }
+        }
+
+        $this->geometry->reset();
+        $ctx->frame->set($this->geometry);
         $fill($ctx, $gbuffer);
+        $pipeline->add(GeometryPass($gbuffer, $this->geometry, $gpu->camera, $this->splitGeometry));
 
         // only a frame with something highlighted pays for the mask and the composite
         bool $outlining = $view->isScene() && $this->outline->active();
@@ -266,6 +328,7 @@ public class DeferredRenderer
             SsaoQuality $quality = guard $this->ssao;
             $pipeline->add(SsaoPass($gpu, $quality));
             $pipeline->add(SsaoBlurPass($gpu));
+            $pipeline->add(SsaoBlurVerticalPass($gpu));
         }
 
         if ($env != null) {
@@ -275,19 +338,61 @@ public class DeferredRenderer
         }
 
         if ($view->isScene()) {
-            $pipeline->add(LightPass($gpu, $env, $this->sun, $this->sky, $this->fog, $this->background));
+            $this->addGodRays($ctx, $gpu);
+        }
+
+        if ($view->isScene()) {
+            LightPass $lighting = LightPass($gpu, $env, $this->sun, $this->sky, $this->moon, $this->fog, $this->background);
+            $pipeline->add($lighting);
 
             if ($this->renderSkybox && $env != null) {
                 Environment $environment = guard $env;
                 if ($environment->isProbe()) {
-                    $pipeline->add(SkyPass($gpu, $this->sky, $this->fog, $this->sun));
+                    TextureRef? $table = $this->mainSkyView($pipeline, $gpu, $ctx->frame->get<CameraData>()->position);
+                    $pipeline->add(SkyPass($gpu, $this->sky, $this->fog, $this->sun, $this->moon, $table));
                 } else {
-                    $pipeline->add(SkyboxPass($gpu, $this->sky, $this->fog, $this->sun));
+                    $pipeline->add(SkyboxPass($gpu, $this->sky, $this->fog, $this->sun, $this->moon));
                 }
             }
 
             LightPassData $light = $ctx->frame->get<LightPassData>();
-            $gpu->blit->pass($pipeline, $output, $light->output);
+            TextureRef $present = $light->output;
+            WaterFrame? $waterNow = $ctx->frame->find<WaterFrame>();
+            if ($waterNow != null) {
+                WaterFrame $held = guard $waterNow;
+                if ($held->active) {
+                    if ($held->mirror) {
+                        $pipeline->add(MirrorLightPass($lighting, $held, Vec4(0.0f, 0.0f, 0.0f, 0.0f)));
+                        if ($this->renderSkybox && $env != null) {
+                            Environment $environment = guard $env;
+                            TextureRef? $mirrorTable = null;
+                            if ($environment->isProbe()) {
+                                $mirrorTable = $this->mirrorSkyView($pipeline, $gpu, $held->camera->position);
+                            }
+
+                            // a probe marches the analytic sky (or reads its table); an HDRI samples its cube
+                            $pipeline->add(MirrorSkyPass(
+                                $gpu,
+                                $held,
+                                $this->sky,
+                                $this->fog,
+                                $this->sun,
+                                $this->moon,
+                                $environment->isProbe(),
+                                $mirrorTable
+                            ));
+                        }
+                    }
+
+                    $pipeline->add(WaterPass($gpu, $held, $lighting));
+                    if ($held->presented != null) {
+                        TextureRef $shown = guard $held->presented;
+                        $present = $shown;
+                    }
+                }
+            }
+
+            $gpu->blit->pass($pipeline, $output, $present);
             if ($outlining) {
                 $pipeline->add(OutlinePass($gpu, $output, $this->outlineStyles, $this->outline->bounds));
             }
@@ -295,11 +400,14 @@ public class DeferredRenderer
             return;
         }
 
+        // a debug view runs no shaft pass, so the history stops following the scene
+        $this->idleGodRays();
         $pipeline->add(DeferredViewPass($gpu, $output, $view->params()));
     }
 
     /**
-     * The common fill: cull/sort the assembler and draw it into the GBuffer with the instanced geometry program.
+     * The common fill: cull/sort the assembler and draw it into the GBuffer with the instanced
+     * geometry program, as one filler of this frame's geometry pass.
      */
     public function draw<P>(
         RenderContext $ctx,
@@ -309,33 +417,8 @@ public class DeferredRenderer
     ) : void
     {
         assert($this->gpu != null, 'DeferredRenderer.draw before load');
-        VertexLayout $joined = $layout;
-        DrawCallAssembler<P> $assembler = $dca;
-        DeferredRenderer $renderer = $this;
-        $ctx->pipeline->add(CallbackPass(
-            'deferred.geometry',
-            setup: function(Pipeline $pipeline, Frame $frame, IoSink $io) : void {
-                $io->writes($gbuffer->target);
-            },
-            execute: function(RenderContext $pass) : status<PipelineError> {
-                CameraData $camera = $pass->frame->get<CameraData>();
-                $assembler->build($camera->cullFrustum, $camera->cullPosition);
-
-                if ($assembler->commandCount() == 0) {
-                    return .ok;
-                }
-
-                RenderEncoder $enc = guard $pass->beginRender($gbuffer->target) else ($e) {
-                    return .error($e);
-                }
-                GpuPass $gpuPass = $renderer->geometryPass($joined);
-                $gpuPass->bind($enc);
-                $renderer->bindCamera($enc);
-                $assembler->execute($enc, $gpuPass);
-                $enc->endRender();
-                return .ok;
-            }
-        ));
+        GeometryFillers $fillers = $ctx->frame->get<GeometryFillers>();
+        $fillers->add(AssemblerFiller<P>($dca, $this->geometryPass($layout)));
     }
 
     /**
@@ -364,6 +447,137 @@ public class DeferredRenderer
         assert($this->gpu != null, 'DeferredRenderer.bindCamera before load');
         DeferredGpu $gpu = guard $this->gpu;
         $gpu->camera->bind($enc);
+    }
+
+    /**
+     * The shaft march and resolve, when this frame can have shafts. A frame that cannot keeps
+     * the textures (the sun comes back) but not their content; switching off frees them.
+     */
+    private function addGodRays(RenderContext $ctx, DeferredGpu $gpu) : void
+    {
+        if (!$this->godRays->enabled) {
+            $this->dropGodRays();
+            return;
+        }
+
+        DirectionalLight $key = keyLight($this->sun, $this->moon);
+        float32 $strength = 0.0f;
+        if ($key->intensity > 0.0f) {
+            $strength = godRayStrength($this->godRays, $key->direction);
+        }
+
+        // a high sun, no key light, no fog or no cascades: nothing to draw, nothing to pay
+        if ($strength <= 0.0f || !$this->fog->enabled || $ctx->frame->find<ShadowMapData>() == null) {
+            $this->idleGodRays();
+            return;
+        }
+
+        GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
+        GodRaySize $size = godRaySize($gbuffer->target->width, $gbuffer->target->height, $this->godRays->scale);
+        GodRayHistory $history = $this->ensureGodRays($size);
+        $ctx->pipeline->add(GodRayPass($gpu, $history, $this->godRays, $this->fog, $this->sun, $this->moon, $strength));
+        $ctx->pipeline->add(GodRayResolvePass($gpu));
+    }
+
+    /**
+     * A frame without the shaft passes: keep the textures, forget their content.
+     */
+    private function idleGodRays() : void
+    {
+        GodRayHistory $held = guard $this->godRayHistory else {
+            return;
+        }
+        $held->filled = false;
+    }
+
+    private function ensureGodRays(GodRaySize $size) : GodRayHistory
+    {
+        GodRayHistory $have = guard $this->godRayHistory else {
+            GodRayHistory $fresh = GodRayHistory($this->device, $size);
+            $this->godRayHistory = $fresh;
+            return $fresh;
+        }
+        $have->fit($size);
+        return $have;
+    }
+
+    /**
+     * The main view's sky-view table for this frame, refilled when stale; null with the
+     * switch off, which also frees both tables.
+     */
+    private function mainSkyView(Pipeline $pipeline, DeferredGpu $gpu, Vec3 $eye) : TextureRef?
+    {
+        if (!$this->skyView) {
+            $this->dropSkyViews();
+            return null;
+        }
+
+        SkyViewLut $lut = guard $this->skyViewMain else {
+            SkyViewLut $fresh = SkyViewLut($this->device, 'sky.view', 'deferred.sky.view');
+            $this->skyViewMain = $fresh;
+            return $fresh->prepare($pipeline, $gpu, $this->skyViewUniforms($eye, SKY_VIEW_SAMPLES, SKY_LIGHT_SAMPLES));
+        }
+        return $lut->prepare($pipeline, $gpu, $this->skyViewUniforms($eye, SKY_VIEW_SAMPLES, SKY_LIGHT_SAMPLES));
+    }
+
+    /**
+     * The water mirror's table, at the reflected eye's height and the mirror's sample counts.
+     */
+    private function mirrorSkyView(Pipeline $pipeline, DeferredGpu $gpu, Vec3 $eye) : TextureRef?
+    {
+        if (!$this->skyView) {
+            $this->dropSkyViews();
+            return null;
+        }
+
+        SkyViewLut $lut = guard $this->skyViewMirror else {
+            SkyViewLut $fresh = SkyViewLut($this->device, 'reflect.sky.view', 'reflect.sky.view');
+            $this->skyViewMirror = $fresh;
+            return $fresh->prepare($pipeline, $gpu, $this->skyViewUniforms($eye, MIRROR_SKY_VIEW_SAMPLES, MIRROR_SKY_LIGHT_SAMPLES));
+        }
+        return $lut->prepare($pipeline, $gpu, $this->skyViewUniforms($eye, MIRROR_SKY_VIEW_SAMPLES, MIRROR_SKY_LIGHT_SAMPLES));
+    }
+
+    private function skyViewUniforms(Vec3 $eye, float32 $viewSamples, float32 $lightSamples) : SkyUniforms
+    {
+        return skyUniforms($this->sky, $eye, false, $viewSamples, $lightSamples, $this->moon);
+    }
+
+    private function dropSkyViews() : void
+    {
+        SkyViewLut? $main = $this->skyViewMain;
+        if ($main != null) {
+            SkyViewLut $held = guard $main;
+            $held->destroy();
+            $this->skyViewMain = null;
+        }
+
+        SkyViewLut? $mirror = $this->skyViewMirror;
+        if ($mirror != null) {
+            SkyViewLut $held = guard $mirror;
+            $held->destroy();
+            $this->skyViewMirror = null;
+        }
+    }
+
+    private function dropGodRays() : void
+    {
+        GodRayHistory $held = guard $this->godRayHistory else {
+            return;
+        }
+        $held->destroy();
+        $this->godRayHistory = null;
+    }
+
+    /**
+     * Whether last frame ran the shaft passes. For the console and tests.
+     */
+    public const function godRaysLive() : bool
+    {
+        GodRayHistory $held = guard $this->godRayHistory else {
+            return false;
+        }
+        return $held->filled;
     }
 
     private function ensureShadowMap(ShadowQuality $quality) : Texture
@@ -399,6 +613,8 @@ public class DeferredRenderer
     {
         $this->dropEnvironment();
         $this->shadowMap = dropTexture($this->shadowMap);
+        $this->dropGodRays();
+        $this->dropSkyViews();
         DeferredGpu $gpu = guard $this->gpu else {
             return;
         }

@@ -1,0 +1,129 @@
+/**
+ * Console grammar and handler for the look of the renderer's moon. Where the moon stands and
+ * how much of it is lit belong to the app's calendar; this type owns the `moonlight` verb.
+ */
+
+namespace visu::console;
+
+use visu::graphics::{DeferredRenderer, Moon, keyLight, moonKeyed};
+use visu::math::Vec3;
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal const MOONLIGHT_USAGE = 'usage: moonlight [on|off|intensity <x>|tint <r> <g> <b>|disc <deg>|earthshine <x>|stars <x>|starlight <r> <g> <b>]';
+
+public class MoonlightConsole : ConsoleCommandHandler
+{
+    public DeferredRenderer $renderer;
+
+    public constructor(DeferredRenderer $renderer)
+    {
+        $this->renderer = $renderer;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('moonlight', $this, 'on|off|intensity|tint|disc|earthshine|stars|starlight');
+        array<string> $names = array<string>();
+        $names[] = 'moonlight';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if (!$cmd->isAction('moonlight')) {
+            return;
+        }
+
+        usize $n = $cmd->parts->count();
+        if ($n == 1) {
+            $console->writeLine($this->statusLine());
+            return;
+        }
+
+        string $verb = $cmd->parts[1];
+        Moon $moon = $this->renderer->moon;
+
+        if ($n == 2 && $verb == 'on') {
+            $moon->enabled = true;
+        } else if ($n == 2 && $verb == 'off') {
+            $moon->enabled = false;
+        } else if ($n == 5 && ($verb == 'tint' || $verb == 'starlight')) {
+            Vec3 $rgb = guard moonlightVec3($cmd->parts[2], $cmd->parts[3], $cmd->parts[4]) else {
+                $console->writeLine(MOONLIGHT_USAGE);
+                return;
+            }
+            if ($verb == 'tint') {
+                $moon->color = $rgb;
+            } else {
+                $moon->starlight = $rgb;
+            }
+        } else if ($n == 3) {
+            float64 $raw = guard str::float($cmd->parts[2]) else {
+                $console->writeLine(MOONLIGHT_USAGE);
+                return;
+            }
+            float32 $x = $raw as float32;
+            if ($x < 0.0f) {
+                $console->writeLine('moonlight: values are not negative');
+                return;
+            }
+
+            if ($verb == 'intensity') {
+                $moon->intensity = $x;
+            } else if ($verb == 'disc') {
+                $moon->discRadius = $x * 0.017453292f;
+            } else if ($verb == 'earthshine') {
+                $moon->earthshine = $x;
+            } else if ($verb == 'stars') {
+                $moon->stars = $x;
+            } else {
+                $console->writeLine(MOONLIGHT_USAGE);
+                return;
+            }
+        } else {
+            $console->writeLine(MOONLIGHT_USAGE);
+            return;
+        }
+
+        $this->renderer->moon = $moon;
+        $console->writeLine($this->statusLine());
+    }
+
+    private function statusLine() : string
+    {
+        Moon $moon = $this->renderer->moon;
+        string $state = 'off';
+        if ($moon->enabled) {
+            $state = 'on';
+        }
+
+        string $key = 'sun';
+        if (moonKeyed($this->renderer->sun, $moon)) {
+            $key = 'moon';
+        }
+
+        if (keyLight($this->renderer->sun, $moon)->intensity <= 0.0f) {
+            $key = 'none (cascades skipped)';
+        }
+
+        float32 $lit = $moon->illumination * 100.0f;
+        float32 $disc = $moon->discRadius * 57.29578f;
+        return "moonlight: {$state}, lit {$lit:.0f}%, light {$moon->light->intensity:.3f} of {$moon->intensity:.2f}, disc {$disc:.2f} deg, earthshine {$moon->earthshine:.2f}, stars {$moon->stars:.2f}, shadows {$key}";
+    }
+}
+
+internal function moonlightVec3(const string& $r, const string& $g, const string& $b) : Vec3?
+{
+    float64 $x = guard str::float($r) else {
+        return null;
+    }
+    float64 $y = guard str::float($g) else {
+        return null;
+    }
+    float64 $z = guard str::float($b) else {
+        return null;
+    }
+
+    return Vec3($x as float32, $y as float32, $z as float32);
+}

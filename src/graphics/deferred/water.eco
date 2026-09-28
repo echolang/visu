@@ -1,0 +1,155 @@
+/**
+ * One frame of flat water. The system publishes it before the deferred passes.
+ * The mirror is one reflected camera. Surfaces past the first eight are dropped.
+ * `casters` is the mailbox geometry fills during `fill`, the same shape as shadow casters.
+ */
+
+namespace visu::graphics;
+
+use visu::geo::{AABB, Frustum, Plane};
+use visu::math::{Mat4, Vec3, Vec4, dot};
+
+/**
+ * Surfaces considered in one frame. A river raises this.
+ */
+public const int32 WATER_MAX = 8;
+
+/**
+ * Mirror resolution relative to the framebuffer. Half is the quality default.
+ */
+public const float32 WATER_MIRROR_SCALE = 0.5f;
+
+/**
+ * std140 payload for one surface, uniform slot 0 of `water`.
+ */
+public struct WaterUniforms
+{
+    public Mat4 $world;
+    public Vec4 $plane;
+    public Vec4 $absorption;
+    public Vec4 $ripple;
+    public Vec4 $flow;
+    public Vec4 $extra;
+
+    /**
+     * Scattering albedo of the water body in rgb, turbidity (per metre) in w.
+     */
+    public Vec4 $body;
+
+    public constructor()
+    {
+        $this->world = Mat4();
+        $this->plane = Vec4(0.0f, 1.0f, 0.0f, 0.0f);
+        $this->absorption = Vec4(0.45f, 0.14f, 0.08f, 0.55f);
+        $this->ripple = Vec4(0.35f, 0.08f, 0.35f, 0.08f);
+        $this->flow = Vec4(0.8f, 0.35f, 0.012f, 0.0f);
+        $this->extra = Vec4(0.0f);
+        $this->body = Vec4(0.03f, 0.2f, 0.24f, 1.1f);
+    }
+}
+
+/**
+ * One visible surface, already in world space. `mirror` is 1 for the surface that owns the mirror.
+ */
+public struct WaterDraw
+{
+    public Mat4 $world;
+    public Plane $plane;
+    public Vec3 $origin;
+    public AABB $bounds;
+    public WaterUniforms $uniforms;
+    public float32 $radius;
+}
+
+/**
+ * True when any corner of `$box` is on the kept side of `$plane` or on the plane.
+ * A box entirely under the water is not a mirror caster.
+ */
+public function waterAbove(const AABB& $box, const Plane& $plane) : bool
+{
+    Vec3 $n = $plane->normal;
+    float32 $x = $box->min->x;
+    if ($n->x >= 0.0f) {
+        $x = $box->max->x;
+    }
+
+    float32 $y = $box->min->y;
+    if ($n->y >= 0.0f) {
+        $y = $box->max->y;
+    }
+
+    float32 $z = $box->min->z;
+    if ($n->z >= 0.0f) {
+        $z = $box->max->z;
+    }
+
+    float32 $side = dot($n, Vec3($x, $y, $z)) + $plane->distance;
+    return $side >= 0.0f;
+}
+
+/**
+ * Draw into the open mirror G-buffer. The pass has uploaded the reflected camera at slot 1.
+ * Implementations are classes. A system registers during its own fill.
+ */
+public interface ReflectionCaster
+{
+    function reflect(RenderContext $ctx, RenderEncoder $enc) : void;
+}
+
+/**
+ * The frame's water. Absent means no surface was visible, and no water pass is added.
+ */
+public class WaterFrame
+{
+    public bool $active;
+    public bool $mirror;
+    public CameraData $camera;
+    public float32 $time;
+    public int32 $mirrorIndex;
+    public array<WaterDraw> $draws;
+    public array<ReflectionCaster> $casters;
+    public GBufferData? $gbuffer;
+    public TextureRef? $color;
+    public TargetRef? $colorTarget;
+    public TextureRef? $presented;
+    public TargetRef? $outputTarget;
+    public Texture? $tiles;
+    public int32 $tilesX;
+    public int32 $tilesY;
+    public Texture? $fallbackCube;
+
+    public constructor()
+    {
+        $this->active = false;
+        $this->mirror = false;
+        $this->camera = CameraData(
+            Mat4(),
+            Mat4(),
+            Mat4(),
+            Mat4(),
+            Mat4(),
+            Frustum(Mat4()),
+            Vec3(0.0f),
+            0.0f,
+            1,
+            1,
+            1.0f,
+            1.0f,
+            Viewport(left: 0.0f, right: 0.0f, bottom: 0.0f, top: 0.0f, 1.0f, 1.0f),
+            false
+        );
+        $this->time = 0.0f;
+        $this->mirrorIndex = -1;
+        $this->draws = array<WaterDraw>();
+        $this->casters = array<ReflectionCaster>();
+        $this->gbuffer = null;
+        $this->color = null;
+        $this->colorTarget = null;
+        $this->presented = null;
+        $this->outputTarget = null;
+        $this->tiles = null;
+        $this->tilesX = 0;
+        $this->tilesY = 0;
+        $this->fallbackCube = null;
+    }
+}

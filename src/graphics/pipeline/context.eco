@@ -29,14 +29,21 @@ public struct RenderContext
 
     /**
      * Open a render encoder on `$target`. Consumes a pending `requestClear` into the load ops.
+     * `overwrite: true` promises the pass writes every pixel of every colour attachment (a
+     * fullscreen draw without blending), so the old contents are not loaded: on a tiled GPU
+     * that is a full read of the target saved. A pending clear still wins.
      */
-    public function beginRender(TargetRef $target) : result<RenderEncoder, PipelineError>
+    public function beginRender(TargetRef $target, overwrite: bool $overwrite = false) : result<RenderEncoder, PipelineError>
     {
         RenderTarget $rt = guard $this->pool->getTarget($target) else ($e) {
             return .error(.pool($e));
         }
 
         LoadOp $colorLoad = .load;
+        if ($overwrite) {
+            $colorLoad = .dontCare;
+        }
+
         LoadOp $depthLoad = .load;
         visu::math::Vec4 $clear = visu::math::Vec4(0.0f, 0.0f, 0.0f, 1.0f);
         float32 $clearDepth = 1.0f;

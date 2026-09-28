@@ -2,7 +2,9 @@
  * Sky parameters, their GPU mirror, the sun light they cast, and the probe face cameras.
  */
 
-use visu::graphics::{DirectionalLight, IblBlend, Sky, SkyUniforms, probeCamera, skyUniforms};
+use visu::graphics::{
+    DirectionalLight, IblBlend, Moon, Sky, SkyUniforms, fogLight, keyLight, moonKeyed, nightAmbient, probeCamera, skyUniforms
+};
 use visu::math::{Mat4, Vec3, Vec4, normalize};
 
 test sky_equality
@@ -26,7 +28,7 @@ test sky_same_atmosphere_ignores_direction
 
 test sky_uniforms_pack
 {
-    assert(mem::size<SkyUniforms>() == 96, 'std140 size');
+    assert(mem::size<SkyUniforms>() == 144, 'std140 size');
     Sky $sky = Sky();
     $sky->direction = Vec3(0.0f, -2.0f, 0.0f);
     $sky->sunIntensity = 4.0f;
@@ -38,6 +40,82 @@ test sky_uniforms_pack
     assert($u->params->x == 16.0f, 'view samples');
     SkyUniforms $bake = skyUniforms($sky, Vec3(0.0f, 0.0f, 0.0f), false, 32.0f, 8.0f);
     assert($bake->origin->w == 0.0f, 'disk off');
+    assert($bake->moon->w == 0.0f, 'no moon in the bake');
+    assert($bake->moonColor->w == 0.0f, 'no moon disc in the bake');
+}
+
+test sky_uniforms_pack_moon
+{
+    Sky $sky = Sky();
+    Moon $moon = Moon();
+    $moon->enabled = true;
+    $moon->direction = Vec3(0.0f, -1.0f, 0.0f);
+    $moon->illumination = 0.5f;
+    $moon->light = $sky->moonLight($moon, 300.0f);
+    SkyUniforms $u = skyUniforms($sky, Vec3(0.0f, 300.0f, 0.0f), true, 16.0f, 8.0f, $moon);
+    assert($u->moon->y > 0.999f, 'towards the moon');
+    assert($u->moon->w == $moon->light->intensity, 'scattered light');
+    assert($u->moonParams->x == 0.5f, 'illumination');
+    assert($u->moonColor->w == 1.0f, 'disc on');
+    $moon->enabled = false;
+    SkyUniforms $off = skyUniforms($sky, Vec3(0.0f, 300.0f, 0.0f), true, 16.0f, 8.0f, $moon);
+    assert($off->moon->w == 0.0f && $off->moonColor->w == 0.0f, 'a disabled moon packs nothing');
+}
+
+test moon_light_follows_phase_and_horizon
+{
+    Sky $sky = Sky();
+    Moon $moon = Moon();
+    $moon->direction = Vec3(0.0f, -1.0f, 0.0f);
+    $moon->illumination = 1.0f;
+    assert($sky->moonLight($moon, 300.0f)->intensity == 0.0f, 'a disabled moon is dark');
+    $moon->enabled = true;
+    DirectionalLight $full = $sky->moonLight($moon, 300.0f);
+    assert($full->intensity > 0.3f && $full->intensity <= $moon->intensity, 'full moon overhead');
+    assert($full->color->z > $full->color->x, 'cool tint');
+    $moon->illumination = 0.5f;
+    DirectionalLight $quarter = $sky->moonLight($moon, 300.0f);
+    assert($quarter->intensity < $full->intensity * 0.5f, 'a quarter is well under half');
+    $moon->illumination = 0.0f;
+    assert($sky->moonLight($moon, 300.0f)->intensity == 0.0f, 'new moon is dark');
+    $moon->illumination = 1.0f;
+    $moon->direction = Vec3(0.0f, 1.0f, 0.0f);
+    assert($sky->moonLight($moon, 300.0f)->intensity == 0.0f, 'set moon is dark');
+}
+
+test key_light_is_the_brighter
+{
+    Sky $sky = Sky();
+    Moon $moon = Moon();
+    $moon->enabled = true;
+    $moon->direction = Vec3(0.0f, -1.0f, 0.0f);
+    $moon->light = $sky->moonLight($moon, 300.0f);
+    $sky->direction = Vec3(0.0f, 1.0f, 0.0f);
+    DirectionalLight $night = $sky->sunLight(300.0f);
+    assert(moonKeyed($night, $moon), 'the moon owns a night');
+    assert(keyLight($night, $moon)->intensity == $moon->light->intensity, 'moon key');
+    $sky->direction = Vec3(0.0f, -1.0f, 0.0f);
+    DirectionalLight $noon = $sky->sunLight(300.0f);
+    assert(!moonKeyed($noon, $moon), 'the sun owns a day');
+    // a low evening sun dimmer than the moon keeps its shadows until it sets
+    DirectionalLight $evening = DirectionalLight(Vec3(0.0f, -0.1f, 1.0f), Vec3(1.0f, 0.5f, 0.3f), 0.05f);
+    assert($evening->intensity < $moon->light->intensity, 'the moon is brighter');
+    assert(!moonKeyed($evening, $moon), 'the sun keeps the cascades while it is up');
+    assert(keyLight($evening, $moon)->intensity == 0.05f, 'sun key at dusk');
+}
+
+test disabled_moon_leaves_night_alone
+{
+    Sky $sky = Sky();
+    $sky->direction = Vec3(0.0f, 1.0f, 0.0f);
+    Moon $moon = Moon();
+    Vec4 $ambient = nightAmbient($moon, $sky);
+    assert($ambient->x == 0.0f && $ambient->y == 0.0f && $ambient->z == 0.0f, 'no night ambient');
+    Vec3 $fog = fogLight($moon, $sky);
+    assert($fog->x == 1.0f && $fog->y == 1.0f && $fog->z == 1.0f, 'fog colour untouched');
+    $moon->enabled = true;
+    assert(nightAmbient($moon, $sky)->z > 0.0f, 'starlight once enabled');
+    assert(fogLight($moon, $sky)->x < 0.1f, 'night fog dims once enabled');
 }
 
 test sun_light_reddens_low

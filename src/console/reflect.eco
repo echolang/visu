@@ -1,0 +1,93 @@
+/**
+ * Console grammar for planar mirrors. `off` keeps the water shading and drops the mirror pass.
+ * `radius` of 0 uses each surface's own radius.
+ */
+
+namespace visu::console;
+
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+use visu::system::WaterSurfaceSystem;
+
+internal const REFLECT_USAGE = 'usage: reflect [on|off|scale <0.25-1>|radius <m>]';
+
+public class ReflectConsole : ConsoleCommandHandler
+{
+    public WaterSurfaceSystem $water;
+
+    public constructor(WaterSurfaceSystem $water)
+    {
+        $this->water = $water;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('reflect', $this, 'on|off|scale <0.25-1>|radius <m>');
+        array<string> $names = array<string>();
+        $names[] = 'reflect';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if (!$cmd->isAction('reflect')) {
+            return;
+        }
+
+        usize $n = $cmd->parts->count();
+        if ($n == 1) {
+            $console->writeLine($this->status());
+            return;
+        }
+
+        string $verb = $cmd->parts[1];
+        if ($verb == 'on') {
+            $this->water->setEnabled(true);
+            $console->writeLine($this->status());
+            return;
+        }
+
+        if ($verb == 'off') {
+            $this->water->setEnabled(false);
+            $console->writeLine($this->status());
+            return;
+        }
+
+        if ($n != 3) {
+            $console->writeLine(REFLECT_USAGE);
+            return;
+        }
+
+        float64 $raw = guard str::float($cmd->parts[2]) else {
+            $console->writeLine(REFLECT_USAGE);
+            return;
+        }
+        float32 $value = $raw as float32;
+        if ($verb == 'scale') {
+            $this->water->setScale($value);
+            $console->writeLine($this->status());
+            return;
+        }
+
+        if ($verb == 'radius') {
+            $this->water->setRadius($value);
+            $console->writeLine($this->status());
+            return;
+        }
+
+        $console->writeLine(REFLECT_USAGE);
+    }
+
+    private function status() : string
+    {
+        string $mode = 'off';
+        if ($this->water->enabled()) {
+            $mode = 'on';
+        }
+
+        float32 $scale = $this->water->scale();
+        float32 $radius = $this->water->radiusOverride();
+        int32 $count = $this->water->surfaceCount();
+        return "reflect: {$mode}, scale {$scale}, radius {$radius}, surfaces {$count}";
+    }
+}

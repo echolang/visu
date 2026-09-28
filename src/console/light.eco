@@ -1,0 +1,169 @@
+/**
+ * Console grammar for packed point lights. `add` and `clear` own debug lamps
+ * that share the frame's fixed list with the entities. `shadow` sets whether
+ * those debug lamps cast.
+ */
+
+namespace visu::console;
+
+use visu::graphics::{PointCandidate, PointGpu, PointPack};
+use visu::math::Vec3;
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+use visu::system::PointLightSystem;
+
+internal const LIGHT_USAGE = 'usage: light [add <x> <y> <z> [r g b] [radius] [intensity]|clear|shadow on|off]';
+
+public class LightConsole : ConsoleCommandHandler
+{
+    public PointLightSystem $lights;
+
+    public constructor(PointLightSystem $lights)
+    {
+        $this->lights = $lights;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('light', $this, 'add <x> <y> <z> [r g b] [radius] [intensity]|clear|shadow on|off');
+        array<string> $names = array<string>();
+        $names[] = 'light';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if (!$cmd->isAction('light')) {
+            return;
+        }
+
+        usize $n = $cmd->parts->count();
+        if ($n == 1) {
+            $console->writeLine(lightStatus($this->lights->packed));
+            return;
+        }
+
+        string $verb = $cmd->parts[1];
+        if ($verb == 'clear') {
+            $this->lights->debugClear();
+            $console->writeLine('light: cleared');
+            return;
+        }
+
+        if ($verb == 'shadow') {
+            if ($n != 3) {
+                $console->writeLine(LIGHT_USAGE);
+                return;
+            }
+
+            string $mode = $cmd->parts[2];
+            if ($mode != 'on' && $mode != 'off') {
+                $console->writeLine(LIGHT_USAGE);
+                return;
+            }
+
+            $this->lights->debugSetShadow($mode == 'on');
+            $console->writeLine(lightStatus($this->lights->packed));
+            return;
+        }
+
+        if ($verb == 'add') {
+            PointCandidate? $lamp = lightParseAdd($cmd);
+            if ($lamp == null) {
+                $console->writeLine(LIGHT_USAGE);
+                return;
+            }
+
+            PointCandidate $held = guard $lamp;
+            if (!$this->lights->debugAdd($held)) {
+                $console->writeLine('light: debug list is full');
+                return;
+            }
+
+            $console->writeLine("light: added {$this->lights->debugCount}");
+            return;
+        }
+
+        $console->writeLine(LIGHT_USAGE);
+    }
+}
+
+internal function lightStatus(const PointPack& $pack) : string
+{
+    string $buf = "light: {$pack->count} packed, {$pack->shadows} shadow";
+    int32 $i = 0;
+    while ($i < $pack->count) {
+        PointGpu $gpu = $pack->gpu[$i];
+        Vec3 $p = $gpu->positionRadius->xyz();
+        Vec3 $c = $gpu->colorIntensity->xyz();
+        float32 $slot = $gpu->sourceShadow->y;
+        $buf = "{$buf}\n  {$i} {$p->x:.1f} {$p->y:.1f} {$p->z:.1f} r {$gpu->positionRadius->w:.1f} rgb {$c->x:.2f} {$c->y:.2f} {$c->z:.2f} i {$gpu->colorIntensity->w:.1f} shadow {$slot:.0f}";
+        $i = $i + 1;
+    }
+
+    return $buf;
+}
+
+internal function lightParseAdd(const ConsoleCommandSignal& $cmd) : PointCandidate?
+{
+    usize $n = $cmd->parts->count();
+    if ($n < 5) {
+        return null;
+    }
+
+    float64 $x = guard str::float($cmd->parts[2]) else {
+        return null;
+    }
+    float64 $y = guard str::float($cmd->parts[3]) else {
+        return null;
+    }
+    float64 $z = guard str::float($cmd->parts[4]) else {
+        return null;
+    }
+    float32 $r = 1.0f;
+    float32 $g = 1.0f;
+    float32 $b = 1.0f;
+    float32 $radius = 7.0f;
+    float32 $intensity = 8.0f;
+    if ($n >= 8) {
+        float64 $pr = guard str::float($cmd->parts[5]) else {
+            return null;
+        }
+        float64 $pg = guard str::float($cmd->parts[6]) else {
+            return null;
+        }
+        float64 $pb = guard str::float($cmd->parts[7]) else {
+            return null;
+        }
+        $r = $pr as float32;
+        $g = $pg as float32;
+        $b = $pb as float32;
+    }
+
+    if ($n >= 9) {
+        float64 $rad = guard str::float($cmd->parts[8]) else {
+            return null;
+        }
+        $radius = $rad as float32;
+    }
+
+    if ($n >= 10) {
+        float64 $power = guard str::float($cmd->parts[9]) else {
+            return null;
+        }
+        $intensity = $power as float32;
+    }
+
+    if ($n != 5 && $n != 8 && $n != 9 && $n != 10) {
+        return null;
+    }
+
+    return PointCandidate(
+        Vec3($x as float32, $y as float32, $z as float32),
+        $radius,
+        Vec3($r, $g, $b),
+        $intensity,
+        0.05f,
+        true
+    );
+}

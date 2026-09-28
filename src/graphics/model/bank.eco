@@ -10,7 +10,7 @@ namespace visu::graphics;
 
 use visu::app::info;
 use visu::asset::{AssetError, AssetRef, Assets};
-use visu::math::{Vec2, Vec4};
+use visu::math::{Vec2, Vec3, Vec4};
 
 /**
  * One material's textures on the GPU plus its slot 0 payload. `$index` is the dense key the
@@ -26,6 +26,11 @@ public class MaterialGpu
     public Texture $metallic;
     public Texture $ao;
     public Texture $alpha;
+
+    /**
+     * Emissive map, or white when the material has none. The factor in `$params` scales it.
+     */
+    public Texture $emissive;
 
     /**
      * Height map the parallax programs march, or the white fallback when `$parallax` is false.
@@ -49,6 +54,7 @@ public class MaterialGpu
         Texture $metallic,
         Texture $ao,
         Texture $alpha,
+        Texture $emissive,
         Texture $height,
         bool $parallax,
         Sampler $sampler,
@@ -63,6 +69,7 @@ public class MaterialGpu
         $this->metallic = $metallic;
         $this->ao = $ao;
         $this->alpha = $alpha;
+        $this->emissive = $emissive;
         $this->height = $height;
         $this->parallax = $parallax;
         $this->sampler = $sampler;
@@ -84,6 +91,7 @@ public class MaterialGpu
         $enc->bindTexture(3, $this->metallic, $this->sampler);
         $enc->bindTexture(4, $this->ao, $this->sampler);
         $enc->bindTexture(5, $this->alpha, $this->sampler);
+        $enc->bindTexture(7, $this->emissive, $this->sampler);
         if ($this->parallax) {
             $enc->bindTexture(MODEL_HEIGHT_SLOT, $this->height, $this->sampler);
         }
@@ -308,6 +316,8 @@ public class ModelBank
         Texture $metallic = $this->mapOr($material->metal, $white, MODEL_MAP_METALLIC, $flags);
         Texture $ao = $this->mapOr($material->ao, $white, MODEL_MAP_AO, $flags);
         Texture $alpha = $this->mapOr($material->alpha, $white, MODEL_MAP_ALPHA, $flags);
+        Texture $emissive = $this->mapOr($material->emissive, $white, 0, $flags);
+        Vec3 $glow = $material->emissiveFactor;
         // the height map is only loaded for a surface that marches it
         Texture $height = $white;
         float32 $depth = 0.0f;
@@ -322,7 +332,8 @@ public class ModelBank
         ModelMaterialData $params = ModelMaterialData(
             Vec4($material->diffuseColor->x, $material->diffuseColor->y, $material->diffuseColor->z, $material->alphaCutoff),
             Vec4($material->roughnessFactor, $material->metallicFactor, $flags as float32, $depth),
-            Vec4($scale->x, $scale->y, $material->parallaxSteps, $material->parallaxFade)
+            Vec4($scale->x, $scale->y, $material->parallaxSteps, $material->parallaxFade),
+            Vec4($glow->x, $glow->y, $glow->z, 0.0f)
         );
         int32 $index = $this->byIndex->count() as int32;
         MaterialGpu $gpu = MaterialGpu(
@@ -334,6 +345,7 @@ public class ModelBank
             $metallic,
             $ao,
             $alpha,
+            $emissive,
             $height,
             $depth > 0.0f,
             $this->modelSampler(),

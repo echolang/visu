@@ -117,7 +117,7 @@ fragment fs_out fs(fs_in in [[stage_in]], constant SsaoUniforms& _81 [[buffer(2)
     {
         ao = mix(1.0, ao, 0.3499999940395355224609375);
     }
-    out.frag_ao = pow(fast::clamp(ao, 0.0, 1.0), strength);
+    out.frag_ao = powr(fast::clamp(ao, 0.0, 1.0), strength);
     return out;
 }
 

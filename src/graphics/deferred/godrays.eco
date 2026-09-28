@@ -1,0 +1,445 @@
+/**
+ * Volumetric light shafts from the key light (the sun by day, the moon once it owns the
+ * cascades). A reduced-resolution pass marches each view ray through the height-fog medium
+ * against the shadow cascades, a temporal resolve accumulates the jittered samples into a
+ * history the renderer owns, and `fog_apply_rays` adds the shadowed inscatter and dims the
+ * analytic fog glow behind occluders. Off by default: a disabled frame adds no pass and the
+ * fog runs exactly as before.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Mat4, Vec3, Vec4, length, normalize};
+
+/**
+ * Texture binding the resolved shafts sit at in the light, sky, skybox and water programs.
+ */
+internal const uint32 GODRAY_SLOT = 15;
+
+/**
+ * A camera that moves further than this between two frames is a cut: the history is dropped.
+ */
+internal const float32 GODRAY_CUT_METRES = 12.0f;
+
+/**
+ * Relative distance mismatch past which a reprojected history texel belongs to another surface.
+ */
+internal const float32 GODRAY_DEPTH_REJECT = 0.08f;
+
+/**
+ * Most march steps a pass will take, whatever the setting says.
+ */
+public const int32 GODRAY_MAX_STEPS = 64;
+
+/**
+ * Light shaft settings. Copied on assignment, like `HeightFog`. The medium is the height fog:
+ * with fog off there is nothing to scatter and the passes are skipped.
+ */
+public struct GodRays
+{
+    /**
+     * Master switch. Off adds no pass, binds no history and leaves the fog untouched.
+     */
+    public bool $enabled;
+
+    /**
+     * Resolution of the march and the history against the screen: 0.5 half, 0.25 quarter.
+     */
+    public float32 $scale;
+
+    /**
+     * March steps per pixel per frame. The resolve accumulates about ten frames of them.
+     */
+    public int32 $steps;
+
+    /**
+     * Metres marched from the eye. The last cascade's far edge caps it; beyond, the medium
+     * counts as lit.
+     */
+    public float32 $maxDistance;
+
+    /**
+     * Strength of the shaft inscatter on top of the fog's own density.
+     */
+    public float32 $scatter;
+
+    /**
+     * Henyey-Greenstein anisotropy of the core lobe: the tight glow hugging the light.
+     */
+    public float32 $anisotropy;
+
+    /**
+     * Anisotropy of the wide lobe, which carries the streaks well away from the light.
+     */
+    public float32 $wideAnisotropy;
+
+    /**
+     * Weight of the wide lobe, added to the core, while the sun is the key light. Low, so the
+     * streaks reach out without veiling the frame.
+     */
+    public float32 $wideWeight;
+
+    /**
+     * Weight of the wide lobe while the moon is the key light. Higher: a night sky has no
+     * bright atmosphere around the moon, so the streaks are what reads.
+     */
+    public float32 $moonWideWeight;
+
+    /**
+     * How far the fog's directional glow darkens with the shadowed share of its ray, 0 to 1.
+     */
+    public float32 $occludeGlow;
+
+    /**
+     * Scale on the shafts while the moon is the key light; moonlight is faint next to the sun.
+     */
+    public float32 $moonBoost;
+
+    /**
+     * Share of the history kept each frame, 0 to about 0.95.
+     */
+    public float32 $historyWeight;
+
+    /**
+     * Key light elevation in degrees at and below which the shafts are at full strength.
+     * Shafts are an evening and morning look: long light paths through the haze, long shadows.
+     */
+    public float32 $lowAngle;
+
+    /**
+     * Key light elevation in degrees at which the shafts have faded out. Above it the passes
+     * are not added at all, so a high sun costs nothing.
+     */
+    public float32 $highAngle;
+
+    public constructor()
+    {
+        $this->enabled = false;
+        $this->scale = 0.5f;
+        $this->steps = 12;
+        $this->maxDistance = 120.0f;
+        $this->scatter = 15.0f;
+        $this->anisotropy = 0.85f;
+        $this->wideAnisotropy = 0.35f;
+        $this->wideWeight = 0.25f;
+        $this->moonWideWeight = 3.0f;
+        $this->occludeGlow = 1.0f;
+        $this->moonBoost = 3.0f;
+        $this->historyWeight = 0.9f;
+        $this->lowAngle = 12.0f;
+        $this->highAngle = 35.0f;
+    }
+}
+
+operator (GodRays $a) == (GodRays $b) : bool
+{
+    return $a->enabled == $b->enabled
+        && $a->scale == $b->scale
+        && $a->steps == $b->steps
+        && $a->maxDistance == $b->maxDistance
+        && $a->scatter == $b->scatter
+        && $a->anisotropy == $b->anisotropy
+        && $a->wideAnisotropy == $b->wideAnisotropy
+        && $a->wideWeight == $b->wideWeight
+        && $a->moonWideWeight == $b->moonWideWeight
+        && $a->occludeGlow == $b->occludeGlow
+        && $a->moonBoost == $b->moonBoost
+        && $a->historyWeight == $b->historyWeight
+        && $a->lowAngle == $b->lowAngle
+        && $a->highAngle == $b->highAngle;
+}
+
+operator (GodRays $a) != (GodRays $b) : bool
+{
+    return !($a == $b);
+}
+
+/**
+ * Mirrors GodRayUniforms in resources/shaders/include/visu/godrays_uniforms.glsl at uniform
+ * slot 0 of the march and the resolve; std140 with mat4 and vec4 members only.
+ */
+public struct GodRayUniforms
+{
+    public Mat4[5] $lightSpace;
+
+    /**
+     * Last frame's projection times view, for the reprojection.
+     */
+    public Mat4 $prevProjectionView;
+
+    /**
+     * Far view Z of cascades 0 to 3.
+     */
+    public Vec4 $splits;
+
+    /**
+     * Direction the key light travels in xyz, far view Z of cascade 4 in w.
+     */
+    public Vec4 $key;
+
+    /**
+     * Steps in x, max distance in y, this frame's jitter in z, fog density at the camera in w.
+     */
+    public Vec4 $march;
+
+    /**
+     * Fog height falloff in x, history weight in y, 1 in z when the history is usable, depth
+     * rejection in w.
+     */
+    public Vec4 $medium;
+
+    /**
+     * Shaft target width, height, 1 / width, 1 / height.
+     */
+    public Vec4 $target;
+
+    /**
+     * Last frame's eye in xyz, the fog's start distance in w: the air nearer stays clear.
+     */
+    public Vec4 $prevCamera;
+
+    public constructor()
+    {
+        Mat4[5] $space;
+        int32 $i = 0;
+        while ($i < SHADOW_CASCADES) {
+            $space[$i] = Mat4();
+            $i = $i + 1;
+        }
+
+        $this->lightSpace = $space;
+        $this->prevProjectionView = Mat4();
+        $this->splits = Vec4(0.0f);
+        $this->key = Vec4(0.0f, -1.0f, 0.0f, 0.0f);
+        $this->march = Vec4(0.0f);
+        $this->medium = Vec4(0.0f);
+        $this->target = Vec4(0.0f);
+        $this->prevCamera = Vec4(0.0f);
+    }
+}
+
+/**
+ * Size of the shaft target for a `$width` x `$height` screen: never below one texel.
+ */
+public function godRaySize(int32 $width, int32 $height, float32 $scale) : GodRaySize
+{
+    float32 $s = $scale;
+    if ($s < 0.0625f) {
+        $s = 0.0625f;
+    }
+
+    if ($s > 1.0f) {
+        $s = 1.0f;
+    }
+
+    float32 $fw = ($width as float32) * $s + 0.5f;
+    float32 $fh = ($height as float32) * $s + 0.5f;
+    int32 $w = $fw as int32;
+    int32 $h = $fh as int32;
+    if ($w < 1) {
+        $w = 1;
+    }
+
+    if ($h < 1) {
+        $h = 1;
+    }
+
+    return GodRaySize($w, $h);
+}
+
+public struct GodRaySize
+{
+    public int32 $width;
+    public int32 $height;
+
+    public constructor(int32 $width, int32 $height)
+    {
+        $this->width = $width;
+        $this->height = $height;
+    }
+}
+
+operator (GodRaySize $a) == (GodRaySize $b) : bool
+{
+    return $a->width == $b->width && $a->height == $b->height;
+}
+
+/**
+ * Whether last frame's history can feed this one: it was written (`GodRayHistory.fit` clears
+ * that on a resize), under the same key light, and the eye did not jump.
+ */
+public function godRayHistoryKept(bool $had, bool $wasMoonKey, bool $moonKey, Vec3 $prevEye, Vec3 $eye) : bool
+{
+    if (!$had) {
+        return false;
+    }
+
+    // sun to moon swaps the cascades underneath: last frame's shadows are another light's
+    if ($wasMoonKey != $moonKey) {
+        return false;
+    }
+
+    return length($eye - $prevEye) <= GODRAY_CUT_METRES;
+}
+
+/**
+ * The frame's jitter: a golden-ratio walk over [0, 1), so any run of frames covers the step
+ * evenly.
+ */
+public function godRayJitter(int64 $frame) : float32
+{
+    float64 $x = ($frame as float64) * 0.6180339887498949;
+    return ($x - std::math::floor($x)) as float32;
+}
+
+/**
+ * Packs the march and resolve uniforms. `$keyDirection` is the way the key light travels.
+ */
+public function godRayUniforms(
+    const GodRays& $rays,
+    const ShadowCascade[5]& $cascades,
+    Vec3 $keyDirection,
+    const HeightFog& $fog,
+    Vec3 $eye,
+    GodRaySize $size,
+    int64 $frame,
+    bool $historyKept,
+    const Mat4& $prevProjectionView,
+    Vec3 $prevEye
+) : GodRayUniforms
+{
+    GodRayUniforms $u = GodRayUniforms();
+    int32 $i = 0;
+    while ($i < SHADOW_CASCADES) {
+        $u->lightSpace[$i] = $cascades[$i]->lightSpace;
+        $i = $i + 1;
+    }
+
+    $u->prevProjectionView = $prevProjectionView;
+    $u->splits = Vec4(
+        $cascades[0]->splitViewZ,
+        $cascades[1]->splitViewZ,
+        $cascades[2]->splitViewZ,
+        $cascades[3]->splitViewZ
+    );
+    Vec3 $dir = normalize($keyDirection);
+    $u->key = Vec4($dir->x, $dir->y, $dir->z, $cascades[4]->splitViewZ);
+    int32 $steps = $rays->steps;
+    if ($steps < 1) {
+        $steps = 1;
+    }
+
+    if ($steps > GODRAY_MAX_STEPS) {
+        $steps = GODRAY_MAX_STEPS;
+    }
+
+    $u->march = Vec4(
+        $steps as float32,
+        $rays->maxDistance,
+        godRayJitter($frame),
+        fogDensityAtCamera($fog, $eye)
+    );
+    float32 $weight = $rays->historyWeight;
+    if ($weight < 0.0f) {
+        $weight = 0.0f;
+    }
+
+    if ($weight > 0.98f) {
+        $weight = 0.98f;
+    }
+
+    float32 $kept = 0.0f;
+    if ($historyKept) {
+        $kept = 1.0f;
+    }
+
+    $u->medium = Vec4($fog->heightFalloff, $weight, $kept, GODRAY_DEPTH_REJECT);
+    $u->target = Vec4(
+        $size->width as float32,
+        $size->height as float32,
+        1.0f / ($size->width as float32),
+        1.0f / ($size->height as float32)
+    );
+    $u->prevCamera = Vec4($prevEye, $fog->startDistance);
+    return $u;
+}
+
+/**
+ * How strong the shafts are for a key light travelling along `$keyDirection`: 1 at or below
+ * `lowAngle` of elevation, a smooth fade to 0 at `highAngle`. Zero means the frame adds no
+ * shaft pass.
+ */
+public function godRayStrength(const GodRays& $rays, Vec3 $keyDirection) : float32
+{
+    Vec3 $toLight = normalize(-$keyDirection);
+    float32 $elevation = std::math::asin(std::math::clamp($toLight->y as float64, -1.0, 1.0)) as float32 * 57.29578f;
+    float32 $span = $rays->highAngle - $rays->lowAngle;
+    if ($span <= 0.001f) {
+        if ($elevation <= $rays->lowAngle) {
+            return 1.0f;
+        }
+        return 0.0f;
+    }
+
+    float32 $x = ($rays->highAngle - $elevation) / $span;
+    if ($x <= 0.0f) {
+        return 0.0f;
+    }
+
+    if ($x >= 1.0f) {
+        return 1.0f;
+    }
+
+    return $x * $x * (3.0f - 2.0f * $x);
+}
+
+/**
+ * The fog's shaft knobs: scatter in x, glow occlusion in y, 1 in w (on). `$strength` is
+ * `godRayStrength`; it scales the inscatter and the occlusion together, so the fade ends on
+ * the plain fog.
+ */
+public function godRayFogShafts(const GodRays& $rays, float32 $strength) : Vec4
+{
+    float32 $occlude = std::math::clamp($rays->occludeGlow as float64, 0.0, 1.0) as float32;
+    return Vec4($rays->scatter * $strength, $occlude * $strength, 0.0f, 1.0f);
+}
+
+/**
+ * The two-lobe phase: core anisotropy in x, wide anisotropy in y, the wide lobe's share in
+ * z (the moon's when `$moonKey`).
+ */
+public function godRayFogPhase(const GodRays& $rays, bool $moonKey) : Vec4
+{
+    float32 $weight = $rays->wideWeight;
+    if ($moonKey) {
+        $weight = $rays->moonWideWeight;
+    }
+
+    return Vec4(
+        godRayLobe($rays->anisotropy),
+        godRayLobe($rays->wideAnisotropy),
+        std::math::clamp($weight as float64, 0.0, 8.0) as float32,
+        0.0f
+    );
+}
+
+internal function godRayLobe(float32 $g) : float32
+{
+    return std::math::clamp($g as float64, -0.95, 0.95) as float32;
+}
+
+/**
+ * The key light's radiance for the shafts in rgb, 1 in w when it is the moon.
+ */
+public function godRayFogLight(const GodRays& $rays, const DirectionalLight& $sun, const Moon& $moon) : Vec4
+{
+    DirectionalLight $key = keyLight($sun, $moon);
+    Vec3 $radiance = $key->color * $key->intensity;
+    float32 $moonKey = 0.0f;
+    if (moonKeyed($sun, $moon)) {
+        $radiance = $radiance * $rays->moonBoost;
+        $moonKey = 1.0f;
+    }
+
+    return Vec4($radiance, $moonKey);
+}

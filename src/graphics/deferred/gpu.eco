@@ -78,6 +78,10 @@ internal class DeferredCache
             $this->programs->drop();
             return .error($e);
         }
+        guard $shaders->program('water') else ($e) {
+            $this->programs->drop();
+            return .error($e);
+        }
         guard $shaders->program('debug_view') else ($e) {
             $this->programs->drop();
             return .error($e);
@@ -116,6 +120,15 @@ internal class DeferredCache
             $this->programs->drop();
             return .error($e);
         }
+        // the shaft passes first run at the first sunset with god rays on
+        guard $shaders->program('godrays') else ($e) {
+            $this->programs->drop();
+            return .error($e);
+        }
+        guard $shaders->program('godrays_resolve') else ($e) {
+            $this->programs->drop();
+            return .error($e);
+        }
         $this->warmed = true;
         return .ok($shaders);
     }
@@ -133,8 +146,18 @@ internal class DeferredGpu
     public Sampler $linear;
     public Sampler $noiseRepeat;
     public Sampler $cube;
+
+    /**
+     * The sky-view table: linear, wrapped around the azimuth, clamped at the zenith and nadir.
+     */
+    public Sampler $skyView;
     public Sampler $shadow;
     public Texture $shadowDummy;
+
+    /**
+     * 1x1 r8 the light pass binds when no lamp is on screen.
+     */
+    public Texture $pointTileDummy;
     public array<Vec4> $kernel;
 
     public static function load(Device $device) : result<DeferredGpu, ShaderError>
@@ -165,8 +188,10 @@ internal class DeferredGpu
                 $wrapT: .repeat
             )),
             $device->createSampler($cubeDesc),
+            $device->createSampler(SamplerDesc($wrapS: .repeat)),
             $device->createSampler(SamplerDesc()),
             shadowDummy($device),
+            pointTileDummy($device),
             ssaoKernel(SSAO_MAX_SAMPLES)
         ));
     }
@@ -210,6 +235,7 @@ internal class DeferredGpu
         $this->white->destroy();
         $this->noise->destroy();
         $this->shadowDummy->destroy();
+        $this->pointTileDummy->destroy();
     }
 }
 
@@ -233,6 +259,16 @@ internal function whitePixel(Device $device) : Texture
 {
     array<uint8> $rgba = [255, 255, 255, 255];
     return Texture($device, 'deferred.white', Pixels(1, 1, $rgba));
+}
+
+internal function pointTileDummy(Device $device) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .r8, $width: 1, $height: 1);
+    $desc->label = 'deferred.pointTiles';
+    Texture $tex = Texture($device, 'deferred.pointTiles', $desc);
+    array<uint8> $zero = [0];
+    $tex->upload(0, ptr<const uint8>(&$zero[0]), 1, 1);
+    return $tex;
 }
 
 internal function shadowDummy(Device $device) : Texture

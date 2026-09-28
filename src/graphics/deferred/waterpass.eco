@@ -1,0 +1,538 @@
+/**
+ * Mirror G-buffer, its lighting and sky, then the water composite.
+ * The composite writes its own colour and samples the lit scene, so the light target stays
+ * the opaque image. The blit presents the composite when water is active.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Vec3, Vec4};
+
+/**
+ * View and light samples for the mirror sky. The mirror target is mostly empty, so the main
+ * sky's march (16 by 8) spends the whole reflection budget on atmosphere. Half of each still
+ * reads as the same sky.
+ */
+internal const float32 MIRROR_SKY_VIEW_SAMPLES = 8.0f;
+internal const float32 MIRROR_SKY_LIGHT_SAMPLES = 4.0f;
+
+/**
+ * Half-resolution G-buffer for the reflected camera. Does not publish `GBufferData` on the frame.
+ */
+public class MirrorGBufferPass : Pass
+{
+    private WaterFrame $water;
+
+    public constructor(WaterFrame $water)
+    {
+        $this->water = $water;
+    }
+
+    public function name() : string
+    {
+        return 'reflect.gbuffer';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        int32 $w = $this->water->camera->resolutionX;
+        int32 $h = $this->water->camera->resolutionY;
+        if ($w < 1) {
+            $w = 1;
+        }
+
+        if ($h < 1) {
+            $h = 1;
+        }
+
+        TargetRef $target = $pipeline->createTarget('reflect.gbuffer', $w, $h);
+        TextureRef $position = $pipeline->createColor($target, 'position', gbufferOptions(.rgba16f));
+        TextureRef $normal = $pipeline->createColor($target, 'normal', gbufferOptions(.rgba16f));
+        TextureRef $albedo = $pipeline->createColor($target, 'albedo', gbufferOptions(.rgba8));
+        TextureRef $material = $pipeline->createColor($target, 'material', gbufferOptions(.rgba8));
+        TextureRef $emissive = $pipeline->createColor($target, 'emissive', gbufferOptions(.rgba16f));
+        TextureRef $id = $pipeline->createColor($target, 'id', gbufferOptions(.r8));
+        TextureRef $depth = $pipeline->createDepth($target, TextureOptions::depth());
+        $this->water->gbuffer = GBufferData($target, $position, $normal, $albedo, $material, $emissive, $id, $depth);
+        $io->writes($target);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        GBufferData $gbuffer = guard $this->water->gbuffer else {
+            return .ok;
+        }
+        $ctx->pipeline->requestClear($gbuffer->target, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 0.0f)));
+        RenderEncoder $enc = guard $ctx->beginRender($gbuffer->target) else ($e) {
+            return .error($e);
+        }
+        $enc->upload($this->water->camera->uniforms(), slot: 1);
+        array<ReflectionCaster> $casters = $this->water->casters;
+        foreach ($casters as $caster) {
+            $caster->reflect($ctx, $enc);
+        }
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+/**
+ * The light pass aimed at the mirror G-buffer. Fog is off. Point-light tiles are the mirror's.
+ */
+public class MirrorLightPass : Pass
+{
+    private LightPass $lighting;
+    private WaterFrame $water;
+    private Vec4 $clear;
+
+    public constructor(LightPass $lighting, WaterFrame $water, Vec4 $clear)
+    {
+        $this->lighting = $lighting;
+        $this->water = $water;
+        $this->clear = $clear;
+    }
+
+    public function name() : string
+    {
+        return 'reflect.light';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        GBufferData $gbuffer = guard $this->water->gbuffer else {
+            return;
+        }
+        readGBuffer($io, $gbuffer);
+        EnvironmentData? $environment = $frame->find<EnvironmentData>();
+        if ($environment != null) {
+            EnvironmentData $found = guard $environment;
+            $io->reads($found->cubemap);
+        }
+
+        IblData? $ibl = $frame->find<IblData>();
+        if ($ibl != null) {
+            IblData $found = guard $ibl;
+            $io->reads($found->irradiance);
+            $io->reads($found->prefilter);
+            $io->reads($found->irradianceB);
+            $io->reads($found->prefilterB);
+            $io->reads($found->brdfLut);
+        }
+
+        ShadowMapData? $shadows = $frame->find<ShadowMapData>();
+        if ($shadows != null) {
+            ShadowMapData $found = guard $shadows;
+            $io->reads($found->map);
+        }
+
+        PointShadowData? $points = $frame->find<PointShadowData>();
+        if ($points != null) {
+            PointShadowData $found = guard $points;
+            $io->reads($found->map);
+        }
+
+        TargetRef $target = $pipeline->createTarget(
+            'reflect.light',
+            $gbuffer->target->width,
+            $gbuffer->target->height
+        );
+        TextureRef $output = $pipeline->createColor($target, 'output', TextureOptions());
+        $this->water->color = $output;
+        $this->water->colorTarget = $target;
+        $io->writes($target);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        GBufferData $gbuffer = guard $this->water->gbuffer else {
+            return .ok;
+        }
+        TargetRef $target = guard $this->water->colorTarget else {
+            return .ok;
+        }
+        HeightFog $fog = $this->lighting->fog;
+        $fog->enabled = false;
+        return $this->lighting->shade(
+            $ctx,
+            $target,
+            $gbuffer,
+            $this->water->camera,
+            $fog,
+            true,
+            $this->water->tiles,
+            $this->water->tilesX,
+            $this->water->tilesY,
+            true,
+            Vec4(0.0f, 0.0f, 0.0f, 0.0f),
+            false,
+            true
+        );
+    }
+}
+
+/**
+ * Sky behind the mirror's shaded pixels. Fog stays off. A probe marches the analytic sky
+ * with fewer samples than the main view, because this target is mostly empty. An HDRI
+ * samples its cube. The reflected eye's height is the sky origin; a sky-view table for the
+ * mirror is filled at that height.
+ */
+public class MirrorSkyPass : Pass
+{
+    private DeferredGpu $gpu;
+    private WaterFrame $water;
+    private Sky $sky;
+    private HeightFog $fog;
+    private DirectionalLight $sun;
+    private Moon $moon;
+    private bool $probe;
+    private TextureRef? $view;
+
+    public constructor(
+        DeferredGpu $gpu,
+        WaterFrame $water,
+        Sky $sky,
+        HeightFog $fog,
+        DirectionalLight $sun,
+        Moon $moon,
+        bool $probe,
+        TextureRef? $view = null
+    )
+    {
+        $this->gpu = $gpu;
+        $this->water = $water;
+        $this->sky = $sky;
+        $this->fog = $fog;
+        $this->sun = $sun;
+        $this->moon = $moon;
+        $this->probe = $probe;
+        $this->view = $view;
+    }
+
+    public function name() : string
+    {
+        return 'reflect.sky';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        GBufferData $gbuffer = guard $this->water->gbuffer else {
+            return;
+        }
+        TargetRef $target = guard $this->water->colorTarget else {
+            return;
+        }
+        $io->reads($gbuffer->depth);
+        $io->writes($target);
+        readSkyView($io, $this->view);
+        if (!$this->probe) {
+            EnvironmentData? $environment = $frame->find<EnvironmentData>();
+            if ($environment != null) {
+                EnvironmentData $found = guard $environment;
+                $io->reads($found->cubemap);
+            }
+        }
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        GBufferData $gbuffer = guard $this->water->gbuffer else {
+            return .ok;
+        }
+        TextureRef $colorRef = guard $this->water->color else {
+            return .ok;
+        }
+        string $programName = 'skybox';
+        if ($this->probe) {
+            $programName = skyProgram($this->view);
+        }
+
+        ShaderProgram $program = guard $this->gpu->shaders->program($programName) else ($e) {
+            return .error(.shader($e));
+        }
+        Texture $color = guard $ctx->pool->getTexture($colorRef) else ($e) {
+            return .error(.pool($e));
+        }
+        Texture $depth = guard $ctx->pool->getTexture($gbuffer->depth) else ($e) {
+            return .error(.pool($e));
+        }
+        RenderEncoder $enc = guard openColorDepth($ctx, $color, $depth, .load, .load) else ($e) {
+            return .error($e);
+        }
+        Device $device = $ctx->device;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
+            return .cube($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3(), skyRaster());
+        $pass->bind($enc);
+        $enc->upload($this->water->camera->uniforms(), slot: 1);
+        HeightFog $quiet = $this->fog;
+        $quiet->enabled = false;
+        FogUniforms $fog = fogUniforms(
+            $quiet,
+            $this->water->camera->position,
+            fogSunTint($this->sun, $this->sky),
+            FOG_VIEW_SAMPLES,
+            FOG_LIGHT_SAMPLES,
+            fogMoonTint($this->moon, $this->sky),
+            fogLight($this->moon, $this->sky)
+        );
+        bool $disk = $this->probe;
+        float32 $viewSamples = SKY_VIEW_SAMPLES;
+        float32 $lightSamples = SKY_LIGHT_SAMPLES;
+        if ($this->probe) {
+            $viewSamples = MIRROR_SKY_VIEW_SAMPLES;
+            $lightSamples = MIRROR_SKY_LIGHT_SAMPLES;
+        }
+
+        SkyUniforms $sky = skyUniforms(
+            $this->sky,
+            $this->water->camera->position,
+            $disk,
+            $viewSamples,
+            $lightSamples,
+            $this->moon
+        );
+        $enc->upload($sky, slot: 2);
+        // the mirror is another camera: the main view's shafts do not line up with it
+        guard bindGodRays($ctx, $enc, $this->gpu, $fog, false) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        $enc->upload($fog, slot: 3);
+        guard bindSkyView($ctx, $enc, $this->gpu, $this->view) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        if (!$this->probe) {
+            EnvironmentData? $environment = $ctx->frame->find<EnvironmentData>();
+            if ($environment != null) {
+                EnvironmentData $found = guard $environment;
+                Texture $cube = guard $ctx->pool->getTexture($found->cubemap) else ($e) {
+                    $enc->endRender();
+                    return .error(.pool($e));
+                }
+                // level 0: a fullscreen cube's derivatives pick a coarse mip
+                $enc->bindTexture(0, $cube, $this->gpu->linear);
+            }
+        }
+
+        $mesh->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+/**
+ * Copies the lit image, then draws each water surface over it.
+ * Samples the lit colour for refraction and the mirror for the fresnel term.
+ */
+public class WaterPass : Pass
+{
+    private DeferredGpu $gpu;
+    private WaterFrame $water;
+    private LightPass $lighting;
+
+    public constructor(DeferredGpu $gpu, WaterFrame $water, LightPass $lighting)
+    {
+        $this->gpu = $gpu;
+        $this->water = $water;
+        $this->lighting = $lighting;
+    }
+
+    public function name() : string
+    {
+        return 'water';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        LightPassData $light = $frame->get<LightPassData>();
+        GBufferData $gbuffer = $frame->get<GBufferData>();
+        $io->reads($light->output);
+        $io->reads($gbuffer->position);
+        $io->reads($gbuffer->depth);
+        readGodRays($io, $frame);
+        TextureRef $mirror = guard $this->water->color else {
+            TargetRef $target = $pipeline->createTarget('water', $light->target->width, $light->target->height);
+            TextureRef $output = $pipeline->createColor($target, 'color', TextureOptions());
+            $this->water->presented = $output;
+            $this->water->outputTarget = $target;
+            $io->writes($target);
+            return;
+        }
+        $io->reads($mirror);
+        TargetRef $target = $pipeline->createTarget('water', $light->target->width, $light->target->height);
+        TextureRef $output = $pipeline->createColor($target, 'color', TextureOptions());
+        $this->water->presented = $output;
+        $this->water->outputTarget = $target;
+        $io->writes($target);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        TextureRef $presented = guard $this->water->presented else {
+            return .ok;
+        }
+        TargetRef $output = guard $this->water->outputTarget else {
+            return .ok;
+        }
+        guard $ctx->pool->getTarget($output) else ($e) {
+            return .error(.pool($e));
+        }
+        LightPassData $light = $ctx->frame->get<LightPassData>();
+        GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
+        Texture $color = guard $ctx->pool->getTexture($presented) else ($e) {
+            return .error(.pool($e));
+        }
+        Texture $depth = guard $ctx->pool->getTexture($gbuffer->depth) else ($e) {
+            return .error(.pool($e));
+        }
+        Texture $scene = guard $ctx->pool->getTexture($light->output) else ($e) {
+            return .error(.pool($e));
+        }
+        RenderEncoder $enc = guard openColorDepth($ctx, $color, $depth, .dontCare, .load) else ($e) {
+            return .error($e);
+        }
+        Device $device = $ctx->device;
+        Mesh $quad = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($device);
+        });
+        $this->gpu->blit->draw($enc, $quad, $scene, $this->gpu->linear);
+
+        ShaderProgram $program = guard $this->gpu->shaders->program('water') else ($e) {
+            $enc->endRender();
+            return .error(.shader($e));
+        }
+        Mesh $surface = $ctx->pool->cache<Mesh>('water.quad', function() : Mesh {
+            return waterQuad($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::opaque());
+        $pass->bind($enc);
+        $this->gpu->camera->bind($enc);
+        CameraData $camera = $ctx->frame->get<CameraData>();
+        LightUniforms $lights = lightUniforms(
+            $this->lighting->sun,
+            $this->lighting->moon,
+            $this->lighting->sky,
+            $this->lighting->environment,
+            $ctx->frame->find<ShadowMapData>()
+        );
+        PointLightFrame? $points = $ctx->frame->find<PointLightFrame>();
+        if ($points != null) {
+            PointLightFrame $packed = guard $points;
+            packPointUniforms($lights, $packed);
+        }
+
+        $enc->upload($lights, slot: 2);
+        FogUniforms $fog = fogUniforms(
+            $this->lighting->fog,
+            $camera->position,
+            fogSunTint($this->lighting->sun, $this->lighting->sky),
+            FOG_VIEW_SAMPLES,
+            FOG_LIGHT_SAMPLES,
+            fogMoonTint($this->lighting->moon, $this->lighting->sky),
+            fogLight($this->lighting->moon, $this->lighting->sky)
+        );
+        guard bindGodRays($ctx, $enc, $this->gpu, $fog, true) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        $enc->upload($fog, slot: 3);
+        $enc->bindTexture(0, $scene, $this->gpu->linear);
+        guard bindPooled($ctx, $enc, 1, $gbuffer->position, $this->gpu->point) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        Texture $mirror = $this->gpu->white;
+        TextureRef $mirrorRef = guard $this->water->color else {
+            $enc->bindTexture(2, $mirror, $this->gpu->linear);
+            return $this->finishSurfaces($ctx, $enc, $surface);
+        }
+        Texture $mirrorTex = guard $ctx->pool->getTexture($mirrorRef) else ($e) {
+            $enc->endRender();
+            return .error(.pool($e));
+        }
+        $enc->bindTexture(2, $mirrorTex, $this->gpu->linear);
+        return $this->finishSurfaces($ctx, $enc, $surface);
+    }
+
+    private function finishSurfaces(
+        RenderContext $ctx,
+        RenderEncoder $enc,
+        Mesh $surface
+    ) : status<PipelineError>
+    {
+        Texture $prefilter = guard $this->water->fallbackCube else {
+            $enc->endRender();
+            return .error(.device(.metal('water', 'no fallback cube')));
+        }
+        IblData? $ibl = $ctx->frame->find<IblData>();
+        if ($ibl != null) {
+            IblData $maps = guard $ibl;
+            Texture $found = guard $ctx->pool->getTexture($maps->prefilter) else ($e) {
+                $enc->endRender();
+                return .error(.pool($e));
+            }
+            $prefilter = $found;
+        }
+
+        $enc->bindTexture(7, $prefilter, $this->gpu->cube);
+        guard bindShadowOrDummy($ctx, $enc, $this->gpu) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        guard $this->lighting->bindPoints($ctx, $enc, null) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        array<WaterDraw> $draws = $this->water->draws;
+        foreach ($draws as $draw) {
+            $enc->upload($draw->uniforms, slot: 0);
+            $surface->draw($enc);
+        }
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+/**
+ * Unit quad in the XZ plane, y up, from -0.5 to 0.5. The transform scale is the size.
+ */
+internal function waterQuad(Device $device) : Mesh
+{
+    array<float32> $verts = [
+        -0.5f, 0.0f, -0.5f, 0.0f, 0.0f,
+        -0.5f, 0.0f, 0.5f, 0.0f, 1.0f,
+        0.5f, 0.0f, -0.5f, 1.0f, 0.0f,
+        0.5f, 0.0f, -0.5f, 1.0f, 0.0f,
+        -0.5f, 0.0f, 0.5f, 0.0f, 1.0f,
+        0.5f, 0.0f, 0.5f, 1.0f, 1.0f,
+    ];
+    return Mesh($device, $verts, stride: (mem::size<float32>() as int32) * 5);
+}
+
+/**
+ * Colour plus a depth that belongs to another target. `$colorLoad` is `.dontCare` when the
+ * first draw covers every pixel.
+ */
+internal function openColorDepth(
+    RenderContext $ctx,
+    Texture $color,
+    Texture $depth,
+    LoadOp $colorLoad,
+    LoadOp $depthLoad
+) : result<RenderEncoder, PipelineError>
+{
+    ColorTarget $colorTarget = ColorTarget($color);
+    $colorTarget->load = $colorLoad;
+    $colorTarget->store = .store;
+    $colorTarget->clear = Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    DepthTarget $depthTarget = DepthTarget($depth);
+    $depthTarget->load = $depthLoad;
+    $depthTarget->store = .dontCare;
+    $depthTarget->clearDepth = 1.0f;
+    RenderPassDesc $desc = RenderPassDesc();
+    $desc->colors[] = $colorTarget;
+    $desc->depth = $depthTarget;
+    return .ok($ctx->device->beginRender($desc));
+}

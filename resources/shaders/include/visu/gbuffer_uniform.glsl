@@ -33,9 +33,16 @@ struct GBuffer
     float coverage;
 };
 
-GBuffer gbuffer_make(vec2 uv)
+// the position texel alone: its alpha is the coverage, so a pass can leave an empty pixel
+// before it pays for the other reads
+vec4 gbuffer_position_at(vec2 uv)
 {
-    vec4 position = texture(gbuffer_position, uv);
+    return texture(gbuffer_position, uv);
+}
+
+// every attachment at uv, `position` already read by gbuffer_position_at
+GBuffer gbuffer_make(vec2 uv, vec4 position)
+{
     vec4 normal = texture(gbuffer_normal, uv);
     vec4 albedo = texture(gbuffer_albedo, uv);
     vec4 material = texture(gbuffer_material, uv);
@@ -52,6 +59,11 @@ GBuffer gbuffer_make(vec2 uv)
     gbuffer.id = gbuffer_id_decode(texture(gbuffer_id, uv).r);
     gbuffer.coverage = position.a;
     return gbuffer;
+}
+
+GBuffer gbuffer_make(vec2 uv)
+{
+    return gbuffer_make(uv, gbuffer_position_at(uv));
 }
 
 #endif

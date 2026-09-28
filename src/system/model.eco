@@ -22,13 +22,14 @@ use visu::app::{FlagValue, Flags, flags, info};
 use visu::asset::MODEL_MAX_LODS;
 use visu::components::{AssemblyInstance, DynamicModel, SkinPose, SkinnedModel, StaticModel};
 use visu::ecs::{Entities, Entity, Schedule, System};
-use visu::geo::{AABB, Frustum, Transform};
+use visu::geo::{AABB, Frustum, Plane, Transform};
 use visu::graphics::{
-    CallbackPass, CameraData, DebugLines, DeferredRenderer, DrawCallAssembler, Frame, GBufferData,
+    CUBE_FACE_COUNT, CallbackPass, CameraData, DebugLines, DeferredRenderer, DrawCallAssembler, Frame, GBufferData, GeometryFiller, GeometryFillers,
     GpuPass, IoSink, Model, ModelBank, ModelInstanceData, OUTLINE_STYLES, OutlineCaster, OutlineData,
-    Pipeline, PipelineError, RenderContext, RenderEncoder, SHADOW_CASCADES, SKIN_PALETTE_ROWS, SKIN_PALETTE_SLOT, ShaderProgram,
-    ShadowCascade, ShadowCaster, ShadowMapData, SkinInstanceData, TransientSlice, debugLinePass,
-    lodIndex, modelLayout, skinnedLayout
+    Pipeline, PipelineError, PointFace, PointLightFrame, PointShadowCaster, PointShadowData, RenderContext,
+    RenderEncoder, SHADOW_CASCADES, SKIN_PALETTE_ROWS, SKIN_PALETTE_SLOT, ShaderProgram,
+    ReflectionCaster, ShadowCascade, ShadowCaster, ShadowMapData, SkinInstanceData, TransientSlice,
+    WaterDraw, WaterFrame, debugLinePass, lodIndex, modelLayout, pointSphereHits, skinnedLayout, waterAbove
 };
 use visu::console::lodColor;
 use visu::math::{Mat4, Vec3, Vec4, length};
@@ -119,9 +120,14 @@ internal struct ModelHighlight
     public int32 $style;
 }
 
-public class ModelSystem : System, ShadowCaster, OutlineCaster
+public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, PointShadowCaster, ReflectionCaster
 {
     public ModelBank $bank;
+
+    /**
+     * The world `fill` saw this frame, drawn when the geometry pass reaches `record`.
+     */
+    private Entities? $filling;
     public DeferredRenderer $renderer;
 
     /**
@@ -209,6 +215,7 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
     {
         $this->bank = $bank;
         $this->renderer = $renderer;
+        $this->filling = null;
         $this->lodBias = flags()->float('model.lod', 1.0) as float32;
         $this->wireframe = flags()->bool('model.wire', false);
         $this->showBounds = flags()->bool('model.bounds', false);
@@ -491,22 +498,33 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
         $this->acquireAll($entities);
         $this->packDynamics($entities, $ctx->compensation);
         $this->packSkins($entities, $ctx);
-        ModelSystem $sys = $this;
-        Entities $world = $entities;
-        $ctx->pipeline->add(CallbackPass(
-            'models',
-            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
-                $io->writes($gbuffer->target);
-            },
-            execute: function(RenderContext $inner) : status<PipelineError> {
-                return $sys->draw($world, $inner, $gbuffer);
-            }
-        ));
+        $this->filling = $entities;
+        $ctx->frame->get<GeometryFillers>()->add($this);
         ShadowMapData? $shadows = $ctx->frame->find<ShadowMapData>();
         if ($shadows != null) {
             ShadowMapData $data = guard $shadows;
             $this->prepareShadows($entities, $ctx, $data->cascades);
             $data->add($this);
+        }
+
+        PointShadowData? $points = $ctx->frame->find<PointShadowData>();
+        if ($points != null) {
+            PointShadowData $mailbox = guard $points;
+            PointLightFrame? $lights = $ctx->frame->find<PointLightFrame>();
+            if ($lights != null) {
+                PointLightFrame $packed = guard $lights;
+                $this->preparePointShadows($entities, $ctx, $packed);
+                $mailbox->add($this);
+            }
+        }
+
+        WaterFrame? $water = $ctx->frame->find<WaterFrame>();
+        if ($water != null) {
+            WaterFrame $mirror = guard $water;
+            if ($mirror->active && $mirror->mirror) {
+                $this->prepareReflection($entities, $ctx, $mirror);
+                $mirror->casters[] = $this;
+            }
         }
 
         if ($this->highlights->count() > 0) {
@@ -585,11 +603,20 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
         }
     }
 
-    /**
-     * Cull, pick LODs, build the batches and record them. No-op before CameraSystem published.
-     */
-    public function draw(Entities $entities, RenderContext $ctx, GBufferData $gbuffer) : status<PipelineError>
+    public function name() : string
     {
+        return 'models';
+    }
+
+    /**
+     * Cull, pick LODs, build the batches and record them into the geometry pass's encoder.
+     * No-op before CameraSystem published.
+     */
+    public function record(RenderContext $ctx, RenderEncoder $enc) : status<PipelineError>
+    {
+        Entities $entities = guard $this->filling else {
+            return .ok;
+        }
         CameraData $camera = guard $ctx->frame->find<CameraData>() else {
             return .ok;
         }
@@ -614,11 +641,6 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
         }
 
         visu::profile::begin('draw');
-        RenderEncoder $enc = guard $ctx->beginRender($gbuffer->target) else ($e) {
-            visu::profile::end();
-            return .error($e);
-        }
-        $this->renderer->bindCamera($enc);
         if ($geometry) {
             $this->rigid->draw($enc, $this->bank);
         }
@@ -631,7 +653,6 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
         }
 
         $this->drawLines($enc);
-        $enc->endRender();
         visu::profile::end();
         return .ok;
     }
@@ -734,6 +755,167 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
     }
 
     /**
+     * Models whose bounds meet each shadow lamp, binned into that lamp's six faces.
+     * LOD stays on the play camera, the same rule as the sun cascades. Grass is not
+     * in this system.
+     */
+    public function preparePointShadows(Entities $entities, RenderContext $ctx, PointLightFrame $lights) : void
+    {
+        if ($lights->pack->shadows <= 0) {
+            return;
+        }
+
+        $this->ensurePasses();
+        CameraData $view = guard $ctx->frame->find<CameraData>() else {
+            return;
+        }
+        visu::profile::begin('cull');
+        $this->rigid->clearPoints();
+        $this->skinned->clearPoints();
+        Vec3 $eye = $view->cullPosition;
+        int32 $lamps = $lights->pack->shadows;
+        int32 $s = 0;
+        while ($s < $lamps) {
+            Vec3 $center = $lights->pack->shadowAt[$s];
+            float32 $radius = $lights->pack->shadowFar[$s];
+            Vec3 $extent = Vec3($radius, $radius, $radius);
+            AABB $box = AABB($center - $extent, $center + $extent);
+            $this->statics->query($box);
+            array<uint32> $ids = $this->statics->visible();
+            foreach ($ids as $id) {
+                StaticInstance $inst = $this->statics->get($id);
+                if (!$inst->live) {
+                    continue;
+                }
+
+                ModelHandles $h = $this->models[$inst->handles as usize];
+                if (!$h->anyCast || !pointSphereHits($inst->bounds, $center, $radius)) {
+                    continue;
+                }
+
+                $this->submitPoint($this->rigid, $h, $inst->world, $inst->bounds, ModelInstanceData($inst->tint), $inst->lodBias, $eye, $lights, $s);
+            }
+
+            foreach ($this->dynamicDraws as $dyn) {
+                ModelHandles $h = $this->models[$dyn->handles as usize];
+                if (!$h->anyCast || !pointSphereHits($dyn->bounds, $center, $radius)) {
+                    continue;
+                }
+
+                $this->submitPoint($this->rigid, $h, $dyn->world, $dyn->bounds, ModelInstanceData($dyn->tint), $dyn->lodBias, $eye, $lights, $s);
+            }
+
+            foreach ($this->skinDraws as $skin) {
+                ModelHandles $h = $this->models[$skin->handles as usize];
+                if (!$h->anyCast || !pointSphereHits($skin->bounds, $center, $radius)) {
+                    continue;
+                }
+
+                SkinInstanceData $payload = SkinInstanceData($skin->tint, Vec4($skin->base, 0.0f, 0.0f, 0.0f));
+                $this->submitPoint($this->skinned, $h, $skin->world, $skin->bounds, $payload, $skin->lodBias, $eye, $lights, $s);
+            }
+
+            $s = $s + 1;
+        }
+
+        int32 $layers = $lamps * CUBE_FACE_COUNT;
+        int32 $layer = 0;
+        while ($layer < $layers) {
+            PointFace $face = $lights->cameras[$layer];
+            $this->rigid->buildPoint($layer, $face->frustum, $eye);
+            $this->skinned->buildPoint($layer, $face->frustum, $eye);
+            $layer = $layer + 1;
+        }
+
+        visu::profile::end();
+    }
+
+    /**
+     * Models inside the mirror sphere and above the plane. LOD stays on the play camera.
+     */
+    public function prepareReflection(Entities $entities, RenderContext $ctx, WaterFrame $water) : void
+    {
+        if ($water->mirrorIndex < 0) {
+            return;
+        }
+
+        $this->ensurePasses();
+        CameraData $view = guard $ctx->frame->find<CameraData>() else {
+            return;
+        }
+        visu::profile::begin('reflect/cull');
+        $this->rigid->clearReflect();
+        $this->skinned->clearReflect();
+        WaterDraw $chosen = $water->draws[$water->mirrorIndex as usize];
+        Vec3 $eye = $view->cullPosition;
+        Vec3 $origin = $chosen->origin;
+        float32 $radius = $chosen->radius;
+        Plane $plane = $chosen->plane;
+        Frustum $frustum = $water->camera->cullFrustum;
+        $this->statics->query($frustum);
+        array<uint32> $ids = $this->statics->visible();
+        foreach ($ids as $id) {
+            StaticInstance $inst = $this->statics->get($id);
+            if (!$inst->live || !waterAbove($inst->bounds, $plane)) {
+                continue;
+            }
+
+            if (length($inst->bounds->closest($origin) - $origin) > $radius) {
+                continue;
+            }
+
+            ModelHandles $h = $this->models[$inst->handles as usize];
+            $this->submitVisible($this->rigid->reflectDca, $h, $inst->world, $inst->bounds, ModelInstanceData($inst->tint), $inst->lodBias, $eye, false);
+        }
+
+        foreach ($this->dynamicDraws as $dyn) {
+            if (!waterAbove($dyn->bounds, $plane)) {
+                continue;
+            }
+
+            if (length($dyn->bounds->closest($origin) - $origin) > $radius) {
+                continue;
+            }
+
+            ModelHandles $h = $this->models[$dyn->handles as usize];
+            $this->submitVisible($this->rigid->reflectDca, $h, $dyn->world, $dyn->bounds, ModelInstanceData($dyn->tint), $dyn->lodBias, $eye, false);
+        }
+
+        foreach ($this->skinDraws as $skin) {
+            if (!waterAbove($skin->bounds, $plane)) {
+                continue;
+            }
+
+            if (length($skin->bounds->closest($origin) - $origin) > $radius) {
+                continue;
+            }
+
+            ModelHandles $h = $this->models[$skin->handles as usize];
+            SkinInstanceData $payload = SkinInstanceData($skin->tint, Vec4($skin->base, 0.0f, 0.0f, 0.0f));
+            $this->submitVisible($this->skinned->reflectDca, $h, $skin->world, $skin->bounds, $payload, $skin->lodBias, $eye, false);
+        }
+
+        $this->rigid->buildReflect($frustum, $eye);
+        $this->skinned->buildReflect($frustum, $eye);
+        visu::profile::end();
+    }
+
+    /**
+     * Draw the lists `prepareReflection` built. The mirror camera is already at slot 1.
+     */
+    public function reflect(RenderContext $ctx, RenderEncoder $enc) : void
+    {
+        if ($this->rigid->reflects()) {
+            $this->rigid->drawReflect($enc, $this->bank);
+        }
+
+        if ($this->skinned->reflects()) {
+            $this->bindPalette($enc);
+            $this->skinned->drawReflect($enc, $this->bank);
+        }
+    }
+
+    /**
      * Draw the list `prepareShadows` built into an open cascade encoder.
      */
     public function cast(RenderContext $ctx, RenderEncoder $enc, const ShadowCascade& $cascade) : void
@@ -753,6 +935,62 @@ public class ModelSystem : System, ShadowCaster, OutlineCaster
         if ($skins) {
             $this->bindPalette($enc);
             $this->skinned->cast($enc, $this->bank, $index);
+        }
+    }
+
+    /**
+     * Draw one lamp face from the lists `preparePointShadows` built.
+     */
+    public function castPoint(RenderContext $ctx, RenderEncoder $enc, int32 $layer, const PointFace& $face) : void
+    {
+        bool $rigid = $this->rigid->castsPoint($layer);
+        bool $skins = $this->skinned->castsPoint($layer);
+        if (!$rigid && !$skins) {
+            return;
+        }
+
+        $enc->upload($face->uniforms, slot: 1);
+        if ($rigid) {
+            $this->rigid->castPoint($enc, $this->bank, $layer);
+        }
+
+        if ($skins) {
+            $this->bindPalette($enc);
+            $this->skinned->castPoint($enc, $this->bank, $layer);
+        }
+    }
+
+    private function submitPoint<P>(
+        ModelLane<P> $lane,
+        ModelHandles $h,
+        const Mat4& $world,
+        const AABB& $bounds,
+        P $payload,
+        float32 $lodBias,
+        Vec3 $eye,
+        PointLightFrame $lights,
+        int32 $lamp
+    ) : void
+    {
+        int32 $f = 0;
+        while ($f < CUBE_FACE_COUNT) {
+            int32 $layer = $lamp * CUBE_FACE_COUNT + $f;
+            PointFace $face = $lights->cameras[$layer];
+            if ($face->frustum->contains($bounds)) {
+                $this->submitVisible(
+                    $lane->pointDca[$layer as usize],
+                    $h,
+                    $world,
+                    $bounds,
+                    $payload,
+                    $lodBias,
+                    $eye,
+                    false,
+                    shadow: true
+                );
+            }
+
+            $f = $f + 1;
         }
     }
 
