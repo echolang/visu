@@ -18,6 +18,8 @@ layout(std140, set = 0, binding = 0) uniform ModelMaterialData {
     vec4 u_factors;
     // uv scale, parallax most steps, parallax fade in metres
     vec4 u_uv_scale;
+    // rgb multiplies the emissive map. Zero writes black and skips the sample.
+    vec4 u_emissive;
 };
 
 layout(set = 1, binding = 0) uniform sampler2D map_albedo;
@@ -26,6 +28,7 @@ layout(set = 1, binding = 2) uniform sampler2D map_roughness;
 layout(set = 1, binding = 3) uniform sampler2D map_metallic;
 layout(set = 1, binding = 4) uniform sampler2D map_ao;
 layout(set = 1, binding = 5) uniform sampler2D map_alpha;
+layout(set = 1, binding = 7) uniform sampler2D map_emissive;
 
 #include "visu/gbuffer_layout.glsl"
 
@@ -111,5 +114,10 @@ void main()
         ao = texture(map_ao, uv).r;
     }
 
-    gbuffer_write(v_position, n, albedo, metallic, roughness, vec3(0.0), ao);
+    vec3 emissive = vec3(0.0);
+    if (dot(u_emissive.rgb, vec3(1.0)) > 0.0) {
+        emissive = u_emissive.rgb * texture(map_emissive, uv).rgb;
+    }
+
+    gbuffer_write(v_position, n, albedo, metallic, roughness, emissive, ao);
 }

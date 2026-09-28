@@ -1,0 +1,194 @@
+/**
+ * The night light the deferred renderer owns beside the sun: a moon that is a second
+ * directional light, a disc in the sky, a glow in the fog, and a hemisphere ambient under it.
+ * Kept off `Sky` on purpose: nothing here may trigger a probe re-bake.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Vec3, Vec4, normalize};
+
+// share of the moon's direct light that comes back from the moonlit sky as ambient
+internal const float32 MOON_SKY_AMBIENT = 0.35f;
+// sine of the sun elevation where night starts to fall (about +2 degrees) and where it is
+// complete (about -8 degrees); sky.glsl's SKY_DUSK_START / SKY_DUSK_END mirror these
+internal const float32 MOON_DUSK_START = 0.035f;
+internal const float32 MOON_DUSK_END = -0.14f;
+// night fog radiance against the night ambient
+internal const float32 MOON_FOG_LIFT = 1.5f;
+
+/**
+ * Moon parameters. The app writes `direction` and `illumination` from its calendar every
+ * frame and `light` from `Sky.moonLight`; the rest is look.
+ */
+public struct Moon
+{
+
+    /**
+     * Draws the disc and the stars and lets the atmosphere scatter `light`. Off by default so a
+     * scene without a calendar keeps a moonless sky.
+     */
+    public bool $enabled;
+
+    /**
+     * The direction moonlight travels, like `DirectionalLight`, so straight down is (0, -1, 0).
+     */
+    public Vec3 $direction;
+
+    /**
+     * Lit fraction of the disc as seen from the ground, 0 at new moon and 1 at full.
+     * Scales the light and the fog glow; the disc itself is shaded from the sun direction.
+     */
+    public float32 $illumination;
+
+    /**
+     * Direct light at full moon overhead, in the units of `Sky.sunIntensity`.
+     */
+    public float32 $intensity;
+
+    /**
+     * Tint of the moonlight and the disc. Stylised cool, not the physical grey.
+     */
+    public Vec3 $color;
+
+    /**
+     * Angular radius of the disc in radians. The real moon is about the sun's size (0.0045);
+     * the default is three times that so it reads at game camera distances.
+     */
+    public float32 $discRadius;
+
+    /**
+     * Brightness of the unlit part of the disc against the lit part.
+     */
+    public float32 $earthshine;
+
+    /**
+     * Ambient floor for a moonless night, linear radiance. Keeps a new moon readable.
+     */
+    public Vec3 $starlight;
+
+    /**
+     * Brightness of the star field. Zero draws no stars.
+     */
+    public float32 $stars;
+
+    /**
+     * The light the moon casts this frame. `Sky.moonLight` fills it; zero leaves the moon dark.
+     */
+    public DirectionalLight $light;
+
+    public constructor()
+    {
+        $this->enabled = false;
+        $this->direction = Vec3(-0.3f, -0.6f, 0.5f);
+        $this->illumination = 1.0f;
+        $this->intensity = 0.36f;
+        $this->color = Vec3(0.62f, 0.72f, 1.0f);
+        $this->discRadius = 0.014f;
+        $this->earthshine = 0.03f;
+        $this->starlight = Vec3(0.006f, 0.008f, 0.014f);
+        $this->stars = 1.0f;
+        $this->light = DirectionalLight($this->direction, $this->color, 0.0f);
+    }
+}
+
+/**
+ * The light that owns the shadow cascades this frame: the sun while it is up, the moon once
+ * the sun has set. Zero intensity means neither is up and the cascades are skipped.
+ */
+public function keyLight(const DirectionalLight& $sun, const Moon& $moon) : DirectionalLight
+{
+    if (moonKeyed($sun, $moon)) {
+        return $moon->light;
+    }
+
+    return $sun;
+}
+
+/**
+ * True when the moon, not the sun, owns the shadow cascades. Only after sunset: a lit sun
+ * without its shadows would leak light through every hill, so a bright moon over a low
+ * evening sun never takes them, and the hand over happens while the sun casts nothing.
+ */
+public function moonKeyed(const DirectionalLight& $sun, const Moon& $moon) : bool
+{
+    return $sun->intensity <= 0.0f && $moon->light->intensity > 0.0f;
+}
+
+/**
+ * How dark the sky is, 0 in daylight and 1 once the sun is well down: a smooth step over the
+ * sun's elevation from `MOON_DUSK_START` to `MOON_DUSK_END`, the same band the stars come out
+ * in (`SKY_DUSK_START` / `SKY_DUSK_END` in sky.glsl). Fades the night ambient and the night fog through twilight, so the daytime
+ * probes are untouched.
+ */
+public function nightFactor(const Sky& $sky) : float32
+{
+    Vec3 $toSun = normalize(-$sky->direction);
+    float32 $x = ($toSun->y - MOON_DUSK_START) / (MOON_DUSK_END - MOON_DUSK_START);
+
+    if ($x < 0.0f) {
+        return 0.0f;
+    }
+
+    if ($x > 1.0f) {
+        return 1.0f;
+    }
+
+    return $x * $x * (3.0f - 2.0f * $x);
+}
+
+/**
+ * Hemisphere ambient under the night sky, rgb from above and ground bounce share in w.
+ * The moonlit sky plus the starlight floor, faded out as the sun comes up. Zero while the
+ * moon is disabled.
+ */
+public function nightAmbient(const Moon& $moon, const Sky& $sky) : Vec4
+{
+    // a scene without a moon keeps the probes' night as it was
+    if (!$moon->enabled) {
+        return Vec4(0.0f);
+    }
+
+    float32 $night = nightFactor($sky);
+    Vec3 $up = ($moon->light->color * ($moon->light->intensity * MOON_SKY_AMBIENT) + $moon->starlight) * $night;
+    return Vec4($up->x, $up->y, $up->z, 0.35f);
+}
+
+/**
+ * Scale for a constant fog colour: one in daylight, the night hemisphere ambient once the sun
+ * is gone, so night fog is moonlit haze rather than a white wall. Nothing changes by day,
+ * nor while the moon is disabled.
+ */
+public function fogLight(const Moon& $moon, const Sky& $sky) : Vec3
+{
+    if (!$moon->enabled) {
+        return Vec3(1.0f, 1.0f, 1.0f);
+    }
+
+    float32 $night = nightFactor($sky);
+    Vec3 $ambient = $moon->light->color * ($moon->light->intensity * MOON_SKY_AMBIENT) + $moon->starlight;
+    // the haze at night reads a little brighter than the ground it hangs over
+    Vec3 $dark = $ambient * MOON_FOG_LIFT;
+    return Vec3(1.0f, 1.0f, 1.0f) * (1.0f - $night) + $dark * $night;
+}
+
+/**
+ * Moon colour scaled for the fog glow, the `fogSunTint` rule: zero below the horizon.
+ */
+public function fogMoonTint(const Moon& $moon, const Sky& $sky) : Vec3
+{
+    float32 $denom = $sky->sunIntensity;
+
+    if ($denom < 0.001f) {
+        $denom = 0.001f;
+    }
+
+    // the moon glow reads against a dark sky, so it is lifted against the sun's scale
+    float32 $scale = 4.0f * $moon->light->intensity / $denom;
+
+    if ($scale > 1.0f) {
+        $scale = 1.0f;
+    }
+
+    return $moon->light->color * $scale;
+}

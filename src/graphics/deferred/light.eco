@@ -1,6 +1,7 @@
 /**
- * Scene lighting the deferred renderer owns. One directional sun for now;
- * point and spot lights land with a light-volume pass.
+ * Scene lighting the deferred renderer owns. A directional sun and moon, the brighter
+ * of them owning the shadow cascades, the night hemisphere ambient, plus the packed
+ * point lamps the light pass shades per tile.
  */
 
 namespace visu::graphics;
@@ -48,6 +49,8 @@ internal function iblParams(Environment? $env) : Vec4
 
 internal function lightUniforms(
     const DirectionalLight& $sun,
+    const Moon& $moon,
+    const Sky& $sky,
     Environment? $env,
     ShadowMapData? $shadows = null
 ) : LightUniforms
@@ -58,6 +61,17 @@ internal function lightUniforms(
         Vec4($sun->color->x, $sun->color->y, $sun->color->z, 1.0f),
         iblParams($env)
     );
+    DirectionalLight $moonLight = $moon->light;
+    Vec3 $moonDirection = normalize($moonLight->direction);
+    float32 $moonOwns = 0.0f;
+
+    if (moonKeyed($sun, $moon)) {
+        $moonOwns = 1.0f;
+    }
+
+    $u->moonDirection = Vec4($moonDirection->x, $moonDirection->y, $moonDirection->z, $moonLight->intensity);
+    $u->moonColor = Vec4($moonLight->color->x, $moonLight->color->y, $moonLight->color->z, $moonOwns);
+    $u->nightAmbient = nightAmbient($moon, $sky);
     ShadowMapData $held = guard $shadows else {
         return $u;
     }
@@ -110,7 +124,8 @@ public struct DirectionalLight
 
 /**
  * Mirrors LightUniforms in resources/shaders/pbr/lightpass.frag at uniform slot 2.
- * std140: three vec4s, five mat4s, then splits and shadow params.
+ * std140: the sun block (three vec4s, five mat4s, splits, shadow), then the point
+ * head, 64 lamps, 24 face matrices, and the moon block (direction, colour, night ambient).
  */
 public struct LightUniforms
 {
@@ -137,6 +152,28 @@ public struct LightUniforms
      */
     public Vec4 $shadow;
 
+    /**
+     * Point count in x, tile size in y, tiles across in z, index stride in w.
+     */
+    public Vec4 $pointsHead;
+    public PointGpu[64] $points;
+    public Mat4[24] $pointFace;
+
+    /**
+     * Moon direction in xyz, intensity in w.
+     */
+    public Vec4 $moonDirection;
+
+    /**
+     * Moon colour in rgb, 1 in w when the moon owns the shadow cascades.
+     */
+    public Vec4 $moonColor;
+
+    /**
+     * Night hemisphere ambient from above in rgb, ground bounce share in w.
+     */
+    public Vec4 $nightAmbient;
+
     public constructor(Vec4 $sunDirection, Vec4 $sunColor, Vec4 $ibl)
     {
         $this->sunDirection = $sunDirection;
@@ -152,6 +189,54 @@ public struct LightUniforms
         $this->lightSpace = $space;
         $this->splits = Vec4(0.0f);
         $this->shadow = Vec4(0.0f);
+        $this->pointsHead = Vec4(0.0f);
+        PointGpu $zero = PointGpu(Vec4(0.0f), Vec4(0.0f), Vec4(0.0f, -1.0f, 0.0f, 0.0f));
+        PointGpu[64] $points;
+        $i = 0;
+        while ($i < POINT_LIGHT_MAX) {
+            $points[$i] = $zero;
+            $i = $i + 1;
+        }
+
+        $this->points = $points;
+        Mat4[24] $faces;
+        $i = 0;
+        while ($i < POINT_SHADOW_LAYERS) {
+            $faces[$i] = Mat4();
+            $i = $i + 1;
+        }
+
+        $this->pointFace = $faces;
+        $this->moonDirection = Vec4(0.0f, -1.0f, 0.0f, 0.0f);
+        $this->moonColor = Vec4(0.0f);
+        $this->nightAmbient = Vec4(0.0f);
+    }
+}
+
+/**
+ * Copy a packed lamp list onto `$u`. Count zero leaves the head at zero so the
+ * light pass skips the tile lookup.
+ */
+public function packPointUniforms(LightUniforms& $u, PointLightFrame $frame) : void
+{
+    PointPack $pack = $frame->pack;
+    $u->pointsHead = Vec4(
+        $pack->count as float32,
+        POINT_TILE as float32,
+        $frame->tilesX as float32,
+        POINT_TILE_STRIDE as float32
+    );
+    int32 $i = 0;
+    while ($i < $pack->count) {
+        $u->points[$i] = $pack->gpu[$i];
+        $i = $i + 1;
+    }
+
+    int32 $n = $pack->shadows * CUBE_FACE_COUNT;
+    $i = 0;
+    while ($i < $n) {
+        $u->pointFace[$i] = $frame->space[$i];
+        $i = $i + 1;
     }
 }
 

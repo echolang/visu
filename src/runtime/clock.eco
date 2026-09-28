@@ -1,6 +1,11 @@
 /**
  * Monotonic seconds since the first call.
  * glfwGetTime stand-in so typical code never writes glfw::.
+ *
+ * This is the presentation clock: animation, wind, UI timers. A capture can pin it
+ * (`pinClock`), after which it only moves when the game loop steps it, one tick per displayed
+ * frame, so two runs of one script render the same moment. Code that measures how long real
+ * work took reads `time::instant` instead, which never pins.
  */
 
 namespace visu::runtime;
@@ -18,12 +23,62 @@ internal class SecondsOrigin
     }
 }
 
+internal class PinnedClock
+{
+    public static bool $pinned = false;
+    public static int64 $ns = 0;
+}
+
 public function seconds() : float64
 {
+    if (PinnedClock::$pinned) {
+        return (PinnedClock::$ns as float64) / 1000000000.0;
+    }
+
     if (SecondsOrigin::$held == null) {
         SecondsOrigin::$held = SecondsOrigin();
     }
 
     SecondsOrigin $held = guard SecondsOrigin::$held;
     return (time::instant::now() - $held->origin)->as_float_secs();
+}
+
+/**
+ * Stop the presentation clock following the wall. From here `seconds()` and the game loop's
+ * frame time move only through `stepClock`, which the loop calls once per displayed frame.
+ * For dcapture's `fixedStep`; play never pins it.
+ */
+public function pinClock() : void
+{
+    if (PinnedClock::$pinned) {
+        return;
+    }
+
+    PinnedClock::$ns = (seconds() * 1000000000.0) as int64;
+    PinnedClock::$pinned = true;
+}
+
+public function clockPinned() : bool
+{
+    return PinnedClock::$pinned;
+}
+
+/**
+ * Move a pinned clock on by `$ns`. A no-op while the clock follows the wall.
+ */
+public function stepClock(int64 $ns) : void
+{
+    if (!PinnedClock::$pinned) {
+        return;
+    }
+
+    PinnedClock::$ns = PinnedClock::$ns + $ns;
+}
+
+/**
+ * The pinned clock in nanoseconds: the frame time a pinned game loop advances to.
+ */
+public function pinnedNs() : int64
+{
+    return PinnedClock::$ns;
 }

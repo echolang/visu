@@ -529,16 +529,99 @@ public class Device : DeviceProtocol
             return .ok($pixels);
         }
 
+        mtl::Texture $source = $mt;
+        uint32 $level = $mip as uint32;
+        uint32 $slice = $layer as uint32;
+        if (mtlPrivate($texture->desc)) {
+            // the CPU cannot see a private texture: blit the one level into a shared copy first
+            mtl::Texture $staged = guard $this->staging($texture->desc->format, $w, $h) else ($e) {
+                return .error($e);
+            }
+            guard $this->blitOnce($mt, $staged, $w, $h, $level, $slice, 0, 0, 0, 0, 0) else ($e) {
+                return .error($e);
+            }
+            $source = $staged;
+            $level = 0;
+            $slice = 0;
+        }
+
         mtl::Region $region = mtl::Region(mtl::Origin(), mtl::Size($w as usize, $h as usize));
-        $mt->getBytes(
+        $source->getBytes(
             ptr<uint8>(&$pixels[0]),
             $row as usize,
             $region,
-            $mip as uint32,
-            slice: $layer as uint32,
+            $level,
+            slice: $slice,
             bytesPerImage: ($row as usize) * ($h as usize)
         );
         return .ok($pixels);
+    }
+
+    /**
+     * A one-level shared texture the CPU can read and write, the go-between for a private one.
+     * Readback and load-time uploads only, never the displayed frame.
+     */
+    private function staging(PixelFormat $format, int32 $w, int32 $h) : result<mtl::Texture, DeviceError>
+    {
+        mtl::Device $gpu = guard $this->gpu else {
+            return .error(.noDevice);
+        }
+        mtl::TextureDescriptor $td = mtl::TextureDescriptor(
+            $pixelFormat: mtlPixelFormat($format),
+            $width: $w as usize
+        );
+        $td->height = $h as usize;
+        $td->mipmapLevelCount = 1;
+        $td->usage = mtl::TEXTURE_USAGE_SHADER_READ;
+        $td->storageMode = .shared;
+        mtl::Texture $tex = guard $gpu->newTexture($td) else {
+            return .error(.outOfMemory(($w * $h) as uint64));
+        }
+        return .ok($tex);
+    }
+
+    /**
+     * Copy a `$w` x `$h` region between two textures on a command buffer of its own and wait
+     * for it. Outside a frame only: the GPU must be idle, as readback and load-time uploads have it.
+     */
+    private function blitOnce(
+        mtl::Texture $src,
+        mtl::Texture $dst,
+        int32 $w,
+        int32 $h,
+        uint32 $srcLevel,
+        uint32 $srcSlice,
+        uint32 $dstLevel,
+        uint32 $dstSlice,
+        int32 $dstX,
+        int32 $dstY,
+        int32 $srcX
+    ) : status<DeviceError>
+    {
+        mtl::CommandQueue $queue = guard $this->queue else {
+            return .error(.metal('blit', 'no command queue'));
+        }
+        mtl::CommandBuffer $cmd = guard $queue->commandBuffer() else {
+            return .error(.metal('blit', 'commandBuffer failed'));
+        }
+        mtl::BlitCommandEncoder $blit = guard $cmd->blitCommandEncoder() else {
+            return .error(.metal('blit', 'blitCommandEncoder failed'));
+        }
+        $blit->copyFromTexture(
+            $src,
+            mtl::Origin($srcX as usize, 0),
+            mtl::Size($w as usize, $h as usize),
+            $dst,
+            mtl::Origin($dstX as usize, $dstY as usize),
+            sourceSlice: $srcSlice,
+            sourceLevel: $srcLevel,
+            destinationSlice: $dstSlice,
+            destinationLevel: $dstLevel
+        );
+        $blit->endEncoding();
+        $cmd->commit();
+        $cmd->waitUntilCompleted();
+        return .ok;
     }
 
     public function copyTexture(Texture $src, Texture $dst) : status<DeviceError>
@@ -629,7 +712,7 @@ public class Device : DeviceProtocol
         $td->mipmapLevelCount = $desc->mips as usize;
         $td->usage = mtlTextureUsage($desc);
 
-        if ($desc->isDepth()) {
+        if (mtlPrivate($desc)) {
             $td->storageMode = .devicePrivate;
         } else {
             $td->storageMode = .shared;
@@ -685,7 +768,29 @@ public class Device : DeviceProtocol
             $row = mipRowBytes($texture->desc->format, $width);
         }
 
-        // colour textures are .shared, so this is a memcpy into the texture's own backing.
+        if (mtlPrivate($texture->desc)) {
+            // a render target: stage the rows in a shared texture and blit them across
+            assert(!$this->inFrame, 'uploadTexture into a render target inside a frame');
+            $this->waitIdle();
+            mtl::Texture $staged = guard $this->staging($texture->desc->format, $width, $height) else {
+                die('uploadTexture staging failed');
+            }
+            $staged->replace(
+                mtl::Region(mtl::Origin(), mtl::Size($width as usize, $height as usize)),
+                ptr<uint8>($src:$),
+                $row as usize,
+                0,
+                slice: 0,
+                bytesPerImage: 0
+            );
+            guard $this->blitOnce($staged, $mt, $width, $height, 0, 0, $mip as uint32, $layer as uint32, $x, $y, 0) else {
+                die('uploadTexture blit failed');
+            }
+            $texture->state = .shaderRead;
+            return;
+        }
+
+        // sampled textures are .shared, so this is a memcpy into the texture's own backing.
         // frames N-1/N-2 may still be sampling; a brush texel can tear for a frame.
         mtl::Region $region = mtl::Region(
             mtl::Origin($x as usize, $y as usize),

@@ -226,13 +226,19 @@ internal function mtlTextureUsage(const TextureDesc& $desc) : uint32
         $usage = $usage | mtl::TEXTURE_USAGE_SHADER_READ;
     }
 
-    if (($desc->usage & TEXTURE_TRANSFER_DST) != 0 && !$desc->format->isCompressed()) {
-        $usage = $usage | mtl::TEXTURE_USAGE_SHADER_WRITE;
-    }
-
     if ($usage == 0) {
         $usage = mtl::TEXTURE_USAGE_SHADER_READ;
     }
 
     return $usage;
+}
+
+/**
+ * Render targets and depth live in GPU-private memory: the CPU never touches them in a frame,
+ * and private storage is what lets Apple GPUs compress them losslessly. Sampled textures stay
+ * shared, so an upload is a memcpy into the texture's own backing.
+ */
+internal function mtlPrivate(const TextureDesc& $desc) : bool
+{
+    return $desc->isDepth() || ($desc->usage & TEXTURE_RENDER_TARGET) != 0;
 }

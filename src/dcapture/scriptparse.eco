@@ -397,5 +397,28 @@ internal function parseStep(json::Value $item, int32 $index) : result<Step, DCap
         $dump = $patterns;
     }
 
-    return .ok(Step($index, $at, $label, $flags, $camera, $console, $dump, $profile, $list, $log, $stop));
+    bool $click = false;
+    float64 $clickX = 0.0;
+    float64 $clickY = 0.0;
+    json::Value? $clickValue = $item->get('click');
+    if ($clickValue != null) {
+        json::Value $kv = guard $clickValue;
+        array<json::Value> $xy = guard $kv->asArray() else {
+            return .error(.field("{$path}.click", 'array of 2 numbers (window points)'));
+        }
+        if ($xy->count() != 2) {
+            return .error(.field("{$path}.click", 'array of 2 numbers (window points)'));
+        }
+        float64 $x = guard $xy[0]->asFloat() else {
+            return .error(.field("{$path}.click", 'array of 2 numbers (window points)'));
+        }
+        float64 $y = guard $xy[1]->asFloat() else {
+            return .error(.field("{$path}.click", 'array of 2 numbers (window points)'));
+        }
+        $clickX = $x;
+        $clickY = $y;
+        $click = true;
+    }
+
+    return .ok(Step($index, $at, $label, $flags, $camera, $console, $dump, $profile, $list, $log, $stop, $click, $clickX, $clickY));
 }

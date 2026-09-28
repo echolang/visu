@@ -36,6 +36,13 @@ public class ActionMap
     private string? $click;
     private map<string, bool> $didPress;
     private map<string, bool> $didRelease;
+
+    /**
+     * The same edges kept for the whole displayed frame. A frame can span several polls; a
+     * render-phase reader must still see a click that landed in an earlier one.
+     */
+    private map<string, bool> $framePress;
+    private map<string, bool> $frameRelease;
     private map<string, bool> $held;
 
     public constructor()
@@ -46,6 +53,8 @@ public class ActionMap
         $this->click = null;
         $this->didPress = map<string, bool>();
         $this->didRelease = map<string, bool>();
+        $this->framePress = map<string, bool>();
+        $this->frameRelease = map<string, bool>();
         $this->held = map<string, bool>();
     }
 
@@ -78,21 +87,44 @@ public class ActionMap
     }
 
     /**
-     * Consume this poll's release edge: true once, then `hasBeenReleased` reads false for every
-     * later reader. Bind order decides who is offered a click first.
+     * Press edge any time since the last displayed frame, across however many polls it spans.
+     * Cleared by `endFrame`. Render-phase readers use this.
      */
-    public function take(string $action) : bool
+    public const function hasBeenPressedThisFrame(string $action) : bool
     {
-        return $this->didRelease->remove($action);
+        return $this->framePress->has($action);
     }
 
     /**
-     * Consume this poll's press edge, the key-press twin of `take`: true once, then
-     * `hasBeenPressed` reads false for every later reader.
+     * Release edge any time since the last displayed frame. Cleared by `endFrame`. A click
+     * read in the render phase must use this: a slow frame polls twice, and the second poll's
+     * `reset` has already dropped the first poll's edge.
+     */
+    public const function hasBeenReleasedThisFrame(string $action) : bool
+    {
+        return $this->frameRelease->has($action);
+    }
+
+    /**
+     * Consume the release edge, poll and frame alike: true once, then both `hasBeenReleased`
+     * and `hasBeenReleasedThisFrame` read false for every later reader. Bind order decides who
+     * is offered a click first.
+     */
+    public function take(string $action) : bool
+    {
+        bool $poll = $this->didRelease->remove($action);
+        bool $frame = $this->frameRelease->remove($action);
+        return $poll || $frame;
+    }
+
+    /**
+     * Consume the press edge, the key-press twin of `take`.
      */
     public function takePress(string $action) : bool
     {
-        return $this->didPress->remove($action);
+        bool $poll = $this->didPress->remove($action);
+        bool $frame = $this->framePress->remove($action);
+        return $poll || $frame;
     }
 
     public const function down(string $action) : bool
@@ -111,12 +143,22 @@ public class ActionMap
 
     /**
      * Drop per-tick edges.
-     * Held state stays.
+     * Held state and this frame's edges stay.
      */
     public function reset() : void
     {
         $this->didPress->clear();
         $this->didRelease->clear();
+    }
+
+    /**
+     * Drop this frame's edges once it has been displayed. The Host calls it with
+     * `InputHub.endFrame`.
+     */
+    public function endFrame() : void
+    {
+        $this->framePress->clear();
+        $this->frameRelease->clear();
     }
 
     public function handle(const KeySignal& $signal) : Flow
@@ -209,6 +251,7 @@ public class ActionMap
             return .proceed;
         }
         $this->didRelease[$action] = true;
+        $this->frameRelease[$action] = true;
         return .stop;
     }
 
@@ -252,8 +295,10 @@ public class ActionMap
     {
         if ($phase == KeyPhase::press) {
             $this->didPress[$action] = true;
+            $this->framePress[$action] = true;
         } else if ($phase == KeyPhase::release) {
             $this->didRelease[$action] = true;
+            $this->frameRelease[$action] = true;
         }
 
         $this->held[$action] = $phase->down();

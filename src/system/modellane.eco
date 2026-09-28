@@ -10,7 +10,7 @@ namespace visu::system;
 use visu::geo::Frustum;
 use visu::graphics::{
     DeferredRenderer, Device, DrawCallAssembler, GpuPass, MaterialGpu, MeshHandle, Model, ModelBank,
-    Raster, RenderEncoder, SHADOW_CASCADES, ShaderProgram, ShadowCascade, VertexLayout
+    POINT_SHADOW_LAYERS, Raster, RenderEncoder, SHADOW_CASCADES, ShaderProgram, ShadowCascade, VertexLayout
 };
 use visu::math::Vec3;
 
@@ -20,9 +20,19 @@ internal class ModelLane<P>
     public array<DrawCallAssembler<P>> $shadowDca;
 
     /**
+     * One assembler per point-shadow face, layer `lamp * 6 + face`.
+     */
+    public array<DrawCallAssembler<P>> $pointDca;
+
+    /**
      * The highlighted instances this frame, drawn into the outline mask.
      */
     public DrawCallAssembler<P> $outlineDca;
+
+    /**
+     * The mirror view's instances. One assembler, culled by the reflected frustum.
+     */
+    public DrawCallAssembler<P> $reflectDca;
     public VertexLayout $layout;
 
     /**
@@ -39,6 +49,8 @@ internal class ModelLane<P>
     private GpuPass? $doubleSidedParallax;
     private GpuPass? $shadow;
     private GpuPass? $outline;
+    private GpuPass? $mirror;
+    private GpuPass? $mirrorParallax;
 
     /**
      * Depth-biased passes, one per biased material index, built the first time that material
@@ -65,8 +77,19 @@ internal class ModelLane<P>
             $s = $s + 1;
         }
 
+        $this->pointDca = array<DrawCallAssembler<P>>();
+        $s = 0;
+        while ($s < POINT_SHADOW_LAYERS) {
+            DrawCallAssembler<P> $face = DrawCallAssembler<P>($device);
+            $face->shareMeshes($this->dca);
+            $this->pointDca[] = $face;
+            $s = $s + 1;
+        }
+
         $this->outlineDca = DrawCallAssembler<P>($device);
         $this->outlineDca->shareMeshes($this->dca);
+        $this->reflectDca = DrawCallAssembler<P>($device);
+        $this->reflectDca->shareMeshes($this->dca);
         $this->layout = $layout;
         $this->program = $program;
         $this->parallaxProgram = $parallaxProgram;
@@ -78,6 +101,8 @@ internal class ModelLane<P>
         $this->doubleSidedParallax = null;
         $this->shadow = null;
         $this->outline = null;
+        $this->mirror = null;
+        $this->mirrorParallax = null;
         $this->biased = map<int32, GpuPass>();
     }
 
@@ -117,6 +142,14 @@ internal class ModelLane<P>
         $this->opaqueParallax = GpuPass($parallaxProgram, $this->layout, $raster);
         $this->doubleSidedParallax = GpuPass($parallaxProgram, $this->layout, $open);
         $this->shadow = GpuPass($shadowProgram, $this->layout, Raster::depth());
+        Raster $flipped = Raster::opaque();
+        $flipped->cull = .front;
+        if ($wireframe) {
+            $flipped->fill = .lines;
+        }
+
+        $this->mirror = GpuPass($program, $this->layout, $flipped);
+        $this->mirrorParallax = GpuPass($parallaxProgram, $this->layout, $flipped);
         ShaderProgram $outlineProgram = guard $renderer->program($this->outlineProgram) else {
             return;
         }
@@ -139,6 +172,8 @@ internal class ModelLane<P>
         $this->doubleSidedParallax = null;
         $this->shadow = null;
         $this->outline = null;
+        $this->mirror = null;
+        $this->mirrorParallax = null;
         $this->biased->clear();
     }
 
@@ -219,6 +254,13 @@ internal class ModelLane<P>
         }
     }
 
+    public function clearPoints() : void
+    {
+        foreach ($this->pointDca as $face) {
+            $face->clearInstances();
+        }
+    }
+
     public function buildShadows(const ShadowCascade[5]& $cascades, Vec3 $eye) : void
     {
         int32 $i = 0;
@@ -272,6 +314,49 @@ internal class ModelLane<P>
                 $opaque->bind($e);
             }
 
+            $m->bind($e);
+        });
+    }
+
+    public function buildPoint(int32 $index, const Frustum& $frustum, Vec3 $eye) : void
+    {
+        if ($index < 0 || $index >= POINT_SHADOW_LAYERS) {
+            return;
+        }
+
+        DrawCallAssembler<P> $dca = $this->pointDca[$index as usize];
+        if ($dca->pendingCount() < 1) {
+            return;
+        }
+
+        $dca->build($frustum, $eye);
+    }
+
+    public const function castsPoint(int32 $index) : bool
+    {
+        if ($index < 0 || $index >= POINT_SHADOW_LAYERS) {
+            return false;
+        }
+
+        return $this->pointDca[$index as usize]->commandCount() > 0;
+    }
+
+    /**
+     * Record point-shadow face `$index`. The face camera is already bound.
+     */
+    public function castPoint(RenderEncoder $enc, ModelBank $bank, int32 $index) : void
+    {
+        GpuPass $pass = guard $this->shadow else {
+            return;
+        }
+        if (!$this->castsPoint($index)) {
+            return;
+        }
+
+        DrawCallAssembler<P> $dca = $this->pointDca[$index as usize];
+        $dca->execute($enc, function(RenderEncoder $e, int32 $material) : void {
+            $pass->bind($e);
+            MaterialGpu $m = $bank->material($material);
             $m->bind($e);
         });
     }
@@ -345,6 +430,63 @@ internal class ModelLane<P>
     {
         $this->dca->clearMeshes();
         $this->clearShadows();
+        $this->clearPoints();
         $this->outlineDca->clearInstances();
+        $this->reflectDca->clearInstances();
+    }
+
+    public function clearReflect() : void
+    {
+        $this->reflectDca->clearInstances();
+    }
+
+    public function buildReflect(const Frustum& $frustum, Vec3 $eye) : void
+    {
+        $this->reflectDca->build($frustum, $eye);
+    }
+
+    public const function reflects() : bool
+    {
+        return $this->reflectDca->commandCount() > 0;
+    }
+
+    /**
+     * The mirror view. Cull is flipped because the reflected basis reverses winding.
+     * Double-sided materials stay unculled. Depth bias is left off: the mirror is half resolution.
+     */
+    public function drawReflect(RenderEncoder $enc, ModelBank $bank) : void
+    {
+        GpuPass $opaque = guard $this->mirror else {
+            return;
+        }
+        GpuPass $parallax = guard $this->mirrorParallax else {
+            return;
+        }
+        GpuPass $twoSided = guard $this->doubleSided else {
+            return;
+        }
+        GpuPass $twoSidedParallax = guard $this->doubleSidedParallax else {
+            return;
+        }
+        if (!$this->reflects()) {
+            return;
+        }
+
+        $this->reflectDca->execute($enc, function(RenderEncoder $e, int32 $material) : void {
+            MaterialGpu $m = $bank->material($material);
+            if ($m->parallax) {
+                if ($m->doubleSided) {
+                    $twoSidedParallax->bind($e);
+                } else {
+                    $parallax->bind($e);
+                }
+            } else if ($m->doubleSided) {
+                $twoSided->bind($e);
+            } else {
+                $opaque->bind($e);
+            }
+
+            $m->bind($e);
+        });
     }
 }

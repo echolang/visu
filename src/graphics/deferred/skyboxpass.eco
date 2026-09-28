@@ -13,18 +13,21 @@ public class SkyboxPass : Pass
     private Sky $sky;
     private HeightFog $fog;
     private DirectionalLight $sun;
+    private Moon $moon;
 
     public constructor(
         DeferredGpu $gpu,
         Sky $sky,
         HeightFog $fog,
-        DirectionalLight $sun
+        DirectionalLight $sun,
+        Moon $moon
     )
     {
         $this->gpu = $gpu;
         $this->sky = $sky;
         $this->fog = $fog;
         $this->sun = $sun;
+        $this->moon = $moon;
     }
 
     public function name() : string
@@ -40,6 +43,7 @@ public class SkyboxPass : Pass
         $io->reads($environment->cubemap);
         // ordering only: the depth is an attachment here, not a sampler
         $io->reads($gbuffer->depth);
+        readGodRays($io, $frame);
         $io->writes($light->target);
     }
 
@@ -64,10 +68,16 @@ public class SkyboxPass : Pass
             $camera->position,
             fogSunTint($this->sun, $this->sky),
             FOG_VIEW_SAMPLES,
-            FOG_LIGHT_SAMPLES
+            FOG_LIGHT_SAMPLES,
+            fogMoonTint($this->moon, $this->sky),
+            fogLight($this->moon, $this->sky)
         );
         // fog.glsl includes sky.glsl, so the SkyUniforms block is in the layout
-        $enc->upload(skyUniforms($this->sky, $camera->position, false, FOG_VIEW_SAMPLES, FOG_LIGHT_SAMPLES), slot: 2);
+        $enc->upload(skyUniforms($this->sky, $camera->position, false, FOG_VIEW_SAMPLES, FOG_LIGHT_SAMPLES, $this->moon), slot: 2);
+        guard bindGodRays($ctx, $enc, $this->gpu, $fog, true) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
         $enc->upload($fog, slot: 3);
         EnvironmentData $environment = $ctx->frame->get<EnvironmentData>();
         Texture $cube = guard $ctx->pool->getTexture($environment->cubemap) else ($e) {
@@ -100,6 +110,13 @@ internal function beginSkyPass(RenderContext $ctx) : result<RenderEncoder, Pipel
     DepthTarget $depthTarget = DepthTarget($depth);
     $depthTarget->load = .load;
     $depthTarget->store = .dontCare;
+    WaterFrame? $water = $ctx->frame->find<WaterFrame>();
+    if ($water != null) {
+        WaterFrame $held = guard $water;
+        if ($held->active) {
+            $depthTarget->store = .store;
+        }
+    }
     RenderPassDesc $desc = RenderPassDesc();
     $desc->colors[] = $target;
     $desc->depth = $depthTarget;

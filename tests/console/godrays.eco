@@ -1,0 +1,55 @@
+/**
+ * The `godrays` grammar and its edits.
+ */
+
+use visu::console::{GodRaysEdit, applyGodRays, parseGodRays};
+use visu::graphics::GodRays;
+
+function godRaysWords(const string& $line) : array<string>
+{
+    str::parts $split = str::split($line, ' ');
+    return $split->owned();
+}
+
+function godRaysApplied(const string& $line) : GodRays
+{
+    GodRays $rays = GodRays();
+    applyGodRays($rays, parseGodRays(godRaysWords($line)));
+    return $rays;
+}
+
+function godRaysInvalid(const string& $line) : bool
+{
+    return match (parseGodRays(godRaysWords($line))) {
+        GodRaysEdit::invalid => true,
+        else => false,
+    };
+}
+
+test god_rays_console_edits
+{
+    assert(godRaysApplied('godrays on')->enabled, 'on');
+    assert(!godRaysApplied('godrays off')->enabled, 'off');
+    assert(godRaysApplied('godrays steps 20')->steps == 20, 'steps');
+    assert(godRaysApplied('godrays scale quarter')->scale == 0.25f, 'quarter');
+    assert(godRaysApplied('godrays scale half')->scale == 0.5f, 'half');
+    assert(godRaysApplied('godrays scatter 4')->scatter == 4.0f, 'scatter');
+    assert(godRaysApplied('godrays g 0.5')->anisotropy == 0.5f, 'core lobe');
+    assert(godRaysApplied('godrays wide 0.2')->wideAnisotropy == 0.2f, 'wide lobe');
+    assert(godRaysApplied('godrays moonwide 2')->moonWideWeight == 2.0f, 'moon wide weight');
+    assert(godRaysApplied('godrays low 8')->lowAngle == 8.0f, 'band low');
+    assert(godRaysApplied('godrays high 40')->highAngle == 40.0f, 'band high');
+    assert(godRaysApplied('godrays') == GodRays(), 'status changes nothing');
+}
+
+test god_rays_console_refuses_nonsense
+{
+    assert(godRaysInvalid('godrays steps 0'), 'no zero steps');
+    assert(godRaysInvalid('godrays steps 999'), 'step cap');
+    assert(godRaysInvalid('godrays g 1'), 'g below one');
+    assert(godRaysInvalid('godrays scatter -1'), 'not negative');
+    assert(godRaysInvalid('godrays glow 2'), 'glow at most one');
+    assert(godRaysInvalid('godrays history 0.99'), 'history cap');
+    assert(godRaysInvalid('godrays bogus 1'), 'unknown verb');
+    assert(godRaysInvalid('godrays on off'), 'extra words');
+}

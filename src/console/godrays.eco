@@ -1,0 +1,269 @@
+/**
+ * Console grammar and handler for the renderer's light shafts. `godrays` alone prints the
+ * state; every other form edits `DeferredRenderer.godRays` and prints it again.
+ */
+
+namespace visu::console;
+
+use visu::graphics::{DeferredRenderer, GODRAY_MAX_STEPS, GodRays, godRayStrength, keyLight, moonKeyed};
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal const GODRAYS_USAGE = 'usage: godrays [on|off|steps <n>|scale half|quarter|<x>|scatter <x>|g <x>|distance <m>|glow <x>|moon <x>|history <x>|wide <g>|wideweight <x>|moonwide <x>|low <deg>|high <deg>]';
+
+/**
+ * One parsed `godrays` form. `apply` writes it onto a settings copy.
+ */
+public enum GodRaysEdit
+{
+    case show;
+    case enable(bool $on);
+    case steps(int32 $n);
+    case scale(float32 $x);
+    case scatter(float32 $x);
+    case anisotropy(float32 $x);
+    case wide(float32 $x);
+    case wideWeight(float32 $x);
+    case moonWide(float32 $x);
+    case distance(float32 $m);
+    case glow(float32 $x);
+    case moon(float32 $x);
+    case history(float32 $x);
+    case low(float32 $degrees);
+    case high(float32 $degrees);
+    case invalid;
+}
+
+/**
+ * Parse the words after `godrays`. Pure, so the grammar is testable without a renderer.
+ */
+public function parseGodRays(const array<string>& $parts) : GodRaysEdit
+{
+    usize $n = $parts->count();
+    if ($n == 1) {
+        return .show;
+    }
+
+    string $verb = $parts[1];
+    if ($n == 2 && $verb == 'on') {
+        return .enable(true);
+    }
+
+    if ($n == 2 && $verb == 'off') {
+        return .enable(false);
+    }
+
+    if ($n != 3) {
+        return .invalid;
+    }
+
+    string $arg = $parts[2];
+    if ($verb == 'scale' && $arg == 'half') {
+        return .scale(0.5f);
+    }
+
+    if ($verb == 'scale' && $arg == 'quarter') {
+        return .scale(0.25f);
+    }
+
+    if ($verb == 'steps') {
+        int64 $steps = guard str::int($arg) else {
+            return .invalid;
+        }
+        if ($steps < 1 || $steps > (GODRAY_MAX_STEPS as int64)) {
+            return .invalid;
+        }
+        return .steps($steps as int32);
+    }
+
+    float64 $raw = guard str::float($arg) else {
+        return .invalid;
+    }
+    float32 $x = $raw as float32;
+    if ($verb == 'g' || $verb == 'wide') {
+        if ($x <= -1.0f || $x >= 1.0f) {
+            return .invalid;
+        }
+        if ($verb == 'wide') {
+            return .wide($x);
+        }
+        return .anisotropy($x);
+    }
+
+    if ($x < 0.0f) {
+        return .invalid;
+    }
+
+    if ($verb == 'scale') {
+        if ($x < 0.0625f || $x > 1.0f) {
+            return .invalid;
+        }
+        return .scale($x);
+    }
+
+    if ($verb == 'scatter') {
+        return .scatter($x);
+    }
+
+    if ($verb == 'distance') {
+        return .distance($x);
+    }
+
+    if ($verb == 'glow') {
+        if ($x > 1.0f) {
+            return .invalid;
+        }
+        return .glow($x);
+    }
+
+    if (($verb == 'wideweight' || $verb == 'moonwide') && $x <= 8.0f) {
+        if ($verb == 'wideweight') {
+            return .wideWeight($x);
+        }
+        return .moonWide($x);
+    }
+
+    if ($verb == 'moon') {
+        return .moon($x);
+    }
+
+    if ($verb == 'low' && $x <= 90.0f) {
+        return .low($x);
+    }
+
+    if ($verb == 'high' && $x <= 90.0f) {
+        return .high($x);
+    }
+
+    if ($verb == 'history') {
+        if ($x > 0.98f) {
+            return .invalid;
+        }
+        return .history($x);
+    }
+
+    return .invalid;
+}
+
+/**
+ * Write one edit onto `$rays`. `show` and `invalid` leave it alone.
+ */
+public function applyGodRays(GodRays& $rays, GodRaysEdit $edit) : void
+{
+    match ($edit) {
+        GodRaysEdit::show => {},
+        GodRaysEdit::invalid => {},
+        GodRaysEdit::enable($on) => {
+            $rays->enabled = $on;
+        },
+        GodRaysEdit::steps($n) => {
+            $rays->steps = $n;
+        },
+        GodRaysEdit::scale($x) => {
+            $rays->scale = $x;
+        },
+        GodRaysEdit::scatter($x) => {
+            $rays->scatter = $x;
+        },
+        GodRaysEdit::anisotropy($x) => {
+            $rays->anisotropy = $x;
+        },
+        GodRaysEdit::wide($x) => {
+            $rays->wideAnisotropy = $x;
+        },
+        GodRaysEdit::wideWeight($x) => {
+            $rays->wideWeight = $x;
+        },
+        GodRaysEdit::moonWide($x) => {
+            $rays->moonWideWeight = $x;
+        },
+        GodRaysEdit::distance($m) => {
+            $rays->maxDistance = $m;
+        },
+        GodRaysEdit::glow($x) => {
+            $rays->occludeGlow = $x;
+        },
+        GodRaysEdit::moon($x) => {
+            $rays->moonBoost = $x;
+        },
+        GodRaysEdit::history($x) => {
+            $rays->historyWeight = $x;
+        },
+        GodRaysEdit::low($x) => {
+            $rays->lowAngle = $x;
+        },
+        GodRaysEdit::high($x) => {
+            $rays->highAngle = $x;
+        },
+    };
+}
+
+public class GodRaysConsole : ConsoleCommandHandler
+{
+    public DeferredRenderer $renderer;
+
+    public constructor(DeferredRenderer $renderer)
+    {
+        $this->renderer = $renderer;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('godrays', $this, 'on|off|steps|scale|scatter|g|wide|wideweight|moonwide|distance|glow|moon|history|low|high');
+        array<string> $names = array<string>();
+        $names[] = 'godrays';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if (!$cmd->isAction('godrays')) {
+            return;
+        }
+
+        GodRaysEdit $edit = parseGodRays($cmd->parts);
+        bool $bad = match ($edit) {
+            GodRaysEdit::invalid => true,
+            else => false,
+        };
+        if ($bad) {
+            $console->writeLine(GODRAYS_USAGE);
+            return;
+        }
+
+        GodRays $rays = $this->renderer->godRays;
+        applyGodRays($rays, $edit);
+        $this->renderer->godRays = $rays;
+        $console->writeLine($this->statusLine());
+    }
+
+    private function statusLine() : string
+    {
+        GodRays $rays = $this->renderer->godRays;
+        string $state = 'off';
+        if ($rays->enabled) {
+            $state = 'on';
+        }
+
+        string $key = 'sun';
+        if (moonKeyed($this->renderer->sun, $this->renderer->moon)) {
+            $key = 'moon';
+        }
+
+        if (keyLight($this->renderer->sun, $this->renderer->moon)->intensity <= 0.0f) {
+            $key = 'none (passes skipped)';
+        }
+
+        float32 $strength = 0.0f;
+        if (keyLight($this->renderer->sun, $this->renderer->moon)->intensity > 0.0f) {
+            $strength = godRayStrength($rays, keyLight($this->renderer->sun, $this->renderer->moon)->direction);
+        }
+
+        string $live = 'idle';
+        if ($this->renderer->godRaysLive()) {
+            $live = 'running';
+        }
+
+        return "godrays: {$state} ({$live}), key {$key}, scale {$rays->scale:.2f}, steps {$rays->steps}, distance {$rays->maxDistance:.0f} m, scatter {$rays->scatter:.2f}, g {$rays->anisotropy:.2f} / wide {$rays->wideAnisotropy:.2f} at {$rays->wideWeight:.2f} (moon {$rays->moonWideWeight:.2f}), glow {$rays->occludeGlow:.2f}, moon {$rays->moonBoost:.2f}, history {$rays->historyWeight:.2f}, band {$rays->lowAngle:.0f}..{$rays->highAngle:.0f} deg, strength {$strength:.2f}";
+    }
+}

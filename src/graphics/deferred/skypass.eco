@@ -14,18 +14,21 @@ public class SkyPass : Pass
     private Sky $sky;
     private HeightFog $fog;
     private DirectionalLight $sun;
+    private Moon $moon;
 
     public constructor(
         DeferredGpu $gpu,
         Sky $sky,
         HeightFog $fog,
-        DirectionalLight $sun
+        DirectionalLight $sun,
+        Moon $moon
     )
     {
         $this->gpu = $gpu;
         $this->sky = $sky;
         $this->fog = $fog;
         $this->sun = $sun;
+        $this->moon = $moon;
     }
 
     public function name() : string
@@ -39,6 +42,7 @@ public class SkyPass : Pass
         GBufferData $gbuffer = $frame->get<GBufferData>();
         // ordering only: the depth is an attachment here, not a sampler
         $io->reads($gbuffer->depth);
+        readGodRays($io, $frame);
         $io->writes($light->target);
     }
 
@@ -63,16 +67,23 @@ public class SkyPass : Pass
             $camera->position,
             fogSunTint($this->sun, $this->sky),
             FOG_VIEW_SAMPLES,
-            FOG_LIGHT_SAMPLES
+            FOG_LIGHT_SAMPLES,
+            fogMoonTint($this->moon, $this->sky),
+            fogLight($this->moon, $this->sky)
         );
         SkyUniforms $sky = skyUniforms(
             $this->sky,
             $camera->position,
             true,
             SKY_VIEW_SAMPLES,
-            SKY_LIGHT_SAMPLES
+            SKY_LIGHT_SAMPLES,
+            $this->moon
         );
         $enc->upload($sky, slot: 2);
+        guard bindGodRays($ctx, $enc, $this->gpu, $fog, true) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
         $enc->upload($fog, slot: 3);
         $mesh->draw($enc);
         $enc->endRender();

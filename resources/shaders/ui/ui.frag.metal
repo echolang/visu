@@ -29,7 +29,7 @@ struct fs_in
 static inline __attribute__((always_inline))
 float sdRoundBox(thread const float2& p, thread const float2& b, thread const float& r)
 {
-    float2 q = (abs(p) - b) + float2(r, r);
+    float2 q = (abs(p) - b) + float2(r);
     return (fast::min(fast::max(q.x, q.y), 0.0) + length(fast::max(q, float2(0.0)))) - r;
 }
 
@@ -82,17 +82,17 @@ fragment fs_out fs(fs_in in [[stage_in]], texture2d<float> uTex [[texture(0)]], 
             }
         }
     }
-    bool _200 = in.vClip.z > 0.5;
-    bool _207;
-    if (!_200)
+    bool _199 = in.vClip.z > 0.5;
+    bool _206;
+    if (!_199)
     {
-        _207 = in.vClip.w > 0.5;
+        _206 = in.vClip.w > 0.5;
     }
     else
     {
-        _207 = _200;
+        _206 = _199;
     }
-    if (_207)
+    if (_206)
     {
         float2 p = in.vPos - in.vClip.xy;
         float2 param_6 = p;
