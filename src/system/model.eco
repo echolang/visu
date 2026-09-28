@@ -29,7 +29,8 @@ use visu::graphics::{
     Pipeline, PipelineError, PointFace, PointLightFrame, PointShadowCaster, PointShadowData, RenderContext,
     RenderEncoder, SHADOW_CASCADES, SKIN_PALETTE_ROWS, SKIN_PALETTE_SLOT, ShaderProgram,
     ReflectionCaster, ShadowCascade, ShadowCaster, ShadowMapData, SkinInstanceData, TransientSlice,
-    WaterDraw, WaterFrame, debugLinePass, lodIndex, modelLayout, pointSphereHits, skinnedLayout, waterAbove
+    WaterDraw, WaterFrame, debugLinePass, lodIndex, modelLayout, pointSphereHits, shadowReach, skinnedLayout,
+    waterAbove
 };
 use visu::console::lodColor;
 use visu::math::{Mat4, Vec3, Vec4, length};
@@ -660,7 +661,8 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     /**
      * Cull against each cascade frustum, pick LODs from the play camera. The light eye sits far
      * up the sun ray, so distance from there would put every model at its coarsest level.
-     * Statics are octree-queried per cascade; dynamics are walked once.
+     * Statics come from one octree query around every cascade and pick their level once, then each
+     * cascade's frustum sorts them; dynamics are walked once.
      */
     public function prepareShadows(
         Entities $entities,
@@ -678,31 +680,39 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         Vec3 $eye = $view->cullPosition;
         float32 $alpha = $ctx->compensation;
         visu::profile::begin('statics');
-        int32 $i = 0;
-        while ($i < SHADOW_CASCADES) {
-            ShadowCascade $cascade = $cascades[$i];
-            DrawCallAssembler<ModelInstanceData> $dca = $this->rigid->shadowDca[$i as usize];
-            $this->statics->query($cascade->frustum);
-            const array<uint32>& $ids = $this->statics->visible();
-            foreach ($ids as $id) {
-                StaticInstance $inst = $this->statics->get($id);
-                if (!$inst->live) {
-                    continue;
-                }
-
-                ModelHandles $h = $this->models[$inst->handles as usize];
-                if (!$h->anyCast) {
-                    continue;
-                }
-
-                $this->submitVisible($dca, $h, $inst->world, $inst->bounds, ModelInstanceData($inst->tint), $inst->lodBias, $eye, false, shadow: true);
+        // one query for every cascade, one LOD per static: the level depends on the play eye only
+        $this->statics->query(shadowReach($cascades));
+        const array<uint32>& $ids = $this->statics->visible();
+        foreach ($ids as $id) {
+            StaticInstance $inst = $this->statics->get($id);
+            if (!$inst->live) {
+                continue;
             }
 
-            $i = $i + 1;
+            ModelHandles $h = $this->models[$inst->handles as usize];
+            if (!$h->anyCast) {
+                continue;
+            }
+
+            int32 $level = $this->levelAt($h, $inst->bounds, $inst->lodBias, $eye);
+            if ($level < 0) {
+                continue;
+            }
+
+            ModelInstanceData $payload = ModelInstanceData($inst->tint);
+            int32 $c = 0;
+            while ($c < SHADOW_CASCADES) {
+                if ($cascades[$c]->frustum->contains($inst->bounds)) {
+                    $this->submitLevel($this->rigid->shadowDca[$c as usize], $h, $level, $inst->world, $payload, true);
+                }
+
+                $c = $c + 1;
+            }
         }
 
         visu::profile::end();
         visu::profile::begin('movers');
+        int32 $i = 0;
         foreach ($this->dynamicDraws as $dyn) {
             ModelHandles $h = $this->models[$dyn->handles as usize];
             if (!$h->anyCast) {
@@ -1370,18 +1380,9 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             $this->lines->box($bounds, lodColor($lod));
         }
 
-        int32 $last = ($h->lodStart->count() as int32) - 2;
-        if ($last < 0) {
-            return;
-        }
-
-        int32 $level = $lod;
+        int32 $level = $this->clampLevel($h, $lod);
         if ($level < 0) {
-            $level = 0;
-        }
-
-        if ($level > $last) {
-            $level = $last;
+            return;
         }
 
         if ($record) {
@@ -1389,6 +1390,53 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             $this->submitted = $this->submitted + 1;
         }
 
+        $this->submitLevel($dca, $h, $level, $world, $payload, $shadow);
+    }
+
+    /**
+     * The level `submitVisible` would draw for these bounds, or -1 when the model is past its
+     * cull distance or has no levels. Keeps no statistics.
+     */
+    private const function levelAt(ModelHandles $h, const AABB& $bounds, float32 $lodBias, Vec3 $eye) : int32
+    {
+        float32 $dist = length($bounds->closest($eye) - $eye);
+        if ($h->model->cullDistance > 0.0f && $dist > $h->model->cullDistance) {
+            return -1;
+        }
+
+        return $this->clampLevel($h, lodIndex($h->model->lods, $dist, $h->model->lodBias * $lodBias * $this->lodBias));
+    }
+
+    private const function clampLevel(ModelHandles $h, int32 $lod) : int32
+    {
+        int32 $last = ($h->lodStart->count() as int32) - 2;
+        if ($last < 0) {
+            return -1;
+        }
+
+        if ($lod < 0) {
+            return 0;
+        }
+
+        if ($lod > $last) {
+            return $last;
+        }
+
+        return $lod;
+    }
+
+    /**
+     * Submit every primitive of one level; a shadow pass skips the ones whose material casts none.
+     */
+    private function submitLevel<P>(
+        DrawCallAssembler<P> $dca,
+        ModelHandles $h,
+        int32 $level,
+        const Mat4& $world,
+        P $payload,
+        bool $shadow
+    ) : void
+    {
         int32 $start = $h->lodStart[$level as usize];
         int32 $end = $h->lodStart[($level + 1) as usize];
         int32 $n = $start;

@@ -195,10 +195,16 @@ public class DrawCallAssembler<P>
         $this->keys->reserve($n);
         usize $i = 0;
 
+        // the centre only feeds the cull and the depth key; a depth-map list wants neither
+        bool $centred = $this->cull || $this->sortFrontToBack;
+        Vec3 $centre = Vec3(0.0f);
         while ($i < $n) {
-            Submission<P> $sub = $this->pending[$i];
-            RegisteredMesh $mesh = $this->table->get($sub->mesh);
-            Vec3 $centre = worldPoint($sub->model, $mesh->centre);
+            const Submission<P>& $sub = $this->pending[$i];
+            const RegisteredMesh& $mesh = $this->table->at($sub->mesh);
+            if ($centred) {
+                $centre = worldPoint($sub->model, $mesh->centre);
+            }
+
             // one key per submission, culled included: sortByKey looks them up by submission index, not by position in $visible
             $this->keys[] = sortKey($mesh->material, $sub->mesh, $this->depthBucket($centre, $cameraPosition, $sub->sortBias));
 
@@ -340,11 +346,11 @@ public class DrawCallAssembler<P>
         usize $i = 0;
 
         while ($i < $n) {
-            Submission<P> $base = $this->pending[$this->visible[$i] as usize];
+            const Submission<P>& $base = $this->pending[$this->visible[$i] as usize];
             usize $start = $i;
 
             while ($i < $n) {
-                Submission<P> $next = $this->pending[$this->visible[$i] as usize];
+                const Submission<P>& $next = $this->pending[$this->visible[$i] as usize];
 
                 if ($next->mesh != $base->mesh) {
                     break;
@@ -354,7 +360,7 @@ public class DrawCallAssembler<P>
                 $i = $i + 1;
             }
 
-            RegisteredMesh $mesh = $this->table->get($base->mesh);
+            const RegisteredMesh& $mesh = $this->table->at($base->mesh);
             $this->commands[] = DrawCommand(
                 $base->mesh,
                 $mesh->material,
