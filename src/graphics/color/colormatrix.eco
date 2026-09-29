@@ -1,0 +1,274 @@
+/**
+ * Colour-space maths on the CPU: a 3 x 3 matrix and a three-channel value in float64, gamuts
+ * given by their primaries, and von Kries adaptation in Bradford cone space. Built when a
+ * look setting changes, never per frame, and uploaded as float32 rows.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+/**
+ * Three linear channels: RGB in some gamut, or CIE XYZ.
+ */
+public struct ColorVector
+{
+    public float64 $x;
+    public float64 $y;
+    public float64 $z;
+
+    public constructor(float64 $x, float64 $y, float64 $z)
+    {
+        $this->x = $x;
+        $this->y = $y;
+        $this->z = $z;
+    }
+}
+
+/**
+ * Row-major 3 x 3: `m01` is row 0, column 1, and a vector is a column on the right.
+ */
+public struct ColorMatrix
+{
+    public float64 $m00;
+    public float64 $m01;
+    public float64 $m02;
+    public float64 $m10;
+    public float64 $m11;
+    public float64 $m12;
+    public float64 $m20;
+    public float64 $m21;
+    public float64 $m22;
+
+    public constructor(
+        float64 $m00,
+        float64 $m01,
+        float64 $m02,
+        float64 $m10,
+        float64 $m11,
+        float64 $m12,
+        float64 $m20,
+        float64 $m21,
+        float64 $m22
+    )
+    {
+        $this->m00 = $m00;
+        $this->m01 = $m01;
+        $this->m02 = $m02;
+        $this->m10 = $m10;
+        $this->m11 = $m11;
+        $this->m12 = $m12;
+        $this->m20 = $m20;
+        $this->m21 = $m21;
+        $this->m22 = $m22;
+    }
+
+    /**
+     * Scales each channel on its own.
+     */
+    public constructor(diagonal: ColorVector $scale)
+    {
+        $this->m00 = $scale->x;
+        $this->m01 = 0.0;
+        $this->m02 = 0.0;
+        $this->m10 = 0.0;
+        $this->m11 = $scale->y;
+        $this->m12 = 0.0;
+        $this->m20 = 0.0;
+        $this->m21 = 0.0;
+        $this->m22 = $scale->z;
+    }
+
+    /**
+     * The three vectors as columns: the XYZ of each primary gives the gamut's RGB to XYZ.
+     */
+    public constructor(columns: ColorVector $a, ColorVector $b, ColorVector $c)
+    {
+        $this->m00 = $a->x;
+        $this->m01 = $b->x;
+        $this->m02 = $c->x;
+        $this->m10 = $a->y;
+        $this->m11 = $b->y;
+        $this->m12 = $c->y;
+        $this->m20 = $a->z;
+        $this->m21 = $b->z;
+        $this->m22 = $c->z;
+    }
+
+    public static function identity() : ColorMatrix
+    {
+        return ColorMatrix(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    }
+
+    public const function determinant() : float64
+    {
+        return $this->m00 * ($this->m11 * $this->m22 - $this->m12 * $this->m21)
+            - $this->m01 * ($this->m10 * $this->m22 - $this->m12 * $this->m20)
+            + $this->m02 * ($this->m10 * $this->m21 - $this->m11 * $this->m20);
+    }
+
+    /**
+     * Every matrix built here is a change of basis, so it is never singular; a zero
+     * determinant is a wiring bug.
+     */
+    public const function inverse() : ColorMatrix
+    {
+        float64 $det = $this->determinant();
+        assert($det != 0.0, 'colour matrix is singular');
+        float64 $s = 1.0 / $det;
+        return ColorMatrix(
+            ($this->m11 * $this->m22 - $this->m12 * $this->m21) * $s,
+            ($this->m02 * $this->m21 - $this->m01 * $this->m22) * $s,
+            ($this->m01 * $this->m12 - $this->m02 * $this->m11) * $s,
+            ($this->m12 * $this->m20 - $this->m10 * $this->m22) * $s,
+            ($this->m00 * $this->m22 - $this->m02 * $this->m20) * $s,
+            ($this->m02 * $this->m10 - $this->m00 * $this->m12) * $s,
+            ($this->m10 * $this->m21 - $this->m11 * $this->m20) * $s,
+            ($this->m01 * $this->m20 - $this->m00 * $this->m21) * $s,
+            ($this->m00 * $this->m11 - $this->m01 * $this->m10) * $s
+        );
+    }
+
+    /**
+     * Row `$i` as the float32 `vec4` the shaders dot with (w is 0).
+     */
+    public const function row(int32 $i) : Vec4
+    {
+        if ($i == 0) {
+            return Vec4($this->m00 as float32, $this->m01 as float32, $this->m02 as float32, 0.0f);
+        }
+        if ($i == 1) {
+            return Vec4($this->m10 as float32, $this->m11 as float32, $this->m12 as float32, 0.0f);
+        }
+        return Vec4($this->m20 as float32, $this->m21 as float32, $this->m22 as float32, 0.0f);
+    }
+}
+
+operator (ColorMatrix $a) * (ColorMatrix $b) : ColorMatrix
+{
+    return ColorMatrix(
+        $a->m00 * $b->m00 + $a->m01 * $b->m10 + $a->m02 * $b->m20,
+        $a->m00 * $b->m01 + $a->m01 * $b->m11 + $a->m02 * $b->m21,
+        $a->m00 * $b->m02 + $a->m01 * $b->m12 + $a->m02 * $b->m22,
+        $a->m10 * $b->m00 + $a->m11 * $b->m10 + $a->m12 * $b->m20,
+        $a->m10 * $b->m01 + $a->m11 * $b->m11 + $a->m12 * $b->m21,
+        $a->m10 * $b->m02 + $a->m11 * $b->m12 + $a->m12 * $b->m22,
+        $a->m20 * $b->m00 + $a->m21 * $b->m10 + $a->m22 * $b->m20,
+        $a->m20 * $b->m01 + $a->m21 * $b->m11 + $a->m22 * $b->m21,
+        $a->m20 * $b->m02 + $a->m21 * $b->m12 + $a->m22 * $b->m22
+    );
+}
+
+operator (ColorMatrix $m) * (ColorVector $v) : ColorVector
+{
+    return ColorVector(
+        $m->m00 * $v->x + $m->m01 * $v->y + $m->m02 * $v->z,
+        $m->m10 * $v->x + $m->m11 * $v->y + $m->m12 * $v->z,
+        $m->m20 * $v->x + $m->m21 * $v->y + $m->m22 * $v->z
+    );
+}
+
+/**
+ * A CIE xy chromaticity.
+ */
+public struct Chromaticity
+{
+    public float64 $x;
+    public float64 $y;
+
+    public constructor(float64 $x, float64 $y)
+    {
+        $this->x = $x;
+        $this->y = $y;
+    }
+
+    /**
+     * XYZ at luminance 1.
+     */
+    public const function xyz() : ColorVector
+    {
+        return ColorVector($this->x / $this->y, 1.0, (1.0 - $this->x - $this->y) / $this->y);
+    }
+}
+
+/**
+ * An RGB colour space: three primaries and the white that equal channels make.
+ */
+public struct Gamut
+{
+    public Chromaticity $red;
+    public Chromaticity $green;
+    public Chromaticity $blue;
+    public Chromaticity $white;
+
+    public constructor(Chromaticity $red, Chromaticity $green, Chromaticity $blue, Chromaticity $white)
+    {
+        $this->red = $red;
+        $this->green = $green;
+        $this->blue = $blue;
+        $this->white = $white;
+    }
+
+    /**
+     * Linear RGB in this gamut to CIE XYZ: the primaries scaled so (1, 1, 1) lands on the white
+     * at luminance 1.
+     */
+    public const function toXyz() : ColorMatrix
+    {
+        ColorMatrix $primaries = ColorMatrix(columns: $this->red->xyz(), $this->green->xyz(), $this->blue->xyz());
+        ColorVector $scale = $primaries->inverse() * $this->white->xyz();
+        return $primaries * ColorMatrix(diagonal: $scale);
+    }
+}
+
+/**
+ * CIE standard illuminant D65, the white of Rec.709 and of the tone-map gamut.
+ */
+public function whiteD65() : Chromaticity
+{
+    return Chromaticity(0.3127, 0.3290);
+}
+
+/**
+ * Rec.709 / sRGB primaries: the gamut the scene is lit in and the display shows.
+ */
+public function gamutRec709() : Gamut
+{
+    return Gamut(Chromaticity(0.64, 0.33), Chromaticity(0.30, 0.60), Chromaticity(0.15, 0.06), whiteD65());
+}
+
+/**
+ * ACES AP1 (ACEScg) primaries with the red primary's x moved to `$redX` (AP1 has 0.713) and a
+ * D65 white. A per-channel curve in plain AP1 turns saturated reds and oranges yellow; the
+ * wider red keeps them red while the gamut still pulls bright saturated colour towards white
+ * instead of towards the corners of the RGB cube.
+ */
+public function gamutToneMap(float64 $redX) : Gamut
+{
+    return Gamut(Chromaticity($redX, 0.293), Chromaticity(0.165, 0.830), Chromaticity(0.128, 0.044), whiteD65());
+}
+
+/**
+ * XYZ to Bradford cone response.
+ */
+public function bradford() : ColorMatrix
+{
+    return ColorMatrix(
+        0.8951, 0.2664, -0.1614,
+        -0.7502, 1.7135, 0.0367,
+        0.0389, -0.0685, 1.0296
+    );
+}
+
+/**
+ * Von Kries adaptation in Bradford cone space, in XYZ: a surface that shows `$from` comes out
+ * as `$to`. Both are XYZ; only their chromaticity matters, the luminance is kept.
+ */
+public function chromaticAdaptation(ColorVector $from, ColorVector $to) : ColorMatrix
+{
+    ColorMatrix $cone = bradford();
+    ColorVector $src = $cone * ColorVector($from->x / $from->y, 1.0, $from->z / $from->y);
+    ColorVector $dst = $cone * ColorVector($to->x / $to->y, 1.0, $to->z / $to->y);
+    ColorMatrix $scale = ColorMatrix(diagonal: ColorVector($dst->x / $src->x, $dst->y / $src->y, $dst->z / $src->z));
+    return $cone->inverse() * $scale * $cone;
+}

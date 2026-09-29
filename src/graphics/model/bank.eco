@@ -45,6 +45,13 @@ public class MaterialGpu
      */
     public bool $parallax;
 
+    /**
+     * Which depth-only bucket the GPU-driven views draw this material's clusters in: -1 casts
+     * no shadow, 0 is the one opaque bucket every material without an alpha cutoff shares, and
+     * each alpha-tested material has a bucket of its own so its maps bind. Set by the bank.
+     */
+    public int32 $shadowBucket;
+
     public constructor(
         int32 $index,
         Material $material,
@@ -75,6 +82,7 @@ public class MaterialGpu
         $this->sampler = $sampler;
         $this->params = $params;
         $this->doubleSided = !$material->backfaceCull;
+        $this->shadowBucket = -1;
     }
 
     /**
@@ -115,6 +123,16 @@ public class ModelBank
     private Texture? $flatNormal;
     private Sampler? $sampler;
 
+    /**
+     * Every loaded model's depth form, for the GPU-driven views.
+     */
+    public MeshArena $arena;
+
+    /**
+     * The material index of alpha-tested shadow bucket `k` at `k - 1`.
+     */
+    private array<int32> $alphaBuckets;
+
     public constructor(Device $device, Assets $assets)
     {
         $this->device = $device;
@@ -126,6 +144,8 @@ public class ModelBank
         $this->white = null;
         $this->flatNormal = null;
         $this->sampler = null;
+        $this->arena = MeshArena($device);
+        $this->alphaBuckets = array<int32>();
     }
 
     /**
@@ -144,6 +164,7 @@ public class ModelBank
             $this->materialGpu($material);
         }
 
+        $this->arenaAdd($model);
         $this->models[$id] = $model;
         return .ok($model);
     }
@@ -175,6 +196,7 @@ public class ModelBank
             $this->materialGpu($material);
         }
 
+        $this->arenaAdd($model);
         $this->models[$model->id] = $model;
         $this->adopted[$model->id] = true;
     }
@@ -192,6 +214,13 @@ public class ModelBank
         Model $model = $this->models[$id];
         $this->models->remove($id);
         $this->adopted->remove($id);
+        ArenaModel? $placed = $model->arena;
+        if ($placed != null) {
+            ArenaModel $held = guard $placed;
+            $this->arena->remove($held);
+            $model->arena = null;
+        }
+
         $model->destroy();
     }
 
@@ -222,6 +251,23 @@ public class ModelBank
     public const function materialCount() : int32
     {
         return $this->byIndex->count() as int32;
+    }
+
+    /**
+     * Shadow buckets in use: the opaque one plus one per alpha-tested material.
+     */
+    public const function shadowBuckets() : int32
+    {
+        return 1 + ($this->alphaBuckets->count() as int32);
+    }
+
+    /**
+     * The material alpha-tested bucket `$bucket` (1 or more) binds.
+     */
+    public const function bucketMaterial(int32 $bucket) : MaterialGpu
+    {
+        assert($bucket >= 1 && ($bucket as usize) <= $this->alphaBuckets->count(), 'bank: shadow bucket');
+        return $this->byIndex[$this->alphaBuckets[($bucket - 1) as usize] as usize];
     }
 
     public const function modelCount() : int32
@@ -296,6 +342,8 @@ public class ModelBank
 
         $this->materials->clear();
         $this->byIndex->clear();
+        $this->alphaBuckets->clear();
+        $this->arena->clear();
         foreach ($ids as $id) {
             $this->assets->forget($id);
         }
@@ -351,9 +399,43 @@ public class ModelBank
             $this->modelSampler(),
             $params
         );
+        if ($material->castShadow) {
+            $gpu->shadowBucket = 0;
+            // shadow.frag only discards with a cutoff, so every other caster shares one bucket
+            if ($material->alphaCutoff > 0.0f) {
+                $this->alphaBuckets[] = $index;
+                $gpu->shadowBucket = $this->alphaBuckets->count() as int32;
+            }
+        }
+
         $this->materials[$material->id] = $gpu;
         $this->byIndex[] = $gpu;
         return $gpu;
+    }
+
+    /**
+     * Move a model's depth form into the arena, its clusters tagged with their slot's bucket.
+     */
+    private function arenaAdd(Model $model) : void
+    {
+        ModelDepth $depth = guard $model->depth else {
+            return;
+        }
+        array<uint32> $buckets = array<uint32>();
+        int32 $slot = 0;
+        while (($slot as usize) < $model->materials->count()) {
+            MaterialGpu $m = $this->materialOf($model, $slot);
+            if ($m->shadowBucket < 0) {
+                $buckets[] = SCENE_BUCKET_NONE;
+            } else {
+                $buckets[] = $m->shadowBucket as uint32;
+            }
+
+            $slot = $slot + 1;
+        }
+
+        $model->arena = $this->arena->add($depth, $buckets, $model->skinned());
+        $model->depth = null;
     }
 
     /**

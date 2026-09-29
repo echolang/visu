@@ -4,9 +4,11 @@
 
 use std::math;
 use visu::graphics::{
-    DirectionalLight, FogUniforms, HeightFog, Sky, fogSunTint, fogTransmittance, fogUniforms
+    AERIAL_SLICE_WIDTH, AERIAL_SLICES, AERIAL_WIDTH, AerialPerspective, DirectionalLight, FOG_SKY_HEIGHT,
+    FogLighting, FogUniforms, HeightFog, Moon, Sky, fogAmbient, fogLighting, fogSkyDir, fogSkyFloor, fogSkyUv,
+    fogSunTint, fogTransmittance, fogUniforms, skyDomeRadiance
 };
-use visu::math::Vec3;
+use visu::math::{Vec2, Vec3, equal};
 
 test fog_defaults_off_and_equal
 {
@@ -23,7 +25,7 @@ test fog_defaults_off_and_equal
 
 test fog_uniforms_pack
 {
-    assert(mem::size<FogUniforms>() == 144, 'std140 size');
+    assert(mem::size<FogUniforms>() == 272, 'std140 size');
     HeightFog $fog = HeightFog();
     $fog->enabled = true;
     $fog->fromSky = false;
@@ -31,7 +33,11 @@ test fog_uniforms_pack
     $fog->heightFalloff = 0.008f;
     $fog->height = 0.0f;
     Vec3 $camera = Vec3(0.0f, 50.0f, 0.0f);
-    FogUniforms $u = fogUniforms($fog, $camera, Vec3(1.0f, 1.0f, 1.0f), 8.0f, 4.0f);
+    FogLighting $lit = FogLighting();
+    $lit->legacy = true;
+    $lit->legacySun = Vec3(1.0f, 1.0f, 1.0f);
+    $lit->legacyFloor = Vec3(0.1f, 0.2f, 0.3f);
+    FogUniforms $u = fogUniforms($fog, $camera, $lit);
     assert($u->density->w == 1.0f, 'enabled');
     assert($u->color->w == 0.0f, 'fromSky off');
     float32 $d0 = 0.00012f * math::exp(-0.4f);
@@ -42,12 +48,107 @@ test fog_uniforms_pack
     }
 
     assert($delta < 0.0000001f, 'D0 at camera');
-    assert($u->samples->x == 8.0f, 'view samples');
-    assert($u->samples->y == 4.0f, 'light samples');
+    assert($u->floor->x == 0.0f && $u->floor->z == 0.0f, 'no floor for a constant colour');
     assert($u->sun->x == 0.4f, 'sun tint');
     assert($u->sun->w == 8.0f, 'exponent');
     assert($u->shafts->w == 0.0f, 'no shafts unless a god-ray frame binds them');
     assert($u->shaftLight->w == 0.0f, 'shaft light unset');
+    assert($u->model->w == 0.0f, 'the legacy fog');
+    $fog->fromSky = true;
+    $lit->legacyScale = Vec3(0.5f, 0.5f, 0.5f);
+    FogUniforms $sky = fogUniforms($fog, $camera, $lit);
+    assert($sky->color->w == 1.0f, 'fromSky reads the table');
+    assert($sky->color->x == 1.0f, 'the sky colour is not scaled by fogLight');
+    assert($sky->floor->y == 0.2f, 'the floor rides along');
+}
+
+test fog_lighting_is_the_frame_lights
+{
+    Sky $sky = Sky();
+    $sky->direction = Vec3(0.0f, -1.0f, 0.0f);
+    DirectionalLight $sun = $sky->sunLight(300.0f);
+    Moon $moon = Moon();
+    $moon->enabled = false;
+    AerialPerspective $aerial = AerialPerspective();
+    Vec3 $ambient = Vec3(0.1f, 0.2f, 0.3f);
+    FogLighting $lit = fogLighting($sun, $moon, $sky, $aerial, $ambient, false);
+    assert(equal($lit->toSun->y, 1.0f), 'towards the sun');
+    assert(equal($lit->sun->x, $sun->color->x * $sun->intensity), 'the sun the light pass shades with');
+    assert($lit->moon->x == 0.0f && $lit->toMoon->y == -1.0f, 'no moon');
+    assert($lit->aerialScale == 1.0f, 'the aerial perspective on');
+    HeightFog $fog = HeightFog();
+    $fog->enabled = true;
+    FogUniforms $u = fogUniforms($fog, Vec3(0.0f, 0.0f, 0.0f), $lit);
+    assert($u->model->w == 1.0f, 'the lit medium');
+    assert($u->ambient->z == 0.3f, 'the ambient');
+    assert($u->aerial->w == 1.0f, 'the distance scale');
+    assert($u->moonLight->w == 0.0f, 'the moon casts nothing');
+    FogLighting $old = fogLighting($sun, $moon, $sky, $aerial, $ambient, true);
+    assert($old->aerialScale == 0.0f, 'the legacy fog has no aerial perspective');
+    $aerial->enabled = false;
+    FogLighting $off = fogLighting($sun, $moon, $sky, $aerial, $ambient, false);
+    assert($off->aerialScale == 0.0f, 'off');
+}
+
+test fog_sky_dome_is_blue_by_day_and_dark_by_night
+{
+    Sky $sky = Sky();
+    $sky->direction = Vec3(0.0f, -1.0f, 0.0f);
+    Vec3 $noon = skyDomeRadiance($sky, 600.0f);
+    assert($noon->z > $noon->x, 'the noon sky is blue');
+    assert($noon->z > 0.0f, 'and lit');
+    $sky->direction = Vec3(0.0f, 1.0f, 0.0f);
+    Vec3 $night = skyDomeRadiance($sky, 600.0f);
+    assert($night->z < $noon->z * 0.001f, 'the sun is under the planet');
+}
+
+test fog_ambient_greys_the_ground
+{
+    Sky $sky = Sky();
+    $sky->direction = Vec3(0.0f, -1.0f, 0.0f);
+    DirectionalLight $sun = $sky->sunLight(300.0f);
+    Moon $moon = Moon();
+    $moon->enabled = false;
+    Vec3 $dome = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 $ambient = fogAmbient($dome, $sun, $moon, $sky);
+    // a white sun off brown ground stays white: only the ground's brightness counts
+    float32 $sunTint = $sun->color->x / $sun->color->z;
+    float32 $fogTint = $ambient->x / $ambient->z;
+    assert(equal($sunTint, $fogTint), 'the ground adds no colour');
+}
+
+test aerial_atlas_holds_every_slice
+{
+    assert(AERIAL_SLICE_WIDTH * AERIAL_SLICES == AERIAL_WIDTH, 'slices side by side');
+}
+
+test fog_sky_floor_is_starlight_at_night
+{
+    Sky $sky = Sky();
+    Moon $moon = Moon();
+    $moon->enabled = false;
+    Vec3 $off = fogSkyFloor($moon, $sky);
+    assert($off->x == 0.0f && $off->z == 0.0f, 'a disabled moon adds nothing');
+    $moon->enabled = true;
+    $sky->direction = Vec3(0.0f, -1.0f, 0.0f);
+    Vec3 $noon = fogSkyFloor($moon, $sky);
+    assert($noon->z == 0.0f, 'nothing by day');
+    $sky->direction = Vec3(0.0f, 1.0f, 0.0f);
+    Vec3 $night = fogSkyFloor($moon, $sky);
+    assert(equal($night->z, $moon->starlight->z * 1.5f), 'lifted starlight at deep night');
+}
+
+test fog_sky_uv_round_trips
+{
+    Vec2 $mid = Vec2(0.3f, 0.6f);
+    Vec2 $back = fogSkyUv(fogSkyDir($mid));
+    assert(equal($back->x, $mid->x) && equal($back->y, $mid->y), 'texel direction maps back');
+    Vec2 $horizon = fogSkyUv(Vec3(1.0f, 0.0f, 0.0f));
+    assert(equal($horizon->y, 0.5f / (FOG_SKY_HEIGHT as float32)), 'the horizon is the first row');
+    Vec2 $zenith = fogSkyUv(Vec3(0.0f, 1.0f, 0.0f));
+    assert(equal($zenith->y, 1.0f - 0.5f / (FOG_SKY_HEIGHT as float32)), 'the zenith the last');
+    Vec2 $east = fogSkyUv(Vec3(1.0f, 0.2f, 0.0f));
+    assert(equal($east->x, 0.5f), '+X is the middle column');
 }
 
 test fog_transmittance_one_when_disabled

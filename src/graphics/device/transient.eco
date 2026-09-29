@@ -26,3 +26,33 @@ public function transientOf<T>(Device $device, const T& $value) : TransientSlice
     mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $n);
     return $slice;
 }
+
+/**
+ * Copy `$rows` into this frame's ring at storage alignment, padded with zero rows to at least
+ * `$minRows`, so a kernel's binding holds even when the list is empty.
+ */
+public function transientRows<T>(Device $device, const array<T>& $rows, usize $minRows) : TransientSlice
+{
+    usize $n = $rows->count();
+    usize $count = $n;
+    if ($count < $minRows) {
+        $count = $minRows;
+    }
+
+    uint64 $size = mem::size<T>() as uint64;
+    uint64 $bytes = ($count as uint64) * $size;
+    TransientSlice $slice = $device->allocTransient($bytes, $device->limits->storageAlign);
+    uint64 $used = ($n as uint64) * $size;
+    if ($n > 0) {
+        ptr<const T> $src = ptr<const T>(&$rows[0]);
+        mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $used);
+    }
+
+    if ($used < $bytes) {
+        ptr<uint8> $tail = $slice->data;
+        $tail:$ = $slice->data:$ + ($used as isize);
+        mem::zero<uint8>($tail, $bytes - $used);
+    }
+
+    return $slice;
+}

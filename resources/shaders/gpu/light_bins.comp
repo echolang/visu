@@ -1,0 +1,118 @@
+#version 450
+
+// visu::graphics::LightCull, stage two, over the sorted keys: each visible light marks the
+// z-bins its depth range spans (the lowest and the highest visible index, the highest stored
+// inverted so one fill clears both) and sets its bit in every screen tile its projected sphere
+// covers. The rect is visu::graphics::pointRect: the tangent cone per axis, the whole screen
+// when the eye is inside the sphere or the sphere reaches behind it. One workgroup per visible
+// light, its threads striding the rect's tiles, so a near light's thousand tiles never sit on
+// one thread
+layout(local_size_x = 64) in;
+
+#include "visu/lightcull.glsl"
+
+layout(std430, set = 2, binding = 0) readonly buffer LightTableBuffer {
+    LightGpu lights[];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer Keys {
+    uint keys[];
+};
+
+layout(std430, set = 2, binding = 2) buffer Counters {
+    uint counters[];
+};
+
+layout(std430, set = 2, binding = 3) buffer ZBins {
+    uint zbins[];
+};
+
+layout(std430, set = 2, binding = 4) buffer Tiles {
+    uint tiles[];
+};
+
+// ndc extents of the tangent cone in one view axis; false when the cone leaves the view
+bool axis_ndc(float axis, float depth, float radius, float proj, out vec2 ndc)
+{
+    ndc = vec2(-1.0, 1.0);
+    if (depth <= 0.0) {
+        return false;
+    }
+
+    float d2 = axis * axis + depth * depth;
+    float r2 = radius * radius;
+    if (d2 <= r2) {
+        return false;
+    }
+
+    float tanA = radius / sqrt(d2 - r2);
+    float tanP = axis / depth;
+    float lo = 1.0 + tanP * tanA;
+    float hi = 1.0 - tanP * tanA;
+    if (lo <= 0.0001 || hi <= 0.0001) {
+        return false;
+    }
+
+    ndc = vec2(((tanP - tanA) / lo) * proj, ((tanP + tanA) / hi) * proj);
+    return true;
+}
+
+void main()
+{
+    uint i = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint visible = min(counters[LIGHT_COUNTER_VISIBLE], u_counts.y);
+    if (i >= visible) {
+        return;
+    }
+
+    uint slot = keys[i] & LIGHT_SLOT_MASK;
+    vec4 pr = lights[slot].position_radius;
+    vec3 viewPos = (u_view * vec4(pr.xyz, 1.0)).xyz;
+    float depth = -viewPos.z;
+    if (t == 0u && depth <= u_shadow.x) {
+        atomicMax(counters[LIGHT_COUNTER_SHADOWED], i + 1u);
+    }
+    uint s0 = light_zslice(depth - pr.w, u_zparams);
+    uint s1 = light_zslice(depth + pr.w, u_zparams);
+    for (uint s = s0 + t; s <= s1; s += 64u) {
+        atomicMin(zbins[s * 2u], i);
+        atomicMin(zbins[s * 2u + 1u], ~i);
+    }
+
+    float w = u_screen.x;
+    float h = u_screen.y;
+    vec4 rect = vec4(0.0, 0.0, w, h);
+    vec3 forward = -vec3(u_view[0].z, u_view[1].z, u_view[2].z);
+    vec2 xs;
+    vec2 ys;
+    bool inside = length(pr.xyz - u_eye.xyz) <= pr.w || dot(pr.xyz - u_eye.xyz, forward) <= pr.w;
+    if (!inside
+        && axis_ndc(viewPos.x, depth, pr.w, u_eye.w, xs)
+        && axis_ndc(viewPos.y, depth, pr.w, u_screen.w, ys)) {
+        float x0 = (xs.x * 0.5 + 0.5) * w;
+        float x1 = (xs.y * 0.5 + 0.5) * w;
+        float y0 = (0.5 - ys.y * 0.5) * h;
+        float y1 = (0.5 - ys.x * 0.5) * h;
+        rect = vec4(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1));
+        rect = clamp(rect, vec4(0.0), vec4(w, h, w, h));
+    }
+
+    float tilePx = u_screen.z;
+    uint tilesX = uint(u_zparams.w + 0.5);
+    uint tilesY = u_counts.w;
+    uint tx0 = min(uint(floor(rect.x / tilePx)), tilesX - 1u);
+    uint ty0 = min(uint(floor(rect.y / tilePx)), tilesY - 1u);
+    uint tx1 = min(uint(ceil(rect.z / tilePx)), tilesX);
+    uint ty1 = min(uint(ceil(rect.w / tilePx)), tilesY);
+    uint word = i >> 5u;
+    uint bit = 1u << (i & 31u);
+    uint words = u_counts.z;
+    uint spanX = tx1 - tx0;
+    uint count = spanX * (ty1 - ty0);
+    for (uint k = t; k < count; k += 64u) {
+        uint tx = tx0 + k % spanX;
+        uint ty = ty0 + k / spanX;
+        atomicOr(tiles[(ty * tilesX + tx) * words + word], bit);
+    }
+}

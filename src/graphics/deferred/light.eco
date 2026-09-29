@@ -1,7 +1,7 @@
 /**
  * Scene lighting the deferred renderer owns. A directional sun and moon, the brighter
- * of them owning the shadow cascades, the night hemisphere ambient, plus the packed
- * point lamps the light pass shades per tile.
+ * of them owning the shadow cascades, and the night hemisphere ambient. Point lights are
+ * GPU table rows culled into clusters (`LightClusterData`); the light pass reads them there.
  */
 
 namespace visu::graphics;
@@ -123,9 +123,9 @@ public struct DirectionalLight
 }
 
 /**
- * Mirrors LightUniforms in resources/shaders/pbr/lightpass.frag at uniform slot 2.
- * std140: the sun block (three vec4s, five mat4s, splits, shadow), then the point
- * head, 64 lamps, 24 face matrices, and the moon block (direction, colour, night ambient).
+ * Mirrors LightUniforms in resources/shaders/pbr/lightpass.frag (and water.frag) at uniform
+ * slot 2. std140: the sun block (three vec4s, five mat4s, splits, shadow), the moon block
+ * (direction, colour, night ambient), then the clustered lights' head, bins and atlas.
  */
 public struct LightUniforms
 {
@@ -153,13 +153,6 @@ public struct LightUniforms
     public Vec4 $shadow;
 
     /**
-     * Point count in x, tile size in y, tiles across in z, index stride in w.
-     */
-    public Vec4 $pointsHead;
-    public PointGpu[64] $points;
-    public Mat4[24] $pointFace;
-
-    /**
      * Moon direction in xyz, intensity in w.
      */
     public Vec4 $moonDirection;
@@ -173,6 +166,23 @@ public struct LightUniforms
      * Night hemisphere ambient from above in rgb, ground bounce share in w.
      */
     public Vec4 $nightAmbient;
+
+    /**
+     * Clustered lights: anything culled, tile pixels, tiles across, mask words. Zero (no
+     * `LightClusterData` this frame) skips every point-light read.
+     */
+    public Vec4 $clusterHead;
+
+    /**
+     * Clustered lights: bin near, slices per log2 metre, slices, flicker seconds.
+     */
+    public Vec4 $clusterZ;
+
+    /**
+     * Clustered lights' shadow atlas (`ShadowAtlas.lookup`): 1 in x when bound, the mip bias
+     * in y, 1 in z for the debug paint, the shadow distance in w.
+     */
+    public Vec4 $vsm;
 
     public constructor(Vec4 $sunDirection, Vec4 $sunColor, Vec4 $ibl)
     {
@@ -189,54 +199,12 @@ public struct LightUniforms
         $this->lightSpace = $space;
         $this->splits = Vec4(0.0f);
         $this->shadow = Vec4(0.0f);
-        $this->pointsHead = Vec4(0.0f);
-        PointGpu $zero = PointGpu(Vec4(0.0f), Vec4(0.0f), Vec4(0.0f, -1.0f, 0.0f, 0.0f));
-        PointGpu[64] $points;
-        $i = 0;
-        while ($i < POINT_LIGHT_MAX) {
-            $points[$i] = $zero;
-            $i = $i + 1;
-        }
-
-        $this->points = $points;
-        Mat4[24] $faces;
-        $i = 0;
-        while ($i < POINT_SHADOW_LAYERS) {
-            $faces[$i] = Mat4();
-            $i = $i + 1;
-        }
-
-        $this->pointFace = $faces;
         $this->moonDirection = Vec4(0.0f, -1.0f, 0.0f, 0.0f);
         $this->moonColor = Vec4(0.0f);
         $this->nightAmbient = Vec4(0.0f);
-    }
-}
-
-/**
- * Copy a packed lamp list onto `$u`. Count zero leaves the head at zero so the
- * light pass skips the tile lookup.
- */
-public function packPointUniforms(LightUniforms& $u, PointLightFrame $frame) : void
-{
-    PointPack $pack = $frame->pack;
-    $u->pointsHead = Vec4(
-        $pack->count as float32,
-        POINT_TILE as float32,
-        $frame->tilesX as float32,
-        POINT_TILE_STRIDE as float32
-    );
-    int32 $i = 0;
-    while ($i < $pack->count) {
-        $u->points[$i] = $pack->gpu[$i];
-        $i = $i + 1;
-    }
-
-    int32 $n = $pack->shadows * CUBE_FACE_COUNT;
-    $i = 0;
-    while ($i < $n) {
-        $u->pointFace[$i] = $frame->space[$i];
-        $i = $i + 1;
+        $this->clusterHead = Vec4(0.0f);
+        $this->clusterZ = Vec4(1.0f);
+        $this->vsm = Vec4(0.0f);
     }
 }
 

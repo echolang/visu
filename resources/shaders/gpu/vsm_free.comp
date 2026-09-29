@@ -1,0 +1,43 @@
+#version 450
+
+// visu::graphics::ShadowAtlas, the pool: every physical page no request kept this frame is a
+// candidate, listed never used first, then stale, then last frame's
+layout(local_size_x = 64) in;
+
+#include "visu/vsmcull.glsl"
+
+layout(std430, set = 2, binding = 0) readonly buffer Physical {
+    uvec2 phys[];
+};
+
+layout(std430, set = 2, binding = 1) writeonly buffer Candidates {
+    uint candidates[];
+};
+
+layout(std430, set = 2, binding = 2) buffer State {
+    uint state[];
+};
+
+void main()
+{
+    uint p = gl_GlobalInvocationID.x;
+    if (p >= VSM_PAGES) {
+        return;
+    }
+
+    uvec2 page = phys[p];
+    uint frame = u_vsm_counts.y;
+    if (page.x != VSM_NONE && page.y == frame) {
+        return;
+    }
+
+    uint list = 2u;
+    if (page.x == VSM_NONE) {
+        list = 0u;
+    } else if (page.y == VSM_NONE || frame - page.y > VSM_STALE_FRAMES) {
+        list = 1u;
+    }
+
+    uint at = atomicAdd(state[VSM_STATE_CANDIDATES + list], 1u);
+    candidates[list * VSM_PAGES + at] = p;
+}

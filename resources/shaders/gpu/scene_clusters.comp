@@ -1,0 +1,123 @@
+#version 450
+
+// visu::graphics::GpuScene, stage two: one workgroup per pair walks its clusters, keeps the
+// ones whose sphere meets the view, and sorts them into segments (the view's pass times the
+// cluster's shadow bucket). Mode 0 counts, mode 1 writes the draw items into the ranges the
+// scan handed out. A group sums its clusters per bucket in shared memory first, so each
+// segment counter sees one atomic per group
+layout(local_size_x = 64) in;
+
+#include "visu/scenecull.glsl"
+
+layout(std430, set = 2, binding = 0) readonly buffer Pairs {
+    uvec4 pairs[];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer Clusters {
+    SceneCluster clusters[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer Statics {
+    SceneInstance statics[];
+};
+
+layout(std430, set = 2, binding = 3) readonly buffer Movers {
+    SceneInstance movers[];
+};
+
+layout(std430, set = 2, binding = 4) readonly buffer Views {
+    SceneView views[];
+};
+
+layout(std430, set = 2, binding = 5) buffer Counters {
+    uint counters[];
+};
+
+layout(std430, set = 2, binding = 6) writeonly buffer Items {
+    uvec4 items[];
+};
+
+shared uint s_count[SCENE_BUCKETS_MAX];
+shared uint s_base[SCENE_BUCKETS_MAX];
+
+bool cluster_kept(SceneCluster c, SceneView view, mat4 world, float scale, bool skinned)
+{
+    uint bucket = c.range.z;
+    if (bucket == SCENE_BUCKET_NONE || bucket >= u_rows.w) {
+        return false;
+    }
+
+    // a posed skin has left its bind-pose spheres; the instance box already passed
+    if (skinned) {
+        return true;
+    }
+
+    vec3 centre = (world * vec4(c.sphere.xyz, 1.0)).xyz;
+    return scene_sphere_visible(view, centre, c.sphere.w * scale * 1.001 + 0.001);
+}
+
+void main()
+{
+    uint p = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint buckets = u_rows.w;
+    for (uint b = t; b < buckets; b += 64u) {
+        s_count[b] = 0u;
+    }
+    barrier();
+
+    uvec4 pair = pairs[p];
+    SceneInstance inst;
+    if ((pair.x & SCENE_MOVER_BIT) != 0u) {
+        inst = movers[pair.x & ~SCENE_MOVER_BIT];
+    } else {
+        inst = statics[pair.x];
+    }
+
+    SceneView view = views[pair.y];
+    uint pass = view.meta.x;
+    mat4 world = inst.world;
+    float scale = max(length(world[0].xyz), max(length(world[1].xyz), length(world[2].xyz)));
+    bool skinned = (inst.meta.y & SCENE_INSTANCE_SKINNED) != 0u;
+
+    for (uint i = t; i < pair.w; i += 64u) {
+        SceneCluster c = clusters[pair.z + i];
+        if (cluster_kept(c, view, world, scale, skinned)) {
+            atomicAdd(s_count[c.range.z], 1u);
+        }
+    }
+    barrier();
+
+    if (u_limits.z == 0u) {
+        for (uint b = t; b < buckets; b += 64u) {
+            uint n = s_count[b];
+            if (n > 0u) {
+                atomicAdd(counters[SCENE_COUNT_BASE + pass * buckets + b], n);
+            }
+        }
+        return;
+    }
+
+    for (uint b = t; b < buckets; b += 64u) {
+        uint n = s_count[b];
+        if (n > 0u) {
+            s_base[b] = atomicAdd(counters[SCENE_CURSOR_BASE + pass * buckets + b], n);
+        }
+        s_count[b] = 0u;
+    }
+    barrier();
+
+    for (uint i = t; i < pair.w; i += 64u) {
+        uint ci = pair.z + i;
+        SceneCluster c = clusters[ci];
+        if (!cluster_kept(c, view, world, scale, skinned)) {
+            continue;
+        }
+
+        uint b = c.range.z;
+        uint slot = s_base[b] + atomicAdd(s_count[b], 1u);
+        if (slot < counters[SCENE_END_BASE + pass * buckets + b]) {
+            items[slot] = uvec4(ci, pair.x, pair.y, 0u);
+        }
+    }
+}

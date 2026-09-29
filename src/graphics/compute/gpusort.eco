@@ -1,0 +1,110 @@
+/**
+ * Ascending sort of uint32 keys on the GPU, a bitonic network: blocks of 1024 keys run in
+ * shared memory (`bitonic_local`), and the steps too wide for a block run one dispatch each
+ * (`bitonic_global`). Every key in the buffer is sorted, so a caller whose live count is only
+ * known on the GPU fills the tail with 0xFFFFFFFF first and the live keys come out in front.
+ * Unique keys sort to one order, so a frame sorts the same way every run.
+ */
+
+namespace visu::graphics;
+
+/**
+ * Smallest key count `GpuSort` takes: one shared-memory block.
+ */
+public const uint32 GPU_SORT_BLOCK = 1024;
+
+/**
+ * One step of the network as the kernels read it (std140 uvec4). `bitonic_global` reads run
+ * length k, pair distance j and the key count; `bitonic_local` reads k and j as the first and
+ * the last run length it sorts.
+ */
+internal struct GpuSortParams
+{
+    public uint32 $k;
+    public uint32 $j;
+    public uint32 $count;
+    public uint32 $pad = 0;
+}
+
+public class GpuSort
+{
+    /**
+     * Keys per sort: a power of two, at least `GPU_SORT_BLOCK`.
+     */
+    public const uint32 $capacity;
+    private ComputeProgram $local;
+    private ComputeProgram $global;
+
+    private constructor(uint32 $capacity, ComputeProgram $local, ComputeProgram $global)
+    {
+        $this->capacity = $capacity;
+        $this->local = $local;
+        $this->global = $global;
+    }
+
+    /**
+     * The sort for `$capacity` keys on `$device`, rounded up to a power of two of at least one
+     * block. Links the two kernels on first use.
+     */
+    public static function load(Device $device, uint32 $capacity) : result<GpuSort, ShaderError>
+    {
+        ComputeProgram $local = guard $device->gpuShaders->kernel($device, 'bitonic_local') else ($e) {
+            return .error($e);
+        }
+        ComputeProgram $global = guard $device->gpuShaders->kernel($device, 'bitonic_global') else ($e) {
+            return .error($e);
+        }
+        return .ok(GpuSort(gpuSortCapacity($capacity), $local, $global));
+    }
+
+    /**
+     * Record the whole network into `$enc` over the first `capacity` keys of `$keys` (bound at
+     * storage slot 0). The dispatch count is fixed by the capacity: about log2(n)^2 / 2 minus
+     * the steps a block absorbs, 15 at 16k keys.
+     */
+    public function sort(ComputeEncoder $enc, Buffer $keys, uint64 $offset = 0) : void
+    {
+        uint32 $n = $this->capacity;
+        uint32 $blocks = $n / GPU_SORT_BLOCK;
+        uint32 $block = GPU_SORT_BLOCK;
+        $enc->setKernel($this->local);
+        $enc->bindStorage(0, $keys, $offset);
+        $enc->upload(GpuSortParams($k: 2, $j: $block, $count: $n), slot: 0);
+        $enc->dispatch($blocks * 512);
+        uint32 $k = $block * 2;
+
+        while ($k <= $n) {
+            uint32 $j = $k / 2;
+            $enc->setKernel($this->global);
+            $enc->bindStorage(0, $keys, $offset);
+
+            while ($j >= $block) {
+                $enc->barrier();
+                $enc->upload(GpuSortParams($k: $k, $j: $j, $count: $n), slot: 0);
+                $enc->dispatch($n / 2);
+                $j = $j / 2;
+            }
+
+            // the rest of run k fits a block: merge from j = 512 down in shared memory
+            $enc->barrier();
+            $enc->setKernel($this->local);
+            $enc->bindStorage(0, $keys, $offset);
+            $enc->upload(GpuSortParams($k: $k, $j: $k, $count: $n), slot: 0);
+            $enc->dispatch($blocks * 512);
+            $k = $k * 2;
+        }
+    }
+}
+
+/**
+ * `$want` rounded up to a power of two, at least one block.
+ */
+public function gpuSortCapacity(uint32 $want) : uint32
+{
+    uint32 $n = GPU_SORT_BLOCK;
+    while ($n < $want) {
+        $n = $n * 2;
+    }
+
+    return $n;
+}

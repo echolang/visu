@@ -1,0 +1,94 @@
+/**
+ * GpuSort orders keys it never showed the CPU: 3000 unique keys in a 4096 buffer whose tail
+ * is 0xFFFFFFFF come back ascending with the tail still last, and the same set of keys.
+ */
+
+use visu::graphics::{
+    BUFFER_STORAGE, Buffer, CallbackPass, ComputeEncoder, Device, Frame, GpuSort, IoSink,
+    Pipeline, PipelineError, RenderContext
+};
+
+public function checkGpuSort(GpuContext $gpu) : void
+{
+    Device $device = $gpu->device;
+    GpuSort $sort = guard GpuSort::load($device, 4096) else ($e) {
+        die($e->message());
+    }
+    assert($sort->capacity == 4096, 'sort: capacity is the power of two asked for');
+    uint32 $live = 3000;
+    array<uint32> $keys = array<uint32>();
+    $keys->reserve(4096);
+    uint64 $sum = 0;
+    uint32 $i = 0;
+
+    while ($i < 4096) {
+        if ($i < $live) {
+            // an odd multiplier is a bijection mod 2^32, so every key is unique
+            uint32 $k = (($i as uint64) * (2654435761 as uint64)) as uint32;
+            if ($k == 0xFFFFFFFF) {
+                $k = 7;
+            }
+            $keys[] = $k;
+            $sum = $sum + ($k as uint64);
+        } else {
+            $keys[] = 0xFFFFFFFF;
+        }
+        $i = $i + 1;
+    }
+
+    ptr<const uint32> $src = $keys->data();
+    Buffer $buf = Buffer($device, BUFFER_STORAGE, ptr<const uint8>($src:$), (4096 * 4) as uint64);
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        $p->add(CallbackPass(
+            'sort',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+            },
+            execute: function(RenderContext $ctx) : status<PipelineError> {
+                ComputeEncoder $enc = $ctx->beginCompute();
+                $sort->sort($enc, $buf);
+                $enc->endCompute();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $bytes = guard $device->readbackBuffer($buf, 0 as uint64, (4096 * 4) as uint64) else ($e) {
+        die($e->message());
+    }
+    $buf->destroy();
+    uint64 $got = 0;
+    uint32 $prev = 0;
+    $i = 0;
+
+    while ($i < 4096) {
+        usize $at = ($i * 4) as usize;
+        uint32 $k = ($bytes[$at] as uint32)
+            | (($bytes[$at + 1] as uint32) << 8)
+            | (($bytes[$at + 2] as uint32) << 16)
+            | (($bytes[$at + 3] as uint32) << 24);
+        if ($i < $live) {
+            assert($k != 0xFFFFFFFF, 'sort: live keys come first');
+            if ($i > 0) {
+                assert($k > $prev, 'sort: keys ascend');
+            }
+            $got = $got + ($k as uint64);
+        } else {
+            assert($k == 0xFFFFFFFF, 'sort: the padding stays last');
+        }
+        $prev = $k;
+        $i = $i + 1;
+    }
+
+    assert($got == $sum, 'sort: the same keys come back');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_sort
+{
+    GpuContext $gpu = gpuHidden('sort');
+    checkGpuSort($gpu);
+    $gpu->end();
+}
+#[end]

@@ -81,6 +81,17 @@ public class ComputeEncoder : ComputeEncoderProtocol
         $this->enc->setBuffer($buf, $offset as uint32, index: METAL_STORAGE_BASE + $slot);
     }
 
+    public function bindStorage(uint32 $slot, transient: TransientSlice $slice) : void
+    {
+        assert(!$this->ended, 'bindStorage after endCompute');
+        assert($slot < STORAGE_SLOTS, 'storage slot');
+        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
+        mtl::Buffer $ring = guard $this->device->slots[$this->device->slot]->ring->buffer else {
+            die('metal: uniform ring is empty');
+        }
+        $this->enc->setBuffer($ring, $slice->offset as uint32, index: METAL_STORAGE_BASE + $slot);
+    }
+
     public function dispatch(uint32 $x, uint32 $y = 1, uint32 $z = 1) : void
     {
         assert(!$this->ended, 'dispatch after endCompute');
@@ -96,6 +107,29 @@ public class ComputeEncoder : ComputeEncoderProtocol
             mtl::Size($x as usize, $y as usize, $z as usize),
             mtl::Size($g->x as usize, $g->y as usize, $g->z as usize)
         );
+    }
+
+    public function dispatchIndirect(Buffer $arguments, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'dispatchIndirect after endCompute');
+        ComputeProgram $kernel = guard $this->kernel else {
+            die('dispatchIndirect before setKernel');
+        }
+        mtl::Buffer $args = guard $arguments->handle->buffer else {
+            die('metal: indirect buffer handle is empty');
+        }
+        WorkgroupSize $g = $kernel->group;
+        $this->enc->dispatchThreadgroups(
+            $args,
+            $offset,
+            mtl::Size($g->x as usize, $g->y as usize, $g->z as usize)
+        );
+    }
+
+    public function barrier() : void
+    {
+        assert(!$this->ended, 'barrier after endCompute');
+        // serial dispatch plus hazard tracking already orders every dispatch here
     }
 
     public function endCompute() : void

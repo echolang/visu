@@ -251,6 +251,19 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->enc->setFragmentBuffer($buf, $offset as uint32, index: $index);
     }
 
+    public function bindStorage(uint32 $slot, transient: TransientSlice $slice) : void
+    {
+        assert(!$this->ended, 'bindStorage after endRender');
+        assert($slot < STORAGE_SLOTS, 'storage slot');
+        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
+        mtl::Buffer $ring = guard $this->device->slots[$this->device->slot]->ring->buffer else {
+            die('metal: uniform ring is empty');
+        }
+        uint32 $index = METAL_STORAGE_BASE + $slot;
+        $this->enc->setVertexBuffer($ring, $slice->offset as uint32, index: $index);
+        $this->enc->setFragmentBuffer($ring, $slice->offset as uint32, index: $index);
+    }
+
     public function tessellateWith(ComputeProgram $kernel, uint32 $patchCount) : void
     {
         assert(!$this->ended, 'tessellateWith after endRender');
@@ -367,6 +380,19 @@ public class RenderEncoder : RenderEncoderProtocol
             $off,
             $n
         );
+    }
+
+    public function drawIndirect(Buffer $arguments, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'drawIndirect after endRender');
+        assert($this->pipelineSet, 'drawIndirect before setGpuPass');
+        assert($this->topology != Topology::patches, 'drawIndirect: patches are not supported');
+        mtl::Buffer $args = guard $arguments->handle->buffer else {
+            die('metal: indirect buffer handle is empty');
+        }
+        $this->flushBindings();
+        $this->device->draws->draw($this->topology, 0, 0, $this->patchControlPoints);
+        $this->enc->drawPrimitives(mtlTopology($this->topology), indirect: $args, $offset);
     }
 
     public function endRender() : void

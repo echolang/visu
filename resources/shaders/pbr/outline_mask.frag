@@ -5,23 +5,12 @@ layout(location = 1) flat in float v_style;
 
 layout(location = 0) out vec4 o_mask;
 
-// visu::graphics::ModelMaterialData, one upload per material batch
-layout(std140, set = 0, binding = 0) uniform ModelMaterialData {
-    // rgb albedo fallback, a alpha cutoff (0 = opaque)
-    vec4 u_base_color;
-    vec4 u_factors;
-    vec4 u_uv_scale;
-};
-
+#include "visu/alpha_cutout.glsl"
 #include "visu/camera.glsl"
 
-layout(set = 1, binding = 0) uniform sampler2D map_albedo;
-layout(set = 1, binding = 5) uniform sampler2D map_alpha;
 // OUTLINE_DEPTH_SLOT: the GBuffer depth the scene drew
 layout(set = 1, binding = 8) uniform sampler2D u_scene_depth;
 
-const int MAP_ALBEDO = 1;
-const int MAP_ALPHA = 32;
 const float OUTLINE_STYLES = 4.0;
 
 // metres from the eye for a 0..1 depth, through the camera's own projection
@@ -34,16 +23,7 @@ float eye_distance(float depth)
 void main()
 {
     // cut-out foliage has to outline its leaves, not its cards
-    vec2 uv = v_uv * u_uv_scale.xy;
-    int flags = int(u_factors.z + 0.5);
-    float alpha = 1.0;
-    if ((flags & MAP_ALBEDO) != 0) {
-        alpha = texture(map_albedo, uv).a;
-    }
-    if ((flags & MAP_ALPHA) != 0) {
-        alpha = texture(map_alpha, uv).r;
-    }
-    if (u_base_color.a > 0.0 && alpha < u_base_color.a) {
+    if (alpha_cutout(v_uv)) {
         discard;
     }
 

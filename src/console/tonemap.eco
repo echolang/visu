@@ -1,0 +1,361 @@
+/**
+ * Console grammar and handler for the display end of the frame. `tonemap` alone prints the
+ * state; every other form edits `DeferredRenderer.toneMap` and prints it again.
+ */
+
+namespace visu::console;
+
+use visu::graphics::{DeferredRenderer, ToneCurve, ToneMap, toneCurveNamed};
+use visu::math::Vec3;
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal const TONEMAP_USAGE = 'usage: tonemap [reset|local on|off|curve aces|neutral|reinhard|filmic|preexposure <x>|contrast high|low <x>|detail <x>|mix <x>|mid <x>|range <stops>|spatial <cells>|tonal <slices>|wide <cells>|power <x>|shoulder <x>|whitepoint <x>|midout <x>|balance <r> <g> <b>|balance off|red <x>]';
+
+/**
+ * A numeric `ToneMap` setting the console can write.
+ */
+public enum ToneKnob
+{
+    case contrastHigh;
+    case contrastLow;
+    case detail;
+    case bilateral;
+    case midpoint;
+    case range;
+    case spatial;
+    case tonal;
+    case wide;
+    case contrast;
+    case shoulder;
+    case whitePoint;
+    case midOut;
+    case redX;
+    case preExposure;
+
+    /**
+     * The inclusive range the console accepts: wide enough to explore, narrow enough that the
+     * passes stay in their loop and grid bounds.
+     */
+    public const function lowest() : float32
+    {
+        return match ($this) {
+            ToneKnob::contrastHigh => 0.0f,
+            ToneKnob::contrastLow => 0.0f,
+            ToneKnob::detail => 0.0f,
+            ToneKnob::bilateral => 0.0f,
+            ToneKnob::midpoint => 0.001f,
+            ToneKnob::range => 4.0f,
+            ToneKnob::spatial => 0.25f,
+            ToneKnob::tonal => 0.25f,
+            ToneKnob::wide => 1.0f,
+            ToneKnob::contrast => 0.5f,
+            ToneKnob::shoulder => 0.5f,
+            ToneKnob::whitePoint => 1.0f,
+            ToneKnob::midOut => 0.01f,
+            ToneKnob::redX => 0.7f,
+            ToneKnob::preExposure => 0.25f,
+        };
+    }
+
+    public const function highest() : float32
+    {
+        return match ($this) {
+            ToneKnob::contrastHigh => 2.0f,
+            ToneKnob::contrastLow => 2.0f,
+            ToneKnob::detail => 4.0f,
+            ToneKnob::bilateral => 1.0f,
+            ToneKnob::midpoint => 10.0f,
+            ToneKnob::range => 32.0f,
+            ToneKnob::spatial => 8.0f,
+            ToneKnob::tonal => 8.0f,
+            ToneKnob::wide => 20.0f,
+            ToneKnob::contrast => 3.0f,
+            ToneKnob::shoulder => 1.2f,
+            ToneKnob::whitePoint => 128.0f,
+            ToneKnob::midOut => 0.9f,
+            ToneKnob::redX => 0.8f,
+            ToneKnob::preExposure => 4.0f,
+        };
+    }
+}
+
+/**
+ * The knob a word names, for the forms `tonemap <word> <x>`.
+ */
+internal function toneKnob(const string& $word) : ToneKnob?
+{
+    if ($word == 'detail') {
+        return ToneKnob::detail;
+    }
+    if ($word == 'mix') {
+        return ToneKnob::bilateral;
+    }
+    if ($word == 'mid') {
+        return ToneKnob::midpoint;
+    }
+    if ($word == 'range') {
+        return ToneKnob::range;
+    }
+    if ($word == 'spatial') {
+        return ToneKnob::spatial;
+    }
+    if ($word == 'tonal') {
+        return ToneKnob::tonal;
+    }
+    if ($word == 'wide') {
+        return ToneKnob::wide;
+    }
+    if ($word == 'power') {
+        return ToneKnob::contrast;
+    }
+    if ($word == 'shoulder') {
+        return ToneKnob::shoulder;
+    }
+    if ($word == 'whitepoint') {
+        return ToneKnob::whitePoint;
+    }
+    if ($word == 'midout') {
+        return ToneKnob::midOut;
+    }
+    if ($word == 'red') {
+        return ToneKnob::redX;
+    }
+    if ($word == 'preexposure') {
+        return ToneKnob::preExposure;
+    }
+    return null;
+}
+
+/**
+ * One parsed `tonemap` form. `applyToneMap` writes it onto a settings copy.
+ */
+public enum ToneMapEdit
+{
+    case show;
+    case reset;
+    case local(bool $on);
+    case curve(ToneCurve $curve);
+    case set(ToneKnob $knob, float32 $x);
+    case balance(Vec3 $white);
+    case invalid;
+}
+
+/**
+ * Parse the words after `tonemap`. Pure, so the grammar is testable without a renderer.
+ */
+public function parseToneMap(const array<string>& $parts) : ToneMapEdit
+{
+    usize $n = $parts->count();
+    if ($n == 1) {
+        return .show;
+    }
+
+    string $verb = $parts[1];
+    if ($n == 2 && $verb == 'reset') {
+        return .reset;
+    }
+
+    if ($n == 3 && $verb == 'local') {
+        if ($parts[2] == 'on') {
+            return .local(true);
+        }
+        if ($parts[2] == 'off') {
+            return .local(false);
+        }
+        return .invalid;
+    }
+
+    if ($n == 3 && $verb == 'curve') {
+        ToneCurve $curve = guard toneCurveNamed($parts[2]) else {
+            return .invalid;
+        }
+        return .curve($curve);
+    }
+
+    if ($verb == 'balance') {
+        if ($n == 3 && $parts[2] == 'off') {
+            return .balance(Vec3(1.0f, 1.0f, 1.0f));
+        }
+        if ($n != 5) {
+            return .invalid;
+        }
+        float64 $r = guard str::float($parts[2]) else {
+            return .invalid;
+        }
+        float64 $g = guard str::float($parts[3]) else {
+            return .invalid;
+        }
+        float64 $b = guard str::float($parts[4]) else {
+            return .invalid;
+        }
+        if ($r <= 0.0 || $g <= 0.0 || $b <= 0.0 || $r > 8.0 || $g > 8.0 || $b > 8.0) {
+            return .invalid;
+        }
+        return .balance(Vec3($r as float32, $g as float32, $b as float32));
+    }
+
+    if ($verb == 'contrast') {
+        if ($n != 4) {
+            return .invalid;
+        }
+        ToneKnob $side = ToneKnob::contrastHigh;
+        if ($parts[2] == 'low') {
+            $side = ToneKnob::contrastLow;
+        } else if ($parts[2] != 'high') {
+            return .invalid;
+        }
+        return toneValue($side, $parts[3]);
+    }
+
+    if ($n != 3) {
+        return .invalid;
+    }
+
+    ToneKnob $knob = guard toneKnob($verb) else {
+        return .invalid;
+    }
+    return toneValue($knob, $parts[2]);
+}
+
+internal function toneValue(ToneKnob $knob, const string& $word) : ToneMapEdit
+{
+    float64 $raw = guard str::float($word) else {
+        return .invalid;
+    }
+    float32 $x = $raw as float32;
+    if ($x < $knob->lowest() || $x > $knob->highest()) {
+        return .invalid;
+    }
+    return .set($knob, $x);
+}
+
+/**
+ * Write one edit onto `$map`. `show` and `invalid` leave it alone.
+ */
+public function applyToneMap(ToneMap& $map, ToneMapEdit $edit) : void
+{
+    match ($edit) {
+        ToneMapEdit::show => {},
+        ToneMapEdit::invalid => {},
+        ToneMapEdit::reset => {
+            $map = ToneMap();
+        },
+        ToneMapEdit::local($on) => {
+            $map->local = $on;
+        },
+        ToneMapEdit::curve($curve) => {
+            $map->curve = $curve;
+        },
+        ToneMapEdit::balance($white) => {
+            $map->white = $white;
+        },
+        ToneMapEdit::set($knob, $x) => {
+            setToneKnob($map, $knob, $x);
+        },
+    };
+}
+
+internal function setToneKnob(ToneMap& $map, ToneKnob $knob, float32 $x) : void
+{
+    match ($knob) {
+        ToneKnob::contrastHigh => {
+            $map->contrastHigh = $x;
+        },
+        ToneKnob::contrastLow => {
+            $map->contrastLow = $x;
+        },
+        ToneKnob::detail => {
+            $map->detail = $x;
+        },
+        ToneKnob::bilateral => {
+            $map->bilateral = $x;
+        },
+        ToneKnob::midpoint => {
+            $map->midpoint = $x;
+        },
+        ToneKnob::range => {
+            $map->range = $x;
+        },
+        ToneKnob::spatial => {
+            $map->spatial = $x;
+        },
+        ToneKnob::tonal => {
+            $map->tonal = $x;
+        },
+        ToneKnob::wide => {
+            $map->wide = $x;
+        },
+        ToneKnob::contrast => {
+            $map->contrast = $x;
+        },
+        ToneKnob::shoulder => {
+            $map->shoulder = $x;
+        },
+        ToneKnob::whitePoint => {
+            $map->whitePoint = $x;
+        },
+        ToneKnob::midOut => {
+            $map->midOut = $x;
+        },
+        ToneKnob::redX => {
+            $map->redX = $x;
+        },
+        ToneKnob::preExposure => {
+            $map->preExposure = $x;
+        },
+    };
+}
+
+public class ToneMapConsole : ConsoleCommandHandler
+{
+    public DeferredRenderer $renderer;
+
+    public constructor(DeferredRenderer $renderer)
+    {
+        $this->renderer = $renderer;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('tonemap', $this, 'reset|local|curve|preexposure|contrast|detail|mix|mid|range|spatial|tonal|wide|power|shoulder|whitepoint|midout|balance|red');
+        array<string> $names = array<string>();
+        $names[] = 'tonemap';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if (!$cmd->isAction('tonemap')) {
+            return;
+        }
+
+        ToneMapEdit $edit = parseToneMap($cmd->parts);
+        bool $bad = match ($edit) {
+            ToneMapEdit::invalid => true,
+            else => false,
+        };
+        if ($bad) {
+            $console->writeLine(TONEMAP_USAGE);
+            return;
+        }
+
+        ToneMap $map = $this->renderer->toneMap;
+        applyToneMap($map, $edit);
+        $this->renderer->toneMap = $map;
+        $console->writeLine(toneMapStatus($map));
+    }
+}
+
+public function toneMapStatus(const ToneMap& $map) : string
+{
+    string $local = 'off';
+    if ($map->local) {
+        $local = 'on';
+    }
+
+    string $curve = $map->curve->word();
+
+    Vec3 $w = $map->white;
+    return "tonemap: local {$local} (contrast high {$map->contrastHigh:.2f} low {$map->contrastLow:.2f}, detail {$map->detail:.2f}, mix {$map->bilateral:.2f}, mid {$map->midpoint:.3f}, range {$map->range:.1f} stops, spatial {$map->spatial:.2f}, tonal {$map->tonal:.2f}, wide {$map->wide:.1f}), curve {$curve} (preexposure {$map->preExposure:.3f}, power {$map->contrast:.2f}, shoulder {$map->shoulder:.3f}, whitepoint {$map->whitePoint:.1f}, midout {$map->midOut:.3f}), balance {$w->x:.2f} {$w->y:.2f} {$w->z:.2f}, red {$map->redX:.3f}";
+}

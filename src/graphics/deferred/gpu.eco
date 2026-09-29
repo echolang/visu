@@ -102,10 +102,6 @@ internal class DeferredCache
             $this->programs->drop();
             return .error($e);
         }
-        guard $shaders->program('shadow') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
         // the outline programs first run when something is hovered; compiling them there would
         // hitch that frame
         guard $shaders->program('outline_mask') else ($e) {
@@ -126,6 +122,41 @@ internal class DeferredCache
             return .error($e);
         }
         guard $shaders->program('godrays_resolve') else ($e) {
+            $this->programs->drop();
+            return .error($e);
+        }
+        // the tone-map chain: the resolve runs every frame, the stages as soon as a setting asks,
+        // which may be a console verb in the middle of play; every curve's resolve, plain and
+        // local, since `tonemap curve` switches between them in play
+        array<string> $toneMap = [
+            'tonemap_luma',
+            'tonemap_coarse',
+            'tonemap_reduce',
+            'tonemap_exposure',
+            'tonemap_exposure+probe',
+            'tonemap_grid',
+            'tonemap_blur',
+            'tonemap_blur+base',
+            'tonemap_upsample',
+            // the fog's sky table refills the first time the fog takes the sky's colour
+            'fog_sky',
+            // the aerial table fills on the first scene frame, and again whenever the sky moves
+            'aerial',
+        ];
+        array<ToneCurve> $curves = toneCurves();
+        foreach ($curves as $curve) {
+            $toneMap[] = $curve->program(false);
+            $toneMap[] = $curve->program(true);
+        }
+        foreach ($toneMap as $name) {
+            guard $shaders->program($name) else ($e) {
+                $this->programs->drop();
+                return .error($e);
+            }
+        }
+        // the GPU-driven kernels and depth programs, which the first lamp, shadow page or
+        // scene cull would otherwise compile mid-frame
+        guard $device->gpuShaders->warm($device) else ($e) {
             $this->programs->drop();
             return .error($e);
         }
@@ -155,9 +186,10 @@ internal class DeferredGpu
     public Texture $shadowDummy;
 
     /**
-     * 1x1 r8 the light pass binds when no lamp is on screen.
+     * Zeroed storage the light and water passes bind at every point-light slot before the
+     * frame's clusters, so a frame without point lights never draws with one unbound.
      */
-    public Texture $pointTileDummy;
+    public Buffer $noLights;
     public array<Vec4> $kernel;
 
     public static function load(Device $device) : result<DeferredGpu, ShaderError>
@@ -191,7 +223,7 @@ internal class DeferredGpu
             $device->createSampler(SamplerDesc($wrapS: .repeat)),
             $device->createSampler(SamplerDesc()),
             shadowDummy($device),
-            pointTileDummy($device),
+            noLightsBuffer($device),
             ssaoKernel(SSAO_MAX_SAMPLES)
         ));
     }
@@ -235,7 +267,7 @@ internal class DeferredGpu
         $this->white->destroy();
         $this->noise->destroy();
         $this->shadowDummy->destroy();
-        $this->pointTileDummy->destroy();
+        $this->noLights->destroy();
     }
 }
 
@@ -261,14 +293,15 @@ internal function whitePixel(Device $device) : Texture
     return Texture($device, 'deferred.white', Pixels(1, 1, $rgba));
 }
 
-internal function pointTileDummy(Device $device) : Texture
+internal function noLightsBuffer(Device $device) : Buffer
 {
-    TextureDesc $desc = TextureDesc($format: .r8, $width: 1, $height: 1);
-    $desc->label = 'deferred.pointTiles';
-    Texture $tex = Texture($device, 'deferred.pointTiles', $desc);
-    array<uint8> $zero = [0];
-    $tex->upload(0, ptr<const uint8>(&$zero[0]), 1, 1);
-    return $tex;
+    array<uint8> $zero = arr::room<uint8>(64);
+    int32 $i = 0;
+    while ($i < 64) {
+        $zero[] = 0;
+        $i = $i + 1;
+    }
+    return Buffer($device, BUFFER_STORAGE, ptr<const uint8>(&$zero[0]), 64 as uint64);
 }
 
 internal function shadowDummy(Device $device) : Texture

@@ -14,8 +14,6 @@ layout(location = 0) out vec4 fragment_color;
 
 #include "visu/camera.glsl"
 #include "visu/constants.glsl"
-#include "visu/functions/gamma_corr.glsl"
-#include "visu/functions/tone_mapping.glsl"
 #include "visu/functions/brdf.glsl"
 #include "visu/shadow.glsl"
 
@@ -31,27 +29,13 @@ vec3 water_sphere_l(vec3 toLight, vec3 V, vec3 N, float sourceRadius)
     return normalize(closest);
 }
 
-// Fog without the sky block. Slot 0 is the water uniform. The integral matches fog.glsl.
-// The inscattering colour is the packed fog colour. The atmosphere term stays on the light pass.
-layout(std140, set = 0, binding = 3) uniform FogUniforms {
-    vec4 u_fog_density;
-    vec4 u_fog_color;
-    vec4 u_fog_params;
-    vec4 u_fog_sun;
-    vec4 u_fog_samples;
-    vec4 u_fog_moon;
-    vec4 u_fog_shafts;
-    vec4 u_fog_shaft_light;
-    vec4 u_fog_shaft_phase;
-};
-
+// Fog at slot 3; slot 0 is the water uniform. The shafts here are marched to the bed, so
+// the water looks them up itself (`water_fog_rays`) and hands the result to the shared fog.
+#define VISU_FOG_SKY_SLOT 3
+#define VISU_AERIAL_SLOT 4
+#include "visu/fog.glsl"
 #include "visu/godrays.glsl"
-
-struct PointGpu {
-    vec4 position_radius;
-    vec4 color_intensity;
-    vec4 source_shadow;
-};
+#include "visu/light_gpu.glsl"
 
 layout(std140, set = 0, binding = 2) uniform LightUniforms {
     vec4 u_sun_direction;
@@ -60,43 +44,36 @@ layout(std140, set = 0, binding = 2) uniform LightUniforms {
     mat4 u_light_space[5];
     vec4 u_splits;
     vec4 u_shadow;
-    vec4 u_points_head;
-    PointGpu u_points[64];
-    mat4 u_point_face[24];
     vec4 u_moon_direction;
     vec4 u_moon_color;
     vec4 u_night_ambient;
+    vec4 u_cluster_head;
+    vec4 u_cluster_z;
+    // x 1 when the shadow atlas is bound, y its mip bias, z 1 paints the debug view (the light
+    // pass only), w the shadow distance
+    vec4 u_vsm;
 };
+
+#include "visu/lights.glsl"
+#include "visu/vsm_sample.glsl"
 
 layout(set = 1, binding = 0) uniform sampler2D u_scene;
 layout(set = 1, binding = 1) uniform sampler2D u_bed;
 layout(set = 1, binding = 2) uniform sampler2D u_mirror;
 layout(set = 1, binding = 7) uniform samplerCube u_prefilter;
 layout(set = 1, binding = 11) uniform sampler2DArray shadowmap;
-layout(set = 1, binding = 13) uniform sampler2D point_tiles;
-layout(set = 1, binding = 14) uniform sampler2DArray point_shadow;
-
-vec3 encoded_linear(vec3 display)
+// legacy: fog_color of fog.glsl, with the sun's azimuth from the light block
+vec3 water_fog_color(vec3 dir)
 {
-    return pow(max(display, vec3(0.0)), vec3(VISU_DISPLAY_GAMMA));
-}
-
-vec3 radiance_linear(vec3 radiance)
-{
-    return encoded_linear(gamma_correct(apply_tonemap(radiance)));
-}
-
-float fog_integral(float dy, float len)
-{
-    float k = u_fog_density.y;
-    float d0 = u_fog_density.x;
-    float x = max(k * dy * len, -60.0);
-    if (abs(x) < 1e-4) {
-        return d0 * len * (1.0 - 0.5 * x);
+    if (u_fog_color.w < 0.5) {
+        return u_fog_color.rgb;
     }
-    return d0 * (1.0 - exp(-x)) / (k * dy);
+
+    vec2 uv = fog_sky_uv(fog_sky_horizon(dir, -u_sun_direction.xyz));
+    return u_fog_color.rgb * (textureLod(u_fog_sky, uv, 0.0).rgb + u_fog_floor.rgb);
 }
 
+// legacy: fog_apply of fog.glsl, with the lights' directions from the light block
 vec3 water_fog(vec3 color, vec3 relative)
 {
     if (u_fog_density.w < 0.5) {
@@ -120,14 +97,44 @@ vec3 water_fog(vec3 color, vec3 relative)
     float sun = pow(max(dot(dir, sunDir), 0.0), max(u_fog_sun.w, 1.0));
     vec3 moonDir = normalize(-u_moon_direction.xyz);
     float moon = pow(max(dot(dir, moonDir), 0.0), max(u_fog_moon.w, 1.0));
-    vec3 glow = radiance_linear(u_fog_sun.rgb) * sun + radiance_linear(u_fog_moon.rgb) * moon;
-    vec3 fog = radiance_linear(u_fog_color.rgb) * (1.0 - t) + glow * (1.0 - td);
+    vec3 glow = u_fog_sun.rgb * sun + u_fog_moon.rgb * moon;
+    vec3 fog = water_fog_color(dir) * (1.0 - t) + glow * (1.0 - td);
     return color * t + fog;
 }
 
-// water_fog with this frame's light shafts, in the same display-linear space. Without the
-// shafts bound it is water_fog itself.
+vec3 water_fog_rays_legacy(vec3 color, vec3 relative, vec2 uv);
+
+// the fog over the water at `relative`, with this frame's light shafts at `uv`: the shared
+// fog, the shafts looked up at the bed's distance and kept to the part in front of the surface
 vec3 water_fog_rays(vec3 color, vec3 relative, vec2 uv)
+{
+    if (u_fog_model.w < 0.5) {
+        return water_fog_rays_legacy(color, relative, uv);
+    }
+    if (u_fog_shafts.w < 0.5) {
+        return fog_apply(color, relative);
+    }
+    float len = length(relative);
+    if (len < 1e-3) {
+        return color;
+    }
+    vec3 dir = relative / len;
+    vec4 bed = texture(u_bed, uv);
+    float bedDist = bed.a >= 0.5 ? length(bed.xyz) : GODRAY_SKY_DEPTH;
+    vec2 shaft = godrays_fetch(uv, bedDist);
+    shaft.x *= clamp(len / max(bedDist, 1e-3), 0.0, 1.0);
+    float lit = mix(1.0, shaft.y, u_fog_shafts.y);
+    bool moonKey = u_fog_shaft_light.w > 0.5;
+    vec3 toLight = moonKey ? u_fog_to_moon.xyz : u_fog_model.xyz;
+    float phase = godrays_phase2(dot(dir, toLight), u_fog_shaft_phase.xyz);
+    vec3 rays = u_fog_shaft_light.rgb * (phase * shaft.x * u_fog_shafts.x);
+    float lit_sun = moonKey ? 1.0 : lit;
+    float lit_moon = moonKey ? lit : 1.0;
+    return fog_surface(color, relative, lit_sun, lit_moon, rays);
+}
+
+// legacy: water_fog with this frame's light shafts. Without the shafts bound it is water_fog.
+vec3 water_fog_rays_legacy(vec3 color, vec3 relative, vec2 uv)
 {
     if (u_fog_shafts.w < 0.5) {
         return water_fog(color, relative);
@@ -160,32 +167,12 @@ vec3 water_fog_rays(vec3 color, vec3 relative, vec2 uv)
     float sun = pow(max(dot(dir, sunDir), 0.0), max(u_fog_sun.w, 1.0));
     vec3 moonDir = normalize(-u_moon_direction.xyz);
     float moon = pow(max(dot(dir, moonDir), 0.0), max(u_fog_moon.w, 1.0));
-    vec3 glow = (radiance_linear(u_fog_sun.rgb) * sun + radiance_linear(u_fog_moon.rgb) * moon) * occlude;
-    vec3 fog = radiance_linear(u_fog_color.rgb) * (1.0 - t) + glow * (1.0 - td);
+    vec3 glow = (u_fog_sun.rgb * sun + u_fog_moon.rgb * moon) * occlude;
+    vec3 fog = water_fog_color(dir) * (1.0 - t) + glow * (1.0 - td);
     vec3 toLight = u_fog_shaft_light.w > 0.5 ? moonDir : sunDir;
     float phase = godrays_phase2(dot(dir, toLight), u_fog_shaft_phase.xyz);
-    vec3 rays = radiance_linear(u_fog_shaft_light.rgb * (phase * shaft.x * u_fog_shafts.x));
+    vec3 rays = u_fog_shaft_light.rgb * (phase * shaft.x * u_fog_shafts.x);
     return color * t + fog + rays;
-}
-
-int point_face_index(vec3 dir)
-{
-    vec3 a = abs(dir);
-    if (a.x >= a.y && a.x >= a.z) {
-        return dir.x >= 0.0 ? 0 : 1;
-    }
-    if (a.y >= a.z) {
-        return dir.y >= 0.0 ? 2 : 3;
-    }
-    return dir.z >= 0.0 ? 4 : 5;
-}
-
-float point_atten(float dist, float radius)
-{
-    float d = clamp(dist / max(radius, 1e-4), 0.0, 1.0);
-    float window = clamp(1.0 - d * d * d * d, 0.0, 1.0);
-    window = window * window;
-    return window / (dist * dist + 1.0);
 }
 
 // One long wave. A phase that jumps by more than a pixel is dropped, so the
@@ -279,9 +266,8 @@ void main()
     vec3 sunIn = u_sun_color.rgb * u_sun_direction.w * max(L.y, 0.0) * sunVis;
     vec3 moonIn = u_moon_color.rgb * u_moon_direction.w * max(Lm.y, 0.0) * moonVis;
     vec3 bodyRadiance = v_body.rgb * ((sunIn + moonIn) / PI + skyAmbient);
-    vec3 body = gamma_correct(apply_tonemap(bodyRadiance));
     float clear = exp(-v_body.w * thickness);
-    vec3 refr = mix(body, texture(u_scene, refrUv).rgb * transmit, clear);
+    vec3 refr = mix(bodyRadiance, texture(u_scene, refrUv).rgb * transmit, clear);
     refr *= 1.0 + 0.35 * pow(ndotl, 6.0) * sunVis;
 
     vec2 mirrorUv = pixel + slide * 0.65;
@@ -297,7 +283,6 @@ void main()
     vec3 ibl = textureLod(u_prefilter, skyR, max(rough, 0.55) * maxLod).rgb;
     // the night probes hold no moonlit sky; add the hemisphere the light pass uses
     ibl += u_night_ambient.rgb;
-    ibl = gamma_correct(apply_tonemap(ibl));
     float mirrorWeight = v_extra.x * inside * (1.0 - rough);
     vec3 reflected = mix(ibl, mirror, mirrorWeight);
 
@@ -319,51 +304,46 @@ void main()
         spec += moonSpec * radiance * max(dot(N, Lm), 0.0) * moonVis;
     }
 
-    int pointCount = int(u_points_head.x + 0.5);
-    if (pointCount > 0) {
-        vec2 px = min(pixel * u_resolution.xy, u_resolution.xy - vec2(1.0));
-        int tilePx = int(u_points_head.y + 0.5);
-        ivec2 tile = ivec2(px) / max(tilePx, 1);
-        int tilesX = max(int(u_points_head.z + 0.5), 1);
-        int stride = int(u_points_head.w + 0.5);
-        tile.x = clamp(tile.x, 0, tilesX - 1);
-        int row = tile.y * stride;
-        int n = int(texelFetch(point_tiles, ivec2(tile.x, row), 0).r * 255.0 + 0.5);
-        for (int i = 0; i < 8; i++) {
-            if (i >= n) {
-                break;
+    {
+        float viewDepth = -(u_view * vec4(v_world, 1.0)).z;
+        uvec2 range = light_range(viewDepth, u_cluster_head, u_cluster_z);
+        if (range.x <= range.y) {
+            vec2 px = min(pixel * u_resolution.xy, u_resolution.xy - vec2(1.0));
+            uint base = light_tile_base(px, u_cluster_head);
+            // the world size of one screen pixel here, which picks the shadow page level
+            float footprint = vsm_footprint(viewDepth, u_projection[1][1], u_resolution.y);
+            for (uint w = range.x >> 5u; w <= (range.y >> 5u); w++) {
+                uint bits = light_word(base, w, range);
+                while (bits != 0u) {
+                    uint b = uint(findLSB(bits));
+                    bits &= bits - 1u;
+                    uint slot = light_slot(w * 32u + b);
+                    LightGpu l = u_lights[slot];
+                    vec4 pr = l.position_radius;
+                    vec3 toLight = pr.xyz - v_world;
+                    float dist = length(toLight);
+                    if (dist >= pr.w) {
+                        continue;
+                    }
+                    vec3 Lc = toLight / max(dist, 1e-4);
+                    vec3 radiance = light_radiance(l, dist, u_cluster_z.w);
+                    vec3 Ls = water_sphere_l(toLight, V, N, l.source.x);
+                    vec3 H = normalize(V + Ls);
+                    vec3 fres;
+                    vec3 one = pbr_specular(N, V, H, Ls, F0, rough, fres);
+                    float vis = 1.0;
+                    float fade = vsm_light_fade(l, u_camera_position.xyz, u_vsm);
+                    if (fade > 0.0) {
+                        vis = mix(1.0, vsm_visibility(slot, pr.xyz, pr.w, v_world + N * l.source.z, footprint, u_vsm.y), fade);
+                    }
+                    spec += one * radiance * max(dot(N, Lc), 0.0) * vis;
+                }
             }
-            int li = int(texelFetch(point_tiles, ivec2(tile.x, row + 1 + i), 0).r * 255.0 + 0.5);
-            if (li < 0 || li >= pointCount) {
-                continue;
-            }
-            vec4 pr = u_points[li].position_radius;
-            vec3 toLight = pr.xyz - v_world;
-            float dist = length(toLight);
-            if (dist >= pr.w) {
-                continue;
-            }
-            vec3 Lc = toLight / max(dist, 1e-4);
-            vec4 src = u_points[li].source_shadow;
-            vec3 radiance = u_points[li].color_intensity.rgb * u_points[li].color_intensity.w * point_atten(dist, pr.w);
-            vec3 Ls = water_sphere_l(toLight, V, N, src.x);
-            float vis = 1.0;
-            if (src.y >= 0.0) {
-                int slot = int(src.y + 0.5);
-                vec3 shifted = v_world + N * src.z;
-                vec3 fromLight = shifted - pr.xyz;
-                int face = point_face_index(fromLight);
-                int layer = slot * 6 + face;
-                vis = 1.0 - shadow_gather(point_shadow, shifted, N, normalize(fromLight), u_point_face[layer], layer, src.w);
-            }
-            vec3 H = normalize(V + Ls);
-            vec3 fres;
-            vec3 one = pbr_specular(N, V, H, Ls, F0, rough, fres);
-            spec += one * radiance * max(dot(N, Lc), 0.0) * vis;
         }
     }
 
-    vec3 color = encoded_linear(mix(refr, reflected, fresnel)) + radiance_linear(spec);
+    // scene, mirror, probe and body are all linear radiance here; the tone-map pass encodes
+    vec3 color = mix(refr, reflected, fresnel) + spec;
     color = water_fog_rays(color, v_world - u_camera_position.xyz, gl_FragCoord.xy * u_resolution.zw);
-    fragment_color = vec4(gamma_correct(color), 1.0);
+    fragment_color = vec4(color, 1.0);
 }

@@ -1,0 +1,171 @@
+/**
+ * A table of `T` rows that lives on the GPU and changes on the GPU's timeline. `set` queues a
+ * row on the CPU (at load, on a spawn, on a move: never a walk); the frame's first pass that
+ * needs the table calls `grow` outside any encoder and `scatter` inside a compute encoder,
+ * which copies this frame's queued rows from the transient ring into place. A frame still in
+ * flight keeps reading the rows it saw, so nothing tears, and an idle table costs nothing.
+ * `T` is a GPU struct whose size is a multiple of four bytes.
+ */
+
+namespace visu::graphics;
+
+/**
+ * `scene_scatter.comp`'s uniform: words per row, records.
+ */
+internal struct ScatterParams
+{
+    public uint32 $rowWords;
+    public uint32 $records;
+    public uint32 $pad0 = 0;
+    public uint32 $pad1 = 0;
+}
+
+public class GpuTable<T>
+{
+    private Device $device;
+    private string $label;
+    private Buffer? $table;
+    private int32 $capacity;
+
+    /**
+     * Rows in use: one past the highest row ever set since the last `clear`.
+     */
+    public int32 $rows;
+    private array<uint32> $pending;
+    private map<int32, int32> $pendingAt;
+    private int32 $records;
+
+    public constructor(Device $device, string $label)
+    {
+        assert((mem::size<T>() % 4) == 0, 'gpu table: row size is a multiple of four bytes');
+        $this->device = $device;
+        $this->label = $label;
+        $this->table = null;
+        $this->capacity = 0;
+        $this->rows = 0;
+        $this->pending = array<uint32>();
+        $this->pendingAt = map<int32, int32>();
+        $this->records = 0;
+    }
+
+    /**
+     * Queue row `$row` to become `$value` at the next scatter. A second set of the same row in
+     * one frame replaces the first.
+     */
+    public function set(int32 $row, const T& $value) : void
+    {
+        assert($row >= 0, 'gpu table: row');
+        usize $words = mem::size<T>() / 4;
+        usize $at = 0;
+        if ($this->pendingAt->has($row)) {
+            $at = $this->pendingAt[$row] as usize;
+        } else {
+            $at = $this->pending->count();
+            $this->pending[] = $row as uint32;
+            usize $w = 0;
+            while ($w < $words) {
+                $this->pending[] = 0;
+                $w = $w + 1;
+            }
+            $this->pendingAt[$row] = $at as int32;
+            $this->records = $this->records + 1;
+        }
+
+        T $local = $value;
+        ptr<const uint8> $src = ptr<const uint8>(&$local);
+        ptr<uint32> $dst = ptr<uint32>(&$this->pending[$at + 1]);
+        mem::copy<uint8>(ptr<uint8>($dst:$), ptr<uint8>($src:$), $words * 4);
+        if ($row >= $this->rows) {
+            $this->rows = $row + 1;
+        }
+    }
+
+    public const function ready() : bool
+    {
+        return $this->table != null;
+    }
+
+    /**
+     * The table buffer. `grow` ran at least once with a row set.
+     */
+    public function buffer() : Buffer
+    {
+        Buffer $b = guard $this->table else {
+            die("gpu table '{$this->label}': no buffer yet");
+        }
+        return $b;
+    }
+
+    /**
+     * Make the buffer hold every row, keeping what it had: a fresh buffer and a GPU copy of the
+     * old rows, in order on this frame's stream. Outside any encoder, inside the frame.
+     */
+    public function grow(RenderContext $ctx) : void
+    {
+        // a table nothing was set in still gets a buffer, so a kernel can bind it
+        if ($this->table != null && $this->rows <= $this->capacity) {
+            return;
+        }
+
+        int32 $cap = 64;
+        while ($cap < $this->rows) {
+            $cap = $cap * 2;
+        }
+
+        uint64 $rowBytes = mem::size<T>() as uint64;
+        Buffer $fresh = Buffer($this->device, BufferDesc(BUFFER_STORAGE, ($cap as uint64) * $rowBytes, $this->label));
+        Buffer? $old = $this->table;
+        if ($old != null) {
+            Buffer $held = guard $old;
+            $ctx->device->copyBuffer($held, 0 as uint64, $fresh, 0 as uint64, ($this->capacity as uint64) * $rowBytes);
+            $held->destroy();
+        }
+
+        $this->table = $fresh;
+        $this->capacity = $cap;
+    }
+
+    /**
+     * Record this frame's queued rows into `$enc`, then forget them. `grow` ran this frame.
+     */
+    public function scatter(ComputeEncoder $enc, ComputeProgram $kernel) : void
+    {
+        if ($this->records == 0) {
+            return;
+        }
+
+        Buffer $table = $this->buffer();
+        uint64 $bytes = ($this->pending->count() as uint64) * 4;
+        TransientSlice $slice = $this->device->allocTransient($bytes, $this->device->limits->storageAlign);
+        ptr<const uint32> $src = ptr<const uint32>(&$this->pending[0]);
+        mem::copy<uint8>(ptr<uint8>($slice->data:$), ptr<uint8>($src:$), $bytes);
+        uint32 $rowWords = (mem::size<T>() / 4) as uint32;
+        $enc->setKernel($kernel);
+        $enc->upload(ScatterParams($rowWords: $rowWords, $records: $this->records as uint32), slot: 0);
+        $enc->bindStorage(0, $table);
+        $enc->bindStorage(1, transient: $slice);
+        $enc->dispatch($rowWords * ($this->records as uint32));
+        $this->pending->clear();
+        $this->pendingAt->clear();
+        $this->records = 0;
+    }
+
+    /**
+     * Forget every row and free the buffer; the device keeps it until no frame reads it.
+     */
+    public function clear() : void
+    {
+        Buffer? $old = $this->table;
+        if ($old != null) {
+            Buffer $held = guard $old;
+            $held->destroy();
+        }
+
+        $this->table = null;
+        $this->capacity = 0;
+        $this->rows = 0;
+        $this->pending->clear();
+        $this->pendingAt->clear();
+        $this->records = 0;
+    }
+}

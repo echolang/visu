@@ -1,8 +1,9 @@
 /**
- * One vertex layout's share of `ModelSystem`: the main assembler, the cascade and outline
+ * One vertex layout's share of `ModelSystem`: the main assembler, the outline and mirror
  * assemblers that share its mesh table, and the GpuPasses that draw it (back-face culled,
- * double-sided, each again with parallax occlusion, shadow, outline mask). Rigid models are one lane, skinned models another; the system decides what goes in,
- * a lane only registers, batches and records.
+ * double-sided, each again with parallax occlusion, outline mask). Rigid models are one lane,
+ * skinned models another; the system decides what goes in, a lane only registers, batches and
+ * records. Shadows are the GPU scene's (`GpuScene`), drawn from the bank's mesh arena.
  */
 
 namespace visu::system;
@@ -10,19 +11,13 @@ namespace visu::system;
 use visu::geo::Frustum;
 use visu::graphics::{
     DeferredRenderer, Device, DrawCallAssembler, GpuPass, MaterialGpu, MeshHandle, Model, ModelBank,
-    POINT_SHADOW_LAYERS, Raster, RenderEncoder, SHADOW_CASCADES, ShaderProgram, ShadowCascade, VertexLayout
+    Raster, RenderEncoder, ShaderProgram, VertexLayout
 };
 use visu::math::Vec3;
 
 internal class ModelLane<P>
 {
     public DrawCallAssembler<P> $dca;
-    public array<DrawCallAssembler<P>> $shadowDca;
-
-    /**
-     * One assembler per point-shadow face, layer `lamp * 6 + face`.
-     */
-    public array<DrawCallAssembler<P>> $pointDca;
 
     /**
      * The highlighted instances this frame, drawn into the outline mask.
@@ -36,18 +31,16 @@ internal class ModelLane<P>
     public VertexLayout $layout;
 
     /**
-     * Program names: `model` / `shadow`, or a variant such as `model+skinned`. The parallax
-     * program draws the materials that march a height map (`MaterialGpu.parallax`).
+     * Program names: `model`, or a variant such as `model+skinned`. The parallax program draws
+     * the materials that march a height map (`MaterialGpu.parallax`).
      */
     public string $program;
     public string $parallaxProgram;
-    public string $shadowProgram;
     public string $outlineProgram;
     private GpuPass? $opaque;
     private GpuPass? $doubleSided;
     private GpuPass? $opaqueParallax;
     private GpuPass? $doubleSidedParallax;
-    private GpuPass? $shadow;
     private GpuPass? $outline;
     private GpuPass? $mirror;
     private GpuPass? $mirrorParallax;
@@ -63,35 +56,10 @@ internal class ModelLane<P>
         VertexLayout $layout,
         string $program,
         string $parallaxProgram,
-        string $shadowProgram,
         string $outlineProgram
     )
     {
         $this->dca = DrawCallAssembler<P>($device);
-        $this->shadowDca = array<DrawCallAssembler<P>>();
-        int32 $s = 0;
-        while ($s < SHADOW_CASCADES) {
-            DrawCallAssembler<P> $shadow = DrawCallAssembler<P>($device);
-            $shadow->shareMeshes($this->dca);
-            // the caller already culled every submission against the cascade, and a depth-only map is
-            // the same in any draw order: no second cull, no play-camera depth key
-            $shadow->cull = false;
-            $shadow->sortFrontToBack = false;
-            $this->shadowDca[] = $shadow;
-            $s = $s + 1;
-        }
-
-        $this->pointDca = array<DrawCallAssembler<P>>();
-        $s = 0;
-        while ($s < POINT_SHADOW_LAYERS) {
-            DrawCallAssembler<P> $face = DrawCallAssembler<P>($device);
-            $face->shareMeshes($this->dca);
-            $face->cull = false;
-            $face->sortFrontToBack = false;
-            $this->pointDca[] = $face;
-            $s = $s + 1;
-        }
-
         $this->outlineDca = DrawCallAssembler<P>($device);
         $this->outlineDca->shareMeshes($this->dca);
         $this->reflectDca = DrawCallAssembler<P>($device);
@@ -99,13 +67,11 @@ internal class ModelLane<P>
         $this->layout = $layout;
         $this->program = $program;
         $this->parallaxProgram = $parallaxProgram;
-        $this->shadowProgram = $shadowProgram;
         $this->outlineProgram = $outlineProgram;
         $this->opaque = null;
         $this->doubleSided = null;
         $this->opaqueParallax = null;
         $this->doubleSidedParallax = null;
-        $this->shadow = null;
         $this->outline = null;
         $this->mirror = null;
         $this->mirrorParallax = null;
@@ -132,9 +98,6 @@ internal class ModelLane<P>
         ShaderProgram $parallaxProgram = guard $renderer->program($this->parallaxProgram) else {
             return;
         }
-        ShaderProgram $shadowProgram = guard $renderer->program($this->shadowProgram) else {
-            return;
-        }
         Raster $raster = Raster::opaque();
         $raster->cull = .back;
         if ($wireframe) {
@@ -147,7 +110,6 @@ internal class ModelLane<P>
         $this->doubleSided = GpuPass($program, $this->layout, $open);
         $this->opaqueParallax = GpuPass($parallaxProgram, $this->layout, $raster);
         $this->doubleSidedParallax = GpuPass($parallaxProgram, $this->layout, $open);
-        $this->shadow = GpuPass($shadowProgram, $this->layout, Raster::depth());
         Raster $flipped = Raster::opaque();
         $flipped->cull = .front;
         if ($wireframe) {
@@ -176,7 +138,6 @@ internal class ModelLane<P>
         $this->doubleSided = null;
         $this->opaqueParallax = null;
         $this->doubleSidedParallax = null;
-        $this->shadow = null;
         $this->outline = null;
         $this->mirror = null;
         $this->mirrorParallax = null;
@@ -227,7 +188,6 @@ internal class ModelLane<P>
                     material: $m->index
                 );
                 $h->handles[] = $handle;
-                $h->casts[] = $m->material->castShadow;
                 if ($m->material->castShadow) {
                     $h->anyCast = true;
                 }
@@ -238,7 +198,7 @@ internal class ModelLane<P>
     }
 
     /**
-     * Give every handle of `$h` back to the shared mesh table (the cascades and the outline share
+     * Give every handle of `$h` back to the shared mesh table (the outline and the mirror share
      * it). `ModelSystem` calls this between frames' fills, never with a submission pending.
      */
     public function unregister(ModelHandles $h) : void
@@ -249,31 +209,7 @@ internal class ModelLane<P>
 
         $h->handles->clear();
         $h->lodStart->clear();
-        $h->casts->clear();
         $h->anyCast = false;
-    }
-
-    public function clearShadows() : void
-    {
-        foreach ($this->shadowDca as $shadow) {
-            $shadow->clearInstances();
-        }
-    }
-
-    public function clearPoints() : void
-    {
-        foreach ($this->pointDca as $face) {
-            $face->clearInstances();
-        }
-    }
-
-    public function buildShadows(const ShadowCascade[5]& $cascades, Vec3 $eye) : void
-    {
-        int32 $i = 0;
-        while ($i < SHADOW_CASCADES) {
-            $this->shadowDca[$i as usize]->build($cascades[$i]->frustum, $eye);
-            $i = $i + 1;
-        }
     }
 
     /**
@@ -324,78 +260,6 @@ internal class ModelLane<P>
         });
     }
 
-    public function buildPoint(int32 $index, const Frustum& $frustum, Vec3 $eye) : void
-    {
-        if ($index < 0 || $index >= POINT_SHADOW_LAYERS) {
-            return;
-        }
-
-        DrawCallAssembler<P> $dca = $this->pointDca[$index as usize];
-        if ($dca->pendingCount() < 1) {
-            return;
-        }
-
-        $dca->build($frustum, $eye);
-    }
-
-    public const function castsPoint(int32 $index) : bool
-    {
-        if ($index < 0 || $index >= POINT_SHADOW_LAYERS) {
-            return false;
-        }
-
-        return $this->pointDca[$index as usize]->commandCount() > 0;
-    }
-
-    /**
-     * Record point-shadow face `$index`. The face camera is already bound.
-     */
-    public function castPoint(RenderEncoder $enc, ModelBank $bank, int32 $index) : void
-    {
-        GpuPass $pass = guard $this->shadow else {
-            return;
-        }
-        if (!$this->castsPoint($index)) {
-            return;
-        }
-
-        DrawCallAssembler<P> $dca = $this->pointDca[$index as usize];
-        $dca->execute($enc, function(RenderEncoder $e, int32 $material) : void {
-            $pass->bind($e);
-            MaterialGpu $m = $bank->material($material);
-            $m->bind($e);
-        });
-    }
-
-    public const function casts(int32 $index) : bool
-    {
-        if ($index < 0 || $index >= SHADOW_CASCADES) {
-            return false;
-        }
-
-        return $this->shadowDca[$index as usize]->commandCount() > 0;
-    }
-
-    /**
-     * Record cascade `$index` into an open shadow encoder. The cascade uniforms are bound.
-     */
-    public function cast(RenderEncoder $enc, ModelBank $bank, int32 $index) : void
-    {
-        GpuPass $pass = guard $this->shadow else {
-            return;
-        }
-        if (!$this->casts($index)) {
-            return;
-        }
-
-        DrawCallAssembler<P> $dca = $this->shadowDca[$index as usize];
-        $dca->execute($enc, function(RenderEncoder $e, int32 $material) : void {
-            $pass->bind($e);
-            MaterialGpu $m = $bank->material($material);
-            $m->bind($e);
-        });
-    }
-
     /**
      * Batch the highlighted instances submitted this frame, culled by the view.
      */
@@ -435,8 +299,6 @@ internal class ModelLane<P>
     public function clear() : void
     {
         $this->dca->clearMeshes();
-        $this->clearShadows();
-        $this->clearPoints();
         $this->outlineDca->clearInstances();
         $this->reflectDca->clearInstances();
     }

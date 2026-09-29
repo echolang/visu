@@ -2,7 +2,7 @@
  * Registry: versioned ids, struct components, views, singletons, listeners.
  */
 
-use visu::ecs::{Entities, Entity, View};
+use visu::ecs::{Entities, Entity, EntityHook, View};
 
 test entities_create_and_valid
 {
@@ -184,7 +184,7 @@ test entities_on_attach_and_release
 {
     Entities $world = Entities();
     EntityLog $log = EntityLog();
-    int32 $handle = $world->onAttach<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+    EntityHook $handle = $world->onAttach<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
         $log->entities->push($e);
         $log->values->push($p->x as int32);
     });
@@ -197,7 +197,7 @@ test entities_on_attach_and_release
     assert($log->entities[0] == $e1, 'e1');
     assert($log->values[1] == 2, 'v2');
 
-    $world->releaseOnAttach($handle);
+    $world->release($handle);
     Entity $e3 = $world->create();
     $world->attach($e3, Position(3.0f, 0.0f));
     assert($log->entities->count() == 2, 'released');
@@ -263,12 +263,96 @@ test entities_multiple_attach_listeners
     assert($b->n == 1, 'b');
 }
 
-test entities_release_unknown_listener
+test entities_release_none_is_a_no_op
 {
     Entities $world = Entities();
-    $world->releaseOnAttach(999);
-    $world->releaseOnDetach(999);
-    assert(true, 'ok');
+    $world->release(EntityHook::none());
+    assert(!EntityHook::none()->valid(), 'none is not a hook');
+}
+
+test entities_changed_reaches_only_that_component
+{
+    Entities $world = Entities();
+    Counter $pos = Counter();
+    Counter $vel = Counter();
+    $world->onChange<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $pos->n = $pos->n + ($p->x as int32);
+    });
+    $world->onChange<Velocity>(function(Entities $ents, Entity $e, const Velocity& $v) : void {
+        $vel->n = $vel->n + 1;
+    });
+    Entity $e = $world->create();
+    $world->attach($e, Position(3.0f, 0.0f));
+    $world->attach($e, Velocity(1.0f, 0.0f));
+    $world->changed<Position>($e);
+    assert($pos->n == 3, 'position heard with the stored value');
+    assert($vel->n == 0, 'velocity not woken');
+}
+
+test entities_changed_without_the_component_is_a_no_op
+{
+    Entities $world = Entities();
+    Counter $heard = Counter();
+    $world->onChange<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $heard->n = $heard->n + 1;
+    });
+    Entity $e = $world->create();
+    $world->changed<Position>($e);
+    $world->changed<Velocity>($e);
+    assert($heard->n == 0, 'nothing to report');
+    assert(!$world->has<Velocity>($e), 'no view side effect on the entity');
+}
+
+test entities_changed_release_keeps_bind_order
+{
+    Entities $world = Entities();
+    EntityLog $log = EntityLog();
+    EntityHook $first = $world->onChange<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $log->values->push(1);
+    });
+    $world->onChange<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $log->values->push(2);
+    });
+    $world->onChange<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $log->values->push(3);
+    });
+    Entity $e = $world->create();
+    $world->attach($e, Position(0.0f, 0.0f));
+    $world->changed<Position>($e);
+    $world->release($first);
+    $world->changed<Position>($e);
+    assert($log->values->count() == 5, 'three then two');
+    assert($log->values[0] == 1 && $log->values[1] == 2 && $log->values[2] == 3, 'bind order');
+    assert($log->values[3] == 2 && $log->values[4] == 3, 'order kept after release');
+}
+
+test entities_release_is_per_moment
+{
+    Entities $world = Entities();
+    Counter $attached = Counter();
+    Counter $changed = Counter();
+    EntityHook $a = $world->onAttach<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $attached->n = $attached->n + 1;
+    });
+    $world->onChange<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+        $changed->n = $changed->n + 1;
+    });
+    $world->release($a);
+    Entity $e = $world->create();
+    $world->attach($e, Position(0.0f, 0.0f));
+    $world->changed<Position>($e);
+    assert($attached->n == 0, 'attach released');
+    assert($changed->n == 1, 'change still listens');
+}
+
+#[tests: expects death]
+test entities_release_twice_dies
+{
+    Entities $world = Entities();
+    EntityHook $h = $world->onChange<Position>(function(Entities $ents, Entity $e, const Position& $p) : void {
+    });
+    $world->release($h);
+    $world->release($h);
 }
 
 #[tests: expects death]

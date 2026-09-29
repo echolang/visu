@@ -220,6 +220,33 @@ public interface DeviceProtocol
     function uploadBuffer(BufferHandle $handle, uint64 $offset, ptr<const uint8> $src, uint64 $bytes) : void;
 
     /**
+     * Copy the first `$bytes` of a `BUFFER_READBACK` buffer into `$dst`, with no stall. Read
+     * what a frame wrote only after that frame retired (its slot came round again); a frame
+     * still in flight may be writing it.
+     */
+    function readMapped(Buffer $buffer, ptr<uint8> $dst, uint64 $bytes) : void;
+
+    /**
+     * waitIdle, then copy `$bytes` at `$offset` of `$buffer` to the CPU. Tests and debug dumps
+     * only: it stalls the GPU, like readbackTexture. Not inside a frame.
+     */
+    function readbackBuffer(Buffer $buffer, uint64 $offset, uint64 $bytes) : result<array<uint8>, DeviceError>;
+
+    /**
+     * Set `$bytes` bytes at `$offset` in `$buffer` to the repeated uint32 `$value`, in order on
+     * this frame's command stream (no stall). Metal fills bytes, so all four bytes of `$value`
+     * must match: 0 and 0xFFFFFFFF are the portable values. Offset and size are multiples of 4.
+     * Not while an encoder is open.
+     */
+    function fillBuffer(Buffer $buffer, uint64 $offset, uint64 $bytes, uint32 $value) : void;
+
+    /**
+     * Copy `$bytes` from `$src` at `$srcOffset` into `$dst` at `$dstOffset`, in order on this
+     * frame's command stream (no stall). Not while an encoder is open.
+     */
+    function copyBuffer(Buffer $src, uint64 $srcOffset, Buffer $dst, uint64 $dstOffset, uint64 $bytes) : void;
+
+    /**
      * Allocate a GPU texture, 2D or cube. `Texture` wraps this handle.
      */
     function createTexture(const TextureDesc& $desc) : result<TextureHandle, DeviceError>;

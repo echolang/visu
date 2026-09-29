@@ -1,0 +1,44 @@
+#version 450
+
+// visu::graphics::GpuSort, the steps that fit in one block: 512 threads sort or merge 1024
+// keys in shared memory. `u_sort.x` / `u_sort.y` are the first and last k (doubling); each k
+// runs its j from min(k / 2, 512) down to 1. Direction comes from the global index, so a
+// block is one run of the whole-buffer network
+layout(local_size_x = 512) in;
+
+layout(std140, set = 0, binding = 0) uniform SortParams {
+    uvec4 u_sort;
+};
+
+layout(std430, set = 2, binding = 0) buffer Keys {
+    uint keys[];
+};
+
+shared uint s_keys[1024];
+
+void main()
+{
+    uint base = gl_WorkGroupID.x * 1024u;
+    uint t = gl_LocalInvocationID.x;
+    s_keys[t] = keys[base + t];
+    s_keys[t + 512u] = keys[base + t + 512u];
+    barrier();
+
+    for (uint k = u_sort.x; k <= u_sort.y; k <<= 1u) {
+        for (uint j = min(k >> 1u, 512u); j > 0u; j >>= 1u) {
+            uint i = 2u * t - (t & (j - 1u));
+            uint l = i + j;
+            bool up = ((base + i) & k) == 0u;
+            uint a = s_keys[i];
+            uint b = s_keys[l];
+            if ((a > b) == up) {
+                s_keys[i] = b;
+                s_keys[l] = a;
+            }
+            barrier();
+        }
+    }
+
+    keys[base + t] = s_keys[t];
+    keys[base + t + 512u] = s_keys[t + 512u];
+}

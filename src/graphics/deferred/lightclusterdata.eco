@@ -1,0 +1,76 @@
+/**
+ * This frame's point lights, published by `PointLightSystem`: the GPU light table and the main
+ * view's cull, which the light pass binds and loops over. Absent (no `PointLightSystem`, no
+ * camera), `bindClusters` binds empty lanes and the pass shades no point light.
+ */
+
+namespace visu::graphics;
+
+public class LightClusterData
+{
+    public LightTable $table;
+    public LightCull $main;
+
+    /**
+     * The point-light shadows every clustered light that casts is looked up in.
+     */
+    public ShadowAtlas $atlas;
+
+    /**
+     * The clock the flicker reads, `visu::runtime::seconds()` when the frame was built.
+     */
+    public float32 $seconds;
+
+    public constructor(LightTable $table, LightCull $main, ShadowAtlas $atlas)
+    {
+        $this->table = $table;
+        $this->main = $main;
+        $this->atlas = $atlas;
+        $this->seconds = 0.0f;
+    }
+
+    /**
+     * Point a light-shading encoder at `$view`'s cull of the table and at the atlas, and fill
+     * the cluster and shadow lanes of `$lights`. The light pass and the water share it.
+     */
+    public function bind(RenderEncoder $enc, LightCull $view, LightUniforms& $lights) : void
+    {
+        $lights->clusterHead = $view->head();
+        $lights->clusterZ = $view->zparams($this->seconds);
+        $view->bind($enc, $this->table);
+        $this->atlas->bind($enc);
+        $lights->vsm = $this->atlas->lookup();
+    }
+}
+
+/**
+ * The storage slots the light programs read point lights through: table, keys, bins, tiles,
+ * then the atlas's page table, generations and cells.
+ */
+internal const uint32 LIGHT_STORAGE_SLOTS = 7;
+
+/**
+ * Bind a light-shading encoder's point lights: every storage slot gets `DeferredGpu.noLights`
+ * first, so a frame without clusters (or with a table that is not ready yet) never draws with
+ * one unbound, then `$clusters` binds `$view` (its main cull when null) over them. With no
+ * clusters the lanes stay zero and the shader reads nothing.
+ */
+internal function bindClusters(
+    RenderEncoder $enc,
+    DeferredGpu $gpu,
+    LightClusterData? $clusters,
+    LightCull? $view,
+    LightUniforms& $lights
+) : void
+{
+    uint32 $slot = 0;
+    while ($slot < LIGHT_STORAGE_SLOTS) {
+        $enc->bindStorage($slot, $gpu->noLights);
+        $slot = $slot + 1;
+    }
+
+    LightClusterData $held = guard $clusters else {
+        return;
+    }
+    $held->bind($enc, $view ?? $held->main, $lights);
+}

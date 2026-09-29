@@ -6,26 +6,14 @@
 
 namespace visu::ecs;
 
-private class AttachHook<T>
+private class LifecycleHook<T>
 {
-    public int32 $handle;
+    public int32 $id;
     public function<void(Entities, Entity, const T&)> $fn;
 
-    public constructor(int32 $handle, function<void(Entities, Entity, const T&)> $fn)
+    public constructor(int32 $id, function<void(Entities, Entity, const T&)> $fn)
     {
-        $this->handle = $handle;
-        $this->fn = $fn;
-    }
-}
-
-private class DetachHook<T>
-{
-    public int32 $handle;
-    public function<void(Entities, Entity, const T&)> $fn;
-
-    public constructor(int32 $handle, function<void(Entities, Entity, const T&)> $fn)
-    {
-        $this->handle = $handle;
+        $this->id = $id;
         $this->fn = $fn;
     }
 }
@@ -67,16 +55,20 @@ public class View<T> : contract::iterable<T>
     private array<uint32> $sparse;
     private array<Entity> $dense;
     private array<T> $payload;
-    private array<erased> $attachHooks;
-    private array<erased> $detachHooks;
+    private array<LifecycleHook<T>> $attachHooks;
+    private array<LifecycleHook<T>> $changeHooks;
+    private array<LifecycleHook<T>> $detachHooks;
+    private int32 $firing;
 
     public constructor()
     {
         $this->sparse = array<uint32>();
         $this->dense = array<Entity>();
         $this->payload = array<T>();
-        $this->attachHooks = array<erased>();
-        $this->detachHooks = array<erased>();
+        $this->attachHooks = array<LifecycleHook<T>>();
+        $this->changeHooks = array<LifecycleHook<T>>();
+        $this->detachHooks = array<LifecycleHook<T>>();
+        $this->firing = 0;
     }
 
     public const function size() : usize
@@ -208,7 +200,7 @@ public class View<T> : contract::iterable<T>
         }
 
         T& $component = $this->get($e);
-        $this->fireDetach($world, $e, $component);
+        $this->fire(.detach, $world, $e, $component);
         $this->erase($e);
     }
 
@@ -217,76 +209,65 @@ public class View<T> : contract::iterable<T>
         return ViewCursor<T>($this);
     }
 
-    internal function listenAttach(int32 $handle, function<void(Entities, Entity, const T&)> $fn) : void
+    internal function listen(HookKind $kind, int32 $id, function<void(Entities, Entity, const T&)> $fn) : void
     {
-        AttachHook<T> $hook = AttachHook<T>($handle, $fn);
-        $this->attachHooks->push(erased::from($hook));
+        $this->hooks($kind)->push(LifecycleHook<T>($id, $fn));
     }
 
-    internal function listenDetach(int32 $handle, function<void(Entities, Entity, const T&)> $fn) : void
+    /**
+     * Run `$kind`'s listeners in bind order. A listener may attach or listen (the walk stops at
+     * the count it started with) but must not release one: that would shift the walk.
+     */
+    internal function fire(HookKind $kind, Entities $world, Entity $e, const T& $component) : void
     {
-        DetachHook<T> $hook = DetachHook<T>($handle, $fn);
-        $this->detachHooks->push(erased::from($hook));
-    }
-
-    internal function fireAttach(Entities $world, Entity $e, const T& $component) : void
-    {
-        foreach ($this->attachHooks as $held) {
-            unsafe {
-                AttachHook<T> $hook = assume<AttachHook<T>>($held);
-                function<void(Entities, Entity, const T&)> $fn = $hook->fn;
-                $fn($world, $e, $component);
-            }
+        array<LifecycleHook<T>>& $list = $this->hooks($kind);
+        usize $n = $list->count();
+        if ($n == 0) {
+            return;
         }
+
+        $this->firing = $this->firing + 1;
+        usize $i = 0;
+        while ($i < $n) {
+            function<void(Entities, Entity, const T&)> $fn = $list[$i]->fn;
+            $fn($world, $e, $component);
+            $i = $i + 1;
+        }
+        $this->firing = $this->firing - 1;
     }
 
-    internal function fireDetach(Entities $world, Entity $e, const T& $component) : void
+    /**
+     * Drop listener `$id` from `$kind`'s list in place, keeping the others in bind order.
+     * False when it is not there.
+     */
+    internal function release(HookKind $kind, int32 $id) : bool
     {
-        foreach ($this->detachHooks as $held) {
-            unsafe {
-                DetachHook<T> $hook = assume<DetachHook<T>>($held);
-                function<void(Entities, Entity, const T&)> $fn = $hook->fn;
-                $fn($world, $e, $component);
+        assert($this->firing == 0, 'view: hook released while its listeners run');
+        array<LifecycleHook<T>>& $list = $this->hooks($kind);
+        usize $i = 0;
+        while ($i < $list->count()) {
+            if ($list[$i]->id == $id) {
+                $list->remove($i);
+                return true;
             }
+
+            $i = $i + 1;
         }
+
+        return false;
     }
 
-    public function releaseAttach(int32 $handle) : void
+    private function hooks(HookKind $kind) : array<LifecycleHook<T>>&
     {
-        array<erased> $kept = array<erased>();
-        foreach ($this->attachHooks as $held) {
-            bool $drop = false;
-            unsafe {
-                AttachHook<T> $hook = assume<AttachHook<T>>($held);
-                if ($hook->handle == $handle) {
-                    $drop = true;
-                }
-            }
-            if ($drop) {
-                continue;
-            }
-            $kept->push($held);
+        if ($kind == HookKind::attach) {
+            return &$this->attachHooks;
         }
-        $this->attachHooks = $kept;
-    }
 
-    public function releaseDetach(int32 $handle) : void
-    {
-        array<erased> $kept = array<erased>();
-        foreach ($this->detachHooks as $held) {
-            bool $drop = false;
-            unsafe {
-                DetachHook<T> $hook = assume<DetachHook<T>>($held);
-                if ($hook->handle == $handle) {
-                    $drop = true;
-                }
-            }
-            if ($drop) {
-                continue;
-            }
-            $kept->push($held);
+        if ($kind == HookKind::change) {
+            return &$this->changeHooks;
         }
-        $this->detachHooks = $kept;
+
+        return &$this->detachHooks;
     }
 
     private function ensureSparse(uint32 $idx) : void

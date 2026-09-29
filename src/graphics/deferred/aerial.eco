@@ -1,0 +1,211 @@
+/**
+ * The aerial perspective: the atmosphere of `Sky` between the eye and every lit pixel, read
+ * from a table instead of marched per pixel, so a far ridge fades into the sky behind it per
+ * channel. Like the sky-view table it depends only on the sun, the moon, the atmosphere and
+ * the eye height, so it is refilled only when one of those moved; a paused clock and a still
+ * eye cost nothing. Layout and mapping live in resources/shaders/include/visu/aerial.glsl.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec3;
+
+/**
+ * Table size: world azimuth texels per slice, the slice's width with its two wrap gutters,
+ * elevation rows over the whole sphere, and distance slices out to `AERIAL_DISTANCE` metres.
+ * Mirrors AERIAL_* in aerial.glsl.
+ */
+public const int32 AERIAL_AZIMUTH = 64;
+public const int32 AERIAL_SLICE_WIDTH = 66;
+public const int32 AERIAL_ELEVATION = 32;
+public const int32 AERIAL_SLICES = 32;
+public const int32 AERIAL_WIDTH = 2112;
+public const float32 AERIAL_DISTANCE = 64000.0f;
+
+/**
+ * Layers of the table: the light but for the sun's Mie lobe with the Rayleigh depth, and the
+ * sun's Mie light without its phase with the Mie depth.
+ */
+internal const int32 AERIAL_LAYERS = 2;
+
+/**
+ * The march per texel. A texel's path is at most `AERIAL_DISTANCE` of air near the ground, so
+ * it wants far fewer steps than a sky ray to the edge of the atmosphere.
+ */
+internal const float32 AERIAL_VIEW_SAMPLES = 8.0f;
+internal const float32 AERIAL_LIGHT_SAMPLES = 4.0f;
+
+/**
+ * The table's binding in each program that fogs a surface.
+ */
+internal const uint32 AERIAL_LIGHT_SLOT = 14;
+internal const uint32 AERIAL_WATER_SLOT = 4;
+
+/**
+ * How far the sun's sine may climb or sink, and the eye rise or fall in metres, before the
+ * fog's sky dome is solved again. The dome is soft: 0.002 is about a tenth of a degree.
+ */
+internal const float32 FOG_AMBIENT_SUN_STEP = 0.002f;
+internal const float32 FOG_AMBIENT_ALTITUDE_STEP = 50.0f;
+
+/**
+ * The aerial perspective's switch and its one artistic lever. `scale` multiplies the distance
+ * every lookup reads the table at: 1 is the air as `Sky` describes it, 2 makes the estate look
+ * twice as deep. The sky is not touched; turbidity stays `Sky.mieScale`.
+ */
+public struct AerialPerspective
+{
+    public bool $enabled;
+    public float32 $scale;
+
+    public constructor()
+    {
+        $this->enabled = true;
+        $this->scale = 1.0f;
+    }
+}
+
+/**
+ * One aerial table and the atmosphere it was last filled under. The renderer keeps one for
+ * the main view; the mirror takes no aerial perspective.
+ */
+internal class AerialLut
+{
+    private Texture $texture;
+    private bool $filled;
+    private SkyUniforms $built;
+
+    public constructor(Device $device)
+    {
+        TextureDesc $desc = TextureDesc(
+            $format: .rgba16f,
+            $kind: .array2D,
+            $width: AERIAL_WIDTH,
+            $height: AERIAL_ELEVATION
+        );
+        $desc->arrayLength = AERIAL_LAYERS;
+        // transfer so dcapture can read the table back; the play path never copies it
+        $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC;
+        $desc->label = 'fog.aerial';
+        $this->texture = Texture($device, 'fog.aerial', $desc);
+        $this->filled = false;
+        // a placeholder until the first fill; `filled` false never compares against it
+        $this->built = skyUniforms(Sky(), Vec3(0.0f, 0.0f, 0.0f), false, 0.0f, 0.0f);
+    }
+
+    /**
+     * Imports the table into this frame's graph and, when `$fill` and the atmosphere moved since
+     * it was last filled, adds the pass that refills it ahead of every pass that fogs. Without
+     * `$fill` the table is only bound, never read, so a frame with the aerial perspective off
+     * costs nothing and the next one on refills only if the sky moved meanwhile.
+     */
+    public function prepare(Pipeline $pipeline, DeferredGpu $gpu, const SkyUniforms& $uniforms, bool $fill) : TextureRef
+    {
+        TextureRef $ref = $pipeline->importTexture('fog.aerial', $this->texture);
+
+        if (!$fill) {
+            return $ref;
+        }
+
+        SkyUniforms $key = skyViewKey($uniforms);
+
+        if ($this->filled && $key == $this->built) {
+            return $ref;
+        }
+
+        $this->built = $key;
+        $this->filled = true;
+        $pipeline->add(AerialPass($gpu, $this->texture, $ref, $key));
+        return $ref;
+    }
+
+    public function destroy() : void
+    {
+        $this->texture->destroy();
+    }
+}
+
+/**
+ * Fills every layer of the aerial table in one draw, one march per texel.
+ */
+internal class AerialPass : Pass
+{
+    private DeferredGpu $gpu;
+    private Texture $texture;
+    private TextureRef $ref;
+    private SkyUniforms $sky;
+
+    public constructor(DeferredGpu $gpu, Texture $texture, TextureRef $ref, SkyUniforms $sky)
+    {
+        $this->gpu = $gpu;
+        $this->texture = $texture;
+        $this->ref = $ref;
+        $this->sky = $sky;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.aerial';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        $io->writes($this->ref);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        ShaderProgram $program = guard $this->gpu->shaders->program('aerial') else ($e) {
+            return .error(.shader($e));
+        }
+        RenderPassDesc $desc = RenderPassDesc();
+        int32 $layer = 0;
+
+        while ($layer < AERIAL_LAYERS) {
+            ColorTarget $color = ColorTarget($this->texture, face: $layer);
+            // every texel is written
+            $color->load = .dontCare;
+            $color->store = .store;
+            $desc->colors[] = $color;
+            $layer = $layer + 1;
+        }
+
+        RenderEncoder $enc = $ctx->device->beginRender($desc);
+        Device $device = $ctx->device;
+        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+            return .quad($device);
+        });
+        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        $pass->bind($enc);
+        $enc->upload($this->sky, slot: 2);
+        $mesh->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+/**
+ * Declares the aerial table as a read.
+ */
+internal function readAerial(IoSink $io, TextureRef? $table) : void
+{
+    TextureRef $held = guard $table else {
+        return;
+    }
+    $io->reads($held);
+}
+
+/**
+ * Binds the aerial table at `$slot`. Every program that fogs a surface declares it, so a pass
+ * without one (a view that never built it) cannot draw; the renderer always hands one over.
+ */
+internal function bindAerial(
+    RenderContext $ctx,
+    RenderEncoder $enc,
+    DeferredGpu $gpu,
+    uint32 $slot,
+    TextureRef $table
+) : status<PipelineError>
+{
+    return bindPooled($ctx, $enc, $slot, $table, $gpu->linear);
+}

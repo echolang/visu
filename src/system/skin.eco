@@ -12,7 +12,7 @@ namespace visu::system;
 use visu::app::info;
 use visu::asset::{Clip, Skeleton};
 use visu::components::{AnimationLayers, AnimationPlayer, SkinPose, SkinnedModel};
-use visu::ecs::{Entities, Entity, Schedule, System};
+use visu::ecs::{Entities, Entity, EntityHook, Schedule, System};
 use visu::graphics::{Model, ModelBank, RenderContext};
 
 public class SkinSystem : System
@@ -28,14 +28,14 @@ public class SkinSystem : System
      * Instances posed by the last render, for the console and tests.
      */
     public int32 $posed;
-    private int32 $attachHook;
+    private EntityHook $attachHook;
 
     public constructor(ModelBank $bank, float32 $dt = 0.016666668f)
     {
         $this->bank = $bank;
         $this->dt = $dt;
         $this->posed = 0;
-        $this->attachHook = -1;
+        $this->attachHook = EntityHook::none();
     }
 
     /**
@@ -55,10 +55,8 @@ public class SkinSystem : System
 
     public function unregister(Entities $entities) : void
     {
-        if ($this->attachHook >= 0) {
-            $entities->releaseOnAttach($this->attachHook);
-            $this->attachHook = -1;
-        }
+        $entities->release($this->attachHook);
+        $this->attachHook = EntityHook::none();
     }
 
     public function schedule(Schedule& $schedule) : void

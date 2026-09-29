@@ -1,0 +1,81 @@
+/**
+ * The sRGB transfer curve (IEC 61966-2-1) on the CPU, the one an sRGB texture's sampler
+ * decodes with. The renderer lights in linear light, so a colour picked on a screen or in a
+ * colour picker goes through `srgbToLinear` once where it is defined, never per frame.
+ */
+
+namespace visu::graphics;
+
+use std::math;
+use visu::math::Vec3;
+
+/**
+ * The linear value an sRGB encoded `$encoded` (0 to 1) stands for. Past 1 the curve carries on,
+ * so a tint above white stays above white.
+ */
+public function srgbToLinear(float32 $encoded) : float32
+{
+    return srgbDecodeValue($encoded as float64) as float32;
+}
+
+/**
+ * The sRGB encoding of the linear value `$linear`; the inverse of `srgbToLinear`.
+ */
+public function linearToSrgb(float32 $linear) : float32
+{
+    return srgbEncodeValue($linear as float64) as float32;
+}
+
+/**
+ * `srgbToLinear` on each channel of `$encoded`.
+ */
+public function srgbToLinearRgb(Vec3 $encoded) : Vec3
+{
+    return Vec3(srgbToLinear($encoded->x), srgbToLinear($encoded->y), srgbToLinear($encoded->z));
+}
+
+/**
+ * `linearToSrgb` on each channel of `$linear`.
+ */
+public function linearToSrgbRgb(Vec3 $linear) : Vec3
+{
+    return Vec3(linearToSrgb($linear->x), linearToSrgb($linear->y), linearToSrgb($linear->z));
+}
+
+/**
+ * The nearest sRGB byte for the linear value `$linear`, clamped to 0 to 255. What an upload
+ * into an sRGB texture writes so the sampler hands `$linear` back.
+ */
+public function srgbByte(float32 $linear) : uint8
+{
+    float64 $l = $linear as float64;
+    if ($l <= 0.0) {
+        return 0;
+    }
+    if ($l >= 1.0) {
+        return 255;
+    }
+    return math::round(srgbEncodeValue($l) * 255.0) as uint8;
+}
+
+internal function srgbDecodeValue(float64 $c) : float64
+{
+    if ($c <= 0.0) {
+        return 0.0;
+    }
+    if ($c <= 0.04045) {
+        return $c / 12.92;
+    }
+    return math::pow(($c + 0.055) / 1.055, 2.4);
+}
+
+internal function srgbEncodeValue(float64 $l) : float64
+{
+    if ($l <= 0.0) {
+        return 0.0;
+    }
+    if ($l <= 0.0031308) {
+        return $l * 12.92;
+    }
+    return 1.055 * math::pow($l, 1.0 / 2.4) - 0.055;
+}

@@ -177,6 +177,13 @@ public class RenderEncoder : RenderEncoderProtocol
         $this->bindings->buffer($slot, $buffer, $offset);
     }
 
+    public function bindStorage(uint32 $slot, transient: TransientSlice $slice) : void
+    {
+        assert(!$this->ended, 'bindStorage after endRender');
+        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
+        $this->bindings->ring($slot, $this->device->slots[$this->device->slot]->ring->buffer, $slice->offset);
+    }
+
     public function tessellateWith(ComputeProgram $kernel, uint32 $patchCount) : void
     {
         assert(!$this->ended, 'tessellateWith after endRender');
@@ -215,6 +222,17 @@ public class RenderEncoder : RenderEncoderProtocol
             $vertexOffset,
             0
         );
+    }
+
+    public function drawIndirect(Buffer $arguments, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'drawIndirect after endRender');
+        assert($this->pipelineSet, 'drawIndirect before setGpuPass');
+        vkFlushUniforms($this->device);
+        vkFlushTextures($this->device, $this->bindings, vk::PIPELINE_BIND_POINT_GRAPHICS);
+        vkFlushStorage($this->device, $this->bindings, vk::PIPELINE_BIND_POINT_GRAPHICS);
+        $this->device->draws->draw($this->topology, 0, 0, $this->patchControlPoints);
+        vk::CmdDrawIndirect($this->device->currentCmd(), $arguments->handle->buffer, $offset, 1, 16);
     }
 
     public function endRender() : void

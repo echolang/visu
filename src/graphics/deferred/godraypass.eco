@@ -16,14 +16,8 @@ use visu::math::{Mat4, Vec3};
 internal class GodRayHistory
 {
     private Device $device;
-    private Texture $a;
-    private Texture $b;
+    public TexturePair $textures;
     public GodRaySize $size;
-
-    /**
-     * 0 when this frame writes `a`.
-     */
-    public int32 $current;
 
     /**
      * The texture this frame will read holds a resolve from the frame before.
@@ -41,10 +35,11 @@ internal class GodRayHistory
     public constructor(Device $device, GodRaySize $size)
     {
         $this->device = $device;
-        $this->a = godRayHistoryTexture($device, $size, 'deferred.godrays.a');
-        $this->b = godRayHistoryTexture($device, $size, 'deferred.godrays.b');
+        $this->textures = TexturePair(
+            godRayHistoryTexture($device, $size, 'deferred.godrays.a'),
+            godRayHistoryTexture($device, $size, 'deferred.godrays.b')
+        );
         $this->size = $size;
-        $this->current = 0;
         $this->filled = false;
         $this->prevProjectionView = Mat4();
         $this->prevEye = Vec3(0.0f, 0.0f, 0.0f);
@@ -62,44 +57,17 @@ internal class GodRayHistory
             return;
         }
 
-        $this->a->destroy();
-        $this->b->destroy();
-        $this->a = godRayHistoryTexture($this->device, $size, 'deferred.godrays.a');
-        $this->b = godRayHistoryTexture($this->device, $size, 'deferred.godrays.b');
+        $this->textures->replace(
+            godRayHistoryTexture($this->device, $size, 'deferred.godrays.a'),
+            godRayHistoryTexture($this->device, $size, 'deferred.godrays.b')
+        );
         $this->size = $size;
         $this->filled = false;
     }
 
-    /**
-     * Swap which texture is written; the one written last frame becomes the one read.
-     */
-    public function flip() : void
-    {
-        $this->current = 1 - $this->current;
-    }
-
-    public function written() : Texture
-    {
-        if ($this->current == 0) {
-            return $this->a;
-        }
-
-        return $this->b;
-    }
-
-    public function read() : Texture
-    {
-        if ($this->current == 0) {
-            return $this->b;
-        }
-
-        return $this->a;
-    }
-
     public function destroy() : void
     {
-        $this->a->destroy();
-        $this->b->destroy();
+        $this->textures->destroy();
     }
 }
 
@@ -175,7 +143,7 @@ public class GodRayPass : Pass
             $history->prevProjectionView,
             $history->prevEye
         );
-        $history->flip();
+        $history->textures->flip();
         $history->prevProjectionView = $camera->projectionView;
         $history->prevEye = $camera->position;
         $history->moonKey = $moonKey;
@@ -184,8 +152,8 @@ public class GodRayPass : Pass
 
         TargetRef $target = $pipeline->createTarget('godrays', $size->width, $size->height);
         TextureRef $raw = $pipeline->createColor($target, 'raw', TextureOptions($format: .rgba16f));
-        TextureRef $resolved = $pipeline->importTexture('godrays.history', $history->written());
-        TextureRef $previous = $pipeline->importTexture('godrays.previous', $history->read());
+        TextureRef $resolved = $pipeline->importTexture('godrays.history', $history->textures->written());
+        TextureRef $previous = $pipeline->importTexture('godrays.previous', $history->textures->read());
         $frame->set(GodRayData(
             $target,
             $raw,

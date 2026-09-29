@@ -13,6 +13,7 @@ struct SkyScatter
     float3 moon_r;
     float3 moon_m;
     float3 transmittance;
+    float3 depth;
     float t_ground;
 };
 
@@ -27,6 +28,7 @@ struct SkyUniforms
     float4 u_sky_moon;
     float4 u_sky_moon_params;
     float4 u_sky_moon_color;
+    float4 u_sky_ozone;
 };
 
 struct fs_out
@@ -39,19 +41,19 @@ struct fs_out
 };
 
 static inline __attribute__((always_inline))
-float2 sky_view_horizon(constant SkyUniforms& _130)
+float2 sky_view_horizon(constant SkyUniforms& _142)
 {
-    float h = fast::max(_130.u_sky_origin.y, 1.0);
-    float r = _130.u_sky_params.z + h;
-    float cos_beta = sqrt(h * ((2.0 * _130.u_sky_params.z) + h)) / r;
+    float h = fast::max(_142.u_sky_origin.y, 1.0);
+    float r = _142.u_sky_params.z + h;
+    float cos_beta = sqrt(h * ((2.0 * _142.u_sky_params.z) + h)) / r;
     float beta = acos(fast::clamp(cos_beta, 0.0, 1.0));
     return float2(3.1415927410125732421875 - beta, beta);
 }
 
 static inline __attribute__((always_inline))
-float3 sky_view_dir(thread const float2& uv, constant SkyUniforms& _130)
+float3 sky_view_dir(thread const float2& uv, constant SkyUniforms& _142)
 {
-    float2 horizon = sky_view_horizon(_130);
+    float2 horizon = sky_view_horizon(_142);
     float zenith;
     if (uv.y < 0.5)
     {
@@ -69,9 +71,9 @@ float3 sky_view_dir(thread const float2& uv, constant SkyUniforms& _130)
 }
 
 static inline __attribute__((always_inline))
-float3 sky_observer(constant SkyUniforms& _130)
+float3 sky_observer(constant SkyUniforms& _142)
 {
-    return float3(0.0, _130.u_sky_params.z + fast::max(_130.u_sky_origin.y, 1.0), 0.0);
+    return float3(0.0, _142.u_sky_params.z + fast::max(_142.u_sky_origin.y, 1.0), 0.0);
 }
 
 static inline __attribute__((always_inline))
@@ -89,32 +91,41 @@ float2 sky_ray_sphere(thread const float3& o, thread const float3& d, thread con
 }
 
 static inline __attribute__((always_inline))
-float2 sky_optical_depth(thread const float3& p, thread const float3& d, thread const float& len, thread const int& samples, constant SkyUniforms& _130)
+float3 sky_density(thread const float& h, constant SkyUniforms& _142)
+{
+    float2 scale = float2(_142.u_sky_rayleigh.w, _142.u_sky_mie.w);
+    float2 rm = exp(float2(-h) / scale);
+    float ozone = fast::max(1.0 - (abs(h - 25000.0) / 15000.0), 0.0);
+    return float3(rm, ozone);
+}
+
+static inline __attribute__((always_inline))
+float3 sky_optical_depth(thread const float3& p, thread const float3& d, thread const float& len, thread const int& samples, constant SkyUniforms& _142)
 {
     float step_len = len / float(samples);
-    float2 depth = float2(0.0);
-    float2 scale = float2(_130.u_sky_rayleigh.w, _130.u_sky_mie.w);
+    float3 depth = float3(0.0);
     for (int i = 0; i < samples; i++)
     {
         float3 s = p + (d * ((float(i) + 0.5) * step_len));
-        float h = fast::max(length(s) - _130.u_sky_params.z, 0.0);
-        depth += (exp(float2(-h) / scale) * step_len);
+        float h = fast::max(length(s) - _142.u_sky_params.z, 0.0);
+        float param = h;
+        depth += (sky_density(param, _142) * step_len);
     }
     return depth;
 }
 
 static inline __attribute__((always_inline))
-float3 sky_extinction(thread const float2& depth, constant SkyUniforms& _130)
+float3 sky_extinction(thread const float3& depth, constant SkyUniforms& _142)
 {
-    return exp(-((_130.u_sky_rayleigh.xyz * depth.x) + (float3(_130.u_sky_mie.y) * depth.y)));
+    return exp(-(((_142.u_sky_rayleigh.xyz * depth.x) + (float3(_142.u_sky_mie.y) * depth.y)) + (_142.u_sky_ozone.xyz * depth.z)));
 }
 
 static inline __attribute__((always_inline))
-SkyScatter sky_scatter_n(thread const float3& dir, thread const int& view_samples, thread const int& light_samples, constant SkyUniforms& _130)
+SkyScatter sky_scatter_to(thread const float3& dir, thread const float& limit, thread const int& view_samples, thread const int& light_samples, constant SkyUniforms& _142)
 {
-    float3 o = sky_observer(_130);
-    float rg = _130.u_sky_params.z;
-    float rt = _130.u_sky_params.w;
+    float3 o = sky_observer(_142);
+    float rg = _142.u_sky_params.z;
+    float rt = _142.u_sky_params.w;
     float3 param = o;
     float3 param_1 = dir;
     float param_2 = rt;
@@ -131,87 +142,115 @@ SkyScatter sky_scatter_n(thread const float3& dir, thread const int& view_sample
         s.t_ground = ground.x;
         t_max = ground.x;
     }
-    float step_len = t_max / float(view_samples);
-    float3 to_sun = _130.u_sky_sun.xyz;
-    float2 scale = float2(_130.u_sky_rayleigh.w, _130.u_sky_mie.w);
+    t_max = fast::min(t_max, limit);
+    bool midpoint = _142.u_sky_ozone.w > 0.5;
+    float n = float(view_samples);
+    float step_len = t_max / n;
+    float3 to_sun = _142.u_sky_sun.xyz;
     float3 sum_r = float3(0.0);
     float3 sum_m = float3(0.0);
-    float2 depth_view = float2(0.0);
-    bool moon_on = _130.u_sky_moon.w > 0.0;
-    float3 to_moon = _130.u_sky_moon.xyz;
+    float3 depth_view = float3(0.0);
+    bool moon_on = _142.u_sky_moon.w > 0.0;
+    float3 to_moon = _142.u_sky_moon.xyz;
     float3 moon_r = float3(0.0);
     float3 moon_m = float3(0.0);
     for (int i = 0; i < view_samples; i++)
     {
-        float3 p = o + (dir * ((float(i) + 0.5) * step_len));
+        float t = (float(i) + 0.5) * step_len;
+        float dt = step_len;
+        if (midpoint)
+        {
+            float a = float(i) / n;
+            float b = float(i + 1) / n;
+            t = (t_max * 0.5) * ((a * a) + (b * b));
+            dt = t_max * ((b * b) - (a * a));
+        }
+        float3 p = o + (dir * t);
         float h = fast::max(length(p) - rg, 0.0);
-        float2 dens = exp(float2(-h) / scale) * step_len;
+        float param_6 = h;
+        float3 dens = sky_density(param_6, _142) * dt;
+        float3 depth_here = depth_view + dens;
+        if (midpoint)
+        {
+            depth_here = depth_view + (dens * 0.5);
+        }
         depth_view += dens;
-        bool _389;
+        bool _476;
         if (moon_on)
         {
-            float3 param_6 = p;
-            float3 param_7 = to_moon;
-            float param_8 = rg;
-            _389 = sky_ray_sphere(param_6, param_7, param_8).x <= 0.0;
+            float3 param_7 = p;
+            float3 param_8 = to_moon;
+            float param_9 = rg;
+            _476 = sky_ray_sphere(param_7, param_8, param_9).x <= 0.0;
         }
         else
         {
-            _389 = moon_on;
+            _476 = moon_on;
         }
-        if (_389)
+        if (_476)
         {
-            float3 param_9 = p;
-            float3 param_10 = to_moon;
-            float param_11 = rt;
-            float2 moon_atmo = sky_ray_sphere(param_9, param_10, param_11);
-            float3 param_12 = p;
-            float3 param_13 = to_moon;
-            float param_14 = fast::max(moon_atmo.y, 0.0);
-            int param_15 = light_samples;
-            float2 moon_depth = sky_optical_depth(param_12, param_13, param_14, param_15, _130);
-            float2 param_16 = depth_view + moon_depth;
-            float3 tm = sky_extinction(param_16, _130);
+            float3 param_10 = p;
+            float3 param_11 = to_moon;
+            float param_12 = rt;
+            float2 moon_atmo = sky_ray_sphere(param_10, param_11, param_12);
+            float3 param_13 = p;
+            float3 param_14 = to_moon;
+            float param_15 = fast::max(moon_atmo.y, 0.0);
+            int param_16 = light_samples;
+            float3 moon_depth = sky_optical_depth(param_13, param_14, param_15, param_16, _142);
+            float3 param_17 = depth_here + moon_depth;
+            float3 tm = sky_extinction(param_17, _142);
             moon_r += (tm * dens.x);
             moon_m += (tm * dens.y);
         }
-        float3 param_17 = p;
-        float3 param_18 = to_sun;
-        float param_19 = rg;
-        float2 sun_ground = sky_ray_sphere(param_17, param_18, param_19);
+        float3 param_18 = p;
+        float3 param_19 = to_sun;
+        float param_20 = rg;
+        float2 sun_ground = sky_ray_sphere(param_18, param_19, param_20);
         if (sun_ground.x > 0.0)
         {
             continue;
         }
-        float3 param_20 = p;
-        float3 param_21 = to_sun;
-        float param_22 = rt;
-        float2 sun_atmo = sky_ray_sphere(param_20, param_21, param_22);
-        float3 param_23 = p;
-        float3 param_24 = to_sun;
-        float param_25 = fast::max(sun_atmo.y, 0.0);
-        int param_26 = light_samples;
-        float2 depth_light = sky_optical_depth(param_23, param_24, param_25, param_26, _130);
-        float2 param_27 = depth_view + depth_light;
-        float3 t = sky_extinction(param_27, _130);
-        sum_r += (t * dens.x);
-        sum_m += (t * dens.y);
+        float3 param_21 = p;
+        float3 param_22 = to_sun;
+        float param_23 = rt;
+        float2 sun_atmo = sky_ray_sphere(param_21, param_22, param_23);
+        float3 param_24 = p;
+        float3 param_25 = to_sun;
+        float param_26 = fast::max(sun_atmo.y, 0.0);
+        int param_27 = light_samples;
+        float3 depth_light = sky_optical_depth(param_24, param_25, param_26, param_27, _142);
+        float3 param_28 = depth_here + depth_light;
+        float3 t_light = sky_extinction(param_28, _142);
+        sum_r += (t_light * dens.x);
+        sum_m += (t_light * dens.y);
     }
-    float2 param_28 = depth_view;
-    s.transmittance = sky_extinction(param_28, _130);
-    s.sun_r = sum_r * _130.u_sky_rayleigh.xyz;
-    s.sun_m = sum_m * float3(_130.u_sky_mie.x);
-    s.moon_r = moon_r * _130.u_sky_rayleigh.xyz;
-    s.moon_m = moon_m * float3(_130.u_sky_mie.x);
+    float3 param_29 = depth_view;
+    s.transmittance = sky_extinction(param_29, _142);
+    s.depth = depth_view;
+    s.sun_r = sum_r * _142.u_sky_rayleigh.xyz;
+    s.sun_m = sum_m * float3(_142.u_sky_mie.x);
+    s.moon_r = moon_r * _142.u_sky_rayleigh.xyz;
+    s.moon_m = moon_m * float3(_142.u_sky_mie.x);
     return s;
 }
 
 static inline __attribute__((always_inline))
-float3 sky_transmittance_from(thread const float3& p, thread const float3& to_sun, constant SkyUniforms& _130)
+SkyScatter sky_scatter_n(thread const float3& dir, thread const int& view_samples, thread const int& light_samples, constant SkyUniforms& _142)
+{
+    float3 param = dir;
+    float param_1 = 1000000015047466219876688855040.0;
+    int param_2 = view_samples;
+    int param_3 = light_samples;
+    return sky_scatter_to(param, param_1, param_2, param_3, _142);
+}
+
+static inline __attribute__((always_inline))
+float3 sky_transmittance_from(thread const float3& p, thread const float3& to_sun, constant SkyUniforms& _142)
 {
     float3 param = p;
     float3 param_1 = to_sun;
-    float param_2 = _130.u_sky_params.z;
+    float param_2 = _142.u_sky_params.z;
     float2 ground = sky_ray_sphere(param, param_1, param_2);
     if (ground.x > 0.0)
     {
@@ -219,15 +258,15 @@ float3 sky_transmittance_from(thread const float3& p, thread const float3& to_su
     }
     float3 param_3 = p;
     float3 param_4 = to_sun;
-    float param_5 = _130.u_sky_params.w;
+    float param_5 = _142.u_sky_params.w;
     float2 atmo = sky_ray_sphere(param_3, param_4, param_5);
     float3 param_6 = p;
     float3 param_7 = to_sun;
     float param_8 = fast::max(atmo.y, 0.0);
-    int param_9 = int(_130.u_sky_params.y);
-    float2 depth = sky_optical_depth(param_6, param_7, param_8, param_9, _130);
-    float2 param_10 = depth;
-    return sky_extinction(param_10, _130);
+    int param_9 = int(_142.u_sky_params.y);
+    float3 depth = sky_optical_depth(param_6, param_7, param_8, param_9, _142);
+    float3 param_10 = depth;
+    return sky_extinction(param_10, _142);
 }
 
 static inline __attribute__((always_inline))
@@ -237,37 +276,37 @@ float sky_phase_rayleigh(thread const float& mu)
 }
 
 static inline __attribute__((always_inline))
-float sky_phase_mie(thread const float& mu, constant SkyUniforms& _130)
+float sky_phase_mie(thread const float& mu, constant SkyUniforms& _142)
 {
-    float g = _130.u_sky_mie.z;
+    float g = _142.u_sky_mie.z;
     float gg = g * g;
-    return (0.119366206228733062744140625 * ((1.0 - gg) * (1.0 + (mu * mu)))) / ((2.0 + gg) * powr((1.0 + gg) - ((2.0 * g) * mu), 1.5));
+    return (0.119366206228733062744140625 * ((1.0 - gg) * (1.0 + (mu * mu)))) / ((2.0 + gg) * pow((1.0 + gg) - ((2.0 * g) * mu), 1.5));
 }
 
 static inline __attribute__((always_inline))
-float3 sky_scatter_color(thread const float3& dir, thread const float3& sun_r, thread const float3& sun_m, thread const float3& moon_r, thread const float3& moon_m, constant SkyUniforms& _130)
+float3 sky_scatter_color(thread const float3& dir, thread const float3& sun_r, thread const float3& sun_m, thread const float3& moon_r, thread const float3& moon_m, constant SkyUniforms& _142)
 {
-    float mu = dot(dir, _130.u_sky_sun.xyz);
+    float mu = dot(dir, _142.u_sky_sun.xyz);
     float param = mu;
     float param_1 = mu;
-    float3 color = ((sun_r * sky_phase_rayleigh(param)) + (sun_m * sky_phase_mie(param_1, _130))) * (_130.u_sky_sun.w * 4.0);
-    if (_130.u_sky_moon.w > 0.0)
+    float3 color = ((sun_r * sky_phase_rayleigh(param)) + (sun_m * sky_phase_mie(param_1, _142))) * (_142.u_sky_sun.w * 4.0);
+    if (_142.u_sky_moon.w > 0.0)
     {
-        float mu_m = dot(dir, _130.u_sky_moon.xyz);
+        float mu_m = dot(dir, _142.u_sky_moon.xyz);
         float param_2 = mu_m;
         float param_3 = mu_m;
-        color += ((_130.u_sky_moon_color.xyz * (_130.u_sky_moon.w * 4.0)) * ((moon_r * sky_phase_rayleigh(param_2)) + (moon_m * sky_phase_mie(param_3, _130))));
+        color += ((_142.u_sky_moon_color.xyz * (_142.u_sky_moon.w * 4.0)) * ((moon_r * sky_phase_rayleigh(param_2)) + (moon_m * sky_phase_mie(param_3, _142))));
     }
     return color;
 }
 
 static inline __attribute__((always_inline))
-float3 sky_inscatter_n(thread const float3& dir, thread const int& view_samples, thread const int& light_samples, thread float3& transmittance, thread float& t_ground, constant SkyUniforms& _130)
+float3 sky_inscatter_n(thread const float3& dir, thread const int& view_samples, thread const int& light_samples, thread float3& transmittance, thread float& t_ground, constant SkyUniforms& _142)
 {
     float3 param = dir;
     int param_1 = view_samples;
     int param_2 = light_samples;
-    SkyScatter s = sky_scatter_n(param, param_1, param_2, _130);
+    SkyScatter s = sky_scatter_n(param, param_1, param_2, _142);
     transmittance = s.transmittance;
     t_ground = s.t_ground;
     float3 param_3 = dir;
@@ -275,66 +314,66 @@ float3 sky_inscatter_n(thread const float3& dir, thread const int& view_samples,
     float3 param_5 = s.sun_m;
     float3 param_6 = s.moon_r;
     float3 param_7 = s.moon_m;
-    return sky_scatter_color(param_3, param_4, param_5, param_6, param_7, _130);
+    return sky_scatter_color(param_3, param_4, param_5, param_6, param_7, _142);
 }
 
 static inline __attribute__((always_inline))
-float3 sky_inscatter(thread const float3& dir, thread float3& transmittance, thread float& t_ground, constant SkyUniforms& _130)
+float3 sky_inscatter(thread const float3& dir, thread float3& transmittance, thread float& t_ground, constant SkyUniforms& _142)
 {
     float3 param = dir;
-    int param_1 = int(_130.u_sky_params.x);
-    int param_2 = int(_130.u_sky_params.y);
+    int param_1 = int(_142.u_sky_params.x);
+    int param_2 = int(_142.u_sky_params.y);
     float3 param_3;
     float param_4;
-    float3 _656 = sky_inscatter_n(param, param_1, param_2, param_3, param_4, _130);
+    float3 _756 = sky_inscatter_n(param, param_1, param_2, param_3, param_4, _142);
     transmittance = param_3;
     t_ground = param_4;
-    return _656;
+    return _756;
 }
 
 static inline __attribute__((always_inline))
-float3 sky_ground(thread const float3& dir, thread const float& t_ground, constant SkyUniforms& _130)
+float3 sky_ground(thread const float3& dir, thread const float& t_ground, constant SkyUniforms& _142)
 {
-    float3 p = sky_observer(_130) + (dir * t_ground);
+    float3 p = sky_observer(_142) + (dir * t_ground);
     float3 n = fast::normalize(p);
-    float3 to_sun = _130.u_sky_sun.xyz;
+    float3 to_sun = _142.u_sky_sun.xyz;
     float3 param = p;
     float3 param_1 = to_sun;
-    float3 sun = sky_transmittance_from(param, param_1, _130) * ((_130.u_sky_sun.w * fast::max(dot(n, to_sun), 0.0)) / 3.1415927410125732421875);
-    if (_130.u_sky_moon.w > 0.0)
+    float3 sun = sky_transmittance_from(param, param_1, _142) * ((_142.u_sky_sun.w * fast::max(dot(n, to_sun), 0.0)) / 3.1415927410125732421875);
+    if (_142.u_sky_moon.w > 0.0)
     {
-        float3 to_moon = _130.u_sky_moon.xyz;
+        float3 to_moon = _142.u_sky_moon.xyz;
         float3 param_2 = p;
         float3 param_3 = to_moon;
-        sun += ((sky_transmittance_from(param_2, param_3, _130) * _130.u_sky_moon_color.xyz) * ((_130.u_sky_moon.w * fast::max(dot(n, to_moon), 0.0)) / 3.1415927410125732421875));
+        sun += ((sky_transmittance_from(param_2, param_3, _142) * _142.u_sky_moon_color.xyz) * ((_142.u_sky_moon.w * fast::max(dot(n, to_moon), 0.0)) / 3.1415927410125732421875));
     }
     float3 mirrored = reflect(dir, n);
     float3 param_4 = mirrored;
     float3 param_5;
     float param_6;
-    float3 _730 = sky_inscatter(param_4, param_5, param_6, _130);
+    float3 _830 = sky_inscatter(param_4, param_5, param_6, _142);
     float3 up_transmittance = param_5;
     float up_ground = param_6;
-    float3 ambient = _730 * 0.5;
-    return _130.u_sky_ground.xyz * (sun + ambient);
+    float3 ambient = _830 * 0.5;
+    return _142.u_sky_ground.xyz * (sun + ambient);
 }
 
-fragment fs_out fs(constant SkyUniforms& _130 [[buffer(4)]], float4 gl_FragCoord [[position]])
+fragment fs_out fs(constant SkyUniforms& _142 [[buffer(4)]], float4 gl_FragCoord [[position]])
 {
     fs_out out = {};
     float2 uv = gl_FragCoord.xy / float2(256.0, 128.0);
     float2 param = uv;
-    float3 dir = sky_view_dir(param, _130);
+    float3 dir = sky_view_dir(param, _142);
     float3 param_1 = dir;
-    int param_2 = int(_130.u_sky_params.x);
-    int param_3 = int(_130.u_sky_params.y);
-    SkyScatter s = sky_scatter_n(param_1, param_2, param_3, _130);
+    int param_2 = int(_142.u_sky_params.x);
+    int param_3 = int(_142.u_sky_params.y);
+    SkyScatter s = sky_scatter_n(param_1, param_2, param_3, _142);
     float3 ground = float3(0.0);
     if (s.t_ground > 0.0)
     {
         float3 param_4 = dir;
         float param_5 = s.t_ground;
-        ground = s.transmittance * sky_ground(param_4, param_5, _130);
+        ground = s.transmittance * sky_ground(param_4, param_5, _142);
     }
     out.lut_sun_r = float4(fast::min(s.sun_r, float3(65504.0)), s.transmittance.x);
     out.lut_sun_m = float4(fast::min(s.sun_m, float3(65504.0)), s.transmittance.y);

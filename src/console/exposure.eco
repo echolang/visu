@@ -1,0 +1,188 @@
+/**
+ * Console grammar and handler for the camera exposure. `exposure` alone prints the state;
+ * every other form edits `DeferredRenderer.exposure` and prints it again.
+ */
+
+namespace visu::console;
+
+use visu::graphics::{DeferredRenderer, Exposure};
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal const EXPOSURE_USAGE = 'usage: exposure [auto|fixed|reset|ev <x>|strength <x>|reference <lux>|min <ev>|max <ev>|speed <up> <down>|highlight <stops> <weight>]';
+
+/**
+ * One parsed `exposure` form. `applyExposure` writes it onto a settings copy.
+ */
+public enum ExposureEdit
+{
+    case show;
+    case reset;
+    case auto(bool $on);
+    case compensation(float32 $ev);
+    case strength(float32 $x);
+    case reference(float32 $lux);
+    case min(float32 $ev);
+    case max(float32 $ev);
+    case speed(float32 $up, float32 $down);
+    case highlight(float32 $stops, float32 $weight);
+    case invalid;
+}
+
+/**
+ * Parse the words after `exposure`. Pure, so the grammar is testable without a renderer.
+ */
+public function parseExposure(const array<string>& $parts) : ExposureEdit
+{
+    usize $n = $parts->count();
+    if ($n == 1) {
+        return .show;
+    }
+
+    string $verb = $parts[1];
+    if ($n == 2) {
+        if ($verb == 'auto') {
+            return .auto(true);
+        }
+        if ($verb == 'fixed') {
+            return .auto(false);
+        }
+        if ($verb == 'reset') {
+            return .reset;
+        }
+        return .invalid;
+    }
+
+    float64 $first = guard str::float($parts[2]) else {
+        return .invalid;
+    }
+    float32 $x = $first as float32;
+    if ($n == 4) {
+        float64 $second = guard str::float($parts[3]) else {
+            return .invalid;
+        }
+        float32 $y = $second as float32;
+        if ($verb == 'speed' && $x > 0.0f && $y > 0.0f && $x <= 60.0f && $y <= 60.0f) {
+            return .speed($x, $y);
+        }
+        if ($verb == 'highlight' && $x >= 0.0f && $x <= 16.0f && $y >= 0.0f && $y <= 1.0f) {
+            return .highlight($x, $y);
+        }
+        return .invalid;
+    }
+
+    if ($n != 3) {
+        return .invalid;
+    }
+
+    if ($verb == 'ev' && $x >= -16.0f && $x <= 16.0f) {
+        return .compensation($x);
+    }
+    if ($verb == 'strength' && $x >= 0.0f && $x <= 1.0f) {
+        return .strength($x);
+    }
+    if ($verb == 'reference' && $x > 0.0f) {
+        return .reference($x);
+    }
+    if ($verb == 'min' && $x >= -24.0f && $x <= 24.0f) {
+        return .min($x);
+    }
+    if ($verb == 'max' && $x >= -24.0f && $x <= 24.0f) {
+        return .max($x);
+    }
+    return .invalid;
+}
+
+/**
+ * Write one edit onto `$exposure`. `show` and `invalid` leave it alone.
+ */
+public function applyExposure(Exposure& $exposure, ExposureEdit $edit) : void
+{
+    match ($edit) {
+        ExposureEdit::show => {},
+        ExposureEdit::invalid => {},
+        ExposureEdit::reset => {
+            $exposure = Exposure();
+        },
+        ExposureEdit::auto($on) => {
+            $exposure->auto = $on;
+        },
+        ExposureEdit::compensation($ev) => {
+            $exposure->compensation = $ev;
+        },
+        ExposureEdit::strength($x) => {
+            $exposure->strength = $x;
+        },
+        ExposureEdit::reference($lux) => {
+            $exposure->reference = $lux;
+        },
+        ExposureEdit::min($ev) => {
+            $exposure->minEv = $ev;
+        },
+        ExposureEdit::max($ev) => {
+            $exposure->maxEv = $ev;
+        },
+        ExposureEdit::speed($up, $down) => {
+            $exposure->speedUp = $up;
+            $exposure->speedDown = $down;
+        },
+        ExposureEdit::highlight($stops, $weight) => {
+            $exposure->highlight = $stops;
+            $exposure->highlightWeight = $weight;
+        },
+    };
+}
+
+public class ExposureConsole : ConsoleCommandHandler
+{
+    public DeferredRenderer $renderer;
+
+    public constructor(DeferredRenderer $renderer)
+    {
+        $this->renderer = $renderer;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('exposure', $this, 'auto|fixed|reset|ev|strength|reference|min|max|speed|highlight');
+        array<string> $names = array<string>();
+        $names[] = 'exposure';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if (!$cmd->isAction('exposure')) {
+            return;
+        }
+
+        ExposureEdit $edit = parseExposure($cmd->parts);
+        bool $bad = match ($edit) {
+            ExposureEdit::invalid => true,
+            else => false,
+        };
+        if ($bad) {
+            $console->writeLine(EXPOSURE_USAGE);
+            return;
+        }
+
+        Exposure $exposure = $this->renderer->exposure;
+        applyExposure($exposure, $edit);
+        $this->renderer->exposure = $exposure;
+        $console->writeLine($this->statusLine());
+    }
+
+    private function statusLine() : string
+    {
+        Exposure $e = $this->renderer->exposure;
+        string $mode = 'fixed';
+        if ($e->auto) {
+            $mode = 'auto (idle)';
+            if ($this->renderer->exposureLive()) {
+                $mode = 'auto (running)';
+            }
+        }
+
+        return "exposure: {$mode}, ev {$e->compensation:.2f}, strength {$e->strength:.2f}, reference {$e->reference:.3f}, range {$e->minEv:.1f}..{$e->maxEv:.1f} EV, speed up {$e->speedUp:.2f} down {$e->speedDown:.2f} /s, highlight {$e->highlight:.1f} stops at {$e->highlightWeight:.2f}";
+    }
+}

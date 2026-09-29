@@ -1,0 +1,717 @@
+/**
+ * The display end of the deferred frame. The light pass, the sky and the water write linear
+ * radiance into rgba16f; `ToneMapPass` exposes, compresses, curves and display-encodes that
+ * scene into the output target the outline, the UI and the present blit draw over.
+ *
+ * Before it, only when a setting asks: the meter (luma, coarse cells, reduce), auto exposure
+ * (`ExposurePass`, into a history the renderer owns), and the local operator's base layer (the
+ * grid, three grid blurs, two base blurs, the upsample). Every stage is a fragment pass over a
+ * small pooled 2D target, so both backends run the same GLSL and dcapture can dump each one as
+ * `pool:tonemap.*`. The stages that only read one image and write one are all `ToneStagePass`.
+ * `ToneMapChain` builds every pass once, with its `GpuPass`, and re-adds them each frame.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+/**
+ * Mirrors ToneMapUniforms in resources/shaders/include/visu/tonemap_uniforms.glsl, slot 0 of
+ * every stage; std140 with vec4 members only. The renderer builds one per frame and each pass
+ * uploads a copy with its own `pass`.
+ */
+public struct ToneMapUniforms
+{
+    /**
+     * x EV when y is 0 (and the compensation auto exposure adds to), y 1 reads the adapted EV,
+     * z 1 with the local operator, w the curve's pre-exposure (ACES; 1 for the others).
+     */
+    public Vec4 $exposure;
+
+    /**
+     * x log2 midpoint (the key auto exposure puts a grey card at), y contrast above it, z
+     * contrast below it, w detail.
+     */
+    public Vec4 $local;
+
+    /**
+     * x bilateral share of the base, y log2 at the first slice, z stops spanned, w slices.
+     */
+    public Vec4 $grid;
+
+    /**
+     * x luma width, y luma height, z scene width, w scene height.
+     */
+    public Vec4 $size;
+    public Vec4 $curve;
+    public Vec4[3] $into;
+    public Vec4[3] $out;
+
+    /**
+     * x strength, y min EV, z max EV, w log2 reference illuminance.
+     */
+    public Vec4 $adapt;
+
+    /**
+     * x highlight stops, y highlight weight, z direct illuminance on the ground, w probe blend.
+     */
+    public Vec4 $meter;
+
+    /**
+     * x blend towards brighter, y towards darker, z 1 when last frame's EV is usable.
+     */
+    public Vec4 $history;
+
+    /**
+     * Per pass: x axis, y sigma, z radius, w slices of 64 x 32 cells.
+     */
+    public Vec4 $pass;
+}
+
+/**
+ * The luma size for a scene: an eighth each way, rounded up.
+ */
+internal function toneLumaSize(int32 $scene) : int32
+{
+    return ($scene + TONEMAP_LUMA_SCALE - 1) / TONEMAP_LUMA_SCALE;
+}
+
+/**
+ * Two 1 x 1 rgba32f textures, written in turn: r the EV shown, g its target, b the metered
+ * illuminance. The one written last frame is the one read.
+ */
+internal class ExposureHistory
+{
+    public TexturePair $textures;
+
+    /**
+     * The texture this frame reads holds an EV from the frame before.
+     */
+    public bool $filled;
+
+    public constructor(Device $device)
+    {
+        $this->textures = TexturePair(
+            exposureTexture($device, 'deferred.exposure.a'),
+            exposureTexture($device, 'deferred.exposure.b')
+        );
+        $this->filled = false;
+    }
+
+    public function destroy() : void
+    {
+        $this->textures->destroy();
+    }
+}
+
+internal function exposureTexture(Device $device, string $label) : Texture
+{
+    TextureDesc $desc = TextureDesc($format: .rgba32f, $width: 1, $height: 1);
+    // transfer so dcapture can read the EV back; the play path never copies it
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC;
+    $desc->label = $label;
+    return Texture($device, $label, $desc);
+}
+
+/**
+ * An image on `ToneMapData` a stage reads or leaves for the stages after it.
+ */
+internal enum ToneImage
+{
+    case scene;
+    case luma;
+    case coarse;
+    case stats;
+    case grid;
+    case base;
+}
+
+/**
+ * The chain's mailbox for one frame: the uniforms the renderer built and the scene it maps,
+ * then each stage's output as it is added. A stage reads the fields the stages before it
+ * filled; a field that is still null means that stage did not run this frame.
+ */
+public class ToneMapData
+{
+    public ToneMapUniforms $uniforms;
+
+    /**
+     * The lit HDR scene the meter reads and the resolve maps.
+     */
+    public TextureRef $scene;
+    public TextureRef? $luma;
+    public TextureRef? $coarse;
+    public TextureRef? $stats;
+    public TextureRef? $exposure;
+    public TextureRef? $grid;
+    public TextureRef? $base;
+
+    public constructor(ToneMapUniforms $uniforms, TextureRef $scene)
+    {
+        $this->uniforms = $uniforms;
+        $this->scene = $scene;
+        $this->luma = null;
+        $this->coarse = null;
+        $this->stats = null;
+        $this->exposure = null;
+        $this->grid = null;
+        $this->base = null;
+    }
+
+    internal const function image(ToneImage $which) : TextureRef?
+    {
+        if ($which == ToneImage::scene) {
+            return $this->scene;
+        } else if ($which == ToneImage::luma) {
+            return $this->luma;
+        } else if ($which == ToneImage::coarse) {
+            return $this->coarse;
+        } else if ($which == ToneImage::stats) {
+            return $this->stats;
+        } else if ($which == ToneImage::grid) {
+            return $this->grid;
+        }
+
+        return $this->base;
+    }
+
+    internal function put(ToneImage $which, TextureRef $ref) : void
+    {
+        assert($which != ToneImage::scene, 'tonemap: no stage writes the scene');
+        if ($which == ToneImage::luma) {
+            $this->luma = $ref;
+        } else if ($which == ToneImage::coarse) {
+            $this->coarse = $ref;
+        } else if ($which == ToneImage::stats) {
+            $this->stats = $ref;
+        } else if ($which == ToneImage::grid) {
+            $this->grid = $ref;
+        } else if ($which == ToneImage::base) {
+            $this->base = $ref;
+        }
+    }
+}
+
+/**
+ * `$program` with the chain's fullscreen layout. `DeferredGpu.load` linked every tone-map
+ * program (the warm list in gpu.eco), so a miss here is a broken bake.
+ */
+internal function tonePass(DeferredGpu $gpu, string $program) : GpuPass
+{
+    ShaderProgram $linked = guard $gpu->shaders->program($program) else ($e) {
+        die($e->message());
+    }
+    return GpuPass($linked, VertexLayout::pos3uv2(), Raster::none());
+}
+
+/**
+ * Opens `$target` and binds `$pass` with the chain's uniforms (`$pass` filled in) at slot 0.
+ * The caller binds its textures and ends with `drawStage`.
+ */
+internal function openStage(
+    RenderContext $ctx,
+    const GpuPass& $pass,
+    TargetRef $target,
+    ToneMapUniforms $uniforms
+) : result<RenderEncoder, PipelineError>
+{
+    RenderEncoder $enc = guard $ctx->beginRender($target, overwrite: true) else ($e) {
+        return .error($e);
+    }
+    $enc->setGpuPass($pass);
+    $enc->upload($uniforms, slot: 0);
+    return .ok($enc);
+}
+
+/**
+ * The same into a texture the renderer owns and imported, overwritten whole.
+ */
+internal function openStage(
+    RenderContext $ctx,
+    const GpuPass& $pass,
+    Texture $out,
+    ToneMapUniforms $uniforms
+) : RenderEncoder
+{
+    ColorTarget $color = ColorTarget($out);
+    $color->load = .dontCare;
+    $color->store = .store;
+    RenderPassDesc $desc = RenderPassDesc();
+    $desc->colors[] = $color;
+    RenderEncoder $enc = $ctx->device->beginRender($desc);
+    $enc->setGpuPass($pass);
+    $enc->upload($uniforms, slot: 0);
+    return $enc;
+}
+
+internal function drawStage(RenderContext $ctx, RenderEncoder $enc, function<Mesh()> $quad) : status<PipelineError>
+{
+    Mesh $mesh = $ctx->pool->cache<Mesh>('quad', $quad);
+    $mesh->draw($enc);
+    $enc->endRender();
+    return .ok;
+}
+
+/**
+ * Binds the pooled `$ref` at `$slot`, ending the encoder when it fails.
+ */
+internal function bindStage(
+    RenderContext $ctx,
+    RenderEncoder $enc,
+    uint32 $slot,
+    TextureRef? $ref,
+    Sampler $sampler
+) : status<PipelineError>
+{
+    TextureRef $held = guard $ref else {
+        $enc->endRender();
+        return .error(.unread('tonemap stage input'));
+    }
+    guard bindPooled($ctx, $enc, $slot, $held, $sampler) else ($e) {
+        $enc->endRender();
+        return .error($e);
+    }
+    return .ok;
+}
+
+/**
+ * One stage of the chain that reads one image off `ToneMapData` (the grid also the exposure)
+ * and draws `$program` into a pooled target of its own, leaving the result on `ToneMapData`:
+ * the luma, the coarse cells, the meter's reduce, the grid, each axis of both blurs and the
+ * upsample.
+ */
+public class ToneStagePass : Pass
+{
+    private DeferredGpu $gpu;
+    private function<Mesh()> $quad;
+    private GpuPass $draw;
+    private string $name;
+    private ToneImage $input;
+    private Sampler $sampler;
+    private string $targetName;
+    private ToneImage $output;
+    private string $colorName;
+    private PixelFormat $format;
+
+    /**
+     * Also reads the exposure at slot 1 (the adapted EV, or white).
+     */
+    private bool $exposed;
+
+    /**
+     * The target's size; the chain moves the luma's with the scene.
+     */
+    internal int32 $width;
+    internal int32 $height;
+
+    /**
+     * This stage's `ToneMapUniforms.pass`. Zero except on the blurs, whose sigma the chain
+     * sets each frame.
+     */
+    internal Vec4 $params;
+    private TargetRef? $target;
+    private TextureRef? $source;
+
+    internal constructor(
+        DeferredGpu $gpu,
+        function<Mesh()> $quad,
+        string $name,
+        string $program,
+        ToneImage $input,
+        Sampler $sampler,
+        string $target,
+        int32 $width,
+        int32 $height,
+        ToneImage $output,
+        string $color,
+        PixelFormat $format,
+        exposed: bool $exposed = false
+    )
+    {
+        $this->gpu = $gpu;
+        $this->quad = $quad;
+        $this->draw = tonePass($gpu, $program);
+        $this->name = $name;
+        $this->input = $input;
+        $this->sampler = $sampler;
+        $this->targetName = $target;
+        $this->width = $width;
+        $this->height = $height;
+        $this->output = $output;
+        $this->colorName = $color;
+        $this->format = $format;
+        $this->exposed = $exposed;
+        $this->params = Vec4(0.0f);
+        $this->target = null;
+        $this->source = null;
+    }
+
+    public function name() : string
+    {
+        return $this->name;
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        ToneMapData $data = $frame->get<ToneMapData>();
+        TextureRef $source = guard $data->image($this->input);
+        $io->reads($source);
+        if ($this->exposed) {
+            readExposure($io, $data);
+        }
+
+        TargetRef $target = $pipeline->createTarget($this->targetName, $this->width, $this->height);
+        $data->put($this->output, $pipeline->createColor($target, $this->colorName, TextureOptions($format: $this->format)));
+        $this->source = $source;
+        $this->target = $target;
+        $io->writes($target);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        ToneMapData $data = $ctx->frame->get<ToneMapData>();
+        TargetRef $target = guard $this->target;
+        ToneMapUniforms $uniforms = $data->uniforms;
+        $uniforms->pass = $this->params;
+        RenderEncoder $enc = guard openStage($ctx, $this->draw, $target, $uniforms) else ($e) {
+            return .error($e);
+        }
+        guard bindStage($ctx, $enc, 0, $this->source, $this->sampler) else ($e) {
+            return .error($e);
+        }
+        if ($this->exposed) {
+            guard bindExposure($ctx, $enc, $this->gpu, 1, $data) else ($e) {
+                return .error($e);
+            }
+        }
+        return drawStage($ctx, $enc, $this->quad);
+    }
+}
+
+/**
+ * Meters the ground illuminance and the frame's highlights and walks last frame's EV towards
+ * the target, into the history texture written this frame.
+ */
+public class ExposurePass : Pass
+{
+    private DeferredGpu $gpu;
+    private function<Mesh()> $quad;
+    private GpuPass $plain;
+
+    /**
+     * With the sky's irradiance probe added to the metered light.
+     */
+    private GpuPass $probe;
+
+    /**
+     * The renderer's history this frame; the chain sets it before each add.
+     */
+    internal ExposureHistory? $history;
+    private TextureRef? $previous;
+
+    internal constructor(DeferredGpu $gpu, function<Mesh()> $quad)
+    {
+        $this->gpu = $gpu;
+        $this->quad = $quad;
+        $this->plain = tonePass($gpu, 'tonemap_exposure');
+        $this->probe = tonePass($gpu, 'tonemap_exposure+probe');
+        $this->history = null;
+        $this->previous = null;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.tonemap.exposure';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        ToneMapData $data = $frame->get<ToneMapData>();
+        TextureRef $stats = guard $data->stats;
+        $io->reads($stats);
+        IblData? $ibl = $frame->find<IblData>();
+        if ($ibl != null) {
+            IblData $found = guard $ibl;
+            $io->reads($found->irradiance);
+            $io->reads($found->irradianceB);
+        }
+
+        ExposureHistory $history = guard $this->history;
+        TexturePair $textures = $history->textures;
+        $textures->flip();
+        TextureRef $written = $pipeline->importTexture('exposure.history', $textures->written());
+        TextureRef $previous = $pipeline->importTexture('exposure.previous', $textures->read());
+        $io->reads($previous);
+        $io->writes($written);
+        $data->exposure = $written;
+        $this->previous = $previous;
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        ToneMapData $data = $ctx->frame->get<ToneMapData>();
+        IblData? $ibl = $ctx->frame->find<IblData>();
+        TextureRef $written = guard $data->exposure;
+        Texture $out = guard $ctx->pool->getTexture($written) else ($e) {
+            return .error(.pool($e));
+        }
+
+        RenderEncoder $enc = $this->open($ctx, $ibl != null, $out, $data->uniforms);
+        guard bindStage($ctx, $enc, 0, $data->stats, $this->gpu->point) else ($e) {
+            return .error($e);
+        }
+        guard bindStage($ctx, $enc, 1, $this->previous, $this->gpu->point) else ($e) {
+            return .error($e);
+        }
+        if ($ibl != null) {
+            IblData $found = guard $ibl;
+            // irradiance is a single mip; a mip-linear cube sampler reads garbage on iOS
+            guard bindStage($ctx, $enc, 6, $found->irradiance, $this->gpu->linear) else ($e) {
+                return .error($e);
+            }
+            guard bindStage($ctx, $enc, 9, $found->irradianceB, $this->gpu->linear) else ($e) {
+                return .error($e);
+            }
+        }
+        return drawStage($ctx, $enc, $this->quad);
+    }
+
+    private function open(RenderContext $ctx, bool $probe, Texture $out, ToneMapUniforms $uniforms) : RenderEncoder
+    {
+        if ($probe) {
+            return openStage($ctx, $this->probe, $out, $uniforms);
+        }
+        return openStage($ctx, $this->plain, $out, $uniforms);
+    }
+}
+
+/**
+ * Exposes, compresses (with the local operator), curves and display-encodes the scene into the
+ * output target.
+ */
+public class ToneMapPass : Pass
+{
+    private DeferredGpu $gpu;
+    private function<Mesh()> $quad;
+
+    /**
+     * One resolve per curve, each without and with the local operator (which reads the grid
+     * and the base): `ToneCurve.index * 2 + local`. Built once, so switching curves in play
+     * links nothing and allocates nothing.
+     */
+    private array<GpuPass> $passes;
+
+    /**
+     * The frame's output; the chain sets it before each add.
+     */
+    internal TargetRef? $target;
+
+    /**
+     * The curve this frame resolves with; the chain sets it before each add.
+     */
+    internal ToneCurve $curve;
+
+    internal constructor(DeferredGpu $gpu, function<Mesh()> $quad)
+    {
+        $this->gpu = $gpu;
+        $this->quad = $quad;
+        array<ToneCurve> $curves = toneCurves();
+        array<GpuPass> $passes = arr::room<GpuPass>($curves->count() * 2);
+        foreach ($curves as $curve) {
+            $passes[] = tonePass($gpu, $curve->program(false));
+            $passes[] = tonePass($gpu, $curve->program(true));
+        }
+        $this->passes = mv $passes;
+        $this->target = null;
+        $this->curve = .aces;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.tonemap';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        ToneMapData $data = $frame->get<ToneMapData>();
+        TargetRef $target = guard $this->target;
+        $io->reads($data->scene);
+        readExposure($io, $data);
+        // the grid stages ran this frame exactly when the local operator is on
+        if ($data->grid != null) {
+            TextureRef $grid = guard $data->grid;
+            TextureRef $base = guard $data->base;
+            $io->reads($grid);
+            $io->reads($base);
+        }
+        $io->writes($target);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        ToneMapData $data = $ctx->frame->get<ToneMapData>();
+        TargetRef $target = guard $this->target;
+        bool $local = $data->grid != null;
+        RenderEncoder $enc = guard $this->open($ctx, $local, $target, $data->uniforms) else ($e) {
+            return .error($e);
+        }
+        guard bindStage($ctx, $enc, 0, $data->scene, $this->gpu->point) else ($e) {
+            return .error($e);
+        }
+        guard bindExposure($ctx, $enc, $this->gpu, 1, $data) else ($e) {
+            return .error($e);
+        }
+        if ($local) {
+            guard bindStage($ctx, $enc, 2, $data->grid, $this->gpu->linear) else ($e) {
+                return .error($e);
+            }
+            guard bindStage($ctx, $enc, 3, $data->base, $this->gpu->linear) else ($e) {
+                return .error($e);
+            }
+        }
+        return drawStage($ctx, $enc, $this->quad);
+    }
+
+    private function open(
+        RenderContext $ctx,
+        bool $local,
+        TargetRef $target,
+        ToneMapUniforms $uniforms
+    ) : result<RenderEncoder, PipelineError>
+    {
+        int32 $slot = $this->curve->index() * 2;
+        if ($local) {
+            $slot = $slot + 1;
+        }
+        return openStage($ctx, $this->passes[$slot as usize], $target, $uniforms);
+    }
+}
+
+/**
+ * Every pass of the display end, built once per renderer with its `GpuPass` and the quad
+ * factory, then re-added each frame: the chain allocates no pass, no pipeline key and no
+ * closure in the displayed frame.
+ */
+internal class ToneMapChain
+{
+    private ToneStagePass $luma;
+    private ToneStagePass $coarse;
+    private ToneStagePass $reduce;
+    private ExposurePass $exposure;
+    private ToneStagePass $grid;
+    private ToneStagePass $gridX;
+    private ToneStagePass $gridY;
+    private ToneStagePass $gridZ;
+    private ToneStagePass $baseX;
+    private ToneStagePass $baseY;
+    private ToneStagePass $upsample;
+    private ToneMapPass $resolve;
+
+    public constructor(DeferredGpu $gpu)
+    {
+        Device $device = $gpu->device;
+        function<Mesh()> $quad = function() : Mesh {
+            return .quad($device);
+        };
+        int32 $atlas = TONEMAP_GRID_W * TONEMAP_GRID_SLICES;
+        // the luma's size follows the scene; `add` sets it
+        $this->luma = ToneStagePass($gpu, $quad, 'deferred.tonemap.luma', 'tonemap_luma', .scene, $gpu->linear, 'tonemap.luma', 1, 1, .luma, 'luma', .r16f);
+        $this->coarse = ToneStagePass($gpu, $quad, 'deferred.tonemap.coarse', 'tonemap_coarse', .luma, $gpu->point, 'tonemap.coarse', TONEMAP_GRID_W, TONEMAP_GRID_H, .coarse, 'coarse', .rg16f);
+        $this->reduce = ToneStagePass($gpu, $quad, 'deferred.tonemap.reduce', 'tonemap_reduce', .coarse, $gpu->point, 'tonemap.stats', TONEMAP_GRID_W / 8, TONEMAP_GRID_H / 8, .stats, 'stats', .rg16f);
+        $this->exposure = ExposurePass($gpu, $quad);
+        $this->grid = ToneStagePass($gpu, $quad, 'deferred.tonemap.grid', 'tonemap_grid', .luma, $gpu->point, 'tonemap.grid', $atlas, TONEMAP_GRID_H, .grid, 'grid', .rg16f, exposed: true);
+        $this->gridX = ToneStagePass($gpu, $quad, 'deferred.tonemap.grid.blur', 'tonemap_blur', .grid, $gpu->point, 'tonemap.grid.x', $atlas, TONEMAP_GRID_H, .grid, 'grid', .rg16f);
+        $this->gridY = ToneStagePass($gpu, $quad, 'deferred.tonemap.grid.blur', 'tonemap_blur', .grid, $gpu->point, 'tonemap.grid.y', $atlas, TONEMAP_GRID_H, .grid, 'grid', .rg16f);
+        $this->gridZ = ToneStagePass($gpu, $quad, 'deferred.tonemap.grid.blur', 'tonemap_blur', .grid, $gpu->point, 'tonemap.grid.z', $atlas, TONEMAP_GRID_H, .grid, 'grid', .rg16f);
+        $this->baseX = ToneStagePass($gpu, $quad, 'deferred.tonemap.base.blur', 'tonemap_blur+base', .coarse, $gpu->point, 'tonemap.base.x', TONEMAP_GRID_W, TONEMAP_GRID_H, .base, 'base', .r16f);
+        $this->baseY = ToneStagePass($gpu, $quad, 'deferred.tonemap.base.blur', 'tonemap_blur+base', .base, $gpu->point, 'tonemap.base.y', TONEMAP_GRID_W, TONEMAP_GRID_H, .base, 'base', .r16f);
+        $this->upsample = ToneStagePass($gpu, $quad, 'deferred.tonemap.upsample', 'tonemap_upsample', .base, $gpu->linear, 'tonemap.base', TONEMAP_BASE_W, TONEMAP_BASE_H, .base, 'base', .r16f);
+        $this->resolve = ToneMapPass($gpu, $quad);
+    }
+
+    /**
+     * Adds this frame's passes: the meter and auto exposure when `$history` is there, the grid
+     * and the base when `$map.local`, then the resolve into `$output`. Needs `ToneMapData` on
+     * the frame already.
+     */
+    public function add(Pipeline $pipeline, const ToneMap& $map, ExposureHistory? $history, TargetRef $output) : void
+    {
+        bool $local = $map->local;
+        if ($history != null || $local) {
+            $this->luma->width = toneLumaSize($output->width);
+            $this->luma->height = toneLumaSize($output->height);
+            $pipeline->add($this->luma);
+            $pipeline->add($this->coarse);
+        }
+
+        if ($history != null) {
+            ExposureHistory $held = guard $history;
+            $pipeline->add($this->reduce);
+            $this->exposure->history = $held;
+            $pipeline->add($this->exposure);
+            $held->filled = true;
+        }
+
+        if ($local) {
+            float32 $slices = TONEMAP_GRID_SLICES as float32;
+            $this->gridX->params = Vec4(0.0f, $map->spatial, blurRadius($map->spatial), $slices);
+            $this->gridY->params = Vec4(1.0f, $map->spatial, blurRadius($map->spatial), $slices);
+            $this->gridZ->params = Vec4(2.0f, $map->tonal, blurRadius($map->tonal), $slices);
+            // the radius covers about three sigma of the Gaussian
+            $this->baseX->params = Vec4(0.0f, $map->wide / 3.0f, $map->wide, 1.0f);
+            $this->baseY->params = Vec4(1.0f, $map->wide / 3.0f, $map->wide, 1.0f);
+            $pipeline->add($this->grid);
+            $pipeline->add($this->gridX);
+            $pipeline->add($this->gridY);
+            $pipeline->add($this->gridZ);
+            $pipeline->add($this->baseX);
+            $pipeline->add($this->baseY);
+            $pipeline->add($this->upsample);
+        }
+
+        $this->resolve->target = $output;
+        $this->resolve->curve = $map->curve;
+        $pipeline->add($this->resolve);
+    }
+}
+
+internal function readExposure(IoSink $io, ToneMapData $data) : void
+{
+    TextureRef? $exposure = $data->exposure;
+    if ($exposure != null) {
+        TextureRef $held = guard $exposure;
+        $io->reads($held);
+    }
+}
+
+/**
+ * The adapted EV at `$slot` when auto exposure ran this frame, white otherwise (the shader then
+ * reads the EV from the uniforms and never samples it).
+ */
+internal function bindExposure(
+    RenderContext $ctx,
+    RenderEncoder $enc,
+    DeferredGpu $gpu,
+    uint32 $slot,
+    ToneMapData $data
+) : status<PipelineError>
+{
+    TextureRef? $exposure = $data->exposure;
+    if ($exposure == null) {
+        $enc->bindTexture($slot, $gpu->white, $gpu->point);
+        return .ok;
+    }
+    return bindStage($ctx, $enc, $slot, $exposure, $gpu->point);
+}
+
+/**
+ * Taps each side for a Gaussian of `$sigma`: about three sigma, at least one.
+ */
+internal function blurRadius(float32 $sigma) : float32
+{
+    float32 $taps = ($sigma * 3.0f + 0.5f) as int32 as float32;
+    if ($taps < 1.0f) {
+        return 1.0f;
+    }
+    return $taps;
+}

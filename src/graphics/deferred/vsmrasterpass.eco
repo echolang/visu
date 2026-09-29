@@ -1,0 +1,39 @@
+/**
+ * Draws this frame's dirty shadow atlas pages: one clear quad each, then their casters, in one
+ * encoder on the atlas. Ordered after `VsmPass` and before the light pass.
+ */
+
+namespace visu::graphics;
+
+public class VsmRasterPass : Pass
+{
+    private GpuScene $scene;
+    private GBufferData $gbuffer;
+    private DeferredGpu $gpu;
+
+    public constructor(GpuScene $scene, GBufferData $gbuffer, DeferredGpu $gpu)
+    {
+        $this->scene = $scene;
+        $this->gbuffer = $gbuffer;
+        $this->gpu = $gpu;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.vsm.raster';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        $io->reads($this->gbuffer->position);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        LightClusterData $clusters = guard $ctx->frame->find<LightClusterData>() else {
+            return .ok;
+        }
+        $clusters->atlas->draw($ctx, $clusters, $this->scene, $this->gpu);
+        return .ok;
+    }
+}

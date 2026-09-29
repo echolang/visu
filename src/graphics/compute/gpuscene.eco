@@ -1,0 +1,757 @@
+/**
+ * The scene the GPU draws its depth-only views from: every model's LOD table, every placed
+ * static as a persistent row, this frame's movers (dynamics and skins), and the views to cull
+ * against. `cull` runs the kernels that pick levels, cull instances and clusters, and bucket
+ * the surviving clusters into draw items by (pass, material bucket); `draw` records one pass as
+ * one indirect draw per bucket, whatever the GPU found. The CPU never learns what was drawn.
+ * The `DeferredRenderer` owns one per scene and adds its cull pass ahead of the shadow pass;
+ * `ModelSystem` fills it (rows on place and release, movers each frame) and draws from it.
+ */
+
+namespace visu::graphics;
+
+use visu::geo::{AABB, Frustum, Plane};
+use visu::math::{Mat4, Vec3, Vec4};
+
+/**
+ * Passes a view can draw in: the five sun cascades now, a shadow atlas later.
+ */
+public const int32 SCENE_PASSES_MAX = 8;
+
+/**
+ * Shadow buckets a frame can draw: the opaque one plus alpha-tested materials. A material past
+ * the cap casts nothing through the scene; the bank has never come close.
+ */
+public const int32 SCENE_BUCKETS_MAX = 128;
+
+/**
+ * Segments the scan hands out, passes times buckets. `scene_scan.comp` runs one group this wide.
+ */
+public const int32 SCENE_SEGMENTS_MAX = 1024;
+
+/**
+ * (instance, view) pairs one frame can keep. Past this a pair is dropped and counted.
+ */
+public const int32 SCENE_MAX_PAIRS = 65536;
+
+/**
+ * Draw items one frame can keep, each a cluster in one view: 4 MB at 16 bytes. Past this an
+ * item is dropped and counted.
+ */
+public const int32 SCENE_MAX_ITEMS = 262144;
+
+/**
+ * Vertices one draw item expands to: `DEPTH_CLUSTER_TRIANGLES` triangles.
+ */
+public const int32 SCENE_ITEM_VERTICES = 192;
+
+public const uint32 SCENE_INSTANCE_LIVE = 1;
+public const uint32 SCENE_INSTANCE_CASTS = 2;
+public const uint32 SCENE_INSTANCE_SKINNED = 4;
+
+/**
+ * Boxes `GpuScene.changed` keeps one frame before it folds the rest into the last.
+ */
+public const int32 SCENE_CHANGED_MAX = 64;
+
+/**
+ * The pass of a GPU-written view that holds nothing this frame; the cull skips it.
+ */
+public const uint32 SCENE_PASS_NONE = 0xFFFFFFFF;
+
+/**
+ * The counter and argument words, as `visu/scenecull.glsl` lays them out: pairs kept and
+ * dropped, items dropped, then per segment the items it holds, the scan cursor and its end;
+ * the arguments are the cluster walk's dispatch, then one indirect draw per segment.
+ */
+internal const int32 SCENE_COUNTER_PAIRS = 0;
+internal const int32 SCENE_COUNTER_PAIRS_DROPPED = 1;
+internal const int32 SCENE_COUNT_BASE = 4;
+internal const int32 SCENE_COUNTER_WORDS = SCENE_COUNT_BASE + 3 * SCENE_SEGMENTS_MAX;
+internal const int32 SCENE_ARGS_DRAW_BASE = 4;
+internal const int32 SCENE_ARGS_WORDS = SCENE_ARGS_DRAW_BASE + 4 * SCENE_SEGMENTS_MAX;
+
+/**
+ * One instance row (std430 `SceneInstance`, 112 bytes): world matrix, world bounds with the
+ * instance LOD bias in `lo.w` and the first palette row in `hi.w`, the scene model and flags.
+ */
+public struct SceneInstanceGpu
+{
+    public Mat4 $world;
+    public Vec4 $lo;
+    public Vec4 $hi;
+    public uint32 $model;
+    public uint32 $flags;
+    public uint32 $pad0 = 0;
+    public uint32 $pad1 = 0;
+}
+
+/**
+ * One model row (std430 `SceneModel`, 96 bytes): its LOD table in the arena's cluster space.
+ */
+public struct SceneModelGpu
+{
+    public uint32 $lodCount;
+    public uint32 $flags;
+    public uint32 $stride;
+    public uint32 $pad0;
+    public float32 $lodBias;
+    public float32 $cullDistance;
+    public float32 $pad1;
+    public float32 $pad2;
+    public float32[8] $distance;
+    public uint32[8] $start;
+
+    public constructor()
+    {
+        $this->lodCount = 0;
+        $this->flags = 0;
+        $this->stride = 0;
+        $this->pad0 = 0;
+        $this->lodBias = 1.0f;
+        $this->cullDistance = 0.0f;
+        $this->pad1 = 0.0f;
+        $this->pad2 = 0.0f;
+        float32[8] $distance;
+        uint32[8] $start;
+        int32 $i = 0;
+        while ($i < 8) {
+            $distance[$i] = 0.0f;
+            $start[$i] = 0;
+            $i = $i + 1;
+        }
+
+        $this->distance = mv $distance;
+        $this->start = mv $start;
+    }
+}
+
+/**
+ * One view (std430 `SceneView`, 112 bytes): six frustum planes and the pass it draws in.
+ */
+public struct SceneViewGpu
+{
+    public Vec4[6] $planes;
+    public uint32 $pass;
+    public uint32 $kind;
+    public uint32 $pad0;
+    public uint32 $pad1;
+
+    public constructor(const Frustum& $frustum, int32 $pass)
+    {
+        $this->planes = scenePlanes($frustum);
+        $this->pass = $pass as uint32;
+        $this->kind = 0;
+        $this->pad0 = 0;
+        $this->pad1 = 0;
+    }
+}
+
+/**
+ * The culling kernels' uniform (std140 `SceneCullParams`).
+ */
+internal struct SceneCullParams
+{
+    public Vec4 $eye;
+    public uint32 $statics;
+    public uint32 $movers;
+    public uint32 $views;
+    public uint32 $buckets;
+    public uint32 $maxPairs;
+    public uint32 $maxItems;
+    public uint32 $mode;
+    public uint32 $passes;
+}
+
+internal function scenePlane(const Plane& $p) : Vec4
+{
+    return Vec4($p->normal->x, $p->normal->y, $p->normal->z, $p->distance);
+}
+
+/**
+ * The six planes in the order every cull kernel tests them: left, right, top, bottom, near, far.
+ */
+internal function scenePlanes(const Frustum& $frustum) : Vec4[6]
+{
+    Vec4[6] $p;
+    $p[0] = scenePlane($frustum->left);
+    $p[1] = scenePlane($frustum->right);
+    $p[2] = scenePlane($frustum->top);
+    $p[3] = scenePlane($frustum->bottom);
+    $p[4] = scenePlane($frustum->near);
+    $p[5] = scenePlane($frustum->far);
+    return $p;
+}
+
+public class GpuScene
+{
+    public Device $device;
+
+    /**
+     * The bank whose arena the rows point into and whose materials the alpha buckets bind.
+     * `ModelSystem` sets it before its first row.
+     */
+    public ModelBank? $bank;
+
+    /**
+     * The global LOD multiplier, as `ModelSystem` reads it.
+     */
+    public float32 $lodBias;
+
+    /**
+     * This frame's joint palette in the ring, or null with no skin on screen. `ModelSystem`
+     * sets it in `fill`; every depth draw binds it at slot 2.
+     */
+    public TransientSlice? $palette;
+
+    /**
+     * World boxes where casters changed this frame: statics placed, moved or removed, movers
+     * that moved (last and this frame's box). The shadow atlas drops the pages of every light
+     * these reach. Past `SCENE_CHANGED_MAX` the rest fold into the last box, which stays
+     * conservative.
+     */
+    public array<AABB> $changed;
+
+    /**
+     * The sun cascades' set and the shadow atlas pages' set.
+     */
+    public SceneCullSet $cascades;
+    public SceneCullSet $pages;
+    private GpuTable<SceneModelGpu> $models;
+    private GpuTable<SceneInstanceGpu> $statics;
+    private array<SceneInstanceGpu> $movers;
+    private array<SceneViewGpu> $views;
+    private TransientSlice? $moverSlice;
+    private TransientSlice? $standIn;
+    private uint64 $standInFrame;
+    private uint64 $preparedFrame;
+    private bool $prepared;
+    private GpuPass? $opaque;
+    private GpuPass? $alpha;
+
+    public constructor(Device $device)
+    {
+        $this->device = $device;
+        $this->bank = null;
+        $this->lodBias = 1.0f;
+        $this->palette = null;
+        $this->changed = arr::room<AABB>(SCENE_CHANGED_MAX as usize);
+        $this->cascades = SceneCullSet('scene.cascades');
+        $this->pages = SceneCullSet('scene.pages');
+        $this->models = GpuTable<SceneModelGpu>($device, 'scene.models');
+        $this->statics = GpuTable<SceneInstanceGpu>($device, 'scene.statics');
+        $this->movers = arr::room<SceneInstanceGpu>(64);
+        $this->views = arr::room<SceneViewGpu>(SCENE_PASSES_MAX);
+        $this->moverSlice = null;
+        $this->standIn = null;
+        $this->standInFrame = 0;
+        $this->preparedFrame = 0;
+        $this->prepared = false;
+        $this->opaque = null;
+        $this->alpha = null;
+    }
+
+    /**
+     * Something to draw: a static placed or a mover this frame.
+     */
+    public const function moverCount() : int32
+    {
+        return $this->movers->count() as int32;
+    }
+
+    public const function active() : bool
+    {
+        return $this->statics->rows > 0 || $this->movers->count() > 0;
+    }
+
+    /**
+     * Row `$index` becomes `$model`'s LOD table. Its arena clusters must be uploaded; a model the
+     * arena does not hold gets an empty table and draws nothing.
+     */
+    public function setModel(int32 $index, Model $model) : void
+    {
+        SceneModelGpu $row = SceneModelGpu();
+        ArenaModel? $placed = $model->arena;
+        if ($placed != null) {
+            ArenaModel $arena = guard $placed;
+            int32 $levels = $model->lods->count() as int32;
+            if ($levels > 7) {
+                $levels = 7;
+            }
+
+            $row->lodCount = $levels as uint32;
+            $row->stride = $arena->stride as uint32;
+            if ($arena->skinned) {
+                $row->flags = SCENE_INSTANCE_SKINNED;
+            }
+
+            $row->lodBias = $model->lodBias;
+            $row->cullDistance = $model->cullDistance;
+            int32 $i = 0;
+            while ($i < $levels) {
+                $row->distance[$i] = $model->lods[$i as usize]->distance;
+                $row->start[$i] = $arena->lodStart[$i as usize] as uint32;
+                $i = $i + 1;
+            }
+
+            $row->start[$levels] = $arena->lodStart[$levels as usize] as uint32;
+        }
+
+        $this->models->set($index, $row);
+    }
+
+    /**
+     * Static row `$slot` draws scene model `$model` at `$world` from now on.
+     */
+    public function placeStatic(
+        int32 $slot,
+        int32 $model,
+        const Mat4& $world,
+        const AABB& $bounds,
+        float32 $lodBias,
+        bool $casts
+    ) : void
+    {
+        $this->statics->set($slot, sceneInstance($model, $world, $bounds, $lodBias, 0.0f, $casts, false));
+        $this->change($bounds);
+    }
+
+    /**
+     * Static row `$slot`, last standing in `$bounds`, draws nothing until it is placed again.
+     */
+    public function releaseStatic(int32 $slot, const AABB& $bounds) : void
+    {
+        SceneInstanceGpu $dead = sceneInstance(0, Mat4(), AABB(Vec3(0.0f), Vec3(0.0f)), 1.0f, 0.0f, false, false);
+        $dead->flags = 0;
+        $this->statics->set($slot, $dead);
+        $this->change($bounds);
+    }
+
+    /**
+     * Casters changed inside `$box` this frame.
+     */
+    public function change(const AABB& $box) : void
+    {
+        foldBox($this->changed, $box, SCENE_CHANGED_MAX);
+    }
+
+    /**
+     * Forget this frame's movers. `ModelSystem.fill` calls it before it adds them again.
+     */
+    public function clearMovers() : void
+    {
+        $this->movers->clear();
+    }
+
+    /**
+     * One dynamic or skinned instance, this frame only. `$skinBase` is its first palette row.
+     */
+    public function addMover(
+        int32 $model,
+        const Mat4& $world,
+        const AABB& $bounds,
+        float32 $lodBias,
+        float32 $skinBase,
+        bool $skinned,
+        bool $casts
+    ) : void
+    {
+        $this->movers[] = sceneInstance($model, $world, $bounds, $lodBias, $skinBase, $casts, $skinned);
+    }
+
+    /**
+     * Drop every row: the scene's models and statics are gone (a reload, a new map).
+     */
+    public function clear() : void
+    {
+        $this->models->clear();
+        $this->statics->clear();
+        $this->movers->clear();
+        $this->changed->clear();
+        $this->cascades->culled = false;
+        $this->pages->culled = false;
+        $this->prepared = false;
+    }
+
+    /**
+     * Once per frame, by whichever cull runs first: grow the tables, scatter their queued rows,
+     * and put the movers in the ring. False when there is nothing to cull.
+     */
+    public function prepare(RenderContext $ctx) : bool
+    {
+        uint64 $frame = $this->device->frameIndex();
+        if ($this->prepared && $this->preparedFrame == $frame) {
+            return true;
+        }
+
+        ModelBank $bank = guard $this->bank else {
+            return false;
+        }
+        if (!$this->active() || $bank->arena->empty()) {
+            return false;
+        }
+
+        ComputeProgram $scatter = guard $this->device->gpuShaders->kernel($this->device, 'scene_scatter') else ($e) {
+            die($e->message());
+        }
+        $this->models->grow($ctx);
+        $this->statics->grow($ctx);
+        $this->moverSlice = $this->uploadMovers();
+        ComputeEncoder $enc = $ctx->beginCompute();
+        $this->models->scatter($enc, $scatter);
+        $this->statics->scatter($enc, $scatter);
+        $enc->endCompute();
+        $this->prepared = true;
+        $this->preparedFrame = $frame;
+        return true;
+    }
+
+    /**
+     * Cull the sun cascades from `ShadowMapData` into the cascade set, one pass each.
+     */
+    public function cullCascades(RenderContext $ctx) : void
+    {
+        $this->cascades->culled = false;
+        ShadowMapData $shadows = guard $ctx->frame->find<ShadowMapData>() else {
+            return;
+        }
+        if (!$this->prepare($ctx)) {
+            return;
+        }
+
+        $this->views->clear();
+        int32 $c = 0;
+        while ($c < SHADOW_CASCADES) {
+            $this->views[] = SceneViewGpu($shadows->cascades[$c]->frustum, $c);
+            $c = $c + 1;
+        }
+
+        TransientSlice $slice = transientRows<SceneViewGpu>($this->device, $this->views, 1);
+        visu::profile::begin('scene');
+        $this->cull($ctx, $this->cascades, $slice, null, $this->views->count() as int32, SHADOW_CASCADES);
+        visu::profile::end();
+    }
+
+    /**
+     * Cull `$count` views the GPU wrote into `$views` (inactive ones carry pass
+     * `SCENE_PASS_NONE`) into the page set, all drawing in pass 0.
+     */
+    public function cullPages(RenderContext $ctx, Buffer $views, int32 $count) : void
+    {
+        $this->pages->culled = false;
+        if (!$this->prepare($ctx)) {
+            return;
+        }
+
+        visu::profile::begin('scene');
+        $this->cull($ctx, $this->pages, null, $views, $count, 1);
+        visu::profile::end();
+    }
+
+    /**
+     * Record cascade `$pass` into an open depth encoder whose camera (slot 1) is that cascade's.
+     */
+    public function drawCascade(RenderEncoder $enc, int32 $pass) : void
+    {
+        $this->ensurePasses();
+        GpuPass $opaque = guard $this->opaque else {
+            return;
+        }
+        GpuPass $alpha = guard $this->alpha else {
+            return;
+        }
+        $this->draw($enc, $this->cascades, $pass, $opaque, $alpha);
+    }
+
+    /**
+     * Record `$set`'s pass `$pass` with `$opaque` for the opaque bucket and `$alpha` for every
+     * alpha-tested one (its material bound): one indirect draw per bucket, whatever the GPU
+     * kept. Binds the arena, the instances and the items at storage 0..5 and the palette at
+     * slot 2; storage 6 and 7 are the caller's.
+     */
+    public function draw(RenderEncoder $enc, SceneCullSet $set, int32 $pass, GpuPass $opaque, GpuPass $alpha) : void
+    {
+        if (!$set->culled || $pass < 0 || $pass >= $set->passes) {
+            return;
+        }
+
+        ModelBank $bank = guard $this->bank else {
+            return;
+        }
+        TransientSlice $movers = guard $this->moverSlice else {
+            return;
+        }
+        Buffer $args = guard $set->args;
+        Buffer $items = guard $set->items;
+        $opaque->bind($enc);
+        $enc->bindUniform(SKIN_PALETTE_SLOT, $this->paletteOrStandIn());
+
+        $enc->bindStorage(0, $bank->arena->vertices());
+        $enc->bindStorage(1, $bank->arena->indexBuffer());
+        $enc->bindStorage(2, $bank->arena->clusterBuffer());
+        $enc->bindStorage(3, $this->statics->buffer());
+        $enc->bindStorage(4, transient: $movers);
+        $enc->bindStorage(5, $items);
+        int32 $b = 0;
+        while ($b < $set->buckets) {
+            uint64 $offset = ((SCENE_ARGS_DRAW_BASE + ($pass * $set->buckets + $b) * 4) * 4) as uint64;
+            if ($b == 1) {
+                $alpha->bind($enc);
+            }
+
+            if ($b > 0) {
+                $bank->bucketMaterial($b)->bind($enc);
+            }
+
+            $enc->drawIndirect($args, $offset);
+            $b = $b + 1;
+        }
+    }
+
+    /**
+     * This frame's palette, or one stand-in slice a frame with no skin on screen: no item reads
+     * it then, but the program's layout still wants the slot.
+     */
+    private function paletteOrStandIn() : TransientSlice
+    {
+        TransientSlice? $palette = $this->palette;
+        if ($palette != null) {
+            TransientSlice $rows = guard $palette;
+            return $rows;
+        }
+
+        uint64 $frame = $this->device->frameIndex();
+        TransientSlice? $standIn = $this->standIn;
+        if ($standIn != null && $this->standInFrame == $frame) {
+            TransientSlice $held = guard $standIn;
+            return $held;
+        }
+
+        uint64 $bytes = (SKIN_PALETTE_ROWS as uint64) * (mem::size<Vec4>() as uint64);
+        TransientSlice $fresh = $this->device->allocTransient($bytes, $this->device->limits->uniformAlign);
+        $this->standIn = $fresh;
+        $this->standInFrame = $frame;
+        return $fresh;
+    }
+
+    /**
+     * Free the working buffers. The renderer calls this when it shuts down.
+     */
+    public function destroy() : void
+    {
+        $this->clear();
+        $this->cascades->destroy();
+        $this->pages->destroy();
+    }
+
+    /**
+     * Instance and cluster culling of `$count` views into `$set`, then the scan that writes its
+     * indirect draws, in one compute encoder. The views are a CPU transient or a GPU buffer.
+     */
+    private function cull(
+        RenderContext $ctx,
+        SceneCullSet $set,
+        TransientSlice? $cpuViews,
+        Buffer? $gpuViews,
+        int32 $count,
+        int32 $passes
+    ) : void
+    {
+        ModelBank $bank = guard $this->bank else {
+            return;
+        }
+        CameraData $camera = guard $ctx->frame->find<CameraData>() else {
+            return;
+        }
+        TransientSlice $movers = guard $this->moverSlice else {
+            return;
+        }
+        GpuShaders $shaders = $this->device->gpuShaders;
+        ComputeProgram $instances = guard $shaders->kernel($this->device, 'scene_instances') else ($e) {
+            die($e->message());
+        }
+        ComputeProgram $pairArgs = guard $shaders->kernel($this->device, 'scene_pair_args') else ($e) {
+            die($e->message());
+        }
+        ComputeProgram $clusters = guard $shaders->kernel($this->device, 'scene_clusters') else ($e) {
+            die($e->message());
+        }
+        ComputeProgram $scan = guard $shaders->kernel($this->device, 'scene_scan') else ($e) {
+            die($e->message());
+        }
+
+        $set->ensure($this->device);
+        Buffer $counters = guard $set->counters;
+        Buffer $args = guard $set->args;
+        Buffer $pairs = guard $set->pairs;
+        Buffer $items = guard $set->items;
+        $this->device->fillBuffer($counters, 0 as uint64, (SCENE_COUNTER_WORDS * 4) as uint64, 0 as uint32);
+        $set->buckets = $bank->shadowBuckets();
+        if ($set->buckets > SCENE_BUCKETS_MAX) {
+            $set->buckets = SCENE_BUCKETS_MAX;
+        }
+
+        $set->passes = $passes;
+        SceneCullParams $params = SceneCullParams(
+            $eye: Vec4($camera->cullPosition, $this->lodBias),
+            $statics: $this->statics->rows as uint32,
+            $movers: $this->movers->count() as uint32,
+            $views: $count as uint32,
+            $buckets: $set->buckets as uint32,
+            $maxPairs: SCENE_MAX_PAIRS as uint32,
+            $maxItems: SCENE_MAX_ITEMS as uint32,
+            $mode: 0,
+            $passes: $passes as uint32
+        );
+        uint32 $rows = ($this->statics->rows as uint32) + ($this->movers->count() as uint32);
+        Buffer $clusterBuffer = $bank->arena->clusterBuffer();
+
+        ComputeEncoder $enc = $ctx->beginCompute();
+        $enc->setKernel($instances);
+        $enc->upload($params, slot: 0);
+        $enc->bindStorage(0, $this->statics->buffer());
+        $enc->bindStorage(1, transient: $movers);
+        $enc->bindStorage(2, $this->models->buffer());
+        sceneBindViews($enc, 3, $cpuViews, $gpuViews);
+        $enc->bindStorage(4, $pairs);
+        $enc->bindStorage(5, $counters);
+        $enc->dispatch($rows, $count as uint32);
+        $enc->barrier();
+
+        $enc->setKernel($pairArgs);
+        $enc->upload($params, slot: 0);
+        $enc->bindStorage(0, $counters);
+        $enc->bindStorage(1, $args);
+        $enc->dispatch(1);
+        $enc->barrier();
+
+        $enc->setKernel($clusters);
+        $enc->upload($params, slot: 0);
+        $this->bindClusterWalk($enc, $pairs, $clusterBuffer, $movers, $cpuViews, $gpuViews, $counters, $items);
+        $enc->dispatchIndirect($args, 0 as uint64);
+        $enc->barrier();
+
+        $enc->setKernel($scan);
+        $enc->upload($params, slot: 0);
+        $enc->bindStorage(0, $counters);
+        $enc->bindStorage(1, $args);
+        $enc->dispatch(SCENE_SEGMENTS_MAX as uint32);
+        $enc->barrier();
+
+        SceneCullParams $write = $params;
+        $write->mode = 1;
+        $enc->setKernel($clusters);
+        $enc->upload($write, slot: 0);
+        $this->bindClusterWalk($enc, $pairs, $clusterBuffer, $movers, $cpuViews, $gpuViews, $counters, $items);
+        $enc->dispatchIndirect($args, 0 as uint64);
+        $enc->endCompute();
+        $set->culled = true;
+    }
+
+    private function bindClusterWalk(
+        ComputeEncoder $enc,
+        Buffer $pairs,
+        Buffer $clusters,
+        TransientSlice $movers,
+        TransientSlice? $cpuViews,
+        Buffer? $gpuViews,
+        Buffer $counters,
+        Buffer $items
+    ) : void
+    {
+        $enc->bindStorage(0, $pairs);
+        $enc->bindStorage(1, $clusters);
+        $enc->bindStorage(2, $this->statics->buffer());
+        $enc->bindStorage(3, transient: $movers);
+        sceneBindViews($enc, 4, $cpuViews, $gpuViews);
+        $enc->bindStorage(5, $counters);
+        $enc->bindStorage(6, $items);
+    }
+
+    /**
+     * The movers in this frame's ring, one zero row when there are none so the binding holds.
+     */
+    private function uploadMovers() : TransientSlice
+    {
+        return transientRows<SceneInstanceGpu>($this->device, $this->movers, 1);
+    }
+
+    private function ensurePasses() : void
+    {
+        if ($this->opaque != null) {
+            return;
+        }
+
+        $this->opaque = depthPullPass($this->device, 'depth_pull');
+        $this->alpha = depthPullPass($this->device, 'depth_pull+alpha');
+    }
+}
+
+/**
+ * A depth-only pass over the gpu tree's vertex-pulling program `$program`.
+ */
+internal function depthPullPass(Device $device, const string& $program) : GpuPass
+{
+    ShaderProgram $shader = guard $device->gpuShaders->program($device, $program) else ($e) {
+        die($e->message());
+    }
+    return GpuPass($shader, VertexLayout::none(), Raster::depth());
+}
+
+/**
+ * Append `$box` to `$boxes`, or past `$max` grow the last box by it, which stays conservative.
+ */
+internal function foldBox(array<AABB>& $boxes, const AABB& $box, int32 $max) : void
+{
+    if (($boxes->count() as int32) < $max) {
+        $boxes[] = $box;
+        return;
+    }
+
+    usize $last = $boxes->count() - 1;
+    AABB $merged = $boxes[$last];
+    $merged->extend($box);
+    $boxes[$last] = $merged;
+}
+
+internal function sceneBindViews(ComputeEncoder $enc, uint32 $slot, TransientSlice? $cpu, Buffer? $gpu) : void
+{
+    if ($cpu != null) {
+        TransientSlice $slice = guard $cpu;
+        $enc->bindStorage($slot, transient: $slice);
+        return;
+    }
+
+    Buffer $buffer = guard $gpu else {
+        die('scene cull without views');
+    }
+    $enc->bindStorage($slot, $buffer);
+}
+
+internal function sceneInstance(
+    int32 $model,
+    const Mat4& $world,
+    const AABB& $bounds,
+    float32 $lodBias,
+    float32 $skinBase,
+    bool $casts,
+    bool $skinned
+) : SceneInstanceGpu
+{
+    uint32 $flags = SCENE_INSTANCE_LIVE;
+    if ($casts) {
+        $flags = $flags | SCENE_INSTANCE_CASTS;
+    }
+
+    if ($skinned) {
+        $flags = $flags | SCENE_INSTANCE_SKINNED;
+    }
+
+    return SceneInstanceGpu(
+        $world: $world,
+        $lo: Vec4($bounds->min, $lodBias),
+        $hi: Vec4($bounds->max, $skinBase),
+        $model: $model as uint32,
+        $flags: $flags
+    );
+}

@@ -1,18 +1,18 @@
 /**
- * Console grammar for packed point lights. `add` and `clear` own debug lamps
- * that share the frame's fixed list with the entities. `shadow` sets whether
- * those debug lamps cast.
+ * Console grammar for point lights. `add` and `clear` own debug lamps, rows in the same light
+ * table as the entities. `shadow` sets whether those debug lamps cast; `vsm` reads the shadow
+ * atlas back.
  */
 
 namespace visu::console;
 
-use visu::graphics::{PointCandidate, PointGpu, PointPack};
+use visu::graphics::PointLamp;
 use visu::math::Vec3;
 use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
 use visu::signal::ConsoleCommandSignal;
 use visu::system::PointLightSystem;
 
-internal const LIGHT_USAGE = 'usage: light [add <x> <y> <z> [r g b] [radius] [intensity]|clear|shadow on|off]';
+internal const LIGHT_USAGE = 'usage: light [add <x> <y> <z> [r g b] [radius] [intensity]|clear|shadow on|off|vsm]';
 
 public class LightConsole : ConsoleCommandHandler
 {
@@ -25,7 +25,7 @@ public class LightConsole : ConsoleCommandHandler
 
     public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
     {
-        $registry->add('light', $this, 'add <x> <y> <z> [r g b] [radius] [intensity]|clear|shadow on|off');
+        $registry->add('light', $this, 'add <x> <y> <z> [r g b] [radius] [intensity]|clear|shadow on|off|vsm');
         array<string> $names = array<string>();
         $names[] = 'light';
         return $names;
@@ -39,7 +39,7 @@ public class LightConsole : ConsoleCommandHandler
 
         usize $n = $cmd->parts->count();
         if ($n == 1) {
-            $console->writeLine(lightStatus($this->lights->packed));
+            $console->writeLine(lightStatus($this->lights));
             return;
         }
 
@@ -47,6 +47,13 @@ public class LightConsole : ConsoleCommandHandler
         if ($verb == 'clear') {
             $this->lights->debugClear();
             $console->writeLine('light: cleared');
+            return;
+        }
+
+        if ($verb == 'vsm') {
+            string $line = $this->lights->atlas->stats();
+            visu::app::info($line);
+            $console->writeLine($line);
             return;
         }
 
@@ -63,18 +70,18 @@ public class LightConsole : ConsoleCommandHandler
             }
 
             $this->lights->debugSetShadow($mode == 'on');
-            $console->writeLine(lightStatus($this->lights->packed));
+            $console->writeLine(lightStatus($this->lights));
             return;
         }
 
         if ($verb == 'add') {
-            PointCandidate? $lamp = lightParseAdd($cmd);
+            PointLamp? $lamp = lightParseAdd($cmd);
             if ($lamp == null) {
                 $console->writeLine(LIGHT_USAGE);
                 return;
             }
 
-            PointCandidate $held = guard $lamp;
+            PointLamp $held = guard $lamp;
             if (!$this->lights->debugAdd($held)) {
                 $console->writeLine('light: debug list is full');
                 return;
@@ -88,23 +95,17 @@ public class LightConsole : ConsoleCommandHandler
     }
 }
 
-internal function lightStatus(const PointPack& $pack) : string
+internal function lightStatus(PointLightSystem $lights) : string
 {
-    string $buf = "light: {$pack->count} packed, {$pack->shadows} shadow";
-    int32 $i = 0;
-    while ($i < $pack->count) {
-        PointGpu $gpu = $pack->gpu[$i];
-        Vec3 $p = $gpu->positionRadius->xyz();
-        Vec3 $c = $gpu->colorIntensity->xyz();
-        float32 $slot = $gpu->sourceShadow->y;
-        $buf = "{$buf}\n  {$i} {$p->x:.1f} {$p->y:.1f} {$p->z:.1f} r {$gpu->positionRadius->w:.1f} rgb {$c->x:.2f} {$c->y:.2f} {$c->z:.2f} i {$gpu->colorIntensity->w:.1f} shadow {$slot:.0f}";
-        $i = $i + 1;
+    string $shadow = 'off';
+    if ($lights->debugShadow) {
+        $shadow = 'on';
     }
-
-    return $buf;
+    int32 $lamps = $lights->lampCount();
+    return "light: {$lamps} lamps ({$lights->debugCount} from the console, their shadows {$shadow})";
 }
 
-internal function lightParseAdd(const ConsoleCommandSignal& $cmd) : PointCandidate?
+internal function lightParseAdd(const ConsoleCommandSignal& $cmd) : PointLamp?
 {
     usize $n = $cmd->parts->count();
     if ($n < 5) {
@@ -158,7 +159,7 @@ internal function lightParseAdd(const ConsoleCommandSignal& $cmd) : PointCandida
         return null;
     }
 
-    return PointCandidate(
+    return PointLamp(
         Vec3($x as float32, $y as float32, $z as float32),
         $radius,
         Vec3($r, $g, $b),

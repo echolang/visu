@@ -1,0 +1,43 @@
+#version 450
+
+// visu::graphics::ShadowAtlas: every visible light that casts and stands within the shadow
+// distance asks for the one coarsest page of all six faces, so every lookup has a level to fall
+// back to wherever a receiver between two request samples lands
+layout(local_size_x = 64) in;
+
+#include "visu/vsmcull.glsl"
+
+layout(std430, set = 2, binding = 0) readonly buffer LightTableBuffer {
+    LightGpu lights[];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer LightKeys {
+    uint keys[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer LightCounters {
+    uint lightCounters[];
+};
+
+layout(std430, set = 2, binding = 3) buffer Requests {
+    uint requests[];
+};
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= min(lightCounters[LIGHT_COUNTER_VISIBLE], LIGHT_VISIBLE_MAX)) {
+        return;
+    }
+
+    uint slot = keys[i] & LIGHT_SLOT_MASK;
+    LightGpu l = lights[slot];
+    if (!light_casts(l, u_vsm_eye.xyz, u_vsm_shadow.x)) {
+        return;
+    }
+
+    for (uint face = 0u; face < 6u; face++) {
+        uint bit = slot * VSM_REQUEST_WORDS * 32u + vsm_page_index(face, VSM_MIPS - 1u, uvec2(0u));
+        atomicOr(requests[bit >> 5u], 1u << (bit & 31u));
+    }
+}

@@ -88,6 +88,30 @@ public function despawnAssembly(Entities $world, Entity $root) : void
     $world->destroy($root);
 }
 
+/**
+ * Report a moved assembly: `Entities.changed<Transform>` for every part node, then the root, so
+ * each system that caches a placement (a static model, a light) follows the whole prop. The
+ * caller has written the root's Transform; the parts follow through their parents. A root
+ * without an `AssemblyInstance` is reported on its own.
+ */
+public function changedAssembly(Entities $world, Entity $root) : void
+{
+    if (!$world->valid($root)) {
+        return;
+    }
+
+    if ($world->has<AssemblyInstance>($root)) {
+        AssemblyInstance& $inst = $world->get<AssemblyInstance>($root);
+        foreach ($inst->nodes as $name => $node) {
+            if ($node != $root) {
+                $world->changed<Transform>($node);
+            }
+        }
+    }
+
+    $world->changed<Transform>($root);
+}
+
 internal function attachPartModel(
     Entities $world,
     Entity $e,

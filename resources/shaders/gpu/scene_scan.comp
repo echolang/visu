@@ -1,0 +1,58 @@
+#version 450
+
+// visu::graphics::GpuScene, between the two cluster walks: an exclusive scan of the segment
+// counts hands every segment its item range (clamped to the item buffer) and writes its
+// indirect draw, SCENE_ITEM_VERTICES vertices per item from the range's first vertex
+layout(local_size_x = 1024) in;
+
+#include "visu/scenecull.glsl"
+
+layout(std430, set = 2, binding = 0) buffer Counters {
+    uint counters[];
+};
+
+layout(std430, set = 2, binding = 1) writeonly buffer Args {
+    uint args[];
+};
+
+shared uint s_scan[SCENE_SEGMENTS_MAX];
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x;
+    uint segments = u_limits.w * u_rows.w;
+    uint count = 0u;
+    if (t < segments) {
+        count = counters[SCENE_COUNT_BASE + t];
+    }
+
+    s_scan[t] = count;
+    barrier();
+    for (uint o = 1u; o < SCENE_SEGMENTS_MAX; o <<= 1u) {
+        uint add = 0u;
+        if (t >= o) {
+            add = s_scan[t - o];
+        }
+        barrier();
+        s_scan[t] += add;
+        barrier();
+    }
+
+    if (t >= segments) {
+        return;
+    }
+
+    uint start = min(s_scan[t] - count, u_limits.y);
+    uint end = min(s_scan[t], u_limits.y);
+    if (end - start < count) {
+        atomicAdd(counters[SCENE_COUNTER_ITEMS_DROPPED], count - (end - start));
+    }
+
+    counters[SCENE_CURSOR_BASE + t] = start;
+    counters[SCENE_END_BASE + t] = end;
+    uint at = SCENE_ARGS_DRAW_BASE + t * 4u;
+    args[at] = (end - start) * SCENE_ITEM_VERTICES;
+    args[at + 1u] = 1u;
+    args[at + 2u] = start * SCENE_ITEM_VERTICES;
+    args[at + 3u] = 0u;
+}

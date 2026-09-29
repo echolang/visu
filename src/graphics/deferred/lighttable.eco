@@ -1,0 +1,161 @@
+/**
+ * Every point light the frame could shade, as rows on the GPU: `PointLightSystem` adds a row
+ * when a light is attached, rewrites it when the light moves or is relit, and frees it when the
+ * light goes. Nothing walks the lights per frame; a moving light rewrites only its own row.
+ * A row's slot is what the cull keys carry, so it stays put for the light's life.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+/**
+ * Most rows: a visible key keeps the slot in its low `LIGHT_SLOT_BITS` bits.
+ */
+public const int32 LIGHT_SLOTS_MAX = 8192;
+public const uint32 LIGHT_SLOT_BITS = 13;
+
+/**
+ * One light row (std430 `LightGpu` in `visu/light_gpu.glsl`, 64 bytes).
+ * `positionRadius` xyz world position, w radius (0 marks a free slot); `colorIntensity` rgb
+ * linear colour, w base intensity; `source` x source radius, y 1 when it casts, z normal offset,
+ * w slope bias; `flicker` x amplitude, y speed in radians a second, z phase.
+ */
+public struct LightGpu
+{
+    public Vec4 $positionRadius;
+    public Vec4 $colorIntensity;
+    public Vec4 $source;
+    public Vec4 $flicker;
+}
+
+operator (const LightGpu& $a) == (const LightGpu& $b) : bool
+{
+    return $a->positionRadius == $b->positionRadius && $a->colorIntensity == $b->colorIntensity
+        && $a->source == $b->source && $a->flicker == $b->flicker;
+}
+
+public class LightTable
+{
+    private GpuTable<LightGpu> $rows;
+    private array<int32> $free;
+
+    /**
+     * The rows as the CPU last wrote them, so a moved or removed light knows where it was.
+     */
+    private array<LightGpu> $mirror;
+
+    /**
+     * Slots whose light was added, changed or removed this frame: the shadow atlas retires
+     * every page of each (a new generation). The atlas clears it once read.
+     */
+    public array<int32> $changed;
+
+    /**
+     * Rows holding a light.
+     */
+    public int32 $live;
+
+    public constructor(Device $device)
+    {
+        $this->rows = GpuTable<LightGpu>($device, 'lights.table');
+        $this->free = array<int32>();
+        $this->mirror = array<LightGpu>();
+        $this->changed = array<int32>();
+        $this->live = 0;
+    }
+
+    /**
+     * A slot for a new light holding `$row`, or -1 when all `LIGHT_SLOTS_MAX` are taken.
+     */
+    public function add(const LightGpu& $row) : int32
+    {
+        int32 $slot = -1;
+        if ($this->free->count() > 0) {
+            usize $last = $this->free->count() - 1;
+            $slot = $this->free[$last];
+            $this->free->pop();
+        } else if ($this->rows->rows < LIGHT_SLOTS_MAX) {
+            $slot = $this->rows->rows;
+        } else {
+            return -1;
+        }
+
+        $this->write($slot, $row);
+        $this->live = $this->live + 1;
+        return $slot;
+    }
+
+    public function set(int32 $slot, const LightGpu& $row) : void
+    {
+        $this->write($slot, $row);
+    }
+
+    /**
+     * Free `$slot`: its row goes dark at the next scatter.
+     */
+    public function remove(int32 $slot) : void
+    {
+        LightGpu $dark = LightGpu(Vec4(0.0f), Vec4(0.0f), Vec4(0.0f), Vec4(0.0f));
+        $this->write($slot, $dark);
+        $this->free[] = $slot;
+        $this->live = $this->live - 1;
+    }
+
+    /**
+     * Rows the cull walks: one past the highest slot ever used.
+     */
+    public const function rows() : int32
+    {
+        return $this->rows->rows;
+    }
+
+    public function grow(RenderContext $ctx) : void
+    {
+        $this->rows->grow($ctx);
+    }
+
+    public function scatter(ComputeEncoder $enc, ComputeProgram $kernel) : void
+    {
+        $this->rows->scatter($enc, $kernel);
+    }
+
+    public function buffer() : Buffer
+    {
+        return $this->rows->buffer();
+    }
+
+    public const function ready() : bool
+    {
+        return $this->rows->ready();
+    }
+
+    public function clear() : void
+    {
+        $this->rows->clear();
+        $this->free->clear();
+        $this->mirror->clear();
+        $this->changed->clear();
+        $this->live = 0;
+    }
+
+    /**
+     * Queue `$row` and note where the slot's light was and now is. A row equal to the one
+     * already there (a prop turned about its lamp) queues nothing and keeps the light's shadow
+     * pages.
+     */
+    private function write(int32 $slot, const LightGpu& $row) : void
+    {
+        if ($slot < ($this->mirror->count() as int32) && $this->mirror[$slot as usize] == $row) {
+            return;
+        }
+
+        while (($this->mirror->count() as int32) <= $slot) {
+            $this->mirror[] = LightGpu(Vec4(0.0f), Vec4(0.0f), Vec4(0.0f), Vec4(0.0f));
+        }
+
+        $this->changed[] = $slot;
+        $this->mirror[$slot as usize] = $row;
+        $this->rows->set($slot, $row);
+    }
+}

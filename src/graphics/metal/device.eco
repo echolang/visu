@@ -56,6 +56,7 @@ public class Device : DeviceProtocol
     internal TextureGrave $grave;
     internal GpuCounts $counts;
     internal DeferredCache $deferred;
+    internal GpuShaders $gpuShaders;
     internal BakedShaderCache $sceneShaders;
 
     public constructor()
@@ -88,6 +89,7 @@ public class Device : DeviceProtocol
         $this->sceneCommitted = false;
         $this->limits = DeviceLimits();
         $this->limits->uniformAlign = 16;
+        $this->limits->storageAlign = 16;
         $this->limits->vertexTextures = true;
         AdapterInfo $info = AdapterInfo();
         $info->api = 'Metal';
@@ -106,6 +108,7 @@ public class Device : DeviceProtocol
         $this->grave = TextureGrave();
         $this->counts = GpuCounts();
         $this->deferred = DeferredCache();
+        $this->gpuShaders = GpuShaders();
         $this->sceneShaders = BakedShaderCache();
     }
 
@@ -705,6 +708,86 @@ public class Device : DeviceProtocol
         mem::copy<uint8>($dst, ptr<uint8>($src:$), $bytes);
     }
 
+    public function readMapped(Buffer $buffer, ptr<uint8> $dst, uint64 $bytes) : void
+    {
+        mtl::Buffer $buf = guard $buffer->handle->buffer else {
+            die('metal: readMapped handle is empty');
+        }
+        mem::copy<uint8>($dst, $buf->contents(), $bytes);
+    }
+
+    public function readbackBuffer(Buffer $buffer, uint64 $offset, uint64 $bytes) : result<array<uint8>, DeviceError>
+    {
+        assert($this->gpu != null, 'readbackBuffer before initialize');
+        assert(!$this->encoderOpen, 'readbackBuffer with an open encoder');
+        assert(!$this->inFrame, 'readbackBuffer inside a frame');
+        mtl::Buffer $buf = guard $buffer->handle->buffer else {
+            return .error(.metal('readback', 'buffer handle is empty'));
+        }
+        $this->waitIdle();
+        array<uint8> $out = pixelsFilled($bytes);
+        if ($bytes == 0) {
+            return .ok($out);
+        }
+
+        ptr<uint8> $base = $buf->contents();
+        ptr<uint8> $src = $base;
+        $src:$ = $base:$ + ($offset as isize);
+        mem::copy<uint8>(ptr<uint8>(&$out[0]), $src, $bytes);
+        return .ok($out);
+    }
+
+    public function fillBuffer(Buffer $buffer, uint64 $offset, uint64 $bytes, uint32 $value) : void
+    {
+        assert(!$this->encoderOpen, 'fillBuffer with an open encoder');
+        assert(($offset % 4) == 0 && ($bytes % 4) == 0, 'fillBuffer: offset and size are multiples of 4');
+        uint8 $byte = ($value & 0xFF) as uint8;
+        assert($value == (($byte as uint32) * 0x01010101), 'metal: fillBuffer takes a repeated byte');
+        if ($bytes == 0) {
+            return;
+        }
+
+        mtl::Buffer $buf = guard $buffer->handle->buffer else {
+            die('metal: fillBuffer handle is empty');
+        }
+        mtl::BlitCommandEncoder $blit = $this->openBlit();
+        $blit->fillBuffer($buf, $offset as usize, $bytes as usize, $byte);
+        $blit->endEncoding();
+    }
+
+    public function copyBuffer(Buffer $src, uint64 $srcOffset, Buffer $dst, uint64 $dstOffset, uint64 $bytes) : void
+    {
+        assert(!$this->encoderOpen, 'copyBuffer with an open encoder');
+        if ($bytes == 0) {
+            return;
+        }
+
+        mtl::Buffer $from = guard $src->handle->buffer else {
+            die('metal: copyBuffer source handle is empty');
+        }
+        mtl::Buffer $to = guard $dst->handle->buffer else {
+            die('metal: copyBuffer target handle is empty');
+        }
+        mtl::BlitCommandEncoder $blit = $this->openBlit();
+        $blit->copyFromBuffer($from, $srcOffset as usize, $to, $dstOffset as usize, $bytes as usize);
+        $blit->endEncoding();
+    }
+
+    /**
+     * A blit encoder on the scene command buffer, in order with the frame's other encoders.
+     */
+    private function openBlit() : mtl::BlitCommandEncoder
+    {
+        assert($this->inFrame, 'blit outside beginFrame');
+        mtl::CommandBuffer $cmd = guard $this->cmd else {
+            die('metal: blit without a command buffer');
+        }
+        mtl::BlitCommandEncoder $blit = guard $cmd->blitCommandEncoder() else {
+            die('metal: blitCommandEncoder failed');
+        }
+        return $blit;
+    }
+
     public function createTexture(const TextureDesc& $desc) : result<TextureHandle, DeviceError>
     {
         mtl::Device $gpu = guard $this->gpu else {
@@ -976,6 +1059,7 @@ public class Device : DeviceProtocol
     public function shutdown() : void
     {
         $this->deferred->drop();
+        $this->gpuShaders->drop();
         $this->sceneShaders->drop();
         if ($this->gpu == null) {
             $this->ready = false;

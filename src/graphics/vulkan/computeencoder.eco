@@ -62,6 +62,13 @@ public class ComputeEncoder : ComputeEncoderProtocol
         $this->bindings->buffer($slot, $buffer, $offset);
     }
 
+    public function bindStorage(uint32 $slot, transient: TransientSlice $slice) : void
+    {
+        assert(!$this->ended, 'bindStorage after endCompute');
+        assert($slice->frameSlot == $this->device->slot, 'transient from another frame');
+        $this->bindings->ring($slot, $this->device->slots[$this->device->slot]->ring->buffer, $slice->offset);
+    }
+
     public function dispatch(uint32 $x, uint32 $y = 1, uint32 $z = 1) : void
     {
         assert(!$this->ended, 'dispatch after endCompute');
@@ -84,6 +91,30 @@ public class ComputeEncoder : ComputeEncoderProtocol
         );
     }
 
+    public function dispatchIndirect(Buffer $arguments, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'dispatchIndirect after endCompute');
+        guard $this->kernel else {
+            die('dispatchIndirect before setKernel');
+        }
+        vkFlushUniforms($this->device, vk::PIPELINE_BIND_POINT_COMPUTE);
+        vkFlushTextures($this->device, $this->bindings, vk::PIPELINE_BIND_POINT_COMPUTE);
+        vkFlushStorage($this->device, $this->bindings, vk::PIPELINE_BIND_POINT_COMPUTE);
+        vk::CmdDispatchIndirect($this->device->currentCmd(), $arguments->handle->buffer, $offset);
+    }
+
+    public function barrier() : void
+    {
+        assert(!$this->ended, 'barrier after endCompute');
+        vkMemoryBarrier(
+            $this->device->currentCmd(),
+            vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk::ACCESS_SHADER_WRITE_BIT,
+            vk::ACCESS_SHADER_READ_BIT | vk::ACCESS_SHADER_WRITE_BIT
+        );
+    }
+
     public function endCompute() : void
     {
         assert(!$this->ended, 'ComputeEncoder.endCompute twice');
@@ -91,12 +122,19 @@ public class ComputeEncoder : ComputeEncoderProtocol
         vkMemoryBarrier(
             $this->device->currentCmd(),
             vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            vk::PIPELINE_STAGE_VERTEX_INPUT_BIT
+            vk::PIPELINE_STAGE_DRAW_INDIRECT_BIT
+                | vk::PIPELINE_STAGE_VERTEX_INPUT_BIT
                 | vk::PIPELINE_STAGE_VERTEX_SHADER_BIT
                 | vk::PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                | vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                | vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                | vk::PIPELINE_STAGE_TRANSFER_BIT,
             vk::ACCESS_SHADER_WRITE_BIT,
-            vk::ACCESS_SHADER_READ_BIT | vk::ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+            vk::ACCESS_SHADER_READ_BIT
+                | vk::ACCESS_SHADER_WRITE_BIT
+                | vk::ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+                | vk::ACCESS_INDIRECT_COMMAND_READ_BIT
+                | vk::ACCESS_TRANSFER_READ_BIT
+                | vk::ACCESS_TRANSFER_WRITE_BIT
         );
         $this->device->encoderClosed();
     }
@@ -136,6 +174,52 @@ internal function vkComputePipeline(Device $device, ComputeProgram $kernel) : vk
     }
     $device->computePsos[$kernel->id] = $pipeline;
     return $pipeline;
+}
+
+/**
+ * Every earlier shader, vertex and indirect read or write of a buffer finishes before a
+ * transfer on the frame command buffer writes it.
+ */
+internal function vkTransferOpen(vk::CommandBuffer $cmd) : void
+{
+    vkMemoryBarrier(
+        $cmd,
+        vk::PIPELINE_STAGE_DRAW_INDIRECT_BIT
+            | vk::PIPELINE_STAGE_VERTEX_INPUT_BIT
+            | vk::PIPELINE_STAGE_VERTEX_SHADER_BIT
+            | vk::PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+            | vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT
+            | vk::PIPELINE_STAGE_TRANSFER_BIT,
+        vk::PIPELINE_STAGE_TRANSFER_BIT,
+        vk::ACCESS_SHADER_WRITE_BIT | vk::ACCESS_TRANSFER_WRITE_BIT,
+        vk::ACCESS_TRANSFER_READ_BIT | vk::ACCESS_TRANSFER_WRITE_BIT
+    );
+}
+
+/**
+ * The transfer's writes are visible to every later shader, vertex and indirect read.
+ */
+internal function vkTransferClose(vk::CommandBuffer $cmd) : void
+{
+    vkMemoryBarrier(
+        $cmd,
+        vk::PIPELINE_STAGE_TRANSFER_BIT,
+        vk::PIPELINE_STAGE_HOST_BIT
+            | vk::PIPELINE_STAGE_DRAW_INDIRECT_BIT
+            | vk::PIPELINE_STAGE_VERTEX_INPUT_BIT
+            | vk::PIPELINE_STAGE_VERTEX_SHADER_BIT
+            | vk::PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+            | vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT
+            | vk::PIPELINE_STAGE_TRANSFER_BIT,
+        vk::ACCESS_TRANSFER_WRITE_BIT,
+        vk::ACCESS_HOST_READ_BIT
+            | vk::ACCESS_SHADER_READ_BIT
+            | vk::ACCESS_SHADER_WRITE_BIT
+            | vk::ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+            | vk::ACCESS_INDIRECT_COMMAND_READ_BIT
+            | vk::ACCESS_TRANSFER_READ_BIT
+            | vk::ACCESS_TRANSFER_WRITE_BIT
+    );
 }
 
 /**

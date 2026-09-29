@@ -63,17 +63,25 @@ struct fs_in
     float2 v_uv [[user(locn0)]];
 };
 
-fragment fs_out fs(fs_in in [[stage_in]], constant OutlineUniforms& _37 [[buffer(2)]], texture2d<float> u_mask [[texture(0)]], sampler u_maskSmplr [[sampler(0)]])
+fragment fs_out fs(fs_in in [[stage_in]], constant OutlineUniforms& _49 [[buffer(2)]], texture2d<float> u_mask [[texture(0)]], sampler u_maskSmplr [[sampler(0)]])
 {
     fs_out out = {};
     float4 here = u_mask.sample(u_maskSmplr, in.v_uv);
     if (here.x > 0.5)
     {
-        discard_fragment();
+        int inside = int(fast::clamp(floor(here.z * 4.0), 0.0, 3.0));
+        float4 paint = _49.u_params[inside];
+        if (paint.z <= 0.0)
+        {
+            discard_fragment();
+        }
+        float4 tint = _49.u_colors[inside];
+        out.o_color = float4(tint.xyz, (tint.w * paint.z) * mix(paint.y, 1.0, here.y));
+        return out;
     }
-    float widest = _37.u_texel.z;
-    spvUnsafeArray<float, 3> _53 = spvUnsafeArray<float, 3>({ 1.5, widest * 0.550000011920928955078125, widest });
-    spvUnsafeArray<float, 3> radii = _53;
+    float widest = _49.u_texel.z;
+    spvUnsafeArray<float, 3> _103 = spvUnsafeArray<float, 3>({ 1.5, widest * 0.550000011920928955078125, widest });
+    spvUnsafeArray<float, 3> radii = _103;
     float best = 0.0;
     int bestStyle = 0;
     int covered = 0;
@@ -84,7 +92,7 @@ fragment fs_out fs(fs_in in [[stage_in]], constant OutlineUniforms& _37 [[buffer
         for (int k = 0; k < 8; k++)
         {
             float a = turn + (float(k) * 0.785399973392486572265625);
-            float2 offset = (float2(cos(a), sin(a)) * radius) * _37.u_texel.xy;
+            float2 offset = (float2(cos(a), sin(a)) * radius) * _49.u_texel.xy;
             float4 m = u_mask.sample(u_maskSmplr, (in.v_uv + offset));
             if (m.x < 0.5)
             {
@@ -95,7 +103,7 @@ fragment fs_out fs(fs_in in [[stage_in]], constant OutlineUniforms& _37 [[buffer
                 covered++;
             }
             int style = int(fast::clamp(floor(m.z * 4.0), 0.0, 3.0));
-            float4 params = _37.u_params[style];
+            float4 params = _49.u_params[style];
             float reach = fast::clamp(1.0 - (radius / (params.x + 1.0)), 0.0, 1.0);
             float strength = mix(params.y, 1.0, m.y) * reach;
             if (strength > best)
@@ -110,7 +118,7 @@ fragment fs_out fs(fs_in in [[stage_in]], constant OutlineUniforms& _37 [[buffer
         discard_fragment();
     }
     best = sqrt(best);
-    float4 color = _37.u_colors[bestStyle];
+    float4 color = _49.u_colors[bestStyle];
     out.o_color = float4(color.xyz, color.w * best);
     return out;
 }

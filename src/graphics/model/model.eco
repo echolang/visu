@@ -40,6 +40,17 @@ public class Model
      * joints and weights and draw through the skinned programs.
      */
     public const Skeleton? $skeleton;
+
+    /**
+     * The depth form GPU-driven views pull from, between `buildModel` and the bank's arena
+     * upload; null once the `ModelBank` has moved it into its `MeshArena`.
+     */
+    public ModelDepth? $depth;
+
+    /**
+     * Where the bank's `MeshArena` holds this model's clusters, once it was uploaded.
+     */
+    public ArenaModel? $arena;
     private bool $dead;
 
     public constructor(string $id, Mesh $mesh, CookedModel $cooked, array<Material> $materials)
@@ -54,6 +65,8 @@ public class Model
         $this->slots = $cooked->slots;
         $this->materials = $materials;
         $this->skeleton = $cooked->skeleton;
+        $this->depth = null;
+        $this->arena = null;
         $this->dead = false;
     }
 
@@ -107,7 +120,9 @@ public function buildModel(Assets $assets, const string& $id, CookedModel $cooke
     Mesh $mesh = Mesh($assets->device, bytes: $cooked->vertices, stride: $cooked->vertexBytes());
     $mesh->index(bytes: $cooked->indices, $cooked->indexType);
     array<Material> $materials = modelMaterials($assets, $id, $cooked->slots);
-    return Model($id, $mesh, $cooked, $materials);
+    Model $model = Model($id, $mesh, $cooked, $materials);
+    $model->depth = modelDepth($cooked);
+    return $model;
 }
 
 /**

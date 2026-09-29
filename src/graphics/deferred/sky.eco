@@ -21,6 +21,16 @@ internal const float32 SKY_MIE_SCATTER = 0.000003996f;
 internal const float32 SKY_MIE_EXTINCTION = 0.00000444f;
 internal const float32 SKY_MIE_HEIGHT = 1200.0f;
 internal const int32 SKY_TRANSMITTANCE_SAMPLES = 8;
+// ozone absorption per metre at the layer's peak, red green blue (Hillaire 2020); it takes the
+// green out of a long path, which keeps the twilight zenith blue and the sunset horizon from
+// going yellow
+internal const float32 SKY_OZONE_R = 0.000000650f;
+internal const float32 SKY_OZONE_G = 0.000001881f;
+internal const float32 SKY_OZONE_B = 0.000000085f;
+// the layer is a tent peaking at 25 km and falling to nothing 15 km either side; mirrors
+// SKY_OZONE_PEAK / SKY_OZONE_HALF_WIDTH in sky.glsl
+internal const float32 SKY_OZONE_PEAK = 25000.0f;
+internal const float32 SKY_OZONE_HALF_WIDTH = 15000.0f;
 
 /**
  * Sky parameters. `direction` is the direction sunlight travels, like `DirectionalLight`, so straight
@@ -36,6 +46,19 @@ public struct Sky
     public float32 $exposure;
     public Vec3 $groundAlbedo;
 
+    /**
+     * How much ozone the air holds against Earth's (1). Zero leaves the green in a long path:
+     * a yellow sunset horizon and a grey twilight zenith.
+     */
+    public float32 $ozoneScale;
+
+    /**
+     * The atmosphere visu had before the aerial perspective: no ozone, and the uniform march
+     * that dims each sample through its whole step (`--flag fog.model=legacy`). Kept until the
+     * new frame is signed off.
+     */
+    public bool $legacy;
+
     public constructor()
     {
         $this->direction = Vec3(0.3f, -0.8f, -0.5f);
@@ -45,6 +68,8 @@ public struct Sky
         $this->mieAnisotropy = 0.8f;
         $this->exposure = 1.0f;
         $this->groundAlbedo = Vec3(0.30f, 0.27f, 0.20f);
+        $this->ozoneScale = 1.0f;
+        $this->legacy = false;
     }
 
     /**
@@ -67,7 +92,21 @@ public struct Sky
             && $this->mieScale == $other->mieScale
             && $this->mieAnisotropy == $other->mieAnisotropy
             && $this->exposure == $other->exposure
-            && $this->groundAlbedo == $other->groundAlbedo;
+            && $this->groundAlbedo == $other->groundAlbedo
+            && $this->ozoneScale == $other->ozoneScale
+            && $this->legacy == $other->legacy;
+    }
+
+    /**
+     * The ozone this sky absorbs with, per metre at the layer's peak: none on the legacy sky.
+     */
+    public const function ozone() : Vec3
+    {
+        if ($this->legacy) {
+            return Vec3(0.0f, 0.0f, 0.0f);
+        }
+
+        return Vec3(SKY_OZONE_R, SKY_OZONE_G, SKY_OZONE_B) * $this->ozoneScale;
     }
 
     /**
@@ -191,6 +230,12 @@ public struct SkyUniforms
      * Moon tint in rgb, 1 in w draws the moon disc and the stars.
      */
     public Vec4 $moonColor;
+
+    /**
+     * Ozone absorption at its peak in rgb, 1 in w marches with midpoint attenuation over
+     * quadratic steps (0 the legacy uniform march).
+     */
+    public Vec4 $ozone;
 }
 
 /**
@@ -226,6 +271,13 @@ public function skyUniforms(
         $moonColor = Vec4($held->color->x, $held->color->y, $held->color->z, $disk);
     }
 
+    Vec3 $ozone = $sky->ozone();
+    float32 $midpoint = 1.0f;
+
+    if ($sky->legacy) {
+        $midpoint = 0.0f;
+    }
+
     return SkyUniforms(
         Vec4($toSun->x, $toSun->y, $toSun->z, $sky->sunIntensity),
         Vec4($origin->x, $origin->y, $origin->z, $disk),
@@ -245,7 +297,8 @@ public function skyUniforms(
         Vec4($viewSamples, $lightSamples, SKY_PLANET_RADIUS, SKY_ATMOSPHERE_RADIUS),
         $moonAt,
         $moonParams,
-        $moonColor
+        $moonColor,
+        Vec4($ozone->x, $ozone->y, $ozone->z, $midpoint)
     );
 }
 
@@ -274,6 +327,7 @@ internal function skyTransmittance(Vec3 $toSun, float32 $altitude, const Sky& $s
     float32 $step = $exit / (SKY_TRANSMITTANCE_SAMPLES as float32);
     float32 $depthR = 0.0f;
     float32 $depthM = 0.0f;
+    float32 $depthO = 0.0f;
     int32 $i = 0;
 
     while ($i < SKY_TRANSMITTANCE_SAMPLES) {
@@ -286,13 +340,210 @@ internal function skyTransmittance(Vec3 $toSun, float32 $altitude, const Sky& $s
 
         $depthR = $depthR + math::exp(-$h / SKY_RAYLEIGH_HEIGHT) * $step;
         $depthM = $depthM + math::exp(-$h / SKY_MIE_HEIGHT) * $step;
+        $depthO = $depthO + skyOzoneDensity($h) * $step;
         $i = $i + 1;
     }
 
     float32 $mie = SKY_MIE_EXTINCTION * $sky->mieScale * $depthM;
+    Vec3 $ozone = $sky->ozone() * $depthO;
     return Vec3(
-        math::exp(-(SKY_RAYLEIGH_R * $sky->rayleighScale * $depthR + $mie)),
-        math::exp(-(SKY_RAYLEIGH_G * $sky->rayleighScale * $depthR + $mie)),
-        math::exp(-(SKY_RAYLEIGH_B * $sky->rayleighScale * $depthR + $mie))
+        math::exp(-(SKY_RAYLEIGH_R * $sky->rayleighScale * $depthR + $mie + $ozone->x)),
+        math::exp(-(SKY_RAYLEIGH_G * $sky->rayleighScale * $depthR + $mie + $ozone->y)),
+        math::exp(-(SKY_RAYLEIGH_B * $sky->rayleighScale * $depthR + $mie + $ozone->z))
     );
+}
+
+/**
+ * The ozone layer's density at `$h` metres, relative to its peak: `sky_density` in sky.glsl.
+ */
+internal function skyOzoneDensity(float32 $h) : float32
+{
+    float32 $d = $h - SKY_OZONE_PEAK;
+
+    if ($d < 0.0f) {
+        $d = -$d;
+    }
+
+    float32 $x = 1.0f - $d / SKY_OZONE_HALF_WIDTH;
+
+    if ($x < 0.0f) {
+        return 0.0f;
+    }
+
+    return $x;
+}
+
+// the dome the fog's ambient integrates over: bands of equal solid angle by azimuths, and the
+// march along each; the ambient is soft, so a coarse grid reads the same
+internal const int32 SKY_DOME_BANDS = 3;
+internal const int32 SKY_DOME_AZIMUTHS = 6;
+internal const int32 SKY_DOME_VIEW_SAMPLES = 6;
+internal const int32 SKY_DOME_LIGHT_SAMPLES = 4;
+
+// single scattering leaves the dome about a quarter as bright as a real sky; mirrors
+// SKY_MULTIPLE_SCATTERING in sky.glsl
+internal const float32 SKY_MULTIPLE_SCATTERING = 4.0f;
+
+/**
+ * The sunlit sky's mean radiance over the upper hemisphere seen from `$altitude` metres, the
+ * sky shader's fixed march with its phase functions, the multiple scattering stand-in and the
+ * exposure. The average over every azimuth does not depend on where the sun stands on the
+ * compass, only on its elevation. The moon's sky is left out: the night ambient carries it.
+ * About five hundred samples; callers cache it on the sun's elevation.
+ */
+public function skyDomeRadiance(const Sky& $sky, float32 $altitude) : Vec3
+{
+    float32 $height = $altitude;
+
+    if ($height < 1.0f) {
+        $height = 1.0f;
+    }
+
+    Vec3 $origin = Vec3(0.0f, SKY_PLANET_RADIUS + $height, 0.0f);
+    Vec3 $toSun = normalize(-$sky->direction);
+    Vec3 $rayleigh = Vec3(SKY_RAYLEIGH_R, SKY_RAYLEIGH_G, SKY_RAYLEIGH_B) * $sky->rayleighScale;
+    float32 $mieScatter = SKY_MIE_SCATTER * $sky->mieScale;
+    float32 $mieExtinction = SKY_MIE_EXTINCTION * $sky->mieScale;
+    Vec3 $ozone = $sky->ozone();
+    Vec3 $sum = Vec3(0.0f, 0.0f, 0.0f);
+    float32 $n = SKY_DOME_VIEW_SAMPLES as float32;
+    int32 $band = 0;
+
+    while ($band < SKY_DOME_BANDS) {
+        float32 $up = (($band as float32) + 0.5f) / (SKY_DOME_BANDS as float32);
+        float32 $across = math::sqrt(1.0f - $up * $up);
+        int32 $a = 0;
+
+        while ($a < SKY_DOME_AZIMUTHS) {
+            float32 $azimuth = (($a as float32) + 0.5f) / (SKY_DOME_AZIMUTHS as float32) * 2.0f * math::PI_F32;
+            Vec3 $dir = Vec3($across * math::cos($azimuth), $up, $across * math::sin($azimuth));
+            float32 $exit = skyRayExit($origin, $dir, SKY_ATMOSPHERE_RADIUS);
+            Vec3 $depth = Vec3(0.0f, 0.0f, 0.0f);
+            Vec3 $sumR = Vec3(0.0f, 0.0f, 0.0f);
+            Vec3 $sumM = Vec3(0.0f, 0.0f, 0.0f);
+            int32 $i = 0;
+
+            while ($i < SKY_DOME_VIEW_SAMPLES) {
+                float32 $s0 = ($i as float32) / $n;
+                float32 $s1 = (($i + 1) as float32) / $n;
+                float32 $t = $exit * 0.5f * ($s0 * $s0 + $s1 * $s1);
+                float32 $dt = $exit * ($s1 * $s1 - $s0 * $s0);
+                Vec3 $p = $origin + $dir * $t;
+                float32 $h = math::sqrt(dot($p, $p)) - SKY_PLANET_RADIUS;
+
+                if ($h < 0.0f) {
+                    $h = 0.0f;
+                }
+
+                Vec3 $dens = Vec3(
+                    math::exp(-$h / SKY_RAYLEIGH_HEIGHT),
+                    math::exp(-$h / SKY_MIE_HEIGHT),
+                    skyOzoneDensity($h)
+                ) * $dt;
+                Vec3 $here = $depth + $dens * 0.5f;
+                $depth = $depth + $dens;
+
+                if (!skyRayHitsGround($p, $toSun)) {
+                    Vec3 $light = $here + skyOpticalDepth($p, $toSun, SKY_DOME_LIGHT_SAMPLES);
+                    Vec3 $tau = $rayleigh * $light->x + Vec3($mieExtinction, $mieExtinction, $mieExtinction) * $light->y
+                        + $ozone * $light->z;
+                    Vec3 $t3 = Vec3(math::exp(-$tau->x), math::exp(-$tau->y), math::exp(-$tau->z));
+                    $sumR = $sumR + $t3 * $dens->x;
+                    $sumM = $sumM + $t3 * $dens->y;
+                }
+
+                $i = $i + 1;
+            }
+
+            float32 $mu = dot($dir, $toSun);
+            Vec3 $r = $sumR * $rayleigh * skyPhaseRayleigh($mu);
+            Vec3 $m = $sumM * ($mieScatter * skyPhaseMie($sky->mieAnisotropy, $mu));
+            $sum = $sum + $r + $m;
+            $a = $a + 1;
+        }
+
+        $band = $band + 1;
+    }
+
+    float32 $count = (SKY_DOME_BANDS * SKY_DOME_AZIMUTHS) as float32;
+    return $sum * ($sky->sunIntensity * SKY_MULTIPLE_SCATTERING * $sky->exposure / $count);
+}
+
+/**
+ * Distance from `$p` along `$dir` to where it leaves the sphere of radius `$radius`.
+ */
+internal function skyRayExit(Vec3 $p, Vec3 $dir, float32 $radius) : float32
+{
+    float32 $b = dot($p, $dir);
+    float32 $disc = $b * $b - (dot($p, $p) - $radius * $radius);
+
+    if ($disc < 0.0f) {
+        return 0.0f;
+    }
+
+    float32 $exit = -$b + math::sqrt($disc);
+
+    if ($exit < 0.0f) {
+        return 0.0f;
+    }
+
+    return $exit;
+}
+
+/**
+ * Whether the planet stands between `$p` and the light along `$dir`.
+ */
+internal function skyRayHitsGround(Vec3 $p, Vec3 $dir) : bool
+{
+    float32 $b = dot($p, $dir);
+    float32 $disc = $b * $b - (dot($p, $p) - SKY_PLANET_RADIUS * SKY_PLANET_RADIUS);
+    return $disc >= 0.0f && -$b - math::sqrt($disc) > 0.0f;
+}
+
+/**
+ * Rayleigh, Mie and ozone optical depth from `$p` along `$dir` to the edge of the atmosphere:
+ * `sky_optical_depth` in sky.glsl.
+ */
+internal function skyOpticalDepth(Vec3 $p, Vec3 $dir, int32 $samples) : Vec3
+{
+    float32 $step = skyRayExit($p, $dir, SKY_ATMOSPHERE_RADIUS) / ($samples as float32);
+    Vec3 $depth = Vec3(0.0f, 0.0f, 0.0f);
+    int32 $i = 0;
+
+    while ($i < $samples) {
+        Vec3 $s = $p + $dir * ((($i as float32) + 0.5f) * $step);
+        float32 $h = math::sqrt(dot($s, $s)) - SKY_PLANET_RADIUS;
+
+        if ($h < 0.0f) {
+            $h = 0.0f;
+        }
+
+        $depth = $depth + Vec3(
+            math::exp(-$h / SKY_RAYLEIGH_HEIGHT),
+            math::exp(-$h / SKY_MIE_HEIGHT),
+            skyOzoneDensity($h)
+        ) * $step;
+        $i = $i + 1;
+    }
+
+    return $depth;
+}
+
+/**
+ * `sky_phase_rayleigh` in sky.glsl.
+ */
+internal function skyPhaseRayleigh(float32 $mu) : float32
+{
+    return 3.0f / (16.0f * math::PI_F32) * (1.0f + $mu * $mu);
+}
+
+/**
+ * `sky_phase_mie` in sky.glsl, Cornette-Shanks with anisotropy `$g`.
+ */
+internal function skyPhaseMie(float32 $g, float32 $mu) : float32
+{
+    float32 $gg = $g * $g;
+    float32 $base = 1.0f + $gg - 2.0f * $g * $mu;
+    return 3.0f / (8.0f * math::PI_F32) * ((1.0f - $gg) * (1.0f + $mu * $mu))
+        / ((2.0f + $gg) * $base * math::sqrt($base));
 }

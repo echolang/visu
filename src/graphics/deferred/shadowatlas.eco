@@ -1,0 +1,724 @@
+/**
+ * Virtual shadow maps for every shadowed point light, in one depth atlas the lights share.
+ * Receivers on screen request the pages they need; pages whose light and casters have not
+ * changed stay cached from frame to frame; misses take a free or the least recently used
+ * physical page, at most `VSM_MAX_DIRTY` a frame, coarse levels first; the GPU scene culls and
+ * draws only those pages' casters. Nothing about which light or page is shown ever reaches the
+ * CPU. A light is retired (its generation moves) when a box where casters or lights changed
+ * reaches its sphere. `PointLightSystem` owns one on the clustered path; the page math lives in
+ * `visu/vsm.glsl`, which these constants mirror.
+ */
+
+namespace visu::graphics;
+
+use visu::geo::AABB;
+use visu::math::{Mat4, Vec3, Vec4};
+
+public const int32 VSM_PAGE = 64;
+public const int32 VSM_CELL = 66;
+public const int32 VSM_PAGES = 3844;
+
+/**
+ * Depths a physical cell holds: the page and its guard border.
+ */
+public const int32 VSM_CELL_TEXELS = 4356;
+
+/**
+ * The scratch depth target this frame's dirty pages are drawn into, 16 x 16 cells.
+ */
+public const int32 VSM_SCRATCH = 1056;
+public const int32 VSM_LIGHT_PAGES = 2046;
+public const int32 VSM_REQUEST_WORDS = 64;
+public const int32 VSM_MISS_MAX = 16384;
+
+/**
+ * Pages drawn a frame at most. A camera cut that misses more spreads over the next frames; the
+ * lookup uses a coarser page meanwhile.
+ */
+public const int32 VSM_MAX_DIRTY = 256;
+
+/**
+ * Receivers sample one pixel of each block this wide.
+ */
+public const int32 VSM_REQUEST_STEP = 4;
+
+/**
+ * Change boxes one frame keeps; the rest fold into the last.
+ */
+public const int32 VSM_BOXES_MAX = 64;
+
+/**
+ * The state words after the views in `viewsState`, as `visu/vsmcull.glsl` lays them out: the
+ * clear draw, misses per level, free candidates per list, dirty pages, misses dropped, the
+ * pool's level bias (1/256, carried from frame to frame) and the copy dispatch.
+ */
+internal const int32 VSM_STATE_MISSES = 4;
+internal const int32 VSM_STATE_CANDIDATES = 9;
+internal const int32 VSM_STATE_DIRTY = 12;
+internal const int32 VSM_STATE_DROPPED = 13;
+internal const int32 VSM_STATE_BIAS = 14;
+internal const int32 VSM_STATE_COPY = 16;
+internal const int32 VSM_STATE_WORDS = 20;
+
+/**
+ * Page levels, one miss list each.
+ */
+internal const int32 VSM_MIPS = 5;
+
+/**
+ * Quiet frames before the atlas stops drawing; the first miss or change turns it back on.
+ */
+public const int32 VSM_QUIET_FRAMES = 3;
+
+/**
+ * The widest light radius a change is assumed to be seen by: a change farther than the shadow
+ * distance plus this from the eye leaves every drawn shadow as it was.
+ */
+public const float32 VSM_LIGHT_REACH = 20.0f;
+
+/**
+ * The atlas kernels' uniform (std140 `VsmParams` in `visu/vsmcull.glsl`).
+ */
+internal struct VsmParams
+{
+    public Mat4 $view;
+    public Vec4 $eye;
+    public Vec4 $screen;
+    public Vec4 $clusterHead;
+    public Vec4 $clusterZ;
+    public uint32 $rows;
+    public uint32 $frame;
+    public uint32 $budget;
+    public uint32 $boxes;
+    public Vec4 $shadow;
+}
+
+public class ShadowAtlas
+{
+    private Device $device;
+
+    /**
+     * Draw point-light shadows at all. Seeded from `--flag light.shadows` (default on).
+     */
+    public bool $enabled;
+
+    /**
+     * Added to the page level a pixel's footprint picks: above 0 is coarser and cheaper.
+     */
+    public float32 $mipBias;
+
+    /**
+     * Lights farther than this from the eye light without a shadow and take no pages; the
+     * shadow fades out over the last 15%. `--flag light.shadowdistance` (metres, default 60).
+     */
+    public float32 $shadowDistance;
+
+    /**
+     * Paint the light pass with where pages were found (`--flag light.vsmdebug`).
+     */
+    public bool $debug;
+    /**
+     * Every physical page's depths, `VSM_CELL_TEXELS` floats a cell.
+     */
+    public Buffer? $atlas;
+    private Texture? $scratch;
+
+    /**
+     * The second scratch target: frames alternate, so a frame never waits for the copy of the
+     * frame before it to finish reading its target.
+     */
+    private Texture? $scratchB;
+    private Buffer? $gens;
+    private Buffer? $requests;
+    private Buffer? $table;
+    private Buffer? $phys;
+    private Buffer? $misses;
+    private Buffer? $candidates;
+    private Buffer? $dirty;
+    private Buffer? $viewsState;
+    private int32 $rowCapacity;
+    private uint32 $frame;
+    private array<AABB> $boxes;
+
+    /**
+     * Slots of lights that changed this frame, for the invalidation kernel.
+     */
+    private array<uint32> $slots;
+
+    /**
+     * The scene the last `update` culled, for `stats`.
+     */
+    private GpuScene? $scene;
+    private array<Vec4> $boxWords;
+    private GpuPass? $opaquePass;
+    private GpuPass? $alphaPass;
+
+    /**
+     * One small CPU-readable copy of the state words per frame slot: the misses and dirty
+     * pages of the frame that last ran in the slot, read with no stall once it retired.
+     */
+    private array<Buffer> $readbacks;
+
+    /**
+     * Frames in a row with nothing to draw: no misses or dirty pages two frames back, no
+     * change, a still camera. Past `VSM_QUIET_FRAMES` the atlas is left alone (no page cull, no
+     * raster, no write), so a still scene never waits on the frame before it.
+     */
+    private int32 $quiet;
+    private bool $drawing;
+    private Mat4 $lastView;
+
+    public constructor(Device $device)
+    {
+        $this->device = $device;
+        $this->enabled = visu::app::flags()->bool('light.shadows', true);
+        $this->mipBias = 0.0f;
+        $this->shadowDistance = visu::app::flags()->float('light.shadowdistance', 60.0) as float32;
+        $this->debug = visu::app::flags()->bool('light.vsmdebug', false);
+        $this->atlas = null;
+        $this->scratch = null;
+        $this->scratchB = null;
+        $this->gens = null;
+        $this->requests = null;
+        $this->table = null;
+        $this->phys = null;
+        $this->misses = null;
+        $this->candidates = null;
+        $this->dirty = null;
+        $this->viewsState = null;
+        $this->rowCapacity = 0;
+        $this->frame = 0;
+        $this->boxes = arr::room<AABB>(VSM_BOXES_MAX as usize);
+        $this->slots = arr::room<uint32>(VSM_BOXES_MAX as usize);
+        $this->scene = null;
+        $this->boxWords = arr::room<Vec4>((VSM_BOXES_MAX * 2) as usize);
+        $this->opaquePass = null;
+        $this->alphaPass = null;
+        $this->readbacks = array<Buffer>();
+        $this->quiet = 0;
+        $this->drawing = false;
+        $this->lastView = Mat4();
+    }
+
+    public const function ready() : bool
+    {
+        return $this->atlas != null && $this->table != null;
+    }
+
+    /**
+     * Receivers, cache, allocation and the pages' caster cull, after the G-buffer is written.
+     * Outside any encoder.
+     */
+    public function update(RenderContext $ctx, LightClusterData $clusters, GpuScene $scene, Texture $position) : void
+    {
+        LightTable $lights = $clusters->table;
+        $this->scene = $scene;
+        $this->ensure($ctx, $lights->rows());
+        $this->gather($lights, $scene);
+        CameraData $camera = guard $ctx->frame->find<CameraData>() else {
+            return;
+        }
+        if (!$this->enabled || $lights->live <= 0 || $clusters->main->rows <= 0) {
+            return;
+        }
+
+        GpuShaders $shaders = $this->device->gpuShaders;
+        ComputeProgram $invalidate = guard $shaders->kernel($this->device, 'vsm_invalidate') else ($e) {
+            die($e->message());
+        }
+        ComputeProgram $request = guard $shaders->kernel($this->device, 'vsm_request') else ($e) {
+            die($e->message());
+        }
+        ComputeProgram $coarse = guard $shaders->kernel($this->device, 'vsm_coarse') else ($e) {
+            die($e->message());
+        }
+        ComputeProgram $mark = guard $shaders->kernel($this->device, 'vsm_mark') else ($e) {
+            die($e->message());
+        }
+        ComputeProgram $free = guard $shaders->kernel($this->device, 'vsm_free') else ($e) {
+            die($e->message());
+        }
+        ComputeProgram $alloc = guard $shaders->kernel($this->device, 'vsm_alloc') else ($e) {
+            die($e->message());
+        }
+
+        visu::profile::begin('vsm');
+        $this->frame = $this->frame + 1;
+        $this->drawing = $this->decide($camera);
+        Buffer $gens = guard $this->gens;
+        Buffer $requests = guard $this->requests;
+        Buffer $table = guard $this->table;
+        Buffer $phys = guard $this->phys;
+        Buffer $misses = guard $this->misses;
+        Buffer $candidates = guard $this->candidates;
+        Buffer $dirty = guard $this->dirty;
+        Buffer $viewsState = guard $this->viewsState;
+        uint64 $stateOffset = $this->stateOffset();
+        uint32 $rows = $lights->rows() as uint32;
+        $this->device->fillBuffer($requests, 0 as uint64, ($rows as uint64) * (VSM_REQUEST_WORDS as uint64) * 4, 0 as uint32);
+        // every counter clears; the bias word carries over
+        $this->device->fillBuffer($viewsState, $stateOffset, (VSM_STATE_BIAS * 4) as uint64, 0 as uint32);
+        TransientSlice $boxes = $this->uploadBoxes();
+        LightCull $main = $clusters->main;
+        VsmParams $params = VsmParams(
+            $view: $camera->view,
+            $eye: Vec4($camera->position, $camera->projection->c1->y),
+            $screen: Vec4($camera->resolutionX as float32, $camera->resolutionY as float32, $this->mipBias, VSM_REQUEST_STEP as float32),
+            $clusterHead: $main->head(),
+            $clusterZ: $main->zparams($clusters->seconds),
+            $rows: $rows,
+            $frame: $this->frame,
+            $budget: $this->budget(),
+            $boxes: $this->boxes->count() as uint32,
+            $shadow: Vec4($this->shadowDistance, $this->slots->count() as float32, 0.0f, 0.0f)
+        );
+
+        ComputeEncoder $enc = $ctx->beginCompute();
+        if ($this->boxes->count() > 0 || $this->slots->count() > 0) {
+            TransientSlice $changed = $this->uploadSlots();
+            $enc->setKernel($invalidate);
+            $enc->upload($params, slot: 0);
+            $enc->bindStorage(0, $lights->buffer());
+            $enc->bindStorage(1, $gens);
+            $enc->bindStorage(2, transient: $boxes);
+            $enc->bindStorage(3, $table);
+            $enc->bindStorage(4, transient: $changed);
+            $enc->dispatch($rows);
+            $enc->barrier();
+        }
+
+        uint32 $stepsX = (($camera->resolutionX + VSM_REQUEST_STEP - 1) / VSM_REQUEST_STEP) as uint32;
+        uint32 $stepsY = (($camera->resolutionY + VSM_REQUEST_STEP - 1) / VSM_REQUEST_STEP) as uint32;
+        $enc->setKernel($request);
+        $enc->upload($params, slot: 0);
+        $enc->bindTexture(0, $position, $this->pointSampler());
+        $enc->bindStorage(0, $lights->buffer());
+        $main->bindCompute($enc);
+        $enc->bindStorage(4, $requests);
+        $enc->bindStorage(5, $viewsState, $stateOffset);
+        $main->bindCounters($enc, 6);
+        $enc->dispatch($stepsX, $stepsY);
+        $enc->setKernel($coarse);
+        $enc->upload($params, slot: 0);
+        $enc->bindStorage(0, $lights->buffer());
+        $main->bindKeys($enc, 1, 2);
+        $enc->bindStorage(3, $requests);
+        $enc->dispatch(LIGHT_VISIBLE_MAX as uint32);
+        $enc->barrier();
+
+        $enc->setKernel($mark);
+        $enc->upload($params, slot: 0);
+        $enc->bindStorage(0, $gens);
+        $enc->bindStorage(1, $requests);
+        $enc->bindStorage(2, $table);
+        $enc->bindStorage(3, $phys);
+        $enc->bindStorage(4, $misses);
+        $enc->bindStorage(5, $viewsState, $stateOffset);
+        $enc->dispatch($rows * (VSM_REQUEST_WORDS as uint32));
+        $enc->barrier();
+
+        $enc->setKernel($free);
+        $enc->upload($params, slot: 0);
+        $enc->bindStorage(0, $phys);
+        $enc->bindStorage(1, $candidates);
+        $enc->bindStorage(2, $viewsState, $stateOffset);
+        $enc->dispatch(VSM_PAGES as uint32);
+        $enc->barrier();
+
+        $enc->setKernel($alloc);
+        $enc->upload($params, slot: 0);
+        $enc->bindStorage(0, $lights->buffer());
+        $enc->bindStorage(1, $gens);
+        $enc->bindStorage(2, $misses);
+        $enc->bindStorage(3, $candidates);
+        $enc->bindStorage(4, $phys);
+        $enc->bindStorage(5, $table);
+        $enc->bindStorage(6, $dirty);
+        $enc->bindStorage(7, $viewsState);
+        $enc->dispatch(VSM_MAX_DIRTY as uint32);
+        $enc->endCompute();
+        $this->device->copyBuffer($viewsState, $stateOffset, $this->readback(), 0 as uint64, (VSM_STATE_WORDS * 4) as uint64);
+        visu::profile::end();
+
+        if ($this->drawing) {
+            $scene->cullPages($ctx, $viewsState, VSM_MAX_DIRTY);
+        } else {
+            $scene->pages->culled = false;
+        }
+    }
+
+    /**
+     * Draw this frame? A change, a moved camera, or misses or dirty pages the frame two back
+     * saw say yes; `VSM_QUIET_FRAMES` without any say no.
+     */
+    private function decide(const CameraData& $camera) : bool
+    {
+        // a change only matters where a shadowed light can see it: near enough to the eye
+        bool $busy = $this->slots->count() > 0 || $camera->view != $this->lastView;
+        float32 $reach = $this->shadowDistance + VSM_LIGHT_REACH;
+        foreach ($this->boxes as $box) {
+            if (visu::math::length($box->closest($camera->position) - $camera->position) <= $reach) {
+                $busy = true;
+            }
+        }
+
+        $this->lastView = $camera->view;
+        uint32 $slot = $this->device->frameSlot();
+        if ((($slot as usize) < $this->readbacks->count()) && $this->frame > (FRAMES_IN_FLIGHT + 1)) {
+            // VSM_STATE_WORDS: an inline array's length cannot name a constant yet
+            uint32[20] $state;
+            $this->device->readMapped($this->readbacks[$slot as usize], ptr<uint8>(&$state[0]), (VSM_STATE_WORDS * 4) as uint64);
+            uint32 $work = $state[VSM_STATE_DIRTY];
+            int32 $m = 0;
+            while ($m < VSM_MIPS) {
+                $work = $work + $state[VSM_STATE_MISSES + $m];
+                $m = $m + 1;
+            }
+
+            if ($work > 0) {
+                $busy = true;
+            }
+        } else {
+            $busy = true;
+        }
+
+        if ($busy) {
+            $this->quiet = 0;
+            return true;
+        }
+
+        $this->quiet = $this->quiet + 1;
+        return $this->quiet < VSM_QUIET_FRAMES;
+    }
+
+    private const function budget() : uint32
+    {
+        if ($this->drawing) {
+            return VSM_MAX_DIRTY as uint32;
+        }
+
+        return 0;
+    }
+
+    /**
+     * This frame slot's readback buffer, made on its first use.
+     */
+    private function readback() : Buffer
+    {
+        uint32 $slot = $this->device->frameSlot();
+        while ($this->readbacks->count() <= ($slot as usize)) {
+            $this->readbacks[] = Buffer($this->device, BufferDesc(BUFFER_READBACK, (VSM_STATE_WORDS * 4) as uint64, 'vsm.readback'));
+        }
+
+        return $this->readbacks[$slot as usize];
+    }
+
+    /**
+     * Draw this frame's dirty pages into the scratch target's cells, then copy each into its
+     * physical cell of the atlas. Outside any encoder; `update` ran this frame.
+     */
+    public function draw(RenderContext $ctx, LightClusterData $clusters, GpuScene $scene, DeferredGpu $gpu) : void
+    {
+        if (!$this->drawing) {
+            return;
+        }
+
+        Texture $scratch = guard $this->scratch else {
+            return;
+        }
+        if (($this->frame % 2) == 1) {
+            Texture $other = guard $this->scratchB else {
+                return;
+            }
+            $scratch = $other;
+        }
+        if (!$scene->pages->culled) {
+            return;
+        }
+
+        ComputeProgram $copy = guard $this->device->gpuShaders->kernel($this->device, 'vsm_copy') else ($e) {
+            die($e->message());
+        }
+        $this->ensurePasses();
+        GpuPass $opaque = guard $this->opaquePass;
+        GpuPass $alpha = guard $this->alphaPass;
+        Buffer $dirty = guard $this->dirty;
+        Buffer $viewsState = guard $this->viewsState;
+        Buffer $atlas = guard $this->atlas;
+        DepthTarget $depth = DepthTarget($scratch);
+        $depth->load = .clear;
+        $depth->store = .store;
+        $depth->clearDepth = 1.0f;
+        RenderPassDesc $desc = RenderPassDesc();
+        $desc->depth = $depth;
+        RenderEncoder $enc = $ctx->device->beginRender($desc);
+        $gpu->camera->bind($enc);
+        $enc->bindStorage(6, $clusters->table->buffer());
+        $enc->bindStorage(7, $dirty);
+        $scene->draw($enc, $scene->pages, 0, $opaque, $alpha);
+        $enc->endRender();
+        $ctx->device->transitionTexture($scratch, .shaderRead);
+        ComputeEncoder $cmp = $ctx->beginCompute();
+        $cmp->setKernel($copy);
+        $cmp->bindTexture(0, $scratch, $this->pointSampler());
+        $cmp->bindStorage(0, $dirty);
+        $cmp->bindStorage(1, $atlas);
+        $cmp->dispatchIndirect($viewsState, $this->stateOffset() + (VSM_STATE_COPY * 4) as uint64);
+        $cmp->endCompute();
+    }
+
+    /**
+     * The page table at storage 4, the generations at 5 and the atlas at 6, where
+     * `visu/vsm_sample.glsl` reads them. `u_vsm` is `lookup()`.
+     */
+    public function bind(RenderEncoder $enc) : void
+    {
+        Buffer $atlas = guard $this->atlas else {
+            return;
+        }
+        Buffer $table = guard $this->table else {
+            return;
+        }
+        Buffer $gens = guard $this->gens;
+        $enc->bindStorage(4, $table);
+        $enc->bindStorage(5, $gens);
+        $enc->bindStorage(6, $atlas);
+    }
+
+    /**
+     * `u_vsm`: whether the lookup may read the atlas, the mip bias, the debug paint and the
+     * shadow distance.
+     */
+    public const function lookup() : Vec4
+    {
+        float32 $on = 0.0f;
+        if ($this->enabled && $this->atlas != null) {
+            $on = 1.0f;
+        }
+
+        float32 $debug = 0.0f;
+        if ($this->debug) {
+            $debug = 1.0f;
+        }
+
+        return Vec4($on, $this->mipBias, $debug, $this->shadowDistance);
+    }
+
+    /**
+     * The last frame's counters, read back with the device idle: misses per level, free
+     * candidates, pages drawn, and the page cull's pairs and items. The `light vsm` verb; a
+     * debug stall, never the play path.
+     */
+    public function stats() : string
+    {
+        GpuScene $scene = guard $this->scene else {
+            return 'vsm: no frame yet';
+        }
+        Buffer $state = guard $this->viewsState else {
+            return 'vsm: not allocated';
+        }
+        array<uint8> $bytes = guard $this->device->readbackBuffer($state, $this->stateOffset(), (VSM_STATE_WORDS * 4) as uint64) else ($e) {
+            return "vsm: {$e->message()}";
+        }
+        int32 $boxCount = $this->boxes->count() as int32;
+        int32 $moverCount = $scene->moverCount();
+        string $out = "vsm: frame {$this->frame} movers {$moverCount} boxes {$boxCount} misses";
+        int32 $m = 0;
+        while ($m < VSM_MIPS) {
+            uint32 $miss = vsmWord($bytes, VSM_STATE_MISSES + $m);
+            $out->append(" {$miss}");
+            $m = $m + 1;
+        }
+
+        uint32 $free = vsmWord($bytes, VSM_STATE_CANDIDATES);
+        uint32 $stale = vsmWord($bytes, VSM_STATE_CANDIDATES + 1);
+        uint32 $recent = vsmWord($bytes, VSM_STATE_CANDIDATES + 2);
+        uint32 $dirty = vsmWord($bytes, VSM_STATE_DIRTY);
+        uint32 $dropped = vsmWord($bytes, VSM_STATE_DROPPED);
+        uint32 $bias = vsmWord($bytes, VSM_STATE_BIAS);
+        $out->append(" candidates {$free} {$stale} {$recent} dirty {$dirty} dropped {$dropped} bias {$bias}/256");
+        Buffer $counters = guard $scene->pages->counters else {
+            return $out;
+        }
+        array<uint8> $c = guard $this->device->readbackBuffer($counters, 0 as uint64, ((SCENE_COUNT_BASE + VSM_MAX_DIRTY) * 4) as uint64) else ($e) {
+            return $out;
+        }
+        uint32 $items = 0;
+        int32 $i = 0;
+        while ($i < VSM_MAX_DIRTY) {
+            $items = $items + vsmWord($c, SCENE_COUNT_BASE + $i);
+            $i = $i + 1;
+        }
+
+        uint32 $pairs = vsmWord($c, SCENE_COUNTER_PAIRS);
+        uint32 $pairsDropped = vsmWord($c, SCENE_COUNTER_PAIRS_DROPPED);
+        $out->append("\nvsm: page cull pairs {$pairs} dropped {$pairsDropped} items {$items}");
+        return $out;
+    }
+
+    public function destroy() : void
+    {
+        $this->scratch = dropTexture($this->scratch);
+        $this->scratchB = dropTexture($this->scratchB);
+        $this->atlas = dropBuffer($this->atlas);
+        $this->dropLightBuffers();
+        $this->phys = dropBuffer($this->phys);
+        $this->misses = dropBuffer($this->misses);
+        $this->candidates = dropBuffer($this->candidates);
+        $this->dirty = dropBuffer($this->dirty);
+        $this->viewsState = dropBuffer($this->viewsState);
+        foreach ($this->readbacks as $readback) {
+            $readback->destroy();
+        }
+
+        $this->readbacks->clear();
+    }
+
+    /**
+     * The views come first in `viewsState`, `VSM_MAX_DIRTY` scene rows; the state words follow.
+     */
+    private const function stateOffset() : uint64
+    {
+        return (VSM_MAX_DIRTY as uint64) * (mem::size<SceneViewGpu>() as uint64);
+    }
+
+    /**
+     * The fixed buffers once, and the per-light ones sized to the table. A table that outgrew
+     * them starts every light over: the pages refill over the next frames.
+     */
+    private function ensure(RenderContext $ctx, int32 $rows) : void
+    {
+        Device $device = $ctx->device;
+        if ($this->atlas == null) {
+            TextureDesc $desc = TextureDesc($format: .depth32f, $width: VSM_SCRATCH, $height: VSM_SCRATCH);
+            $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET;
+            $desc->label = 'vsm.scratch';
+            $this->scratch = Texture($device, 'vsm.scratch', $desc);
+            $desc->label = 'vsm.scratch.b';
+            $this->scratchB = Texture($device, 'vsm.scratch.b', $desc);
+            // a cell is only read once its entry is mapped, which is after it was written
+            $this->atlas = Buffer($device, BufferDesc(BUFFER_STORAGE, ((VSM_PAGES as uint64) * (VSM_CELL_TEXELS as uint64)) * 4, 'vsm.atlas'));
+            $this->phys = Buffer($device, BufferDesc(BUFFER_STORAGE, (VSM_PAGES * 8) as uint64, 'vsm.phys'));
+            $this->misses = Buffer($device, BufferDesc(BUFFER_STORAGE, (5 * VSM_MISS_MAX * 4) as uint64, 'vsm.misses'));
+            $this->candidates = Buffer($device, BufferDesc(BUFFER_STORAGE, (3 * VSM_PAGES * 4) as uint64, 'vsm.candidates'));
+            $this->dirty = Buffer($device, BufferDesc(BUFFER_STORAGE, (VSM_MAX_DIRTY * 16) as uint64, 'vsm.dirty'));
+            uint64 $bytes = $this->stateOffset() + (VSM_STATE_WORDS * 4) as uint64;
+            $this->viewsState = Buffer($device, BufferDesc(BUFFER_STORAGE | BUFFER_INDIRECT, $bytes, 'vsm.views'));
+            Buffer $vs = guard $this->viewsState;
+            $device->fillBuffer($vs, 0 as uint64, $bytes, 0 as uint32);
+            Buffer $p = guard $this->phys;
+            $device->fillBuffer($p, 0 as uint64, (VSM_PAGES * 8) as uint64, 0xFFFFFFFF);
+        }
+
+        int32 $want = $rows;
+        if ($want < 1) {
+            $want = 1;
+        }
+
+        if ($want <= $this->rowCapacity && $this->table != null) {
+            return;
+        }
+
+        int32 $cap = 64;
+        while ($cap < $want) {
+            $cap = $cap * 2;
+        }
+
+        $this->dropLightBuffers();
+        $this->rowCapacity = $cap;
+        uint64 $n = $cap as uint64;
+        $this->gens = Buffer($device, BufferDesc(BUFFER_STORAGE, $n * 4, 'vsm.gens'));
+        $this->requests = Buffer($device, BufferDesc(BUFFER_STORAGE, $n * (VSM_REQUEST_WORDS as uint64) * 4, 'vsm.requests'));
+        $this->table = Buffer($device, BufferDesc(BUFFER_STORAGE, $n * (VSM_LIGHT_PAGES as uint64) * 4, 'vsm.table'));
+        Buffer $g = guard $this->gens;
+        Buffer $t = guard $this->table;
+        Buffer $p = guard $this->phys;
+        $device->fillBuffer($g, 0 as uint64, $n * 4, 0 as uint32);
+        $device->fillBuffer($t, 0 as uint64, $n * (VSM_LIGHT_PAGES as uint64) * 4, 0xFFFFFFFF);
+        // every page belonged to an entry of the old table
+        $device->fillBuffer($p, 0 as uint64, (VSM_PAGES * 8) as uint64, 0xFFFFFFFF);
+    }
+
+    /**
+     * This frame's change boxes from the light table and the scene, folded to `VSM_BOXES_MAX`.
+     */
+    private function gather(LightTable $lights, GpuScene $scene) : void
+    {
+        $this->boxes->clear();
+        $this->slots->clear();
+        foreach ($lights->changed as $slot) {
+            if (($this->slots->count() as int32) < VSM_BOXES_MAX) {
+                $this->slots[] = $slot as uint32;
+            } else {
+                // more lights changed than the list holds: retire every light's pages
+                $this->boxes->clear();
+                $this->fold(AABB(Vec3(-10000000.0f), Vec3(10000000.0f)));
+            }
+        }
+
+        foreach ($scene->changed as $box) {
+            $this->fold($box);
+        }
+
+        $lights->changed->clear();
+        $scene->changed->clear();
+    }
+
+    private function fold(const AABB& $box) : void
+    {
+        foldBox($this->boxes, $box, VSM_BOXES_MAX);
+    }
+
+    private function uploadBoxes() : TransientSlice
+    {
+        $this->boxWords->clear();
+        foreach ($this->boxes as $b) {
+            $this->boxWords[] = Vec4($b->min, 0.0f);
+            $this->boxWords[] = Vec4($b->max, 0.0f);
+        }
+
+        return transientRows<Vec4>($this->device, $this->boxWords, 2);
+    }
+
+    private function uploadSlots() : TransientSlice
+    {
+        return transientRows<uint32>($this->device, $this->slots, 4);
+    }
+
+    private function dropLightBuffers() : void
+    {
+        $this->gens = dropBuffer($this->gens);
+        $this->requests = dropBuffer($this->requests);
+        $this->table = dropBuffer($this->table);
+        $this->rowCapacity = 0;
+    }
+
+    private function ensurePasses() : void
+    {
+        if ($this->opaquePass != null) {
+            return;
+        }
+
+        $this->opaquePass = depthPullPass($this->device, 'depth_pull+vsm');
+        $this->alphaPass = depthPullPass($this->device, 'depth_pull+vsm_alpha');
+    }
+
+    private function pointSampler() : Sampler
+    {
+        SamplerDesc $desc = SamplerDesc();
+        $desc->min = Filter::nearest;
+        $desc->mag = Filter::nearest;
+        $desc->wrapS = Wrap::clampToEdge;
+        $desc->wrapT = Wrap::clampToEdge;
+        return $this->device->createSampler($desc);
+    }
+}
+
+internal function vsmWord(const array<uint8>& $bytes, int32 $word) : uint32
+{
+    usize $at = ($word * 4) as usize;
+    return ($bytes[$at] as uint32)
+        | (($bytes[$at + 1] as uint32) << 8)
+        | (($bytes[$at + 2] as uint32) << 16)
+        | (($bytes[$at + 3] as uint32) << 24);
+}

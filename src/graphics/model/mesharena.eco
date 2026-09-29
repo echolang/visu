@@ -1,0 +1,386 @@
+/**
+ * Every model's depth form in three storage buffers the GPU-driven views read by index: vertex
+ * words, indices (already the word offset of their vertex) and cluster records. The `ModelBank`
+ * owns one and adds a model when it loads or adopts it, so nothing here runs in a frame that
+ * did not load something. A CPU mirror keeps every word, so growing a buffer is one fresh
+ * buffer and one upload at that load step; a removed model's ranges go back on a free list.
+ * The buffers a frame in flight read are released by the device once no frame reads them.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+/**
+ * Cluster flag: the model is skinned, so its vertices carry joints and weights and its bind
+ * pose bounds say nothing about where the posed triangles are.
+ */
+public const uint32 SCENE_CLUSTER_SKINNED = 1;
+
+/**
+ * Bucket of a cluster whose material casts no shadow: every depth view skips it.
+ */
+public const uint32 SCENE_BUCKET_NONE = 0xFFFFFFFF;
+
+/**
+ * One cluster as the kernels and `depth_pull.vert` read it, 32 bytes (std430 `vec4, uvec4`).
+ * `sphere` is the model-space centre and radius, `firstIndex` its first entry in the arena
+ * index buffer, `bucket` the shadow bucket of its material (`MaterialGpu.shadowBucket`).
+ */
+public struct SceneClusterGpu
+{
+    public Vec4 $sphere;
+    public uint32 $firstIndex;
+    public uint32 $triangles;
+    public uint32 $bucket;
+    public uint32 $flags;
+}
+
+/**
+ * Where one model sits in the arena. Level `l` of its clusters is `lodStart[l] .. lodStart[l + 1]`,
+ * global cluster indices.
+ */
+public struct ArenaModel
+{
+    public int32 $firstWord;
+    public int32 $words;
+    public int32 $firstIndex;
+    public int32 $indices;
+    public int32 $firstCluster;
+    public int32 $clusters;
+    public int32 $stride;
+    public bool $skinned;
+    public array<int32> $lodStart;
+}
+
+public class MeshArena
+{
+    private Device $device;
+    private array<uint32> $words;
+    private array<uint32> $indices;
+    private array<SceneClusterGpu> $clusters;
+    private ArenaRanges $wordRanges;
+    private ArenaRanges $indexRanges;
+    private ArenaRanges $clusterRanges;
+    private Buffer? $wordBuffer;
+    private Buffer? $indexBuffer;
+    private Buffer? $clusterBuffer;
+
+    public constructor(Device $device)
+    {
+        $this->device = $device;
+        $this->words = array<uint32>();
+        $this->indices = array<uint32>();
+        $this->clusters = array<SceneClusterGpu>();
+        $this->wordRanges = ArenaRanges();
+        $this->indexRanges = ArenaRanges();
+        $this->clusterRanges = ArenaRanges();
+        $this->wordBuffer = null;
+        $this->indexBuffer = null;
+        $this->clusterBuffer = null;
+    }
+
+    /**
+     * Copy `$depth` in and upload it. `$buckets` is the shadow bucket of each material slot.
+     */
+    public function add(const ModelDepth& $depth, const array<uint32>& $buckets, bool $skinned) : ArenaModel
+    {
+        int32 $wordCount = $depth->words->count() as int32;
+        int32 $indexCount = $depth->indices->count() as int32;
+        int32 $clusterCount = $depth->clusters->count() as int32;
+        int32 $firstWord = $this->wordRanges->take($wordCount);
+        int32 $firstIndex = $this->indexRanges->take($indexCount);
+        int32 $firstCluster = $this->clusterRanges->take($clusterCount);
+        arenaFit<uint32>($this->words, $this->wordRanges->top, 0 as uint32);
+        arenaFit<uint32>($this->indices, $this->indexRanges->top, 0 as uint32);
+        arenaFit<SceneClusterGpu>($this->clusters, $this->clusterRanges->top, SceneClusterGpu(
+            $sphere: Vec4(0.0f),
+            $firstIndex: 0,
+            $triangles: 0,
+            $bucket: SCENE_BUCKET_NONE,
+            $flags: 0
+        ));
+
+        int32 $i = 0;
+        while ($i < $wordCount) {
+            $this->words[($firstWord + $i) as usize] = $depth->words[$i as usize];
+            $i = $i + 1;
+        }
+
+        uint32 $stride = $depth->stride as uint32;
+        $i = 0;
+        while ($i < $indexCount) {
+            $this->indices[($firstIndex + $i) as usize] = ($firstWord as uint32) + $depth->indices[$i as usize] * $stride;
+            $i = $i + 1;
+        }
+
+        uint32 $flags = 0;
+        if ($skinned) {
+            $flags = SCENE_CLUSTER_SKINNED;
+        }
+
+        $i = 0;
+        while ($i < $clusterCount) {
+            DepthCluster $c = $depth->clusters[$i as usize];
+            uint32 $bucket = SCENE_BUCKET_NONE;
+            if ($c->slot >= 0 && ($c->slot as usize) < $buckets->count()) {
+                $bucket = $buckets[$c->slot as usize];
+            }
+
+            $this->clusters[($firstCluster + $i) as usize] = SceneClusterGpu(
+                $sphere: Vec4($c->center->x, $c->center->y, $c->center->z, $c->radius),
+                $firstIndex: ($firstIndex + $c->firstIndex) as uint32,
+                $triangles: $c->triangles as uint32,
+                $bucket: $bucket,
+                $flags: $flags
+            );
+            $i = $i + 1;
+        }
+
+        array<int32> $lodStart = array<int32>();
+        foreach ($depth->lodStart as $start) {
+            $lodStart[] = $firstCluster + $start;
+        }
+
+        $this->sync();
+        $this->uploadWords($firstWord, $wordCount);
+        $this->uploadIndices($firstIndex, $indexCount);
+        $this->uploadClusters($firstCluster, $clusterCount);
+        return ArenaModel(
+            $firstWord: $firstWord,
+            $words: $wordCount,
+            $firstIndex: $firstIndex,
+            $indices: $indexCount,
+            $firstCluster: $firstCluster,
+            $clusters: $clusterCount,
+            $stride: $depth->stride,
+            $skinned: $skinned,
+            $lodStart: $lodStart
+        );
+    }
+
+    /**
+     * Give a model's ranges back. Its words stay until something reuses them; no view points
+     * at them once the model has no users.
+     */
+    public function remove(const ArenaModel& $model) : void
+    {
+        $this->wordRanges->give($model->firstWord, $model->words);
+        $this->indexRanges->give($model->firstIndex, $model->indices);
+        $this->clusterRanges->give($model->firstCluster, $model->clusters);
+    }
+
+    /**
+     * Forget every model and free the buffers. The bank calls this when it drops its models.
+     */
+    public function clear() : void
+    {
+        $this->words->clear();
+        $this->indices->clear();
+        $this->clusters->clear();
+        $this->wordRanges = ArenaRanges();
+        $this->indexRanges = ArenaRanges();
+        $this->clusterRanges = ArenaRanges();
+        $this->dropBuffers();
+    }
+
+    public const function empty() : bool
+    {
+        return $this->wordBuffer == null;
+    }
+
+    /**
+     * The vertex words. Only valid when not `empty`.
+     */
+    public function vertices() : Buffer
+    {
+        Buffer $b = guard $this->wordBuffer else {
+            die('mesh arena: no vertices yet');
+        }
+        return $b;
+    }
+
+    public function indexBuffer() : Buffer
+    {
+        Buffer $b = guard $this->indexBuffer else {
+            die('mesh arena: no indices yet');
+        }
+        return $b;
+    }
+
+    public function clusterBuffer() : Buffer
+    {
+        Buffer $b = guard $this->clusterBuffer else {
+            die('mesh arena: no clusters yet');
+        }
+        return $b;
+    }
+
+    /**
+     * Replace every buffer whose range outgrew it with one sized to its capacity, filled from
+     * the mirror.
+     */
+    private function sync() : void
+    {
+        if (arenaNeeds($this->wordBuffer, $this->wordRanges->capacity * 4)) {
+            $this->wordBuffer = arenaBuffer($this->device, $this->wordBuffer, $this->wordRanges->capacity * 4, 'arena.words');
+            $this->uploadWords(0, $this->wordRanges->top);
+        }
+
+        if (arenaNeeds($this->indexBuffer, $this->indexRanges->capacity * 4)) {
+            $this->indexBuffer = arenaBuffer($this->device, $this->indexBuffer, $this->indexRanges->capacity * 4, 'arena.indices');
+            $this->uploadIndices(0, $this->indexRanges->top);
+        }
+
+        int32 $clusterBytes = mem::size<SceneClusterGpu>() as int32;
+        if (arenaNeeds($this->clusterBuffer, $this->clusterRanges->capacity * $clusterBytes)) {
+            $this->clusterBuffer = arenaBuffer($this->device, $this->clusterBuffer, $this->clusterRanges->capacity * $clusterBytes, 'arena.clusters');
+            $this->uploadClusters(0, $this->clusterRanges->top);
+        }
+    }
+
+    private function uploadWords(int32 $first, int32 $count) : void
+    {
+        Buffer $b = guard $this->wordBuffer else {
+            return;
+        }
+        if ($count <= 0) {
+            return;
+        }
+
+        ptr<const uint32> $src = ptr<const uint32>(&$this->words[$first as usize]);
+        $b->upload(ptr<const uint8>($src:$), ($count as uint64) * 4, ($first as uint64) * 4);
+    }
+
+    private function uploadIndices(int32 $first, int32 $count) : void
+    {
+        Buffer $b = guard $this->indexBuffer else {
+            return;
+        }
+        if ($count <= 0) {
+            return;
+        }
+
+        ptr<const uint32> $src = ptr<const uint32>(&$this->indices[$first as usize]);
+        $b->upload(ptr<const uint8>($src:$), ($count as uint64) * 4, ($first as uint64) * 4);
+    }
+
+    private function uploadClusters(int32 $first, int32 $count) : void
+    {
+        Buffer $b = guard $this->clusterBuffer else {
+            return;
+        }
+        if ($count <= 0) {
+            return;
+        }
+
+        uint64 $size = mem::size<SceneClusterGpu>() as uint64;
+        ptr<const SceneClusterGpu> $src = ptr<const SceneClusterGpu>(&$this->clusters[$first as usize]);
+        $b->upload(ptr<const uint8>($src:$), ($count as uint64) * $size, ($first as uint64) * $size);
+    }
+
+    private function dropBuffers() : void
+    {
+        $this->wordBuffer = dropBuffer($this->wordBuffer);
+        $this->indexBuffer = dropBuffer($this->indexBuffer);
+        $this->clusterBuffer = dropBuffer($this->clusterBuffer);
+    }
+}
+
+/**
+ * First-fit ranges over one arena buffer, in elements. `top` is the high-water mark the mirror
+ * spans, `capacity` what the GPU buffer holds; a take past it doubles the capacity.
+ */
+internal class ArenaRanges
+{
+    public int32 $top;
+    public int32 $capacity;
+    private array<int32> $freeStart;
+    private array<int32> $freeCount;
+
+    public constructor()
+    {
+        $this->top = 0;
+        $this->capacity = 0;
+        $this->freeStart = array<int32>();
+        $this->freeCount = array<int32>();
+    }
+
+    public function take(int32 $n) : int32
+    {
+        if ($n <= 0) {
+            return $this->top;
+        }
+
+        usize $i = 0;
+        while ($i < $this->freeStart->count()) {
+            if ($this->freeCount[$i] >= $n) {
+                int32 $start = $this->freeStart[$i];
+                $this->freeStart[$i] = $start + $n;
+                $this->freeCount[$i] = $this->freeCount[$i] - $n;
+                return $start;
+            }
+
+            $i = $i + 1;
+        }
+
+        int32 $start = $this->top;
+        $this->top = $this->top + $n;
+        if ($this->top > $this->capacity) {
+            int32 $grown = $this->capacity * 2;
+            if ($grown < 4096) {
+                $grown = 4096;
+            }
+
+            while ($grown < $this->top) {
+                $grown = $grown * 2;
+            }
+
+            $this->capacity = $grown;
+        }
+
+        return $start;
+    }
+
+    public function give(int32 $start, int32 $n) : void
+    {
+        if ($n <= 0) {
+            return;
+        }
+
+        $this->freeStart[] = $start;
+        $this->freeCount[] = $n;
+    }
+}
+
+/**
+ * Grow `$mirror` to `$count` entries with `$fill`.
+ */
+internal function arenaFit<T>(array<T>& $mirror, int32 $count, T $fill) : void
+{
+    while (($mirror->count() as int32) < $count) {
+        $mirror[] = $fill;
+    }
+}
+
+internal function arenaNeeds(Buffer? $have, int32 $bytes) : bool
+{
+    if ($bytes <= 0) {
+        return false;
+    }
+
+    Buffer $b = guard $have else {
+        return true;
+    }
+    return ($b->handle->bytes as int64) < ($bytes as int64);
+}
+
+/**
+ * A fresh storage buffer of `$bytes`; the old one is destroyed, which the device defers until
+ * no frame in flight reads it.
+ */
+internal function arenaBuffer(Device $device, Buffer? $old, int32 $bytes, string $label) : Buffer
+{
+    dropBuffer($old);
+    return Buffer($device, BufferDesc(BUFFER_STORAGE, $bytes as uint64, $label));
+}

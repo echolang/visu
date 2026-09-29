@@ -1,0 +1,89 @@
+#version 450
+
+// visu::graphics::ShadowAtlas, receivers: one G-buffer sample per step x step block asks, for
+// every shadowed light its clustered lists give that pixel, for the page its footprint wants
+// and for the coarsest page of that face, so a lookup always has a level to fall back to
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "visu/vsmcull.glsl"
+// the clustered lists at storage 0 to 3
+#include "visu/lights.glsl"
+
+layout(set = 1, binding = 0) uniform sampler2D gbuffer_position;
+
+layout(std430, set = 2, binding = 4) buffer Requests {
+    uint requests[];
+};
+
+layout(std430, set = 2, binding = 5) readonly buffer State {
+    uint state[];
+};
+
+layout(std430, set = 2, binding = 6) readonly buffer LightCounters {
+    uint lightCounters[];
+};
+
+void request(uint slot, uint page)
+{
+    // each light owns VSM_REQUEST_WORDS words of the mask; bit `page` of them. Neighbouring
+    // samples ask for the same pages, so a bit already set skips the atomic
+    uint bit = slot * VSM_REQUEST_WORDS * 32u + page;
+    uint mask = 1u << (bit & 31u);
+    if ((requests[bit >> 5u] & mask) == 0u) {
+        atomicOr(requests[bit >> 5u], mask);
+    }
+}
+
+void main()
+{
+    uint step = uint(u_vsm_screen.w + 0.5);
+    uvec2 pixel = gl_GlobalInvocationID.xy * step + uvec2(step / 2u);
+    if (pixel.x >= uint(u_vsm_screen.x) || pixel.y >= uint(u_vsm_screen.y)) {
+        return;
+    }
+
+    vec4 position = texelFetch(gbuffer_position, ivec2(pixel), 0);
+    if (position.a < 0.5) {
+        return;
+    }
+
+    vec3 world = position.xyz + u_vsm_eye.xyz;
+    float viewDepth = -(u_vsm_view * vec4(world, 1.0)).z;
+    // empty (lo > hi) when the view has no visible lights
+    uvec2 range = light_range(viewDepth, u_vsm_cluster_head, u_vsm_cluster_z);
+    // lights sorted past the shadow distance never cast: stop the walk there
+    uint shadowed = lightCounters[LIGHT_COUNTER_SHADOWED];
+    if (shadowed == 0u) {
+        return;
+    }
+    range.y = min(range.y, shadowed - 1u);
+    if (range.x > range.y) {
+        return;
+    }
+
+    uint base = light_tile_base(pixel, u_vsm_cluster_head);
+    // the world size of one screen pixel at this depth
+    float footprint = vsm_footprint(viewDepth, u_vsm_eye.w, u_vsm_screen.y);
+    float bias = u_vsm_screen.z + float(state[VSM_STATE_BIAS]) / 256.0;
+    for (uint w = range.x >> 5u; w <= (range.y >> 5u); w++) {
+        uint bits = light_word(base, w, range);
+        while (bits != 0u) {
+            uint b = uint(findLSB(bits));
+            bits &= bits - 1u;
+            uint slot = light_slot(w * 32u + b);
+            LightGpu l = u_lights[slot];
+            if (!light_casts(l, u_vsm_eye.xyz, u_vsm_shadow.x)) {
+                continue;
+            }
+            vec3 d = world - l.position_radius.xyz;
+            if (dot(d, d) >= l.position_radius.w * l.position_radius.w) {
+                continue;
+            }
+            uint face = vsm_face(d);
+            vec3 v = vsm_view(face, d);
+            vec2 f = v.xy / max(v.z, 1e-6);
+            uint mip = vsm_mip(footprint, v.z, bias);
+            request(slot, vsm_page_index(face, mip, vsm_page_xy(f, mip)));
+        }
+    }
+}

@@ -87,6 +87,13 @@ public interface RenderEncoderProtocol
     function bindStorage(uint32 $slot, Buffer $buffer, uint64 $offset = 0) : void;
 
     /**
+     * Bind this frame's transient `$slice` as the storage buffer at `$slot`, read only: per
+     * frame rows the CPU wrote (`allocTransient` at `limits.storageAlign`) that a kernel or a
+     * draw reads without a buffer of their own. A transient from another frame asserts.
+     */
+    function bindStorage(uint32 $slot, transient: TransientSlice $slice) : void;
+
+    /**
      * GPU per-patch tessellation factors for the next patches draw. Reads the bound vertex transient and uniform slots.
      * Metal records `$kernel` into the frame's pre-render compute command buffer and binds the factor slice it writes;
      * Vulkan does nothing: the tessellation control shader owns the factors there.
@@ -105,6 +112,14 @@ public interface RenderEncoderProtocol
      * Metal currently asserts `$vertexOffset == 0`.
      */
     function drawIndexed(int32 $firstIndex, int32 $count, int32 $instances = 1, int32 $vertexOffset = 0) : void;
+
+    /**
+     * Non-indexed draw whose arguments a kernel wrote: four uint32 at `$offset` in `$arguments`
+     * (vertex count, instance count, first vertex, first instance). Needs setGpuPass and a
+     * buffer made with `BUFFER_INDIRECT`. The CPU never learns the count, so the draw
+     * statistics record the call and no triangles.
+     */
+    function drawIndirect(Buffer $arguments, uint64 $offset = 0) : void;
 
     /**
      * Close the encoder. The destructor asserts you called this.

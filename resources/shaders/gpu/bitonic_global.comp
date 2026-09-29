@@ -1,0 +1,33 @@
+#version 450
+
+// visu::graphics::GpuSort, one compare-exchange step too wide for a block: pair distance
+// `u_sort.y` (j) of run `u_sort.x` (k) over `u_sort.z` keys, one thread per pair
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform SortParams {
+    uvec4 u_sort;
+};
+
+layout(std430, set = 2, binding = 0) buffer Keys {
+    uint keys[];
+};
+
+void main()
+{
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= (u_sort.z >> 1u)) {
+        return;
+    }
+
+    uint k = u_sort.x;
+    uint j = u_sort.y;
+    uint i = 2u * t - (t & (j - 1u));
+    uint l = i + j;
+    bool up = (i & k) == 0u;
+    uint a = keys[i];
+    uint b = keys[l];
+    if ((a > b) == up) {
+        keys[i] = b;
+        keys[l] = a;
+    }
+}

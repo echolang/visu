@@ -1,0 +1,51 @@
+#version 450
+
+// visu::graphics::LightCull, stage one: every live light whose sphere meets the view becomes a
+// key, its view depth above the slot, so the sort that follows orders the visible lights near
+// to far and a key still names its slot
+layout(local_size_x = 64) in;
+
+#include "visu/lightcull.glsl"
+#include "visu/scene.glsl"
+
+layout(std430, set = 2, binding = 0) readonly buffer LightTableBuffer {
+    LightGpu lights[];
+};
+
+layout(std430, set = 2, binding = 1) writeonly buffer Keys {
+    uint keys[];
+};
+
+layout(std430, set = 2, binding = 2) buffer Counters {
+    uint counters[];
+};
+
+void main()
+{
+    uint slot = gl_GlobalInvocationID.x;
+    if (slot >= u_counts.x) {
+        return;
+    }
+
+    vec4 pr = lights[slot].position_radius;
+    if (pr.w <= 0.0) {
+        return;
+    }
+
+    // visu::geo::Frustum.contains(center, radius)
+    for (int i = 0; i < 6; i++) {
+        if (scene_sphere_behind(u_planes[i], pr.xyz, pr.w)) {
+            return;
+        }
+    }
+
+    float depth = max(-(u_view * vec4(pr.xyz, 1.0)).z, 0.0);
+    uint key = ((floatBitsToUint(depth) >> LIGHT_SLOT_BITS) << LIGHT_SLOT_BITS) | slot;
+    uint at = atomicAdd(counters[LIGHT_COUNTER_VISIBLE], 1u);
+    if (at >= u_counts.y) {
+        atomicAdd(counters[LIGHT_COUNTER_DROPPED], 1u);
+        return;
+    }
+
+    keys[at] = key;
+}

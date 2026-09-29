@@ -1,0 +1,83 @@
+/**
+ * Console grammar and handler for the renderer's aerial perspective: the `aerial` verb. The
+ * atmosphere itself is the sky's (`sky` in the app); this switches the lookup and scales it.
+ */
+
+namespace visu::console;
+
+use visu::graphics::{AerialPerspective, DeferredRenderer};
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal const AERIAL_USAGE = 'usage: aerial [on|off|scale <x>]';
+
+public class AerialConsole : ConsoleCommandHandler
+{
+    public DeferredRenderer $renderer;
+
+    public constructor(DeferredRenderer $renderer)
+    {
+        $this->renderer = $renderer;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('aerial', $this, 'on|off|scale <x>');
+        array<string> $names = array<string>();
+        $names[] = 'aerial';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        if (!$cmd->isAction('aerial')) {
+            return;
+        }
+
+        usize $n = $cmd->parts->count();
+        if ($n == 1) {
+            $console->writeLine($this->statusLine());
+            return;
+        }
+
+        string $verb = $cmd->parts[1];
+        AerialPerspective $aerial = $this->renderer->aerial;
+
+        if ($n == 2 && $verb == 'on') {
+            $aerial->enabled = true;
+        } else if ($n == 2 && $verb == 'off') {
+            $aerial->enabled = false;
+        } else if ($n == 3 && $verb == 'scale') {
+            float64 $raw = guard str::float($cmd->parts[2]) else {
+                $console->writeLine(AERIAL_USAGE);
+                return;
+            }
+            if ($raw <= 0.0) {
+                $console->writeLine('aerial: the scale is above zero');
+                return;
+            }
+            $aerial->scale = $raw as float32;
+        } else {
+            $console->writeLine(AERIAL_USAGE);
+            return;
+        }
+
+        $this->renderer->aerial = $aerial;
+        $console->writeLine($this->statusLine());
+    }
+
+    private function statusLine() : string
+    {
+        AerialPerspective $aerial = $this->renderer->aerial;
+        string $state = 'off';
+        if ($aerial->enabled) {
+            $state = 'on';
+        }
+
+        if ($this->renderer->legacyFog) {
+            $state = "{$state} (legacy fog: not drawn)";
+        }
+
+        return "aerial: {$state}, scale {$aerial->scale:.2f}";
+    }
+}

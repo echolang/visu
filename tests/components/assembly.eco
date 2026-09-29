@@ -4,7 +4,7 @@
 
 use json;
 use visu::asset::{Assembly, parseAssembly};
-use visu::components::{AssemblyInstance, DynamicModel, StaticModel, spawnAssembly};
+use visu::components::{AssemblyInstance, DynamicModel, StaticModel, changedAssembly, spawnAssembly};
 use visu::ecs::{Entities, Entity};
 use visu::geo::Transform;
 use visu::math::{Vec3, equal};
@@ -61,4 +61,43 @@ test spawn_assembly_skips_empty_part
     assert($models == 1, 'joint has no mesh');
     AssemblyInstance $inst = $world->get<AssemblyInstance>($rootId);
     assert($inst->node('joint') != null, 'joint entity');
+}
+
+private class HeardLog
+{
+    public array<Entity> $entities;
+
+    public constructor()
+    {
+        $this->entities = array<Entity>();
+    }
+}
+
+test changed_assembly_reports_every_node_then_the_root
+{
+    json::Value $root = guard json::parse('{"parts":{"body":{"model":"car/body"},"wheel":{"model":"car/wheel","dynamic":true}},"nodes":[{"name":"body","part":"body","position":[1,0,0]},{"name":"wheel_fl","part":"wheel","parent":"body","position":[0.8,0.3,1.2]}]}') else ($e) {
+        die($e->message());
+    }
+    Assembly $doc = guard parseAssembly('car', $root, '') else ($e) {
+        die($e->message());
+    }
+    Entities $world = Entities();
+    Entity $rootId = spawnAssembly($world, $doc, Transform());
+    HeardLog $log = HeardLog();
+    $world->onChange<Transform>(function(Entities $w, Entity $e, const Transform& $t) : void {
+        $log->entities->push($e);
+    });
+    changedAssembly($world, $rootId);
+    AssemblyInstance& $inst = $world->get<AssemblyInstance>($rootId);
+    assert($log->entities->count() >= 3, 'both parts and the root');
+    assert($log->entities[$log->entities->count() - 1] == $rootId, 'root last');
+    foreach ($inst->nodes as $name => $node) {
+        bool $heard = false;
+        foreach ($log->entities as $e) {
+            if ($e == $node) {
+                $heard = true;
+            }
+        }
+        assert($heard, 'every node heard');
+    }
 }

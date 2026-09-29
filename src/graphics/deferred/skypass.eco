@@ -1,8 +1,7 @@
 /**
- * Draws the procedural atmosphere per pixel behind the shaded scene, with its sun disk.
- * Same depth-borrow as `SkyboxPass`: geometry still occludes the sky. With a sky-view table
- * (`DeferredRenderer.skyView`) the atmosphere is read from it and only the disc, the moon
- * and the stars are evaluated per pixel.
+ * Draws the procedural atmosphere behind the shaded scene. Same depth-borrow as `SkyboxPass`:
+ * geometry still occludes the sky. The atmosphere is read from the sky-view table
+ * (`SkyViewLut`); only the disc, the moon and the stars are evaluated per pixel.
  */
 
 namespace visu::graphics;
@@ -17,7 +16,9 @@ public class SkyPass : Pass
     private HeightFog $fog;
     private DirectionalLight $sun;
     private Moon $moon;
-    private TextureRef? $view;
+    private TextureRef $view;
+    private TextureRef? $fogSky;
+    private FogLighting $fogLighting;
 
     public constructor(
         DeferredGpu $gpu,
@@ -25,7 +26,9 @@ public class SkyPass : Pass
         HeightFog $fog,
         DirectionalLight $sun,
         Moon $moon,
-        TextureRef? $view = null
+        TextureRef $view,
+        FogLighting $fogLighting,
+        TextureRef? $fogSky = null
     )
     {
         $this->gpu = $gpu;
@@ -34,6 +37,8 @@ public class SkyPass : Pass
         $this->sun = $sun;
         $this->moon = $moon;
         $this->view = $view;
+        $this->fogSky = $fogSky;
+        $this->fogLighting = $fogLighting;
     }
 
     public function name() : string
@@ -49,12 +54,13 @@ public class SkyPass : Pass
         $io->reads($gbuffer->depth);
         readGodRays($io, $frame);
         readSkyView($io, $this->view);
+        readFogSky($io, $this->fogSky);
         $io->writes($light->target);
     }
 
     public function execute(RenderContext $ctx) : status<PipelineError>
     {
-        ShaderProgram $program = guard $this->gpu->shaders->program(skyProgram($this->view)) else ($e) {
+        ShaderProgram $program = guard $this->gpu->shaders->program('sky') else ($e) {
             return .error(.shader($e));
         }
         RenderEncoder $enc = guard beginSkyPass($ctx) else ($e) {
@@ -68,15 +74,7 @@ public class SkyPass : Pass
         $pass->bind($enc);
         $this->gpu->camera->bind($enc);
         CameraData $camera = $ctx->frame->get<CameraData>();
-        FogUniforms $fog = fogUniforms(
-            $this->fog,
-            $camera->position,
-            fogSunTint($this->sun, $this->sky),
-            FOG_VIEW_SAMPLES,
-            FOG_LIGHT_SAMPLES,
-            fogMoonTint($this->moon, $this->sky),
-            fogLight($this->moon, $this->sky)
-        );
+        FogUniforms $fog = fogUniforms($this->fog, $camera->position, $this->fogLighting);
         SkyUniforms $sky = skyUniforms(
             $this->sky,
             $camera->position,
@@ -95,22 +93,14 @@ public class SkyPass : Pass
             $enc->endRender();
             return .error($e);
         }
+        guard bindFogSky($ctx, $enc, $this->gpu, FOG_SKY_SKY_SLOT, $this->fogSky) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
         $mesh->draw($enc);
         $enc->endRender();
         return .ok;
     }
-}
-
-/**
- * The analytic sky's program: the table lookup when there is a table.
- */
-internal function skyProgram(TextureRef? $view) : string
-{
-    if ($view == null) {
-        return 'sky';
-    }
-
-    return 'sky+lut';
 }
 
 /**
@@ -125,8 +115,7 @@ internal function readSkyView(IoSink $io, TextureRef? $view) : void
 }
 
 /**
- * Binds the sky-view table at `SKY_VIEW_SLOT` when the pass has one; the plain `sky`
- * program has no such binding.
+ * Binds the sky-view table at `SKY_VIEW_SLOT` when the pass has one; `skybox` has none.
  */
 internal function bindSkyView(RenderContext $ctx, RenderEncoder $enc, DeferredGpu $gpu, TextureRef? $view) : status<PipelineError>
 {

@@ -77,7 +77,8 @@ public class MirrorGBufferPass : Pass
 }
 
 /**
- * The light pass aimed at the mirror G-buffer. Fog is off. Point-light tiles are the mirror's.
+ * The light pass aimed at the mirror G-buffer. Fog is off. Point lights come through the
+ * mirror view's cull of the light table.
  */
 public class MirrorLightPass : Pass
 {
@@ -103,6 +104,7 @@ public class MirrorLightPass : Pass
             return;
         }
         readGBuffer($io, $gbuffer);
+        readAerial($io, $this->lighting->aerial);
         EnvironmentData? $environment = $frame->find<EnvironmentData>();
         if ($environment != null) {
             EnvironmentData $found = guard $environment;
@@ -125,18 +127,12 @@ public class MirrorLightPass : Pass
             $io->reads($found->map);
         }
 
-        PointShadowData? $points = $frame->find<PointShadowData>();
-        if ($points != null) {
-            PointShadowData $found = guard $points;
-            $io->reads($found->map);
-        }
-
         TargetRef $target = $pipeline->createTarget(
             'reflect.light',
             $gbuffer->target->width,
             $gbuffer->target->height
         );
-        TextureRef $output = $pipeline->createColor($target, 'output', TextureOptions());
+        TextureRef $output = $pipeline->createColor($target, 'output', TextureOptions($format: .rgba16f));
         $this->water->color = $output;
         $this->water->colorTarget = $target;
         $io->writes($target);
@@ -152,29 +148,30 @@ public class MirrorLightPass : Pass
         }
         HeightFog $fog = $this->lighting->fog;
         $fog->enabled = false;
+        // the mirror takes no aerial perspective either; the table stays bound, unread
+        FogLighting $quiet = $this->lighting->fogLighting;
+        $quiet->aerialScale = 0.0f;
         return $this->lighting->shade(
             $ctx,
             $target,
             $gbuffer,
             $this->water->camera,
             $fog,
+            $quiet,
             true,
-            $this->water->tiles,
-            $this->water->tilesX,
-            $this->water->tilesY,
             true,
             Vec4(0.0f, 0.0f, 0.0f, 0.0f),
             false,
-            true
+            true,
+            cull: $this->water->cull
         );
     }
 }
 
 /**
- * Sky behind the mirror's shaded pixels. Fog stays off. A probe marches the analytic sky
- * with fewer samples than the main view, because this target is mostly empty. An HDRI
- * samples its cube. The reflected eye's height is the sky origin; a sky-view table for the
- * mirror is filled at that height.
+ * Sky behind the mirror's shaded pixels. Fog stays off. A probe reads the mirror's sky-view
+ * table, filled at the reflected eye's height with fewer samples than the main view's,
+ * because this target is mostly empty. An HDRI samples its cube.
  */
 public class MirrorSkyPass : Pass
 {
@@ -186,6 +183,7 @@ public class MirrorSkyPass : Pass
     private Moon $moon;
     private bool $probe;
     private TextureRef? $view;
+    private FogLighting $fogLighting;
 
     public constructor(
         DeferredGpu $gpu,
@@ -195,6 +193,7 @@ public class MirrorSkyPass : Pass
         DirectionalLight $sun,
         Moon $moon,
         bool $probe,
+        FogLighting $fogLighting,
         TextureRef? $view = null
     )
     {
@@ -206,6 +205,7 @@ public class MirrorSkyPass : Pass
         $this->moon = $moon;
         $this->probe = $probe;
         $this->view = $view;
+        $this->fogLighting = $fogLighting;
     }
 
     public function name() : string
@@ -243,7 +243,7 @@ public class MirrorSkyPass : Pass
         }
         string $programName = 'skybox';
         if ($this->probe) {
-            $programName = skyProgram($this->view);
+            $programName = 'sky';
         }
 
         ShaderProgram $program = guard $this->gpu->shaders->program($programName) else ($e) {
@@ -267,15 +267,7 @@ public class MirrorSkyPass : Pass
         $enc->upload($this->water->camera->uniforms(), slot: 1);
         HeightFog $quiet = $this->fog;
         $quiet->enabled = false;
-        FogUniforms $fog = fogUniforms(
-            $quiet,
-            $this->water->camera->position,
-            fogSunTint($this->sun, $this->sky),
-            FOG_VIEW_SAMPLES,
-            FOG_LIGHT_SAMPLES,
-            fogMoonTint($this->moon, $this->sky),
-            fogLight($this->moon, $this->sky)
-        );
+        FogUniforms $fog = fogUniforms($quiet, $this->water->camera->position, $this->fogLighting);
         bool $disk = $this->probe;
         float32 $viewSamples = SKY_VIEW_SAMPLES;
         float32 $lightSamples = SKY_LIGHT_SAMPLES;
@@ -300,6 +292,15 @@ public class MirrorSkyPass : Pass
         }
         $enc->upload($fog, slot: 3);
         guard bindSkyView($ctx, $enc, $this->gpu, $this->view) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        // fog is off in the mirror: white in the fog sky table's place
+        uint32 $fogSlot = FOG_SKY_SKYBOX_SLOT;
+        if ($this->probe) {
+            $fogSlot = FOG_SKY_SKY_SLOT;
+        }
+        guard bindFogSky($ctx, $enc, $this->gpu, $fogSlot, null) else ($e) {
             $enc->endRender();
             return .error($e);
         }
@@ -352,9 +353,11 @@ public class WaterPass : Pass
         $io->reads($gbuffer->position);
         $io->reads($gbuffer->depth);
         readGodRays($io, $frame);
+        readFogSky($io, $this->lighting->fogSky);
+        readAerial($io, $this->lighting->aerial);
         TextureRef $mirror = guard $this->water->color else {
             TargetRef $target = $pipeline->createTarget('water', $light->target->width, $light->target->height);
-            TextureRef $output = $pipeline->createColor($target, 'color', TextureOptions());
+            TextureRef $output = $pipeline->createColor($target, 'color', TextureOptions($format: .rgba16f));
             $this->water->presented = $output;
             $this->water->outputTarget = $target;
             $io->writes($target);
@@ -362,7 +365,7 @@ public class WaterPass : Pass
         }
         $io->reads($mirror);
         TargetRef $target = $pipeline->createTarget('water', $light->target->width, $light->target->height);
-        TextureRef $output = $pipeline->createColor($target, 'color', TextureOptions());
+        TextureRef $output = $pipeline->createColor($target, 'color', TextureOptions($format: .rgba16f));
         $this->water->presented = $output;
         $this->water->outputTarget = $target;
         $io->writes($target);
@@ -417,22 +420,10 @@ public class WaterPass : Pass
             $this->lighting->environment,
             $ctx->frame->find<ShadowMapData>()
         );
-        PointLightFrame? $points = $ctx->frame->find<PointLightFrame>();
-        if ($points != null) {
-            PointLightFrame $packed = guard $points;
-            packPointUniforms($lights, $packed);
-        }
+        bindClusters($enc, $this->gpu, $ctx->frame->find<LightClusterData>(), null, $lights);
 
         $enc->upload($lights, slot: 2);
-        FogUniforms $fog = fogUniforms(
-            $this->lighting->fog,
-            $camera->position,
-            fogSunTint($this->lighting->sun, $this->lighting->sky),
-            FOG_VIEW_SAMPLES,
-            FOG_LIGHT_SAMPLES,
-            fogMoonTint($this->lighting->moon, $this->lighting->sky),
-            fogLight($this->lighting->moon, $this->lighting->sky)
-        );
+        FogUniforms $fog = fogUniforms($this->lighting->fog, $camera->position, $this->lighting->fogLighting);
         guard bindGodRays($ctx, $enc, $this->gpu, $fog, true) else ($e) {
             $enc->endRender();
             return .error($e);
@@ -481,7 +472,11 @@ public class WaterPass : Pass
             $enc->endRender();
             return .error($e);
         }
-        guard $this->lighting->bindPoints($ctx, $enc, null) else ($e) {
+        guard bindFogSky($ctx, $enc, $this->gpu, FOG_SKY_WATER_SLOT, $this->lighting->fogSky) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        guard bindAerial($ctx, $enc, $this->gpu, AERIAL_WATER_SLOT, $this->lighting->aerial) else ($e) {
             $enc->endRender();
             return .error($e);
         }

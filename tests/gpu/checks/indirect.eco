@@ -1,0 +1,116 @@
+/**
+ * The GPU decides the work: a kernel writes the draw and dispatch arguments, a fill clears the
+ * cells, an indirect dispatch colours them, a copy moves them to a second buffer and an
+ * indirect draw reads the copy. The same 8 x 8 grid as the compute check comes out.
+ */
+
+use visu::graphics::{
+    BUFFER_INDIRECT, BUFFER_STORAGE, Buffer, BufferDesc, CallbackPass, ClearPass, ClearPassOptions,
+    ComputeEncoder, ComputeProgram, Device, Frame, GpuPass, IoSink, Mesh, Pipeline, PipelineError,
+    Raster, RenderContext, RenderEncoder, ShaderCollection, TargetRef, VertexLayout
+};
+use visu::math::Vec4;
+
+public function checkIndirect(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    ComputeProgram $argsKernel = guard $shaders->compute('indirect_args') else ($e) {
+        die($e->message());
+    }
+    ComputeProgram $fillKernel = guard $shaders->compute('compute_fill') else ($e) {
+        die($e->message());
+    }
+    $ref = guard $shaders->shader('storage_quad') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    Device $device = $gpu->device;
+    Buffer $args = Buffer($device, BufferDesc(BUFFER_STORAGE | BUFFER_INDIRECT, 32 as uint64, 'args'));
+    Buffer $cells = Buffer($device, BufferDesc(BUFFER_STORAGE, (64 * 16) as uint64, 'cells'));
+    Buffer $copy = Buffer($device, BufferDesc(BUFFER_STORAGE, (64 * 16) as uint64, 'copy'));
+    array<float32> $verts = [
+        0.0f, 0.0f, 0.0f,
+        0.25f, 0.0f, 0.0f,
+        0.25f, 0.25f, 0.0f,
+        0.0f, 0.0f, 0.0f,
+        0.25f, 0.25f, 0.0f,
+        0.0f, 0.25f, 0.0f
+    ];
+    Mesh $quad = Mesh($device, $verts, stride: 12);
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'indirect');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'indirect-args',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+            },
+            execute: function(RenderContext $ctx) : status<PipelineError> {
+                $ctx->device->fillBuffer($copy, 0 as uint64, (64 * 16) as uint64, 0 as uint32);
+                ComputeEncoder $enc = $ctx->beginCompute();
+                $enc->setKernel($argsKernel);
+                $enc->bindStorage(0, $args);
+                $enc->dispatch(1);
+                $enc->endCompute();
+                ComputeEncoder $fill = $ctx->beginCompute();
+                $fill->setKernel($fillKernel);
+                $fill->bindStorage(0, $cells);
+                $fill->dispatchIndirect($args, 16 as uint64);
+                $fill->endCompute();
+                $ctx->device->copyBuffer($cells, 0 as uint64, $copy, 0 as uint64, (64 * 16) as uint64);
+                return .ok;
+            }
+        ));
+        $p->add(CallbackPass(
+            'indirect-draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(RenderContext $ctx) : status<PipelineError> {
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3(), Raster::none());
+                $pass->bind($enc);
+                $enc->bindStorage(0, $copy);
+                $enc->setVertexBuffer(0, $quad->vertices);
+                $enc->drawIndirect($args, 0 as uint64);
+                $enc->endRender();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('indirect');
+    $quad->destroy();
+    $args->destroy();
+    $cells->destroy();
+    $copy->destroy();
+    $shaders->destroy();
+    int32 $col = 0;
+    while ($col < 8) {
+        usize $at = ((4 * 64 + $col * 8 + 4) * 4) as usize;
+        int32 $want = ($col * 255) / 7;
+        int32 $r = $pixels[$at] as int32;
+        assert($r >= $want - 3 && $r <= $want + 3, 'indirect: red follows the column');
+        assert($pixels[$at + 2] > 240, 'indirect: blue marks a copied cell');
+        $col = $col + 1;
+    }
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_indirect
+{
+    GpuContext $gpu = gpuHidden('indirect');
+    checkIndirect($gpu);
+    $gpu->end();
+}
+#[end]

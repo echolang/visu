@@ -64,6 +64,7 @@ internal class HostRing
             $device,
             $bytes,
             vk::BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                | vk::BUFFER_USAGE_STORAGE_BUFFER_BIT
                 | vk::BUFFER_USAGE_TRANSFER_SRC_BIT
                 | vk::BUFFER_USAGE_VERTEX_BUFFER_BIT
                 | vk::BUFFER_USAGE_INDEX_BUFFER_BIT,
@@ -252,15 +253,26 @@ internal function vkCreateBoundBuffer(
     return .ok(BufferHandle($buffer, $mem, 0 as uint64, $bytes));
 }
 
-internal function vkBufferUsage(BufferUsage $usage) : uint32
+internal function vkBufferUsage(uint32 $usage) : uint32
 {
-    uint32 $bits = vk::BUFFER_USAGE_TRANSFER_DST_BIT;
-    return match ($usage) {
-        BufferUsage::vertex => $bits | vk::BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        BufferUsage::index => $bits | vk::BUFFER_USAGE_INDEX_BUFFER_BIT,
-        BufferUsage::uniform => $bits | vk::BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-        BufferUsage::storage => $bits | vk::BUFFER_USAGE_STORAGE_BUFFER_BIT,
-    };
+    // every buffer is a copy source and target: staged uploads, fill and copy
+    uint32 $bits = vk::BUFFER_USAGE_TRANSFER_DST_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (($usage & BUFFER_VERTEX) != 0) {
+        $bits = $bits | vk::BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    }
+    if (($usage & BUFFER_INDEX) != 0) {
+        $bits = $bits | vk::BUFFER_USAGE_INDEX_BUFFER_BIT;
+    }
+    if (($usage & BUFFER_UNIFORM) != 0) {
+        $bits = $bits | vk::BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    }
+    if (($usage & BUFFER_STORAGE) != 0) {
+        $bits = $bits | vk::BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    }
+    if (($usage & BUFFER_INDIRECT) != 0) {
+        $bits = $bits | vk::BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    }
+    return $bits;
 }
 
 internal function vkOneShotCopy(
@@ -316,6 +328,38 @@ internal function vkOneShotCopy(
     guard vkCheck(vk::QueueWaitIdle($device->queue), 'QueueWaitIdle') else ($e) {
         die($e->message());
     }
+}
+
+/**
+ * Copy `$bytes` of `$src` at `$srcOffset` into the start of host-visible `$dst` on the setup
+ * command buffer, and wait for it. The device is idle around it.
+ */
+internal function vkOneShotReadback(
+    Device $device,
+    BufferHandle $src,
+    uint64 $srcOffset,
+    BufferHandle $dst,
+    uint64 $bytes
+) : void
+{
+    vk::CommandBuffer $cmd = vkBeginSetup($device);
+    vk::BufferCopy $region = vk::BufferCopy();
+    $region->srcOffset = $srcOffset;
+    $region->dstOffset = 0 as uint64;
+    $region->size = $bytes;
+    vk::CmdCopyBuffer($cmd, $src->buffer, $dst->buffer, 1, &$region);
+    vkMemoryBarrier(
+        $cmd,
+        vk::PIPELINE_STAGE_TRANSFER_BIT,
+        vk::PIPELINE_STAGE_HOST_BIT,
+        vk::ACCESS_TRANSFER_WRITE_BIT,
+        vk::ACCESS_HOST_READ_BIT
+    );
+    guard vkCheck(vk::EndCommandBuffer($cmd), 'EndCommandBuffer') else ($e) {
+        die($e->message());
+    }
+
+    vkSubmitSetup($device);
 }
 
 internal function vkSubmitSetup(Device $device) : void

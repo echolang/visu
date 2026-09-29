@@ -1,7 +1,7 @@
 /**
  * Publishes `WaterFrame` for the deferred renderer. One reflected camera for the surface
  * under the view center, or the closest visible one. Point lights are not gathered again:
- * the mirror splats the pack `PointLightSystem` already built.
+ * the mirror culls the light table `PointLightSystem` owns against its own camera.
  * Bind this after `CameraSystem` and `PointLightSystem`.
  */
 
@@ -11,9 +11,10 @@ use visu::components::WaterSurface;
 use visu::ecs::{Entities, Schedule, System};
 use visu::geo::{AABB, Plane, Ray, Transform};
 use visu::graphics::{
-    CameraData, Device, PointLightFrame, RenderContext, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST,
+    CameraData, Device, LightClusterData, LightCull, LightCullPass, LightTable,
+    RenderContext, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST,
     Texture, TextureDesc, WATER_MAX, WATER_MIRROR_SCALE, WaterDraw, WaterFrame, WaterUniforms,
-    mirrorCamera, pointSplat, pointTiles, reflectPoint
+    mirrorCamera, reflectPoint
 };
 use visu::math::{Mat4, Vec2, Vec3, Vec4, dot, inverse, length};
 
@@ -29,11 +30,12 @@ public class WaterSurfaceSystem : System
     private float32 $scale;
     private float32 $radiusOverride;
     private Texture? $fallback;
-    private array<uint8> $tileBytes;
-    private Texture? $tiles0;
-    private Texture? $tiles1;
-    private int32 $tileW;
-    private int32 $tileH;
+
+    /**
+     * The mirror's light lists, made on the first frame with a mirror and point lights.
+     */
+    private LightCull? $mirrorCull;
+    private LightCullPass? $mirrorCullPass;
 
     public constructor(Device $device)
     {
@@ -46,11 +48,8 @@ public class WaterSurfaceSystem : System
         $this->scale = WATER_MIRROR_SCALE;
         $this->radiusOverride = 0.0f;
         $this->fallback = null;
-        $this->tileBytes = array<uint8>();
-        $this->tiles0 = null;
-        $this->tiles1 = null;
-        $this->tileW = 0;
-        $this->tileH = 0;
+        $this->mirrorCull = null;
+        $this->mirrorCullPass = null;
     }
 
     public function register(Entities $entities) : void
@@ -82,9 +81,7 @@ public class WaterSurfaceSystem : System
         $this->frame->colorTarget = null;
         $this->frame->presented = null;
         $this->frame->outputTarget = null;
-        $this->frame->tiles = null;
-        $this->frame->tilesX = 0;
-        $this->frame->tilesY = 0;
+        $this->frame->cull = null;
         $this->ensureTextures();
         $this->frame->fallbackCube = $this->fallback;
         $this->frame->time = waterTime($this->origin);
@@ -165,7 +162,7 @@ public class WaterSurfaceSystem : System
             float32 $reach = length($mirrorEye - $chosen->origin) + $chosen->radius;
             $this->frame->camera = mirrorCamera($camera, $chosen->plane, $reach, $w, $h);
             $this->frame->mirror = true;
-            $this->splat($ctx, $this->frame->camera);
+            $this->cullMirror($ctx, $this->frame->camera);
         }
 
         $ctx->frame->set($this->frame);
@@ -229,29 +226,27 @@ public class WaterSurfaceSystem : System
         return $this->frame->draws->count() as int32;
     }
 
-    private function splat(RenderContext $ctx, CameraData $camera) : void
+    /**
+     * The mirror's own light lists, culled on the GPU against the mirror camera in a pass ahead
+     * of the mirror's light pass. Nothing without point lights this frame.
+     */
+    private function cullMirror(RenderContext $ctx, CameraData $camera) : void
     {
-        visu::profile::begin('reflect/tiles');
-        PointLightFrame? $points = $ctx->frame->find<PointLightFrame>();
-        if ($points == null || !$this->enabled) {
-            visu::profile::end();
+        LightClusterData $clusters = guard $ctx->frame->find<LightClusterData>() else {
             return;
         }
-
-        PointLightFrame $packed = guard $points;
-        int32 $tx = pointTiles($camera->resolutionX);
-        int32 $ty = pointTiles($camera->resolutionY);
-        if ($packed->pack->count <= 0 || $tx <= 0 || $ty <= 0) {
-            visu::profile::end();
-            return;
+        if ($this->mirrorCull == null) {
+            LightCull $made = LightCull($this->device, 'lights.mirror');
+            $this->mirrorCull = $made;
+            $this->mirrorCullPass = LightCullPass('reflect.lightcull', $clusters->table, $made, null);
         }
 
-        $this->ensureTiles($tx, $ty);
-        pointSplat($camera, $packed->pack, $this->tileBytes, $tx, $ty);
-        $this->frame->tiles = $this->uploadTiles();
-        $this->frame->tilesX = $tx;
-        $this->frame->tilesY = $ty;
-        visu::profile::end();
+        LightCull $cull = guard $this->mirrorCull;
+        LightCullPass $pass = guard $this->mirrorCullPass;
+        $pass->table = $clusters->table;
+        $pass->camera = $camera;
+        $ctx->pipeline->add($pass);
+        $this->frame->cull = $cull;
     }
 
     private function ensureTextures() : void
@@ -259,71 +254,6 @@ public class WaterSurfaceSystem : System
         if ($this->fallback == null) {
             $this->fallback = waterFallbackCube($this->device);
         }
-    }
-
-    private function ensureTiles(int32 $tilesX, int32 $tilesY) : void
-    {
-        int32 $bytes = $tilesX * $tilesY * 9;
-        if ($this->tileBytes->count() != $bytes as usize) {
-            array<uint8> $fresh = array<uint8>();
-            $fresh->reserve($bytes as usize);
-            int32 $i = 0;
-            while ($i < $bytes) {
-                $fresh[] = 0;
-                $i = $i + 1;
-            }
-
-            $this->tileBytes = mv $fresh;
-        }
-
-        if ($this->tileW == $tilesX && $this->tileH == $tilesY && $this->tiles0 != null) {
-            return;
-        }
-
-        $this->dropTiles();
-        int32 $height = $tilesY * 9;
-        $this->tiles0 = waterTileTexture($this->device, $tilesX, $height, 0);
-        $this->tiles1 = waterTileTexture($this->device, $tilesX, $height, 1);
-        $this->tileW = $tilesX;
-        $this->tileH = $tilesY;
-    }
-
-    private function uploadTiles() : Texture
-    {
-        uint32 $slot = $this->device->frameSlot() % 2;
-        Texture $tex = guard $this->tiles0 else {
-            return waterTileTexture($this->device, 1, 1, 0);
-        }
-        if ($slot == 1) {
-            Texture $alt = guard $this->tiles1 else {
-                return $tex;
-            }
-            $tex = $alt;
-        }
-
-        uint64 $bytes = $this->tileBytes->count() as uint64;
-        if ($bytes > 0) {
-            $tex->upload(0, ptr<const uint8>(&$this->tileBytes[0]), $bytes, $this->tileW);
-        }
-
-        return $tex;
-    }
-
-    private function dropTiles() : void
-    {
-        Texture $a = guard $this->tiles0 else {
-            $this->tiles0 = null;
-            $this->tiles1 = null;
-            return;
-        }
-        $a->destroy();
-        $this->tiles0 = null;
-        Texture $b = guard $this->tiles1 else {
-            $this->tiles1 = null;
-            return;
-        }
-        $b->destroy();
-        $this->tiles1 = null;
     }
 }
 
@@ -471,14 +401,6 @@ internal function waterInside(const WaterDraw& $draw, Vec3 $world) : bool
     }
 
     return $ax <= 0.5f && $az <= 0.5f;
-}
-
-internal function waterTileTexture(Device $device, int32 $width, int32 $height, int32 $slot) : Texture
-{
-    TextureDesc $desc = TextureDesc($format: .r8, $width: $width, $height: $height);
-    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_DST;
-    $desc->label = "reflect.tiles.{$slot}";
-    return Texture($device, "reflect.tiles.{$slot}", $desc);
 }
 
 internal function waterFallbackCube(Device $device) : Texture

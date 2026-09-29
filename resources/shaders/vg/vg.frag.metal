@@ -35,16 +35,16 @@ struct fs_in
 static inline __attribute__((always_inline))
 float sdRoundBox(thread const float2& p, thread const float2& b, thread const float& r)
 {
-    float2 q = (abs(p) - b) + float2(r);
+    float2 q = (abs(p) - b) + float2(r, r);
     return (fast::min(fast::max(q.x, q.y), 0.0) + length(fast::max(q, float2(0.0)))) - r;
 }
 
-fragment fs_out fs(fs_in in [[stage_in]], constant Vg& _48 [[buffer(2)]], texture2d<float> uTex [[texture(0)]], sampler uTexSmplr [[sampler(0)]])
+fragment fs_out fs(fs_in in [[stage_in]], constant Vg& _49 [[buffer(2)]], texture2d<float> uTex [[texture(0)]], sampler uTexSmplr [[sampler(0)]])
 {
     fs_out out = {};
-    float4 color = _48.inner;
+    float4 color = _49.inner;
     float cover = 1.0;
-    int typ = int(_48.stroke.x + 0.5);
+    int typ = int(_49.stroke.x + 0.5);
     if (in.vShape.w > 0.5)
     {
         float2 param = in.vUv;
@@ -60,17 +60,17 @@ fragment fs_out fs(fs_in in [[stage_in]], constant Vg& _48 [[buffer(2)]], textur
             cover = fast::clamp(in.vUv.x, 0.0, 1.0);
         }
     }
-    float2 pt = float2(((_48.paint0.x * in.vPos.x) + (_48.paint0.z * in.vPos.y)) + _48.paint1.x, ((_48.paint0.y * in.vPos.x) + (_48.paint0.w * in.vPos.y)) + _48.paint1.y);
+    float2 pt = float2(((_49.paint0.x * in.vPos.x) + (_49.paint0.z * in.vPos.y)) + _49.paint1.x, ((_49.paint0.y * in.vPos.x) + (_49.paint0.w * in.vPos.y)) + _49.paint1.y);
     if (typ == 0)
     {
         float2 param_3 = pt;
-        float2 param_4 = _48.extent.xy;
-        float param_5 = _48.extent.z;
+        float2 param_4 = _49.extent.xy;
+        float param_5 = _49.extent.z;
         float d_1 = sdRoundBox(param_3, param_4, param_5);
         float t = 0.0;
-        if (_48.extent.w > 9.9999997473787516355514526367188e-05)
+        if (_49.extent.w > 9.9999997473787516355514526367188e-05)
         {
-            t = fast::clamp((d_1 + (_48.extent.w * 0.5)) / _48.extent.w, 0.0, 1.0);
+            t = fast::clamp((d_1 + (_49.extent.w * 0.5)) / _49.extent.w, 0.0, 1.0);
         }
         else
         {
@@ -79,46 +79,46 @@ fragment fs_out fs(fs_in in [[stage_in]], constant Vg& _48 [[buffer(2)]], textur
                 t = 1.0;
             }
         }
-        color = mix(_48.inner, _48.outer, float4(t));
+        color = mix(_49.inner, _49.outer, float4(t));
     }
     else
     {
         if (typ == 1)
         {
-            float2 uv = pt / fast::max(_48.extent.xy, float2(9.9999997473787516355514526367188e-05));
-            color = uTex.sample(uTexSmplr, uv) * _48.inner;
+            float2 uv = pt / fast::max(_49.extent.xy, float2(9.9999997473787516355514526367188e-05));
+            color = uTex.sample(uTexSmplr, uv) * _49.inner;
         }
         else
         {
             if (typ == 2)
             {
-                color = _48.inner * uTex.sample(uTexSmplr, in.vUv).x;
+                color = _49.inner * uTex.sample(uTexSmplr, in.vUv).x;
             }
             else
             {
                 if (typ == 3)
                 {
-                    float t_1 = fast::clamp(pt.x / fast::max(_48.extent.x, 9.9999997473787516355514526367188e-05), 0.0, 1.0);
-                    color = mix(_48.inner, _48.outer, float4(t_1));
+                    float t_1 = fast::clamp(pt.x / fast::max(_49.extent.x, 9.9999997473787516355514526367188e-05), 0.0, 1.0);
+                    color = mix(_49.inner, _49.outer, float4(t_1));
                 }
                 else
                 {
                     if (typ == 4)
                     {
-                        float t_2 = fast::clamp((length(pt) - _48.extent.z) / fast::max(_48.extent.w, 9.9999997473787516355514526367188e-05), 0.0, 1.0);
-                        color = mix(_48.inner, _48.outer, float4(t_2));
+                        float t_2 = fast::clamp((length(pt) - _49.extent.z) / fast::max(_49.extent.w, 9.9999997473787516355514526367188e-05), 0.0, 1.0);
+                        color = mix(_49.inner, _49.outer, float4(t_2));
                     }
                 }
             }
         }
     }
-    float scScale = _48.scissorExt.w;
+    float scScale = _49.scissorExt.w;
     if (scScale > 0.5)
     {
-        float2 sc = float2(((_48.scissor0.x * in.vPos.x) + (_48.scissor0.z * in.vPos.y)) + _48.scissor1.x, ((_48.scissor0.y * in.vPos.x) + (_48.scissor0.w * in.vPos.y)) + _48.scissor1.y);
+        float2 sc = float2(((_49.scissor0.x * in.vPos.x) + (_49.scissor0.z * in.vPos.y)) + _49.scissor1.x, ((_49.scissor0.y * in.vPos.x) + (_49.scissor0.w * in.vPos.y)) + _49.scissor1.y);
         float2 param_6 = sc;
-        float2 param_7 = _48.scissorExt.xy;
-        float param_8 = _48.scissorExt.z;
+        float2 param_7 = _49.scissorExt.xy;
+        float param_8 = _49.scissorExt.z;
         float sd = sdRoundBox(param_6, param_7, param_8);
         float a = fast::clamp(0.5 - (sd * scScale), 0.0, 1.0);
         color *= a;

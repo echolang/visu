@@ -1,0 +1,70 @@
+#version 450
+
+// visu::graphics::ShadowAtlas, the cache: every requested page whose table entry is current
+// (same generation as its light) keeps its physical page for this frame; every other one is a
+// miss, listed by mip so the coarse levels are served first
+layout(local_size_x = 64) in;
+
+#include "visu/vsmcull.glsl"
+
+layout(std430, set = 2, binding = 0) readonly buffer Generations {
+    uint gens[];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer Requests {
+    uint requests[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer PageTable {
+    uint table[];
+};
+
+layout(std430, set = 2, binding = 3) buffer Physical {
+    // owner key, last frame used
+    uvec2 phys[];
+};
+
+layout(std430, set = 2, binding = 4) writeonly buffer Misses {
+    uint misses[];
+};
+
+layout(std430, set = 2, binding = 5) buffer State {
+    uint state[];
+};
+
+void main()
+{
+    uint word = gl_GlobalInvocationID.x;
+    if (word >= u_vsm_counts.x * VSM_REQUEST_WORDS) {
+        return;
+    }
+
+    uint bits = requests[word];
+    uint slot = word / VSM_REQUEST_WORDS;
+    uint gen = gens[slot] & VSM_GEN_MASK;
+    while (bits != 0u) {
+        uint b = uint(findLSB(bits));
+        bits &= bits - 1u;
+        uint page = (word - slot * VSM_REQUEST_WORDS) * 32u + b;
+        if (page >= VSM_LIGHT_PAGES) {
+            continue;
+        }
+        uint key = slot * VSM_LIGHT_PAGES + page;
+        uint entry = table[key];
+        if (entry != VSM_NONE && (entry >> 16u) == gen) {
+            phys[entry & 0xFFFFu].y = u_vsm_counts.y;
+            continue;
+        }
+
+        uint face;
+        uint mip;
+        uvec2 xy;
+        vsm_page_of(page, face, mip, xy);
+        uint at = atomicAdd(state[VSM_STATE_MISSES + mip], 1u);
+        if (at < VSM_MISS_MAX) {
+            misses[mip * VSM_MISS_MAX + at] = key;
+        } else {
+            atomicAdd(state[VSM_STATE_DROPPED], 1u);
+        }
+    }
+}

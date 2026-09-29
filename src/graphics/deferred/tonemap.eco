@@ -1,0 +1,790 @@
+/**
+ * Settings for the display end of the frame: `ToneMap` (the local operator, the curve and the
+ * white balance) and `Exposure` (the camera). Both are copied on assignment, like `GodRays`.
+ * The defaults are exposure 0 EV, no local operator and the ACES curve; `curve = .neutral`
+ * with those is the frame visu drew before ACES. Also the CPU side of the curves: their solved
+ * constants, the matrices into and out of the tone-map gamut, a mirror of each curve and the
+ * clear colour mapped back into the scene through it.
+ */
+
+namespace visu::graphics;
+
+use std::math;
+use visu::math::{Vec3, Vec4, normalize};
+
+/**
+ * The display gamma `gamma_corr.glsl` encodes with (`VISU_DISPLAY_GAMMA`).
+ */
+internal const float64 DISPLAY_GAMMA = 2.2;
+
+/**
+ * Bilateral grid cells across and down. The shaders spell the same numbers.
+ */
+public const int32 TONEMAP_GRID_W = 64;
+public const int32 TONEMAP_GRID_H = 32;
+
+/**
+ * Log-luminance slices of the grid, side by side in one atlas row.
+ */
+public const int32 TONEMAP_GRID_SLICES = 64;
+
+/**
+ * The Gaussian base, upsampled with a cubic B-spline before the resolve reads it.
+ */
+public const int32 TONEMAP_BASE_W = 256;
+public const int32 TONEMAP_BASE_H = 128;
+
+/**
+ * The luma image is an eighth of the scene each way.
+ */
+public const int32 TONEMAP_LUMA_SCALE = 8;
+
+/**
+ * Which curve turns exposed radiance into display values. Each one is its own baked variant of
+ * `tonemap.frag` (`TONEMAP_METHOD`), so the resolve never branches on it and a new curve is a
+ * case here, a pragma pair there and a line in `tone_mapping.glsl`.
+ */
+public enum ToneCurve
+{
+    /**
+     * ACES as Stephen Hill fitted it: into AP1 through the RRT, the RRT + ODT rational fit, back
+     * to Rec.709. Contrast and saturation in the mids, highlights roll off towards white. The
+     * default; `ToneMap.preExposure` lands middle grey where the neutral curve puts it.
+     */
+    case aces;
+
+    /**
+     * Khronos PBR Neutral on Rec.709, the curve visu had before ACES: base colours come out as
+     * authored and nothing is added. White balance and the gamut do not apply.
+     */
+    case neutral;
+
+    /**
+     * Extended Reinhard per channel with display white at `TONE_REINHARD_WHITE`.
+     */
+    case reinhard;
+
+    /**
+     * A per-channel filmic curve (contrast, shoulder, white point) run in the tone-map gamut,
+     * with white balance folded into the matrix that enters it.
+     */
+    case filmic;
+
+    /**
+     * The word the console and the `tonemap.curve` flag use.
+     */
+    public const function word() : string
+    {
+        return match ($this) {
+            ToneCurve::aces => 'aces',
+            ToneCurve::neutral => 'neutral',
+            ToneCurve::reinhard => 'reinhard',
+            ToneCurve::filmic => 'filmic',
+        };
+    }
+
+    /**
+     * The baked resolve program for this curve, with or without the local operator. ACES is
+     * the shader's default define, so it is the plain `tonemap` pair.
+     */
+    public const function program(bool $local) : string
+    {
+        if ($local) {
+            return match ($this) {
+                ToneCurve::aces => 'tonemap+local',
+                ToneCurve::neutral => 'tonemap+neutral_local',
+                ToneCurve::reinhard => 'tonemap+reinhard_local',
+                ToneCurve::filmic => 'tonemap+filmic_local',
+            };
+        }
+
+        return match ($this) {
+            ToneCurve::aces => 'tonemap',
+            ToneCurve::neutral => 'tonemap+neutral',
+            ToneCurve::reinhard => 'tonemap+reinhard',
+            ToneCurve::filmic => 'tonemap+filmic',
+        };
+    }
+
+    /**
+     * The curve's place in `toneCurves()`.
+     */
+    public const function index() : int32
+    {
+        return match ($this) {
+            ToneCurve::aces => 0,
+            ToneCurve::neutral => 1,
+            ToneCurve::reinhard => 2,
+            ToneCurve::filmic => 3,
+        };
+    }
+}
+
+/**
+ * Every curve, in `ToneCurve.index` order: what the resolve builds a pass for and the warm list
+ * links.
+ */
+public function toneCurves() : array<ToneCurve>
+{
+    array<ToneCurve> $all = arr::room<ToneCurve>(4);
+    $all[] = ToneCurve::aces;
+    $all[] = ToneCurve::neutral;
+    $all[] = ToneCurve::reinhard;
+    $all[] = ToneCurve::filmic;
+    return $all;
+}
+
+/**
+ * The curve `$word` names, or null.
+ */
+public function toneCurveNamed(const string& $word) : ToneCurve?
+{
+    array<ToneCurve> $all = toneCurves();
+    foreach ($all as $curve) {
+        string $name = $curve->word();
+        if ($name == $word) {
+            return $curve;
+        }
+    }
+    return null;
+}
+
+public struct ToneMap
+{
+    /**
+     * Compress luminance against an edge-aware base before the curve: large-scale contrast
+     * comes down by `contrastHigh` / `contrastLow`, local detail keeps `detail`. Off adds none
+     * of the grid or base passes.
+     */
+    public bool $local;
+
+    /**
+     * Middle grey after exposure, in linear radiance. The local operator pivots on it, auto
+     * exposure puts a grey card there.
+     */
+    public float32 $midpoint;
+
+    /**
+     * Base-layer contrast above the midpoint. Below 1 pulls bright regions (sky, sunlit walls)
+     * towards the middle.
+     */
+    public float32 $contrastHigh;
+
+    /**
+     * Base-layer contrast below the midpoint. Below 1 lifts deep shade.
+     */
+    public float32 $contrastLow;
+
+    /**
+     * How much of the detail layer (the pixel against its base) is kept. 1 keeps it as lit.
+     */
+    public float32 $detail;
+
+    /**
+     * Share of the bilateral grid in the base; the rest is the wide Gaussian. The grid follows
+     * edges, the Gaussian keeps it from ringing along smooth gradients.
+     */
+    public float32 $bilateral;
+
+    /**
+     * Stops of exposed luminance the grid's slices span, centred on the midpoint.
+     */
+    public float32 $range;
+
+    /**
+     * Grid blur across the screen, in cells (sigma).
+     */
+    public float32 $spatial;
+
+    /**
+     * Grid blur across the slices, in slices (sigma). Small keeps edges.
+     */
+    public float32 $tonal;
+
+    /**
+     * The Gaussian base's radius, in 64 x 32 cells.
+     */
+    public float32 $wide;
+    public ToneCurve $curve;
+
+    /**
+     * Linear scale on the exposed radiance before the ACES curve. The fit puts middle grey
+     * lower than the neutral curve does; 1.216 lands 0.18 where neutral shows it (0.14), so
+     * switching curves changes contrast and colour, not brightness. Unused by other curves.
+     */
+    public float32 $preExposure;
+
+    /**
+     * Filmic contrast: the power the curve raises its input to. Above 1 deepens the toe.
+     */
+    public float32 $contrast;
+
+    /**
+     * Filmic shoulder: just under 1 rolls highlights off gently, lower is harder.
+     */
+    public float32 $shoulder;
+
+    /**
+     * Exposed radiance the filmic curve maps to display white.
+     */
+    public float32 $whitePoint;
+
+    /**
+     * Display value the filmic curve gives the midpoint.
+     */
+    public float32 $midOut;
+
+    /**
+     * The colour, in linear Rec.709, that should come out white: white balance as "this light
+     * is neutral". (1, 1, 1) is D65 and changes nothing.
+     */
+    public Vec3 $white;
+
+    /**
+     * x of the tone-map gamut's red primary; ACES AP1 has 0.713.
+     */
+    public float32 $redX;
+
+    public constructor()
+    {
+        $this->local = false;
+        $this->midpoint = 0.18f;
+        $this->contrastHigh = 0.75f;
+        $this->contrastLow = 1.0f;
+        $this->detail = 1.0f;
+        $this->bilateral = 0.4f;
+        $this->range = 16.0f;
+        $this->spatial = 2.0f;
+        $this->tonal = 1.0f;
+        $this->wide = 13.0f;
+        $this->curve = .aces;
+        $this->preExposure = 1.216f;
+        $this->contrast = 1.35f;
+        $this->shoulder = 0.97f;
+        $this->whitePoint = 16.0f;
+        $this->midOut = 0.18f;
+        $this->white = Vec3(1.0f, 1.0f, 1.0f);
+        $this->redX = 0.75f;
+    }
+
+    /**
+     * Whether a curve or colour setting differs, which is all the cached matrices, curve
+     * constants and the resolved clear colour depend on.
+     */
+    public const function lookChanged(const ToneMap& $other) : bool
+    {
+        return $this->curve != $other->curve
+            || $this->preExposure != $other->preExposure
+            || $this->contrast != $other->contrast
+            || $this->shoulder != $other->shoulder
+            || $this->whitePoint != $other->whitePoint
+            || $this->midpoint != $other->midpoint
+            || $this->midOut != $other->midOut
+            || $this->white->x != $other->white->x
+            || $this->white->y != $other->white->y
+            || $this->white->z != $other->white->z
+            || $this->redX != $other->redX;
+    }
+}
+
+public struct Exposure
+{
+    /**
+     * Meter the light falling on the ground (sun, moon, night ambient, the sky's irradiance)
+     * and expose a grey card to the midpoint, adapting over time. Off is `compensation` alone
+     * and adds no pass.
+     */
+    public bool $auto;
+
+    /**
+     * EV on top of whatever the meter says; with auto off, the whole exposure.
+     */
+    public float32 $compensation;
+
+    /**
+     * How much of the metered change the camera follows, 0 to 1. 1 shows a moonlit field as
+     * bright as a sunlit one; lower keeps night dark.
+     */
+    public float32 $strength;
+
+    /**
+     * Illuminance at which auto exposure adds nothing. Pi puts a grey card (albedo 0.18) at a
+     * midpoint of 0.18 at full strength.
+     */
+    public float32 $reference;
+    public float32 $minEv;
+    public float32 $maxEv;
+
+    /**
+     * Stops over the midpoint the brightest part of the frame may reach before it pulls the
+     * exposure down.
+     */
+    public float32 $highlight;
+
+    /**
+     * Share of each stop past `highlight` the exposure gives back.
+     */
+    public float32 $highlightWeight;
+
+    /**
+     * Adaptation rates per second: towards a brighter image, and towards a darker one.
+     */
+    public float32 $speedUp;
+    public float32 $speedDown;
+
+    public constructor()
+    {
+        $this->auto = false;
+        $this->compensation = 0.0f;
+        $this->strength = 1.0f;
+        $this->reference = math::PI_F32;
+        $this->minEv = -8.0f;
+        $this->maxEv = 8.0f;
+        $this->highlight = 5.0f;
+        $this->highlightWeight = 0.5f;
+        $this->speedUp = 1.0f;
+        $this->speedDown = 2.0f;
+    }
+}
+
+/**
+ * What the curve settings resolve to: the rows into and out of the tone-map gamut and the
+ * filmic constants. Pure; the renderer keeps one and rebuilds it when `lookChanged`.
+ */
+public struct ToneLook
+{
+    public Vec4[3] $into;
+    public Vec4[3] $out;
+
+    /**
+     * x contrast, y shoulder, z b, w c.
+     */
+    public Vec4 $curve;
+
+    public constructor(const ToneMap& $map)
+    {
+        Gamut $display = gamutRec709();
+        Gamut $tone = gamutToneMap($map->redX as float64);
+        ColorMatrix $toXyz = $display->toXyz();
+        ColorMatrix $toneToXyz = $tone->toXyz();
+        ColorVector $white = $toXyz * ColorVector($map->white->x as float64, $map->white->y as float64, $map->white->z as float64);
+        ColorMatrix $balance = chromaticAdaptation($white, whiteD65()->xyz());
+        ColorMatrix $into = $toneToXyz->inverse() * $balance * $toXyz;
+        ColorMatrix $out = $toXyz->inverse() * $toneToXyz;
+        Vec4[3] $in;
+        Vec4[3] $back;
+        int32 $i = 0;
+        while ($i < 3) {
+            $in[$i] = $into->row($i);
+            $back[$i] = $out->row($i);
+            $i = $i + 1;
+        }
+
+        $this->into = mv $in;
+        $this->out = mv $back;
+        $this->curve = filmicCurve($map->contrast, $map->shoulder, $map->whitePoint, $map->midpoint, $map->midOut);
+    }
+}
+
+/**
+ * Solves `x^a / ((x^a)^d b + c)` so the midpoint maps to `$midOut` and `$white` to 1. Returns
+ * (a, d, b, c).
+ */
+public function filmicCurve(float32 $contrast, float32 $shoulder, float32 $white, float32 $midIn, float32 $midOut) : Vec4
+{
+    float64 $a = $contrast as float64;
+    float64 $d = $shoulder as float64;
+    float64 $m = math::pow($midIn as float64, $a);
+    float64 $h = math::pow($white as float64, $a);
+    float64 $md = math::pow($m, $d);
+    float64 $hd = math::pow($h, $d);
+    float64 $o = $midOut as float64;
+    float64 $den = ($hd - $md) * $o;
+    float64 $b = ($h * $o - $m) / $den;
+    float64 $c = ($hd * $m - $h * $md * $o) / $den;
+    return Vec4($contrast, $shoulder, $b as float32, $c as float32);
+}
+
+/**
+ * The clear colour mapped back into the scene: the radiance `$map`'s curve and the display gamma
+ * turn into `$display`, so a clear colour authored for the screen still reads as that colour
+ * whichever curve runs. Solved when the background or the look changes (the renderer caches
+ * it), never per frame. A channel past what the curve can reach comes back at its end of the
+ * range. Alpha passes through.
+ */
+public function sceneBackground(Vec4 $display, const ToneMap& $map, const ToneLook& $look) : Vec4
+{
+    Vec3 $shown = Vec3(displayLinear($display->x), displayLinear($display->y), displayLinear($display->z));
+    Vec3 $scene = match ($map->curve) {
+        ToneCurve::aces => acesBackground($shown, $map->preExposure),
+        ToneCurve::neutral => neutralBackground($shown),
+        ToneCurve::reinhard => reinhardBackground($shown),
+        ToneCurve::filmic => filmicBackground($shown, $map, $look),
+    };
+    return Vec4($scene->x, $scene->y, $scene->z, $display->w);
+}
+
+/**
+ * What `tonemap.frag` makes of the exposed radiance `$x` before the display gamma: the curve
+ * `$map` picks, with its pre-exposure and gamut. The CPU mirror of the shader, for tests and
+ * for checking a look without a frame.
+ */
+public function toneCurveApply(const ToneMap& $map, const ToneLook& $look, Vec3 $x) : Vec3
+{
+    return match ($map->curve) {
+        ToneCurve::aces => acesApply($x, $map->preExposure),
+        ToneCurve::neutral => neutralApply($x),
+        ToneCurve::reinhard => Vec3(reinhardValue($x->x), reinhardValue($x->y), reinhardValue($x->z)),
+        ToneCurve::filmic => filmicApply($x, $look),
+    };
+}
+
+/**
+ * Exposed radiance the Reinhard curve maps to display white. `tone_mapping.glsl` spells it too.
+ */
+public const float64 TONE_REINHARD_WHITE = 4.0;
+
+/**
+ * Hill's ACESInputMat: Rec.709 into AP1 with the RRT's saturation folded in.
+ * `tone_mapping.glsl` spells the same rows.
+ */
+public function acesInput() : ColorMatrix
+{
+    return ColorMatrix(0.59719, 0.35458, 0.04823, 0.07600, 0.90834, 0.01566, 0.02840, 0.13383, 0.83777);
+}
+
+/**
+ * Hill's ACESOutputMat: the ODT's way back to Rec.709.
+ */
+public function acesOutput() : ColorMatrix
+{
+    return ColorMatrix(1.60475, -0.53108, -0.07367, -0.10208, 1.10813, -0.00605, -0.00327, -0.07276, 1.07602);
+}
+
+/**
+ * Hill's rational fit of the RRT and the sRGB ODT, per channel in AP1.
+ */
+public function acesFit(float64 $v) : float64
+{
+    float64 $top = $v * ($v + 0.0245786) - 0.000090537;
+    float64 $bottom = $v * (0.983729 * $v + 0.4329510) + 0.238081;
+    return $top / $bottom;
+}
+
+/**
+ * The input `acesFit` maps to `$y`, the positive root of its quadratic. The fit tends to
+ * 1 / 0.983729, so `$y` is held just under 1.
+ */
+internal function acesFitInverse(float64 $y) : float64
+{
+    float64 $t = clamp64($y, 0.0, 0.9999);
+    float64 $qa = 1.0 - 0.983729 * $t;
+    float64 $qb = 0.0245786 - 0.4329510 * $t;
+    float64 $qc = -(0.000090537 + 0.238081 * $t);
+    return (-$qb + math::sqrt($qb * $qb - 4.0 * $qa * $qc)) / (2.0 * $qa);
+}
+
+internal function acesApply(Vec3 $x, float32 $preExposure) : Vec3
+{
+    float64 $k = $preExposure as float64;
+    ColorVector $v = acesInput() * ColorVector(($x->x as float64) * $k, ($x->y as float64) * $k, ($x->z as float64) * $k);
+    ColorVector $out = acesOutput() * ColorVector(acesFit($v->x), acesFit($v->y), acesFit($v->z));
+    return clampRgb($out);
+}
+
+internal function acesBackground(Vec3 $shown, float32 $preExposure) : Vec3
+{
+    ColorVector $fitted = acesOutput()->inverse() * ColorVector($shown->x as float64, $shown->y as float64, $shown->z as float64);
+    ColorVector $v = ColorVector(acesFitInverse($fitted->x), acesFitInverse($fitted->y), acesFitInverse($fitted->z));
+    ColorVector $x = acesInput()->inverse() * $v;
+    float64 $k = 1.0 / ($preExposure as float64);
+    return Vec3(
+        (max64($x->x, 0.0) * $k) as float32,
+        (max64($x->y, 0.0) * $k) as float32,
+        (max64($x->z, 0.0) * $k) as float32
+    );
+}
+
+internal function neutralApply(Vec3 $x) : Vec3
+{
+    float32 $low = min3($x->x, $x->y, $x->z);
+    float32 $offset = 0.04f;
+    if ($low < 0.08f) {
+        $offset = $low - 6.25f * $low * $low;
+    }
+    Vec3 $c = Vec3($x->x - $offset, $x->y - $offset, $x->z - $offset);
+    float32 $start = 0.8f - 0.04f;
+    float32 $peak = max3($c->x, $c->y, $c->z);
+    if ($peak < $start) {
+        return $c;
+    }
+
+    float32 $d = 1.0f - $start;
+    float32 $top = 1.0f - $d * $d / ($peak + $d - $start);
+    float32 $s = $top / $peak;
+    float32 $g = 1.0f - 1.0f / (0.15f * ($peak - $top) + 1.0f);
+    return Vec3(
+        $c->x * $s + ($top - $c->x * $s) * $g,
+        $c->y * $s + ($top - $c->y * $s) * $g,
+        $c->z * $s + ($top - $c->z * $s) * $g
+    );
+}
+
+/**
+ * Below its shoulder (0.76) the Khronos PBR Neutral curve is a pure offset, so this is exact for
+ * any clear colour; a brighter channel comes back without the shoulder undone.
+ */
+internal function neutralBackground(Vec3 $shown) : Vec3
+{
+    float32 $low = min3($shown->x, $shown->y, $shown->z);
+    // the curve lifts the toe by a quadratic offset that settles at 0.04 once the darkest channel
+    // reaches 0.08; on the way out that darkest channel is 6.25 x^2
+    float32 $offset = 0.04f;
+    if ($low < 0.04f) {
+        $offset = math::sqrt($low / 6.25f) - $low;
+    }
+    return Vec3($shown->x + $offset, $shown->y + $offset, $shown->z + $offset);
+}
+
+internal function reinhardValue(float32 $x) : float32
+{
+    float64 $v = $x as float64;
+    float64 $w2 = TONE_REINHARD_WHITE * TONE_REINHARD_WHITE;
+    return ($v * (1.0 + $v / $w2) / (1.0 + $v)) as float32;
+}
+
+/**
+ * The root of `x^2 / W^2 + x (1 - y) - y = 0`, the Reinhard curve read backwards.
+ */
+internal function reinhardInverse(float32 $y) : float32
+{
+    float64 $t = clamp64($y as float64, 0.0, 1.0);
+    float64 $w2 = TONE_REINHARD_WHITE * TONE_REINHARD_WHITE;
+    float64 $b = 1.0 - $t;
+    return ($w2 * 0.5 * (-$b + math::sqrt($b * $b + 4.0 * $t / $w2))) as float32;
+}
+
+internal function reinhardBackground(Vec3 $shown) : Vec3
+{
+    return Vec3(reinhardInverse($shown->x), reinhardInverse($shown->y), reinhardInverse($shown->z));
+}
+
+internal function filmicValue(float64 $t, const Vec4& $curve) : float64
+{
+    float64 $z = math::pow(max64($t, 0.0), $curve->x as float64);
+    return $z / (math::pow($z, $curve->y as float64) * ($curve->z as float64) + ($curve->w as float64));
+}
+
+internal function filmicApply(Vec3 $x, const ToneLook& $look) : Vec3
+{
+    ColorVector $t = lookRows($look->into[0], $look->into[1], $look->into[2]) * ColorVector($x->x as float64, $x->y as float64, $x->z as float64);
+    ColorVector $f = ColorVector(filmicValue($t->x, $look->curve), filmicValue($t->y, $look->curve), filmicValue($t->z, $look->curve));
+    return clampRgb(lookRows($look->out[0], $look->out[1], $look->out[2]) * $f);
+}
+
+/**
+ * The tone-gamut input the filmic curve maps to `$y`, by bisection up to twice the white point
+ * (the curve rises monotonically there for every shoulder the console allows).
+ */
+internal function filmicInverse(float64 $y, const Vec4& $curve, float64 $white) : float64
+{
+    float64 $target = clamp64($y, 0.0, 1.0);
+    float64 $lo = 0.0;
+    float64 $hi = $white * 2.0;
+    int32 $i = 0;
+    while ($i < 48) {
+        float64 $mid = ($lo + $hi) * 0.5;
+        if (filmicValue($mid, $curve) < $target) {
+            $lo = $mid;
+        } else {
+            $hi = $mid;
+        }
+        $i = $i + 1;
+    }
+    return ($lo + $hi) * 0.5;
+}
+
+internal function filmicBackground(Vec3 $shown, const ToneMap& $map, const ToneLook& $look) : Vec3
+{
+    ColorMatrix $out = lookRows($look->out[0], $look->out[1], $look->out[2]);
+    ColorMatrix $into = lookRows($look->into[0], $look->into[1], $look->into[2]);
+    ColorVector $f = $out->inverse() * ColorVector($shown->x as float64, $shown->y as float64, $shown->z as float64);
+    float64 $white = $map->whitePoint as float64;
+    ColorVector $t = ColorVector(
+        filmicInverse($f->x, $look->curve, $white),
+        filmicInverse($f->y, $look->curve, $white),
+        filmicInverse($f->z, $look->curve, $white)
+    );
+    ColorVector $x = $into->inverse() * $t;
+    return Vec3(max64($x->x, 0.0) as float32, max64($x->y, 0.0) as float32, max64($x->z, 0.0) as float32);
+}
+
+/**
+ * A `ToneLook` matrix back from the three float32 rows it uploads.
+ */
+internal function lookRows(Vec4 $r0, Vec4 $r1, Vec4 $r2) : ColorMatrix
+{
+    return ColorMatrix(
+        $r0->x as float64, $r0->y as float64, $r0->z as float64,
+        $r1->x as float64, $r1->y as float64, $r1->z as float64,
+        $r2->x as float64, $r2->y as float64, $r2->z as float64
+    );
+}
+
+internal function clampRgb(ColorVector $c) : Vec3
+{
+    return Vec3(clamp64($c->x, 0.0, 1.0) as float32, clamp64($c->y, 0.0, 1.0) as float32, clamp64($c->z, 0.0, 1.0) as float32);
+}
+
+internal function clamp64(float64 $v, float64 $lo, float64 $hi) : float64
+{
+    if ($v < $lo) {
+        return $lo;
+    }
+    if ($v > $hi) {
+        return $hi;
+    }
+    return $v;
+}
+
+internal function max64(float64 $a, float64 $b) : float64
+{
+    if ($a > $b) {
+        return $a;
+    }
+    return $b;
+}
+
+internal function min3(float32 $a, float32 $b, float32 $c) : float32
+{
+    float32 $m = $a;
+    if ($b < $m) {
+        $m = $b;
+    }
+    if ($c < $m) {
+        $m = $c;
+    }
+    return $m;
+}
+
+internal function max3(float32 $a, float32 $b, float32 $c) : float32
+{
+    float32 $m = $a;
+    if ($b > $m) {
+        $m = $b;
+    }
+    if ($c > $m) {
+        $m = $c;
+    }
+    return $m;
+}
+
+internal function displayLinear(float32 $display) : float32
+{
+    if ($display <= 0.0f) {
+        return 0.0f;
+    }
+    return math::pow($display as float64, DISPLAY_GAMMA) as float32;
+}
+
+/**
+ * Rec.709 luminance of linear RGB.
+ */
+public function luminance(Vec3 $rgb) : float32
+{
+    return 0.2126f * $rgb->x + 0.7152f * $rgb->y + 0.0722f * $rgb->z;
+}
+
+/**
+ * The illuminance on flat ground from what the CPU knows: the sun and the moon (unshadowed,
+ * by elevation) and the night hemisphere the light pass adds. The sky's own share is the
+ * irradiance probe, read by the exposure pass on the GPU.
+ */
+public function groundIlluminance(const DirectionalLight& $sun, const Moon& $moon, const Sky& $sky) : float32
+{
+    float32 $lux = 0.0f;
+    float32 $sunUp = -normalize($sun->direction)->y;
+    if ($sunUp > 0.0f && $sun->intensity > 0.0f) {
+        $lux = $lux + luminance($sun->color) * $sun->intensity * $sunUp;
+    }
+
+    DirectionalLight $moonLight = $moon->light;
+    float32 $moonUp = -normalize($moonLight->direction)->y;
+    if ($moonUp > 0.0f && $moonLight->intensity > 0.0f) {
+        $lux = $lux + luminance($moonLight->color) * $moonLight->intensity * $moonUp;
+    }
+
+    // the light pass adds the night ambient times albedo, so as irradiance it is pi times that
+    Vec4 $night = nightAmbient($moon, $sky);
+    return $lux + math::PI_F32 * luminance(Vec3($night->x, $night->y, $night->z));
+}
+
+/**
+ * The chain's uniforms for one frame. `$lux` is `groundIlluminance` (only the meter reads it),
+ * `$blend` the probe blend, `$dt` the seconds since the last frame, `$filled` whether last
+ * frame's EV is usable.
+ */
+public function toneMapUniforms(
+    const ToneMap& $map,
+    const Exposure& $exposure,
+    const ToneLook& $look,
+    int32 $width,
+    int32 $height,
+    float32 $lux,
+    float32 $blend,
+    float32 $dt,
+    bool $filled
+) : ToneMapUniforms
+{
+    float32 $mid = math::log2($map->midpoint as float64) as float32;
+    float32 $auto = 0.0f;
+    if ($exposure->auto) {
+        $auto = 1.0f;
+    }
+    float32 $local = 0.0f;
+    if ($map->local) {
+        $local = 1.0f;
+    }
+    // the curve itself is the resolve's variant; only ACES scales its input
+    float32 $pre = 1.0f;
+    if ($map->curve == ToneCurve::aces) {
+        $pre = $map->preExposure;
+    }
+    float32 $kept = 0.0f;
+    if ($filled) {
+        $kept = 1.0f;
+    }
+
+    ToneMapUniforms $u;
+    $u->exposure = Vec4($exposure->compensation, $auto, $local, $pre);
+    $u->local = Vec4($mid, $map->contrastHigh, $map->contrastLow, $map->detail);
+    $u->grid = Vec4($map->bilateral, $mid - $map->range * 0.5f, $map->range, TONEMAP_GRID_SLICES as float32);
+    $u->size = Vec4(
+        toneLumaSize($width) as float32,
+        toneLumaSize($height) as float32,
+        $width as float32,
+        $height as float32
+    );
+    $u->curve = $look->curve;
+    $u->into = $look->into;
+    $u->out = $look->out;
+    // the compensation is exposure.x and the key is local.x; the meter reads them there
+    $u->adapt = Vec4(
+        $exposure->strength,
+        $exposure->minEv,
+        $exposure->maxEv,
+        math::log2($exposure->reference as float64) as float32
+    );
+    $u->meter = Vec4($exposure->highlight, $exposure->highlightWeight, $lux, $blend);
+    $u->history = Vec4(adaptBlend($exposure->speedUp, $dt), adaptBlend($exposure->speedDown, $dt), $kept, 0.0f);
+    $u->pass = Vec4(0.0f);
+    return $u;
+}
+
+/**
+ * The share of the way to its target an exposure moving at `$rate` per second covers in `$dt`.
+ */
+internal function adaptBlend(float32 $rate, float32 $dt) : float32
+{
+    return 1.0f - math::exp(-$rate * $dt);
+}

@@ -6,14 +6,25 @@
 
 using namespace metal;
 
-struct SkyScatter
+struct FogUniforms
 {
-    float3 sun_r;
-    float3 sun_m;
-    float3 moon_r;
-    float3 moon_m;
-    float3 transmittance;
-    float t_ground;
+    float4 u_fog_density;
+    float4 u_fog_color;
+    float4 u_fog_params;
+    float4 u_fog_sun;
+    float4 u_fog_floor;
+    float4 u_fog_moon;
+    float4 u_fog_shafts;
+    float4 u_fog_shaft_light;
+    float4 u_fog_shaft_phase;
+    float4 u_fog_model;
+    float4 u_fog_to_moon;
+    float4 u_fog_sun_light;
+    float4 u_fog_moon_light;
+    float4 u_fog_ambient;
+    float4 u_fog_albedo;
+    float4 u_fog_aerial;
+    float4 u_fog_aerial_extinction;
 };
 
 struct SkyUniforms
@@ -27,19 +38,7 @@ struct SkyUniforms
     float4 u_sky_moon;
     float4 u_sky_moon_params;
     float4 u_sky_moon_color;
-};
-
-struct FogUniforms
-{
-    float4 u_fog_density;
-    float4 u_fog_color;
-    float4 u_fog_params;
-    float4 u_fog_sun;
-    float4 u_fog_samples;
-    float4 u_fog_moon;
-    float4 u_fog_shafts;
-    float4 u_fog_shaft_light;
-    float4 u_fog_shaft_phase;
+    float4 u_sky_ozone;
 };
 
 struct CameraUniforms
@@ -64,9 +63,9 @@ struct fs_in
 };
 
 static inline __attribute__((always_inline))
-float3 sky_observer(constant SkyUniforms& _217)
+float3 sky_observer(constant SkyUniforms& _1180)
 {
-    return float3(0.0, _217.u_sky_params.z + fast::max(_217.u_sky_origin.y, 1.0), 0.0);
+    return float3(0.0, _1180.u_sky_params.z + fast::max(_1180.u_sky_origin.y, 1.0), 0.0);
 }
 
 static inline __attribute__((always_inline))
@@ -84,121 +83,34 @@ float2 sky_ray_sphere(thread const float3& o, thread const float3& d, thread con
 }
 
 static inline __attribute__((always_inline))
-float2 sky_optical_depth(thread const float3& p, thread const float3& d, thread const float& len, thread const int& samples, constant SkyUniforms& _217)
+float2 sky_view_horizon(constant SkyUniforms& _1180)
 {
-    float step_len = len / float(samples);
-    float2 depth = float2(0.0);
-    float2 scale = float2(_217.u_sky_rayleigh.w, _217.u_sky_mie.w);
-    for (int i = 0; i < samples; i++)
-    {
-        float3 s = p + (d * ((float(i) + 0.5) * step_len));
-        float h = fast::max(length(s) - _217.u_sky_params.z, 0.0);
-        depth += (exp(float2(-h) / scale) * step_len);
-    }
-    return depth;
+    float h = fast::max(_1180.u_sky_origin.y, 1.0);
+    float r = _1180.u_sky_params.z + h;
+    float cos_beta = sqrt(h * ((2.0 * _1180.u_sky_params.z) + h)) / r;
+    float beta = acos(fast::clamp(cos_beta, 0.0, 1.0));
+    return float2(3.1415927410125732421875 - beta, beta);
 }
 
 static inline __attribute__((always_inline))
-float3 sky_extinction(thread const float2& depth, constant SkyUniforms& _217)
+float2 sky_view_uv(thread const float3& dir, thread const bool& ground, constant SkyUniforms& _1180)
 {
-    return exp(-((_217.u_sky_rayleigh.xyz * depth.x) + (float3(_217.u_sky_mie.y) * depth.y)));
-}
-
-static inline __attribute__((always_inline))
-SkyScatter sky_scatter_n(thread const float3& dir, thread const int& view_samples, thread const int& light_samples, constant SkyUniforms& _217)
-{
-    float3 o = sky_observer(_217);
-    float rg = _217.u_sky_params.z;
-    float rt = _217.u_sky_params.w;
-    float3 param = o;
-    float3 param_1 = dir;
-    float param_2 = rt;
-    float2 atmo = sky_ray_sphere(param, param_1, param_2);
-    float t_max = fast::max(atmo.y, 0.0);
-    float3 param_3 = o;
-    float3 param_4 = dir;
-    float param_5 = rg;
-    float2 ground = sky_ray_sphere(param_3, param_4, param_5);
-    SkyScatter s;
-    s.t_ground = -1.0;
-    if (ground.x > 0.0)
+    float2 horizon = sky_view_horizon(_1180);
+    float zenith = acos(fast::clamp(dir.y, -1.0, 1.0));
+    float half_texel = 0.00390625;
+    float v;
+    if (!ground)
     {
-        s.t_ground = ground.x;
-        t_max = ground.x;
+        float c = sqrt(fast::max(1.0 - (zenith / horizon.x), 0.0));
+        v = fast::clamp(0.5 * (1.0 - c), half_texel, 0.5 - half_texel);
     }
-    float step_len = t_max / float(view_samples);
-    float3 to_sun = _217.u_sky_sun.xyz;
-    float2 scale = float2(_217.u_sky_rayleigh.w, _217.u_sky_mie.w);
-    float3 sum_r = float3(0.0);
-    float3 sum_m = float3(0.0);
-    float2 depth_view = float2(0.0);
-    bool moon_on = _217.u_sky_moon.w > 0.0;
-    float3 to_moon = _217.u_sky_moon.xyz;
-    float3 moon_r = float3(0.0);
-    float3 moon_m = float3(0.0);
-    for (int i = 0; i < view_samples; i++)
+    else
     {
-        float3 p = o + (dir * ((float(i) + 0.5) * step_len));
-        float h = fast::max(length(p) - rg, 0.0);
-        float2 dens = exp(float2(-h) / scale) * step_len;
-        depth_view += dens;
-        bool _476;
-        if (moon_on)
-        {
-            float3 param_6 = p;
-            float3 param_7 = to_moon;
-            float param_8 = rg;
-            _476 = sky_ray_sphere(param_6, param_7, param_8).x <= 0.0;
-        }
-        else
-        {
-            _476 = moon_on;
-        }
-        if (_476)
-        {
-            float3 param_9 = p;
-            float3 param_10 = to_moon;
-            float param_11 = rt;
-            float2 moon_atmo = sky_ray_sphere(param_9, param_10, param_11);
-            float3 param_12 = p;
-            float3 param_13 = to_moon;
-            float param_14 = fast::max(moon_atmo.y, 0.0);
-            int param_15 = light_samples;
-            float2 moon_depth = sky_optical_depth(param_12, param_13, param_14, param_15, _217);
-            float2 param_16 = depth_view + moon_depth;
-            float3 tm = sky_extinction(param_16, _217);
-            moon_r += (tm * dens.x);
-            moon_m += (tm * dens.y);
-        }
-        float3 param_17 = p;
-        float3 param_18 = to_sun;
-        float param_19 = rg;
-        float2 sun_ground = sky_ray_sphere(param_17, param_18, param_19);
-        if (sun_ground.x > 0.0)
-        {
-            continue;
-        }
-        float3 param_20 = p;
-        float3 param_21 = to_sun;
-        float param_22 = rt;
-        float2 sun_atmo = sky_ray_sphere(param_20, param_21, param_22);
-        float3 param_23 = p;
-        float3 param_24 = to_sun;
-        float param_25 = fast::max(sun_atmo.y, 0.0);
-        int param_26 = light_samples;
-        float2 depth_light = sky_optical_depth(param_23, param_24, param_25, param_26, _217);
-        float2 param_27 = depth_view + depth_light;
-        float3 t = sky_extinction(param_27, _217);
-        sum_r += (t * dens.x);
-        sum_m += (t * dens.y);
+        float c_1 = sqrt(fast::max((zenith - horizon.x) / horizon.y, 0.0));
+        v = fast::clamp(0.5 + (0.5 * c_1), 0.5 + half_texel, 1.0 - half_texel);
     }
-    float2 param_28 = depth_view;
-    s.transmittance = sky_extinction(param_28, _217);
-    s.sun_r = sum_r * _217.u_sky_rayleigh.xyz;
-    s.sun_m = sum_m * float3(_217.u_sky_mie.x);
-    s.moon_r = moon_r * _217.u_sky_rayleigh.xyz;
-    s.moon_m = moon_m * float3(_217.u_sky_mie.x);
-    return s;
+    float u = (precise::atan2(dir.z, dir.x) / 6.283185482025146484375) + 0.5;
+    return float2(u, v);
 }
 
 static inline __attribute__((always_inline))
@@ -208,65 +120,34 @@ float sky_phase_rayleigh(thread const float& mu)
 }
 
 static inline __attribute__((always_inline))
-float sky_phase_mie(thread const float& mu, constant SkyUniforms& _217)
+float sky_phase_mie(thread const float& mu, constant SkyUniforms& _1180)
 {
-    float g = _217.u_sky_mie.z;
+    float g = _1180.u_sky_mie.z;
     float gg = g * g;
-    return (0.119366206228733062744140625 * ((1.0 - gg) * (1.0 + (mu * mu)))) / ((2.0 + gg) * powr((1.0 + gg) - ((2.0 * g) * mu), 1.5));
+    return (0.119366206228733062744140625 * ((1.0 - gg) * (1.0 + (mu * mu)))) / ((2.0 + gg) * pow((1.0 + gg) - ((2.0 * g) * mu), 1.5));
 }
 
 static inline __attribute__((always_inline))
-float3 sky_scatter_color(thread const float3& dir, thread const float3& sun_r, thread const float3& sun_m, thread const float3& moon_r, thread const float3& moon_m, constant SkyUniforms& _217)
+float3 sky_scatter_color(thread const float3& dir, thread const float3& sun_r, thread const float3& sun_m, thread const float3& moon_r, thread const float3& moon_m, constant SkyUniforms& _1180)
 {
-    float mu = dot(dir, _217.u_sky_sun.xyz);
+    float mu = dot(dir, _1180.u_sky_sun.xyz);
     float param = mu;
     float param_1 = mu;
-    float3 color = ((sun_r * sky_phase_rayleigh(param)) + (sun_m * sky_phase_mie(param_1, _217))) * (_217.u_sky_sun.w * 4.0);
-    if (_217.u_sky_moon.w > 0.0)
+    float3 color = ((sun_r * sky_phase_rayleigh(param)) + (sun_m * sky_phase_mie(param_1, _1180))) * (_1180.u_sky_sun.w * 4.0);
+    if (_1180.u_sky_moon.w > 0.0)
     {
-        float mu_m = dot(dir, _217.u_sky_moon.xyz);
+        float mu_m = dot(dir, _1180.u_sky_moon.xyz);
         float param_2 = mu_m;
         float param_3 = mu_m;
-        color += ((_217.u_sky_moon_color.xyz * (_217.u_sky_moon.w * 4.0)) * ((moon_r * sky_phase_rayleigh(param_2)) + (moon_m * sky_phase_mie(param_3, _217))));
+        color += ((_1180.u_sky_moon_color.xyz * (_1180.u_sky_moon.w * 4.0)) * ((moon_r * sky_phase_rayleigh(param_2)) + (moon_m * sky_phase_mie(param_3, _1180))));
     }
     return color;
 }
 
 static inline __attribute__((always_inline))
-float3 sky_inscatter_n(thread const float3& dir, thread const int& view_samples, thread const int& light_samples, thread float3& transmittance, thread float& t_ground, constant SkyUniforms& _217)
+float3 sky_sun_disk(thread const float3& dir, thread const float3& transmittance, constant SkyUniforms& _1180)
 {
-    float3 param = dir;
-    int param_1 = view_samples;
-    int param_2 = light_samples;
-    SkyScatter s = sky_scatter_n(param, param_1, param_2, _217);
-    transmittance = s.transmittance;
-    t_ground = s.t_ground;
-    float3 param_3 = dir;
-    float3 param_4 = s.sun_r;
-    float3 param_5 = s.sun_m;
-    float3 param_6 = s.moon_r;
-    float3 param_7 = s.moon_m;
-    return sky_scatter_color(param_3, param_4, param_5, param_6, param_7, _217);
-}
-
-static inline __attribute__((always_inline))
-float3 sky_inscatter(thread const float3& dir, thread float3& transmittance, thread float& t_ground, constant SkyUniforms& _217)
-{
-    float3 param = dir;
-    int param_1 = int(_217.u_sky_params.x);
-    int param_2 = int(_217.u_sky_params.y);
-    float3 param_3;
-    float param_4;
-    float3 _743 = sky_inscatter_n(param, param_1, param_2, param_3, param_4, _217);
-    transmittance = param_3;
-    t_ground = param_4;
-    return _743;
-}
-
-static inline __attribute__((always_inline))
-float3 sky_sun_disk(thread const float3& dir, thread const float3& transmittance, constant SkyUniforms& _217)
-{
-    float3 to_sun = _217.u_sky_sun.xyz;
+    float3 to_sun = _1180.u_sky_sun.xyz;
     if (dot(dir, to_sun) <= 0.0)
     {
         return float3(0.0);
@@ -279,29 +160,29 @@ float3 sky_sun_disk(thread const float3& dir, thread const float3& transmittance
     }
     float x = fast::min(angle / 0.004652000032365322113037109375, 1.0);
     float limb = 1.0 - (0.60000002384185791015625 * (1.0 - sqrt(fast::max(1.0 - (x * x), 0.0))));
-    return transmittance * (((_217.u_sky_sun.w * 500.0) * disk) * limb);
+    return transmittance * (((_1180.u_sky_sun.w * 500.0) * disk) * limb);
 }
 
 static inline __attribute__((always_inline))
-float3 sky_moon_halo(thread const float3& dir, thread const float3& transmittance, constant SkyUniforms& _217)
+float3 sky_moon_halo(thread const float3& dir, thread const float3& transmittance, constant SkyUniforms& _1180)
 {
-    float c = fast::clamp(dot(dir, _217.u_sky_moon.xyz), -1.0, 1.0);
-    bool _1088 = c <= 0.0;
-    bool _1095;
-    if (!_1088)
+    float c = fast::clamp(dot(dir, _1180.u_sky_moon.xyz), -1.0, 1.0);
+    bool _1624 = c <= 0.0;
+    bool _1631;
+    if (!_1624)
     {
-        _1095 = _217.u_sky_moon.w <= 0.0;
+        _1631 = _1180.u_sky_moon.w <= 0.0;
     }
     else
     {
-        _1095 = _1088;
+        _1631 = _1624;
     }
-    if (_1095)
+    if (_1631)
     {
         return float3(0.0);
     }
     float angle = sqrt(fast::max(2.0 * (1.0 - c), 0.0));
-    return (transmittance * _217.u_sky_moon_color.xyz) * ((_217.u_sky_moon.w * 0.3499999940395355224609375) * exp((-angle) / 0.04500000178813934326171875));
+    return (transmittance * _1180.u_sky_moon_color.xyz) * ((_1180.u_sky_moon.w * 0.3499999940395355224609375) * exp((-angle) / 0.04500000178813934326171875));
 }
 
 static inline __attribute__((always_inline))
@@ -319,26 +200,26 @@ float sky_value_noise(thread const float2& x)
     float2 f = fract(x);
     f = (f * f) * (float2(3.0) - (f * 2.0));
     float3 param = float3(i, 0.0);
-    float _869 = sky_hash(param);
-    float a = _869;
+    float _1408 = sky_hash(param);
+    float a = _1408;
     float3 param_1 = float3(i + float2(1.0, 0.0), 0.0);
-    float _878 = sky_hash(param_1);
-    float b = _878;
+    float _1416 = sky_hash(param_1);
+    float b = _1416;
     float3 param_2 = float3(i + float2(0.0, 1.0), 0.0);
-    float _887 = sky_hash(param_2);
-    float c = _887;
+    float _1425 = sky_hash(param_2);
+    float c = _1425;
     float3 param_3 = float3(i + float2(1.0), 0.0);
-    float _896 = sky_hash(param_3);
-    float d = _896;
+    float _1434 = sky_hash(param_3);
+    float d = _1434;
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
 static inline __attribute__((always_inline))
-float3 sky_moon_disk(thread const float3& dir, thread const float3& transmittance, constant SkyUniforms& _217)
+float3 sky_moon_disk(thread const float3& dir, thread const float3& transmittance, constant SkyUniforms& _1180)
 {
-    float3 m = _217.u_sky_moon.xyz;
+    float3 m = _1180.u_sky_moon.xyz;
     float c = dot(dir, m);
-    float cr = _217.u_sky_moon_params.z;
+    float cr = _1180.u_sky_moon_params.z;
     if (c <= cr)
     {
         return float3(0.0);
@@ -359,15 +240,15 @@ float3 sky_moon_disk(thread const float3& dir, thread const float3& transmittanc
     }
     float edge = 1.0 - smoothstep(0.939999997615814208984375, 1.0, sqrt(rr));
     float3 n = ((right * q.x) + (up * q.y)) - (m * sqrt(1.0 - rr));
-    float lit = fast::max(dot(n, _217.u_sky_sun.xyz), 0.0);
+    float lit = fast::max(dot(n, _1180.u_sky_sun.xyz), 0.0);
     float2 param = (q * 2.2000000476837158203125) + float2(3.099999904632568359375);
     float2 param_1 = (q * 6.0) + float2(11.69999980926513671875);
     float2 param_2 = (q * 15.0) + float2(5.30000019073486328125);
     float maria = ((sky_value_noise(param) * 0.60000002384185791015625) + (sky_value_noise(param_1) * 0.300000011920928955078125)) + (sky_value_noise(param_2) * 0.100000001490116119384765625);
     float albedo = mix(0.449999988079071044921875, 1.0, smoothstep(0.37999999523162841796875, 0.62000000476837158203125, maria));
     float limb = 0.75 + (0.25 * sqrt(1.0 - rr));
-    float3 tint = mix(float3(1.0), _217.u_sky_moon_color.xyz, float3(0.3499999940395355224609375));
-    float light = (lit * limb) + _217.u_sky_moon_params.y;
+    float3 tint = mix(float3(1.0), _1180.u_sky_moon_color.xyz, float3(0.3499999940395355224609375));
+    float light = (lit * limb) + _1180.u_sky_moon_params.y;
     return (transmittance * tint) * (((2.2000000476837158203125 * albedo) * light) * edge);
 }
 
@@ -375,37 +256,37 @@ static inline __attribute__((always_inline))
 float3 sky_hash3(thread const float3& p)
 {
     float3 param = p;
-    float _832 = sky_hash(param);
+    float _1371 = sky_hash(param);
     float3 param_1 = p + float3(17.1299991607666015625);
-    float _838 = sky_hash(param_1);
+    float _1377 = sky_hash(param_1);
     float3 param_2 = p + float3(41.70999908447265625);
-    float _844 = sky_hash(param_2);
-    return float3(_832, _838, _844);
+    float _1383 = sky_hash(param_2);
+    return float3(_1371, _1377, _1383);
 }
 
 static inline __attribute__((always_inline))
-float3 sky_stars(thread const float3& dir, thread const float3& transmittance, thread const float3& sky, constant SkyUniforms& _217)
+float3 sky_stars(thread const float3& dir, thread const float3& transmittance, thread const float3& sky, constant SkyUniforms& _1180)
 {
-    float fade = (1.0 - smoothstep(-0.14000000059604644775390625, 0.0350000001490116119384765625, _217.u_sky_sun.y)) * _217.u_sky_moon_params.w;
-    bool _1133 = fade <= 0.0;
-    bool _1140;
-    if (!_1133)
+    float fade = (1.0 - smoothstep(-0.14000000059604644775390625, 0.0350000001490116119384765625, _1180.u_sky_sun.y)) * _1180.u_sky_moon_params.w;
+    bool _1669 = fade <= 0.0;
+    bool _1676;
+    if (!_1669)
     {
-        _1140 = dir.y <= 0.0;
+        _1676 = dir.y <= 0.0;
     }
     else
     {
-        _1140 = _1133;
+        _1676 = _1669;
     }
-    if (_1140)
+    if (_1676)
     {
         return float3(0.0);
     }
     float3 p = dir * 180.0;
     float3 cell = floor(p);
     float3 param = cell;
-    float _1154 = sky_hash(param);
-    float h = _1154;
+    float _1690 = sky_hash(param);
+    float h = _1690;
     if (h > 0.04500000178813934326171875)
     {
         return float3(0.0);
@@ -414,10 +295,10 @@ float3 sky_stars(thread const float3& dir, thread const float3& transmittance, t
     float3 at = (cell + float3(0.20000000298023223876953125)) + (sky_hash3(param_1) * 0.60000002384185791015625);
     float d = length(p - at);
     float core = exp(((-d) * d) * 60.0);
-    float mag = (powr(h / 0.04500000178813934326171875, 6.0) * 3.5) + 0.119999997317790985107421875;
+    float mag = (pow(h / 0.04500000178813934326171875, 6.0) * 3.5) + 0.119999997317790985107421875;
     float3 param_2 = cell + float3(9.0);
-    float _1200 = sky_hash(param_2);
-    float warm = _1200;
+    float _1736 = sky_hash(param_2);
+    float warm = _1736;
     float3 color = mix(float3(0.75, 0.85000002384185791015625, 1.0), float3(1.0, 0.85000002384185791015625, 0.64999997615814208984375), float3(warm));
     float lum = dot(sky, float3(0.2125999927520751953125, 0.715200006961822509765625, 0.072200000286102294921875));
     float drown = exp((-lum) * 60.0);
@@ -425,111 +306,78 @@ float3 sky_stars(thread const float3& dir, thread const float3& transmittance, t
 }
 
 static inline __attribute__((always_inline))
-float3 sky_lights(thread const float3& dir, thread const float3& transmittance, thread float3& color, constant SkyUniforms& _217)
+float3 sky_lights(thread const float3& dir, thread const float3& transmittance, thread float3& color, constant SkyUniforms& _1180)
 {
-    if (_217.u_sky_origin.w > 0.5)
+    if (_1180.u_sky_origin.w > 0.5)
     {
         float3 param = dir;
         float3 param_1 = transmittance;
-        color += sky_sun_disk(param, param_1, _217);
+        color += sky_sun_disk(param, param_1, _1180);
     }
-    if (_217.u_sky_moon_color.w > 0.5)
+    if (_1180.u_sky_moon_color.w > 0.5)
     {
         float3 sky = color;
         float3 param_2 = dir;
         float3 param_3 = transmittance;
-        color += sky_moon_halo(param_2, param_3, _217);
+        color += sky_moon_halo(param_2, param_3, _1180);
         float3 param_4 = dir;
         float3 param_5 = transmittance;
-        color += sky_moon_disk(param_4, param_5, _217);
+        color += sky_moon_disk(param_4, param_5, _1180);
         float3 param_6 = dir;
         float3 param_7 = transmittance;
         float3 param_8 = sky;
-        color += sky_stars(param_6, param_7, param_8, _217);
+        color += sky_stars(param_6, param_7, param_8, _1180);
     }
     return color;
 }
 
 static inline __attribute__((always_inline))
-float3 sky_transmittance_from(thread const float3& p, thread const float3& to_sun, constant SkyUniforms& _217)
+float3 sky_radiance_lut(thread const float3& dir, texture2d_array<float> lut, sampler lutSmplr, constant SkyUniforms& _1180)
 {
-    float3 param = p;
-    float3 param_1 = to_sun;
-    float param_2 = _217.u_sky_params.z;
-    float2 ground = sky_ray_sphere(param, param_1, param_2);
-    if (ground.x > 0.0)
+    float3 param = sky_observer(_1180);
+    float3 param_1 = dir;
+    float param_2 = _1180.u_sky_params.z;
+    bool ground = sky_ray_sphere(param, param_1, param_2).x > 0.0;
+    float3 param_3 = dir;
+    bool param_4 = ground;
+    float2 uv = sky_view_uv(param_3, param_4, _1180);
+    float3 _1929 = float3(uv, 0.0);
+    float4 sun_r = lut.sample(lutSmplr, _1929.xy, uint(rint(_1929.z)), level(0.0));
+    float3 _1936 = float3(uv, 1.0);
+    float4 sun_m = lut.sample(lutSmplr, _1936.xy, uint(rint(_1936.z)), level(0.0));
+    float3 _1943 = float3(uv, 2.0);
+    float4 moon_r = lut.sample(lutSmplr, _1943.xy, uint(rint(_1943.z)), level(0.0));
+    float4 moon_m = float4(0.0);
+    if (_1180.u_sky_moon.w > 0.0)
     {
-        return float3(0.0);
+        float3 _1956 = float3(uv, 3.0);
+        moon_m = lut.sample(lutSmplr, _1956.xy, uint(rint(_1956.z)), level(0.0));
     }
-    float3 param_3 = p;
-    float3 param_4 = to_sun;
-    float param_5 = _217.u_sky_params.w;
-    float2 atmo = sky_ray_sphere(param_3, param_4, param_5);
-    float3 param_6 = p;
-    float3 param_7 = to_sun;
-    float param_8 = fast::max(atmo.y, 0.0);
-    int param_9 = int(_217.u_sky_params.y);
-    float2 depth = sky_optical_depth(param_6, param_7, param_8, param_9, _217);
-    float2 param_10 = depth;
-    return sky_extinction(param_10, _217);
+    float3 transmittance = float3(sun_r.w, sun_m.w, moon_r.w);
+    float3 param_5 = dir;
+    float3 param_6 = sun_r.xyz;
+    float3 param_7 = sun_m.xyz;
+    float3 param_8 = moon_r.xyz;
+    float3 param_9 = moon_m.xyz;
+    float3 color = sky_scatter_color(param_5, param_6, param_7, param_8, param_9, _1180);
+    if (!ground)
+    {
+        float3 param_10 = dir;
+        float3 param_11 = transmittance;
+        float3 param_12 = color;
+        float3 _1992 = sky_lights(param_10, param_11, param_12, _1180);
+        return _1992 * _1180.u_sky_ground.w;
+    }
+    float3 _2002 = float3(uv, 4.0);
+    float3 lit_ground = lut.sample(lutSmplr, _2002.xy, uint(rint(_2002.z)), level(0.0)).xyz;
+    return (color + lit_ground) * _1180.u_sky_ground.w;
 }
 
 static inline __attribute__((always_inline))
-float3 sky_ground(thread const float3& dir, thread const float& t_ground, constant SkyUniforms& _217)
+float fog_integral(thread const float& dy, thread const float& len, constant FogUniforms& _271)
 {
-    float3 p = sky_observer(_217) + (dir * t_ground);
-    float3 n = fast::normalize(p);
-    float3 to_sun = _217.u_sky_sun.xyz;
-    float3 param = p;
-    float3 param_1 = to_sun;
-    float3 sun = sky_transmittance_from(param, param_1, _217) * ((_217.u_sky_sun.w * fast::max(dot(n, to_sun), 0.0)) / 3.1415927410125732421875);
-    if (_217.u_sky_moon.w > 0.0)
-    {
-        float3 to_moon = _217.u_sky_moon.xyz;
-        float3 param_2 = p;
-        float3 param_3 = to_moon;
-        sun += ((sky_transmittance_from(param_2, param_3, _217) * _217.u_sky_moon_color.xyz) * ((_217.u_sky_moon.w * fast::max(dot(n, to_moon), 0.0)) / 3.1415927410125732421875));
-    }
-    float3 mirrored = reflect(dir, n);
-    float3 param_4 = mirrored;
-    float3 param_5;
-    float param_6;
-    float3 _1348 = sky_inscatter(param_4, param_5, param_6, _217);
-    float3 up_transmittance = param_5;
-    float up_ground = param_6;
-    float3 ambient = _1348 * 0.5;
-    return _217.u_sky_ground.xyz * (sun + ambient);
-}
-
-static inline __attribute__((always_inline))
-float3 sky_radiance(thread const float3& dir, constant SkyUniforms& _217)
-{
-    float3 param = dir;
-    float3 param_1;
-    float param_2;
-    float3 _1368 = sky_inscatter(param, param_1, param_2, _217);
-    float3 transmittance = param_1;
-    float t_ground = param_2;
-    float3 color = _1368;
-    if (t_ground < 0.0)
-    {
-        float3 param_3 = dir;
-        float3 param_4 = transmittance;
-        float3 param_5 = color;
-        float3 _1381 = sky_lights(param_3, param_4, param_5, _217);
-        return _1381 * _217.u_sky_ground.w;
-    }
-    float3 param_6 = dir;
-    float param_7 = t_ground;
-    float3 ground = sky_ground(param_6, param_7, _217);
-    return (color + (transmittance * ground)) * _217.u_sky_ground.w;
-}
-
-static inline __attribute__((always_inline))
-float fog_integral(thread const float& dy, thread const float& len, constant FogUniforms& _1405)
-{
-    float k = _1405.u_fog_density.y;
-    float d0 = _1405.u_fog_density.x;
+    float k = _271.u_fog_density.y;
+    float d0 = _271.u_fog_density.x;
     float x = fast::max((k * dy) * len, -60.0);
     if (abs(x) < 9.9999997473787516355514526367188e-05)
     {
@@ -539,13 +387,13 @@ float fog_integral(thread const float& dy, thread const float& len, constant Fog
 }
 
 static inline __attribute__((always_inline))
-float3 fog_horizon_dir(thread const float3& dir, constant SkyUniforms& _217)
+float3 fog_sky_horizon(thread const float3& dir, thread const float3& fallback)
 {
     float2 xz = dir.xz;
     float horiz = length(xz);
     if (horiz < 9.9999997473787516355514526367188e-05)
     {
-        xz = _217.u_sky_sun.xz;
+        xz = fallback.xz;
         horiz = length(xz);
         if (horiz < 9.9999997473787516355514526367188e-05)
         {
@@ -558,30 +406,34 @@ float3 fog_horizon_dir(thread const float3& dir, constant SkyUniforms& _217)
 }
 
 static inline __attribute__((always_inline))
-float3 fog_color(thread const float3& dir, constant SkyUniforms& _217, constant FogUniforms& _1405)
+float2 fog_sky_uv(thread const float3& dir)
 {
-    float3 tint = _1405.u_fog_color.xyz;
-    if (_1405.u_fog_color.w < 0.5)
+    float elevation = asin(fast::clamp(dir.y, 0.0, 1.0));
+    float v = sqrt(elevation / 1.57079637050628662109375);
+    float half_texel = 0.015625;
+    float u = (precise::atan2(dir.z, dir.x) / 6.283185482025146484375) + 0.5;
+    return float2(u, fast::clamp(v, half_texel, 1.0 - half_texel));
+}
+
+static inline __attribute__((always_inline))
+float3 fog_color(thread const float3& dir, constant FogUniforms& _271, texture2d<float> u_fog_sky, sampler u_fog_skySmplr)
+{
+    float3 tint = _271.u_fog_color.xyz;
+    if (_271.u_fog_color.w < 0.5)
     {
         return tint;
     }
     float3 param = dir;
-    float3 param_1 = fog_horizon_dir(param, _217);
-    int param_2 = int(_1405.u_fog_samples.x);
-    int param_3 = int(_1405.u_fog_samples.y);
-    float3 param_4;
-    float param_5;
-    float3 _1508 = sky_inscatter_n(param_1, param_2, param_3, param_4, param_5, _217);
-    float3 transmittance = param_4;
-    float t_ground = param_5;
-    float3 radiance = _1508;
-    return (tint * _217.u_sky_ground.w) * radiance;
+    float3 param_1 = _271.u_fog_model.xyz;
+    float3 param_2 = fog_sky_horizon(param, param_1);
+    float2 uv = fog_sky_uv(param_2);
+    return tint * (u_fog_sky.sample(u_fog_skySmplr, uv, level(0.0)).xyz + _271.u_fog_floor.xyz);
 }
 
 static inline __attribute__((always_inline))
-float3 fog_apply(thread const float3& color, thread const float3& relative, constant SkyUniforms& _217, constant FogUniforms& _1405)
+float3 fog_apply_legacy(thread const float3& color, thread const float3& relative, constant FogUniforms& _271, texture2d<float> u_fog_sky, sampler u_fog_skySmplr)
 {
-    if (_1405.u_fog_density.w < 0.5)
+    if (_271.u_fog_density.w < 0.5)
     {
         return color;
     }
@@ -590,38 +442,104 @@ float3 fog_apply(thread const float3& color, thread const float3& relative, cons
     {
         return color;
     }
-    float cutoff = _1405.u_fog_params.y;
+    float cutoff = _271.u_fog_params.y;
     if ((cutoff > 0.0) && (len > cutoff))
     {
         return color;
     }
     float3 dir = relative / float3(len);
     float dy = dir.y;
-    float start = _1405.u_fog_params.x;
+    float start = _271.u_fog_params.x;
     float param = dy;
     float param_1 = len;
-    float optical = fog_integral(param, param_1, _1405);
+    float optical = fog_integral(param, param_1, _271);
     float param_2 = dy;
     float param_3 = fast::min(len, start);
-    float t = fast::max(exp(-(optical - fog_integral(param_2, param_3, _1405))), 1.0 - _1405.u_fog_density.z);
+    float t = fast::max(exp(-(optical - fog_integral(param_2, param_3, _271))), 1.0 - _271.u_fog_density.z);
     float param_4 = dy;
-    float param_5 = fast::min(len, start + _1405.u_fog_params.w);
-    float td = exp(-(optical - fog_integral(param_4, param_5, _1405)));
-    float sun = powr(fast::max(dot(dir, _217.u_sky_sun.xyz), 0.0), _1405.u_fog_sun.w);
-    float moon = powr(fast::max(dot(dir, _217.u_sky_moon.xyz), 0.0), fast::max(_1405.u_fog_moon.w, 1.0));
-    float3 glow = (_1405.u_fog_sun.xyz * sun) + (_1405.u_fog_moon.xyz * moon);
+    float param_5 = fast::min(len, start + _271.u_fog_params.w);
+    float td = exp(-(optical - fog_integral(param_4, param_5, _271)));
+    float sun = pow(fast::max(dot(dir, _271.u_fog_model.xyz), 0.0), _271.u_fog_sun.w);
+    float moon = pow(fast::max(dot(dir, _271.u_fog_to_moon.xyz), 0.0), fast::max(_271.u_fog_moon.w, 1.0));
+    float3 glow = (_271.u_fog_sun.xyz * sun) + (_271.u_fog_moon.xyz * moon);
     float3 param_6 = dir;
-    float3 fog = (fog_color(param_6, _217, _1405) * (1.0 - t)) + (glow * (1.0 - td));
+    float3 fog = (fog_color(param_6, _271, u_fog_sky, u_fog_skySmplr) * (1.0 - t)) + (glow * (1.0 - td));
     return (color * t) + fog;
 }
 
 static inline __attribute__((always_inline))
-float3 fog_apply_sky(thread const float3& color, thread const float3& dir, constant SkyUniforms& _217, constant FogUniforms& _1405)
+float phase_hg(thread const float& g, thread const float& mu)
+{
+    float gg = g * g;
+    float base = fast::max((1.0 + gg) - ((2.0 * g) * mu), 9.9999997473787516355514526367188e-05);
+    return (1.0 - gg) / ((12.56637096405029296875 * base) * sqrt(base));
+}
+
+static inline __attribute__((always_inline))
+float fog_phase(thread const float& mu, constant FogUniforms& _271)
+{
+    float param = _271.u_fog_sun_light.w;
+    float param_1 = mu;
+    float forward = phase_hg(param, param_1);
+    return mix(0.079577468335628509521484375, forward, _271.u_fog_to_moon.w);
+}
+
+static inline __attribute__((always_inline))
+float3 fog_medium(thread const float3& dir, thread const float& lit_sun, thread const float& lit_moon, constant FogUniforms& _271)
+{
+    float param = dot(dir, _271.u_fog_model.xyz);
+    float3 light = _271.u_fog_ambient.xyz + (_271.u_fog_sun_light.xyz * (fog_phase(param, _271) * lit_sun));
+    if (_271.u_fog_moon_light.w > 0.5)
+    {
+        float param_1 = dot(dir, _271.u_fog_to_moon.xyz);
+        light += (_271.u_fog_moon_light.xyz * (fog_phase(param_1, _271) * lit_moon));
+    }
+    return _271.u_fog_albedo.xyz * (light * _271.u_fog_albedo.w);
+}
+
+static inline __attribute__((always_inline))
+float3 fog_height(thread const float3& color, thread const float3& dir, thread const float& len, thread const float& lit_sun, thread const float& lit_moon, thread const float3& rays, constant FogUniforms& _271)
+{
+    if (_271.u_fog_density.w < 0.5)
+    {
+        return color;
+    }
+    float cutoff = _271.u_fog_params.y;
+    if ((cutoff > 0.0) && (len > cutoff))
+    {
+        return color;
+    }
+    float dy = dir.y;
+    float start = _271.u_fog_params.x;
+    float param = dy;
+    float param_1 = len;
+    float optical = fog_integral(param, param_1, _271);
+    float param_2 = dy;
+    float param_3 = fast::min(len, start);
+    float t = fast::max(exp(-(optical - fog_integral(param_2, param_3, _271))), 1.0 - _271.u_fog_density.z);
+    float3 param_4 = dir;
+    float param_5 = lit_sun;
+    float param_6 = lit_moon;
+    return ((color * t) + (fog_medium(param_4, param_5, param_6, _271) * (1.0 - t))) + rays;
+}
+
+static inline __attribute__((always_inline))
+float3 fog_apply_sky(thread const float3& color, thread const float3& dir, constant FogUniforms& _271, texture2d<float> u_fog_sky, sampler u_fog_skySmplr)
 {
     float3 d = fast::normalize(dir);
-    float3 param = color;
-    float3 param_1 = d * _1405.u_fog_params.z;
-    return fog_apply(param, param_1, _217, _1405);
+    if (_271.u_fog_model.w < 0.5)
+    {
+        float3 param = color;
+        float3 param_1 = d * _271.u_fog_params.z;
+        return fog_apply_legacy(param, param_1, _271, u_fog_sky, u_fog_skySmplr);
+    }
+    float3 param_2 = color;
+    float3 param_3 = d;
+    float param_4 = _271.u_fog_params.z;
+    float param_5 = 1.0;
+    float param_6 = 1.0;
+    float3 param_7 = float3(0.0);
+    return fog_height(param_2, param_3, param_4, param_5, param_6, param_7, _271);
 }
 
 static inline __attribute__((always_inline))
@@ -636,8 +554,8 @@ float2 godrays_fetch(thread const float2& uv, thread const float& dist, texture2
     float d = fast::min(dist, 60000.0);
     float2 sum = float2(0.0);
     float weight = 0.0;
-    float _1732;
-    float _1745;
+    float _721;
+    float _734;
     for (int j = 0; j < 2; j++)
     {
         for (int i = 0; i < 2; i++)
@@ -645,22 +563,22 @@ float2 godrays_fetch(thread const float2& uv, thread const float& dist, texture2
             float4 s = godrays_resolved.read(uint2(clamp(base + int2(i, j), int2(0), top)), 0);
             if (i == 0)
             {
-                _1732 = 1.0 - f.x;
+                _721 = 1.0 - f.x;
             }
             else
             {
-                _1732 = f.x;
+                _721 = f.x;
             }
-            float bx = _1732;
+            float bx = _721;
             if (j == 0)
             {
-                _1745 = 1.0 - f.y;
+                _734 = 1.0 - f.y;
             }
             else
             {
-                _1745 = f.y;
+                _734 = f.y;
             }
-            float by = _1745;
+            float by = _734;
             float rel = abs(s.z - d) / fast::max(d, 1.0);
             float w = ((bx * by) / (0.001000000047497451305389404296875 + rel)) + 9.9999999747524270787835121154785e-07;
             sum += (s.xy * w);
@@ -689,9 +607,9 @@ float godrays_phase2(thread const float& cosTheta, thread const float3& lobes)
 }
 
 static inline __attribute__((always_inline))
-float3 fog_apply_rays_at(thread const float3& color, thread const float3& relative, thread const float2& uv, thread const float& fetchDist, constant SkyUniforms& _217, constant FogUniforms& _1405, texture2d<float> godrays_resolved, sampler godrays_resolvedSmplr)
+float3 fog_apply_rays_legacy(thread const float3& color, thread const float3& relative, thread const float2& uv, thread const float& fetchDist, constant FogUniforms& _271, texture2d<float> u_fog_sky, sampler u_fog_skySmplr, texture2d<float> godrays_resolved, sampler godrays_resolvedSmplr)
 {
-    if (_1405.u_fog_density.w < 0.5)
+    if (_271.u_fog_density.w < 0.5)
     {
         return color;
     }
@@ -700,120 +618,134 @@ float3 fog_apply_rays_at(thread const float3& color, thread const float3& relati
     {
         return color;
     }
-    float cutoff = _1405.u_fog_params.y;
+    float cutoff = _271.u_fog_params.y;
     if ((cutoff > 0.0) && (len > cutoff))
     {
         return color;
     }
     float3 dir = relative / float3(len);
     float dy = dir.y;
-    float start = _1405.u_fog_params.x;
+    float start = _271.u_fog_params.x;
     float param = dy;
     float param_1 = len;
-    float optical = fog_integral(param, param_1, _1405);
+    float optical = fog_integral(param, param_1, _271);
     float param_2 = dy;
     float param_3 = fast::min(len, start);
-    float t = fast::max(exp(-(optical - fog_integral(param_2, param_3, _1405))), 1.0 - _1405.u_fog_density.z);
+    float t = fast::max(exp(-(optical - fog_integral(param_2, param_3, _271))), 1.0 - _271.u_fog_density.z);
     float param_4 = dy;
-    float param_5 = fast::min(len, start + _1405.u_fog_params.w);
-    float td = exp(-(optical - fog_integral(param_4, param_5, _1405)));
+    float param_5 = fast::min(len, start + _271.u_fog_params.w);
+    float td = exp(-(optical - fog_integral(param_4, param_5, _271)));
     float2 param_6 = uv;
     float param_7 = fetchDist;
     float2 shaft = godrays_fetch(param_6, param_7, godrays_resolved, godrays_resolvedSmplr);
-    float occlude = mix(1.0, shaft.y, _1405.u_fog_shafts.y);
-    float sun = powr(fast::max(dot(dir, _217.u_sky_sun.xyz), 0.0), _1405.u_fog_sun.w);
-    float moon = powr(fast::max(dot(dir, _217.u_sky_moon.xyz), 0.0), fast::max(_1405.u_fog_moon.w, 1.0));
-    float3 glow = ((_1405.u_fog_sun.xyz * sun) + (_1405.u_fog_moon.xyz * moon)) * occlude;
+    float occlude = mix(1.0, shaft.y, _271.u_fog_shafts.y);
+    float sun = pow(fast::max(dot(dir, _271.u_fog_model.xyz), 0.0), _271.u_fog_sun.w);
+    float moon = pow(fast::max(dot(dir, _271.u_fog_to_moon.xyz), 0.0), fast::max(_271.u_fog_moon.w, 1.0));
+    float3 glow = ((_271.u_fog_sun.xyz * sun) + (_271.u_fog_moon.xyz * moon)) * occlude;
     float3 param_8 = dir;
-    float3 fog = (fog_color(param_8, _217, _1405) * (1.0 - t)) + (glow * (1.0 - td));
-    float3 _1973;
-    if (_1405.u_fog_shaft_light.w > 0.5)
+    float3 fog = (fog_color(param_8, _271, u_fog_sky, u_fog_skySmplr) * (1.0 - t)) + (glow * (1.0 - td));
+    float3 _1020;
+    if (_271.u_fog_shaft_light.w > 0.5)
     {
-        _1973 = _217.u_sky_moon.xyz;
+        _1020 = _271.u_fog_to_moon.xyz;
     }
     else
     {
-        _1973 = _217.u_sky_sun.xyz;
+        _1020 = _271.u_fog_model.xyz;
     }
-    float3 toLight = _1973;
+    float3 toLight = _1020;
     float param_9 = dot(dir, toLight);
-    float3 param_10 = _1405.u_fog_shaft_phase.xyz;
+    float3 param_10 = _271.u_fog_shaft_phase.xyz;
     float phase = godrays_phase2(param_9, param_10);
-    float3 rays = _1405.u_fog_shaft_light.xyz * ((phase * shaft.x) * _1405.u_fog_shafts.x);
+    float3 rays = _271.u_fog_shaft_light.xyz * ((phase * shaft.x) * _271.u_fog_shafts.x);
     return ((color * t) + fog) + rays;
 }
 
 static inline __attribute__((always_inline))
-float3 fog_apply_sky_rays(thread const float3& color, thread const float3& dir, thread const float2& uv, constant SkyUniforms& _217, constant FogUniforms& _1405, texture2d<float> godrays_resolved, sampler godrays_resolvedSmplr)
+float4 fog_shafts(thread const float3& dir, thread const float2& uv, thread const float& fetchDist, constant FogUniforms& _271, texture2d<float> godrays_resolved, sampler godrays_resolvedSmplr)
 {
-    if (_1405.u_fog_shafts.w < 0.5)
+    float2 param = uv;
+    float param_1 = fetchDist;
+    float2 shaft = godrays_fetch(param, param_1, godrays_resolved, godrays_resolvedSmplr);
+    float lit = mix(1.0, shaft.y, _271.u_fog_shafts.y);
+    float3 _840;
+    if (_271.u_fog_shaft_light.w > 0.5)
     {
-        float3 param = color;
-        float3 param_1 = dir;
-        return fog_apply_sky(param, param_1, _217, _1405);
-    }
-    float3 d = fast::normalize(dir);
-    float3 param_2 = color;
-    float3 param_3 = d * _1405.u_fog_params.z;
-    float2 param_4 = uv;
-    float param_5 = 60000.0;
-    return fog_apply_rays_at(param_2, param_3, param_4, param_5, _217, _1405, godrays_resolved, godrays_resolvedSmplr);
-}
-
-static inline __attribute__((always_inline))
-float3 tonemap_neutral(thread float3& color)
-{
-    float x = fast::min(color.x, fast::min(color.y, color.z));
-    float _2055;
-    if (x < 0.07999999821186065673828125)
-    {
-        _2055 = x - ((6.25 * x) * x);
+        _840 = _271.u_fog_to_moon.xyz;
     }
     else
     {
-        _2055 = 0.039999999105930328369140625;
+        _840 = _271.u_fog_model.xyz;
     }
-    float offset = _2055;
-    color -= float3(offset);
-    float peak = fast::max(color.x, fast::max(color.y, color.z));
-    if (peak < 0.7599999904632568359375)
+    float3 toLight = _840;
+    float param_2 = dot(dir, toLight);
+    float3 param_3 = _271.u_fog_shaft_phase.xyz;
+    float phase = godrays_phase2(param_2, param_3);
+    return float4(lit, _271.u_fog_shaft_light.xyz * ((phase * shaft.x) * _271.u_fog_shafts.x));
+}
+
+static inline __attribute__((always_inline))
+float3 fog_apply_sky_rays(thread const float3& color, thread const float3& dir, thread const float2& uv, constant FogUniforms& _271, texture2d<float> u_fog_sky, sampler u_fog_skySmplr, texture2d<float> godrays_resolved, sampler godrays_resolvedSmplr)
+{
+    if (_271.u_fog_shafts.w < 0.5)
     {
-        return color;
+        float3 param = color;
+        float3 param_1 = dir;
+        return fog_apply_sky(param, param_1, _271, u_fog_sky, u_fog_skySmplr);
     }
-    float newPeak = 1.0 - (0.057599999010562896728515625 / ((peak + 0.23999999463558197021484375) - 0.7599999904632568359375));
-    color *= (newPeak / peak);
-    float g = 1.0 - (1.0 / ((0.1500000059604644775390625 * (peak - newPeak)) + 1.0));
-    return mix(color, float3(newPeak), float3(g));
+    float3 d = fast::normalize(dir);
+    if (_271.u_fog_model.w < 0.5)
+    {
+        float3 param_2 = color;
+        float3 param_3 = d * _271.u_fog_params.z;
+        float2 param_4 = uv;
+        float param_5 = 60000.0;
+        return fog_apply_rays_legacy(param_2, param_3, param_4, param_5, _271, u_fog_sky, u_fog_skySmplr, godrays_resolved, godrays_resolvedSmplr);
+    }
+    float3 param_6 = d;
+    float2 param_7 = uv;
+    float param_8 = 60000.0;
+    float4 shafts = fog_shafts(param_6, param_7, param_8, _271, godrays_resolved, godrays_resolvedSmplr);
+    bool moonKey = _271.u_fog_shaft_light.w > 0.5;
+    float _1106;
+    if (moonKey)
+    {
+        _1106 = 1.0;
+    }
+    else
+    {
+        _1106 = shafts.x;
+    }
+    float lit_sun = _1106;
+    float _1115;
+    if (moonKey)
+    {
+        _1115 = shafts.x;
+    }
+    else
+    {
+        _1115 = 1.0;
+    }
+    float lit_moon = _1115;
+    float3 param_9 = color;
+    float3 param_10 = d;
+    float param_11 = _271.u_fog_params.z;
+    float param_12 = lit_sun;
+    float param_13 = lit_moon;
+    float3 param_14 = shafts.yzw;
+    return fog_height(param_9, param_10, param_11, param_12, param_13, param_14, _271);
 }
 
-static inline __attribute__((always_inline))
-float3 apply_tonemap(thread const float3& color)
-{
-    float3 param = color;
-    float3 _2120 = tonemap_neutral(param);
-    return _2120;
-}
-
-static inline __attribute__((always_inline))
-float3 gamma_correct(thread const float3& color)
-{
-    return powr(color, float3(0.4545454680919647216796875));
-}
-
-fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _2148 [[buffer(3)]], constant SkyUniforms& _217 [[buffer(4)]], constant FogUniforms& _1405 [[buffer(5)]], texture2d<float> godrays_resolved [[texture(15)]], sampler godrays_resolvedSmplr [[sampler(15)]], float4 gl_FragCoord [[position]])
+fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _2033 [[buffer(3)]], constant SkyUniforms& _1180 [[buffer(4)]], constant FogUniforms& _271 [[buffer(5)]], texture2d_array<float> u_sky_view [[texture(1)]], texture2d<float> u_fog_sky [[texture(2)]], texture2d<float> godrays_resolved [[texture(15)]], sampler u_sky_viewSmplr [[sampler(1)]], sampler u_fog_skySmplr [[sampler(2)]], sampler godrays_resolvedSmplr [[sampler(15)]], float4 gl_FragCoord [[position]])
 {
     fs_out out = {};
     float3 dir = fast::normalize(in.v_direction);
     float3 param = dir;
-    float3 color = fast::min(sky_radiance(param, _217), float3(65504.0));
+    float3 color = fast::min(sky_radiance_lut(param, u_sky_view, u_sky_viewSmplr, _1180), float3(65504.0));
     float3 param_1 = color;
     float3 param_2 = dir;
-    float2 param_3 = gl_FragCoord.xy * _2148.u_resolution.zw;
-    color = fog_apply_sky_rays(param_1, param_2, param_3, _217, _1405, godrays_resolved, godrays_resolvedSmplr);
-    float3 param_4 = color;
-    color = apply_tonemap(param_4);
-    float3 param_5 = color;
-    color = gamma_correct(param_5);
+    float2 param_3 = gl_FragCoord.xy * _2033.u_resolution.zw;
+    color = fog_apply_sky_rays(param_1, param_2, param_3, _271, u_fog_sky, u_fog_skySmplr, godrays_resolved, godrays_resolvedSmplr);
     out.frag_color = float4(color, 1.0);
     return out;
 }

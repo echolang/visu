@@ -1,0 +1,61 @@
+/**
+ * One culled view set's working buffers: the (instance, view) pairs, the draw items, the
+ * counters and the indirect arguments one `GpuScene.cull` fills and `GpuScene.draw` records.
+ * The shadow cascades are one set, the shadow atlas pages another, so both can be culled in
+ * one frame without sharing a counter. Allocated on first use, sized once.
+ */
+
+namespace visu::graphics;
+
+public class SceneCullSet
+{
+    public string $label;
+    public Buffer? $pairs;
+    public Buffer? $items;
+    public Buffer? $counters;
+    public Buffer? $args;
+
+    /**
+     * Passes and buckets the last cull sorted by; `draw` must match them.
+     */
+    public int32 $passes;
+    public int32 $buckets;
+
+    /**
+     * The last cull ran this frame and wrote the arguments.
+     */
+    public bool $culled;
+
+    public constructor(string $label)
+    {
+        $this->label = $label;
+        $this->pairs = null;
+        $this->items = null;
+        $this->counters = null;
+        $this->args = null;
+        $this->passes = 0;
+        $this->buckets = 0;
+        $this->culled = false;
+    }
+
+    public function ensure(Device $device) : void
+    {
+        if ($this->counters != null) {
+            return;
+        }
+
+        $this->pairs = Buffer($device, BufferDesc(BUFFER_STORAGE, (SCENE_MAX_PAIRS * 16) as uint64, "{$this->label}.pairs"));
+        $this->items = Buffer($device, BufferDesc(BUFFER_STORAGE, (SCENE_MAX_ITEMS * 16) as uint64, "{$this->label}.items"));
+        $this->counters = Buffer($device, BufferDesc(BUFFER_STORAGE, (SCENE_COUNTER_WORDS * 4) as uint64, "{$this->label}.counters"));
+        $this->args = Buffer($device, BufferDesc(BUFFER_STORAGE | BUFFER_INDIRECT, (SCENE_ARGS_WORDS * 4) as uint64, "{$this->label}.args"));
+    }
+
+    public function destroy() : void
+    {
+        $this->pairs = dropBuffer($this->pairs);
+        $this->items = dropBuffer($this->items);
+        $this->counters = dropBuffer($this->counters);
+        $this->args = dropBuffer($this->args);
+        $this->culled = false;
+    }
+}

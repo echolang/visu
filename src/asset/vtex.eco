@@ -4,10 +4,10 @@
 
 namespace visu::asset;
 
-use std::math;
 use visu::graphics::{
     Device, PixelFormat, Pixels, Texture, TextureDesc, compressRgba, mipByteCount, mipRowBytes,
-    mipSize, pixelCode, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST, TEXTURE_TRANSFER_SRC
+    mipSize, pixelCode, srgbByte, srgbDecodeValue, TEXTURE_SAMPLED, TEXTURE_TRANSFER_DST,
+    TEXTURE_TRANSFER_SRC
 };
 
 internal const string TEXTURE_MAGIC = 'VTEX';
@@ -404,9 +404,9 @@ internal function boxMip(
 
                 if ($srgb) {
                     float32 $inv = 1.0f / ($n as float32);
-                    $out->push(srgbEncode($lr * $inv));
-                    $out->push(srgbEncode($lg * $inv));
-                    $out->push(srgbEncode($lb * $inv));
+                    $out->push(srgbByte($lr * $inv));
+                    $out->push(srgbByte($lg * $inv));
+                    $out->push(srgbByte($lb * $inv));
                 } else {
                     $out->push(($r / ($n as uint32)) as uint8);
                     $out->push(($g / ($n as uint32)) as uint8);
@@ -432,34 +432,10 @@ internal function srgbDecodeTable() : array<float32>
     int32 $i = 0;
 
     while ($i < 256) {
-        float64 $c = ($i as float64) / 255.0;
-        float64 $l = $c / 12.92;
-        if ($c > 0.04045) {
-            $l = math::pow(($c + 0.055) / 1.055, 2.4);
-        }
-        $table[] = $l as float32;
+        $table[] = srgbDecodeValue(($i as float64) / 255.0) as float32;
         $i = $i + 1;
     }
 
     return $table;
 }
 
-/**
- * Nearest sRGB byte for a linear value in 0..1.
- */
-internal function srgbEncode(float32 $linear) : uint8
-{
-    float64 $l = $linear as float64;
-    if ($l <= 0.0) {
-        return 0;
-    }
-    if ($l >= 1.0) {
-        return 255;
-    }
-
-    float64 $c = $l * 12.92;
-    if ($l > 0.0031308) {
-        $c = 1.055 * math::pow($l, 1.0 / 2.4) - 0.055;
-    }
-    return math::round($c * 255.0) as uint8;
-}

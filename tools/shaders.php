@@ -71,6 +71,15 @@ const BAKES = [
         'title' => 'Baked FlyUI shaders.',
     ],
     [
+        'dir' => 'gpu',
+        'out' => 'src/graphics/compute/gpushader.eco',
+        'ns' => 'visu::graphics',
+        'prefix' => 'gpu',
+        'title' => 'Baked GPU-driven kernels and depth programs.',
+        // `gpuKernels()` / `gpuPrograms()`, which the device links at load
+        'names' => true,
+    ],
+    [
         'dir' => 'loading',
         'out' => 'src/scene/loadingshader.eco',
         'ns' => 'visu::scene',
@@ -93,6 +102,7 @@ function main(array $argv) : int
     $args = array_slice($argv, 1);
     $check = false;
     $bake = false;
+    $bakeOnly = [];
     $dirs = [];
     $includes = [];
 
@@ -107,6 +117,14 @@ function main(array $argv) : int
 
         if ($arg === '--bake') {
             $bake = true;
+            continue;
+        }
+
+        // --bake=<dir> bakes only that BAKES tree and compiles nothing else, so a local
+        // toolchain that emits different bytes never rewrites the other trees
+        if (str_starts_with($arg, '--bake=')) {
+            $bake = true;
+            $bakeOnly[] = substr($arg, strlen('--bake='));
             continue;
         }
 
@@ -167,6 +185,9 @@ function main(array $argv) : int
     // --check verifies the baked files too, so CI catches a stale bake
     if ($bake || $check) {
         foreach (BAKES as $spec) {
+            if (!empty($bakeOnly) && !in_array($spec['dir'], $bakeOnly, true)) {
+                continue;
+            }
             $bakeResult = bakeTree($root, $spec, $tools);
             if ($bakeResult === 'error') {
                 return 1;
@@ -175,6 +196,10 @@ function main(array $argv) : int
                 $wrote = $wrote + 1;
             }
         }
+    }
+
+    if (!empty($bakeOnly) && empty($dirs)) {
+        return 0;
     }
 
     if (empty($dirs)) {
@@ -220,7 +245,7 @@ function usage() : string
     return <<<TXT
 Compile Vulkan GLSL to SPIR-V and Metal.
 
-  php tools/shaders.php [dir...] [--check] [--bake] [--include dir]
+  php tools/shaders.php [dir...] [--check] [--bake] [--bake=<tree>] [--include dir]
 
 With no dirs, compiles the library, example, and test shader trees.
 --check compiles and diffs against the committed outputs.
@@ -779,13 +804,22 @@ function bakeTree(string $root, array $spec, array $tools) : string
                     'spv' => file_get_contents($spvPath),
                     'metal' => file_get_contents($metalPath),
                 ];
+
+                if ($ext === 'comp') {
+                    $group = spirvLocalSize($programs[$program][$ext]['spv']);
+                    if ($group === null) {
+                        fwrite(STDERR, "shaders: no local_size in {$src}\n");
+                        return 'error';
+                    }
+                    $programs[$program][$ext]['group'] = $group;
+                }
             }
         }
     }
 
     $tools['check'] = $wasCheck;
     ksort($programs);
-    $eco = bakeEcoTree($programs, $spec['ns'], $spec['prefix'], $spec['title']);
+    $eco = bakeEcoTree($programs, $spec['ns'], $spec['prefix'], $spec['title'], !empty($spec['names']));
     $result = emit($out, $eco, $wasCheck);
 
     if ($result === 'error') {
@@ -801,10 +835,14 @@ function bakeTree(string $root, array $spec, array $tools) : string
     return $result;
 }
 
-function bakeEcoTree(array $programs, string $ns, string $prefix, string $title) : string
+function bakeEcoTree(array $programs, string $ns, string $prefix, string $title, bool $names = false) : string
 {
     $metal = bakeArm($programs, $prefix, true);
     $spirv = bakeArm($programs, $prefix, false);
+    $groups = bakeGroups($programs, $prefix);
+    if ($names) {
+        $groups = $groups . bakeNames($programs, $prefix);
+    }
     $names = implode(', ', array_keys($programs));
 
     return <<<ECO
@@ -818,8 +856,102 @@ namespace {$ns};
 #[if: (os == darwin || os == ios) && !VISU_BACKEND_VULKAN]
 {$metal}#[else]
 {$spirv}#[end]
-
+{$groups}
 ECO;
+}
+
+/**
+ * The workgroup size of every baked kernel, read from its SPIR-V at bake time: the Metal arm
+ * carries MSL only, and both dispatches need the size. Empty for a tree without kernels.
+ */
+function bakeGroups(array $programs, string $prefix) : string
+{
+    $body = '';
+
+    foreach ($programs as $program => $stages) {
+        if (!isset($stages['comp'])) {
+            continue;
+        }
+
+        [$x, $y, $z] = $stages['comp']['group'];
+        $body = $body . "    if (\$program == '{$program}') {\n"
+            . "        return visu::graphics::WorkgroupSize(\$x: {$x}, \$y: {$y}, \$z: {$z});\n"
+            . "    }\n\n";
+    }
+
+    if ($body === '') {
+        return '';
+    }
+
+    return "\ninternal function {$prefix}Workgroup(string \$program) : visu::graphics::WorkgroupSize?\n"
+        . "{\n"
+        . $body
+        . "    return null;\n"
+        . "}\n";
+}
+
+/**
+ * `<prefix>Kernels()` and `<prefix>Programs()`: every compute program of the tree and every
+ * vertex / fragment one, so the device can link them all at load instead of on first use.
+ */
+function bakeNames(array $programs, string $prefix) : string
+{
+    $kernels = [];
+    $shaders = [];
+
+    foreach ($programs as $program => $stages) {
+        if (isset($stages['comp'])) {
+            $kernels[] = "'{$program}'";
+        } else {
+            $shaders[] = "'{$program}'";
+        }
+    }
+
+    return "\ninternal function {$prefix}Kernels() : array<string>\n"
+        . "{\n"
+        . '    array<string> $names = [' . implode(', ', $kernels) . "];\n"
+        . "    return \$names;\n"
+        . "}\n"
+        . "\ninternal function {$prefix}Programs() : array<string>\n"
+        . "{\n"
+        . '    array<string> $names = [' . implode(', ', $shaders) . "];\n"
+        . "    return \$names;\n"
+        . "}\n";
+}
+
+/**
+ * `OpExecutionMode LocalSize` of the first entry point, as [x, y, z], or null.
+ */
+function spirvLocalSize(string $spv) : ?array
+{
+    $n = strlen($spv);
+    if ($n < 20) {
+        return null;
+    }
+
+    $words = array_values(unpack('V*', $spv));
+    if ($words[0] !== 0x07230203) {
+        return null;
+    }
+
+    $at = 5;
+    $count = count($words);
+    while ($at < $count) {
+        $head = $words[$at];
+        $len = $head >> 16;
+        $op = $head & 0xFFFF;
+        if ($len === 0) {
+            return null;
+        }
+
+        if ($op === 16 && $len >= 6 && $words[$at + 2] === 17) {
+            return [$words[$at + 3], $words[$at + 4], $words[$at + 5]];
+        }
+
+        $at += $len;
+    }
+
+    return null;
 }
 
 /**
@@ -831,7 +963,11 @@ function bakeArm(array $programs, string $prefix, bool $isMetal) : string
 
     foreach ($programs as $program => $stages) {
         foreach ($stages as $ext => $bytes) {
-            $kind = $ext === 'vert' ? 'vertex' : 'fragment';
+            $kind = match ($ext) {
+                'vert' => 'vertex',
+                'comp' => 'compute',
+                default => 'fragment',
+            };
 
             if ($isMetal) {
                 $value = echoSingleQuoted($bytes['metal']);

@@ -1,0 +1,70 @@
+/**
+ * `deferred.lightcull` and `reflect.lightcull`: the GPU cull of the light table for one camera,
+ * ahead of the light pass that reads its lists. The owner builds one and hands it each frame's
+ * camera, so adding it to the frame's pipeline builds nothing.
+ */
+
+namespace visu::graphics;
+
+public class LightCullPass : Pass
+{
+    private string $label;
+    private LightCull $cull;
+
+    /**
+     * The table the cull reads. The mirror's owner hands it the frame's `LightClusterData.table`.
+     */
+    public LightTable $table;
+
+    /**
+     * The main view's pass: it grows the table and scatters its queued rows first, and culls
+     * with the atlas's shadow distance. The mirror's pass runs after it and does neither.
+     */
+    private ShadowAtlas? $atlas;
+
+    /**
+     * The camera this frame's cull runs against. Set before the pass is added.
+     */
+    public CameraData? $camera;
+
+    public constructor(string $label, LightTable $table, LightCull $cull, ShadowAtlas? $atlas)
+    {
+        $this->label = $label;
+        $this->table = $table;
+        $this->cull = $cull;
+        $this->atlas = $atlas;
+        $this->camera = null;
+    }
+
+    public function name() : string
+    {
+        return $this->label;
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        CameraData $camera = guard $this->camera else {
+            return .ok;
+        }
+        ShadowAtlas? $owner = $this->atlas;
+        if ($owner != null) {
+            ShadowAtlas $atlas = guard $owner;
+            Device $device = $ctx->device;
+            $this->table->grow($ctx);
+            ComputeProgram $scatter = guard $device->gpuShaders->kernel($device, 'scene_scatter') else ($e) {
+                return .error(.shader($e));
+            }
+            ComputeEncoder $enc = $ctx->beginCompute();
+            $this->table->scatter($enc, $scatter);
+            $enc->endCompute();
+            $this->cull->shadowDistance = $atlas->shadowDistance;
+        }
+
+        $this->cull->cull($ctx, $this->table, $camera);
+        return .ok;
+    }
+}

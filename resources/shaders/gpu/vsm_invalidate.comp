@@ -1,0 +1,113 @@
+#version 450
+
+// visu::graphics::ShadowAtlas, invalidation, one thread per light. A light that was added,
+// moved or removed gets a new generation, which retires all of its pages. A box where casters
+// changed (a mover's last and new box, a placed or removed static) clears only the entries of
+// the pages it projects onto, face by face and level by level, so a car driving past a torch
+// redraws the few pages it crosses and the rest stay cached
+layout(local_size_x = 64) in;
+
+#include "visu/vsmcull.glsl"
+
+layout(std430, set = 2, binding = 0) readonly buffer LightTableBuffer {
+    LightGpu lights[];
+};
+
+layout(std430, set = 2, binding = 1) buffer Generations {
+    uint gens[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer Boxes {
+    // lo then hi of each box
+    vec4 boxes[];
+};
+
+layout(std430, set = 2, binding = 3) buffer PageTable {
+    uint table[];
+};
+
+layout(std430, set = 2, binding = 4) readonly buffer ChangedLights {
+    uint changedSlots[];
+};
+
+// clear this light's entries of `face` under the face-ndc rect `r` (xy min, zw max), every level
+void clear_rect(uint slot, uint face, vec4 r)
+{
+    for (uint m = 0u; m < VSM_MIPS; m++) {
+        uvec2 lo = vsm_page_xy(r.xy, m);
+        uvec2 hi = vsm_page_xy(r.zw, m);
+        for (uint y = lo.y; y <= hi.y; y++) {
+            for (uint x = lo.x; x <= hi.x; x++) {
+                table[slot * VSM_LIGHT_PAGES + vsm_page_index(face, m, uvec2(x, y))] = VSM_NONE;
+            }
+        }
+    }
+}
+
+void main()
+{
+    uint slot = gl_GlobalInvocationID.x;
+    if (slot >= u_vsm_counts.x) {
+        return;
+    }
+
+    uint changed = uint(u_vsm_shadow.y + 0.5);
+    for (uint i = 0u; i < changed; i++) {
+        if (changedSlots[i] == slot) {
+            gens[slot] = gens[slot] + 1u;
+            return;
+        }
+    }
+
+    vec4 pr = lights[slot].position_radius;
+    if (pr.w <= 0.0) {
+        return;
+    }
+
+    for (uint b = 0u; b < u_vsm_counts.w; b++) {
+        vec3 lo = boxes[b * 2u].xyz;
+        vec3 hi = boxes[b * 2u + 1u].xyz;
+        vec3 closest = clamp(pr.xyz, lo, hi);
+        vec3 d = closest - pr.xyz;
+        if (dot(d, d) > pr.w * pr.w) {
+            continue;
+        }
+
+        // the light inside the box: every page of every face may see it
+        if (all(greaterThanEqual(pr.xyz, lo)) && all(lessThanEqual(pr.xyz, hi))) {
+            for (uint face = 0u; face < 6u; face++) {
+                clear_rect(slot, face, vec4(-1.0, -1.0, 1.0, 1.0));
+            }
+            continue;
+        }
+
+        for (uint face = 0u; face < 6u; face++) {
+            vec4 r = vec4(1e9, 1e9, -1e9, -1e9);
+            bool front = false;
+            bool behind = false;
+            for (uint c = 0u; c < 8u; c++) {
+                vec3 corner = vec3((c & 1u) != 0u ? hi.x : lo.x, (c & 2u) != 0u ? hi.y : lo.y, (c & 4u) != 0u ? hi.z : lo.z);
+                vec3 v = vsm_view(face, corner - pr.xyz);
+                if (v.z <= VSM_NEAR) {
+                    behind = true;
+                    continue;
+                }
+                front = true;
+                vec2 f = v.xy / v.z;
+                r.xy = min(r.xy, f);
+                r.zw = max(r.zw, f);
+            }
+            if (!front) {
+                continue;
+            }
+            // a box straddling the face's plane can reach any of its pages
+            if (behind) {
+                r = vec4(-1.0, -1.0, 1.0, 1.0);
+            }
+            if (r.x > 1.0 || r.y > 1.0 || r.z < -1.0 || r.w < -1.0) {
+                continue;
+            }
+            clear_rect(slot, face, clamp(r, vec4(-1.0), vec4(1.0)));
+        }
+    }
+}

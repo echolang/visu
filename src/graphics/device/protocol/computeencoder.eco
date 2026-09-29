@@ -32,10 +32,31 @@ public interface ComputeEncoderProtocol
     function bindStorage(uint32 $slot, Buffer $buffer, uint64 $offset = 0) : void;
 
     /**
+     * Bind this frame's transient `$slice` as the storage buffer at `$slot`, read only: per
+     * frame rows the CPU wrote (`allocTransient` at `limits.storageAlign`) that a kernel or a
+     * draw reads without a buffer of their own. A transient from another frame asserts.
+     */
+    function bindStorage(uint32 $slot, transient: TransientSlice $slice) : void;
+
+    /**
      * Run the kernel over `$x * $y * $z` threads, not groups: the backend divides by the
      * kernel's workgroup size and the kernel bounds-checks the tail. Needs setKernel first.
      */
     function dispatch(uint32 $x, uint32 $y = 1, uint32 $z = 1) : void;
+
+    /**
+     * Run the kernel over the workgroup counts a kernel wrote: three uint32 at `$offset` in
+     * `$arguments` (groups along x, y and z, not threads). Needs setKernel first and a buffer
+     * made with `BUFFER_INDIRECT`.
+     */
+    function dispatchIndirect(Buffer $arguments, uint64 $offset = 0) : void;
+
+    /**
+     * Every dispatch before this finishes its storage writes before any dispatch after it reads
+     * them, inside this one encoder. Vulkan records a compute to compute barrier; Metal
+     * dispatches in order and tracks buffer hazards, so it does nothing there.
+     */
+    function barrier() : void;
 
     /**
      * Close the encoder. The destructor asserts you called this.

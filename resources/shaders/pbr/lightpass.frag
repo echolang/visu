@@ -9,24 +9,17 @@ layout(location = 0) out vec4 fragment_color;
 #include "visu/camera.glsl"
 #include "visu/constants.glsl"
 #include "visu/functions/gamma_corr.glsl"
-#include "visu/functions/tone_mapping.glsl"
 #include "visu/functions/brdf.glsl"
 #include "visu/gbuffer_uniform.glsl"
 #include "visu/pbr/surface.glsl"
 #include "visu/pbr/shade.glsl"
 #include "visu/shadow.glsl"
 
-// the light pass has no per-draw payload at slot 0 and slot 2 is LightUniforms
-#define VISU_SKY_SLOT 0
+#define VISU_FOG_SKY_SLOT 13
+#define VISU_AERIAL_SLOT 14
 #define VISU_FOG_RAYS
 #include "visu/fog.glsl"
-
-struct PointGpu {
-    vec4 position_radius;
-    vec4 color_intensity;
-    // x source radius, y shadow slot (-1 none), z normal offset, w slope bias
-    vec4 source_shadow;
-};
+#include "visu/light_gpu.glsl"
 
 layout(std140, set = 0, binding = 2) uniform LightUniforms {
     // xyz direction the sun travels, w intensity
@@ -38,17 +31,23 @@ layout(std140, set = 0, binding = 2) uniform LightUniforms {
     vec4 u_splits;
     // x fifth split, y enabled, z cascade tint, w 1 picks the cascade from world position
     vec4 u_shadow;
-    // x lamp count, y tile pixels, z tiles across, w index stride
-    vec4 u_points_head;
-    PointGpu u_points[64];
-    mat4 u_point_face[24];
     // xyz direction the moon's light travels, w intensity
     vec4 u_moon_direction;
     // rgb moon colour, w 1 when the moon owns the shadow cascades
     vec4 u_moon_color;
     // rgb night sky ambient from above, w ground bounce share
     vec4 u_night_ambient;
+    // x visible lights, y tile pixels, z tiles across, w mask words
+    vec4 u_cluster_head;
+    // x near, y slices per log2 metre, z slices, w seconds for the flicker
+    vec4 u_cluster_z;
+    // x 1 when the shadow atlas is bound, y its mip bias, z 1 paints the debug view, w the
+    // shadow distance
+    vec4 u_vsm;
 };
+
+#include "visu/lights.glsl"
+#include "visu/vsm_sample.glsl"
 
 #ifdef USE_ENV_CUBEMAP
 layout(set = 1, binding = 6) uniform samplerCube environment_cubemap;
@@ -63,8 +62,6 @@ layout(set = 1, binding = 10) uniform samplerCube ibl_prefilter_map_b;
 #endif
 
 layout(set = 1, binding = 11) uniform sampler2DArray shadowmap;
-layout(set = 1, binding = 13) uniform sampler2D point_tiles;
-layout(set = 1, binding = 14) uniform sampler2DArray point_shadow;
 
 int csm_pick(vec3 world)
 {
@@ -73,26 +70,6 @@ int csm_pick(vec3 world)
     }
     float view_z = (u_view * vec4(world, 1.0)).z;
     return csm_index(view_z, u_splits);
-}
-
-int point_face_index(vec3 dir)
-{
-    vec3 a = abs(dir);
-    if (a.x >= a.y && a.x >= a.z) {
-        return dir.x >= 0.0 ? 0 : 1;
-    }
-    if (a.y >= a.z) {
-        return dir.y >= 0.0 ? 2 : 3;
-    }
-    return dir.z >= 0.0 ? 4 : 5;
-}
-
-float point_atten(float dist, float radius)
-{
-    float d = clamp(dist / max(radius, 1e-4), 0.0, 1.0);
-    float window = clamp(1.0 - d * d * d * d, 0.0, 1.0);
-    window = window * window;
-    return window / (dist * dist + 1.0);
 }
 
 void main()
@@ -111,10 +88,7 @@ void main()
     vec3 transmitted = vec3(0.0);
 
     if (gbuffer.id == GBUFFER_ID_UNLIT) {
-        vec3 unlit = fog_apply_rays(s.emissive, gbuffer.relative, v_uv);
-        unlit = apply_tonemap(unlit);
-        unlit = gamma_correct(unlit);
-        fragment_color = vec4(unlit, 1.0);
+        fragment_color = vec4(fog_apply_rays(s.emissive, gbuffer.relative, v_uv), 1.0);
         return;
     }
 
@@ -161,58 +135,50 @@ void main()
         }
     }
 
-    // count zero is coherent across the screen: no tile lookup, no shade
-    int pointCount = int(u_points_head.x + 0.5);
-    if (pointCount > 0) {
-        vec2 pixel = min(v_uv * u_resolution.xy, u_resolution.xy - vec2(1.0));
-        int tilePx = int(u_points_head.y + 0.5);
-        ivec2 tile = ivec2(pixel) / max(tilePx, 1);
-        int tilesX = max(int(u_points_head.z + 0.5), 1);
-        int stride = int(u_points_head.w + 0.5);
-        tile.x = clamp(tile.x, 0, tilesX - 1);
-        int row = tile.y * stride;
-        int n = int(texelFetch(point_tiles, ivec2(tile.x, row), 0).r * 255.0 + 0.5);
-        float wrap = gbuffer_id_wrap(gbuffer.id);
-        float thickness = gbuffer_id_thickness(gbuffer.id);
-        for (int i = 0; i < 8; i++) {
-            if (i >= n) {
-                break;
-            }
-            int li = int(texelFetch(point_tiles, ivec2(tile.x, row + 1 + i), 0).r * 255.0 + 0.5);
-            if (li < 0 || li >= pointCount) {
-                continue;
-            }
-            vec4 pr = u_points[li].position_radius;
-            vec3 toLight = pr.xyz - s.P;
-            float dist = length(toLight);
-            if (dist >= pr.w) {
-                continue;
-            }
-            vec3 Lc = toLight / max(dist, 1e-4);
-            vec4 src = u_points[li].source_shadow;
-            vec3 radiance = u_points[li].color_intensity.rgb * u_points[li].color_intensity.w * point_atten(dist, pr.w);
-            vec3 Ls = pbr_sphere_l(toLight, s.V, s.N, src.x);
-            float vis = 1.0;
-            if (src.y >= 0.0) {
-                int slot = int(src.y + 0.5);
-                vec3 shifted = s.P + s.N * src.z;
-                vec3 fromLight = shifted - pr.xyz;
-                int face = point_face_index(fromLight);
-                int layer = slot * 6 + face;
-                vis = 1.0 - shadow_gather(
-                    point_shadow,
-                    shifted,
-                    s.N,
-                    normalize(fromLight),
-                    u_point_face[layer],
-                    layer,
-                    src.w
-                );
-            }
-            Lo += pbr_shade_sphere(s, Lc, Ls, radiance, wrap) * vis;
-            if (thickness > 0.0) {
-                float t = pow(clamp(dot(s.V, -Lc), 0.0, 1.0), 2.0);
-                transmitted += s.albedo * radiance * t * thickness * vis;
+    vec3 vsmDebug = vec3(0.0);
+    // the pixel's z-bin gives a range of visible lights, its tile a mask over them
+    {
+        float viewDepth = -(u_view * vec4(s.P, 1.0)).z;
+        uvec2 range = light_range(viewDepth, u_cluster_head, u_cluster_z);
+        if (range.x <= range.y) {
+            vec2 pixel = min(v_uv * u_resolution.xy, u_resolution.xy - vec2(1.0));
+            uint base = light_tile_base(pixel, u_cluster_head);
+            // the world size of one screen pixel here, which picks the shadow page level
+            float footprint = vsm_footprint(viewDepth, u_projection[1][1], u_resolution.y);
+            float wrap = gbuffer_id_wrap(gbuffer.id);
+            float thickness = gbuffer_id_thickness(gbuffer.id);
+            for (uint w = range.x >> 5u; w <= (range.y >> 5u); w++) {
+                uint bits = light_word(base, w, range);
+                while (bits != 0u) {
+                    uint b = uint(findLSB(bits));
+                    bits &= bits - 1u;
+                    uint slot = light_slot(w * 32u + b);
+                    LightGpu l = u_lights[slot];
+                    vec4 pr = l.position_radius;
+                    vec3 toLight = pr.xyz - s.P;
+                    float dist = length(toLight);
+                    if (dist >= pr.w) {
+                        continue;
+                    }
+                    vec3 Lc = toLight / max(dist, 1e-4);
+                    vec3 radiance = light_radiance(l, dist, u_cluster_z.w);
+                    vec3 Ls = pbr_sphere_l(toLight, s.V, s.N, l.source.x);
+                    float vis = 1.0;
+                    float fade = vsm_light_fade(l, u_camera_position.xyz, u_vsm);
+                    if (fade > 0.0) {
+                        float seen = vsm_lookup(slot, pr.xyz, pr.w, s.P + s.N * l.source.z, footprint, u_vsm.y);
+                        vis = mix(1.0, seen < -0.5 ? 1.0 : seen, fade);
+                        // debug view: red has no page, magenta a stale one, green is lit, blue is shadowed
+                        if (u_vsm.z > 0.5) {
+                            vsmDebug += seen < -1.5 ? vec3(1.0, 0.0, 1.0) : (seen < -0.5 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, seen, 1.0 - seen));
+                        }
+                    }
+                    Lo += pbr_shade_sphere(s, Lc, Ls, radiance, wrap) * vis;
+                    if (thickness > 0.0) {
+                        float t = pow(clamp(dot(s.V, -Lc), 0.0, 1.0), 2.0);
+                        transmitted += s.albedo * radiance * t * thickness * vis;
+                    }
+                }
             }
         }
     }
@@ -268,8 +234,7 @@ void main()
 
     vec3 color = (Lo + ambient) * s.ao + transmitted + s.emissive;
     color = fog_apply_rays(color, gbuffer.relative, v_uv);
-    color = apply_tonemap(color);
-    color = gamma_correct(color);
+    // the debug tints are display colours: lift them into the scene so the curve hands them back
     if (u_shadow.z > 0.5 && u_shadow.y > 0.5) {
         int cascade = csm_pick(s.P);
         vec3 tint = vec3(1.0, 0.0, 0.0);
@@ -282,7 +247,10 @@ void main()
         } else if (cascade == 4) {
             tint = vec3(0.0, 1.0, 1.0);
         }
-        color += tint * 0.15;
+        color += display_linear(tint * 0.15);
+    }
+    if (u_vsm.z > 0.5 && dot(vsmDebug, vsmDebug) > 0.0) {
+        color = display_linear(clamp(vsmDebug, 0.0, 1.0));
     }
     fragment_color = vec4(color, 1.0);
 }

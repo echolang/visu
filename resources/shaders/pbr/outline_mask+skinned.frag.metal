@@ -6,6 +6,13 @@
 
 using namespace metal;
 
+struct ModelMaterialData
+{
+    float4 u_base_color;
+    float4 u_factors;
+    float4 u_uv_scale;
+};
+
 struct CameraUniforms
 {
     float4x4 u_projection;
@@ -15,13 +22,6 @@ struct CameraUniforms
     float4x4 u_inverse_projection_view;
     float4 u_camera_position;
     float4 u_resolution;
-};
-
-struct ModelMaterialData
-{
-    float4 u_base_color;
-    float4 u_factors;
-    float4 u_uv_scale;
 };
 
 struct fs_out
@@ -36,17 +36,10 @@ struct fs_in
 };
 
 static inline __attribute__((always_inline))
-float eye_distance(thread const float& depth, constant CameraUniforms& _18)
+bool alpha_cutout(thread const float2& meshUv, constant ModelMaterialData& _24, texture2d<float> map_albedo, sampler map_albedoSmplr, texture2d<float> map_alpha, sampler map_alphaSmplr)
 {
-    float4 view = _18.u_inverse_projection * float4(0.0, 0.0, depth, 1.0);
-    return (-view.z) / view.w;
-}
-
-fragment fs_out fs(fs_in in [[stage_in]], constant ModelMaterialData& _48 [[buffer(2)]], constant CameraUniforms& _18 [[buffer(3)]], texture2d<float> map_albedo [[texture(0)]], texture2d<float> map_alpha [[texture(5)]], texture2d<float> u_scene_depth [[texture(8)]], sampler map_albedoSmplr [[sampler(0)]], sampler map_alphaSmplr [[sampler(5)]], sampler u_scene_depthSmplr [[sampler(8)]], float4 gl_FragCoord [[position]])
-{
-    fs_out out = {};
-    float2 uv = in.v_uv * _48.u_uv_scale.xy;
-    int flags = int(_48.u_factors.z + 0.5);
+    float2 uv = meshUv * _24.u_uv_scale.xy;
+    int flags = int(_24.u_factors.z + 0.5);
     float alpha = 1.0;
     if ((flags & 1) != 0)
     {
@@ -56,25 +49,39 @@ fragment fs_out fs(fs_in in [[stage_in]], constant ModelMaterialData& _48 [[buff
     {
         alpha = map_alpha.sample(map_alphaSmplr, uv).x;
     }
-    bool _94 = _48.u_base_color.w > 0.0;
-    bool _101;
-    if (_94)
+    bool _75 = _24.u_base_color.w > 0.0;
+    bool _82;
+    if (_75)
     {
-        _101 = alpha < _48.u_base_color.w;
+        _82 = alpha < _24.u_base_color.w;
     }
     else
     {
-        _101 = _94;
+        _82 = _75;
     }
-    if (_101)
+    return _82;
+}
+
+static inline __attribute__((always_inline))
+float eye_distance(thread const float& depth, constant CameraUniforms& _90)
+{
+    float4 view = _90.u_inverse_projection * float4(0.0, 0.0, depth, 1.0);
+    return (-view.z) / view.w;
+}
+
+fragment fs_out fs(fs_in in [[stage_in]], constant ModelMaterialData& _24 [[buffer(2)]], constant CameraUniforms& _90 [[buffer(3)]], texture2d<float> map_albedo [[texture(0)]], texture2d<float> map_alpha [[texture(5)]], texture2d<float> u_scene_depth [[texture(8)]], sampler map_albedoSmplr [[sampler(0)]], sampler map_alphaSmplr [[sampler(5)]], sampler u_scene_depthSmplr [[sampler(8)]], float4 gl_FragCoord [[position]])
+{
+    fs_out out = {};
+    float2 param = in.v_uv;
+    if (alpha_cutout(param, _24, map_albedo, map_albedoSmplr, map_alpha, map_alphaSmplr))
     {
         discard_fragment();
     }
     float scene = u_scene_depth.read(uint2(int2(gl_FragCoord.xy)), 0).x;
-    float param = gl_FragCoord.z;
-    float mine = eye_distance(param, _18);
-    float param_1 = scene;
-    float front = eye_distance(param_1, _18);
+    float param_1 = gl_FragCoord.z;
+    float mine = eye_distance(param_1, _90);
+    float param_2 = scene;
+    float front = eye_distance(param_2, _90);
     float visible = float(mine <= ((front + 0.0500000007450580596923828125) + (front * 0.00999999977648258209228515625)));
     out.o_mask = float4(1.0, visible, (in.v_style + 0.5) / 4.0, 1.0);
     return out;

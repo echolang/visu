@@ -1,0 +1,33 @@
+#version 450
+
+// visu::graphics::ShadowAtlas: this frame's dirty pages, drawn into the scratch target's cells,
+// copied texel for texel into their physical cells of the atlas buffer (cell rows run up, like
+// face-space y). Seventeen workgroups of 256 per dirty page, one texel a thread, dispatched from
+// the count the allocation wrote
+layout(local_size_x = 256) in;
+
+#include "visu/vsmcull.glsl"
+
+layout(set = 1, binding = 0) uniform sampler2D scratch;
+
+layout(std430, set = 2, binding = 0) readonly buffer Dirty {
+    uvec4 dirty[];
+};
+
+layout(std430, set = 2, binding = 1) writeonly buffer Atlas {
+    float atlas[];
+};
+
+void main()
+{
+    uint k = gl_WorkGroupID.x / 17u;
+    uint i = (gl_WorkGroupID.x % 17u) * 256u + gl_LocalInvocationID.x;
+    if (i >= VSM_CELL_TEXELS) {
+        return;
+    }
+
+    uvec2 cell = uvec2(k % VSM_SCRATCH_ROW, k / VSM_SCRATCH_ROW) * VSM_CELL;
+    uvec2 p = cell + uvec2(i % VSM_CELL, i / VSM_CELL);
+    // p counts rows up from the bottom, as ndc does; the texture's rows run down
+    atlas[dirty[k].x * VSM_CELL_TEXELS + i] = texelFetch(scratch, ivec2(p.x, VSM_SCRATCH - 1u - p.y), 0).r;
+}

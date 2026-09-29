@@ -7,17 +7,30 @@ namespace visu::graphics;
 use visu::math::Vec4;
 
 
-public enum BufferUsage
-{
-    case vertex;
-    case index;
-    case uniform;
-    case storage;
-}
+public const uint32 BUFFER_VERTEX = 1;
+public const uint32 BUFFER_INDEX = 2;
+public const uint32 BUFFER_UNIFORM = 4;
+public const uint32 BUFFER_STORAGE = 8;
 
+/**
+ * Draw or dispatch arguments the GPU writes (`drawIndirect`, `dispatchIndirect`). Combine with
+ * `BUFFER_STORAGE` so the kernel that fills it can bind it.
+ */
+public const uint32 BUFFER_INDIRECT = 16;
+
+/**
+ * CPU-readable: the GPU copies into it (`Device.copyBuffer`) and the CPU reads it with
+ * `Device.readMapped` once the frame that wrote it has retired, with no stall.
+ */
+public const uint32 BUFFER_READBACK = 32;
+
+/**
+ * A GPU buffer: `usage` is a set of `BUFFER_*` bits, every role it is bound in. A storage
+ * buffer a kernel fills and a draw then reads as vertices is `BUFFER_STORAGE | BUFFER_VERTEX`.
+ */
 public struct BufferDesc
 {
-    public BufferUsage $usage;
+    public uint32 $usage;
     public uint64 $bytes;
     public string $label = '';
 }
@@ -318,6 +331,8 @@ public struct DeviceOptions
 public struct DeviceLimits
 {
     public uint64 $uniformAlign = 256;
+    // offset alignment of a storage binding, and so of a transient bound with `bindStorage`
+    public uint64 $storageAlign = 256;
     public uint64 $maxUniformRange = 65536;
     public bool $vertexTextures = false;
     public int32 $maxTessellationFactor = 0;

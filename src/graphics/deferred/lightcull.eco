@@ -1,0 +1,309 @@
+/**
+ * One view's clustered light lists, built on the GPU from the `LightTable`: every visible light
+ * as a key sorted near to far, 64 log-depth z-bins holding the visible index range each slice
+ * sees, and a bitmask of visible indices per 32-pixel screen tile. A pixel intersects its bin's
+ * range with its tile's mask. Fixed buffers sized to the view: resized only when the target
+ * is, never per frame. The main camera owns one; the water mirror another.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Mat4, Vec4};
+
+/**
+ * Screen tile edge in pixels.
+ */
+public const int32 LIGHT_TILE = 32;
+
+/**
+ * Lights one view keeps: past this the farthest-sorted keys are the ones dropped (and counted).
+ */
+public const int32 LIGHT_VISIBLE_MAX = 4096;
+public const int32 LIGHT_ZBINS = 64;
+
+/**
+ * Nearest and farthest view depth the log bins span, metres. Nearer clamps to the first bin,
+ * farther to the last.
+ */
+public const float32 LIGHT_BIN_NEAR = 0.25f;
+public const float32 LIGHT_BIN_FAR = 2048.0f;
+
+/**
+ * The culling kernels' uniform (std140 `LightCullParams` in `visu/lightcull.glsl`).
+ */
+internal struct LightCullParams
+{
+    public Vec4[6] $planes;
+    public Mat4 $view;
+    public Vec4 $eye;
+    public Vec4 $screen;
+    public Vec4 $zparams;
+    public uint32 $rows;
+    public uint32 $capacity;
+    public uint32 $words;
+    public uint32 $tilesDown;
+    public Vec4 $shadow;
+}
+
+public class LightCull
+{
+    private Device $device;
+    private string $label;
+    private GpuSort? $sort;
+    private Buffer? $keys;
+    private Buffer? $counters;
+    private Buffer? $zbins;
+    private Buffer? $tiles;
+    private Buffer? $args;
+    public int32 $tilesX;
+    public int32 $tilesY;
+    public int32 $words;
+
+    /**
+     * The table rows this frame's cull saw, 0 when it did not run: the shading loop skips.
+     */
+    public int32 $rows;
+
+    /**
+     * View depth the shadow-casting lights end at; the cull counts the sorted lights within.
+     */
+    public float32 $shadowDistance;
+
+    public constructor(Device $device, string $label)
+    {
+        $this->device = $device;
+        $this->label = $label;
+        $this->sort = null;
+        $this->keys = null;
+        $this->counters = null;
+        $this->zbins = null;
+        $this->tiles = null;
+        $this->args = null;
+        $this->tilesX = 0;
+        $this->tilesY = 0;
+        $this->words = LIGHT_VISIBLE_MAX / 32;
+        $this->rows = 0;
+        $this->shadowDistance = 0.0f;
+    }
+
+    /**
+     * Record this view's cull. Outside any encoder: it clears its buffers first, then opens one
+     * compute encoder for the visible pass, the sort and the bins. The table was scattered
+     * earlier this frame.
+     */
+    public function cull(RenderContext $ctx, LightTable $table, const CameraData& $camera) : void
+    {
+        $this->rows = 0;
+        // the lists exist even with no light, so the light pass always has its bindings
+        $this->ensureBuffers($camera->resolutionX, $camera->resolutionY);
+        if ($table->live <= 0 || !$table->ready()) {
+            return;
+        }
+
+        GpuShaders $shaders = $this->device->gpuShaders;
+        ComputeProgram $visible = guard $shaders->kernel($this->device, 'light_visible') else ($e) {
+            die($e->message());
+        }
+        ComputeProgram $bins = guard $shaders->kernel($this->device, 'light_bins') else ($e) {
+            die($e->message());
+        }
+        ComputeProgram $binArgs = guard $shaders->kernel($this->device, 'light_args') else ($e) {
+            die($e->message());
+        }
+        GpuSort $sort = $this->ensureSort();
+        Buffer $keys = guard $this->keys;
+        Buffer $counters = guard $this->counters;
+        Buffer $zbins = guard $this->zbins;
+        Buffer $tiles = guard $this->tiles;
+        Buffer $args = guard $this->args;
+        Device $device = $ctx->device;
+        $device->fillBuffer($keys, 0 as uint64, (LIGHT_VISIBLE_MAX * 4) as uint64, 0xFFFFFFFF);
+        $device->fillBuffer($counters, 0 as uint64, 16 as uint64, 0 as uint32);
+        $device->fillBuffer($zbins, 0 as uint64, (LIGHT_ZBINS * 8) as uint64, 0xFFFFFFFF);
+        $device->fillBuffer($tiles, 0 as uint64, $this->tileBytes(), 0 as uint32);
+        LightCullParams $params = $this->params($table, $camera);
+        ComputeEncoder $enc = $ctx->beginCompute();
+        $enc->setKernel($visible);
+        $enc->upload($params, slot: 0);
+        $enc->bindStorage(0, $table->buffer());
+        $enc->bindStorage(1, $keys);
+        $enc->bindStorage(2, $counters);
+        $enc->dispatch($table->rows() as uint32);
+        $enc->barrier();
+        $sort->sort($enc, $keys);
+        $enc->barrier();
+        $enc->setKernel($binArgs);
+        $enc->upload($params, slot: 0);
+        $enc->bindStorage(0, $counters);
+        $enc->bindStorage(1, $args);
+        $enc->dispatch(1);
+        $enc->barrier();
+        $enc->setKernel($bins);
+        $enc->upload($params, slot: 0);
+        $enc->bindStorage(0, $table->buffer());
+        $enc->bindStorage(1, $keys);
+        $enc->bindStorage(2, $counters);
+        $enc->bindStorage(3, $zbins);
+        $enc->bindStorage(4, $tiles);
+        $enc->dispatchIndirect($args, 0 as uint64);
+        $enc->endCompute();
+        $this->rows = $table->rows();
+    }
+
+    /**
+     * Bind the table and this view's lists at storage 0..3 of an open encoder, where
+     * `visu/lights.glsl` reads them. Only after a `cull` that ran this frame.
+     */
+    public function bind(RenderEncoder $enc, LightTable $table) : void
+    {
+        Buffer $keys = guard $this->keys else {
+            return;
+        }
+        if (!$table->ready()) {
+            return;
+        }
+
+        Buffer $zbins = guard $this->zbins;
+        Buffer $tiles = guard $this->tiles;
+        $enc->bindStorage(0, $table->buffer());
+        $enc->bindStorage(1, $keys);
+        $enc->bindStorage(2, $zbins);
+        $enc->bindStorage(3, $tiles);
+    }
+
+    /**
+     * This view's keys, bins and tiles at storage 1..3 of a compute encoder, as
+     * `vsm_request.comp` reads them.
+     */
+    public function bindCompute(ComputeEncoder $enc) : void
+    {
+        Buffer $keys = guard $this->keys else {
+            return;
+        }
+        Buffer $zbins = guard $this->zbins;
+        Buffer $tiles = guard $this->tiles;
+        $enc->bindStorage(1, $keys);
+        $enc->bindStorage(2, $zbins);
+        $enc->bindStorage(3, $tiles);
+    }
+
+    /**
+     * The visible and shadowed counters at `$slot` of a compute encoder.
+     */
+    public function bindCounters(ComputeEncoder $enc, uint32 $slot) : void
+    {
+        Buffer $counters = guard $this->counters else {
+            return;
+        }
+        $enc->bindStorage($slot, $counters);
+    }
+
+    /**
+     * The sorted keys at `$keysSlot` and the visible counter at `$countSlot` of a compute encoder.
+     */
+    public function bindKeys(ComputeEncoder $enc, uint32 $keysSlot, uint32 $countSlot) : void
+    {
+        Buffer $keys = guard $this->keys else {
+            return;
+        }
+        Buffer $counters = guard $this->counters;
+        $enc->bindStorage($keysSlot, $keys);
+        $enc->bindStorage($countSlot, $counters);
+    }
+
+    /**
+     * `u_cluster_head`: whether anything was culled, tile pixels, tiles across, mask words.
+     */
+    public const function head() : Vec4
+    {
+        float32 $any = 0.0f;
+        if ($this->rows > 0) {
+            $any = 1.0f;
+        }
+
+        return Vec4($any, LIGHT_TILE as float32, $this->tilesX as float32, $this->words as float32);
+    }
+
+    /**
+     * `u_cluster_z`: bin near, slices per log2 metre, slices, and the flicker clock.
+     */
+    public const function zparams(float32 $seconds) : Vec4
+    {
+        float32 $perLog = (LIGHT_ZBINS as float32) / std::math::log2(LIGHT_BIN_FAR / LIGHT_BIN_NEAR);
+        return Vec4(LIGHT_BIN_NEAR, $perLog, LIGHT_ZBINS as float32, $seconds);
+    }
+
+    public function destroy() : void
+    {
+        $this->keys = dropBuffer($this->keys);
+        $this->counters = dropBuffer($this->counters);
+        $this->zbins = dropBuffer($this->zbins);
+        $this->tiles = dropBuffer($this->tiles);
+        $this->args = dropBuffer($this->args);
+        $this->tilesX = 0;
+        $this->tilesY = 0;
+    }
+
+    private function params(LightTable $table, const CameraData& $camera) : LightCullParams
+    {
+        Vec4 $z = $this->zparams(0.0f);
+        return LightCullParams(
+            $planes: scenePlanes($camera->frustum),
+            $view: $camera->view,
+            $eye: Vec4($camera->position, $camera->projection->c0->x),
+            $screen: Vec4($camera->resolutionX as float32, $camera->resolutionY as float32, LIGHT_TILE as float32, $camera->projection->c1->y),
+            $zparams: Vec4($z->x, $z->y, $z->z, $this->tilesX as float32),
+            $rows: $table->rows() as uint32,
+            $capacity: LIGHT_VISIBLE_MAX as uint32,
+            $words: $this->words as uint32,
+            $tilesDown: $this->tilesY as uint32,
+            $shadow: Vec4($this->shadowDistance, 0.0f, 0.0f, 0.0f)
+        );
+    }
+
+    private function tileBytes() : uint64
+    {
+        return ($this->tilesX as uint64) * ($this->tilesY as uint64) * ($this->words as uint64) * 4;
+    }
+
+    private function ensureSort() : GpuSort
+    {
+        GpuSort $have = guard $this->sort else {
+            GpuSort $made = guard GpuSort::load($this->device, LIGHT_VISIBLE_MAX as uint32) else ($e) {
+                die($e->message());
+            }
+            $this->sort = $made;
+            return $made;
+        }
+        return $have;
+    }
+
+    private function ensureBuffers(int32 $width, int32 $height) : void
+    {
+        int32 $tx = ($width + LIGHT_TILE - 1) / LIGHT_TILE;
+        int32 $ty = ($height + LIGHT_TILE - 1) / LIGHT_TILE;
+        if ($tx < 1) {
+            $tx = 1;
+        }
+
+        if ($ty < 1) {
+            $ty = 1;
+        }
+
+        if ($this->keys == null) {
+            $this->keys = Buffer($this->device, BufferDesc(BUFFER_STORAGE, (LIGHT_VISIBLE_MAX * 4) as uint64, "{$this->label}.keys"));
+            $this->counters = Buffer($this->device, BufferDesc(BUFFER_STORAGE, 16 as uint64, "{$this->label}.counters"));
+            $this->zbins = Buffer($this->device, BufferDesc(BUFFER_STORAGE, (LIGHT_ZBINS * 8) as uint64, "{$this->label}.zbins"));
+            $this->args = Buffer($this->device, BufferDesc(BUFFER_STORAGE | BUFFER_INDIRECT, 16 as uint64, "{$this->label}.args"));
+        }
+
+        if ($tx == $this->tilesX && $ty == $this->tilesY && $this->tiles != null) {
+            return;
+        }
+
+        $this->tiles = dropBuffer($this->tiles);
+        $this->tilesX = $tx;
+        $this->tilesY = $ty;
+        $this->tiles = Buffer($this->device, BufferDesc(BUFFER_STORAGE, $this->tileBytes(), "{$this->label}.tiles"));
+    }
+}

@@ -1,0 +1,69 @@
+/**
+ * Two textures of one shape written in turn, for a history a pass feeds forward: this frame
+ * writes one while it reads what the other got last frame. The owner creates both and keeps
+ * whatever else its history needs (whether the read side holds a usable frame, what to
+ * reproject it with).
+ */
+
+namespace visu::graphics;
+
+internal class TexturePair
+{
+    private Texture $a;
+    private Texture $b;
+
+    /**
+     * 0 when this frame writes `a`.
+     */
+    public int32 $current;
+
+    public constructor(Texture $a, Texture $b)
+    {
+        $this->a = $a;
+        $this->b = $b;
+        $this->current = 0;
+    }
+
+    /**
+     * Swap which texture is written; the one written last frame becomes the one read.
+     */
+    public function flip() : void
+    {
+        $this->current = 1 - $this->current;
+    }
+
+    public function written() : Texture
+    {
+        if ($this->current == 0) {
+            return $this->a;
+        }
+
+        return $this->b;
+    }
+
+    public function read() : Texture
+    {
+        if ($this->current == 0) {
+            return $this->b;
+        }
+
+        return $this->a;
+    }
+
+    /**
+     * Destroy both textures and take `$a` and `$b` in their place, keeping which side is
+     * written. The device buries the old ones until no frame in flight samples them.
+     */
+    public function replace(Texture $a, Texture $b) : void
+    {
+        $this->destroy();
+        $this->a = $a;
+        $this->b = $b;
+    }
+
+    public function destroy() : void
+    {
+        $this->a->destroy();
+        $this->b->destroy();
+    }
+}

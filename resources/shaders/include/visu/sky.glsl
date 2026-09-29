@@ -34,6 +34,9 @@ layout(std140, set = 0, binding = VISU_SKY_SLOT) uniform SkyUniforms {
     vec4 u_sky_moon_params;
     // rgb moon tint, w 1 draws the moon disc and the stars
     vec4 u_sky_moon_color;
+    // rgb ozone absorption at its peak density (1/m), w 1 marches with midpoint attenuation
+    // over quadratic steps (0 the uniform march visu had before)
+    vec4 u_sky_ozone;
 };
 
 const float SKY_PI = 3.14159265359;
@@ -59,6 +62,10 @@ const float SKY_STAR_DENSITY = 0.045;
 // mirrors MOON_DUSK_START / MOON_DUSK_END in visu::graphics (moon.eco)
 const float SKY_DUSK_START = 0.035;
 const float SKY_DUSK_END = -0.14;
+// the ozone layer: a tent peaking at 25 km, falling to nothing 15 km either side
+// (Hillaire 2020); mirrors SKY_OZONE_PEAK / SKY_OZONE_HALF_WIDTH in sky.eco
+const float SKY_OZONE_PEAK = 25000.0;
+const float SKY_OZONE_HALF_WIDTH = 15000.0;
 
 /**
  * Ray against a sphere at the origin: (entry, exit) distances, both
@@ -87,26 +94,36 @@ vec3 sky_observer()
 }
 
 /**
- * Rayleigh and Mie optical depth along `len` metres from `p`.
+ * Rayleigh, Mie and ozone density at height `h` above the ground, relative to their peaks.
  */
-vec2 sky_optical_depth(vec3 p, vec3 d, float len, int samples)
+vec3 sky_density(float h)
+{
+    vec2 scale = vec2(u_sky_rayleigh.w, u_sky_mie.w);
+    vec2 rm = exp(-h / scale);
+    float ozone = max(1.0 - abs(h - SKY_OZONE_PEAK) / SKY_OZONE_HALF_WIDTH, 0.0);
+    return vec3(rm, ozone);
+}
+
+/**
+ * Rayleigh, Mie and ozone optical depth along `len` metres from `p`.
+ */
+vec3 sky_optical_depth(vec3 p, vec3 d, float len, int samples)
 {
     float step_len = len / float(samples);
-    vec2 depth = vec2(0.0);
-    vec2 scale = vec2(u_sky_rayleigh.w, u_sky_mie.w);
+    vec3 depth = vec3(0.0);
 
     for (int i = 0; i < samples; i++) {
         vec3 s = p + d * ((float(i) + 0.5) * step_len);
         float h = max(length(s) - u_sky_params.z, 0.0);
-        depth += exp(-h / scale) * step_len;
+        depth += sky_density(h) * step_len;
     }
 
     return depth;
 }
 
-vec3 sky_extinction(vec2 depth)
+vec3 sky_extinction(vec3 depth)
 {
-    return exp(-(u_sky_rayleigh.xyz * depth.x + vec3(u_sky_mie.y) * depth.y));
+    return exp(-(u_sky_rayleigh.xyz * depth.x + vec3(u_sky_mie.y) * depth.y + u_sky_ozone.rgb * depth.z));
 }
 
 /**
@@ -121,7 +138,7 @@ vec3 sky_transmittance_from(vec3 p, vec3 to_sun)
     }
 
     vec2 atmo = sky_ray_sphere(p, to_sun, u_sky_params.w);
-    vec2 depth = sky_optical_depth(p, to_sun, max(atmo.y, 0.0), int(u_sky_params.y));
+    vec3 depth = sky_optical_depth(p, to_sun, max(atmo.y, 0.0), int(u_sky_params.y));
     return sky_extinction(depth);
 }
 
@@ -146,10 +163,21 @@ struct SkyScatter {
     vec3 moon_r;
     vec3 moon_m;
     vec3 transmittance;
+    // Rayleigh, Mie and ozone optical depth of the path, per unit coefficient (metres of air
+    // at the ground's density)
+    vec3 depth;
     float t_ground;
 };
 
-SkyScatter sky_scatter_n(vec3 dir, int view_samples, int light_samples)
+/**
+ * The split march along `dir`, stopped at `limit` metres (the atmosphere edge or the ground
+ * when nearer). With `u_sky_ozone.w` set each sample is attenuated by the optical depth up
+ * to itself, half its own step, and the steps grow quadratically from the observer, so a
+ * horizon ray a thousand kilometres long still resolves the air next to the eye. Without it
+ * the march is the one visu had: uniform steps, each attenuated through its whole step, which
+ * over a long horizon ray takes the blue out and leaves the horizon yellow.
+ */
+SkyScatter sky_scatter_to(vec3 dir, float limit, int view_samples, int light_samples)
 {
     vec3 o = sky_observer();
     float rg = u_sky_params.z;
@@ -165,12 +193,14 @@ SkyScatter sky_scatter_n(vec3 dir, int view_samples, int light_samples)
         t_max = ground.x;
     }
 
-    float step_len = t_max / float(view_samples);
+    t_max = min(t_max, limit);
+    bool midpoint = u_sky_ozone.w > 0.5;
+    float n = float(view_samples);
+    float step_len = t_max / n;
     vec3 to_sun = u_sky_sun.xyz;
-    vec2 scale = vec2(u_sky_rayleigh.w, u_sky_mie.w);
     vec3 sum_r = vec3(0.0);
     vec3 sum_m = vec3(0.0);
-    vec2 depth_view = vec2(0.0);
+    vec3 depth_view = vec3(0.0);
     // the moon shares the view march; its light loop only runs while it is up and lit,
     // which is the same for every pixel of the draw
     bool moon_on = u_sky_moon.w > 0.0;
@@ -179,15 +209,31 @@ SkyScatter sky_scatter_n(vec3 dir, int view_samples, int light_samples)
     vec3 moon_m = vec3(0.0);
 
     for (int i = 0; i < view_samples; i++) {
-        vec3 p = o + dir * ((float(i) + 0.5) * step_len);
+        float t = (float(i) + 0.5) * step_len;
+        float dt = step_len;
+
+        if (midpoint) {
+            float a = float(i) / n;
+            float b = float(i + 1) / n;
+            t = t_max * 0.5 * (a * a + b * b);
+            dt = t_max * (b * b - a * a);
+        }
+
+        vec3 p = o + dir * t;
         float h = max(length(p) - rg, 0.0);
-        vec2 dens = exp(-h / scale) * step_len;
+        vec3 dens = sky_density(h) * dt;
+        vec3 depth_here = depth_view + dens;
+
+        if (midpoint) {
+            depth_here = depth_view + 0.5 * dens;
+        }
+
         depth_view += dens;
 
         if (moon_on && sky_ray_sphere(p, to_moon, rg).x <= 0.0) {
             vec2 moon_atmo = sky_ray_sphere(p, to_moon, rt);
-            vec2 moon_depth = sky_optical_depth(p, to_moon, max(moon_atmo.y, 0.0), light_samples);
-            vec3 tm = sky_extinction(depth_view + moon_depth);
+            vec3 moon_depth = sky_optical_depth(p, to_moon, max(moon_atmo.y, 0.0), light_samples);
+            vec3 tm = sky_extinction(depth_here + moon_depth);
             moon_r += tm * dens.x;
             moon_m += tm * dens.y;
         }
@@ -199,18 +245,27 @@ SkyScatter sky_scatter_n(vec3 dir, int view_samples, int light_samples)
         }
 
         vec2 sun_atmo = sky_ray_sphere(p, to_sun, rt);
-        vec2 depth_light = sky_optical_depth(p, to_sun, max(sun_atmo.y, 0.0), light_samples);
-        vec3 t = sky_extinction(depth_view + depth_light);
-        sum_r += t * dens.x;
-        sum_m += t * dens.y;
+        vec3 depth_light = sky_optical_depth(p, to_sun, max(sun_atmo.y, 0.0), light_samples);
+        vec3 t_light = sky_extinction(depth_here + depth_light);
+        sum_r += t_light * dens.x;
+        sum_m += t_light * dens.y;
     }
 
     s.transmittance = sky_extinction(depth_view);
+    s.depth = depth_view;
     s.sun_r = sum_r * u_sky_rayleigh.xyz;
     s.sun_m = sum_m * vec3(u_sky_mie.x);
     s.moon_r = moon_r * u_sky_rayleigh.xyz;
     s.moon_m = moon_m * vec3(u_sky_mie.x);
     return s;
+}
+
+/**
+ * The split march along `dir` to the atmosphere edge or the ground.
+ */
+SkyScatter sky_scatter_n(vec3 dir, int view_samples, int light_samples)
+{
+    return sky_scatter_to(dir, 1e30, view_samples, light_samples);
 }
 
 float sky_phase_rayleigh(float mu)

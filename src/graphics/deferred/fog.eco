@@ -1,17 +1,16 @@
 /**
- * Exponential height fog the deferred renderer applies to lit pixels and the sky.
- * `HeightFog` is the artist-facing knob set; `FogUniforms` is its GPU mirror.
- * Density at the camera is collapsed on the CPU, the same way Unreal packs
- * `RayOriginTerms`. The probe bake does not include fog.
+ * Exponential height fog the deferred renderer applies to lit pixels and the sky: a medium lit
+ * by the sun, the moon and the sky's ambient, with the aerial perspective (`aerial.eco`) on
+ * top. `HeightFog` is the artist-facing knob set; `FogLighting` is what the frame's lights make
+ * of it, solved once a frame; `FogUniforms` is their GPU mirror. Density at the camera is
+ * collapsed on the CPU, the same way Unreal packs `RayOriginTerms`. The probe bake does not
+ * include fog.
  */
 
 namespace visu::graphics;
 
 use std::math;
-use visu::math::{Vec3, Vec4, length};
-
-internal const float32 FOG_VIEW_SAMPLES = 8.0f;
-internal const float32 FOG_LIGHT_SAMPLES = 4.0f;
+use visu::math::{Vec3, Vec4, length, normalize};
 
 /**
  * Height fog parameters. Copied on assignment, like `Sky`. Metres, Unreal 4.27
@@ -41,14 +40,40 @@ public struct HeightFog
     public float32 $height;
 
     /**
-     * Inscattering colour, or a tint on the atmosphere when `fromSky`. Unreal
-     * `FogInscatteringColor`.
+     * The medium's single-scattering albedo: the share of the light it catches that it sends
+     * on rather than absorbs. Mist is a little under white.
+     */
+    public Vec3 $albedo;
+
+    /**
+     * Anisotropy of the medium's forward lobe (Henyey-Greenstein g): how tightly it glows
+     * around a light it is seen against.
+     */
+    public float32 $anisotropy;
+
+    /**
+     * Share of the forward lobe in the phase; the rest scatters evenly, the multiple
+     * scattering of a thick mist, so it never goes black looking away from the light.
+     */
+    public float32 $forward;
+
+    /**
+     * Light the medium sends on after scattering more than once, as a factor on its single
+     * scattering, the height fog's twin of the sky's stand-in. A haze a few kilometres deep is
+     * lit from every side by itself; without this it hangs grey against the sky behind it.
+     */
+    public float32 $multipleScattering;
+
+    /**
+     * Legacy (`--flag fog.model=legacy`): inscattering colour, or a tint on the sky when
+     * `fromSky`. Unreal `FogInscatteringColor`.
      */
     public Vec3 $color;
 
     /**
-     * Multiply `color` by the atmosphere's horizon radiance in the pixel's
-     * azimuth. Unreal's cubemap inscattering, pointed at our sky.
+     * Legacy: multiply `color` by the sky's own radiance at the horizon in the pixel's azimuth (the
+     * fog's sky table, `FogSkyLut`), so the haze takes the sky's colour. Unreal's cubemap
+     * inscattering, pointed at our sky.
      */
     public bool $fromSky;
 
@@ -76,18 +101,18 @@ public struct HeightFog
     public float32 $skyDistance;
 
     /**
-     * Directional inscattering colour, tinted engine-side by the current sun.
+     * Legacy: directional inscattering colour, tinted engine-side by the current sun.
      * Unreal `DirectionalInscatteringColor`.
      */
     public Vec3 $sunColor;
 
     /**
-     * Tightness of the sun glow. Unreal `DirectionalInscatteringExponent`.
+     * Legacy: tightness of the sun glow. Unreal `DirectionalInscatteringExponent`.
      */
     public float32 $sunExponent;
 
     /**
-     * Extra metres on top of `startDistance` before the sun glow starts.
+     * Legacy: extra metres on top of `startDistance` before the sun glow starts.
      * Unreal `DirectionalInscatteringStartDistance`.
      */
     public float32 $sunStartDistance;
@@ -98,6 +123,10 @@ public struct HeightFog
         $this->density = 0.00012f;
         $this->heightFalloff = 0.008f;
         $this->height = 0.0f;
+        $this->albedo = Vec3(0.9f, 0.9f, 0.9f);
+        $this->anisotropy = 0.6f;
+        $this->forward = 0.5f;
+        $this->multipleScattering = 1.7f;
         $this->color = Vec3(1.0f, 1.0f, 1.0f);
         $this->fromSky = false;
         $this->maxOpacity = 1.0f;
@@ -116,6 +145,10 @@ operator (HeightFog $a) == (HeightFog $b) : bool
         && $a->density == $b->density
         && $a->heightFalloff == $b->heightFalloff
         && $a->height == $b->height
+        && $a->albedo == $b->albedo
+        && $a->anisotropy == $b->anisotropy
+        && $a->forward == $b->forward
+        && $a->multipleScattering == $b->multipleScattering
         && $a->color == $b->color
         && $a->fromSky == $b->fromSky
         && $a->maxOpacity == $b->maxOpacity
@@ -144,7 +177,7 @@ public struct FogUniforms
     public Vec4 $density;
 
     /**
-     * Inscattering colour or tint in rgb, 1 in w multiplies the atmosphere's horizon radiance.
+     * Inscattering colour or tint in rgb, 1 in w multiplies the fog's sky table.
      */
     public Vec4 $color;
 
@@ -159,9 +192,9 @@ public struct FogUniforms
     public Vec4 $sun;
 
     /**
-     * Sky view samples in x, sky light samples in y.
+     * Added to the sky table's colour in rgb: the starlight the table has no stars for.
      */
-    public Vec4 $samples;
+    public Vec4 $floor;
 
     /**
      * Directional inscattering towards the moon (already moon tinted) in rgb, exponent in w.
@@ -183,23 +216,182 @@ public struct FogUniforms
      * Shaft phase: core anisotropy in x, wide anisotropy in y, wide lobe share in z.
      */
     public Vec4 $shaftPhase;
+
+    /**
+     * Unit vector towards the sun in xyz, 1 in w for the lit medium and the aerial perspective
+     * (0 the legacy fog).
+     */
+    public Vec4 $model;
+
+    /**
+     * Unit vector towards the moon in xyz, the forward lobe's share in w.
+     */
+    public Vec4 $toMoon;
+
+    /**
+     * Sun irradiance at the fog in rgb, the forward lobe's anisotropy in w.
+     */
+    public Vec4 $sunLight;
+
+    /**
+     * Moon irradiance at the fog in rgb, 1 in w while it casts any.
+     */
+    public Vec4 $moonLight;
+
+    /**
+     * The sky's radiance the medium scatters evenly in rgb.
+     */
+    public Vec4 $ambient;
+
+    /**
+     * The medium's albedo in rgb, its multiple scattering stand-in in w.
+     */
+    public Vec4 $albedo;
+
+    /**
+     * Aerial perspective: the sky's Mie anisotropy in z, the distance scale in w (0 off).
+     */
+    public Vec4 $aerial;
+
+    /**
+     * Rayleigh scattering in rgb and Mie extinction in w (1/m): the transmittance of an aerial
+     * path from its optical depths.
+     */
+    public Vec4 $aerialExtinction;
 }
 
 /**
- * Packs fog for one draw. `$camera` is where the viewer stands; `$sunTint` is
- * `fogSunTint` of the current sun so the glow reddens and vanishes at night, and
- * `$moonTint` is `fogMoonTint`, the same glow around the moon. `$colorScale` is
- * `fogLight`: a constant fog colour is a radiance, so it has to dim with the light.
+ * What this frame's lights make of the fog, solved once a frame by the renderer and handed to
+ * every pass that fogs, so none of them works it out again.
  */
-public function fogUniforms(
-    const HeightFog& $fog,
-    Vec3 $camera,
-    Vec3 $sunTint,
-    float32 $viewSamples,
-    float32 $lightSamples,
-    Vec3 $moonTint = Vec3(0.0f, 0.0f, 0.0f),
-    Vec3 $colorScale = Vec3(1.0f, 1.0f, 1.0f)
-) : FogUniforms
+public struct FogLighting
+{
+    /**
+     * Unit vectors towards the sun and the moon: the sky's (the moon's is straight down while it
+     * is disabled).
+     */
+    public Vec3 $toSun;
+    public Vec3 $toMoon;
+
+    /**
+     * Irradiance the sun and the moon bring to the fog: the lights the light pass shades with.
+     */
+    public Vec3 $sun;
+    public Vec3 $moon;
+
+    /**
+     * The sky's radiance the medium scatters evenly: `fogAmbient`.
+     */
+    public Vec3 $ambient;
+
+    /**
+     * The sky's Mie anisotropy, Rayleigh scattering and Mie extinction, for the aerial lookup.
+     */
+    public float32 $mieAnisotropy;
+    public Vec3 $rayleigh;
+    public float32 $mieExtinction;
+
+    /**
+     * Distance scale every aerial lookup reads at; 0 turns the aerial perspective off.
+     */
+    public float32 $aerialScale;
+
+    /**
+     * The legacy fog (`--flag fog.model=legacy`) and its tints: `fogSunTint`, `fogMoonTint`,
+     * `fogLight` and `fogSkyFloor`.
+     */
+    public bool $legacy;
+    public Vec3 $legacySun;
+    public Vec3 $legacyMoon;
+    public Vec3 $legacyScale;
+    public Vec3 $legacyFloor;
+
+    public constructor()
+    {
+        Vec3 $zero = Vec3(0.0f, 0.0f, 0.0f);
+        $this->toSun = Vec3(0.0f, 1.0f, 0.0f);
+        $this->toMoon = Vec3(0.0f, -1.0f, 0.0f);
+        $this->sun = $zero;
+        $this->moon = $zero;
+        $this->ambient = $zero;
+        $this->mieAnisotropy = 0.0f;
+        $this->rayleigh = $zero;
+        $this->mieExtinction = 0.0f;
+        $this->aerialScale = 0.0f;
+        $this->legacy = false;
+        $this->legacySun = $zero;
+        $this->legacyMoon = $zero;
+        $this->legacyScale = Vec3(1.0f, 1.0f, 1.0f);
+        $this->legacyFloor = $zero;
+    }
+}
+
+/**
+ * The fog's lighting this frame. `$ambient` is `fogAmbient`, which the renderer caches;
+ * `$legacy` packs the fog visu had before and turns the aerial perspective off.
+ */
+public function fogLighting(
+    const DirectionalLight& $sun,
+    const Moon& $moon,
+    const Sky& $sky,
+    const AerialPerspective& $aerial,
+    Vec3 $ambient,
+    bool $legacy
+) : FogLighting
+{
+    FogLighting $lit = FogLighting();
+    $lit->toSun = normalize(-$sky->direction);
+    $lit->sun = $sun->color * $sun->intensity;
+    $lit->ambient = $ambient;
+    $lit->mieAnisotropy = $sky->mieAnisotropy;
+    $lit->rayleigh = Vec3(SKY_RAYLEIGH_R, SKY_RAYLEIGH_G, SKY_RAYLEIGH_B) * $sky->rayleighScale;
+    $lit->mieExtinction = SKY_MIE_EXTINCTION * $sky->mieScale;
+
+    if ($moon->enabled) {
+        DirectionalLight $light = $moon->light;
+        $lit->toMoon = normalize(-$moon->direction);
+        $lit->moon = $light->color * $light->intensity;
+    }
+
+    if ($aerial->enabled && !$legacy) {
+        $lit->aerialScale = $aerial->scale;
+    }
+
+    $lit->legacy = $legacy;
+    $lit->legacySun = fogSunTint($sun, $sky);
+    $lit->legacyMoon = fogMoonTint($moon, $sky);
+    $lit->legacyScale = fogLight($moon, $sky);
+    $lit->legacyFloor = fogSkyFloor($moon, $sky);
+    return $lit;
+}
+
+/**
+ * The radiance the sky sends into the fog from every side, for its even scattering: half the
+ * sphere is the sunlit dome (`$dome`, `skyDomeRadiance`), the other half the ground lit by the
+ * sun and that dome. The ground's brightness counts, not its colour: the grass would tint a
+ * white mist green. The night hemisphere (moonlit sky and starlight) comes on top, from above
+ * and off the ground the same way.
+ */
+public function fogAmbient(Vec3 $dome, const DirectionalLight& $sun, const Moon& $moon, const Sky& $sky) : Vec3
+{
+    float32 $albedo = luminance($sky->groundAlbedo);
+    float32 $up = -normalize($sun->direction)->y;
+
+    if ($up < 0.0f) {
+        $up = 0.0f;
+    }
+
+    Vec3 $ground = ($sun->color * ($sun->intensity * $up / math::PI_F32) + $dome) * $albedo;
+    Vec4 $night = nightAmbient($moon, $sky);
+    Vec3 $below = Vec3($night->x, $night->y, $night->z);
+    return ($dome + $ground + $below * (1.0f + $albedo)) * 0.5f;
+}
+
+/**
+ * Packs fog for one draw. `$camera` is where the viewer stands; `$lit` is the frame's
+ * `fogLighting`.
+ */
+public function fogUniforms(const HeightFog& $fog, Vec3 $camera, const FogLighting& $lit) : FogUniforms
 {
     float32 $enabled = 0.0f;
 
@@ -213,27 +405,50 @@ public function fogUniforms(
         $fromSky = 1.0f;
     }
 
-    Vec3 $sun = $fog->sunColor * $sunTint;
+    Vec3 $sun = $fog->sunColor * $lit->legacySun;
     Vec3 $color = $fog->color;
+    Vec3 $lift = Vec3(0.0f, 0.0f, 0.0f);
 
-    // the sky's horizon already carries the light; only a constant colour is scaled
+    // the sky already carries the light; only a constant colour is scaled
     if (!$fog->fromSky) {
-        $color = $color * $colorScale;
+        $color = $color * $lit->legacyScale;
+    } else {
+        $lift = $lit->legacyFloor;
     }
 
     // the fog's warm sun colour would turn the moon amber; keep only its strength
     float32 $glow = ($fog->sunColor->x + $fog->sunColor->y + $fog->sunColor->z) / 3.0f;
-    Vec3 $moon = $moonTint * $glow;
+    Vec3 $moon = $lit->legacyMoon * $glow;
+    float32 $model = 1.0f;
+
+    if ($lit->legacy) {
+        $model = 0.0f;
+    }
+
+    float32 $moonUp = 0.0f;
+
+    if ($lit->moon->x + $lit->moon->y + $lit->moon->z > 0.0f) {
+        $moonUp = 1.0f;
+    }
+
     return FogUniforms(
         Vec4(fogDensityAtCamera($fog, $camera), $fog->heightFalloff, $fog->maxOpacity, $enabled),
         Vec4($color->x, $color->y, $color->z, $fromSky),
         Vec4($fog->startDistance, $fog->cutoffDistance, $fog->skyDistance, $fog->sunStartDistance),
         Vec4($sun->x, $sun->y, $sun->z, $fog->sunExponent),
-        Vec4($viewSamples, $lightSamples, 0.0f, 0.0f),
+        Vec4($lift->x, $lift->y, $lift->z, 0.0f),
         Vec4($moon->x, $moon->y, $moon->z, $fog->sunExponent),
         Vec4(0.0f),
         Vec4(0.0f),
-        Vec4(0.0f)
+        Vec4(0.0f),
+        Vec4($lit->toSun->x, $lit->toSun->y, $lit->toSun->z, $model),
+        Vec4($lit->toMoon->x, $lit->toMoon->y, $lit->toMoon->z, $fog->forward),
+        Vec4($lit->sun->x, $lit->sun->y, $lit->sun->z, $fog->anisotropy),
+        Vec4($lit->moon->x, $lit->moon->y, $lit->moon->z, $moonUp),
+        Vec4($lit->ambient->x, $lit->ambient->y, $lit->ambient->z, 0.0f),
+        Vec4($fog->albedo->x, $fog->albedo->y, $fog->albedo->z, $fog->multipleScattering),
+        Vec4(0.0f, 0.0f, $lit->mieAnisotropy, $lit->aerialScale),
+        Vec4($lit->rayleigh->x, $lit->rayleigh->y, $lit->rayleigh->z, $lit->mieExtinction)
     );
 }
 

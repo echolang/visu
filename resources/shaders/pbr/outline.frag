@@ -13,9 +13,18 @@ const int RING_TAPS = 8;
 void main()
 {
     vec4 here = texture(u_mask, v_uv);
-    // the glow sits outside the silhouette; the object itself stays as lit
+    // the glow sits outside the silhouette; the object itself stays as lit unless its style
+    // fills it (a placement ghost, which is only ever in the mask)
     if (here.r > 0.5) {
-        discard;
+        int inside = int(clamp(floor(here.b * OUTLINE_STYLES), 0.0, OUTLINE_STYLES - 1.0));
+        vec4 paint = u_params[inside];
+        if (paint.z <= 0.0) {
+            discard;
+        }
+
+        vec4 tint = u_colors[inside];
+        o_color = vec4(tint.rgb, tint.a * paint.z * mix(paint.y, 1.0, here.g));
+        return;
     }
 
     float widest = u_texel.z;

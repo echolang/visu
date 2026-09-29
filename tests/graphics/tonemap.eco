@@ -1,0 +1,267 @@
+/**
+ * The CPU side of the display end: colour matrices, white balance, the filmic solve, the curve
+ * table and mirrors, the clear colour mapped back into the scene through each curve, the chain's
+ * uniforms and its per-frame mailbox.
+ */
+
+use visu::graphics::{
+    ColorMatrix, ColorVector, Exposure, TextureOptions, TextureRef, ToneCurve, ToneImage, ToneLook,
+    ToneMap, ToneMapData, acesInput, acesOutput, chromaticAdaptation, filmicCurve, gamutRec709,
+    gamutToneMap, sceneBackground, toneCurveApply, toneCurveNamed, toneCurves, ToneMapUniforms,
+    toneMapUniforms, whiteD65,
+};
+use visu::math::{Vec3, Vec4};
+
+function near(float64 $a, float64 $b, float64 $eps) : bool
+{
+    float64 $d = $a - $b;
+    return $d < $eps && $d > -$eps;
+}
+
+function nearIdentity(const ColorMatrix& $m, float64 $eps) : bool
+{
+    return near($m->m00, 1.0, $eps) && near($m->m11, 1.0, $eps) && near($m->m22, 1.0, $eps)
+        && near($m->m01, 0.0, $eps) && near($m->m02, 0.0, $eps)
+        && near($m->m10, 0.0, $eps) && near($m->m12, 0.0, $eps)
+        && near($m->m20, 0.0, $eps) && near($m->m21, 0.0, $eps);
+}
+
+test rec709_white_is_d65
+{
+    ColorVector $white = gamutRec709()->toXyz() * ColorVector(1.0, 1.0, 1.0);
+    ColorVector $d65 = whiteD65()->xyz();
+    assert(near($white->x, $d65->x, 0.000000001), 'x');
+    assert(near($white->y, 1.0, 0.000000001), 'luminance 1');
+    assert(near($white->z, $d65->z, 0.000000001), 'z');
+    // the second row of RGB to XYZ is the luma weights
+    ColorMatrix $m = gamutRec709()->toXyz();
+    assert(near($m->m10, 0.2126, 0.001) && near($m->m11, 0.7152, 0.001) && near($m->m12, 0.0722, 0.001), 'luma row');
+}
+
+test matrix_inverse_round_trips
+{
+    ColorMatrix $m = gamutToneMap(0.75)->toXyz();
+    assert(nearIdentity($m * $m->inverse(), 0.000000001), 'm m^-1');
+    assert(nearIdentity($m->inverse() * $m, 0.000000001), 'm^-1 m');
+}
+
+test bradford_at_d65_changes_nothing
+{
+    ColorMatrix $same = chromaticAdaptation(whiteD65()->xyz(), whiteD65()->xyz());
+    assert(nearIdentity($same, 0.000000001), 'identity');
+}
+
+test white_balance_turns_the_picked_colour_white
+{
+    ColorMatrix $toXyz = gamutRec709()->toXyz();
+    ColorVector $warm = $toXyz * ColorVector(1.0, 0.8, 0.6);
+    ColorMatrix $cat = chromaticAdaptation($warm, whiteD65()->xyz());
+    ColorVector $out = $toXyz->inverse() * ($cat * $warm);
+    // chromaticity lands on D65: equal channels, luminance kept
+    assert(near($out->x, $out->y, 0.000001) && near($out->y, $out->z, 0.000001), 'neutral');
+    assert(near(($toXyz * $out)->y, $warm->y, 0.000001), 'luminance kept');
+}
+
+test tone_look_is_a_round_trip_without_balance
+{
+    ToneLook $look = ToneLook(ToneMap());
+    Vec4 $r0 = $look->into[0];
+    // grey stays grey through the tone-map gamut, both D65
+    float32 $sum = $r0->x + $r0->y + $r0->z;
+    assert($sum > 0.9999f && $sum < 1.0001f, 'rows keep grey');
+    ColorMatrix $into = ColorMatrix(
+        $look->into[0]->x as float64, $look->into[0]->y as float64, $look->into[0]->z as float64,
+        $look->into[1]->x as float64, $look->into[1]->y as float64, $look->into[1]->z as float64,
+        $look->into[2]->x as float64, $look->into[2]->y as float64, $look->into[2]->z as float64
+    );
+    ColorMatrix $out = ColorMatrix(
+        $look->out[0]->x as float64, $look->out[0]->y as float64, $look->out[0]->z as float64,
+        $look->out[1]->x as float64, $look->out[1]->y as float64, $look->out[1]->z as float64,
+        $look->out[2]->x as float64, $look->out[2]->y as float64, $look->out[2]->z as float64
+    );
+    assert(nearIdentity($out * $into, 0.00001), 'out undoes into');
+}
+
+test filmic_curve_hits_midpoint_and_white
+{
+    Vec4 $c = filmicCurve(1.35f, 0.97f, 16.0f, 0.18f, 0.18f);
+    float64 $a = $c->x as float64;
+    float64 $d = $c->y as float64;
+    float64 $b = $c->z as float64;
+    float64 $k = $c->w as float64;
+    float64 $zm = std::math::pow(0.18, $a);
+    float64 $zh = std::math::pow(16.0, $a);
+    float64 $mid = $zm / (std::math::pow($zm, $d) * $b + $k);
+    float64 $white = $zh / (std::math::pow($zh, $d) * $b + $k);
+    assert(near($mid, 0.18, 0.0001), 'midpoint');
+    assert(near($white, 1.0, 0.0001), 'white point');
+}
+
+function neutralMap() : ToneMap
+{
+    ToneMap $map = ToneMap();
+    $map->curve = ToneCurve::neutral;
+    return $map;
+}
+
+test scene_background_undoes_the_neutral_curve
+{
+    ToneMap $map = neutralMap();
+    ToneLook $look = ToneLook($map);
+    // the default clear colour: dark, so the darkest channel is on the quadratic toe
+    Vec4 $scene = sceneBackground(Vec4(0.05f, 0.05f, 0.06f, 1.0f), $map, $look);
+    float32 $low = $scene->x;
+    // neutral subtracts x - 6.25 x^2 while the darkest channel is under 0.08
+    float32 $offset = $low - 6.25f * $low * $low;
+    float32 $shown = std::math::pow(($scene->z - $offset) as float64, 1.0 / 2.2) as float32;
+    assert($shown > 0.0599f && $shown < 0.0601f, 'blue comes back');
+    assert($scene->w == 1.0f, 'alpha');
+    Vec4 $grey = sceneBackground(Vec4(0.5f, 0.5f, 0.5f, 1.0f), $map, $look);
+    float32 $mid = std::math::pow(($grey->x - 0.04f) as float64, 1.0 / 2.2) as float32;
+    assert($mid > 0.4999f && $mid < 0.5001f, 'past the toe the offset is 0.04');
+}
+
+function shownThrough(const ToneMap& $map, const ToneLook& $look, Vec4 $display) : Vec3
+{
+    Vec4 $scene = sceneBackground($display, $map, $look);
+    Vec3 $out = toneCurveApply($map, $look, Vec3($scene->x, $scene->y, $scene->z));
+    return Vec3(
+        std::math::pow($out->x as float64, 1.0 / 2.2) as float32,
+        std::math::pow($out->y as float64, 1.0 / 2.2) as float32,
+        std::math::pow($out->z as float64, 1.0 / 2.2) as float32
+    );
+}
+
+function nearRgb(Vec3 $a, Vec4 $b, float64 $eps) : bool
+{
+    return near($a->x as float64, $b->x as float64, $eps)
+        && near($a->y as float64, $b->y as float64, $eps)
+        && near($a->z as float64, $b->z as float64, $eps);
+}
+
+function clearRoundTrips(ToneCurve $curve) : bool
+{
+    Vec4 $dark = Vec4(0.05f, 0.05f, 0.06f, 1.0f);
+    Vec4 $sky = Vec4(0.45f, 0.62f, 0.82f, 1.0f);
+    ToneMap $map = ToneMap();
+    $map->curve = $curve;
+    ToneLook $look = ToneLook($map);
+    return nearRgb(shownThrough($map, $look, $dark), $dark, 0.001)
+        && nearRgb(shownThrough($map, $look, $sky), $sky, 0.001);
+}
+
+test scene_background_round_trips_through_every_curve
+{
+    assert(clearRoundTrips(ToneCurve::aces), 'aces');
+    assert(clearRoundTrips(ToneCurve::neutral), 'neutral');
+    assert(clearRoundTrips(ToneCurve::reinhard), 'reinhard');
+    assert(clearRoundTrips(ToneCurve::filmic), 'filmic');
+}
+
+test curves_are_listed_in_index_order
+{
+    array<ToneCurve> $curves = toneCurves();
+    assert($curves->count() == 4, 'four curves');
+    int32 $i = 0;
+    foreach ($curves as $curve) {
+        assert($curve->index() == $i, 'index is the list position');
+        string $word = $curve->word();
+        ToneCurve $named = guard toneCurveNamed($word);
+        assert($named == $curve, 'the word names the curve');
+        $i = $i + 1;
+    }
+    string $aces = ToneCurve::aces->program(false);
+    string $acesLocal = ToneCurve::aces->program(true);
+    string $neutral = ToneCurve::neutral->program(true);
+    assert($aces == 'tonemap' && $acesLocal == 'tonemap+local', 'aces is the default variant');
+    assert($neutral == 'tonemap+neutral_local', 'a combined variant');
+    assert(toneCurveNamed('bogus') == null, 'unknown word');
+}
+
+test aces_pre_exposure_keeps_middle_grey
+{
+    ToneMap $aces = ToneMap();
+    ToneMap $neutral = neutralMap();
+    Vec3 $grey = Vec3(0.18f, 0.18f, 0.18f);
+    Vec3 $a = toneCurveApply($aces, ToneLook($aces), $grey);
+    Vec3 $n = toneCurveApply($neutral, ToneLook($neutral), $grey);
+    assert(near($n->x as float64, 0.14, 0.0001), 'neutral shows grey at 0.14');
+    assert(near($a->x as float64, $n->x as float64, 0.002), 'aces lands grey where neutral does');
+    assert(near($a->x as float64, $a->z as float64, 0.0005), 'grey stays grey');
+}
+
+test aces_matrices_keep_grey
+{
+    ColorVector $in = acesInput() * ColorVector(1.0, 1.0, 1.0);
+    ColorVector $out = acesOutput() * ColorVector(1.0, 1.0, 1.0);
+    assert(near($in->x, 1.0, 0.0001) && near($in->y, 1.0, 0.0001) && near($in->z, 1.0, 0.0001), 'input rows sum to one');
+    assert(near($out->x, 1.0, 0.0001) && near($out->y, 1.0, 0.0001) && near($out->z, 1.0, 0.0001), 'output rows sum to one');
+}
+
+test aces_is_the_default_and_neutral_the_legacy_frame
+{
+    ToneMap $map = ToneMap();
+    assert($map->curve == ToneCurve::aces, 'aces by default');
+    Exposure $exposure = Exposure();
+    ToneLook $look = ToneLook($map);
+    ToneMapUniforms $u = toneMapUniforms($map, $exposure, $look, 2560, 1440, 5.0f, 0.0f, 0.016f, false);
+    assert($u->exposure->x == 0.0f, 'zero EV');
+    assert($u->exposure->y == 0.0f, 'no adapted EV');
+    assert($u->exposure->z == 0.0f, 'no local operator');
+    assert($u->exposure->w == $map->preExposure, 'aces pre-exposure');
+    assert($u->size->x == 320.0f && $u->size->y == 180.0f, 'luma an eighth');
+    ToneMap $legacy = neutralMap();
+    ToneMapUniforms $old = toneMapUniforms($legacy, $exposure, ToneLook($legacy), 2560, 1440, 5.0f, 0.0f, 0.016f, false);
+    assert($old->exposure->w == 1.0f, 'neutral takes its input as exposed');
+    ToneMap $filmic = ToneMap();
+    $filmic->curve = ToneCurve::filmic;
+    assert($filmic->lookChanged($map), 'curve is a look change');
+    ToneMap $pre = ToneMap();
+    $pre->preExposure = 1.5f;
+    assert($pre->lookChanged($map), 'pre-exposure is a look change');
+    ToneMap $local = ToneMap();
+    $local->local = true;
+    assert(!$local->lookChanged($map), 'the local switch rebuilds no matrix');
+}
+
+test auto_exposure_uniforms_carry_each_value_once
+{
+    ToneMap $map = ToneMap();
+    Exposure $exposure = Exposure();
+    $exposure->auto = true;
+    $exposure->compensation = -1.5f;
+    $exposure->strength = 0.4f;
+    $exposure->minEv = -3.0f;
+    $exposure->maxEv = 3.0f;
+    $exposure->highlight = 4.0f;
+    $exposure->highlightWeight = 0.25f;
+    ToneLook $look = ToneLook($map);
+    ToneMapUniforms $u = toneMapUniforms($map, $exposure, $look, 2560, 1440, 5.0f, 0.3f, 0.016f, true);
+    // the meter reads the compensation and the key where the resolve does
+    assert($u->exposure->x == -1.5f && $u->exposure->y == 1.0f, 'compensation, adapted');
+    assert($u->local->x == std::math::log2(0.18f as float64) as float32, 'key');
+    assert($u->adapt->x == 0.4f && $u->adapt->y == -3.0f && $u->adapt->z == 3.0f, 'strength, range');
+    assert($u->adapt->w == std::math::log2(std::math::PI_F32 as float64) as float32, 'log2 reference');
+    assert($u->meter->x == 4.0f && $u->meter->y == 0.25f, 'highlight');
+    assert($u->meter->z == 5.0f && $u->meter->w == 0.3f, 'ground light, probe blend');
+    assert($u->history->z == 1.0f, 'history kept');
+    assert($exposure->reference == std::math::PI_F32, 'reference is pi');
+}
+
+test tone_stages_read_what_the_stages_before_left
+{
+    ToneMap $map = ToneMap();
+    ToneMapUniforms $u = toneMapUniforms($map, Exposure(), ToneLook($map), 64, 32, 0.0f, 0.0f, 0.0f, false);
+    TextureRef $scene = TextureRef('scene', 64, 32, TextureOptions());
+    ToneMapData $data = ToneMapData($u, $scene);
+    assert($data->image(ToneImage::scene) != null, 'scene is there from the start');
+    assert($data->image(ToneImage::luma) == null && $data->image(ToneImage::base) == null, 'nothing ran yet');
+    $data->put(ToneImage::coarse, TextureRef('coarse', 64, 32, TextureOptions()));
+    $data->put(ToneImage::base, TextureRef('base.x', 64, 32, TextureOptions()));
+    $data->put(ToneImage::base, TextureRef('base.y', 64, 32, TextureOptions()));
+    TextureRef $coarse = guard $data->image(ToneImage::coarse);
+    TextureRef $base = guard $data->base;
+    assert($coarse->name == 'coarse', 'coarse');
+    assert($base->name == 'base.y', 'the last write wins');
+    assert($data->grid == null && $data->stats == null, 'other images untouched');
+}

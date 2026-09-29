@@ -80,6 +80,7 @@ public class Device : DeviceProtocol
     public GpuProfiler $gpuProfiler;
     internal GpuCounts $counts;
     internal DeferredCache $deferred;
+    internal GpuShaders $gpuShaders;
     internal BakedShaderCache $sceneShaders;
 
     public constructor()
@@ -147,6 +148,7 @@ public class Device : DeviceProtocol
         $this->gpuProfiler = GpuProfiler();
         $this->counts = GpuCounts();
         $this->deferred = DeferredCache();
+        $this->gpuShaders = GpuShaders();
         $this->sceneShaders = BakedShaderCache();
     }
 
@@ -703,14 +705,31 @@ public class Device : DeviceProtocol
     public function createBuffer(const BufferDesc& $desc) : result<BufferHandle, DeviceError>
     {
         assert($this->logical->handle != 0, 'createBuffer before initialize');
+        bool $readback = ($desc->usage & BUFFER_READBACK) != 0;
+        uint32 $memory = vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        if ($readback) {
+            $memory = vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        }
+
         BufferHandle $handle = guard vkCreateBoundBuffer(
             $this,
             $desc->bytes,
             vkBufferUsage($desc->usage),
-            vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+            $memory
         ) else ($e) {
             return .error($e);
         }
+        if ($readback) {
+            ptr<uint8> $mapped = null;
+            guard vkCheck(
+                vk::MapMemory($this->logical, $handle->memory, 0 as uint64, vk::WHOLE_SIZE, 0, &$mapped),
+                'MapMemory'
+            ) else ($e) {
+                return .error($e);
+            }
+            $handle->mapped = $mapped;
+        }
+
         vkNoteAlloc($this, $handle->bytes);
         return .ok($handle);
     }
@@ -772,6 +791,82 @@ public class Device : DeviceProtocol
         vkOneShotCopy($this, $staging, $handle, $offset, $bytes);
         vk::DestroyBuffer($this->logical, $staging->buffer, null);
         vk::FreeMemory($this->logical, $staging->memory, null);
+    }
+
+    public function readMapped(Buffer $buffer, ptr<uint8> $dst, uint64 $bytes) : void
+    {
+        assert($buffer->handle->mapped:$ != null, 'vulkan: readMapped needs BUFFER_READBACK');
+        mem::copy<uint8>($dst, $buffer->handle->mapped, $bytes);
+    }
+
+    public function readbackBuffer(Buffer $buffer, uint64 $offset, uint64 $bytes) : result<array<uint8>, DeviceError>
+    {
+        assert(!$this->encoderOpen, 'readbackBuffer with an open encoder');
+        assert(!$this->inFrame, 'readbackBuffer inside a frame');
+        $this->waitIdle();
+        array<uint8> $out = pixelsFilled($bytes);
+        if ($bytes == 0) {
+            return .ok($out);
+        }
+
+        BufferHandle $staging = guard vkCreateBoundBuffer(
+            $this,
+            $bytes,
+            vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT
+        ) else ($e) {
+            return .error($e);
+        }
+
+        vkOneShotReadback($this, $buffer->handle, $offset, $staging, $bytes);
+        ptr<uint8> $mapped = null;
+        guard vkCheck(
+            vk::MapMemory($this->logical, $staging->memory, 0 as uint64, vk::WHOLE_SIZE, 0, &$mapped),
+            'MapMemory'
+        ) else ($e) {
+            vk::DestroyBuffer($this->logical, $staging->buffer, null);
+            vk::FreeMemory($this->logical, $staging->memory, null);
+            return .error($e);
+        }
+
+        mem::copy<uint8>(ptr<uint8>(&$out[0]), $mapped, $bytes);
+        vk::UnmapMemory($this->logical, $staging->memory);
+        vk::DestroyBuffer($this->logical, $staging->buffer, null);
+        vk::FreeMemory($this->logical, $staging->memory, null);
+        return .ok($out);
+    }
+
+    public function fillBuffer(Buffer $buffer, uint64 $offset, uint64 $bytes, uint32 $value) : void
+    {
+        assert($this->inFrame, 'fillBuffer outside beginFrame');
+        assert(!$this->encoderOpen, 'fillBuffer with an open encoder');
+        assert(($offset % 4) == 0 && ($bytes % 4) == 0, 'fillBuffer: offset and size are multiples of 4');
+        if ($bytes == 0) {
+            return;
+        }
+
+        vk::CommandBuffer $cmd = $this->currentCmd();
+        vkTransferOpen($cmd);
+        vk::CmdFillBuffer($cmd, $buffer->handle->buffer, $offset, $bytes, $value);
+        vkTransferClose($cmd);
+    }
+
+    public function copyBuffer(Buffer $src, uint64 $srcOffset, Buffer $dst, uint64 $dstOffset, uint64 $bytes) : void
+    {
+        assert($this->inFrame, 'copyBuffer outside beginFrame');
+        assert(!$this->encoderOpen, 'copyBuffer with an open encoder');
+        if ($bytes == 0) {
+            return;
+        }
+
+        vk::CommandBuffer $cmd = $this->currentCmd();
+        vkTransferOpen($cmd);
+        vk::BufferCopy $region = vk::BufferCopy();
+        $region->srcOffset = $srcOffset;
+        $region->dstOffset = $dstOffset;
+        $region->size = $bytes;
+        vk::CmdCopyBuffer($cmd, $src->handle->buffer, $dst->handle->buffer, 1, &$region);
+        vkTransferClose($cmd);
     }
 
     public function createTexture(const TextureDesc& $desc) : result<TextureHandle, DeviceError>
@@ -967,6 +1062,7 @@ public class Device : DeviceProtocol
     public function shutdown() : void
     {
         $this->deferred->drop();
+        $this->gpuShaders->drop();
         $this->sceneShaders->drop();
         // headless construct never loaded vk; destroy stubs SIGSEGV
         if ($this->instance->handle == 0 && $this->logical->handle == 0) {

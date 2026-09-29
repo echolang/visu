@@ -2,7 +2,9 @@
  * Named actions bound to a key, a key chord, a mouse button, or a virtual click (press then release without travelling far).
  * A matching handle consumes the signal (`Flow::stop`).
  * A plain `.key` fires only while no Control, Alt or Super is held (Shift is allowed), so `S` and
- * `Cmd+S` are two actions. A chord matches its modifiers exactly.
+ * `Cmd+S` are two actions. A chord matches its modifiers exactly. A `.clickWith` matches the
+ * click's modifiers exactly and fires beside the plain `.click`, not instead of it: a Shift+click
+ * is still a click, and the reader of the modified one `take`s both when it acts.
  * Analog (composite WASD, virtual stick, control schemes) is the next layer; putting `evaluate(const InputHub&)` on this type currently trips an Echo `size<T>` instantiation limit.
  */
 
@@ -17,6 +19,11 @@ public enum Binding
     case button(MouseButton $code);
     case click;
 
+    /**
+     * A click with exactly these modifiers held (`MOD_SHIFT`, ...).
+     */
+    case clickWith(int32 $mods);
+
     public const function label() : string
     {
         return match ($this) {
@@ -24,6 +31,7 @@ public enum Binding
             .chord($code, $mods) => "key {$code->value()} mods {$mods}",
             .button($code) => "button {$code->value()}",
             .click => 'click',
+            .clickWith($mods) => "click mods {$mods}",
         };
     }
 }
@@ -34,6 +42,11 @@ public class ActionMap
     private map<int32, string> $keyAction;
     private map<int32, string> $buttons;
     private string? $click;
+
+    /**
+     * Modified clicks by their modifier set.
+     */
+    private map<int32, string> $clicks;
     private map<string, bool> $didPress;
     private map<string, bool> $didRelease;
 
@@ -51,6 +64,7 @@ public class ActionMap
         $this->keyAction = map<int32, string>();
         $this->buttons = map<int32, string>();
         $this->click = null;
+        $this->clicks = map<int32, string>();
         $this->didPress = map<string, bool>();
         $this->didRelease = map<string, bool>();
         $this->framePress = map<string, bool>();
@@ -65,6 +79,7 @@ public class ActionMap
             .chord($code, $mods) => $this->bindKey($action, $code, $mods & MOD_CHORD_MASK),
             .button($code) => $this->bindButton($action, $code),
             .click => $this->bindClick($action),
+            .clickWith($mods) => $this->bindModifiedClick($action, $mods & MOD_CHORD_MASK),
         };
     }
 
@@ -247,11 +262,27 @@ public class ActionMap
 
     public function handle(const ClickSignal& $signal) : Flow
     {
-        string $action = guard $this->click else {
+        bool $hit = false;
+        int32 $mods = $signal->mods & MOD_CHORD_MASK;
+
+        if ($mods != 0 && $this->clicks->has($mods)) {
+            string $modified = $this->clicks->get($mods);
+            $this->didRelease[$modified] = true;
+            $this->frameRelease[$modified] = true;
+            $hit = true;
+        }
+
+        if ($this->click != null) {
+            string $action = guard $this->click;
+            $this->didRelease[$action] = true;
+            $this->frameRelease[$action] = true;
+            $hit = true;
+        }
+
+        if (!$hit) {
             return .proceed;
         }
-        $this->didRelease[$action] = true;
-        $this->frameRelease[$action] = true;
+
         return .stop;
     }
 
@@ -289,6 +320,16 @@ public class ActionMap
         }
 
         return .error(.taken(.click, $existing));
+    }
+
+    private function bindModifiedClick(string $action, int32 $mods) : status<InputError>
+    {
+        if ($this->clicks->has($mods)) {
+            return .error(.taken(.clickWith($mods), $this->clicks->get($mods)));
+        }
+
+        $this->clicks[$mods] = $action;
+        return .ok;
     }
 
     private function note(string $action, KeyPhase $phase) : void

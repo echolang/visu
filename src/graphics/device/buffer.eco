@@ -26,7 +26,7 @@ public class Buffer : GpuObject
         $this->device->counts->noteBufferCreated();
     }
 
-    public constructor(Device $device, BufferUsage $usage, const array<float32>& $data)
+    public constructor(Device $device, uint32 $usage, const array<float32>& $data)
     {
         usize $n = $data->count();
         assert($n > 0, 'buffer data');
@@ -43,7 +43,7 @@ public class Buffer : GpuObject
         $device->uploadBuffer($handle, 0 as uint64, ptr<const uint8>($src:$), $bytes);
     }
 
-    public constructor(Device $device, BufferUsage $usage, ptr<const uint8> $src, uint64 $bytes)
+    public constructor(Device $device, uint32 $usage, ptr<const uint8> $src, uint64 $bytes)
     {
         assert($bytes > 0, 'buffer data');
         BufferDesc $desc = BufferDesc($usage, $bytes);
@@ -78,4 +78,17 @@ public class Buffer : GpuObject
         assert(!$this->dead, 'upload on destroyed buffer');
         $this->device->uploadBuffer($this->handle, $offset, $src, $bytes);
     }
+}
+
+/**
+ * Destroys an owned buffer if there is one; always returns null.
+ */
+internal function dropBuffer(Buffer? $buffer) : Buffer?
+{
+    Buffer $held = guard $buffer else {
+        return null;
+    }
+
+    $held->destroy();
+    return null;
 }

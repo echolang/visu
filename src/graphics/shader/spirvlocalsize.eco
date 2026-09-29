@@ -24,13 +24,13 @@ public struct WorkgroupSize
 public function spirvLocalSize(const string& $spv) : WorkgroupSize?
 {
     usize $n = $spv->size();
-    if ($n < 20 || spirvWord($spv, 0) != SPIRV_MAGIC) {
+    if ($n < 20 || u32le($spv, 0) != SPIRV_MAGIC) {
         return null;
     }
 
     usize $at = 20;
     while ($at + 4 <= $n) {
-        uint32 $head = spirvWord($spv, $at);
+        uint32 $head = u32le($spv, $at);
         uint32 $words = $head >> 16;
         uint32 $op = $head & 0xFFFF;
         if ($words == 0) {
@@ -42,11 +42,11 @@ public function spirvLocalSize(const string& $spv) : WorkgroupSize?
             return null;
         }
 
-        if ($op == SPIRV_OP_EXECUTION_MODE && $words >= 6 && spirvWord($spv, $at + 8) == SPIRV_MODE_LOCAL_SIZE) {
+        if ($op == SPIRV_OP_EXECUTION_MODE && $words >= 6 && u32le($spv, $at + 8) == SPIRV_MODE_LOCAL_SIZE) {
             return WorkgroupSize(
-                $x: spirvWord($spv, $at + 12),
-                $y: spirvWord($spv, $at + 16),
-                $z: spirvWord($spv, $at + 20)
+                $x: u32le($spv, $at + 12),
+                $y: u32le($spv, $at + 16),
+                $z: u32le($spv, $at + 20)
             );
         }
 
@@ -56,7 +56,10 @@ public function spirvLocalSize(const string& $spv) : WorkgroupSize?
     return null;
 }
 
-internal function spirvWord(const string& $s, usize $off) : uint32
+/**
+ * A little-endian uint32 at byte `$off` of `$s`: SPIR-V words, cooked model bytes.
+ */
+internal function u32le(const string& $s, usize $off) : uint32
 {
     return ($s->byte($off) as uint32)
         | (($s->byte($off + 1) as uint32) << 8)

@@ -1,0 +1,169 @@
+#version 450
+
+// visu::graphics::ShadowAtlas, allocation: miss k (coarse mips first) takes candidate k (never
+// used, then stale, then last frame's), up to the frame's dirty budget. A page taken from
+// another owner leaves that owner's entry empty (only if it still points here). The page's
+// entry, its dirty record, the six planes the scene culls its casters with, and the clear draw
+// are written here
+layout(local_size_x = 64) in;
+
+#include "visu/vsmcull.glsl"
+#include "visu/scene.glsl"
+
+layout(std430, set = 2, binding = 0) readonly buffer LightTableBuffer {
+    LightGpu lights[];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer Generations {
+    uint gens[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer Misses {
+    uint misses[];
+};
+
+layout(std430, set = 2, binding = 3) readonly buffer Candidates {
+    uint candidates[];
+};
+
+layout(std430, set = 2, binding = 4) buffer Physical {
+    uvec2 phys[];
+};
+
+layout(std430, set = 2, binding = 5) buffer PageTable {
+    uint table[];
+};
+
+layout(std430, set = 2, binding = 6) writeonly buffer Dirty {
+    // physical page, light slot, page index
+    uvec4 dirty[];
+};
+
+layout(std430, set = 2, binding = 7) buffer ViewsAndState {
+    uint words[];
+};
+
+// the views sit first, SceneView rows of SCENE_VIEW_WORDS; the state words follow them
+uint state_at(uint i)
+{
+    return u_vsm_counts.z * SCENE_VIEW_WORDS + i;
+}
+
+void write_plane(uint k, uint i, vec3 normal, float dist)
+{
+    float len = max(length(normal), 1e-6);
+    uint at = k * SCENE_VIEW_WORDS + i * 4u;
+    words[at] = floatBitsToUint(normal.x / len);
+    words[at + 1u] = floatBitsToUint(normal.y / len);
+    words[at + 2u] = floatBitsToUint(normal.z / len);
+    words[at + 3u] = floatBitsToUint(dist / len);
+}
+
+void main()
+{
+    uint k = gl_GlobalInvocationID.x;
+    uint budget = u_vsm_counts.z;
+    if (k >= budget) {
+        return;
+    }
+
+    uint missTotal = 0u;
+    for (uint m = 0u; m < VSM_MIPS; m++) {
+        missTotal += min(words[state_at(VSM_STATE_MISSES + m)], VSM_MISS_MAX);
+    }
+    uint candTotal = 0u;
+    for (uint l = 0u; l < 3u; l++) {
+        candTotal += words[state_at(VSM_STATE_CANDIDATES + l)];
+    }
+    uint taken = min(min(missTotal, budget), candTotal);
+    if (k == 0u) {
+        // keep the pool's demand (pages kept this frame plus the misses) near 60 to 90% of it
+        uint demand = (VSM_PAGES - candTotal) + missTotal;
+        uint bias = words[state_at(VSM_STATE_BIAS)];
+        if (demand * 10u > VSM_PAGES * 9u) {
+            bias = min(bias + 16u, 1024u);
+        } else if (demand * 10u < VSM_PAGES * 6u && bias > 0u) {
+            bias = bias - min(bias, 4u);
+        }
+        words[state_at(VSM_STATE_BIAS)] = bias;
+        words[state_at(VSM_STATE_CLEAR)] = 6u;
+        words[state_at(VSM_STATE_CLEAR + 1u)] = taken;
+        words[state_at(VSM_STATE_CLEAR + 2u)] = 0u;
+        words[state_at(VSM_STATE_CLEAR + 3u)] = 0u;
+        words[state_at(VSM_STATE_DIRTY)] = taken;
+        words[state_at(VSM_STATE_COPY)] = taken * 17u;
+        words[state_at(VSM_STATE_COPY + 1u)] = 1u;
+        words[state_at(VSM_STATE_COPY + 2u)] = 1u;
+    }
+
+    if (k >= taken) {
+        // an empty view: the scene cull skips it
+        words[k * SCENE_VIEW_WORDS + SCENE_VIEW_META] = SCENE_PASS_NONE;
+        return;
+    }
+
+    // miss k, coarsest mip first
+    uint key = VSM_NONE;
+    uint rest = k;
+    for (int m = int(VSM_MIPS) - 1; m >= 0; m--) {
+        uint count = min(words[state_at(VSM_STATE_MISSES + uint(m))], VSM_MISS_MAX);
+        if (rest < count) {
+            key = misses[uint(m) * VSM_MISS_MAX + rest];
+            break;
+        }
+        rest -= count;
+    }
+
+    // candidate k, never used first
+    uint p = 0u;
+    rest = k;
+    for (uint l = 0u; l < 3u; l++) {
+        uint count = words[state_at(VSM_STATE_CANDIDATES + l)];
+        if (rest < count) {
+            p = candidates[l * VSM_PAGES + rest];
+            break;
+        }
+        rest -= count;
+    }
+
+    uint owner = phys[p].x;
+    if (owner != VSM_NONE) {
+        uint entry = table[owner];
+        if (entry != VSM_NONE && (entry & 0xFFFFu) == p) {
+            atomicCompSwap(table[owner], entry, VSM_NONE);
+        }
+    }
+
+    uint slot = key / VSM_LIGHT_PAGES;
+    uint page = key - slot * VSM_LIGHT_PAGES;
+    phys[p] = uvec2(key, u_vsm_counts.y);
+    table[key] = ((gens[slot] & VSM_GEN_MASK) << 16u) | p;
+    dirty[k] = uvec4(p, slot, page, 0u);
+
+    // the page's frustum, guard included: four sides through the light, near and far
+    uint face;
+    uint mip;
+    uvec2 xy;
+    vsm_page_of(page, face, mip, xy);
+    vec4 rect = vsm_page_rect(mip, xy);
+    vec3 n;
+    vec3 r;
+    vec3 u;
+    vsm_basis(face, n, r, u);
+    vec4 pr = lights[slot].position_radius;
+    vec3 L = pr.xyz;
+    vec3 left = r - rect.x * n;
+    vec3 right = rect.z * n - r;
+    vec3 bottom = u - rect.y * n;
+    vec3 top = rect.w * n - u;
+    write_plane(k, 0u, left, -dot(left, L));
+    write_plane(k, 1u, right, -dot(right, L));
+    write_plane(k, 2u, top, -dot(top, L));
+    write_plane(k, 3u, bottom, -dot(bottom, L));
+    write_plane(k, 4u, n, -dot(n, L) - VSM_NEAR);
+    write_plane(k, 5u, -n, dot(n, L) + pr.w);
+    words[k * SCENE_VIEW_WORDS + SCENE_VIEW_META] = 0u;
+    words[k * SCENE_VIEW_WORDS + SCENE_VIEW_META + 1u] = 0u;
+    words[k * SCENE_VIEW_WORDS + SCENE_VIEW_META + 2u] = 0u;
+    words[k * SCENE_VIEW_WORDS + SCENE_VIEW_META + 3u] = 0u;
+}

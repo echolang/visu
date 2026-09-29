@@ -1,0 +1,97 @@
+/**
+ * The `tonemap` and `exposure` grammars and their edits.
+ */
+
+use visu::console::{ExposureEdit, ToneMapEdit, applyExposure, applyToneMap, parseExposure, parseToneMap};
+use visu::graphics::{Exposure, ToneCurve, ToneMap};
+
+function toneWords(const string& $line) : array<string>
+{
+    str::parts $split = str::split($line, ' ');
+    return $split->owned();
+}
+
+function toneApplied(const string& $line) : ToneMap
+{
+    ToneMap $map = ToneMap();
+    applyToneMap($map, parseToneMap(toneWords($line)));
+    return $map;
+}
+
+function toneInvalid(const string& $line) : bool
+{
+    return match (parseToneMap(toneWords($line))) {
+        ToneMapEdit::invalid => true,
+        else => false,
+    };
+}
+
+function exposureApplied(const string& $line) : Exposure
+{
+    Exposure $exposure = Exposure();
+    applyExposure($exposure, parseExposure(toneWords($line)));
+    return $exposure;
+}
+
+function exposureInvalid(const string& $line) : bool
+{
+    return match (parseExposure(toneWords($line))) {
+        ExposureEdit::invalid => true,
+        else => false,
+    };
+}
+
+test tone_map_console_edits
+{
+    assert(toneApplied('tonemap local on')->local, 'local on');
+    assert(!toneApplied('tonemap local off')->local, 'local off');
+    assert(toneApplied('tonemap curve filmic')->curve == ToneCurve::filmic, 'filmic');
+    assert(toneApplied('tonemap curve neutral')->curve == ToneCurve::neutral, 'neutral');
+    assert(toneApplied('tonemap curve reinhard')->curve == ToneCurve::reinhard, 'reinhard');
+    assert(toneApplied('tonemap curve aces')->curve == ToneCurve::aces, 'aces');
+    assert(toneApplied('tonemap preexposure 1.5')->preExposure == 1.5f, 'pre-exposure');
+    assert(toneApplied('tonemap contrast high 0.6')->contrastHigh == 0.6f, 'contrast high');
+    assert(toneApplied('tonemap contrast low 0.9')->contrastLow == 0.9f, 'contrast low');
+    assert(toneApplied('tonemap detail 1.5')->detail == 1.5f, 'detail');
+    assert(toneApplied('tonemap mix 0.25')->bilateral == 0.25f, 'bilateral share');
+    assert(toneApplied('tonemap whitepoint 8')->whitePoint == 8.0f, 'white point');
+    assert(toneApplied('tonemap balance 1 0.9 0.8')->white->z == 0.8f, 'white balance');
+    assert(toneApplied('tonemap balance off')->white->y == 1.0f, 'balance off');
+    assert(toneApplied('tonemap red 0.72')->redX == 0.72f, 'red primary');
+    assert(!toneApplied('tonemap reset')->local, 'reset');
+}
+
+test tone_map_console_refuses_nonsense
+{
+    assert(toneInvalid('tonemap local maybe'), 'local word');
+    assert(toneInvalid('tonemap curve bogus'), 'unknown curve');
+    assert(toneInvalid('tonemap preexposure 9'), 'pre-exposure cap');
+    assert(toneInvalid('tonemap contrast mid 1'), 'contrast side');
+    assert(toneInvalid('tonemap mix 2'), 'mix at most one');
+    assert(toneInvalid('tonemap wide 40'), 'wide cap keeps the loop bounded');
+    assert(toneInvalid('tonemap balance 1 0 1'), 'no zero channel');
+    assert(toneInvalid('tonemap bogus 1'), 'unknown verb');
+    assert(toneInvalid('tonemap detail'), 'missing value');
+}
+
+test exposure_console_edits
+{
+    assert(exposureApplied('exposure auto')->auto, 'auto');
+    assert(!exposureApplied('exposure fixed')->auto, 'fixed');
+    assert(exposureApplied('exposure ev -1.5')->compensation == -1.5f, 'compensation');
+    assert(exposureApplied('exposure strength 0.4')->strength == 0.4f, 'strength');
+    assert(exposureApplied('exposure max 3')->maxEv == 3.0f, 'max');
+    Exposure $speed = exposureApplied('exposure speed 2 4');
+    assert($speed->speedUp == 2.0f && $speed->speedDown == 4.0f, 'speed');
+    Exposure $high = exposureApplied('exposure highlight 4 0.25');
+    assert($high->highlight == 4.0f && $high->highlightWeight == 0.25f, 'highlight');
+}
+
+test exposure_console_refuses_nonsense
+{
+    assert(exposureInvalid('exposure strength 2'), 'strength at most one');
+    assert(exposureInvalid('exposure speed 0 1'), 'no zero speed');
+    assert(exposureInvalid('exposure reference 0'), 'reference above zero');
+    assert(exposureInvalid('exposure highlight 4'), 'weight missing');
+    assert(exposureInvalid('exposure bogus'), 'unknown verb');
+}

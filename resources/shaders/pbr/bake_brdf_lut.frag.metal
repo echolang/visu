@@ -101,7 +101,7 @@ float2 integrate_brdf(thread const float& NdotV, thread const float& roughness)
             float param_8 = roughness;
             float G = geometry_smith_ibl(param_5, param_6, param_7, param_8);
             float G_Vis = (G * VdotH) / (NdotH * NdotV);
-            float Fc = powr(1.0 - VdotH, 5.0);
+            float Fc = pow(1.0 - VdotH, 5.0);
             A += ((1.0 - Fc) * G_Vis);
             B += (Fc * G_Vis);
         }

@@ -28,7 +28,7 @@ test sky_same_atmosphere_ignores_direction
 
 test sky_uniforms_pack
 {
-    assert(mem::size<SkyUniforms>() == 144, 'std140 size');
+    assert(mem::size<SkyUniforms>() == 160, 'std140 size');
     Sky $sky = Sky();
     $sky->direction = Vec3(0.0f, -2.0f, 0.0f);
     $sky->sunIntensity = 4.0f;
@@ -42,6 +42,30 @@ test sky_uniforms_pack
     assert($bake->origin->w == 0.0f, 'disk off');
     assert($bake->moon->w == 0.0f, 'no moon in the bake');
     assert($bake->moonColor->w == 0.0f, 'no moon disc in the bake');
+}
+
+test sky_ozone_and_the_legacy_march
+{
+    Sky $sky = Sky();
+    SkyUniforms $u = skyUniforms($sky, Vec3(0.0f, 300.0f, 0.0f), false, 16.0f, 8.0f);
+    assert($u->ozone->y > $u->ozone->x && $u->ozone->y > $u->ozone->z, 'ozone takes the green');
+    assert($u->ozone->w == 1.0f, 'the midpoint march');
+    $sky->legacy = true;
+    SkyUniforms $old = skyUniforms($sky, Vec3(0.0f, 300.0f, 0.0f), false, 16.0f, 8.0f);
+    assert($old->ozone->y == 0.0f && $old->ozone->w == 0.0f, 'the legacy sky: no ozone, the uniform march');
+    Sky $fresh = Sky();
+    assert(!$fresh->sameAtmosphere($sky), 'a legacy sky rebakes the probes');
+}
+
+test sky_ozone_pinks_the_low_sun
+{
+    Sky $sky = Sky();
+    $sky->direction = Vec3(0.0f, -0.03f, -1.0f);
+    DirectionalLight $now = $sky->sunLight(300.0f);
+    $sky->ozoneScale = 0.0f;
+    DirectionalLight $bare = $sky->sunLight(300.0f);
+    // the sun's colour is normalised to its brightest channel, red, so green is what moves
+    assert($now->color->y < $bare->color->y, 'less green through the ozone');
 }
 
 test sky_uniforms_pack_moon

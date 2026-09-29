@@ -1,21 +1,20 @@
 /**
- * Packs `PointLight` entities and console lamps into `PointLightFrame` before
- * the deferred renderer builds its passes. The tile grid and the shadow faces
- * are reserved storage: the frame resets counts and fills.
+ * Point lights on the GPU: a `PointLight` takes a `LightTable` row when it is attached and
+ * gives it back when it goes, a moved or edited light rewrites its row, and each frame one
+ * pass scatters the table and culls it into clusters (`LightClusterData`). Nothing walks the
+ * lights per frame. Console lamps (`light add`) are rows too.
  */
 
 namespace visu::system;
 
 use visu::components::PointLight;
-use visu::ecs::{Entities, Schedule, System};
+use visu::ecs::{Entities, Entity, EntityHook, Schedule, System};
 use visu::geo::Transform;
 use visu::graphics::{
-    CameraData, Device, POINT_SHADOW_LAYERS, POINT_SHADOW_RES, POINT_TILE_STRIDE, PointCandidate,
-    PointLightFrame, PointList, PointPack, RenderContext, TEXTURE_RENDER_TARGET, TEXTURE_SAMPLED,
-    TEXTURE_TRANSFER_DST, Texture, TextureDesc, pointConsider, pointFinish, pointSplat, pointTiles,
-    pointWriteFaces
+    CameraData, Device, LightClusterData, LightCull, LightCullPass, LightGpu, LightTable,
+    POINT_NORMAL_OFFSET, POINT_SHADOW_BIAS, PointLamp, RenderContext, ShadowAtlas
 };
-use visu::math::{Mat4, Vec3, Vec4, length};
+use visu::math::{Mat4, Vec3, Vec4};
 
 public const int32 POINT_DEBUG_MAX = 64;
 
@@ -24,26 +23,34 @@ public class PointLightSystem : System
     public Device $device;
     public bool $debugShadow;
     public int32 $debugCount;
-    private PointCandidate[64] $debug;
-    private PointLightFrame $frame;
-    private array<uint8> $tileBytes;
-    private int32 $tileW;
-    private int32 $tileH;
-    private Texture? $tiles0;
-    private Texture? $tiles1;
-    private Texture? $shadowMap;
 
     /**
-     * The list packed last render, for the `light` console.
+     * The console lamps, in the order of `debugSlots`, so a shadow switch can rewrite their rows.
      */
-    public PointPack $packed;
+    private PointLamp[64] $debug;
+    public LightTable $table;
+    private LightCull $cull;
+
+    /**
+     * The clustered lights' virtual shadow maps.
+     */
+    public ShadowAtlas $atlas;
+    private LightClusterData $clusterData;
+    private LightCullPass $cullPass;
+    private map<Entity, int32> $slotOf;
+    internal array<Entity> $pending;
+    private array<int32> $debugSlots;
+    private EntityHook $attachHook;
+    private EntityHook $detachHook;
+    private EntityHook $moveHook;
+    private EntityHook $changeHook;
 
     public constructor(Device $device)
     {
         $this->device = $device;
         $this->debugShadow = true;
         $this->debugCount = 0;
-        PointCandidate $blank = PointCandidate(
+        PointLamp $blank = PointLamp(
             Vec3(0.0f, 0.0f, 0.0f),
             0.0f,
             Vec3(1.0f, 1.0f, 1.0f),
@@ -51,7 +58,7 @@ public class PointLightSystem : System
             0.05f,
             true
         );
-        PointCandidate[64] $debug;
+        PointLamp[64] $debug;
         int32 $i = 0;
         while ($i < POINT_DEBUG_MAX) {
             $debug[$i] = $blank;
@@ -59,23 +66,89 @@ public class PointLightSystem : System
         }
 
         $this->debug = $debug;
-
-        $this->frame = PointLightFrame();
-        $this->tileBytes = array<uint8>();
-        $this->tileW = 0;
-        $this->tileH = 0;
-        $this->tiles0 = null;
-        $this->tiles1 = null;
-        $this->shadowMap = null;
-        $this->packed = PointPack();
+        $this->table = LightTable($device);
+        $this->cull = LightCull($device, 'lights.main');
+        $this->atlas = ShadowAtlas($device);
+        $this->clusterData = LightClusterData($this->table, $this->cull, $this->atlas);
+        $this->cullPass = LightCullPass('deferred.lightcull', $this->table, $this->cull, $this->atlas);
+        $this->slotOf = map<Entity, int32>();
+        $this->pending = array<Entity>();
+        $this->debugSlots = arr::room<int32>(POINT_DEBUG_MAX as usize);
+        $this->attachHook = EntityHook::none();
+        $this->detachHook = EntityHook::none();
+        $this->moveHook = EntityHook::none();
+        $this->changeHook = EntityHook::none();
     }
 
+    /**
+     * Every light already in the world, and every one attached later, waits for a table row; a
+     * detached light gives its row back at once, and a moved one (`Entities.changed<Transform>`)
+     * or an edited one (`changed<PointLight>`) rewrites its row.
+     */
     public function register(Entities $entities) : void
     {
+        PointLightSystem $sys = $this;
+        $this->attachHook = $entities->onAttach<PointLight>(function(Entities $w, Entity $e, const PointLight& $c) : void {
+            $sys->pending[] = $e;
+        });
+        $this->detachHook = $entities->onDetach<PointLight>(function(Entities $w, Entity $e, const PointLight& $c) : void {
+            $sys->forget($e);
+        });
+        $this->moveHook = $entities->onChange<Transform>(function(Entities $w, Entity $e, const Transform& $t) : void {
+            $sys->relight($w, $e);
+        });
+        $this->changeHook = $entities->onChange<PointLight>(function(Entities $w, Entity $e, const PointLight& $c) : void {
+            $sys->relight($w, $e);
+        });
+        foreach ($entities->view<PointLight>() as $id => &$light) {
+            $this->pending[] = $id;
+        }
     }
 
     public function unregister(Entities $entities) : void
     {
+        $entities->release($this->attachHook);
+        $this->attachHook = EntityHook::none();
+        $entities->release($this->detachHook);
+        $this->detachHook = EntityHook::none();
+        $entities->release($this->moveHook);
+        $this->moveHook = EntityHook::none();
+        $entities->release($this->changeHook);
+        $this->changeHook = EntityHook::none();
+
+        $this->table->clear();
+        $this->cull->destroy();
+        $this->atlas->destroy();
+        $this->slotOf->clear();
+        $this->pending->clear();
+        $this->debugSlots->clear();
+    }
+
+    /**
+     * Rewrite `$e`'s row from its component and transform: a changed colour or radius arrives
+     * through `Entities.changed<PointLight>`, a moved lamp through `changed<Transform>`.
+     */
+    public function relight(Entities $entities, Entity $e) : void
+    {
+        if (!$this->slotOf->has($e)) {
+            return;
+        }
+
+        LightGpu? $row = lightRow($entities, $e);
+        LightGpu $held = guard $row else {
+            return;
+        }
+        $this->table->set($this->slotOf[$e], $held);
+    }
+
+    internal function forget(Entity $e) : void
+    {
+        if (!$this->slotOf->has($e)) {
+            return;
+        }
+
+        $this->table->remove($this->slotOf[$e]);
+        $this->slotOf->remove($e);
     }
 
     public function schedule(Schedule& $schedule) : void
@@ -91,13 +164,19 @@ public class PointLightSystem : System
      * Append a console lamp. Past `POINT_DEBUG_MAX` the add is ignored.
      * Returns false when the list is full.
      */
-    public function debugAdd(PointCandidate $lamp) : bool
+    public function debugAdd(PointLamp $lamp) : bool
     {
         if ($this->debugCount >= POINT_DEBUG_MAX) {
             return false;
         }
 
         $lamp->castShadow = $this->debugShadow;
+        int32 $slot = $this->table->add(lampRow($lamp, $this->debugCount));
+        if ($slot < 0) {
+            return false;
+        }
+
+        $this->debugSlots[] = $slot;
         int32 $at = $this->debugCount;
         $this->debug[$at] = $lamp;
         $this->debugCount = $at + 1;
@@ -106,179 +185,125 @@ public class PointLightSystem : System
 
     public function debugClear() : void
     {
+        foreach ($this->debugSlots as $slot) {
+            $this->table->remove($slot);
+        }
+
+        $this->debugSlots->clear();
         $this->debugCount = 0;
     }
 
     /**
-     * Whether lamps added from the console cast, and the ones already added.
+     * Whether lamps added from the console cast, and the ones already added: their rows are
+     * rewritten.
      */
     public function debugSetShadow(bool $on) : void
     {
         $this->debugShadow = $on;
         int32 $i = 0;
         while ($i < $this->debugCount) {
-            PointCandidate $lamp = $this->debug[$i];
+            PointLamp $lamp = $this->debug[$i];
             $lamp->castShadow = $on;
             $this->debug[$i] = $lamp;
+            $this->table->set($this->debugSlots[$i as usize], lampRow($lamp, $i));
             $i = $i + 1;
         }
     }
 
+    /**
+     * Lights with a table row: the attached ones and the console lamps.
+     */
+    public const function lampCount() : int32
+    {
+        return ($this->slotOf->count() as int32) + $this->debugCount;
+    }
+
+    /**
+     * Rows for the lights attached since last frame, then one pass ahead of every other that
+     * scatters the table and culls it against the camera. O(new lights) on the CPU.
+     */
     public function render(Entities $entities, RenderContext $ctx) : void
     {
         visu::profile::begin('render/pointlights');
-        PointLightFrame $frame = $this->frame;
-        CameraData? $found = $ctx->frame->find<CameraData>();
-        CameraData $cam = guard $found else {
-            $frame->count = 0;
-            $frame->pack = PointPack();
-            $frame->tiles = null;
-            $this->packed = $frame->pack;
-            $ctx->frame->set($frame);
+        foreach ($this->pending as $e) {
+            if ($this->slotOf->has($e)) {
+                continue;
+            }
+
+            LightGpu? $row = lightRow($entities, $e);
+            LightGpu $held = guard $row else {
+                continue;
+            }
+            int32 $slot = $this->table->add($held);
+            if ($slot >= 0) {
+                $this->slotOf[$e] = $slot;
+            }
+        }
+
+        $this->pending->clear();
+        CameraData $cam = guard $ctx->frame->find<CameraData>() else {
             visu::profile::end();
             return;
         }
-        PointList $list = PointList();
-        float32 $alpha = $ctx->compensation;
-        foreach ($entities->view<PointLight>() as $id => &$light) {
-            if (!$entities->has<Transform>($id)) {
-                continue;
-            }
-
-            Transform& $transform = $entities->get<Transform>($id);
-            Mat4 $world = $transform->world($entities, $alpha);
-            Vec3 $pos = ($world * Vec4($light->offset, 1.0f))->xyz();
-            if (!$cam->frustum->contains($pos, $light->radius)) {
-                continue;
-            }
-
-            PointCandidate $lamp = PointCandidate(
-                $pos,
-                $light->radius,
-                $light->color,
-                $light->intensity,
-                $light->sourceRadius,
-                $light->castShadow
-            );
-            pointConsider($list, $lamp, length($pos - $cam->position));
-        }
-
-        int32 $d = 0;
-        while ($d < $this->debugCount) {
-            PointCandidate $lamp = $this->debug[$d];
-            if ($cam->frustum->contains($lamp->position, $lamp->radius)) {
-                pointConsider($list, $lamp, length($lamp->position - $cam->position));
-            }
-
-            $d = $d + 1;
-        }
-
-        PointPack $pack = pointFinish($list);
-        $frame->pack = $pack;
-        $frame->count = $pack->count;
-        $frame->tilesX = pointTiles($cam->resolutionX);
-        $frame->tilesY = pointTiles($cam->resolutionY);
-        if ($pack->shadows > 0) {
-            pointWriteFaces($pack, $frame);
-            $frame->shadowMap = $this->ensureShadow();
-        }
-
-        if ($pack->count > 0 && $frame->tilesX > 0 && $frame->tilesY > 0) {
-            $this->ensureTiles($frame->tilesX, $frame->tilesY);
-            pointSplat($cam, $pack, $this->tileBytes, $frame->tilesX, $frame->tilesY);
-            $frame->tiles = $this->uploadTiles();
-        } else {
-            $frame->tiles = null;
-        }
-
-        $this->packed = $pack;
-        $ctx->frame->set($frame);
+        $this->cullPass->camera = $cam;
+        $ctx->pipeline->add($this->cullPass);
+        $this->clusterData->seconds = visu::runtime::seconds() as float32;
+        $ctx->frame->set($this->clusterData);
         visu::profile::end();
     }
-
-    private function ensureShadow() : Texture
-    {
-        Texture $have = guard $this->shadowMap else {
-            Texture $fresh = pointShadowMap($this->device);
-            $this->shadowMap = $fresh;
-            return $fresh;
-        }
-        return $have;
-    }
-
-    private function ensureTiles(int32 $tilesX, int32 $tilesY) : void
-    {
-        int32 $bytes = $tilesX * $tilesY * POINT_TILE_STRIDE;
-        if ($this->tileBytes->count() != $bytes as usize) {
-            array<uint8> $fresh = array<uint8>();
-            $fresh->reserve($bytes as usize);
-            int32 $i = 0;
-            while ($i < $bytes) {
-                $fresh[] = 0;
-                $i = $i + 1;
-            }
-
-            $this->tileBytes = mv $fresh;
-        }
-
-        if ($this->tileW == $tilesX && $this->tileH == $tilesY && $this->tiles0 != null) {
-            return;
-        }
-
-        $this->tiles0 = dropPointTexture($this->tiles0);
-        $this->tiles1 = dropPointTexture($this->tiles1);
-        int32 $height = $tilesY * POINT_TILE_STRIDE;
-        $this->tiles0 = pointTileTexture($this->device, $tilesX, $height, 0);
-        $this->tiles1 = pointTileTexture($this->device, $tilesX, $height, 1);
-        $this->tileW = $tilesX;
-        $this->tileH = $tilesY;
-    }
-
-    private function uploadTiles() : Texture
-    {
-        uint32 $slot = $this->device->frameSlot() % 2;
-        Texture $tex = guard $this->tiles0 else {
-            return pointTileTexture($this->device, 1, 1, 0);
-        }
-        if ($slot == 1) {
-            Texture $alt = guard $this->tiles1 else {
-                return $tex;
-            }
-            $tex = $alt;
-        }
-
-        uint64 $bytes = $this->tileBytes->count() as uint64;
-        if ($bytes > 0) {
-            $tex->upload(0, ptr<const uint8>(&$this->tileBytes[0]), $bytes, $this->tileW);
-        }
-
-        return $tex;
-    }
 }
 
-internal function pointTileTexture(Device $device, int32 $width, int32 $height, int32 $slot) : Texture
+/**
+ * `$e`'s table row: world position of its offset, colour, source, whether it casts, flicker.
+ * Null without a `PointLight` or a `Transform`.
+ */
+internal function lightRow(Entities $entities, Entity $e) : LightGpu?
 {
-    TextureDesc $desc = TextureDesc($format: .r8, $width: $width, $height: $height);
-    $desc->usage = TEXTURE_SAMPLED | TEXTURE_TRANSFER_DST;
-    $desc->label = "point.tiles.{$slot}";
-    return Texture($device, "point.tiles.{$slot}", $desc);
-}
-
-internal function pointShadowMap(Device $device) : Texture
-{
-    TextureDesc $desc = TextureDesc($format: .depth32f, $width: POINT_SHADOW_RES, $height: POINT_SHADOW_RES);
-    $desc->kind = .array2D;
-    $desc->arrayLength = POINT_SHADOW_LAYERS;
-    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET;
-    $desc->label = 'point.shadow';
-    return Texture($device, 'point.shadow', $desc);
-}
-
-internal function dropPointTexture(Texture? $texture) : Texture?
-{
-    Texture $held = guard $texture else {
+    if (!$entities->valid($e) || !$entities->has<PointLight>($e) || !$entities->has<Transform>($e)) {
         return null;
     }
-    $held->destroy();
-    return null;
+
+    PointLight $light = $entities->get<PointLight>($e);
+    Transform& $transform = $entities->get<Transform>($e);
+    Mat4 $world = $transform->world($entities);
+    Vec3 $pos = ($world * Vec4($light->offset, 1.0f))->xyz();
+    float32 $casts = 0.0f;
+    if ($light->castShadow) {
+        $casts = 1.0f;
+    }
+
+    return LightGpu(
+        Vec4($pos, $light->radius),
+        Vec4($light->color, $light->intensity),
+        Vec4($light->sourceRadius, $casts, POINT_NORMAL_OFFSET, POINT_SHADOW_BIAS),
+        Vec4($light->flicker, $light->flickerSpeed, lightPhase($e->id), 0.0f)
+    );
+}
+
+internal function lampRow(const PointLamp& $lamp, int32 $index) : LightGpu
+{
+    float32 $casts = 0.0f;
+    if ($lamp->castShadow) {
+        $casts = 1.0f;
+    }
+
+    return LightGpu(
+        Vec4($lamp->position, $lamp->radius),
+        Vec4($lamp->color, $lamp->intensity),
+        Vec4($lamp->sourceRadius, $casts, POINT_NORMAL_OFFSET, POINT_SHADOW_BIAS),
+        Vec4(0.0f, 0.0f, lightPhase($index as uint32), 0.0f)
+    );
+}
+
+/**
+ * A fixed flicker phase per light, so neighbouring torches do not pulse together.
+ */
+internal function lightPhase(uint32 $seed) : float32
+{
+    uint32 $h = $seed * (2654435761 as uint32);
+    uint32 $shifted = $h >> 15;
+    uint32 $mixed = $h ^ $shifted;
+    uint32 $low = $mixed & (0xFFFF as uint32);
+    float32 $unit = ($low as float32) / 65535.0f;
+    return $unit * 6.2831853f;
 }

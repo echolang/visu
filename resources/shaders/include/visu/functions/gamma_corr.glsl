@@ -18,4 +18,12 @@ vec3 gamma_correct(vec3 color)
     return pow(color, vec3(1.0 / VISU_DISPLAY_GAMMA));
 }
 
+/**
+ * The linear value a display colour encodes; the inverse of gamma_correct.
+ */
+vec3 display_linear(vec3 display)
+{
+    return pow(max(display, vec3(0.0)), vec3(VISU_DISPLAY_GAMMA));
+}
+
 #endif

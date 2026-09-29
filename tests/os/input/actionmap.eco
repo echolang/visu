@@ -4,7 +4,7 @@
 
 use visu::math::Vec2;
 use visu::os::{Window, WindowHints};
-use visu::os::input::{ActionMap, ContextMap, InputError, InputHub, MOD_CAPS_LOCK, MOD_PRIMARY, MOD_SHIFT};
+use visu::os::input::{ActionMap, ContextMap, InputError, InputHub, MOD_CAPS_LOCK, MOD_CONTROL, MOD_PRIMARY, MOD_SHIFT};
 use visu::signal::{ClickSignal, Dispatcher, Flow, KeySignal, MouseButtonSignal};
 
 class MapHits
@@ -408,4 +408,29 @@ test action_map_end_frame_drops_frame_edges
     $map->endFrame();
     assert(!$map->hasBeenPressedThisFrame('bag'), 'gone after the frame');
     assert($map->down('bag'), 'held state stays');
+}
+
+test action_map_modified_click_fires_beside_the_plain_click
+{
+    ActionMap $map = ActionMap();
+    guard $map->bind('move', .click) else ($e) {
+        die($e->message());
+    }
+    guard $map->bind('alt', .clickWith(MOD_SHIFT)) else ($e) {
+        die($e->message());
+    }
+    $map->handle(ClickSignal(0, Vec2(0.0f), Vec2(0.0f), 0.0f));
+    assert($map->hasBeenReleased('move'), 'a plain click moves');
+    assert(!$map->hasBeenReleased('alt'), 'but is no shift click');
+    $map->reset();
+    $map->endFrame();
+    $map->handle(ClickSignal(MOD_SHIFT, Vec2(0.0f), Vec2(0.0f), 0.0f));
+    assert($map->hasBeenReleasedThisFrame('alt'), 'a shift click is the alt click');
+    assert($map->hasBeenReleasedThisFrame('move'), 'and still a click');
+    assert($map->take('alt') && $map->take('move'), 'the alt reader takes both');
+    $map->reset();
+    $map->endFrame();
+    $map->handle(ClickSignal(MOD_SHIFT | MOD_CONTROL, Vec2(0.0f), Vec2(0.0f), 0.0f));
+    assert(!$map->hasBeenReleased('alt'), 'modifiers match exactly');
+    assert(!$map->bind('again', .clickWith(MOD_SHIFT))->has_value(), 'one action per modifier set');
 }

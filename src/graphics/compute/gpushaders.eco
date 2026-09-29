@@ -1,0 +1,85 @@
+/**
+ * The baked `gpu` tree for one Device: the GPU-driven kernels (sort, culling, page requests)
+ * and the depth programs they feed. Linked at load (`warm`) and kept until the device shuts down,
+ * because releasing an MTLLibrary and compiling the same MSL again smashes the AGX compiler
+ * heap. The device owns this and drops it in shutdown.
+ */
+
+namespace visu::graphics;
+
+internal class GpuShaders
+{
+    private map<string, ComputeProgram> $kernels;
+    private BakedShaderCache $programs;
+
+    public constructor()
+    {
+        $this->kernels = map<string, ComputeProgram>();
+        $this->programs = BakedShaderCache();
+    }
+
+    /**
+     * The kernel `$name` of the gpu tree, linked on first use. A name the bake does not carry
+     * is `.missing`.
+     */
+    public function kernel(Device $device, const string& $name) : result<ComputeProgram, ShaderError>
+    {
+        if ($this->kernels->has($name)) {
+            return .ok($this->kernels->get($name));
+        }
+
+        string $bytes = guard gpuBytes($name, ShaderKind::compute) else {
+            return .error(.missing($name));
+        }
+        WorkgroupSize $group = guard gpuWorkgroup($name) else {
+            return .error(.noWorkgroup($name));
+        }
+        ComputeProgram $kernel = guard ComputeProgram::link($device, $name, $bytes, $group) else ($e) {
+            return .error($e);
+        }
+        $this->kernels[$name] = $kernel;
+        return .ok($kernel);
+    }
+
+    /**
+     * The vertex and fragment program `$name` of the gpu tree, linked on first use.
+     */
+    public function program(Device $device, const string& $name) : result<ShaderProgram, ShaderError>
+    {
+        BakedShaders $shaders = $this->programs->shaders($device, function(string $program, ShaderKind $kind) : string? {
+            return gpuBytes($program, $kind);
+        });
+        return $shaders->program($name);
+    }
+
+    /**
+     * Link every kernel and program of the tree now, at load: the first cull, sort or shadow
+     * page would otherwise compile its kernels inside the displayed frame.
+     */
+    public function warm(Device $device) : status<ShaderError>
+    {
+        foreach (gpuKernels() as $name) {
+            guard $this->kernel($device, $name) else ($e) {
+                return .error($e);
+            }
+        }
+
+        foreach (gpuPrograms() as $name) {
+            guard $this->program($device, $name) else ($e) {
+                return .error($e);
+            }
+        }
+
+        return .ok;
+    }
+
+    public function drop() : void
+    {
+        foreach ($this->kernels as $kernel) {
+            $kernel->destroy();
+        }
+
+        $this->kernels = map<string, ComputeProgram>();
+        $this->programs->drop();
+    }
+}

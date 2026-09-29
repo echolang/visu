@@ -1,0 +1,41 @@
+/**
+ * The shadow atlas's compute for this frame, after the G-buffer: receiver requests, the page
+ * cache, allocation, and the GPU scene's cull of the pages that need drawing. Reads the
+ * G-buffer position, so it runs after the geometry pass.
+ */
+
+namespace visu::graphics;
+
+public class VsmPass : Pass
+{
+    private GpuScene $scene;
+    private GBufferData $gbuffer;
+
+    public constructor(GpuScene $scene, GBufferData $gbuffer)
+    {
+        $this->scene = $scene;
+        $this->gbuffer = $gbuffer;
+    }
+
+    public function name() : string
+    {
+        return 'deferred.vsm';
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        $io->reads($this->gbuffer->position);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        LightClusterData $clusters = guard $ctx->frame->find<LightClusterData>() else {
+            return .ok;
+        }
+        Texture $position = guard $ctx->pool->getTexture($this->gbuffer->position) else ($e) {
+            return .error(.pool($e));
+        }
+        $clusters->atlas->update($ctx, $clusters, $this->scene, $position);
+        return .ok;
+    }
+}

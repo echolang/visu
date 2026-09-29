@@ -45,24 +45,70 @@ struct spvUnsafeArray
     }
 };
 
+// Implementation of the GLSL findLSB() function
+template<typename T>
+inline T spvFindLSB(T x)
+{
+    return select(ctz(x), T(-1), x == T(0));
+}
+
+struct LightGpu
+{
+    float4 position_radius;
+    float4 color_intensity;
+    float4 source;
+    float4 flicker;
+};
+
 struct FogUniforms
 {
     float4 u_fog_density;
     float4 u_fog_color;
     float4 u_fog_params;
     float4 u_fog_sun;
-    float4 u_fog_samples;
+    float4 u_fog_floor;
     float4 u_fog_moon;
     float4 u_fog_shafts;
     float4 u_fog_shaft_light;
     float4 u_fog_shaft_phase;
+    float4 u_fog_model;
+    float4 u_fog_to_moon;
+    float4 u_fog_sun_light;
+    float4 u_fog_moon_light;
+    float4 u_fog_ambient;
+    float4 u_fog_albedo;
+    float4 u_fog_aerial;
+    float4 u_fog_aerial_extinction;
 };
 
-struct PointGpu
+struct LightZBins
 {
-    float4 position_radius;
-    float4 color_intensity;
-    float4 source_shadow;
+    uint2 u_light_zbins[1];
+};
+
+struct LightTiles
+{
+    uint u_light_tiles[1];
+};
+
+struct LightKeys
+{
+    uint u_light_keys[1];
+};
+
+struct VsmGenerations
+{
+    uint u_vsm_gens[1];
+};
+
+struct VsmPageTable
+{
+    uint u_vsm_table[1];
+};
+
+struct VsmAtlas
+{
+    float u_vsm_atlas[1];
 };
 
 struct LightUniforms
@@ -73,12 +119,12 @@ struct LightUniforms
     float4x4 u_light_space[5];
     float4 u_splits;
     float4 u_shadow;
-    float4 u_points_head;
-    PointGpu u_points[64];
-    float4x4 u_point_face[24];
     float4 u_moon_direction;
     float4 u_moon_color;
     float4 u_night_ambient;
+    float4 u_cluster_head;
+    float4 u_cluster_z;
+    float4 u_vsm;
 };
 
 struct CameraUniforms
@@ -92,7 +138,20 @@ struct CameraUniforms
     float4 u_resolution;
 };
 
-constant spvUnsafeArray<float, 5> _590 = spvUnsafeArray<float, 5>({ 0.00120000005699694156646728515625, 0.001700000022538006305694580078125, 0.00179999996908009052276611328125, 0.0005000000237487256526947021484375, 0.00120000005699694156646728515625 });
+struct LightGpu_1
+{
+    float4 position_radius;
+    float4 color_intensity;
+    float4 source;
+    float4 flicker;
+};
+
+struct LightTableBuffer
+{
+    LightGpu_1 u_lights[1];
+};
+
+constant spvUnsafeArray<float, 5> _701 = spvUnsafeArray<float, 5>({ 0.00120000005699694156646728515625, 0.001700000022538006305694580078125, 0.00179999996908009052276611328125, 0.0005000000237487256526947021484375, 0.00120000005699694156646728515625 });
 
 struct fs_out
 {
@@ -221,40 +280,40 @@ float shadow_gather(texture2d_array<float> shadowmap, sampler shadowmapSmplr, th
         for (int y = -1; y <= 1; y++)
         {
             float2 sample_uv = uv + (float2(float(x), float(y)) * texel.xy);
-            bool _521 = sample_uv.x < 0.0;
-            bool _528;
-            if (!_521)
+            bool _632 = sample_uv.x < 0.0;
+            bool _639;
+            if (!_632)
             {
-                _528 = sample_uv.x > 1.0;
+                _639 = sample_uv.x > 1.0;
             }
             else
             {
-                _528 = _521;
+                _639 = _632;
             }
-            bool _535;
-            if (!_528)
+            bool _646;
+            if (!_639)
             {
-                _535 = sample_uv.y < 0.0;
+                _646 = sample_uv.y < 0.0;
             }
             else
             {
-                _535 = _528;
+                _646 = _639;
             }
-            bool _542;
-            if (!_535)
+            bool _653;
+            if (!_646)
             {
-                _542 = sample_uv.y > 1.0;
+                _653 = sample_uv.y > 1.0;
             }
             else
             {
-                _542 = _535;
+                _653 = _646;
             }
-            if (_542)
+            if (_653)
             {
                 continue;
             }
-            float3 _553 = float3(sample_uv, float(shadow_index));
-            float closest = shadowmap.sample(shadowmapSmplr, _553.xy, uint(rint(_553.z))).x;
+            float3 _664 = float3(sample_uv, float(shadow_index));
+            float closest = shadowmap.sample(shadowmapSmplr, _664.xy, uint(rint(_664.z))).x;
             shadow += float((current_depth - bias0) > closest);
             taps++;
         }
@@ -274,48 +333,8 @@ float shadow_sample(texture2d_array<float> shadowmap, sampler shadowmapSmplr, th
     float3 param_2 = light_dir;
     float4x4 param_3 = light_space;
     int param_4 = shadow_index;
-    float param_5 = _590[shadow_index];
+    float param_5 = _701[shadow_index];
     return shadow_gather(shadowmap, shadowmapSmplr, param, param_1, param_2, param_3, param_4, param_5);
-}
-
-static inline __attribute__((always_inline))
-float3 tonemap_neutral(thread float3& color)
-{
-    float x = fast::min(color.x, fast::min(color.y, color.z));
-    float _172;
-    if (x < 0.07999999821186065673828125)
-    {
-        _172 = x - ((6.25 * x) * x);
-    }
-    else
-    {
-        _172 = 0.039999999105930328369140625;
-    }
-    float offset = _172;
-    color -= float3(offset);
-    float peak = fast::max(color.x, fast::max(color.y, color.z));
-    if (peak < 0.7599999904632568359375)
-    {
-        return color;
-    }
-    float newPeak = 1.0 - (0.057599999010562896728515625 / ((peak + 0.23999999463558197021484375) - 0.7599999904632568359375));
-    color *= (newPeak / peak);
-    float g = 1.0 - (1.0 / ((0.1500000059604644775390625 * (peak - newPeak)) + 1.0));
-    return mix(color, float3(newPeak), float3(g));
-}
-
-static inline __attribute__((always_inline))
-float3 apply_tonemap(thread const float3& color)
-{
-    float3 param = color;
-    float3 _238 = tonemap_neutral(param);
-    return _238;
-}
-
-static inline __attribute__((always_inline))
-float3 gamma_correct(thread const float3& color)
-{
-    return powr(color, float3(0.4545454680919647216796875));
 }
 
 static inline __attribute__((always_inline))
@@ -341,7 +360,7 @@ float geometry_smith_ggx_correlated(thread const float& NdotL, thread const floa
 static inline __attribute__((always_inline))
 float3 fresnel_schlick(thread const float3& F0, thread const float& cosTheta)
 {
-    return F0 + ((float3(1.0) - F0) * powr(1.0 - cosTheta, 5.0));
+    return F0 + ((float3(1.0) - F0) * pow(1.0 - cosTheta, 5.0));
 }
 
 static inline __attribute__((always_inline))
@@ -371,12 +390,99 @@ float3 pbr_specular(thread const float3& N, thread const float3& V, thread const
 }
 
 static inline __attribute__((always_inline))
+uint light_zslice(thread const float& viewDepth, thread const float4& clusterZ)
+{
+    float z = fast::max(viewDepth, clusterZ.x);
+    float s = log2(z / clusterZ.x) * clusterZ.y;
+    return uint(fast::clamp(s, 0.0, clusterZ.z - 1.0));
+}
+
+static inline __attribute__((always_inline))
+uint2 light_range(thread const float& viewDepth, thread const float4& clusterHead, thread const float4& clusterZ, const device LightZBins& _1740)
+{
+    if (clusterHead.x < 0.5)
+    {
+        return uint2(1u, 0u);
+    }
+    float param = viewDepth;
+    float4 param_1 = clusterZ;
+    uint2 bin = _1740.u_light_zbins[light_zslice(param, param_1)];
+    return uint2(bin.x, ~bin.y);
+}
+
+static inline __attribute__((always_inline))
+uint light_tile_base(thread const uint2& pixel, thread const float4& clusterHead)
+{
+    uint tilePx = uint(clusterHead.y + 0.5);
+    uint tilesX = max(uint(clusterHead.z + 0.5), 1u);
+    uint2 tile = pixel / uint2(max(tilePx, 1u));
+    tile.x = min(tile.x, (tilesX - 1u));
+    return ((tile.y * tilesX) + tile.x) * uint(clusterHead.w + 0.5);
+}
+
+static inline __attribute__((always_inline))
+uint light_tile_base(thread const float2& pixel, thread const float4& clusterHead)
+{
+    uint2 param = uint2(pixel);
+    float4 param_1 = clusterHead;
+    return light_tile_base(param, param_1);
+}
+
+static inline __attribute__((always_inline))
+float vsm_footprint(thread const float& viewDepth, thread const float& projectionY, thread const float& height)
+{
+    return (2.0 * viewDepth) / (projectionY * height);
+}
+
+static inline __attribute__((always_inline))
+uint light_word(thread const uint& base, thread const uint& w, thread const uint2& range, const device LightTiles& _1806)
+{
+    uint m = _1806.u_light_tiles[base + w];
+    uint first = w * 32u;
+    if (range.x > first)
+    {
+        m &= (4294967295u << (range.x - first));
+    }
+    if (range.y < (first + 31u))
+    {
+        m &= (4294967295u >> (31u - (range.y - first)));
+    }
+    return m;
+}
+
+static inline __attribute__((always_inline))
+uint light_slot(thread const uint& index, const device LightKeys& _1853)
+{
+    return _1853.u_light_keys[index] & 8191u;
+}
+
+static inline __attribute__((always_inline))
+float light_intensity(thread const LightGpu& l, thread const float& seconds)
+{
+    if (l.flicker.x <= 0.0)
+    {
+        return l.color_intensity.w;
+    }
+    return l.color_intensity.w + (l.flicker.x * sin((l.flicker.y * seconds) + l.flicker.z));
+}
+
+static inline __attribute__((always_inline))
 float point_atten(thread const float& dist, thread const float& radius)
 {
     float d = fast::clamp(dist / fast::max(radius, 9.9999997473787516355514526367188e-05), 0.0, 1.0);
     float window = fast::clamp(1.0 - (((d * d) * d) * d), 0.0, 1.0);
     window *= window;
     return window / ((dist * dist) + 1.0);
+}
+
+static inline __attribute__((always_inline))
+float3 light_radiance(thread const LightGpu& l, thread const float& dist, thread const float& seconds)
+{
+    LightGpu param = l;
+    float param_1 = seconds;
+    float param_2 = dist;
+    float param_3 = l.position_radius.w;
+    return (l.color_intensity.xyz * light_intensity(param, param_1)) * point_atten(param_2, param_3);
 }
 
 static inline __attribute__((always_inline))
@@ -394,50 +500,293 @@ float3 water_sphere_l(thread const float3& toLight, thread const float3& V, thre
 }
 
 static inline __attribute__((always_inline))
-int point_face_index(thread const float3& dir)
+float vsm_fade(thread const float3& L, thread const float3& eye, thread const float& limit)
 {
-    float3 a = abs(dir);
-    bool _1268 = a.x >= a.y;
-    bool _1276;
-    if (_1268)
+    float d = distance(L, eye);
+    return fast::clamp((limit - d) / fast::max(limit * 0.1500000059604644775390625, 1.0), 0.0, 1.0);
+}
+
+static inline __attribute__((always_inline))
+float vsm_light_fade(thread const LightGpu& l, thread const float3& eye, thread const float4& vsm)
+{
+    bool _2366 = l.source.y > 0.5;
+    bool _2372;
+    if (_2366)
     {
-        _1276 = a.x >= a.z;
+        _2372 = vsm.x > 0.5;
     }
     else
     {
-        _1276 = _1268;
+        _2372 = _2366;
     }
-    if (_1276)
+    float _2373;
+    if (_2372)
     {
-        return (dir.x >= 0.0) ? 0 : 1;
+        float3 param = l.position_radius.xyz;
+        float3 param_1 = eye;
+        float param_2 = vsm.w;
+        _2373 = vsm_fade(param, param_1, param_2);
+    }
+    else
+    {
+        _2373 = 0.0;
+    }
+    return _2373;
+}
+
+static inline __attribute__((always_inline))
+uint vsm_face(thread const float3& d)
+{
+    float3 a = abs(d);
+    bool _1931 = a.x >= a.y;
+    bool _1939;
+    if (_1931)
+    {
+        _1939 = a.x >= a.z;
+    }
+    else
+    {
+        _1939 = _1931;
+    }
+    if (_1939)
+    {
+        return (d.x >= 0.0) ? 0u : 1u;
     }
     if (a.y >= a.z)
     {
-        return (dir.y >= 0.0) ? 2 : 3;
+        return (d.y >= 0.0) ? 2u : 3u;
     }
-    return (dir.z >= 0.0) ? 4 : 5;
+    return (d.z >= 0.0) ? 4u : 5u;
 }
 
 static inline __attribute__((always_inline))
-float3 encoded_linear(thread const float3& display)
+void vsm_basis(thread const uint& face, thread float3& n, thread float3& r, thread float3& u)
 {
-    return powr(fast::max(display, float3(0.0)), float3(2.2000000476837158203125));
+    if (face == 0u)
+    {
+        n = float3(1.0, 0.0, 0.0);
+        r = float3(0.0, 0.0, -1.0);
+        u = float3(0.0, 1.0, 0.0);
+    }
+    else
+    {
+        if (face == 1u)
+        {
+            n = float3(-1.0, 0.0, 0.0);
+            r = float3(0.0, 0.0, 1.0);
+            u = float3(0.0, 1.0, 0.0);
+        }
+        else
+        {
+            if (face == 2u)
+            {
+                n = float3(0.0, 1.0, 0.0);
+                r = float3(1.0, 0.0, 0.0);
+                u = float3(0.0, 0.0, -1.0);
+            }
+            else
+            {
+                if (face == 3u)
+                {
+                    n = float3(0.0, -1.0, 0.0);
+                    r = float3(1.0, 0.0, 0.0);
+                    u = float3(0.0, 0.0, 1.0);
+                }
+                else
+                {
+                    if (face == 4u)
+                    {
+                        n = float3(0.0, 0.0, 1.0);
+                        r = float3(1.0, 0.0, 0.0);
+                        u = float3(0.0, 1.0, 0.0);
+                    }
+                    else
+                    {
+                        n = float3(0.0, 0.0, -1.0);
+                        r = float3(-1.0, 0.0, 0.0);
+                        u = float3(0.0, 1.0, 0.0);
+                    }
+                }
+            }
+        }
+    }
 }
 
 static inline __attribute__((always_inline))
-float3 radiance_linear(thread const float3& radiance)
+float3 vsm_view(thread const uint& face, thread const float3& d)
 {
-    float3 param = radiance;
-    float3 param_1 = apply_tonemap(param);
-    float3 param_2 = gamma_correct(param_1);
-    return encoded_linear(param_2);
+    uint param = face;
+    float3 param_1;
+    float3 param_2;
+    float3 param_3;
+    vsm_basis(param, param_1, param_2, param_3);
+    float3 n = param_1;
+    float3 r = param_2;
+    float3 u = param_3;
+    return float3(dot(d, r), dot(d, u), dot(d, n));
 }
 
 static inline __attribute__((always_inline))
-float fog_integral(thread const float& dy, thread const float& len, constant FogUniforms& _834)
+uint vsm_mip(thread const float& footprint, thread const float& z, thread const float& bias0)
 {
-    float k = _834.u_fog_density.y;
-    float d0 = _834.u_fog_density.x;
+    float texel = (2.0 * fast::max(z, 0.0500000007450580596923828125)) / 1024.0;
+    float m = floor(log2(fast::max(footprint / texel, 1.0)) + bias0);
+    return uint(fast::clamp(m, 0.0, 4.0));
+}
+
+static inline __attribute__((always_inline))
+uint vsm_mip_side(thread const uint& mip)
+{
+    return 16u >> mip;
+}
+
+static inline __attribute__((always_inline))
+uint2 vsm_page_xy(thread const float2& f, thread const uint& mip)
+{
+    uint param = mip;
+    uint side = vsm_mip_side(param);
+    float2 uv = fast::clamp((f * 0.5) + float2(0.5), float2(0.0), float2(0.999989986419677734375));
+    return min(uint2(uv * float(side)), uint2(side - 1u));
+}
+
+static inline __attribute__((always_inline))
+uint vsm_mip_offset(thread const uint& mip)
+{
+    if (mip == 0u)
+    {
+        return 0u;
+    }
+    if (mip == 1u)
+    {
+        return 256u;
+    }
+    if (mip == 2u)
+    {
+        return 320u;
+    }
+    if (mip == 3u)
+    {
+        return 336u;
+    }
+    return 340u;
+}
+
+static inline __attribute__((always_inline))
+uint vsm_page_index(thread const uint& face, thread const uint& mip, thread const uint2& page)
+{
+    uint param = mip;
+    uint param_1 = mip;
+    return (((face * 341u) + vsm_mip_offset(param)) + (page.y * vsm_mip_side(param_1))) + page.x;
+}
+
+static inline __attribute__((always_inline))
+float4 vsm_page_rect(thread const uint& mip, thread const uint2& page)
+{
+    uint param = mip;
+    float side = float(vsm_mip_side(param));
+    float w = 2.0 / side;
+    float g = (w * 1.0) / 64.0;
+    float2 lo = (float2(page) * w) - float2(1.0);
+    return float4(lo - float2(g), (lo + float2(w)) + float2(g));
+}
+
+static inline __attribute__((always_inline))
+float2 vsm_cell_texel(thread const float2& f, thread const float4& rect)
+{
+    return ((f - rect.xy) / (rect.zw - rect.xy)) * 66.0;
+}
+
+static inline __attribute__((always_inline))
+float vsm_linear(thread const float& depth, thread const float& radius)
+{
+    float f = fast::max(radius, 0.100000001490116119384765625);
+    float a = f / (f - 0.0500000007450580596923828125);
+    return (a * 0.0500000007450580596923828125) / fast::max(a - depth, 9.9999999747524270787835121154785e-07);
+}
+
+static inline __attribute__((always_inline))
+float vsm_lookup(thread const uint& slot, thread const float3& L, thread const float& radius, thread const float3& P, thread const float& footprint, thread const float& mipBias, const device VsmGenerations& _2160, const device VsmPageTable& _2197, const device VsmAtlas& _2288)
+{
+    float3 d = P - L;
+    float3 param = d;
+    uint face = vsm_face(param);
+    uint param_1 = face;
+    float3 param_2 = d;
+    float3 v = vsm_view(param_1, param_2);
+    if (v.z <= 0.0500000007450580596923828125)
+    {
+        return 1.0;
+    }
+    float2 f = v.xy / float2(v.z);
+    uint gen = _2160.u_vsm_gens[slot] & 32767u;
+    uint base = slot * 2046u;
+    float missing = -1.0;
+    float param_3 = footprint;
+    float param_4 = v.z;
+    float param_5 = mipBias;
+    uint _2179 = vsm_mip(param_3, param_4, param_5);
+    for (uint m = _2179; m < 5u; m++)
+    {
+        float2 param_6 = f;
+        uint param_7 = m;
+        uint2 xy = vsm_page_xy(param_6, param_7);
+        uint param_8 = face;
+        uint param_9 = m;
+        uint2 param_10 = xy;
+        uint entry = _2197.u_vsm_table[base + vsm_page_index(param_8, param_9, param_10)];
+        if (entry == 4294967295u)
+        {
+            continue;
+        }
+        if ((entry >> 16u) != gen)
+        {
+            missing = -2.0;
+            continue;
+        }
+        uint param_11 = m;
+        uint2 param_12 = xy;
+        float4 rect = vsm_page_rect(param_11, param_12);
+        float2 param_13 = f;
+        float4 param_14 = rect;
+        int2 t = int2(floor(vsm_cell_texel(param_13, param_14)));
+        uint cell = (entry & 65535u) * 4356u;
+        float texel = (2.0 * v.z) / (1024.0 / float(1u << m));
+        float receiver = v.z - (texel * 1.5);
+        float shadow = 0.0;
+        for (int x = -1; x <= 1; x++)
+        {
+            for (int y = -1; y <= 1; y++)
+            {
+                int2 at = clamp(t + int2(x, y), int2(0), int2(65));
+                float stored = _2288.u_vsm_atlas[(cell + (uint(at.y) * 66u)) + uint(at.x)];
+                float param_15 = stored;
+                float param_16 = radius;
+                shadow += float(receiver > vsm_linear(param_15, param_16));
+            }
+        }
+        return fast::clamp(1.0 - (shadow / 9.0), 0.0, 1.0);
+    }
+    return missing;
+}
+
+static inline __attribute__((always_inline))
+float vsm_visibility(thread const uint& slot, thread const float3& L, thread const float& radius, thread const float3& P, thread const float& footprint, thread const float& mipBias, const device VsmGenerations& _2160, const device VsmPageTable& _2197, const device VsmAtlas& _2288)
+{
+    uint param = slot;
+    float3 param_1 = L;
+    float param_2 = radius;
+    float3 param_3 = P;
+    float param_4 = footprint;
+    float param_5 = mipBias;
+    float v = vsm_lookup(param, param_1, param_2, param_3, param_4, param_5, _2160, _2197, _2288);
+    return (v < (-0.5)) ? 1.0 : v;
+}
+
+static inline __attribute__((always_inline))
+float fog_integral(thread const float& dy, thread const float& len, constant FogUniforms& _935)
+{
+    float k = _935.u_fog_density.y;
+    float d0 = _935.u_fog_density.x;
     float x = fast::max((k * dy) * len, -60.0);
     if (abs(x) < 9.9999997473787516355514526367188e-05)
     {
@@ -447,9 +796,52 @@ float fog_integral(thread const float& dy, thread const float& len, constant Fog
 }
 
 static inline __attribute__((always_inline))
-float3 water_fog(thread const float3& color, thread const float3& relative, constant FogUniforms& _834, constant LightUniforms& _960)
+float3 fog_sky_horizon(thread const float3& dir, thread const float3& fallback)
 {
-    if (_834.u_fog_density.w < 0.5)
+    float2 xz = dir.xz;
+    float horiz = length(xz);
+    if (horiz < 9.9999997473787516355514526367188e-05)
+    {
+        xz = fallback.xz;
+        horiz = length(xz);
+        if (horiz < 9.9999997473787516355514526367188e-05)
+        {
+            xz = float2(1.0, 0.0);
+            horiz = 1.0;
+        }
+    }
+    xz /= float2(horiz);
+    return fast::normalize(float3(xz.x, fast::max(dir.y, 0.0199999995529651641845703125), xz.y));
+}
+
+static inline __attribute__((always_inline))
+float2 fog_sky_uv(thread const float3& dir)
+{
+    float elevation = asin(fast::clamp(dir.y, 0.0, 1.0));
+    float v = sqrt(elevation / 1.57079637050628662109375);
+    float half_texel = 0.015625;
+    float u = (precise::atan2(dir.z, dir.x) / 6.283185482025146484375) + 0.5;
+    return float2(u, fast::clamp(v, half_texel, 1.0 - half_texel));
+}
+
+static inline __attribute__((always_inline))
+float3 water_fog_color(thread const float3& dir, constant FogUniforms& _935, texture2d<float> u_fog_sky, sampler u_fog_skySmplr, constant LightUniforms& _2403)
+{
+    if (_935.u_fog_color.w < 0.5)
+    {
+        return _935.u_fog_color.xyz;
+    }
+    float3 param = dir;
+    float3 param_1 = -_2403.u_sun_direction.xyz;
+    float3 param_2 = fog_sky_horizon(param, param_1);
+    float2 uv = fog_sky_uv(param_2);
+    return _935.u_fog_color.xyz * (u_fog_sky.sample(u_fog_skySmplr, uv, level(0.0)).xyz + _935.u_fog_floor.xyz);
+}
+
+static inline __attribute__((always_inline))
+float3 water_fog(thread const float3& color, thread const float3& relative, constant FogUniforms& _935, texture2d<float> u_fog_sky, sampler u_fog_skySmplr, constant LightUniforms& _2403)
+{
+    if (_935.u_fog_density.w < 0.5)
     {
         return color;
     }
@@ -458,32 +850,30 @@ float3 water_fog(thread const float3& color, thread const float3& relative, cons
     {
         return color;
     }
-    float cutoff = _834.u_fog_params.y;
+    float cutoff = _935.u_fog_params.y;
     if ((cutoff > 0.0) && (len > cutoff))
     {
         return color;
     }
     float3 dir = relative / float3(len);
     float dy = dir.y;
-    float start = _834.u_fog_params.x;
+    float start = _935.u_fog_params.x;
     float param = dy;
     float param_1 = len;
-    float optical = fog_integral(param, param_1, _834);
+    float optical = fog_integral(param, param_1, _935);
     float param_2 = dy;
     float param_3 = fast::min(len, start);
-    float t = fast::max(exp(-(optical - fog_integral(param_2, param_3, _834))), 1.0 - _834.u_fog_density.z);
+    float t = fast::max(exp(-(optical - fog_integral(param_2, param_3, _935))), 1.0 - _935.u_fog_density.z);
     float param_4 = dy;
-    float param_5 = fast::min(len, start + _834.u_fog_params.w);
-    float td = exp(-(optical - fog_integral(param_4, param_5, _834)));
-    float3 sunDir = fast::normalize(-_960.u_sun_direction.xyz);
-    float sun = powr(fast::max(dot(dir, sunDir), 0.0), fast::max(_834.u_fog_sun.w, 1.0));
-    float3 moonDir = fast::normalize(-_960.u_moon_direction.xyz);
-    float moon = powr(fast::max(dot(dir, moonDir), 0.0), fast::max(_834.u_fog_moon.w, 1.0));
-    float3 param_6 = _834.u_fog_sun.xyz;
-    float3 param_7 = _834.u_fog_moon.xyz;
-    float3 glow = (radiance_linear(param_6) * sun) + (radiance_linear(param_7) * moon);
-    float3 param_8 = _834.u_fog_color.xyz;
-    float3 fog = (radiance_linear(param_8) * (1.0 - t)) + (glow * (1.0 - td));
+    float param_5 = fast::min(len, start + _935.u_fog_params.w);
+    float td = exp(-(optical - fog_integral(param_4, param_5, _935)));
+    float3 sunDir = fast::normalize(-_2403.u_sun_direction.xyz);
+    float sun = pow(fast::max(dot(dir, sunDir), 0.0), fast::max(_935.u_fog_sun.w, 1.0));
+    float3 moonDir = fast::normalize(-_2403.u_moon_direction.xyz);
+    float moon = pow(fast::max(dot(dir, moonDir), 0.0), fast::max(_935.u_fog_moon.w, 1.0));
+    float3 glow = (_935.u_fog_sun.xyz * sun) + (_935.u_fog_moon.xyz * moon);
+    float3 param_6 = dir;
+    float3 fog = (water_fog_color(param_6, _935, u_fog_sky, u_fog_skySmplr, _2403) * (1.0 - t)) + (glow * (1.0 - td));
     return (color * t) + fog;
 }
 
@@ -499,8 +889,8 @@ float2 godrays_fetch(thread const float2& uv, thread const float& dist, texture2
     float d = fast::min(dist, 60000.0);
     float2 sum = float2(0.0);
     float weight = 0.0;
-    float _713;
-    float _726;
+    float _1538;
+    float _1551;
     for (int j = 0; j < 2; j++)
     {
         for (int i = 0; i < 2; i++)
@@ -508,22 +898,22 @@ float2 godrays_fetch(thread const float2& uv, thread const float& dist, texture2
             float4 s = godrays_resolved.read(uint2(clamp(base + int2(i, j), int2(0), top)), 0);
             if (i == 0)
             {
-                _713 = 1.0 - f.x;
+                _1538 = 1.0 - f.x;
             }
             else
             {
-                _713 = f.x;
+                _1538 = f.x;
             }
-            float bx = _713;
+            float bx = _1538;
             if (j == 0)
             {
-                _726 = 1.0 - f.y;
+                _1551 = 1.0 - f.y;
             }
             else
             {
-                _726 = f.y;
+                _1551 = f.y;
             }
-            float by = _726;
+            float by = _1551;
             float rel = abs(s.z - d) / fast::max(d, 1.0);
             float w = ((bx * by) / (0.001000000047497451305389404296875 + rel)) + 9.9999999747524270787835121154785e-07;
             sum += (s.xy * w);
@@ -552,15 +942,15 @@ float godrays_phase2(thread const float& cosTheta, thread const float3& lobes)
 }
 
 static inline __attribute__((always_inline))
-float3 water_fog_rays(thread const float3& color, thread const float3& relative, thread const float2& uv, texture2d<float> godrays_resolved, sampler godrays_resolvedSmplr, constant FogUniforms& _834, constant LightUniforms& _960, texture2d<float> u_bed, sampler u_bedSmplr)
+float3 water_fog_rays_legacy(thread const float3& color, thread const float3& relative, thread const float2& uv, constant FogUniforms& _935, texture2d<float> u_fog_sky, sampler u_fog_skySmplr, texture2d<float> godrays_resolved, sampler godrays_resolvedSmplr, constant LightUniforms& _2403, texture2d<float> u_bed, sampler u_bedSmplr)
 {
-    if (_834.u_fog_shafts.w < 0.5)
+    if (_935.u_fog_shafts.w < 0.5)
     {
         float3 param = color;
         float3 param_1 = relative;
-        return water_fog(param, param_1, _834, _960);
+        return water_fog(param, param_1, _935, u_fog_sky, u_fog_skySmplr, _2403);
     }
-    if (_834.u_fog_density.w < 0.5)
+    if (_935.u_fog_density.w < 0.5)
     {
         return color;
     }
@@ -569,71 +959,364 @@ float3 water_fog_rays(thread const float3& color, thread const float3& relative,
     {
         return color;
     }
-    float cutoff = _834.u_fog_params.y;
+    float cutoff = _935.u_fog_params.y;
     if ((cutoff > 0.0) && (len > cutoff))
     {
         return color;
     }
     float3 dir = relative / float3(len);
     float dy = dir.y;
-    float start = _834.u_fog_params.x;
+    float start = _935.u_fog_params.x;
     float param_2 = dy;
     float param_3 = len;
-    float optical = fog_integral(param_2, param_3, _834);
+    float optical = fog_integral(param_2, param_3, _935);
     float param_4 = dy;
     float param_5 = fast::min(len, start);
-    float t = fast::max(exp(-(optical - fog_integral(param_4, param_5, _834))), 1.0 - _834.u_fog_density.z);
+    float t = fast::max(exp(-(optical - fog_integral(param_4, param_5, _935))), 1.0 - _935.u_fog_density.z);
     float param_6 = dy;
-    float param_7 = fast::min(len, start + _834.u_fog_params.w);
-    float td = exp(-(optical - fog_integral(param_6, param_7, _834)));
+    float param_7 = fast::min(len, start + _935.u_fog_params.w);
+    float td = exp(-(optical - fog_integral(param_6, param_7, _935)));
     float4 bed = u_bed.sample(u_bedSmplr, uv);
-    float _1128;
+    float _2802;
     if (bed.w >= 0.5)
     {
-        _1128 = length(bed.xyz);
+        _2802 = length(bed.xyz);
     }
     else
     {
-        _1128 = 60000.0;
+        _2802 = 60000.0;
     }
-    float bedDist = _1128;
+    float bedDist = _2802;
     float2 param_8 = uv;
     float param_9 = bedDist;
     float2 shaft = godrays_fetch(param_8, param_9, godrays_resolved, godrays_resolvedSmplr);
     shaft.x *= fast::clamp(len / fast::max(bedDist, 0.001000000047497451305389404296875), 0.0, 1.0);
-    float occlude = mix(1.0, shaft.y, _834.u_fog_shafts.y);
-    float3 sunDir = fast::normalize(-_960.u_sun_direction.xyz);
-    float sun = powr(fast::max(dot(dir, sunDir), 0.0), fast::max(_834.u_fog_sun.w, 1.0));
-    float3 moonDir = fast::normalize(-_960.u_moon_direction.xyz);
-    float moon = powr(fast::max(dot(dir, moonDir), 0.0), fast::max(_834.u_fog_moon.w, 1.0));
-    float3 param_10 = _834.u_fog_sun.xyz;
-    float3 param_11 = _834.u_fog_moon.xyz;
-    float3 glow = ((radiance_linear(param_10) * sun) + (radiance_linear(param_11) * moon)) * occlude;
-    float3 param_12 = _834.u_fog_color.xyz;
-    float3 fog = (radiance_linear(param_12) * (1.0 - t)) + (glow * (1.0 - td));
-    float3 toLight = (_834.u_fog_shaft_light.w > 0.5) ? moonDir : sunDir;
-    float param_13 = dot(dir, toLight);
-    float3 param_14 = _834.u_fog_shaft_phase.xyz;
-    float phase = godrays_phase2(param_13, param_14);
-    float3 param_15 = _834.u_fog_shaft_light.xyz * ((phase * shaft.x) * _834.u_fog_shafts.x);
-    float3 rays = radiance_linear(param_15);
+    float occlude = mix(1.0, shaft.y, _935.u_fog_shafts.y);
+    float3 sunDir = fast::normalize(-_2403.u_sun_direction.xyz);
+    float sun = pow(fast::max(dot(dir, sunDir), 0.0), fast::max(_935.u_fog_sun.w, 1.0));
+    float3 moonDir = fast::normalize(-_2403.u_moon_direction.xyz);
+    float moon = pow(fast::max(dot(dir, moonDir), 0.0), fast::max(_935.u_fog_moon.w, 1.0));
+    float3 glow = ((_935.u_fog_sun.xyz * sun) + (_935.u_fog_moon.xyz * moon)) * occlude;
+    float3 param_10 = dir;
+    float3 fog = (water_fog_color(param_10, _935, u_fog_sky, u_fog_skySmplr, _2403) * (1.0 - t)) + (glow * (1.0 - td));
+    float3 toLight = (_935.u_fog_shaft_light.w > 0.5) ? moonDir : sunDir;
+    float param_11 = dot(dir, toLight);
+    float3 param_12 = _935.u_fog_shaft_phase.xyz;
+    float phase = godrays_phase2(param_11, param_12);
+    float3 rays = _935.u_fog_shaft_light.xyz * ((phase * shaft.x) * _935.u_fog_shafts.x);
     return ((color * t) + fog) + rays;
 }
 
-fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _1565 [[buffer(3)]], constant LightUniforms& _960 [[buffer(4)]], constant FogUniforms& _834 [[buffer(5)]], texture2d<float> u_scene [[texture(0)]], texture2d<float> u_bed [[texture(1)]], texture2d<float> u_mirror [[texture(2)]], texturecube<float> u_prefilter [[texture(7)]], texture2d_array<float> shadowmap [[texture(11)]], texture2d<float> point_tiles [[texture(13)]], texture2d_array<float> point_shadow [[texture(14)]], texture2d<float> godrays_resolved [[texture(15)]], sampler u_sceneSmplr [[sampler(0)]], sampler u_bedSmplr [[sampler(1)]], sampler u_mirrorSmplr [[sampler(2)]], sampler u_prefilterSmplr [[sampler(7)]], sampler shadowmapSmplr [[sampler(11)]], sampler point_tilesSmplr [[sampler(13)]], sampler point_shadowSmplr [[sampler(14)]], sampler godrays_resolvedSmplr [[sampler(15)]], float4 gl_FragCoord [[position]])
+static inline __attribute__((always_inline))
+float3 fog_color(thread const float3& dir, constant FogUniforms& _935, texture2d<float> u_fog_sky, sampler u_fog_skySmplr)
 {
-    fs_out out = {};
-    bool _1530 = in.v_flow.w > 0.5;
-    bool _1542;
-    if (_1530)
+    float3 tint = _935.u_fog_color.xyz;
+    if (_935.u_fog_color.w < 0.5)
     {
-        _1542 = dot(in.v_local.xz, in.v_local.xz) > 0.25;
+        return tint;
+    }
+    float3 param = dir;
+    float3 param_1 = _935.u_fog_model.xyz;
+    float3 param_2 = fog_sky_horizon(param, param_1);
+    float2 uv = fog_sky_uv(param_2);
+    return tint * (u_fog_sky.sample(u_fog_skySmplr, uv, level(0.0)).xyz + _935.u_fog_floor.xyz);
+}
+
+static inline __attribute__((always_inline))
+float3 fog_apply_legacy(thread const float3& color, thread const float3& relative, constant FogUniforms& _935, texture2d<float> u_fog_sky, sampler u_fog_skySmplr)
+{
+    if (_935.u_fog_density.w < 0.5)
+    {
+        return color;
+    }
+    float len = length(relative);
+    if (len < 0.001000000047497451305389404296875)
+    {
+        return color;
+    }
+    float cutoff = _935.u_fog_params.y;
+    if ((cutoff > 0.0) && (len > cutoff))
+    {
+        return color;
+    }
+    float3 dir = relative / float3(len);
+    float dy = dir.y;
+    float start = _935.u_fog_params.x;
+    float param = dy;
+    float param_1 = len;
+    float optical = fog_integral(param, param_1, _935);
+    float param_2 = dy;
+    float param_3 = fast::min(len, start);
+    float t = fast::max(exp(-(optical - fog_integral(param_2, param_3, _935))), 1.0 - _935.u_fog_density.z);
+    float param_4 = dy;
+    float param_5 = fast::min(len, start + _935.u_fog_params.w);
+    float td = exp(-(optical - fog_integral(param_4, param_5, _935)));
+    float sun = pow(fast::max(dot(dir, _935.u_fog_model.xyz), 0.0), _935.u_fog_sun.w);
+    float moon = pow(fast::max(dot(dir, _935.u_fog_to_moon.xyz), 0.0), fast::max(_935.u_fog_moon.w, 1.0));
+    float3 glow = (_935.u_fog_sun.xyz * sun) + (_935.u_fog_moon.xyz * moon);
+    float3 param_6 = dir;
+    float3 fog = (fog_color(param_6, _935, u_fog_sky, u_fog_skySmplr) * (1.0 - t)) + (glow * (1.0 - td));
+    return (color * t) + fog;
+}
+
+static inline __attribute__((always_inline))
+float phase_hg(thread const float& g, thread const float& mu)
+{
+    float gg = g * g;
+    float base = fast::max((1.0 + gg) - ((2.0 * g) * mu), 9.9999997473787516355514526367188e-05);
+    return (1.0 - gg) / ((12.56637096405029296875 * base) * sqrt(base));
+}
+
+static inline __attribute__((always_inline))
+float fog_phase(thread const float& mu, constant FogUniforms& _935)
+{
+    float param = _935.u_fog_sun_light.w;
+    float param_1 = mu;
+    float forward = phase_hg(param, param_1);
+    return mix(0.079577468335628509521484375, forward, _935.u_fog_to_moon.w);
+}
+
+static inline __attribute__((always_inline))
+float3 fog_medium(thread const float3& dir, thread const float& lit_sun, thread const float& lit_moon, constant FogUniforms& _935)
+{
+    float param = dot(dir, _935.u_fog_model.xyz);
+    float3 light = _935.u_fog_ambient.xyz + (_935.u_fog_sun_light.xyz * (fog_phase(param, _935) * lit_sun));
+    if (_935.u_fog_moon_light.w > 0.5)
+    {
+        float param_1 = dot(dir, _935.u_fog_to_moon.xyz);
+        light += (_935.u_fog_moon_light.xyz * (fog_phase(param_1, _935) * lit_moon));
+    }
+    return _935.u_fog_albedo.xyz * (light * _935.u_fog_albedo.w);
+}
+
+static inline __attribute__((always_inline))
+float3 fog_height(thread const float3& color, thread const float3& dir, thread const float& len, thread const float& lit_sun, thread const float& lit_moon, thread const float3& rays, constant FogUniforms& _935)
+{
+    if (_935.u_fog_density.w < 0.5)
+    {
+        return color;
+    }
+    float cutoff = _935.u_fog_params.y;
+    if ((cutoff > 0.0) && (len > cutoff))
+    {
+        return color;
+    }
+    float dy = dir.y;
+    float start = _935.u_fog_params.x;
+    float param = dy;
+    float param_1 = len;
+    float optical = fog_integral(param, param_1, _935);
+    float param_2 = dy;
+    float param_3 = fast::min(len, start);
+    float t = fast::max(exp(-(optical - fog_integral(param_2, param_3, _935))), 1.0 - _935.u_fog_density.z);
+    float3 param_4 = dir;
+    float param_5 = lit_sun;
+    float param_6 = lit_moon;
+    return ((color * t) + (fog_medium(param_4, param_5, param_6, _935) * (1.0 - t))) + rays;
+}
+
+static inline __attribute__((always_inline))
+float aerial_slice(thread const float& d)
+{
+    return (sqrt(fast::max(d, 0.0) / 64000.0) * 32.0) - 1.0;
+}
+
+static inline __attribute__((always_inline))
+float2 aerial_uv(thread const float3& dir)
+{
+    float y = fast::clamp(dir.y, -1.0, 1.0);
+    float v = 0.5 + ((0.5 * sign(y)) * sqrt(abs(y)));
+    float half_texel = 0.015625;
+    float u = ((precise::atan2(dir.z, dir.x) / 6.283185482025146484375) + 0.5) * 64.0;
+    return float2(u, fast::clamp(v, half_texel, 1.0 - half_texel));
+}
+
+static inline __attribute__((always_inline))
+float phase_mie(thread const float& g, thread const float& mu)
+{
+    float gg = g * g;
+    float base = (1.0 + gg) - ((2.0 * g) * mu);
+    return (0.119366206228733062744140625 * ((1.0 - gg) * (1.0 + (mu * mu)))) / (((2.0 + gg) * base) * sqrt(base));
+}
+
+static inline __attribute__((always_inline))
+float2 aerial_atlas(thread const float2& uv, thread const float& k)
+{
+    return float2((((k * 66.0) + 1.0) + uv.x) / 2112.0, uv.y);
+}
+
+static inline __attribute__((always_inline))
+float3 aerial_fetch(thread const float2& uv, thread const float& k, thread const float& mie_sun, thread float2& depth, texture2d_array<float> u_aerial, sampler u_aerialSmplr)
+{
+    float2 param = uv;
+    float param_1 = k;
+    float2 at = aerial_atlas(param, param_1);
+    float3 _1290 = float3(at, 0.0);
+    float4 light = u_aerial.sample(u_aerialSmplr, _1290.xy, uint(rint(_1290.z)), level(0.0));
+    float3 _1297 = float3(at, 1.0);
+    float4 sun_m = u_aerial.sample(u_aerialSmplr, _1297.xy, uint(rint(_1297.z)), level(0.0));
+    depth = float2(light.w, sun_m.w);
+    return light.xyz + (sun_m.xyz * mie_sun);
+}
+
+static inline __attribute__((always_inline))
+float3 aerial_apply(thread const float3& color, thread const float3& dir, thread const float& len, constant FogUniforms& _935, texture2d_array<float> u_aerial, sampler u_aerialSmplr)
+{
+    if (_935.u_fog_aerial.w <= 0.0)
+    {
+        return color;
+    }
+    float param = len * _935.u_fog_aerial.w;
+    float s = fast::min(aerial_slice(param), 31.0);
+    float k = floor(s);
+    float f = s - k;
+    float3 param_1 = dir;
+    float2 uv = aerial_uv(param_1);
+    float param_2 = _935.u_fog_aerial.z;
+    float param_3 = dot(dir, _935.u_fog_model.xyz);
+    float mie_sun = phase_mie(param_2, param_3);
+    float2 param_4 = uv;
+    float param_5 = fast::min(k + 1.0, 31.0);
+    float param_6 = mie_sun;
+    float2 param_7;
+    float3 _1363 = aerial_fetch(param_4, param_5, param_6, param_7, u_aerial, u_aerialSmplr);
+    float2 d_far = param_7;
+    float3 far = _1363;
+    float2 d_near = float2(0.0);
+    float3 near = float3(0.0);
+    if (k >= 0.0)
+    {
+        float2 param_8 = uv;
+        float param_9 = k;
+        float param_10 = mie_sun;
+        float2 param_11;
+        float3 _1379 = aerial_fetch(param_8, param_9, param_10, param_11, u_aerial, u_aerialSmplr);
+        d_near = param_11;
+        near = _1379;
+    }
+    float2 depth = mix(d_near, d_far, float2(f));
+    float3 transmittance = exp(-((_935.u_fog_aerial_extinction.xyz * depth.x) + (float3(_935.u_fog_aerial_extinction.w) * depth.y)));
+    return (color * transmittance) + mix(near, far, float3(f));
+}
+
+static inline __attribute__((always_inline))
+float3 fog_surface(thread float3& color, thread const float3& relative, thread const float& lit_sun, thread const float& lit_moon, thread const float3& rays, constant FogUniforms& _935, texture2d_array<float> u_aerial, sampler u_aerialSmplr)
+{
+    float len = length(relative);
+    if (len < 0.001000000047497451305389404296875)
+    {
+        return color;
+    }
+    float3 dir = relative / float3(len);
+    float3 param = color;
+    float3 param_1 = dir;
+    float param_2 = len;
+    float param_3 = lit_sun;
+    float param_4 = lit_moon;
+    float3 param_5 = rays;
+    color = fog_height(param, param_1, param_2, param_3, param_4, param_5, _935);
+    float3 param_6 = color;
+    float3 param_7 = dir;
+    float param_8 = len;
+    return aerial_apply(param_6, param_7, param_8, _935, u_aerial, u_aerialSmplr);
+}
+
+static inline __attribute__((always_inline))
+float3 fog_apply(thread const float3& color, thread const float3& relative, constant FogUniforms& _935, texture2d<float> u_fog_sky, sampler u_fog_skySmplr, texture2d_array<float> u_aerial, sampler u_aerialSmplr)
+{
+    if (_935.u_fog_model.w < 0.5)
+    {
+        float3 param = color;
+        float3 param_1 = relative;
+        return fog_apply_legacy(param, param_1, _935, u_fog_sky, u_fog_skySmplr);
+    }
+    float3 param_2 = color;
+    float3 param_3 = relative;
+    float param_4 = 1.0;
+    float param_5 = 1.0;
+    float3 param_6 = float3(0.0);
+    float3 _1469 = fog_surface(param_2, param_3, param_4, param_5, param_6, _935, u_aerial, u_aerialSmplr);
+    return _1469;
+}
+
+static inline __attribute__((always_inline))
+float3 water_fog_rays(thread const float3& color, thread const float3& relative, thread const float2& uv, constant FogUniforms& _935, texture2d<float> u_fog_sky, sampler u_fog_skySmplr, texture2d_array<float> u_aerial, sampler u_aerialSmplr, texture2d<float> godrays_resolved, sampler godrays_resolvedSmplr, constant LightUniforms& _2403, texture2d<float> u_bed, sampler u_bedSmplr)
+{
+    if (_935.u_fog_model.w < 0.5)
+    {
+        float3 param = color;
+        float3 param_1 = relative;
+        float2 param_2 = uv;
+        return water_fog_rays_legacy(param, param_1, param_2, _935, u_fog_sky, u_fog_skySmplr, godrays_resolved, godrays_resolvedSmplr, _2403, u_bed, u_bedSmplr);
+    }
+    if (_935.u_fog_shafts.w < 0.5)
+    {
+        float3 param_3 = color;
+        float3 param_4 = relative;
+        return fog_apply(param_3, param_4, _935, u_fog_sky, u_fog_skySmplr, u_aerial, u_aerialSmplr);
+    }
+    float len = length(relative);
+    if (len < 0.001000000047497451305389404296875)
+    {
+        return color;
+    }
+    float3 dir = relative / float3(len);
+    float4 bed = u_bed.sample(u_bedSmplr, uv);
+    float _2614;
+    if (bed.w >= 0.5)
+    {
+        _2614 = length(bed.xyz);
     }
     else
     {
-        _1542 = _1530;
+        _2614 = 60000.0;
     }
-    if (_1542)
+    float bedDist = _2614;
+    float2 param_5 = uv;
+    float param_6 = bedDist;
+    float2 shaft = godrays_fetch(param_5, param_6, godrays_resolved, godrays_resolvedSmplr);
+    shaft.x *= fast::clamp(len / fast::max(bedDist, 0.001000000047497451305389404296875), 0.0, 1.0);
+    float lit = mix(1.0, shaft.y, _935.u_fog_shafts.y);
+    bool moonKey = _935.u_fog_shaft_light.w > 0.5;
+    float3 _2651;
+    if (moonKey)
+    {
+        _2651 = _935.u_fog_to_moon.xyz;
+    }
+    else
+    {
+        _2651 = _935.u_fog_model.xyz;
+    }
+    float3 toLight = _2651;
+    float param_7 = dot(dir, toLight);
+    float3 param_8 = _935.u_fog_shaft_phase.xyz;
+    float phase = godrays_phase2(param_7, param_8);
+    float3 rays = _935.u_fog_shaft_light.xyz * ((phase * shaft.x) * _935.u_fog_shafts.x);
+    float lit_sun = moonKey ? 1.0 : lit;
+    float lit_moon = moonKey ? lit : 1.0;
+    float3 param_9 = color;
+    float3 param_10 = relative;
+    float param_11 = lit_sun;
+    float param_12 = lit_moon;
+    float3 param_13 = rays;
+    float3 _2703 = fog_surface(param_9, param_10, param_11, param_12, param_13, _935, u_aerial, u_aerialSmplr);
+    return _2703;
+}
+
+fragment fs_out fs(fs_in in [[stage_in]], const device LightTableBuffer& _3691 [[buffer(6)]], const device LightKeys& _1853 [[buffer(7)]], constant CameraUniforms& _3157 [[buffer(3)]], const device LightZBins& _1740 [[buffer(8)]], constant LightUniforms& _2403 [[buffer(4)]], constant FogUniforms& _935 [[buffer(5)]], const device LightTiles& _1806 [[buffer(9)]], const device VsmPageTable& _2197 [[buffer(10)]], const device VsmGenerations& _2160 [[buffer(11)]], const device VsmAtlas& _2288 [[buffer(12)]], texture2d<float> u_scene [[texture(0)]], texture2d<float> u_bed [[texture(1)]], texture2d<float> u_mirror [[texture(2)]], texture2d<float> u_fog_sky [[texture(3)]], texture2d_array<float> u_aerial [[texture(4)]], texturecube<float> u_prefilter [[texture(7)]], texture2d_array<float> shadowmap [[texture(11)]], texture2d<float> godrays_resolved [[texture(15)]], sampler u_sceneSmplr [[sampler(0)]], sampler u_bedSmplr [[sampler(1)]], sampler u_mirrorSmplr [[sampler(2)]], sampler u_fog_skySmplr [[sampler(3)]], sampler u_aerialSmplr [[sampler(4)]], sampler u_prefilterSmplr [[sampler(7)]], sampler shadowmapSmplr [[sampler(11)]], sampler godrays_resolvedSmplr [[sampler(15)]], float4 gl_FragCoord [[position]])
+{
+    fs_out out = {};
+    bool _3122 = in.v_flow.w > 0.5;
+    bool _3134;
+    if (_3122)
+    {
+        _3134 = dot(in.v_local.xz, in.v_local.xz) > 0.25;
+    }
+    else
+    {
+        _3134 = _3122;
+    }
+    if (_3134)
     {
         discard_fragment();
     }
@@ -642,15 +1325,15 @@ fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _1565 [[buffe
     float3 param_1 = in.v_world;
     float param_2 = in.v_extra.y;
     float3 N = ripple_normal(param, param_1, param_2, in.v_ripple, in.v_flow);
-    float3 V = fast::normalize(_1565.u_camera_position.xyz - in.v_world);
+    float3 V = fast::normalize(_3157.u_camera_position.xyz - in.v_world);
     float facing = fast::max(dot(planeN, V), 0.0);
-    float fresnel = mix(0.039999999105930328369140625, 0.2800000011920928955078125, powr(1.0 - facing, 5.0));
+    float fresnel = mix(0.039999999105930328369140625, 0.2800000011920928955078125, pow(1.0 - facing, 5.0));
     float rough = fast::clamp(in.v_ripple.w, 0.0199999995529651641845703125, 1.0);
-    float2 pixel = gl_FragCoord.xy / fast::max(_1565.u_resolution.xy, float2(1.0));
+    float2 pixel = gl_FragCoord.xy / fast::max(_3157.u_resolution.xy, float2(1.0));
     float2 slide = N.xz * in.v_flow.z;
     float2 refrUv = fast::clamp(pixel + slide, float2(0.0), float2(1.0));
     float4 bedSample = u_bed.sample(u_bedSmplr, refrUv);
-    float3 bed = bedSample.xyz + _1565.u_camera_position.xyz;
+    float3 bed = bedSample.xyz + _3157.u_camera_position.xyz;
     float thickness = 6.0;
     float side = dot(planeN, bed) + in.v_plane.w;
     if ((bedSample.w > 0.5) && (side < 0.0))
@@ -658,202 +1341,204 @@ fragment fs_out fs(fs_in in [[stage_in]], constant CameraUniforms& _1565 [[buffe
         thickness = fast::max(distance(in.v_world, bed), 0.0);
     }
     float3 transmit = exp(((-in.v_absorption.xyz) * in.v_absorption.w) * thickness);
-    float3 L = fast::normalize(-_960.u_sun_direction.xyz);
-    float3 Lm = fast::normalize(-_960.u_moon_direction.xyz);
-    bool moonKey = _960.u_moon_color.w > 0.5;
+    float3 L = fast::normalize(-_2403.u_sun_direction.xyz);
+    float3 Lm = fast::normalize(-_2403.u_moon_direction.xyz);
+    bool moonKey = _2403.u_moon_color.w > 0.5;
     float keyVis = 1.0;
-    if (_960.u_shadow.y > 0.5)
+    if (_2403.u_shadow.y > 0.5)
     {
-        float viewZ = (_1565.u_view * float4(in.v_world, 1.0)).z;
+        float viewZ = (_3157.u_view * float4(in.v_world, 1.0)).z;
         float param_3 = viewZ;
-        float4 param_4 = _960.u_splits;
+        float4 param_4 = _2403.u_splits;
         int cascade = csm_index(param_3, param_4);
-        float3 _1695;
+        float3 _3285;
         if (moonKey)
         {
-            _1695 = _960.u_moon_direction.xyz;
+            _3285 = _2403.u_moon_direction.xyz;
         }
         else
         {
-            _1695 = _960.u_sun_direction.xyz;
+            _3285 = _2403.u_sun_direction.xyz;
         }
-        float3 keyDir = _1695;
+        float3 keyDir = _3285;
         float3 param_5 = in.v_world;
         float3 param_6 = N;
         float3 param_7 = fast::normalize(keyDir);
-        float4x4 param_8 = _960.u_light_space[cascade];
+        float4x4 param_8 = _2403.u_light_space[cascade];
         int param_9 = cascade;
         keyVis = 1.0 - shadow_sample(shadowmap, shadowmapSmplr, param_5, param_6, param_7, param_8, param_9);
     }
     float sunVis = moonKey ? 1.0 : keyVis;
     float moonVis = moonKey ? keyVis : 1.0;
     float ndotl = fast::max(dot(N, L), 0.0);
-    float maxLodBody = fast::max(_960.u_ibl.x - 1.0, 0.0);
-    float3 skyAmbient = u_prefilter.sample(u_prefilterSmplr, float3(0.0, 1.0, 0.0), level(maxLodBody)).xyz + _960.u_night_ambient.xyz;
-    float3 sunIn = ((_960.u_sun_color.xyz * _960.u_sun_direction.w) * fast::max(L.y, 0.0)) * sunVis;
-    float3 moonIn = ((_960.u_moon_color.xyz * _960.u_moon_direction.w) * fast::max(Lm.y, 0.0)) * moonVis;
+    float maxLodBody = fast::max(_2403.u_ibl.x - 1.0, 0.0);
+    float3 skyAmbient = u_prefilter.sample(u_prefilterSmplr, float3(0.0, 1.0, 0.0), level(maxLodBody)).xyz + _2403.u_night_ambient.xyz;
+    float3 sunIn = ((_2403.u_sun_color.xyz * _2403.u_sun_direction.w) * fast::max(L.y, 0.0)) * sunVis;
+    float3 moonIn = ((_2403.u_moon_color.xyz * _2403.u_moon_direction.w) * fast::max(Lm.y, 0.0)) * moonVis;
     float3 bodyRadiance = in.v_body.xyz * (((sunIn + moonIn) / float3(3.1415927410125732421875)) + skyAmbient);
-    float3 param_10 = bodyRadiance;
-    float3 param_11 = apply_tonemap(param_10);
-    float3 body = gamma_correct(param_11);
     float clear = exp((-in.v_body.w) * thickness);
-    float3 refr = mix(body, u_scene.sample(u_sceneSmplr, refrUv).xyz * transmit, float3(clear));
-    refr *= (1.0 + ((0.3499999940395355224609375 * powr(ndotl, 6.0)) * sunVis));
+    float3 refr = mix(bodyRadiance, u_scene.sample(u_sceneSmplr, refrUv).xyz * transmit, float3(clear));
+    refr *= (1.0 + ((0.3499999940395355224609375 * pow(ndotl, 6.0)) * sunVis));
     float2 mirrorUv = pixel + (slide * 0.64999997615814208984375);
     float inside = 1.0;
-    bool _1836 = mirrorUv.x < 0.0;
-    bool _1843;
-    if (!_1836)
+    bool _3418 = mirrorUv.x < 0.0;
+    bool _3425;
+    if (!_3418)
     {
-        _1843 = mirrorUv.y < 0.0;
+        _3425 = mirrorUv.y < 0.0;
     }
     else
     {
-        _1843 = _1836;
+        _3425 = _3418;
     }
-    bool _1850;
-    if (!_1843)
+    bool _3432;
+    if (!_3425)
     {
-        _1850 = mirrorUv.x > 1.0;
+        _3432 = mirrorUv.x > 1.0;
     }
     else
     {
-        _1850 = _1843;
+        _3432 = _3425;
     }
-    bool _1857;
-    if (!_1850)
+    bool _3439;
+    if (!_3432)
     {
-        _1857 = mirrorUv.y > 1.0;
+        _3439 = mirrorUv.y > 1.0;
     }
     else
     {
-        _1857 = _1850;
+        _3439 = _3432;
     }
-    if (_1857)
+    if (_3439)
     {
         inside = 0.0;
     }
     float3 mirror = u_mirror.sample(u_mirrorSmplr, fast::clamp(mirrorUv, float2(0.0), float2(1.0))).xyz;
     float3 R = fast::normalize(reflect(-V, N));
     float3 skyR = fast::normalize(float3(R.x, fast::max(R.y, 0.449999988079071044921875), R.z));
-    float maxLod = fast::max(_960.u_ibl.x - 1.0, 0.0);
+    float maxLod = fast::max(_2403.u_ibl.x - 1.0, 0.0);
     float3 ibl = u_prefilter.sample(u_prefilterSmplr, skyR, level(fast::max(rough, 0.550000011920928955078125) * maxLod)).xyz;
-    ibl += _960.u_night_ambient.xyz;
-    float3 param_12 = ibl;
-    float3 param_13 = apply_tonemap(param_12);
-    ibl = gamma_correct(param_13);
+    ibl += _2403.u_night_ambient.xyz;
     float mirrorWeight = (in.v_extra.x * inside) * (1.0 - rough);
     float3 reflected = mix(ibl, mirror, float3(mirrorWeight));
     float3 spec = float3(0.0);
     float3 F0 = float3(0.0199999995529651641845703125);
     float3 H = fast::normalize(V + L);
-    float3 param_14 = N;
-    float3 param_15 = V;
-    float3 param_16 = H;
-    float3 param_17 = L;
-    float3 param_18 = F0;
-    float param_19 = rough;
-    float3 param_20;
-    float3 _1945 = pbr_specular(param_14, param_15, param_16, param_17, param_18, param_19, param_20);
-    float3 fres = param_20;
-    float3 sunSpec = _1945;
-    float3 radiance = _960.u_sun_color.xyz * _960.u_sun_direction.w;
+    float3 param_10 = N;
+    float3 param_11 = V;
+    float3 param_12 = H;
+    float3 param_13 = L;
+    float3 param_14 = F0;
+    float param_15 = rough;
+    float3 param_16;
+    float3 _3522 = pbr_specular(param_10, param_11, param_12, param_13, param_14, param_15, param_16);
+    float3 fres = param_16;
+    float3 sunSpec = _3522;
+    float3 radiance = _2403.u_sun_color.xyz * _2403.u_sun_direction.w;
     spec += (((sunSpec * radiance) * ndotl) * sunVis);
-    if (_960.u_moon_direction.w > 0.0)
+    if (_2403.u_moon_direction.w > 0.0)
     {
         float3 H_1 = fast::normalize(V + Lm);
-        float3 param_21 = N;
-        float3 param_22 = V;
-        float3 param_23 = H_1;
-        float3 param_24 = Lm;
-        float3 param_25 = F0;
-        float param_26 = rough;
-        float3 param_27;
-        float3 _1988 = pbr_specular(param_21, param_22, param_23, param_24, param_25, param_26, param_27);
-        float3 fres_1 = param_27;
-        float3 moonSpec = _1988;
-        float3 radiance_1 = _960.u_moon_color.xyz * _960.u_moon_direction.w;
+        float3 param_17 = N;
+        float3 param_18 = V;
+        float3 param_19 = H_1;
+        float3 param_20 = Lm;
+        float3 param_21 = F0;
+        float param_22 = rough;
+        float3 param_23;
+        float3 _3565 = pbr_specular(param_17, param_18, param_19, param_20, param_21, param_22, param_23);
+        float3 fres_1 = param_23;
+        float3 moonSpec = _3565;
+        float3 radiance_1 = _2403.u_moon_color.xyz * _2403.u_moon_direction.w;
         spec += (((moonSpec * radiance_1) * fast::max(dot(N, Lm), 0.0)) * moonVis);
     }
-    int pointCount = int(_960.u_points_head.x + 0.5);
-    if (pointCount > 0)
+    float viewDepth = -(_3157.u_view * float4(in.v_world, 1.0)).z;
+    float param_24 = viewDepth;
+    float4 param_25 = _2403.u_cluster_head;
+    float4 param_26 = _2403.u_cluster_z;
+    uint2 range = light_range(param_24, param_25, param_26, _1740);
+    if (range.x <= range.y)
     {
-        float2 px = fast::min(pixel * _1565.u_resolution.xy, _1565.u_resolution.xy - float2(1.0));
-        int tilePx = int(_960.u_points_head.y + 0.5);
-        int2 tile = int2(px) / int2(max(tilePx, 1));
-        int tilesX = max(int(_960.u_points_head.z + 0.5), 1);
-        int stride = int(_960.u_points_head.w + 0.5);
-        tile.x = clamp(tile.x, 0, tilesX - 1);
-        int row = tile.y * stride;
-        int n = int((point_tiles.read(uint2(int2(tile.x, row)), 0).x * 255.0) + 0.5);
-        float3 param_47;
-        for (int i = 0; i < 8; i++)
+        float2 px = fast::min(pixel * _3157.u_resolution.xy, _3157.u_resolution.xy - float2(1.0));
+        float2 param_27 = px;
+        float4 param_28 = _2403.u_cluster_head;
+        uint base = light_tile_base(param_27, param_28);
+        float param_29 = viewDepth;
+        float param_30 = _3157.u_projection[1].y;
+        float param_31 = _3157.u_resolution.y;
+        float footprint = vsm_footprint(param_29, param_30, param_31);
+        uint _3645 = range.x >> 5u;
+        float3 param_49;
+        for (uint w = _3645; w <= (range.y >> 5u); w++)
         {
-            if (i >= n)
+            uint param_32 = base;
+            uint param_33 = w;
+            uint2 param_34 = range;
+            uint bits = light_word(param_32, param_33, param_34, _1806);
+            while (bits != 0u)
             {
-                break;
+                uint b = uint(int(spvFindLSB(bits)));
+                bits &= (bits - 1u);
+                uint param_35 = (w * 32u) + b;
+                uint slot = light_slot(param_35, _1853);
+                LightGpu _3696;
+                _3696.position_radius = _3691.u_lights[slot].position_radius;
+                _3696.color_intensity = _3691.u_lights[slot].color_intensity;
+                _3696.source = _3691.u_lights[slot].source;
+                _3696.flicker = _3691.u_lights[slot].flicker;
+                LightGpu l = _3696;
+                float4 pr = l.position_radius;
+                float3 toLight = pr.xyz - in.v_world;
+                float dist = length(toLight);
+                if (dist >= pr.w)
+                {
+                    continue;
+                }
+                float3 Lc = toLight / float3(fast::max(dist, 9.9999997473787516355514526367188e-05));
+                LightGpu param_36 = l;
+                float param_37 = dist;
+                float param_38 = _2403.u_cluster_z.w;
+                float3 radiance_2 = light_radiance(param_36, param_37, param_38);
+                float3 param_39 = toLight;
+                float3 param_40 = V;
+                float3 param_41 = N;
+                float param_42 = l.source.x;
+                float3 Ls = water_sphere_l(param_39, param_40, param_41, param_42);
+                float3 H_2 = fast::normalize(V + Ls);
+                float3 param_43 = N;
+                float3 param_44 = V;
+                float3 param_45 = H_2;
+                float3 param_46 = Ls;
+                float3 param_47 = F0;
+                float param_48 = rough;
+                float3 _3761 = pbr_specular(param_43, param_44, param_45, param_46, param_47, param_48, param_49);
+                float3 fres_2 = param_49;
+                float3 one = _3761;
+                float vis = 1.0;
+                LightGpu param_50 = l;
+                float3 param_51 = _3157.u_camera_position.xyz;
+                float4 param_52 = _2403.u_vsm;
+                float fade = vsm_light_fade(param_50, param_51, param_52);
+                if (fade > 0.0)
+                {
+                    uint param_53 = slot;
+                    float3 param_54 = pr.xyz;
+                    float param_55 = pr.w;
+                    float3 param_56 = in.v_world + (N * l.source.z);
+                    float param_57 = footprint;
+                    float param_58 = _2403.u_vsm.y;
+                    vis = mix(1.0, vsm_visibility(param_53, param_54, param_55, param_56, param_57, param_58, _2160, _2197, _2288), fade);
+                }
+                spec += (((one * radiance_2) * fast::max(dot(N, Lc), 0.0)) * vis);
             }
-            int li = int((point_tiles.read(uint2(int2(tile.x, (row + 1) + i)), 0).x * 255.0) + 0.5);
-            if ((li < 0) || (li >= pointCount))
-            {
-                continue;
-            }
-            float4 pr = _960.u_points[li].position_radius;
-            float3 toLight = pr.xyz - in.v_world;
-            float dist = length(toLight);
-            if (dist >= pr.w)
-            {
-                continue;
-            }
-            float3 Lc = toLight / float3(fast::max(dist, 9.9999997473787516355514526367188e-05));
-            float4 src = _960.u_points[li].source_shadow;
-            float param_28 = dist;
-            float param_29 = pr.w;
-            float3 radiance_2 = (_960.u_points[li].color_intensity.xyz * _960.u_points[li].color_intensity.w) * point_atten(param_28, param_29);
-            float3 param_30 = toLight;
-            float3 param_31 = V;
-            float3 param_32 = N;
-            float param_33 = src.x;
-            float3 Ls = water_sphere_l(param_30, param_31, param_32, param_33);
-            float vis = 1.0;
-            if (src.y >= 0.0)
-            {
-                int slot = int(src.y + 0.5);
-                float3 shifted = in.v_world + (N * src.z);
-                float3 fromLight = shifted - pr.xyz;
-                float3 param_34 = fromLight;
-                int face = point_face_index(param_34);
-                int layer = (slot * 6) + face;
-                float3 param_35 = shifted;
-                float3 param_36 = N;
-                float3 param_37 = fast::normalize(fromLight);
-                float4x4 param_38 = _960.u_point_face[layer];
-                int param_39 = layer;
-                float param_40 = src.w;
-                vis = 1.0 - shadow_gather(point_shadow, point_shadowSmplr, param_35, param_36, param_37, param_38, param_39, param_40);
-            }
-            float3 H_2 = fast::normalize(V + Ls);
-            float3 param_41 = N;
-            float3 param_42 = V;
-            float3 param_43 = H_2;
-            float3 param_44 = Ls;
-            float3 param_45 = F0;
-            float param_46 = rough;
-            float3 _2242 = pbr_specular(param_41, param_42, param_43, param_44, param_45, param_46, param_47);
-            float3 fres_2 = param_47;
-            float3 one = _2242;
-            spec += (((one * radiance_2) * fast::max(dot(N, Lc), 0.0)) * vis);
         }
     }
-    float3 param_48 = mix(refr, reflected, float3(fresnel));
-    float3 param_49 = spec;
-    float3 color = encoded_linear(param_48) + radiance_linear(param_49);
-    float3 param_50 = color;
-    float3 param_51 = in.v_world - _1565.u_camera_position.xyz;
-    float2 param_52 = gl_FragCoord.xy * _1565.u_resolution.zw;
-    color = water_fog_rays(param_50, param_51, param_52, godrays_resolved, godrays_resolvedSmplr, _834, _960, u_bed, u_bedSmplr);
-    float3 param_53 = color;
-    out.fragment_color = float4(gamma_correct(param_53), 1.0);
+    float3 color = mix(refr, reflected, float3(fresnel)) + spec;
+    float3 param_59 = color;
+    float3 param_60 = in.v_world - _3157.u_camera_position.xyz;
+    float2 param_61 = gl_FragCoord.xy * _3157.u_resolution.zw;
+    color = water_fog_rays(param_59, param_60, param_61, _935, u_fog_sky, u_fog_skySmplr, u_aerial, u_aerialSmplr, godrays_resolved, godrays_resolvedSmplr, _2403, u_bed, u_bedSmplr);
+    out.fragment_color = float4(color, 1.0);
     return out;
 }
 

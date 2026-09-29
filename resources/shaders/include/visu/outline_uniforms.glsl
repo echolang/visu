@@ -11,7 +11,7 @@ layout(std140, set = 0, binding = 0) uniform OutlineUniforms {
     // 1 / width, 1 / height of the mask, widest glow in device pixels, unused
     vec4 u_texel;
     vec4 u_colors[4];
-    // per style: glow width in device pixels, strength behind an occluder, unused, unused
+    // per style: glow width in device pixels, strength behind an occluder, silhouette fill, unused
     vec4 u_params[4];
 };
 

@@ -15,7 +15,28 @@ public class LightPass : Pass
     internal Sky $sky;
     internal Moon $moon;
     internal HeightFog $fog;
-    internal Vec4 $background;
+
+    /**
+     * The clear colour in scene radiance: the renderer's background already mapped back through
+     * the curve (`sceneBackground`), so the pass never solves it per frame.
+     */
+    internal Vec4 $clear;
+
+    /**
+     * This frame's fog sky table (`FogSkyLut`) when the fog takes the sky's colour, which the
+     * sky and the water read too.
+     */
+    internal TextureRef? $fogSky;
+
+    /**
+     * This frame's fog lighting (`fogLighting`), which the sky and the water pack too.
+     */
+    internal FogLighting $fogLighting;
+
+    /**
+     * This frame's aerial table (`AerialLut`), bound whether or not it is read.
+     */
+    internal TextureRef $aerial;
 
     public constructor(
         DeferredGpu $gpu,
@@ -24,7 +45,10 @@ public class LightPass : Pass
         Sky $sky,
         Moon $moon,
         HeightFog $fog,
-        Vec4 $background
+        Vec4 $clear,
+        FogLighting $fogLighting,
+        TextureRef $aerial,
+        TextureRef? $fogSky = null
     )
     {
         $this->gpu = $gpu;
@@ -33,7 +57,10 @@ public class LightPass : Pass
         $this->sky = $sky;
         $this->moon = $moon;
         $this->fog = $fog;
-        $this->background = $background;
+        $this->clear = $clear;
+        $this->fogSky = $fogSky;
+        $this->fogLighting = $fogLighting;
+        $this->aerial = $aerial;
     }
 
     public function name() : string
@@ -47,6 +74,8 @@ public class LightPass : Pass
         readGBuffer($io, $gbuffer);
         readSsao($io, $frame);
         readGodRays($io, $frame);
+        readFogSky($io, $this->fogSky);
+        readAerial($io, $this->aerial);
 
         EnvironmentData? $environment = $frame->find<EnvironmentData>();
 
@@ -72,18 +101,13 @@ public class LightPass : Pass
             $io->reads($found->map);
         }
 
-        PointShadowData? $points = $frame->find<PointShadowData>();
-        if ($points != null) {
-            PointShadowData $found = guard $points;
-            $io->reads($found->map);
-        }
-
         TargetRef $target = $pipeline->createTarget(
             'lightpass',
             $gbuffer->target->width,
             $gbuffer->target->height
         );
-        TextureRef $output = $pipeline->createColor($target, 'output', TextureOptions());
+        // linear radiance: the tone-map pass at the end of the frame is the one display encode
+        TextureRef $output = $pipeline->createColor($target, 'output', TextureOptions($format: .rgba16f));
         $frame->set(LightPassData($target, $output));
         $io->writes($target);
     }
@@ -93,14 +117,14 @@ public class LightPass : Pass
         LightPassData $data = $ctx->frame->get<LightPassData>();
         GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
         CameraData $camera = $ctx->frame->get<CameraData>();
-        return $this->shade($ctx, $data->target, $gbuffer, $camera, $this->fog, false, null, 0, 0, true, $this->background, $godRays: true);
+        return $this->shade($ctx, $data->target, $gbuffer, $camera, $this->fog, $this->fogLighting, false, true, $this->clear, $godRays: true);
     }
 
     /**
      * Shade `$gbuffer` into `$target` with the light-pass program.
      * `$uploadCamera` writes `$camera` at slot 1. Otherwise the shared camera buffer is bound,
      * which the G-buffer pass already pushed for the main view.
-     * `$tiles` replaces the main point-light grid. `$tileW` is that grid's width.
+     * `$cull` is the view's cull of the light table; the main view's when null.
      * `$sampleSsao` is the play-view occlusion. A mirror leaves it off and binds white.
      * `$worldCascades` picks the sun cascade from the receiver's place in each map.
      * `$godRays` composites this frame's light shafts; only the main view has them.
@@ -111,15 +135,14 @@ public class LightPass : Pass
         GBufferData $gbuffer,
         CameraData $camera,
         HeightFog $fog,
+        FogLighting $fogLighting,
         bool $uploadCamera,
-        Texture? $tiles,
-        int32 $tileW,
-        int32 $tileH,
         bool $doClear,
         Vec4 $clear,
         bool $sampleSsao = true,
         bool $worldCascades = false,
-        bool $godRays = false
+        bool $godRays = false,
+        cull: LightCull? $cull = null
     ) : status<PipelineError>
     {
         if ($doClear) {
@@ -131,17 +154,8 @@ public class LightPass : Pass
             return .error(.shader($e));
         }
 
-        PointLightFrame? $points = $ctx->frame->find<PointLightFrame>();
-        bool $pointShadow = false;
-        if ($points != null) {
-            PointLightFrame $packed = guard $points;
-            if ($ctx->frame->find<PointShadowData>() != null && $packed->shadowMap != null) {
-                $pointShadow = true;
-            }
-        }
-
         // the 1x1 depth clear opens its own encoder, so it has to run before this pass
-        if ($ctx->frame->find<ShadowMapData>() == null || !$pointShadow) {
+        if ($ctx->frame->find<ShadowMapData>() == null) {
             ensureShadowDummy($ctx->device, $this->gpu->shadowDummy);
         }
 
@@ -160,7 +174,6 @@ public class LightPass : Pass
             $this->gpu->camera->bind($enc);
         }
 
-        $enc->upload(skyUniforms($this->sky, $camera->position, false, FOG_VIEW_SAMPLES, FOG_LIGHT_SAMPLES, $this->moon), slot: 0);
         LightUniforms $lights = lightUniforms($this->sun, $this->moon, $this->sky, $this->environment, $ctx->frame->find<ShadowMapData>());
         if ($worldCascades) {
             $lights->shadow = Vec4(
@@ -171,34 +184,28 @@ public class LightPass : Pass
             );
         }
 
-        if ($points != null) {
-            PointLightFrame $packed = guard $points;
-            packPointUniforms($lights, $packed);
-            if ($tiles != null && $tileW > 0) {
-                $lights->pointsHead = Vec4(
-                    $lights->pointsHead->x,
-                    POINT_TILE as float32,
-                    $tileW as float32,
-                    POINT_TILE_STRIDE as float32
-                );
-            }
-        }
+        bindClusters($enc, $this->gpu, $ctx->frame->find<LightClusterData>(), $cull, $lights);
 
         $enc->upload($lights, slot: 2);
-        FogUniforms $fogUniforms = fogUniforms(
-            $fog,
-            $camera->position,
-            fogSunTint($this->sun, $this->sky),
-            FOG_VIEW_SAMPLES,
-            FOG_LIGHT_SAMPLES,
-            fogMoonTint($this->moon, $this->sky),
-            fogLight($this->moon, $this->sky)
-        );
+        FogUniforms $fogUniforms = fogUniforms($fog, $camera->position, $fogLighting);
         guard bindGodRays($ctx, $enc, $this->gpu, $fogUniforms, $godRays) else ($e) {
             $enc->endRender();
             return .error($e);
         }
         $enc->upload($fogUniforms, slot: 3);
+        // a view without fog (the mirror) binds white in the table's place
+        TextureRef? $fogSky = null;
+        if ($fog->enabled) {
+            $fogSky = $this->fogSky;
+        }
+        guard bindFogSky($ctx, $enc, $this->gpu, FOG_SKY_LIGHT_SLOT, $fogSky) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
+        guard bindAerial($ctx, $enc, $this->gpu, AERIAL_LIGHT_SLOT, $this->aerial) else ($e) {
+            $enc->endRender();
+            return .error($e);
+        }
         Sampler $point = $this->gpu->point;
 
         guard bindGBuffer($ctx, $enc, $gbuffer, $point) else ($e) {
@@ -221,49 +228,8 @@ public class LightPass : Pass
             $enc->endRender();
             return .error($e);
         }
-        guard $this->bindPoints($ctx, $enc, $tiles) else ($e) {
-            $enc->endRender();
-            return .error($e);
-        }
-
         $mesh->draw($enc);
         $enc->endRender();
-        return .ok;
-    }
-
-    /**
-     * Slot 13 is the tile index, slot 14 the point-shadow array. Count zero still
-     * binds the 1x1 dummies so the shader's samplers are valid.
-     */
-    internal function bindPoints(RenderContext $ctx, RenderEncoder $enc, Texture? $override) : status<PipelineError>
-    {
-        Texture $tiles = $this->gpu->pointTileDummy;
-        Texture $shadow = $this->gpu->shadowDummy;
-        if ($override != null) {
-            Texture $held = guard $override;
-            $tiles = $held;
-        }
-
-        PointLightFrame? $points = $ctx->frame->find<PointLightFrame>();
-        if ($points != null) {
-            PointLightFrame $packed = guard $points;
-            if ($override == null) {
-                Texture? $tileTex = $packed->tiles;
-                if ($tileTex != null) {
-                    Texture $held = guard $tileTex;
-                    $tiles = $held;
-                }
-            }
-
-            if ($ctx->frame->find<PointShadowData>() != null && $packed->shadowMap != null) {
-                Texture? $map = $packed->shadowMap;
-                Texture $held = guard $map;
-                $shadow = $held;
-            }
-        }
-
-        $enc->bindTexture(POINT_TILE_SLOT, $tiles, $this->gpu->point);
-        $enc->bindTexture(POINT_SHADOW_SLOT, $shadow, $this->gpu->shadow);
         return .ok;
     }
 
