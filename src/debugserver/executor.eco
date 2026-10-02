@@ -5,14 +5,14 @@
  * presented. Nothing here runs while no request is in flight.
  */
 
-namespace visu::debughttp;
+namespace visu::debugserver;
 
 use visu::app::{Flags, FlagValue, flags};
 use visu::dcapture::{DumpQueue, DumpRecord, DumpSink, StepRunner};
 use std::time;
 use visu::runtime::{DebugConsole, clockPinned};
 
-internal const int64 DEBUG_HTTP_DEADLINE_SECONDS = 120;
+internal const int64 DEBUG_DEADLINE_SECONDS = 120;
 
 public class DebugExecutor : DumpSink
 {
@@ -23,14 +23,12 @@ public class DebugExecutor : DumpSink
      * `DebugJob.id`, which is also their dump ticket.
      */
     private array<DebugJob> $waiting;
-    private array<bool> $wantsJson;
     private int32 $frame;
 
     public constructor(DumpQueue $dumps)
     {
         $this->dumps = $dumps;
         $this->waiting = array<DebugJob>();
-        $this->wantsJson = array<bool>();
         $this->frame = 0;
     }
 
@@ -75,18 +73,18 @@ public class DebugExecutor : DumpSink
                 $o['out'] = json::str($this->dumps->out);
                 $job->answer(DebugReply(json: json::dump($o)));
             },
-            DebugRequest::snapshot($pattern, $json) => {
-                $this->park($job, $json);
+            DebugRequest::snapshot($pattern) => {
+                $this->park($job);
                 // the ticket in the file name: two snapshots of one name in one frame never share a file
-                $this->dumps->queue($pattern, "http{$job->id}", $job->id);
+                $this->dumps->queue($pattern, "live{$job->id}", $job->id);
             },
             DebugRequest::dumps => {
-                $this->park($job, true);
+                $this->park($job);
                 $this->dumps->queueList($job->id);
             },
             DebugRequest::profile => {
-                $this->park($job, true);
-                $this->dumps->queueProfile("http{$job->id}", $job->id);
+                $this->park($job);
+                $this->dumps->queueProfile("live{$job->id}", $job->id);
             },
             DebugRequest::wait($frames) => {
                 if ($frames <= 0) {
@@ -94,7 +92,7 @@ public class DebugExecutor : DumpSink
                     return;
                 }
 
-                $this->park($job, true);
+                $this->park($job);
             },
         }
     }
@@ -145,7 +143,7 @@ public class DebugExecutor : DumpSink
      */
     public function expire() : void
     {
-        time::duration $limit = time::duration::secs(DEBUG_HTTP_DEADLINE_SECONDS);
+        time::duration $limit = time::duration::secs(DEBUG_DEADLINE_SECONDS);
         usize $i = 0;
         while ($i < $this->waiting->count()) {
             DebugJob $job = $this->waiting[$i];
@@ -166,7 +164,6 @@ public class DebugExecutor : DumpSink
     {
         array<DebugJob> $left = $this->waiting;
         $this->waiting = array<DebugJob>();
-        $this->wantsJson = array<bool>();
         foreach ($left as $job) {
             $job->answer(DebugReply(503, error: 'the app is shutting down'));
         }
@@ -183,7 +180,6 @@ public class DebugExecutor : DumpSink
             return;
         }
         DebugJob $job = $this->waiting[$at];
-        bool $json = $this->wantsJson[$at];
         $this->unpark($at);
         if ($records->empty()) {
             string $why = 'nothing was dumped';
@@ -198,11 +194,6 @@ public class DebugExecutor : DumpSink
             }
 
             $job->answer(DebugReply($status, error: $why));
-            return;
-        }
-
-        if ($records->count() == 1 && $errors->empty() && !$json) {
-            $job->answer(DebugReply(file: $records[0]->path));
             return;
         }
 
@@ -233,9 +224,9 @@ public class DebugExecutor : DumpSink
             return;
         }
 
-        DebugReply $reply = DebugReply(file: $path);
-        $reply->type = 'application/json';
-        $job->answer($reply);
+        json::Value $o = json::object();
+        $o['path'] = json::str($path);
+        $job->answer(DebugReply(json: json::dump($o)));
     }
 
     public function listed(int32 $ticket, const array<string>& $names) : void
@@ -250,17 +241,15 @@ public class DebugExecutor : DumpSink
         $job->answer(DebugReply(json: json::dump($o)));
     }
 
-    private function park(DebugJob $job, bool $json) : void
+    private function park(DebugJob $job) : void
     {
         $job->parkedAt = time::instant::now();
         $this->waiting[] = $job;
-        $this->wantsJson[] = $json;
     }
 
     private function unpark(usize $at) : void
     {
         $this->waiting->remove($at);
-        $this->wantsJson->remove($at);
     }
 
     private function find(int32 $ticket) : usize?

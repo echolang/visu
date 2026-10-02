@@ -1,0 +1,165 @@
+/**
+ * The debug server over a real loopback socket: the handshake, one request answered on the test
+ * thread as the Host would drain it, and the clients it turns away.
+ */
+
+use std::thread;
+use visu::dcapture::{DumpQueue, StepRunner};
+use visu::debugserver::{DebugContext, DebugServer};
+
+internal function startServer() : DebugServer
+{
+    DebugServer $server = DebugServer('127.0.0.1', 0, DumpQueue('var/test-debug'));
+    guard $server->start() else ($e) {
+        die($e->message());
+    }
+    return $server;
+}
+
+/**
+ * Frames off `$s` until one arrives, the peer closes, or about two seconds pass. Empty on close.
+ */
+internal function readReply(tcp::Stream $s, tcp::FrameReader& $r) : string
+{
+    int32 $tries = 0;
+    while ($tries < 80) {
+        string? $got = guard $r->read($s, 25) else {
+            return '';
+        }
+        if ($got != null) {
+            string $body = guard $got;
+            return $body;
+        }
+        $tries = $tries + 1;
+    }
+    return 'timeout';
+}
+
+test debugserver_answers_a_request_on_the_draining_thread
+{
+    DebugServer $server = startServer();
+    int32 $port = $server->port();
+    assert($port > 0, 'bound an ephemeral port');
+    thread::task<string> $client = guard thread::spawn(function() : string {
+        tcp::Stream $s = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
+            return "connect: {$e->message()}";
+        }
+        tcp::FrameReader $r = tcp::FrameReader(65536);
+        guard tcp::writeFrame($s, '{"op":"hello","protocol":1}') else {
+            return 'hello write failed';
+        }
+        string $hello = readReply($s, $r);
+        json::Value $hv = guard json::parse($hello) else {
+            return "hello reply: {$hello}";
+        }
+        if (!($hv['ok']->asBool() ?? false)) {
+            return "hello refused: {$hello}";
+        }
+        guard tcp::writeFrame($s, '{"id":7,"op":"status"}') else {
+            return 'request write failed';
+        }
+        return readReply($s, $r);
+    }) else ($e) {
+        die($e->message());
+    }
+
+    DebugContext $ctx = DebugContext(null, StepRunner(), 12, 34);
+    int32 $tries = 0;
+    while (!$server->pending() && $tries < 2000) {
+        thread::sleep(1);
+        $tries = $tries + 1;
+    }
+    assert($server->pending(), 'the request reached the mailbox');
+    $server->drain($ctx);
+    string $reply = $client->wait();
+    json::Value $v = guard json::parse($reply) else {
+        die("reply: {$reply}");
+    }
+    assert(($v['id']->asInt() ?? 0) == 7, 'the reply carries the request id');
+    assert(($v['ok']->asBool() ?? false), 'ok');
+    assert(($v['result']['frame']->asInt() ?? 0) == 12, 'answered with the drained frame');
+    $server->stop();
+}
+
+test debugserver_refuses_a_request_before_the_handshake
+{
+    DebugServer $server = startServer();
+    tcp::Stream $s = guard tcp::Stream::connect('127.0.0.1', $server->port()) else ($e) {
+        die($e->message());
+    }
+    tcp::FrameReader $r = tcp::FrameReader(65536);
+    guard tcp::writeFrame($s, '{"id":1,"op":"status"}') else ($e) {
+        die($e->message());
+    }
+    string $reply = readReply($s, $r);
+    json::Value $v = guard json::parse($reply) else {
+        die("reply: {$reply}");
+    }
+    assert(($v['status']->asInt() ?? 0) == 400, 'refused with a 400');
+    assert(readReply($s, $r)->empty(), 'then closed');
+    assert(!$server->pending(), 'nothing reached the main thread');
+    $server->stop();
+}
+
+test debugserver_drops_an_http_client
+{
+    DebugServer $server = startServer();
+    tcp::Stream $s = guard tcp::Stream::connect('127.0.0.1', $server->port()) else ($e) {
+        die($e->message());
+    }
+    guard $s->writeAll('GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n', 1000) else ($e) {
+        die($e->message());
+    }
+    tcp::FrameReader $r = tcp::FrameReader(65536);
+    assert(readReply($s, $r)->empty(), 'an HTTP request is closed without a reply');
+    assert(!$server->pending(), 'nothing reached the main thread');
+    $server->stop();
+}
+
+test debugserver_stop_answers_a_parked_client
+{
+    DebugServer $server = startServer();
+    int32 $port = $server->port();
+    thread::task<string> $client = guard thread::spawn(function() : string {
+        tcp::Stream $s = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
+            return "connect: {$e->message()}";
+        }
+        tcp::FrameReader $r = tcp::FrameReader(65536);
+        guard tcp::writeFrame($s, '{"op":"hello","protocol":1}') else {
+            return 'hello write failed';
+        }
+        string $hello = readReply($s, $r);
+        guard tcp::writeFrame($s, '{"id":2,"op":"wait","frames":600}') else {
+            return 'request write failed';
+        }
+        int32 $tries = 0;
+        while ($tries < 400) {
+            string? $got = guard $r->read($s, 25) else {
+                return '';
+            }
+            if ($got != null) {
+                string $body = guard $got;
+                return $body;
+            }
+            $tries = $tries + 1;
+        }
+        return 'timeout';
+    }) else ($e) {
+        die($e->message());
+    }
+
+    DebugContext $ctx = DebugContext(null, StepRunner(), 0, 0);
+    int32 $tries = 0;
+    while (!$server->pending() && $tries < 2000) {
+        thread::sleep(1);
+        $tries = $tries + 1;
+    }
+    $server->drain($ctx);
+    assert($server->parked(), 'the wait is parked on a frame');
+    $server->stop();
+    string $reply = $client->wait();
+    json::Value $v = guard json::parse($reply) else {
+        die("reply: {$reply}");
+    }
+    assert(($v['status']->asInt() ?? 0) == 503, 'stop answers the parked wait with a 503');
+}

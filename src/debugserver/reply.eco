@@ -1,0 +1,33 @@
+/**
+ * The main thread's answer to a `DebugRequest`. The connection thread wraps it in the reply frame
+ * (`replyJson`): `body` is the result's JSON when `status` is 200, `error` the reason otherwise.
+ * Snapshots and profiles answer with the paths they wrote, so the main thread never reads an
+ * image back in and nothing large crosses the wire.
+ */
+
+namespace visu::debugserver;
+
+public struct DebugReply
+{
+    public int32 $status;
+    public string $body;
+    public string $error;
+
+    public constructor(json: const string& $body)
+    {
+        $this->status = 200;
+        $this->body = $body;
+        $this->error = '';
+    }
+
+    /**
+     * A failure with its status: 400 a bad request, 404 nothing matched, 409 no console, 503 the
+     * app is going away, 504 no frame came in time.
+     */
+    public constructor(int32 $status, error: const string& $message)
+    {
+        $this->status = $status;
+        $this->body = '';
+        $this->error = $message;
+    }
+}

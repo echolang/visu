@@ -1,0 +1,288 @@
+/**
+ * The debug wire's request side: a request frame's JSON to a `DebugRequest`, and a whole frame to
+ * its reply frame. The parsers are pure so tests drive them without a socket. Connection threads
+ * call `answerFrame` and touch nothing but the mailbox.
+ *
+ * A request is `{"id": <int>, "op": "<op>", ...args}`; the ops are listed in `DEBUG_OPS`.
+ */
+
+namespace visu::debugserver;
+
+use visu::dcapture::{CameraSpec, FlagAssign, Step, StepAt, parseCamera, parseLiveStep};
+
+internal const DEBUG_OPS = 'status, console, verbs, flags, flag, step, camera, click, wait, dumps, snapshot, profile, quit';
+
+/**
+ * The handshake frame, `{"op": "hello", "protocol": 1}`: the protocol it asks for, or why it is not
+ * a handshake.
+ */
+internal function parseHello(const string& $text) : result<int64, string>
+{
+    json::Value $v = guard json::parse($text) else ($e) {
+        return .error("bad json: {$e->message()}");
+    }
+    if (!$v->isObject()) {
+        return .error('the first frame must be {"op":"hello","protocol":1}');
+    }
+
+    string $op = $v['op']->asStr() ?? '';
+    if ($op != 'hello') {
+        return .error('the first frame must be {"op":"hello","protocol":1}');
+    }
+
+    int64 $protocol = guard $v['protocol']->asInt() else {
+        return .error('hello needs "protocol": 1');
+    }
+    int64 $speaks = DEBUG_PROTOCOL as int64;
+    if ($protocol != $speaks) {
+        return .error("this server speaks protocol {$speaks}, not {$protocol}");
+    }
+
+    return .ok($protocol);
+}
+
+/**
+ * A request frame to its reply frame: parse, post to `$mail` (which sleeps until the main thread
+ * answers), wrap. A frame that does not parse is answered 400 with the id it carried, or 0.
+ */
+internal function answerFrame(const string& $text, DebugMailbox $mail) : string
+{
+    json::Value $v = guard json::parse($text) else ($e) {
+        return replyJson(0, DebugReply(400, error: "bad json: {$e->message()}"));
+    }
+    int64 $id = 0;
+    if ($v->isObject()) {
+        $id = $v['id']->asInt() ?? 0;
+    }
+
+    DebugRequest $request = guard parseOp($v) else ($why) {
+        return replyJson($id, DebugReply(400, error: $why));
+    }
+    return replyJson($id, $mail->post($request));
+}
+
+/**
+ * One request object to what it asks for.
+ */
+internal function parseOp(json::Value $v) : result<DebugRequest, string>
+{
+    if (!$v->isObject()) {
+        return .error('a request is an object: {"id": 1, "op": "status"}');
+    }
+
+    string $op = guard $v['op']->asStr() else {
+        string $ops = DEBUG_OPS;
+        return .error("a request needs \"op\": one of {$ops}");
+    }
+    if ($op == 'status') {
+        return .ok(.status);
+    }
+    if ($op == 'console') {
+        array<string> $commands = guard parseCommands($v) else ($e) {
+            return .error($e);
+        }
+        return .ok(.console($commands));
+    }
+    if ($op == 'verbs') {
+        return .ok(.verbs);
+    }
+    if ($op == 'flags') {
+        return .ok(.flags);
+    }
+    if ($op == 'flag') {
+        return parseFlagOp($v);
+    }
+    if ($op == 'step') {
+        json::Value $sv = guard $v->get('step') else {
+            return .error('step needs "step": {..}, a dcapture step object');
+        }
+        Step $step = guard parseLiveStep($sv) else ($e) {
+            return .error($e->message());
+        }
+        return .ok(.step($step));
+    }
+    if ($op == 'camera') {
+        Step $cam = guard parseCameraOp($v) else ($e) {
+            return .error($e);
+        }
+        return .ok(.step($cam));
+    }
+    if ($op == 'click') {
+        Step $click = guard parseClickOp($v) else ($e) {
+            return .error($e);
+        }
+        return .ok(.step($click));
+    }
+    if ($op == 'wait') {
+        int32 $frames = guard parseFrames($v) else ($e) {
+            return .error($e);
+        }
+        return .ok(.wait($frames));
+    }
+    if ($op == 'dumps') {
+        return .ok(.dumps);
+    }
+    if ($op == 'snapshot') {
+        string $name = $v['name']->asStr() ?? 'scene';
+        if ($name->empty()) {
+            return .error('snapshot "name" is a dump name or glob, e.g. "scene" or "pbr.gbuffer.*"');
+        }
+
+        return .ok(.snapshot($name));
+    }
+    if ($op == 'profile') {
+        return .ok(.profile);
+    }
+    if ($op == 'quit') {
+        return .ok(.step(liveStep(.none, false, 0.0, 0.0, $stop: true)));
+    }
+
+    string $known = DEBUG_OPS;
+    return .error("unknown op '{$op}': one of {$known}");
+}
+
+/**
+ * `"commands": [..]` or `"command": ".."`. Blank commands are skipped.
+ */
+internal function parseCommands(json::Value $v) : result<array<string>, string>
+{
+    array<string> $out = array<string>();
+    json::Value? $single = $v->get('command');
+    if ($single != null) {
+        json::Value $sv = guard $single;
+        string $line = guard $sv->asStr() else {
+            return .error('command must be a string');
+        }
+        string $one = str::trim($line);
+        if ($one->empty()) {
+            return .error('no commands');
+        }
+
+        $out[] = $one;
+        return .ok($out);
+    }
+
+    json::Value $list = guard $v->get('commands') else {
+        return .error('console needs "commands": [..] or "command": ".."');
+    }
+    array<json::Value> $items = guard $list->asArray() else {
+        return .error('commands must be an array of strings');
+    }
+    foreach ($items as $item) {
+        string $line = guard $item->asStr() else {
+            return .error('commands must be an array of strings');
+        }
+        string $one = str::trim($line);
+        if (!$one->empty()) {
+            $out[] = $one;
+        }
+    }
+
+    if ($out->empty()) {
+        return .error('no commands');
+    }
+
+    return .ok($out);
+}
+
+/**
+ * `"name"` and `"value"`: a string is the raw flag text, a number or a bool is written as JSON
+ * writes it (`true`, `3`, `0.5`).
+ */
+internal function parseFlagOp(json::Value $v) : result<DebugRequest, string>
+{
+    string $name = str::trim($v['name']->asStr() ?? '');
+    if ($name->empty()) {
+        return .error('flag needs "name" and "value"');
+    }
+
+    json::Value $value = guard $v->get('value') else {
+        return .error('flag needs "name" and "value"');
+    }
+    string $raw = '';
+    if ($value->isStr()) {
+        $raw = str::trim($value->asStr() ?? '');
+    } else {
+        if ($value->isNumber() || $value->isBool()) {
+            $raw = json::dump($value);
+        }
+    }
+
+    if ($raw->empty()) {
+        return .error('flag "value" is a string, a number or a bool');
+    }
+
+    return .ok(.setFlag($name, $raw));
+}
+
+/**
+ * A dcapture camera (`position` with `lookAt`, `euler` or `orientation`, and `fov`) as a step that
+ * pins it, or `"clear": true` to let go.
+ */
+internal function parseCameraOp(json::Value $v) : result<Step, string>
+{
+    if ($v['clear']->asBool() ?? false) {
+        return .ok(liveStep(.clear, false, 0.0, 0.0));
+    }
+
+    CameraSpec $camera = guard parseCamera($v, 'camera') else ($e) {
+        return .error($e->message());
+    }
+    return .ok(liveStep($camera, false, 0.0, 0.0));
+}
+
+/**
+ * `"x"` and `"y"` in window points as a step that clicks there.
+ */
+internal function parseClickOp(json::Value $v) : result<Step, string>
+{
+    string $shape = 'click needs "x" and "y" in window points';
+    float64 $x = guard $v['x']->asFloat() else {
+        return .error($shape);
+    }
+    float64 $y = guard $v['y']->asFloat() else {
+        return .error($shape);
+    }
+    return .ok(liveStep(.none, true, $x, $y));
+}
+
+/**
+ * `"frames"`, 0 to 3600, default 1.
+ */
+internal function parseFrames(json::Value $v) : result<int32, string>
+{
+    json::Value? $given = $v->get('frames');
+    if ($given == null) {
+        return .ok(1);
+    }
+
+    json::Value $fv = guard $given;
+    int64 $n = guard $fv->asInt() else {
+        return .error('frames must be a whole number');
+    }
+    if ($n < 0 || $n > 3600) {
+        return .error('frames must be 0 to 3600');
+    }
+
+    return .ok($n as int32);
+}
+
+internal function liveStep(CameraSpec $camera, bool $click, float64 $x, float64 $y, bool $stop = false) : Step
+{
+    return Step(
+        0,
+        StepAt::after(0),
+        '',
+        array<FlagAssign>(),
+        $camera,
+        array<string>(),
+        array<string>(),
+        false,
+        false,
+        '',
+        $stop,
+        $click,
+        $x,
+        $y,
+    );
+}

@@ -28,7 +28,7 @@ use visu::graphics::{
 use visu::console::{DCaptureConsole, FlagConsole, GpuConsole, OverlayConsole, ProfileConsole};
 use visu::dcapture::{DCapture, DumpQueue, StepRunner};
 #[if: os != windows && os != ios && !VISU_RELEASE]
-use visu::debughttp::{DebugContext, DebugServer};
+use visu::debugserver::{DebugContext, DebugServer};
 #[end]
 use visu::instrument::{DrawSource, Instruments, Overlay, ResourceSource, Sample};
 use visu::math::Vec2;
@@ -71,7 +71,7 @@ public class Host
     public float32 $uiScale;
     private DCapture? $script;
     #[if: os != windows && os != ios && !VISU_RELEASE]
-    private DebugServer? $debugHttp;
+    private DebugServer? $debugServer;
     #[end]
     private FullscreenTextureRenderer $blit;
     private Overlay? $overlay;
@@ -96,14 +96,14 @@ public class Host
             $dcapture->configure($config);
         }
 
-        applyDebugHttpFlags($config);
+        applyDebugServerFlags($config);
         $services->once(function(Services $s) : DumpQueue {
             return DumpQueue('var/dcapture');
         });
         $this->dumps = $services->get<DumpQueue>();
         $this->steps = StepRunner();
         #[if: os != windows && os != ios && !VISU_RELEASE]
-        $this->debugHttp = null;
+        $this->debugServer = null;
         #[end]
         $this->tickIndex = 0;
         $this->config = $config;
@@ -159,7 +159,7 @@ public class Host
         $this->bootOverlay();
         $this->bootUi();
         $this->bootConsole();
-        $this->bootDebugHttp();
+        $this->bootDebugServer();
         if ($this->config->deferAssets) {
             if ($this->fail->failed()) {
                 return .error($this->fail);
@@ -373,11 +373,11 @@ public class Host
     {
         #[if: os != windows && os != ios && !VISU_RELEASE]
         // every request in flight answers 503 before anything it could touch goes away
-        DebugServer? $maybeHttp = $this->debugHttp;
-        if ($maybeHttp != null) {
-            DebugServer $http = guard $maybeHttp;
-            $http->stop();
-            $this->debugHttp = null;
+        DebugServer? $maybeServer = $this->debugServer;
+        if ($maybeServer != null) {
+            DebugServer $server = guard $maybeServer;
+            $server->stop();
+            $this->debugServer = null;
         }
         #[end]
 
@@ -554,10 +554,10 @@ public class Host
         $this->frameIndex = $this->frameIndex + 1;
         $this->dumps->afterPresent($frame, $this->pool, $this->window, $this->frameIndex - 1, $this->tickIndex);
         #[if: os != windows && os != ios && !VISU_RELEASE]
-        DebugServer? $maybeHttp = $this->debugHttp;
-        if ($maybeHttp != null) {
-            DebugServer $http = guard $maybeHttp;
-            $http->afterPresent($frame, $this->pool, $this->window, $this->frameIndex - 1, $this->tickIndex);
+        DebugServer? $maybeServer = $this->debugServer;
+        if ($maybeServer != null) {
+            DebugServer $server = guard $maybeServer;
+            $server->afterPresent($frame, $this->pool, $this->window, $this->frameIndex - 1, $this->tickIndex);
         }
         #[end]
         return true;
@@ -577,10 +577,10 @@ public class Host
             $this->instruments->noteProfile($f, $prof->stats);
             $this->dumps->noteProfile($f, $prof->stats);
             #[if: os != windows && os != ios && !VISU_RELEASE]
-            DebugServer? $maybeHttp = $this->debugHttp;
-            if ($maybeHttp != null) {
-                DebugServer $http = guard $maybeHttp;
-                $http->noteProfile($f, $prof->stats);
+            DebugServer? $maybeServer = $this->debugServer;
+            if ($maybeServer != null) {
+                DebugServer $server = guard $maybeServer;
+                $server->noteProfile($f, $prof->stats);
             }
             #[end]
             $done = $prof->complete();
@@ -599,49 +599,49 @@ public class Host
             $dcapture->advance($this->frameIndex, $this->tickIndex, $this->console, $this->steps);
         }
 
-        $this->drainDebugHttp();
+        $this->drainDebugServer();
         $this->steps->feed($this->input, $this->window);
     }
 
-    private function drainDebugHttp() : void
+    private function drainDebugServer() : void
     {
         #[if: os != windows && os != ios && !VISU_RELEASE]
-        DebugServer $http = guard $this->debugHttp else {
+        DebugServer $server = guard $this->debugServer else {
             return;
         }
-        if ($http->parked()) {
-            $http->expire();
+        if ($server->parked()) {
+            $server->expire();
         }
 
-        if (!$http->pending()) {
+        if (!$server->pending()) {
             return;
         }
 
-        visu::profile::begin('debughttp');
+        visu::profile::begin('debugserver');
         DebugContext $ctx = DebugContext($this->console, $this->steps, $this->frameIndex, $this->tickIndex);
         $ctx->width = $this->window->framebufferWidth();
         $ctx->height = $this->window->framebufferHeight();
         $ctx->windowWidth = $this->config->width;
         $ctx->windowHeight = $this->config->height;
         $ctx->scripted = $this->script != null;
-        $http->drain($ctx);
+        $server->drain($ctx);
         visu::profile::end();
         #[end]
     }
 
-    private function bootDebugHttp() : void
+    private function bootDebugServer() : void
     {
         #[if: os != windows && os != ios && !VISU_RELEASE]
-        if ($this->config->debugHttpPort <= 0) {
+        if ($this->config->debugPort <= 0) {
             return;
         }
 
-        DebugServer $http = DebugServer($this->config->debugHttpHost, $this->config->debugHttpPort, $this->dumps);
-        guard $http->start() else ($e) {
+        DebugServer $server = DebugServer($this->config->debugHost, $this->config->debugPort, $this->dumps);
+        guard $server->start() else ($e) {
             info($e->message());
             return;
         }
-        $this->debugHttp = $http;
+        $this->debugServer = $server;
         #[end]
     }
 
@@ -845,20 +845,23 @@ public class Host
 }
 
 /**
- * `--flag debug.http=<port>` and `debug.http.host` onto the config. A port turns the console on,
- * since most of what a debug client does is a console line.
+ * `--flag debug.port=<port>` and `debug.host` onto the config (`debug.http` and `debug.http.host`
+ * still work, from before the server spoke tcp). A port turns the console on, since most of what
+ * a debug client does is a console line.
  */
-internal function applyDebugHttpFlags(HostConfig $config) : void
+internal function applyDebugServerFlags(HostConfig $config) : void
 {
     #[if: os != windows && os != ios && !VISU_RELEASE]
     Flags $bag = flags();
-    int64 $port = $bag->int('debug.http', $config->debugHttpPort as int64);
+    int64 $legacy = $bag->int('debug.http', $config->debugPort as int64);
+    int64 $port = $bag->int('debug.port', $legacy);
     if ($port > 0 && $port < 65536) {
-        $config->debugHttpPort = $port as int32;
+        $config->debugPort = $port as int32;
     }
 
-    $config->debugHttpHost = $bag->str('debug.http.host', $config->debugHttpHost);
-    if ($config->debugHttpPort > 0) {
+    string $host = $bag->str('debug.http.host', $config->debugHost);
+    $config->debugHost = $bag->str('debug.host', $host);
+    if ($config->debugPort > 0) {
         $config->debugConsole = true;
     }
     #[end]

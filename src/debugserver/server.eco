@@ -1,0 +1,250 @@
+/**
+ * The opt-in debug server: `--flag debug.port=<port>` (and `debug.host`, default 127.0.0.1).
+ * Length-prefixed JSON over TCP (libtcp): every frame is a uint32 big-endian byte count and that
+ * much JSON. The client's first frame is `{"op":"hello","protocol":1}`; after that each request
+ * `{"id", "op", ...}` gets one reply `{"id", "ok", "status", "result" | "error"}`, in order.
+ *
+ * An accept thread hands each connection a thread of its own (at most `DEBUG_CONNECTIONS_MAX`).
+ * A connection thread posts every request to the mailbox and sleeps until the main thread answers
+ * it when the Host drains. Snapshots, the dump catalog and profiles go through a `DumpQueue` of
+ * their own under `var/debug`, so a dcapture run beside it keeps a clean manifest, and answer with
+ * the paths written: the server only listens on loopback, so the client reads them from disk.
+ *
+ * A snapshot reads the image back with the device idle, like every dump: one frame hitches.
+ */
+
+namespace visu::debugserver;
+
+use std::thread;
+use visu::app::info;
+use visu::dcapture::DumpQueue;
+use visu::graphics::{Frame, Pool};
+use visu::os::Window;
+use visu::profile::{FrameProfile, StatsBook};
+
+internal const DEBUG_SERVER_OUT = 'var/debug';
+internal const int32 DEBUG_PROTOCOL = 1;
+
+// one frame's body at most: the largest reply is a console dump or a flag list, far under this
+internal const usize DEBUG_FRAME_MAX = 16777216;
+
+// one client at a time is the intended use; a few more let a second tool look in
+internal const int32 DEBUG_CONNECTIONS_MAX = 4;
+
+// how long a thread sleeps in accept or read before it looks at the stop flag again
+internal const int32 DEBUG_POLL_MS = 100;
+
+// a reply that cannot be written in this long goes to a client that stopped reading
+internal const int32 DEBUG_WRITE_MS = 5000;
+
+// stop waits this long for connection threads to leave (each looks every DEBUG_POLL_MS)
+internal const int32 DEBUG_STOP_TRIES = 400;
+
+public class DebugServer
+{
+    public const string $host;
+    private int32 $requested;
+    private int32 $bound;
+    private DumpQueue $dumps;
+    private DebugMailbox $mailbox;
+    private DebugExecutor $executor;
+    private DebugGate $gate;
+    private thread::handle? $thread;
+
+    /**
+     * `$shared` is the Host's dump queue: this server's queue reads its providers.
+     */
+    public constructor(string $host, int32 $port, DumpQueue $shared)
+    {
+        $this->host = $host;
+        $this->requested = $port;
+        $this->bound = 0;
+        $this->dumps = DumpQueue(DEBUG_SERVER_OUT, sharing: $shared);
+        $this->mailbox = DebugMailbox();
+        $this->executor = DebugExecutor($this->dumps);
+        $this->dumps->sink = $this->executor;
+        $this->gate = DebugGate();
+        $this->thread = null;
+    }
+
+    /**
+     * The bound port, or 0 before `start` succeeded.
+     */
+    public const function port() : int32
+    {
+        return $this->bound;
+    }
+
+    /**
+     * Bind on this thread, so a taken port is an error here, then accept on a thread of its own.
+     */
+    public function start() : status<DebugServerError>
+    {
+        string $address = "{$this->host}:{$this->requested}";
+        tcp::Listener $listener = guard tcp::Listener::open($this->host, $this->requested) else ($e) {
+            return .error(.bind($address, $e->message()));
+        }
+        $this->bound = $listener->port();
+        DebugMailbox $mail = $this->mailbox;
+        DebugGate $gate = $this->gate;
+        thread::handle $handle = guard thread::spawn(function() : void {
+            acceptLoop($listener, $mail, $gate);
+        }) else ($e) {
+            $listener->close();
+            return .error(.spawn($e->message()));
+        }
+        $this->thread = $handle;
+        int32 $protocol = DEBUG_PROTOCOL;
+        info("debug server: listening on {$this->host}:{$this->bound} (protocol {$protocol})");
+        return .ok;
+    }
+
+    /**
+     * Answer what the connection threads posted. Main thread, once a poll. One atomic load when
+     * idle.
+     */
+    public function drain(DebugContext $ctx) : void
+    {
+        DebugJob? $next = $this->mailbox->take();
+        while ($next != null) {
+            DebugJob $job = guard $next;
+            $this->executor->run($job, $ctx);
+            $next = $this->mailbox->take();
+        }
+    }
+
+    /**
+     * True when a job is queued. The Host builds a `DebugContext` only then.
+     */
+    public const function pending() : bool
+    {
+        return $this->mailbox->waiting();
+    }
+
+    /**
+     * True while a job waits on a frame. The Host then calls `expire` every poll.
+     */
+    public const function parked() : bool
+    {
+        return $this->executor->parked();
+    }
+
+    public function expire() : void
+    {
+        $this->executor->expire();
+    }
+
+    /**
+     * After present: answer waits that are due, and write the queued snapshots.
+     */
+    public function afterPresent(Frame $frame, Pool $pool, Window $window, int32 $presented, int32 $tick) : void
+    {
+        $this->executor->tick($presented + 1);
+        $this->dumps->afterPresent($frame, $pool, $window, $presented, $tick);
+    }
+
+    public function noteProfile(const FrameProfile& $profile, const StatsBook& $stats) : void
+    {
+        $this->dumps->noteProfile($profile, $stats);
+    }
+
+    /**
+     * Answer everything in flight with a 503, stop accepting, and wait for every thread to leave,
+     * so none runs past the Host.
+     */
+    public function stop() : void
+    {
+        $this->mailbox->close();
+        $this->executor->close();
+        $this->dumps->sink = null;
+        $this->gate->stop();
+        thread::handle $handle = guard $this->thread else {
+            return;
+        }
+        $this->thread = null;
+        $handle->join();
+        int32 $tries = 0;
+        while ($this->gate->connections() > 0 && $tries < DEBUG_STOP_TRIES) {
+            thread::sleep(5);
+            $tries = $tries + 1;
+        }
+    }
+}
+
+/**
+ * The accept thread: a thread per connection until the gate closes, then the listener goes.
+ */
+internal function acceptLoop(tcp::Listener $listener, DebugMailbox $mail, DebugGate $gate) : void
+{
+    while ($gate->running()) {
+        tcp::Stream? $maybe = guard $listener->accept(DEBUG_POLL_MS) else ($e) {
+            // a failed accept (out of descriptors) must not spin
+            thread::sleep(DEBUG_POLL_MS as usize);
+            continue;
+        }
+        if ($maybe == null) {
+            continue;
+        }
+
+        tcp::Stream $stream = guard $maybe;
+        if (!$gate->enter(DEBUG_CONNECTIONS_MAX)) {
+            int32 $most = DEBUG_CONNECTIONS_MAX;
+            string $busy = replyJson(0, DebugReply(503, error: "the debug server serves {$most} connections at most"));
+            // best effort: the connection closes either way
+            status<tcp::Error> $sent = tcp::writeFrame($stream, $busy, DEBUG_WRITE_MS);
+            $stream->close();
+            continue;
+        }
+
+        thread::handle $served = guard thread::spawn(function() : void {
+            serveConnection($stream, $mail, $gate);
+            $stream->close();
+            $gate->leave();
+        }) else ($e) {
+            $stream->close();
+            $gate->leave();
+            continue;
+        }
+        $served->detach();
+    }
+
+    $listener->close();
+}
+
+/**
+ * One client: the handshake, then a reply for every request until it closes, sends what is not
+ * a frame, or the gate closes.
+ */
+internal function serveConnection(tcp::Stream $stream, DebugMailbox $mail, DebugGate $gate) : void
+{
+    tcp::FrameReader $reader = tcp::FrameReader(DEBUG_FRAME_MAX);
+    bool $greeted = false;
+    while ($gate->running()) {
+        // closed, truncated, oversized (an HTTP client) or broken: the conversation is over
+        string? $next = guard $reader->read($stream, DEBUG_POLL_MS) else {
+            return;
+        }
+        if ($next == null) {
+            continue;
+        }
+
+        string $text = guard $next;
+        if (!$greeted) {
+            int64 $protocol = guard parseHello($text) else ($why) {
+                // best effort: the connection closes either way
+                status<tcp::Error> $sent = tcp::writeFrame($stream, replyJson(0, DebugReply(400, error: $why)), DEBUG_WRITE_MS);
+                return;
+            }
+            guard tcp::writeFrame($stream, helloJson(), DEBUG_WRITE_MS) else {
+                return;
+            }
+            $greeted = true;
+            continue;
+        }
+
+        string $reply = answerFrame($text, $mail);
+        guard tcp::writeFrame($stream, $reply, DEBUG_WRITE_MS) else {
+            return;
+        }
+    }
+}

@@ -1,0 +1,61 @@
+/**
+ * The JSON the debug server answers with.
+ */
+
+namespace visu::debugserver;
+
+use visu::app::FlagValue;
+
+/**
+ * One reply frame: `{"id", "ok", "status", "result"}` on success, `{"id", "ok", "status",
+ * "error"}` otherwise. The result is spliced in as the executor wrote it, not parsed again.
+ */
+internal function replyJson(int64 $id, const DebugReply& $reply) : string
+{
+    if ($reply->status == 200) {
+        string $out = '{"id":';
+        $out->append("{$id}");
+        $out->append(',"ok":true,"status":200,"result":');
+        $out->append($reply->body);
+        $out->append('}');
+        return $out;
+    }
+
+    json::Value $o = json::object();
+    $o['id'] = json::int($id);
+    $o['ok'] = json::bool(false);
+    $o['status'] = json::int($reply->status as int64);
+    $o['error'] = json::str($reply->error);
+    return json::dump($o);
+}
+
+/**
+ * The answer to the handshake.
+ */
+internal function helloJson() : string
+{
+    json::Value $o = json::object();
+    $o['ok'] = json::bool(true);
+    $o['protocol'] = json::int(DEBUG_PROTOCOL as int64);
+    return json::dump($o);
+}
+
+internal function stringsJson(const array<string>& $items) : json::Value
+{
+    json::Value $list = json::arr();
+    foreach ($items as $item) {
+        $list[] = $item;
+    }
+
+    return $list;
+}
+
+internal function flagJson(FlagValue $value) : json::Value
+{
+    return match ($value) {
+        FlagValue::boolean($v) => json::bool($v),
+        FlagValue::integer($n) => json::int($n),
+        FlagValue::floating($n) => json::float($n),
+        FlagValue::text($s) => json::str($s),
+    };
+}

@@ -1,0 +1,179 @@
+/**
+ * Debug server request frames: the handshake, every op, and the refusals.
+ */
+
+use visu::dcapture::{CameraSpec, Step};
+use visu::debugserver::DebugRequest;
+
+internal function opOf(const string& $text) : DebugRequest
+{
+    json::Value $v = guard json::parse($text) else ($e) {
+        die("bad test json: {$e->message()}");
+    }
+    DebugRequest $r = guard visu::debugserver::parseOp($v) else ($why) {
+        die("parseOp: {$why}");
+    }
+    return $r;
+}
+
+internal function refused(const string& $text) : bool
+{
+    json::Value $v = guard json::parse($text) else ($e) {
+        return true;
+    }
+    return !visu::debugserver::parseOp($v)->has_value();
+}
+
+test debugserver_hello_checks_the_protocol
+{
+    bool $ok = visu::debugserver::parseHello('{"op":"hello","protocol":1}')->has_value();
+    assert($ok, 'protocol 1');
+    bool $other = visu::debugserver::parseHello('{"op":"hello","protocol":2}')->has_value();
+    assert(!$other, 'another protocol');
+    bool $notHello = visu::debugserver::parseHello('{"id":1,"op":"status"}')->has_value();
+    assert(!$notHello, 'a request before the handshake');
+    bool $broken = visu::debugserver::parseHello('{"op":')->has_value();
+    assert(!$broken, 'bad json');
+}
+
+test debugserver_plain_ops
+{
+    bool $status = match (opOf('{"id":1,"op":"status"}')) {
+        DebugRequest::status => true,
+        else => false,
+    };
+    assert($status, 'status');
+    bool $verbs = match (opOf('{"op":"verbs"}')) {
+        DebugRequest::verbs => true,
+        else => false,
+    };
+    assert($verbs, 'verbs, the id is optional');
+    bool $flags = match (opOf('{"op":"flags"}')) {
+        DebugRequest::flags => true,
+        else => false,
+    };
+    assert($flags, 'flags');
+    bool $dumps = match (opOf('{"op":"dumps"}')) {
+        DebugRequest::dumps => true,
+        else => false,
+    };
+    assert($dumps, 'dumps');
+    bool $profile = match (opOf('{"op":"profile"}')) {
+        DebugRequest::profile => true,
+        else => false,
+    };
+    assert($profile, 'profile');
+    bool $quit = match (opOf('{"op":"quit"}')) {
+        DebugRequest::step($s) => $s->stop,
+        else => false,
+    };
+    assert($quit, 'quit is a stop step');
+}
+
+test debugserver_console_op
+{
+    array<string> $list = match (opOf('{"op":"console","commands":["time pause"," ","moon age 12"]}')) {
+        DebugRequest::console($c) => $c,
+        else => array<string>(),
+    };
+    assert($list->count() == 2, 'blank commands skipped');
+    assert($list[1] == 'moon age 12', 'order kept');
+    array<string> $one = match (opOf('{"op":"console","command":"fog"}')) {
+        DebugRequest::console($c) => $c,
+        else => array<string>(),
+    };
+    assert($one->count() == 1 && $one[0] == 'fog', 'one command');
+    assert(refused('{"op":"console"}'), 'no commands');
+    assert(refused('{"op":"console","commands":[1]}'), 'a command that is not a string');
+    assert(refused('{"op":"console","commands":[" "]}'), 'only blank commands');
+}
+
+test debugserver_flag_op
+{
+    string $raw = match (opOf('{"op":"flag","name":"fog.model","value":"legacy"}')) {
+        DebugRequest::setFlag($n, $r) => $r,
+        else => '',
+    };
+    assert($raw == 'legacy', 'a string value');
+    string $num = match (opOf('{"op":"flag","name":"light.shadowdistance","value":60}')) {
+        DebugRequest::setFlag($n, $r) => $r,
+        else => '',
+    };
+    assert($num == '60', 'a number written as json writes it');
+    string $yes = match (opOf('{"op":"flag","name":"light.shadows","value":false}')) {
+        DebugRequest::setFlag($n, $r) => $r,
+        else => '',
+    };
+    assert($yes == 'false', 'a bool');
+    assert(refused('{"op":"flag","value":"x"}'), 'no name');
+    assert(refused('{"op":"flag","name":"a"}'), 'no value');
+}
+
+test debugserver_step_camera_click_ops
+{
+    bool $step = match (opOf('{"op":"step","step":{"console":["time"],"dump":["scene"],"frame":40}}')) {
+        DebugRequest::step($s) => $s->console->count() == 1 && $s->dump->count() == 1,
+        else => false,
+    };
+    assert($step, 'a step object, its timing key ignored');
+    assert(refused('{"op":"step"}'), 'step needs a step');
+
+    bool $posed = match (opOf('{"op":"camera","position":[0,10,20],"lookAt":[0,0,0],"fov":50}')) {
+        DebugRequest::step($s) => match ($s->camera) {
+            CameraSpec::pose($p, $q, $fov) => $fov == 50.0f,
+            else => false,
+        },
+        else => false,
+    };
+    assert($posed, 'a pose with its fov');
+    bool $cleared = match (opOf('{"op":"camera","clear":true}')) {
+        DebugRequest::step($s) => match ($s->camera) {
+            CameraSpec::clear => true,
+            else => false,
+        },
+        else => false,
+    };
+    assert($cleared, 'clear lets go');
+
+    bool $clicked = match (opOf('{"op":"click","x":950,"y":560}')) {
+        DebugRequest::step($s) => $s->click && $s->clickX == 950.0 && $s->clickY == 560.0,
+        else => false,
+    };
+    assert($clicked, 'a click in window points');
+    assert(refused('{"op":"click","x":1}'), 'a click without y');
+}
+
+test debugserver_wait_and_snapshot_ops
+{
+    int32 $one = match (opOf('{"op":"wait"}')) {
+        DebugRequest::wait($n) => $n,
+        else => -1,
+    };
+    assert($one == 1, 'one frame by default');
+    int32 $thirty = match (opOf('{"op":"wait","frames":30}')) {
+        DebugRequest::wait($n) => $n,
+        else => -1,
+    };
+    assert($thirty == 30, 'frames');
+    assert(refused('{"op":"wait","frames":3601}'), 'past 3600');
+    assert(refused('{"op":"wait","frames":-1}'), 'negative');
+    assert(refused('{"op":"wait","frames":"ten"}'), 'not a number');
+
+    string $scene = match (opOf('{"op":"snapshot"}')) {
+        DebugRequest::snapshot($p) => $p,
+        else => '',
+    };
+    assert($scene == 'scene', 'the scene by default');
+    string $glob = match (opOf('{"op":"snapshot","name":"pbr.gbuffer.*"}')) {
+        DebugRequest::snapshot($p) => $p,
+        else => '',
+    };
+    assert($glob == 'pbr.gbuffer.*', 'a glob');
+}
+
+test debugserver_unknown_and_malformed_requests
+{
+    assert(refused('{"op":"teleport"}'), 'an unknown op');
+    assert(refused('{"id":3}'), 'no op');
+    assert(refused('[1,2]'), 'not an object');
+}

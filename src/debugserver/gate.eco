@@ -1,0 +1,52 @@
+/**
+ * What the server's threads share besides the mailbox: the stop flag and how many connections
+ * are being served. Atomics only, so no thread ever waits on another for it.
+ */
+
+namespace visu::debugserver;
+
+#[atomic]
+internal class DebugGate
+{
+    private atomic<int32> $stopping;
+    private atomic<int32> $open;
+
+    public constructor()
+    {
+        $this->stopping = atomic<int32>(0);
+        $this->open = atomic<int32>(0);
+    }
+
+    public const function running() : bool
+    {
+        return $this->stopping->load() == 0;
+    }
+
+    public function stop() : void
+    {
+        $this->stopping->store(1);
+    }
+
+    /**
+     * Count one more connection in, unless `$most` are already served.
+     */
+    public function enter(int32 $most) : bool
+    {
+        if ($this->open->load() >= $most) {
+            return false;
+        }
+
+        int32 $was = $this->open->add(1);
+        return true;
+    }
+
+    public function leave() : void
+    {
+        int32 $was = $this->open->sub(1);
+    }
+
+    public const function connections() : int32
+    {
+        return $this->open->load();
+    }
+}
