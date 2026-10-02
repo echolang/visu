@@ -28,10 +28,10 @@ namespace visu::system;
 
 use visu::app::{FlagValue, Flags, flags, info};
 use visu::asset::{Assembly, AssemblyNode, AssemblyPart, MODEL_MAX_LODS};
-use visu::components::{AssemblyInstance, DynamicModel, SkinPose, SkinnedModel, StaticModel};
+use visu::components::{AssemblyInstance, DynamicModel, SkinPose, SkinnedModel, StaticModel, assemblyRootOf};
 use visu::ecs::{Entities, Entity, EntityHook, Schedule, System, View};
 use std::time;
-use visu::geo::{AABB, Frustum, Plane, Pose, Transform};
+use visu::geo::{AABB, Frustum, Plane, Pose, Transform, decomposePose, poseBounds};
 use visu::graphics::{
     SCENE_CHUNK_METRES, SCENE_PASS_CAMERA, SCENE_PASS_MIRROR, SCENE_PASS_OUTLINE,
     CallbackPass, CameraData, DebugLines, DeferredRenderer, DrawCallAssembler, Frame, GBufferData, GeometryFiller, GeometryFillers,
@@ -39,7 +39,8 @@ use visu::graphics::{
     SceneRow,
     Pipeline, PipelineError, RenderContext,
     RenderEncoder, SHADOW_CASCADES, SKIN_PALETTE_ROWS, SKIN_PALETTE_SLOT, ShaderProgram,
-    ReflectionCaster, ShadowCascade, ShadowCaster, ShadowMapData, SkinInstanceData, TransientSlice,
+    ReflectionCaster, SCENE_VIEW_CASCADES, SCENE_VIEW_GBUFFER, SCENE_VIEW_MIRROR, SCENE_VIEW_OUTLINE, SceneDrawer,
+    SceneViews, ShadowCascade, ShadowCaster, ShadowMapData, SkinInstanceData, TransientSlice,
     WaterDraw, WaterFrame, debugLinePass, lodIndex, modelLayout, shadowReach, skinnedLayout,
     waterAbove
 };
@@ -47,188 +48,7 @@ use visu::console::lodColor;
 use visu::math::{Mat4, Quat, Vec3, Vec4, length, scale, translate};
 use visu::runtime::DebugConsole;
 
-/**
- * One model's assembler handles, lod-major: level `l` is `$handles[$lodStart[l] .. $lodStart[l + 1])`.
- */
-internal class ModelHandles
-{
-    public Model $model;
-    public array<visu::graphics::MeshHandle> $handles;
-    public array<int32> $lodStart;
-
-    /**
-     * Some material of the model casts a shadow; false keeps its GPU scene rows out of every
-     * shadow view.
-     */
-    public bool $anyCast;
-
-    /**
-     * Placed statics, dynamics and skins drawing this model. `evict` waits for zero.
-     */
-    public int32 $users;
-
-    /**
-     * Evicted: the handles went back to the mesh table and the slot waits for reuse.
-     */
-    public bool $dead;
-
-    public constructor(Model $model)
-    {
-        $this->model = $model;
-        $this->handles = array<visu::graphics::MeshHandle>();
-        $this->lodStart = array<int32>();
-        $this->anyCast = false;
-        $this->users = 0;
-        $this->dead = false;
-    }
-}
-
-/**
- * Evictions `drainEvictions` may hold at once before the queue grows.
- */
-internal const int32 MODEL_EVICT_RESERVE = 64;
-
-/**
- * One skin this frame: where it stands and where its joints start in the frame palette.
- * `fill` writes these; the GBuffer pass and every cascade read the same list.
- */
-internal struct SkinDraw
-{
-    public Entity $entity;
-    public int32 $handles;
-    public Mat4 $world;
-    public AABB $bounds;
-    public Vec4 $tint;
-    public float32 $lodBias;
-    public float32 $base;
-}
-
-/**
- * One casting mover's shadow bookkeeping: where it was when its shadows were last redrawn,
- * and everything it swept since.
- */
-internal struct MoverTrack
-{
-    public AABB $drawn;
-    public AABB $swept;
-    public bool $moved;
-}
-
-/**
- * Metres from the eye within which a moving caster redraws its point-light shadows every
- * frame; past it, every `MOVER_SHADOW_EVERY` frames, over everything it swept meanwhile.
- */
-public const float32 MOVER_SHADOW_NEAR = 20.0f;
-public const int32 MOVER_SHADOW_EVERY = 4;
-
-/**
- * One acquired dynamic in the CPU main view's draw list: its handles, world and bounds (current
- * while it rests, interpolated each frame while it moves), look and whether it is hidden.
- */
-internal struct DynamicDraw
-{
-    public Entity $entity;
-    public int32 $handles;
-    public Mat4 $world;
-    public AABB $bounds;
-    public Vec4 $tint;
-    public float32 $lodBias;
-    public bool $hidden;
-}
-
-internal enum ModelKind
-{
-    case statics;
-    case dynamic;
-    case skinned;
-}
-
-/**
- * What `ModelSystem` holds for one model entity: its GPU scene row, its model's handle slot,
- * which kind drew it, its place in the static set or the dynamic draw list, and the update its
- * row last moved in.
- */
-internal struct ModelRecord
-{
-    public int32 $row;
-    public int32 $handles;
-    public ModelKind $kind;
-    public int32 $slot;
-    public uint32 $movedIn;
-    public bool $moving;
-    public bool $shown;
-
-    /**
-     * The fill a skin was last packed in; a skin that misses one leaves the scene until it is back.
-     */
-    public int32 $frame;
-
-    /**
-     * The outline style slot its row glows in, -1 for none (`highlight`).
-     */
-    public int32 $outline = -1;
-
-    /**
-     * Its entity has a parent, or is an assembly root: a move then walks the assembly. Read once at
-     * acquire; a body or a car root without either moves on the fast path.
-     */
-    public bool $linked = true;
-
-    /**
-     * An editor drag (`beginEdit`) holds its row in the active set until `endEdit`.
-     */
-    public bool $editing = false;
-
-    /**
-     * Its index in the moving list while `moving`, -1 otherwise.
-     */
-    public int32 $movingAt = -1;
-}
-
-/**
- * Model arrivals `fill` acquires in one frame at most; the rest wait for the next. A map load of a
- * few thousand is one frame; a scatter of a million ramps in over a couple of seconds.
- */
-public const int32 MODEL_ACQUIRE_BUDGET = 8192;
-
-/**
- * Milliseconds of a displayed frame the acquisitions may take, checked every
- * `MODEL_ACQUIRE_CHECK` arrivals: a big scatter ramps in without a hitch. Under a pinned clock
- * (dcapture `fixedStep`) only the count holds, so a run acquires the same rows every frame.
- */
-public const float64 MODEL_ACQUIRE_MS = 2.0;
-internal const int32 MODEL_ACQUIRE_CHECK = 256;
-
-/**
- * Model entities `highlight` may hold at once. An assembly root counts each part it expands to.
- */
-public const int32 MODEL_HIGHLIGHTS = 16;
-
-/**
- * One highlighted model entity and the outline style slot it glows in.
- */
-internal struct ModelHighlight
-{
-    public Entity $entity;
-    public int32 $style;
-}
-
-/**
- * Forms `preview` takes in one frame; the rest are dropped. A placement ghost is one.
- */
-public const int32 MODEL_PREVIEWS = 8;
-
-/**
- * One `preview` call: the form, its root in the world and the outline style slot it draws in.
- */
-internal struct ModelPreview
-{
-    public PreviewForm $form;
-    public Mat4 $root;
-    public int32 $style;
-}
-
-public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, ReflectionCaster
+public class ModelSystem : System, SceneDrawer, GeometryFiller, ShadowCaster, OutlineCaster, ReflectionCaster
 {
     public ModelBank $bank;
 
@@ -236,6 +56,16 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      * The world `fill` saw this frame, drawn when the geometry pass reaches `record`.
      */
     private Entities? $filling;
+
+    /**
+     * The world `register` bound, which `prepare` works over.
+     */
+    private Entities? $world;
+
+    /**
+     * The world box of what this frame's outline mask draws (`outlineBounds`).
+     */
+    private AABB $outlined;
     public DeferredRenderer $renderer;
 
     /**
@@ -263,9 +93,8 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     private int32 $flagsSeen;
 
     /**
-     * Counts from the last draw, for the console and tests.
+     * Skins posed in the last fill, for the console and tests.
      */
-    public int32 $dynamicCount;
     public int32 $skinnedCount;
 
     /**
@@ -273,14 +102,13 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public int32 $paletteRows;
     public int32 $paletteDropped;
-    public int32 $submitted;
-    public int32 $distanceCulled;
-    public array<int32> $lodHistogram;
-    private StaticSet $statics;
-    private ModelLane<ModelInstanceData> $rigid;
-    private ModelLane<SkinInstanceData> $skinned;
     private map<string, int32> $modelIndex;
-    private array<ModelHandles> $models;
+
+    /**
+     * The handle slots, the dynamic draw list and this frame's skins, shared with the CPU main
+     * views when they draw.
+     */
+    private ModelTables $tables;
 
     /**
      * Handle slots an eviction freed, reused by the next `acquire`.
@@ -331,8 +159,6 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     /**
      * This frame's skins and their palette rows, kept across frames so the capacity survives.
      */
-    private array<SkinDraw> $skinDraws;
-    private array<DynamicDraw> $dynamicDraws;
     private array<Vec4> $palette;
 
     /**
@@ -366,12 +192,12 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     private int32 $moverFrame;
 
     /**
-     * The main views come from the GPU scene (`--flag models.gpu`, on by default where the device
-     * has bindless textures): the camera, the mirror and the outline are culled and drawn on the
-     * GPU, and no CPU structure (the static octree, the per-frame mover worlds) is kept for them.
-     * Off keeps the CPU assemblers. Read once, at construction.
+     * The CPU main views (`CpuModelViews`): null when the main views come from the GPU scene
+     * (`--flag models.gpu`, on by default where the device has bindless textures), so the camera,
+     * the mirror and the outline are culled and drawn on the GPU and no CPU structure is kept for
+     * them. Decided once, at construction.
      */
-    private bool $gpu;
+    private CpuModelViews? $cpu;
     private ScenePasses $passes;
 
     /**
@@ -391,11 +217,12 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->bank = $bank;
         $this->renderer = $renderer;
         $this->scene = $renderer->scene;
-        $this->scene->bank = $bank;
         $this->tracks = View<MoverTrack>();
         $this->moverFrame = 0;
-        $this->gpu = flags()->bool('models.gpu', true) && $bank->device->limits()->bindless;
-        $this->scene->mainViews = $this->gpu;
+        // a bank that already dropped its classic meshes can only feed GPU views
+        bool $wanted = flags()->bool('models.gpu', true) || !$bank->keepsClassicMeshes();
+        bool $gpuViews = $wanted && $bank->device->limits()->bindless;
+        $this->scene->own($bank, $gpuViews);
         if ($this->scene->rowCount() == 0) {
             $this->scene->layout($world, flags()->float('scene.chunk', SCENE_CHUNK_METRES as float64) as float32);
         }
@@ -405,41 +232,18 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->previewRowsUsed = 0;
         $this->staticRecords = 0;
         $this->filling = null;
+        $this->world = null;
+        $this->outlined = AABB(Vec3(0.0f), Vec3(0.0f));
         $this->lodBias = flags()->float('model.lod', 1.0) as float32;
         $this->wireframe = flags()->bool('model.wire', false);
         $this->showBounds = flags()->bool('model.bounds', false);
         $this->showOctree = flags()->bool('model.octree', false);
         $this->flagsSeen = flags()->version;
-        $this->dynamicCount = 0;
         $this->skinnedCount = 0;
         $this->paletteRows = 0;
         $this->paletteDropped = 0;
-        $this->submitted = 0;
-        $this->distanceCulled = 0;
-        $this->lodHistogram = array<int32>();
-        int32 $i = 0;
-        while ($i < MODEL_MAX_LODS) {
-            $this->lodHistogram[] = 0;
-            $i = $i + 1;
-        }
-
-        $this->statics = StaticSet($world);
-        $this->rigid = ModelLane<ModelInstanceData>(
-            $bank->device,
-            modelLayout(),
-            'model',
-            'model+parallax',
-            'outline_mask'
-        );
-        $this->skinned = ModelLane<SkinInstanceData>(
-            $bank->device,
-            skinnedLayout(),
-            'model+skinned',
-            'model+skinned_parallax',
-            'outline_mask+skinned'
-        );
         $this->modelIndex = map<string, int32>();
-        $this->models = array<ModelHandles>();
+        $this->tables = ModelTables();
         $this->freeModels = array<int32>();
         $this->evictions = arr::room<string>(MODEL_EVICT_RESERVE as usize);
         $this->records = View<ModelRecord>();
@@ -452,8 +256,6 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->movingRecords = array<Entity>();
         $this->movingUpdates = array<uint32>();
         $this->expanded = View<int32>();
-        $this->skinDraws = array<SkinDraw>();
-        $this->dynamicDraws = array<DynamicDraw>();
         $this->palette = array<Vec4>();
         $this->palette->reserve(SKIN_PALETTE_ROWS as usize);
         $this->highlights = arr::room<ModelHighlight>(MODEL_HIGHLIGHTS as usize);
@@ -462,6 +264,11 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->lines = DebugLines($bank->device);
         $this->linePass = null;
         $this->hooks = array<EntityHook>();
+        $this->cpu = cpuViewsFor($gpuViews, $bank, $world, $this->tables);
+        if ($gpuViews) {
+            // the GPU scene reads only the arena: the classic meshes would be a second, unread copy
+            $bank->dropClassicMeshes();
+        }
     }
 
     /**
@@ -469,11 +276,10 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public const function staticCount() : int32
     {
-        if ($this->gpu) {
+        CpuModelViews $cpu = guard $this->cpu else {
             return $this->staticRecords;
         }
-
-        return $this->statics->count;
+        return $cpu->statics->count;
     }
 
     /**
@@ -481,7 +287,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public const function gpuViews() : bool
     {
-        return $this->gpu;
+        return $this->cpu == null;
     }
 
     /**
@@ -491,6 +297,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public function register(Entities $entities) : void
     {
+        $this->world = $entities;
         ModelSystem $sys = $this;
         $this->hooks[] = $entities->onAttach<StaticModel>(function(Entities $w, Entity $e, const StaticModel& $c) : void {
             $sys->arrive($e);
@@ -548,12 +355,15 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     {
         $this->records->reserve($models as usize);
         $this->arrivals->reserve($models as usize);
+        $this->refreshes->reserve($models as usize);
         $this->moved->reserve(($movers * 2) as usize);
         $this->movingRecords->reserve($movers as usize);
         $this->movingUpdates->reserve($movers as usize);
-        $this->dynamicDraws->reserve($movers as usize);
-        if (!$this->gpu) {
-            $this->statics->reserve($models as usize);
+        $this->tables->dynamics->reserve($movers as usize);
+        CpuModelViews? $cpu = $this->cpu;
+        if ($cpu != null) {
+            CpuModelViews $views = guard $cpu;
+            $views->statics->reserve($models as usize);
         }
 
         $this->scene->reserve($models, $movers);
@@ -564,6 +374,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public function unregister(Entities $entities) : void
     {
+        $this->world = null;
         foreach ($this->hooks as $hook) {
             $entities->release($hook);
         }
@@ -577,13 +388,11 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->previewRows->clear();
         $this->previewRowsUsed = 0;
         $this->staticRecords = 0;
-        $this->rigid->clear();
-        $this->skinned->clear();
-        $this->models->clear();
+        $this->cpu?->clear();
+        $this->tables->models->clear();
         $this->freeModels->clear();
         $this->evictions->clear();
         $this->modelIndex->clear();
-        $this->statics->clear();
         $this->records = View<ModelRecord>();
         $this->arrivals->clear();
         $this->arrivalsRead = 0;
@@ -593,8 +402,8 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->movingRecords->clear();
         $this->movingUpdates->clear();
         $this->expanded = View<int32>();
-        $this->skinDraws->clear();
-        $this->dynamicDraws->clear();
+        $this->tables->skins->clear();
+        $this->tables->dynamics->clear();
         $this->palette->clear();
         $this->highlights->clear();
         $this->previews->clear();
@@ -622,8 +431,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             bool $wire = $bag->bool('model.wire', $this->wireframe);
             if ($wire != $this->wireframe) {
                 $this->wireframe = $wire;
-                $this->rigid->reset();
-                $this->skinned->reset();
+                $this->cpu?->reset();
                 $this->passes->reset($wire);
             }
         }
@@ -714,19 +522,11 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public function mask(RenderContext $ctx, RenderEncoder $enc) : void
     {
-        if ($this->gpu) {
-            ScenePasses $passes = $this->passes;
-            $this->scene->drawMain($enc, SCENE_PASS_OUTLINE, function(int32 $k) : GpuPass? {
-                return $passes->outline($k);
-            });
+        CpuModelViews $cpu = guard $this->cpu else {
+            $this->scene->drawMain($enc, SCENE_PASS_OUTLINE, $this->passes, .outline);
             return;
         }
-
-        $this->rigid->outline($enc, $this->bank);
-        if ($this->skinned->outlines()) {
-            $this->bindPalette($enc);
-            $this->skinned->outline($enc, $this->bank);
-        }
+        $cpu->mask($enc, $this->bank, $this->scene->palette);
     }
 
     /**
@@ -786,7 +586,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $rec->editing = $on;
         $this->scene->pin($rec->row, $on);
         // the next fill rewrites it exactly, which places it by the pin
-        $this->refreshes[] = $e;
+        $this->queueRefresh($e);
     }
 
     /**
@@ -812,13 +612,15 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      * Acquire what arrived, apply edits and moves to the GPU scene rows, then one pass that
      * writes the GBuffer with every visible instance.
      */
-    public function fill(Entities $entities, RenderContext $ctx, GBufferData $gbuffer) : void
+    public function prepare(RenderContext $ctx, SceneViews $views) : int32
     {
+        Entities $entities = guard $this->world else {
+            return 0;
+        }
         $this->ensurePasses();
         $this->drainEvictions();
         $this->moverFrame = $this->moverFrame + 1;
-        $this->scene->lodBias = $this->lodBias;
-        $this->scene->interpolation = $ctx->compensation;
+        $this->scene->frameInputs($this->lodBias, $ctx->compensation);
         Vec3 $eye = Vec3(0.0f);
         CameraData? $view = $ctx->frame->find<CameraData>();
         if ($view != null) {
@@ -834,7 +636,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         visu::profile::begin('moves');
         $this->applyMoves($entities, $eye);
         visu::profile::end();
-        if (!$this->gpu) {
+        if ($this->cpu != null) {
             visu::profile::begin('interpolate');
             $this->interpolateMoving($entities, $ctx->compensation, $eye);
             visu::profile::end();
@@ -843,37 +645,33 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         visu::profile::end();
         $this->packSkins($entities, $ctx);
         $this->packMovers($ctx, $eye);
-        if ($this->gpu) {
+        if ($this->cpu == null) {
             $this->passes->ensure($this->bank);
             $this->writePreviews();
-            $this->scene->outlining = $this->highlights->count() > 0 || $this->previewRowsUsed > 0;
+            $this->scene->outlines($this->highlights->count() > 0 || $this->previewRowsUsed > 0);
         }
         $this->filling = $entities;
-        $ctx->frame->get<GeometryFillers>()->add($this);
-        ShadowMapData? $shadows = $ctx->frame->find<ShadowMapData>();
-        if ($shadows != null) {
-            ShadowMapData $data = guard $shadows;
-            $data->add($this);
-        }
-
-        WaterFrame? $water = $ctx->frame->find<WaterFrame>();
+        int32 $wants = SCENE_VIEW_GBUFFER | SCENE_VIEW_CASCADES;
+        WaterFrame? $water = $views->mirror;
         if ($water != null) {
             WaterFrame $mirror = guard $water;
-            if ($mirror->active && $mirror->mirror) {
-                $this->prepareReflection($entities, $ctx, $mirror);
-                $mirror->casters[] = $this;
-            }
+            $this->prepareReflection($entities, $ctx, $mirror);
+            $wants = $wants | SCENE_VIEW_MIRROR;
         }
 
-        if ($this->highlights->count() > 0 || $this->previews->count() > 0) {
-            OutlineData? $outline = $ctx->frame->find<OutlineData>();
-            if ($outline != null) {
-                OutlineData $mailbox = guard $outline;
-                $this->prepareOutline($entities, $ctx, $mailbox);
+        if ($views->outline && ($this->highlights->count() > 0 || $this->previews->count() > 0)) {
+            if ($this->prepareOutline($entities, $ctx)) {
+                $wants = $wants | SCENE_VIEW_OUTLINE;
             }
         }
 
         $this->previews->clear();
+        return $wants;
+    }
+
+    public function outlineBounds() : AABB
+    {
+        return $this->outlined;
     }
 
     /**
@@ -937,19 +735,18 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      * picks, so the mask traces the same surface the scene depth holds. O(highlighted); statics
      * resolve through the set's entity map, skins through this frame's short skin list.
      */
-    private function prepareOutline(Entities $entities, RenderContext $ctx, OutlineData $mailbox) : void
+    private function prepareOutline(Entities $entities, RenderContext $ctx) : bool
     {
         CameraData $view = guard $ctx->frame->find<CameraData>() else {
-            return;
+            return false;
         }
-        if ($this->gpu) {
-            $this->outlineBox($entities, $mailbox);
-            return;
+        CpuModelViews $cpu = guard $this->cpu else {
+            return $this->outlineBox($entities);
         }
 
         visu::profile::begin('outline');
-        $this->rigid->outlineDca->clearInstances();
-        $this->skinned->outlineDca->clearInstances();
+        $cpu->outlineBegin();
+        CpuDrawTuning $tuning = $this->tuning();
         Vec3 $eye = $view->cullPosition;
         float32 $alpha = $ctx->compensation;
         bool $any = false;
@@ -958,12 +755,12 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             // the mask program reads the style slot from the tint's red channel
             Vec4 $tag = Vec4($mark->style as float32, 0.0f, 0.0f, 1.0f);
             Entity $e = $mark->entity;
-            int32 $slot = $this->statics->find($e);
+            int32 $slot = $cpu->statics->find($e);
             if ($slot >= 0) {
-                StaticInstance $inst = $this->statics->get($slot as uint32);
+                StaticInstance $inst = $cpu->statics->get($slot as uint32);
                 if ($inst->live) {
-                    ModelHandles $h = $this->models[$inst->handles as usize];
-                    $this->submitVisible($this->rigid->outlineDca, $h, $inst->world, $inst->bounds, ModelInstanceData($tag), $inst->lodBias, $eye, false);
+                    ModelHandles $h = $this->tables->models[$inst->handles as usize];
+                    $cpu->outlineRigid($h, $inst->world, $inst->bounds, ModelInstanceData($tag), $inst->lodBias, $eye, $tuning);
                     $box = outlineUnion($box, $inst->bounds, $any);
                     $any = true;
                 }
@@ -973,10 +770,10 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
 
             if ($this->records->contains($e) && $this->records->get($e)->kind == ModelKind::dynamic) {
                 ModelRecord $rec = $this->records->get($e);
-                DynamicDraw $dyn = $this->dynamicDraws[$rec->slot as usize];
+                DynamicDraw $dyn = $this->tables->dynamics[$rec->slot as usize];
                 if (!$dyn->hidden) {
-                    ModelHandles $h = $this->models[$rec->handles as usize];
-                    $this->submitVisible($this->rigid->outlineDca, $h, $dyn->world, $dyn->bounds, ModelInstanceData($tag), $dyn->lodBias, $eye, false);
+                    ModelHandles $h = $this->tables->models[$rec->handles as usize];
+                    $cpu->outlineRigid($h, $dyn->world, $dyn->bounds, ModelInstanceData($tag), $dyn->lodBias, $eye, $tuning);
                     $box = outlineUnion($box, $dyn->bounds, $any);
                     $any = true;
                 }
@@ -984,14 +781,14 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
                 continue;
             }
 
-            foreach ($this->skinDraws as $skin) {
+            foreach ($this->tables->skins as $skin) {
                 if ($skin->entity != $e) {
                     continue;
                 }
 
-                ModelHandles $h = $this->models[$skin->handles as usize];
+                ModelHandles $h = $this->tables->models[$skin->handles as usize];
                 SkinInstanceData $payload = SkinInstanceData($tag, Vec4($skin->base, 0.0f, 0.0f, 0.0f));
-                $this->submitVisible($this->skinned->outlineDca, $h, $skin->world, $skin->bounds, $payload, $skin->lodBias, $eye, false);
+                $cpu->outlineSkinned($h, $skin->world, $skin->bounds, $payload, $skin->lodBias, $eye, $tuning);
                 $box = outlineUnion($box, $skin->bounds, $any);
                 $any = true;
             }
@@ -1010,7 +807,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
                     continue;
                 }
 
-                ModelHandles $h = $this->models[$handles as usize];
+                ModelHandles $h = $this->tables->models[$handles as usize];
 
                 if ($h->model->skinned()) {
                     continue;
@@ -1018,18 +815,20 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
 
                 Mat4 $world = $ghost->root * $ghost->form->locals[($i - 1) as usize];
                 AABB $bounds = $h->model->bounds->transformed($world);
-                $this->submitVisible($this->rigid->outlineDca, $h, $world, $bounds, ModelInstanceData($tag), 1.0f, $eye, false);
+                $cpu->outlineRigid($h, $world, $bounds, ModelInstanceData($tag), 1.0f, $eye, $tuning);
                 $box = outlineUnion($box, $bounds, $any);
                 $any = true;
             }
         }
 
-        $this->rigid->buildOutline($view->cullFrustum, $eye);
-        $this->skinned->buildOutline($view->cullFrustum, $eye);
+        bool $drawn = $cpu->outlineBuild($view->cullFrustum, $eye);
         visu::profile::end();
-        if ($any && ($this->rigid->outlines() || $this->skinned->outlines())) {
-            $mailbox->add($this, $box);
+        if ($any && $drawn) {
+            $this->outlined = $box;
+            return true;
         }
+
+        return false;
     }
 
     /**
@@ -1060,142 +859,62 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public function record(RenderContext $ctx, RenderEncoder $enc) : status<PipelineError>
     {
-        Entities $entities = guard $this->filling else {
-            return .ok;
-        }
         CameraData $camera = guard $ctx->frame->find<CameraData>() else {
             return .ok;
         }
-        if ($this->gpu) {
+        CpuModelViews? $views = $this->cpu;
+        if ($views != null) {
+            CpuModelViews $cpu = guard $views;
+            if (!$cpu->rigid->ready()) {
+                return .ok;
+            }
+
             $this->lines->clear();
-            if ($camera->cullFrozen) {
-                $this->lines->frustum($camera->cullCorners(), Vec4(1.00f, 0.85f, 0.15f, 1.0f));
-                $this->lines->cross($camera->cullPosition, 4.0f);
-            }
-
-            if ($this->scene->showChunks) {
-                $this->drawChunks();
-            }
-
-            visu::profile::begin('draw');
-            ScenePasses $passes = $this->passes;
-            // the cut-out classes' depth first, then every class shades
-            $this->scene->drawMain($enc, SCENE_PASS_CAMERA, function(int32 $k) : GpuPass? {
-                return $passes->cameraDepth($k);
-            });
-            $this->scene->drawMain($enc, SCENE_PASS_CAMERA, function(int32 $k) : GpuPass? {
-                return $passes->camera($k);
-            });
+            $cpu->record($enc, $this->bank, $camera, $this->lines, $this->tuning(), $this->scene->palette);
             $this->drawLines($enc);
-            visu::profile::end();
             return .ok;
         }
 
-        if (!$this->rigid->ready()) {
-            return .ok;
-        }
-
-        visu::profile::begin('cull');
-        $this->submitAll($entities, $camera->cullFrustum, $camera->cullPosition, $ctx->compensation);
-        $this->rigid->dca->build($camera->cullFrustum, $camera->cullPosition);
-        $this->skinned->dca->build($camera->cullFrustum, $camera->cullPosition);
+        $this->lines->clear();
         if ($camera->cullFrozen) {
             $this->lines->frustum($camera->cullCorners(), Vec4(1.00f, 0.85f, 0.15f, 1.0f));
             $this->lines->cross($camera->cullPosition, 4.0f);
         }
 
-        visu::profile::end();
-        bool $geometry = $this->rigid->dca->commandCount() > 0;
-        bool $skins = $this->skinned->dca->commandCount() > 0;
-        if (!$geometry && !$skins && $this->lines->empty()) {
-            return .ok;
+        if ($this->scene->showChunks) {
+            $this->drawChunks();
         }
 
         visu::profile::begin('draw');
-        if ($geometry) {
-            $this->rigid->draw($enc, $this->bank);
-        }
-
-        if ($skins) {
-            visu::profile::begin('skinned');
-            $this->bindPalette($enc);
-            $this->skinned->draw($enc, $this->bank);
-            visu::profile::end();
-        }
-
+        // the cut-out classes' depth first, then every class shades
+        $this->scene->drawMain($enc, SCENE_PASS_CAMERA, $this->passes, .cameraDepth);
+        $this->scene->drawMain($enc, SCENE_PASS_CAMERA, $this->passes, .camera);
         $this->drawLines($enc);
         visu::profile::end();
         return .ok;
     }
 
     /**
-     * Models inside the mirror sphere and above the plane. LOD stays on the play camera.
+     * The CPU views' knobs as this system holds them.
+     */
+    private const function tuning() : CpuDrawTuning
+    {
+        return CpuDrawTuning($this->lodBias, $this->showBounds, $this->showOctree);
+    }
+
+    /**
+     * The CPU views' mirror lists for `$water`; the GPU views cull the mirror themselves.
      */
     public function prepareReflection(Entities $entities, RenderContext $ctx, WaterFrame $water) : void
     {
-        if ($water->mirrorIndex < 0 || $this->gpu) {
+        CpuModelViews $cpu = guard $this->cpu else {
             return;
         }
-
         $this->ensurePasses();
         CameraData $view = guard $ctx->frame->find<CameraData>() else {
             return;
         }
-        visu::profile::begin('reflect/cull');
-        $this->rigid->clearReflect();
-        $this->skinned->clearReflect();
-        WaterDraw $chosen = $water->draws[$water->mirrorIndex as usize];
-        Vec3 $eye = $view->cullPosition;
-        Vec3 $origin = $chosen->origin;
-        float32 $radius = $chosen->radius;
-        Plane $plane = $chosen->plane;
-        Frustum $frustum = $water->camera->cullFrustum;
-        $this->statics->query($frustum);
-        const array<uint32>& $ids = $this->statics->visible();
-        foreach ($ids as $id) {
-            StaticInstance $inst = $this->statics->get($id);
-            if (!$inst->live || !waterAbove($inst->bounds, $plane)) {
-                continue;
-            }
-
-            if (length($inst->bounds->closest($origin) - $origin) > $radius) {
-                continue;
-            }
-
-            ModelHandles $h = $this->models[$inst->handles as usize];
-            $this->submitVisible($this->rigid->reflectDca, $h, $inst->world, $inst->bounds, ModelInstanceData($inst->tint), $inst->lodBias, $eye, false);
-        }
-
-        foreach ($this->dynamicDraws as $dyn) {
-            if ($dyn->hidden || !waterAbove($dyn->bounds, $plane)) {
-                continue;
-            }
-
-            if (length($dyn->bounds->closest($origin) - $origin) > $radius) {
-                continue;
-            }
-
-            ModelHandles $h = $this->models[$dyn->handles as usize];
-            $this->submitVisible($this->rigid->reflectDca, $h, $dyn->world, $dyn->bounds, ModelInstanceData($dyn->tint), $dyn->lodBias, $eye, false);
-        }
-
-        foreach ($this->skinDraws as $skin) {
-            if (!waterAbove($skin->bounds, $plane)) {
-                continue;
-            }
-
-            if (length($skin->bounds->closest($origin) - $origin) > $radius) {
-                continue;
-            }
-
-            ModelHandles $h = $this->models[$skin->handles as usize];
-            SkinInstanceData $payload = SkinInstanceData($skin->tint, Vec4($skin->base, 0.0f, 0.0f, 0.0f));
-            $this->submitVisible($this->skinned->reflectDca, $h, $skin->world, $skin->bounds, $payload, $skin->lodBias, $eye, false);
-        }
-
-        $this->rigid->buildReflect($frustum, $eye);
-        $this->skinned->buildReflect($frustum, $eye);
-        visu::profile::end();
+        $cpu->prepareReflection($view, $water, $this->tuning());
     }
 
     /**
@@ -1203,22 +922,11 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public function reflect(RenderContext $ctx, RenderEncoder $enc) : void
     {
-        if ($this->gpu) {
-            ScenePasses $passes = $this->passes;
-            $this->scene->drawMain($enc, SCENE_PASS_MIRROR, function(int32 $k) : GpuPass? {
-                return $passes->mirror($k);
-            });
+        CpuModelViews $cpu = guard $this->cpu else {
+            $this->scene->drawMain($enc, SCENE_PASS_MIRROR, $this->passes, .mirror);
             return;
         }
-
-        if ($this->rigid->reflects()) {
-            $this->rigid->drawReflect($enc, $this->bank);
-        }
-
-        if ($this->skinned->reflects()) {
-            $this->bindPalette($enc);
-            $this->skinned->drawReflect($enc, $this->bank);
-        }
+        $cpu->reflect($enc, $this->bank, $this->scene->palette);
     }
 
     /**
@@ -1228,18 +936,6 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     {
         $enc->upload($cascade->uniforms, slot: 1);
         $this->scene->drawCascade($enc, $cascade->index);
-    }
-
-    /**
-     * Bind this frame's palette at slot 2: the slice `packMovers` put in the ring, which every
-     * pass of the frame shares. Nothing to bind with no skin on screen.
-     */
-    private function bindPalette(RenderEncoder $enc) : void
-    {
-        TransientSlice $slice = guard $this->scene->palette else {
-            return;
-        }
-        $enc->bindUniform(SKIN_PALETTE_SLOT, $slice);
     }
 
     /**
@@ -1261,12 +957,18 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
 
     public const function commandCount() : int32
     {
-        return $this->rigid->dca->commandCount() + $this->skinned->dca->commandCount();
+        CpuModelViews $cpu = guard $this->cpu else {
+            return 0;
+        }
+        return $cpu->commandCount();
     }
 
     public const function frustumCulled() : int32
     {
-        return $this->rigid->dca->culledCount() + $this->skinned->dca->culledCount();
+        CpuModelViews $cpu = guard $this->cpu else {
+            return 0;
+        }
+        return $cpu->frustumCulled();
     }
 
     /**
@@ -1274,31 +976,38 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     internal function printStatus(DebugConsole $console) : void
     {
-        int32 $commands = $this->commandCount();
-        int32 $culled = $this->frustumCulled();
-        int32 $models = $this->models->count() as int32;
+        int32 $models = $this->tables->models->count() as int32;
         int32 $statics = $this->staticCount();
-        $console->writeLine("model: {$models} models, {$statics} static, {$this->dynamicCount} dynamic, {$this->skinnedCount} skinned");
-        if ($this->gpu) {
+        int32 $rowCap = SKIN_PALETTE_ROWS;
+        CpuModelViews? $views = $this->cpu;
+        if ($views == null) {
             int32 $rows = $this->scene->rowCount();
             int32 $active = $this->scene->activeCount();
             int32 $moving = $this->scene->moverCount();
+            $console->writeLine("model: {$models} models, {$statics} static, {$this->tables->dynamics->count()} dynamic, {$this->skinnedCount} skinned");
             $console->writeLine("model: gpu views, {$rows} scene rows, {$active} active, {$moving} moving (see `scene`)");
+            $console->writeLine("model: palette {$this->paletteRows}/{$rowCap} rows, {$this->paletteDropped} skins dropped");
+            $console->writeLine("model: bias {$this->lodBias}, overlay {$this->lines->count()} segments");
+            return;
         }
-        int32 $rowCap = SKIN_PALETTE_ROWS;
+
+        CpuModelViews $cpu = guard $views;
+        int32 $commands = $cpu->commandCount();
+        int32 $culled = $cpu->frustumCulled();
+        $console->writeLine("model: {$models} models, {$statics} static, {$cpu->dynamicCount} dynamic, {$this->skinnedCount} skinned");
         $console->writeLine("model: palette {$this->paletteRows}/{$rowCap} rows, {$this->paletteDropped} skins dropped");
-        $console->writeLine("model: {$this->submitted} submitted, {$this->distanceCulled} past cull distance, {$culled} frustum culled, {$commands} draws");
+        $console->writeLine("model: {$cpu->submitted} submitted, {$cpu->distanceCulled} past cull distance, {$culled} frustum culled, {$commands} draws");
         string $hist = '';
         int32 $i = 0;
         while ($i < MODEL_MAX_LODS) {
-            int32 $n = $this->lodHistogram[$i as usize];
+            int32 $n = $cpu->lodHistogram[$i as usize];
             $hist->append(" lod{$i}={$n}");
             $i = $i + 1;
         }
 
         $console->writeLine("model: bias {$this->lodBias}{$hist}");
         int32 $segments = $this->lines->count();
-        int32 $cells = $this->statics->nodeCount();
+        int32 $cells = $cpu->statics->nodeCount();
         $console->writeLine("model: octree {$cells} cells, overlay {$segments} segments");
     }
 
@@ -1344,8 +1053,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     internal function setWireframe(DebugConsole $console, bool $on) : void
     {
         $this->wireframe = $on;
-        $this->rigid->reset();
-        $this->skinned->reset();
+        $this->cpu?->reset();
         $this->passes->reset($on);
         flags()->set('model.wire', FlagValue::boolean($on));
         $this->flagsSeen = flags()->version;
@@ -1371,6 +1079,24 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     internal function refresh(Entity $e) : void
     {
+        $this->queueRefresh($e);
+    }
+
+    /**
+     * Queue `$e` for an exact rewrite at the next fill, once. An entity not acquired yet is
+     * queued without the mark; `applyRefreshes` skips it if it never arrives.
+     */
+    private function queueRefresh(Entity $e) : void
+    {
+        if ($this->records->contains($e)) {
+            ModelRecord& $rec = $this->records->get($e);
+            if ($rec->refreshQueued) {
+                return;
+            }
+
+            $rec->refreshQueued = true;
+        }
+
         $this->refreshes[] = $e;
     }
 
@@ -1419,13 +1145,15 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
                 return;
             }
 
-            ModelHandles $h = $this->models[$handles as usize];
+            ModelHandles $h = $this->tables->models[$handles as usize];
             $this->addUser($handles);
             Mat4 $world = $entities->get<Transform>($e)->world($entities);
             AABB $bounds = $h->model->bounds->transformed($world);
             int32 $slot = -1;
-            if (!$this->gpu) {
-                $slot = $this->statics->place($e, $handles, $world, $bounds, $static->tint, $static->lodBias);
+            CpuModelViews? $cpu = $this->cpu;
+            if ($cpu != null) {
+                CpuModelViews $views = guard $cpu;
+                $slot = $views->statics->place($e, $handles, $world, $bounds, $static->tint, $static->lodBias);
             }
 
             int32 $row = $this->scene->acquire();
@@ -1444,12 +1172,12 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
                 return;
             }
 
-            ModelHandles $h = $this->models[$handles as usize];
+            ModelHandles $h = $this->tables->models[$handles as usize];
             $this->addUser($handles);
             Mat4 $world = $entities->get<Transform>($e)->world($entities);
             AABB $bounds = $h->model->bounds->transformed($world);
-            int32 $slot = $this->dynamicDraws->count() as int32;
-            $this->dynamicDraws[] = DynamicDraw($e, $handles, $world, $bounds, $dynamic->tint, $dynamic->lodBias, $dynamic->hidden);
+            int32 $slot = $this->tables->dynamics->count() as int32;
+            $this->tables->dynamics[] = DynamicDraw($e, $handles, $world, $bounds, $dynamic->tint, $dynamic->lodBias, $dynamic->hidden);
             int32 $row = $this->scene->acquire();
             ModelRecord $rec = ModelRecord($row, $handles, ModelKind::dynamic, $slot, 0, false, !$dynamic->hidden, 0, $this->outlineOf($e));
             $rec->linked = $entities->get<Transform>($e)->parent != Entity::none() || $entities->has<AssemblyInstance>($e);
@@ -1469,7 +1197,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
                 return;
             }
 
-            if (!$this->models[$handles as usize]->model->skinned()) {
+            if (!$this->tables->models[$handles as usize]->model->skinned()) {
                 info("model: '{$skin->model}' has no skeleton; a SkinnedModel needs one");
                 return;
             }
@@ -1503,6 +1231,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             }
 
             ModelRecord& $rec = $this->records->get($e);
+            $rec->refreshQueued = false;
             if ($rec->kind == ModelKind::statics) {
                 $this->refreshStatic($entities, $e);
             } else if ($rec->kind == ModelKind::dynamic) {
@@ -1517,7 +1246,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     {
         ModelRecord $rec = $this->records->get($e);
         StaticModel& $static = $entities->get<StaticModel>($e);
-        ModelHandles $h = $this->models[$rec->handles as usize];
+        ModelHandles $h = $this->tables->models[$rec->handles as usize];
         if (!$h->model->id->equals($static->model)) {
             $this->release($e);
             $this->acquireEntity($entities, $e);
@@ -1528,12 +1257,14 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         AABB $bounds = $h->model->bounds->transformed($world);
         AABB $old = $bounds;
         int32 $slot = -1;
-        if ($this->gpu) {
+        CpuModelViews? $cpu = $this->cpu;
+        if ($cpu == null) {
             $old = $this->scene->homeBox($rec->row);
         } else {
-            $old = $this->statics->get($rec->slot as uint32)->bounds;
-            $this->statics->release($e);
-            $slot = $this->statics->place($e, $rec->handles, $world, $bounds, $static->tint, $static->lodBias);
+            CpuModelViews $views = guard $cpu;
+            $old = $views->statics->get($rec->slot as uint32)->bounds;
+            $views->statics->release($e);
+            $slot = $views->statics->place($e, $rec->handles, $world, $bounds, $static->tint, $static->lodBias);
         }
 
         $this->scene->write($rec->row, $this->rowFor($rec, $bounds, $static->lodBias, $static->tint, 0.0f, $h->anyCast, false, true), $world);
@@ -1547,7 +1278,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     {
         ModelRecord $rec = $this->records->get($e);
         DynamicModel& $dynamic = $entities->get<DynamicModel>($e);
-        ModelHandles $h = $this->models[$rec->handles as usize];
+        ModelHandles $h = $this->tables->models[$rec->handles as usize];
         if (!$h->model->id->equals($dynamic->model)) {
             $this->release($e);
             $this->acquireEntity($entities, $e);
@@ -1556,7 +1287,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
 
         Mat4 $world = $entities->get<Transform>($e)->world($entities);
         AABB $bounds = $h->model->bounds->transformed($world);
-        DynamicDraw& $draw = $this->dynamicDraws->at($rec->slot as usize);
+        DynamicDraw& $draw = $this->tables->dynamics->at($rec->slot as usize);
         bool $wasShown = !$draw->hidden;
         AABB $old = $draw->bounds;
         $draw->world = $world;
@@ -1651,13 +1382,13 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             return $rec->linked;
         }
 
-        DynamicDraw& $draw = $this->dynamicDraws->at($rec->slot as usize);
+        DynamicDraw& $draw = $this->tables->dynamics->at($rec->slot as usize);
         if ($draw->hidden) {
             return $rec->linked;
         }
 
         Transform& $t = $entities->get<Transform>($e);
-        ModelHandles $h = $this->models[$rec->handles as usize];
+        ModelHandles $h = $this->tables->models[$rec->handles as usize];
         // a root's world pose is its own; only a part under a parent needs the chain and a
         // decomposition
         Pose $wasPose = $t->previousPose();
@@ -1676,7 +1407,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         SceneRow $row = $this->rowFor($rec, $bounds, $draw->lodBias, $draw->tint, 0.0f, $h->anyCast, false, true);
         $this->scene->write($rec->row, $row, moving: $wasPose, $nowPose);
         $rec->movedIn = $update;
-        if ($this->gpu) {
+        if ($this->cpu == null) {
             // the GPU views read the swept box; the shadows change where the row was rewritten
             $draw->bounds = $bounds;
             $this->noteMover($e, $bounds, $h->anyCast, $eye);
@@ -1701,10 +1432,10 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     {
         ModelRecord& $rec = $this->records->get($e);
         $rec->moving = false;
-        ModelHandles $h = $this->models[$rec->handles as usize];
+        ModelHandles $h = $this->tables->models[$rec->handles as usize];
         Mat4 $world = $entities->get<Transform>($e)->world($entities);
         AABB $bounds = $h->model->bounds->transformed($world);
-        DynamicDraw& $draw = $this->dynamicDraws->at($rec->slot as usize);
+        DynamicDraw& $draw = $this->tables->dynamics->at($rec->slot as usize);
         $draw->world = $world;
         $draw->bounds = $bounds;
         $this->scene->write($rec->row, $this->rowFor($rec, $bounds, $draw->lodBias, $draw->tint, 0.0f, $h->anyCast, false, !$draw->hidden), $world);
@@ -1753,10 +1484,10 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     {
         foreach ($this->movingRecords as $e) {
             ModelRecord $rec = $this->records->get($e);
-            ModelHandles $h = $this->models[$rec->handles as usize];
+            ModelHandles $h = $this->tables->models[$rec->handles as usize];
             Mat4 $world = $entities->get<Transform>($e)->world($entities, $alpha);
             AABB $bounds = $h->model->bounds->transformed($world);
-            DynamicDraw& $draw = $this->dynamicDraws->at($rec->slot as usize);
+            DynamicDraw& $draw = $this->tables->dynamics->at($rec->slot as usize);
             $draw->world = $world;
             $draw->bounds = $bounds;
             $this->noteMover($e, $bounds, $h->anyCast, $eye);
@@ -1778,8 +1509,8 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             $this->scene->palette = $slice;
         }
 
-        foreach ($this->skinDraws as $skin) {
-            ModelHandles $h = $this->models[$skin->handles as usize];
+        foreach ($this->tables->skins as $skin) {
+            ModelHandles $h = $this->tables->models[$skin->handles as usize];
             ModelRecord& $rec = $this->records->get($skin->entity);
             SceneRow $row = $this->rowFor($rec, $skin->bounds, $skin->lodBias, $skin->tint, $skin->base, $h->anyCast, true, true);
             $this->scene->write($rec->row, $row, $skin->world);
@@ -1796,7 +1527,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             }
 
             $rec->shown = false;
-            ModelHandles $h = $this->models[$rec->handles as usize];
+            ModelHandles $h = $this->tables->models[$rec->handles as usize];
             $this->scene->restyle($rec->row, SceneRow($rec->handles, AABB(Vec3(0.0f), Vec3(0.0f)), 1.0f, Vec4(1.0f), 0.0f, $h->anyCast, true, false));
             $this->forgetMover($e);
         }
@@ -1851,7 +1582,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     private function packSkins(Entities $entities, RenderContext $ctx) : void
     {
-        $this->skinDraws->clear();
+        $this->tables->skins->clear();
         $this->palette->clear();
         $this->skinnedCount = 0;
         $this->paletteDropped = 0;
@@ -1878,7 +1609,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             SkinPose $pose = guard $skin->pose else {
                 continue;
             }
-            ModelHandles $h = $this->models[$handles as usize];
+            ModelHandles $h = $this->tables->models[$handles as usize];
             Transform& $t = $entities->get<Transform>($id);
             Mat4 $world = $t->world($entities, $alpha);
             AABB $bounds = $h->model->bounds->transformed($world);
@@ -1903,144 +1634,12 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
                 $this->palette[] = $row;
             }
 
-            $this->skinDraws[] = SkinDraw($id, $handles, $world, $bounds, $skin->tint, $skin->lodBias, $base as float32);
+            $this->tables->skins[] = SkinDraw($id, $handles, $world, $bounds, $skin->tint, $skin->lodBias, $base as float32);
             $this->skinnedCount = $this->skinnedCount + 1;
         }
 
         $this->paletteRows = $this->palette->count() as int32;
         visu::profile::end();
-    }
-
-    /**
-     * Query the octree for statics inside `$frustum`, walk the dynamics, submit each at the LOD
-     * its distance from `$eye` earns. Records console counters and debug lines.
-     */
-    private function submitAll(
-        Entities $entities,
-        const Frustum& $frustum,
-        Vec3 $eye,
-        float32 $alpha
-    ) : void
-    {
-        $this->rigid->dca->clearInstances();
-        $this->skinned->dca->clearInstances();
-        $this->submitted = 0;
-        $this->distanceCulled = 0;
-        $this->dynamicCount = 0;
-        int32 $i = 0;
-        while ($i < MODEL_MAX_LODS) {
-            $this->lodHistogram[$i as usize] = 0;
-            $i = $i + 1;
-        }
-
-        $this->lines->clear();
-        if ($this->showOctree) {
-            $this->statics->draw($this->lines);
-        }
-
-        $this->statics->query($frustum);
-        const array<uint32>& $ids = $this->statics->visible();
-        foreach ($ids as $id) {
-            StaticInstance $inst = $this->statics->get($id);
-            if (!$inst->live) {
-                continue;
-            }
-
-            ModelHandles $h = $this->models[$inst->handles as usize];
-            $this->submitVisible($this->rigid->dca, $h, $inst->world, $inst->bounds, ModelInstanceData($inst->tint), $inst->lodBias, $eye, true);
-        }
-
-        foreach ($this->dynamicDraws as $dyn) {
-            if ($dyn->hidden) {
-                continue;
-            }
-
-            $this->dynamicCount = $this->dynamicCount + 1;
-            ModelHandles $h = $this->models[$dyn->handles as usize];
-            $this->submitVisible($this->rigid->dca, $h, $dyn->world, $dyn->bounds, ModelInstanceData($dyn->tint), $dyn->lodBias, $eye, true);
-        }
-
-        foreach ($this->skinDraws as $skin) {
-            ModelHandles $h = $this->models[$skin->handles as usize];
-            SkinInstanceData $payload = SkinInstanceData($skin->tint, Vec4($skin->base, 0.0f, 0.0f, 0.0f));
-            $this->submitVisible($this->skinned->dca, $h, $skin->world, $skin->bounds, $payload, $skin->lodBias, $eye, true);
-        }
-    }
-
-    private function submitVisible<P>(
-        DrawCallAssembler<P> $dca,
-        ModelHandles $h,
-        const Mat4& $world,
-        const AABB& $bounds,
-        P $payload,
-        float32 $lodBias,
-        Vec3 $eye,
-        bool $record
-    ) : void
-    {
-        float32 $dist = length($bounds->closest($eye) - $eye);
-        if ($h->model->cullDistance > 0.0f && $dist > $h->model->cullDistance) {
-            if ($record) {
-                $this->distanceCulled = $this->distanceCulled + 1;
-            }
-
-            return;
-        }
-
-        int32 $lod = lodIndex($h->model->lods, $dist, $h->model->lodBias * $lodBias * $this->lodBias);
-        if ($record && $this->showBounds) {
-            $this->lines->box($bounds, lodColor($lod));
-        }
-
-        int32 $level = $this->clampLevel($h, $lod);
-        if ($level < 0) {
-            return;
-        }
-
-        if ($record) {
-            $this->lodHistogram[$level as usize] = $this->lodHistogram[$level as usize] + 1;
-            $this->submitted = $this->submitted + 1;
-        }
-
-        $this->submitLevel($dca, $h, $level, $world, $payload);
-    }
-
-    private const function clampLevel(ModelHandles $h, int32 $lod) : int32
-    {
-        int32 $last = ($h->lodStart->count() as int32) - 2;
-        if ($last < 0) {
-            return -1;
-        }
-
-        if ($lod < 0) {
-            return 0;
-        }
-
-        if ($lod > $last) {
-            return $last;
-        }
-
-        return $lod;
-    }
-
-    /**
-     * Submit every primitive of one level.
-     */
-    private function submitLevel<P>(
-        DrawCallAssembler<P> $dca,
-        ModelHandles $h,
-        int32 $level,
-        const Mat4& $world,
-        P $payload
-    ) : void
-    {
-        int32 $start = $h->lodStart[$level as usize];
-        int32 $end = $h->lodStart[($level + 1) as usize];
-        int32 $n = $start;
-        while ($n < $end) {
-            $dca->submit($h->handles[$n as usize], $world, $payload, 0.0f);
-            $n = $n + 1;
-        }
     }
 
     /**
@@ -2060,24 +1659,26 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             return -1;
         }
         ModelHandles $h = ModelHandles($model);
-        if ($model->skinned()) {
-            $this->skinned->register($this->bank, $model, $h);
+        CpuModelViews? $cpu = $this->cpu;
+        if ($cpu != null) {
+            CpuModelViews $views = guard $cpu;
+            $views->register($this->bank, $h);
         } else {
-            $this->rigid->register($this->bank, $model, $h);
+            $h->anyCast = modelCasts($this->bank, $model);
         }
 
         if ($this->freeModels->count() > 0) {
             usize $last = $this->freeModels->count() - 1;
             int32 $reused = $this->freeModels[$last];
             $this->freeModels->pop();
-            $this->models[$reused as usize] = $h;
+            $this->tables->models[$reused as usize] = $h;
             $this->modelIndex[$id] = $reused;
             $this->scene->setModel($reused, $model);
             return $reused;
         }
 
-        int32 $index = $this->models->count() as int32;
-        $this->models[] = $h;
+        int32 $index = $this->tables->models->count() as int32;
+        $this->tables->models[] = $h;
         $this->modelIndex[$id] = $index;
         $this->scene->setModel($index, $model);
         return $index;
@@ -2124,17 +1725,12 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             return true;
         }
 
-        ModelHandles $h = $this->models[$index as usize];
+        ModelHandles $h = $this->tables->models[$index as usize];
         if ($h->users > 0) {
             return false;
         }
 
-        if ($h->model->skinned()) {
-            $this->skinned->unregister($h);
-        } else {
-            $this->rigid->unregister($h);
-        }
-
+        $this->cpu?->unregister($h);
         $h->dead = true;
         $this->modelIndex->remove($id);
         $this->freeModels[] = $index;
@@ -2147,7 +1743,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             return;
         }
 
-        ModelHandles $h = $this->models[$handles as usize];
+        ModelHandles $h = $this->tables->models[$handles as usize];
         $h->users = $h->users + 1;
     }
 
@@ -2157,7 +1753,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             return;
         }
 
-        ModelHandles $h = $this->models[$handles as usize];
+        ModelHandles $h = $this->tables->models[$handles as usize];
         if ($h->users > 0) {
             $h->users = $h->users - 1;
         }
@@ -2178,24 +1774,26 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->leaveMovingList($e);
         $this->forgetMover($e);
         if ($rec->kind == ModelKind::statics) {
-            if ($this->gpu) {
+            CpuModelViews? $cpu = $this->cpu;
+            if ($cpu == null) {
                 $this->scene->release($rec->row, $this->scene->homeBox($rec->row));
             } else {
-                $this->scene->release($rec->row, $this->statics->get($rec->slot as uint32)->bounds);
-                $this->statics->release($e);
+                CpuModelViews $views = guard $cpu;
+                $this->scene->release($rec->row, $views->statics->get($rec->slot as uint32)->bounds);
+                $views->statics->release($e);
             }
 
             $this->staticRecords = $this->staticRecords - 1;
         } else if ($rec->kind == ModelKind::dynamic) {
-            $this->scene->release($rec->row, $this->dynamicDraws[$rec->slot as usize]->bounds);
-            usize $last = $this->dynamicDraws->count() - 1;
+            $this->scene->release($rec->row, $this->tables->dynamics[$rec->slot as usize]->bounds);
+            usize $last = $this->tables->dynamics->count() - 1;
             if (($rec->slot as usize) != $last) {
-                DynamicDraw $moved = $this->dynamicDraws[$last];
-                $this->dynamicDraws[$rec->slot as usize] = $moved;
+                DynamicDraw $moved = $this->tables->dynamics[$last];
+                $this->tables->dynamics[$rec->slot as usize] = $moved;
                 $this->records->get($moved->entity)->slot = $rec->slot;
             }
 
-            $this->dynamicDraws->pop();
+            $this->tables->dynamics->pop();
         } else {
             $this->scene->release($rec->row, AABB(Vec3(0.0f), Vec3(0.0f)));
             usize $last = $this->skins->count() - 1;
@@ -2243,7 +1841,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     private function restyleOutline(Entity $e, int32 $style) : void
     {
-        if (!$this->gpu || !$this->records->contains($e)) {
+        if ($this->cpu != null || !$this->records->contains($e)) {
             return;
         }
 
@@ -2254,7 +1852,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
 
         $rec->outline = $style;
         if ($rec->kind != ModelKind::skinned) {
-            $this->refreshes[] = $e;
+            $this->queueRefresh($e);
         }
     }
 
@@ -2296,7 +1894,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      * transform, dynamics from their swept box, skins from this frame's list, previews from their
      * form. O(highlights + preview parts).
      */
-    private function outlineBox(Entities $entities, OutlineData $mailbox) : void
+    private function outlineBox(Entities $entities) : bool
     {
         bool $any = false;
         AABB $box = AABB(Vec3(0.0f), Vec3(0.0f));
@@ -2307,12 +1905,12 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             }
 
             ModelRecord $rec = $this->records->get($e);
-            ModelHandles $h = $this->models[$rec->handles as usize];
+            ModelHandles $h = $this->tables->models[$rec->handles as usize];
             AABB $bounds = $box;
             if ($rec->kind == ModelKind::statics) {
                 $bounds = $h->model->bounds->transformed($entities->get<Transform>($e)->world($entities));
             } else if ($rec->kind == ModelKind::dynamic) {
-                DynamicDraw $dyn = $this->dynamicDraws[$rec->slot as usize];
+                DynamicDraw $dyn = $this->tables->dynamics[$rec->slot as usize];
                 if ($dyn->hidden) {
                     continue;
                 }
@@ -2320,7 +1918,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
                 $bounds = $dyn->bounds;
             } else {
                 bool $posed = false;
-                foreach ($this->skinDraws as $skin) {
+                foreach ($this->tables->skins as $skin) {
                     if ($skin->entity == $e) {
                         $bounds = $skin->bounds;
                         $posed = true;
@@ -2343,7 +1941,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
                 int32 $handles = $ghost->form->handles[$i as usize];
                 if ($handles >= 0) {
                     Mat4 $world = $ghost->root * $ghost->form->locals[$i as usize];
-                    $box = outlineUnion($box, $this->models[$handles as usize]->model->bounds->transformed($world), $any);
+                    $box = outlineUnion($box, $this->tables->models[$handles as usize]->model->bounds->transformed($world), $any);
                     $any = true;
                 }
 
@@ -2352,8 +1950,10 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         }
 
         if ($any) {
-            $mailbox->add($this, $box);
+            $this->outlined = $box;
         }
+
+        return $any;
     }
 
     /**
@@ -2374,7 +1974,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
                     continue;
                 }
 
-                ModelHandles $h = $this->models[$handles as usize];
+                ModelHandles $h = $this->tables->models[$handles as usize];
                 if ($h->model->skinned()) {
                     continue;
                 }
@@ -2498,8 +2098,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     private function ensurePasses() : void
     {
-        $this->rigid->ensure($this->renderer, $this->wireframe);
-        $this->skinned->ensure($this->renderer, $this->wireframe);
+        $this->cpu?->ensure($this->renderer, $this->wireframe);
         if ($this->linePass != null) {
             return;
         }
@@ -2556,98 +2155,29 @@ internal function previewPose(Assembly $assembly, AssemblyNode $node) : Mat4
 }
 
 /**
- * `$world` as a pose: its translation, its column lengths as the scale, and the rotation left
- * when they are divided out. A mirrored matrix keeps its handedness in a negative x scale. A
- * sheared chain (a non-uniform scale under a rotation) is not a pose; it comes back as the
- * nearest one.
+ * Whether some material of `$model` casts a shadow: its GPU scene rows join the shadow views.
  */
-internal function decomposePose(const Mat4& $world) : Pose
+internal function modelCasts(ModelBank $bank, Model $model) : bool
 {
-    Vec3 $x = Vec3($world->c0->x, $world->c0->y, $world->c0->z);
-    Vec3 $y = Vec3($world->c1->x, $world->c1->y, $world->c1->z);
-    Vec3 $z = Vec3($world->c2->x, $world->c2->y, $world->c2->z);
-    float32 $sx = length($x);
-    float32 $sy = length($y);
-    float32 $sz = length($z);
-    if (visu::math::dot(visu::math::cross($x, $y), $z) < 0.0f) {
-        $sx = 0.0f - $sx;
-    }
-
-    Vec3 $position = Vec3($world->c3->x, $world->c3->y, $world->c3->z);
-    if ($sx == 0.0f || $sy == 0.0f || $sz == 0.0f) {
-        return Pose($position, Quat(), Vec3($sx, $sy, $sz));
-    }
-
-    Mat4 $rotation = Mat4(
-        Vec4($x / $sx, 0.0f),
-        Vec4($y / $sy, 0.0f),
-        Vec4($z / $sz, 0.0f),
-        Vec4(0.0f, 0.0f, 0.0f, 1.0f)
-    );
-    return Pose($position, visu::math::normalize(Quat($rotation)), Vec3($sx, $sy, $sz));
-}
-
-/**
- * The assembly root `$e` belongs to: `$e` itself when it is one, else the first ancestor that
- * is, or `Entity::none()` outside any assembly. O(depth).
- */
-internal function assemblyRootOf(Entities $entities, Entity $e) : Entity
-{
-    Entity $walk = $e;
-    int32 $depth = 0;
-    while ($walk != Entity::none() && $depth < 32) {
-        if ($entities->has<AssemblyInstance>($walk)) {
-            return $walk;
+    foreach ($model->lods as $lod) {
+        foreach ($lod->primitives as $prim) {
+            if ($bank->materialOf($model, $prim->slot)->material->castShadow) {
+                return true;
+            }
         }
-
-        if (!$entities->has<Transform>($walk)) {
-            return Entity::none();
-        }
-
-        $walk = $entities->get<Transform>($walk)->parent;
-        $depth = $depth + 1;
     }
 
-    return Entity::none();
+    return false;
 }
 
 /**
- * The world box of `$local` under `$pose`: the centre carried through the pose, the half extents
- * through the absolute rotation times the scale. As tight as `AABB.transformed` on the pose's
- * matrix, without building it; a mover's row takes two a move.
+ * The CPU main views when the main views do not come from the GPU scene; null when they do.
  */
-internal function poseBounds(const AABB& $local, const Pose& $pose) : AABB
+internal function cpuViewsFor(bool $gpuViews, ModelBank $bank, const AABB& $world, ModelTables $tables) : CpuModelViews?
 {
-    Quat $q = $pose->orientation;
-    float32 $xx = $q->x * $q->x;
-    float32 $yy = $q->y * $q->y;
-    float32 $zz = $q->z * $q->z;
-    float32 $xy = $q->x * $q->y;
-    float32 $xz = $q->x * $q->z;
-    float32 $yz = $q->y * $q->z;
-    float32 $wx = $q->w * $q->x;
-    float32 $wy = $q->w * $q->y;
-    float32 $wz = $q->w * $q->z;
-    // the rows of the rotation Mat4(Quat) builds
-    Vec3 $r0 = Vec3(1.0f - 2.0f * ($yy + $zz), 2.0f * ($xy - $wz), 2.0f * ($xz + $wy));
-    Vec3 $r1 = Vec3(2.0f * ($xy + $wz), 1.0f - 2.0f * ($xx + $zz), 2.0f * ($yz - $wx));
-    Vec3 $r2 = Vec3(2.0f * ($xz - $wy), 2.0f * ($yz + $wx), 1.0f - 2.0f * ($xx + $yy));
-    Vec3 $s = $pose->scale;
-    Vec3 $c = ($local->min + $local->max) * 0.5f * $s;
-    Vec3 $e = ($local->max - $local->min) * 0.5f * visu::math::abs($s);
-    Vec3 $centre = $pose->position + Vec3(visu::math::dot($r0, $c), visu::math::dot($r1, $c), visu::math::dot($r2, $c));
-    Vec3 $half = Vec3(
-        visu::math::dot(visu::math::abs($r0), $e),
-        visu::math::dot(visu::math::abs($r1), $e),
-        visu::math::dot(visu::math::abs($r2), $e)
-    );
-    return AABB($centre - $half, $centre + $half);
-}
+    if ($gpuViews) {
+        return null;
+    }
 
-/**
- * The TRS matrix of `$pose`, as `Transform.local` builds it.
- */
-internal function poseMatrix(const Pose& $pose) : Mat4
-{
-    return translate($pose->position) * Mat4($pose->orientation) * scale($pose->scale);
+    return CpuModelViews($bank->device, $world, $tables);
 }

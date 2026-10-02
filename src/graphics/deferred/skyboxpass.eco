@@ -14,7 +14,6 @@ public class SkyboxPass : Pass
     private HeightFog $fog;
     private DirectionalLight $sun;
     private Moon $moon;
-    private TextureRef? $fogSky;
     private FogLighting $fogLighting;
 
     public constructor(
@@ -23,8 +22,7 @@ public class SkyboxPass : Pass
         HeightFog $fog,
         DirectionalLight $sun,
         Moon $moon,
-        FogLighting $fogLighting,
-        TextureRef? $fogSky = null
+        FogLighting $fogLighting
     )
     {
         $this->gpu = $gpu;
@@ -32,7 +30,6 @@ public class SkyboxPass : Pass
         $this->fog = $fog;
         $this->sun = $sun;
         $this->moon = $moon;
-        $this->fogSky = $fogSky;
         $this->fogLighting = $fogLighting;
     }
 
@@ -50,7 +47,6 @@ public class SkyboxPass : Pass
         // ordering only: the depth is an attachment here, not a sampler
         $io->reads($gbuffer->depth);
         readGodRays($io, $frame);
-        readFogSky($io, $this->fogSky);
         $io->writes($light->target);
     }
 
@@ -62,11 +58,8 @@ public class SkyboxPass : Pass
         RenderEncoder $enc = guard beginSkyPass($ctx) else ($e) {
             return .error($e);
         }
-        Device $device = $ctx->device;
-        Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
-            return .cube($device);
-        });
-        GpuPass $pass = GpuPass($program, VertexLayout::pos3(), skyRaster());
+        Mesh $mesh = $this->gpu->skyCube;
+        GpuPass $pass = $this->gpu->cubePass($program, skyRaster());
         $pass->bind($enc);
         $this->gpu->camera->bind($enc);
         CameraData $camera = $ctx->frame->get<CameraData>();
@@ -82,10 +75,6 @@ public class SkyboxPass : Pass
             return .error(.pool($e));
         }
         $enc->bindTexture(0, $cube, $this->gpu->cube);
-        guard bindFogSky($ctx, $enc, $this->gpu, FOG_SKY_SKYBOX_SLOT, $this->fogSky) else ($e) {
-            $enc->endRender();
-            return .error($e);
-        }
         $mesh->draw($enc);
         $enc->endRender();
         return .ok;

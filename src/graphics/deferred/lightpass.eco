@@ -23,12 +23,6 @@ public class LightPass : Pass
     internal Vec4 $clear;
 
     /**
-     * This frame's fog sky table (`FogSkyLut`) when the fog takes the sky's colour, which the
-     * sky and the water read too.
-     */
-    internal TextureRef? $fogSky;
-
-    /**
      * This frame's fog lighting (`fogLighting`), which the sky and the water pack too.
      */
     internal FogLighting $fogLighting;
@@ -47,8 +41,7 @@ public class LightPass : Pass
         HeightFog $fog,
         Vec4 $clear,
         FogLighting $fogLighting,
-        TextureRef $aerial,
-        TextureRef? $fogSky = null
+        TextureRef $aerial
     )
     {
         $this->gpu = $gpu;
@@ -58,7 +51,6 @@ public class LightPass : Pass
         $this->moon = $moon;
         $this->fog = $fog;
         $this->clear = $clear;
-        $this->fogSky = $fogSky;
         $this->fogLighting = $fogLighting;
         $this->aerial = $aerial;
     }
@@ -74,7 +66,6 @@ public class LightPass : Pass
         readGBuffer($io, $gbuffer);
         readSsao($io, $frame);
         readGodRays($io, $frame);
-        readFogSky($io, $this->fogSky);
         readAerial($io, $this->aerial);
 
         EnvironmentData? $environment = $frame->find<EnvironmentData>();
@@ -162,11 +153,8 @@ public class LightPass : Pass
         RenderEncoder $enc = guard $ctx->beginRender($target) else ($e) {
             return .error($e);
         }
-        Device $device = $ctx->device;
-        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
-            return .quad($device);
-        });
-        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        Mesh $mesh = $this->gpu->quad;
+        GpuPass $pass = $this->gpu->quadPass($program, Raster::none());
         $pass->bind($enc);
         if ($uploadCamera) {
             $enc->upload($camera->uniforms(), slot: 1);
@@ -193,15 +181,6 @@ public class LightPass : Pass
             return .error($e);
         }
         $enc->upload($fogUniforms, slot: 3);
-        // a view without fog (the mirror) binds white in the table's place
-        TextureRef? $fogSky = null;
-        if ($fog->enabled) {
-            $fogSky = $this->fogSky;
-        }
-        guard bindFogSky($ctx, $enc, $this->gpu, FOG_SKY_LIGHT_SLOT, $fogSky) else ($e) {
-            $enc->endRender();
-            return .error($e);
-        }
         guard bindAerial($ctx, $enc, $this->gpu, AERIAL_LIGHT_SLOT, $this->aerial) else ($e) {
             $enc->endRender();
             return .error($e);

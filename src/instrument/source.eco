@@ -30,6 +30,12 @@ public class Sink
     public string $currentSection;
     public map<string, array<Metric>> $passExtras;
 
+    /**
+     * False for a sample only the compact HUD line reads: tab, section, metric, note, pass and
+     * extra writes are dropped, so a frame with the panel collapsed builds no tab mail.
+     */
+    public bool $tabsOn = true;
+
     public static function empty() : Sink
     {
         return Sink(
@@ -43,6 +49,16 @@ public class Sink
             '',
             map<string, array<Metric>>()
         );
+    }
+
+    /**
+     * A sink that keeps loop, memory, adapter and gauges only.
+     */
+    public static function light() : Sink
+    {
+        Sink $sink = Sink::empty();
+        $sink->tabsOn = false;
+        return $sink;
     }
 
     public function loop(LoopStats $stats) : void
@@ -70,6 +86,10 @@ public class Sink
      */
     public function tab(string $id) : void
     {
+        if (!$this->tabsOn) {
+            return;
+        }
+
         $this->ensureTab($id, $id, 100, false);
     }
 
@@ -78,11 +98,19 @@ public class Sink
      */
     public function tab(string $id, title: string $title, int32 $order) : void
     {
+        if (!$this->tabsOn) {
+            return;
+        }
+
         $this->ensureTab($id, $title, $order, true);
     }
 
     public function section(string $id) : void
     {
+        if (!$this->tabsOn) {
+            return;
+        }
+
         if ($this->currentTab->empty()) {
             $this->tab('app');
         }
@@ -94,6 +122,10 @@ public class Sink
 
     public function metric(string $name, float64 $value, Unit $unit, of: float64 $of = 0.0) : void
     {
+        if (!$this->tabsOn) {
+            return;
+        }
+
         if ($this->currentTab->empty()) {
             $this->tab('app');
         }
@@ -111,6 +143,10 @@ public class Sink
      */
     public function note(string $text) : void
     {
+        if (!$this->tabsOn) {
+            return;
+        }
+
         if ($this->currentTab->empty()) {
             $this->tab('app');
         }
@@ -125,6 +161,10 @@ public class Sink
      */
     public function pass(PassTiming $timing) : void
     {
+        if (!$this->tabsOn) {
+            return;
+        }
+
         if ($this->currentTab->empty()) {
             $this->tab('graph', title: 'Graph', 10);
         }
@@ -138,6 +178,10 @@ public class Sink
      */
     public function replacePasses(array<PassTiming> $rows) : void
     {
+        if (!$this->tabsOn) {
+            return;
+        }
+
         if ($this->currentTab->empty()) {
             $this->tab('graph', title: 'Graph', 10);
         }
@@ -148,6 +192,10 @@ public class Sink
 
     public function passExtra(string $pass, string $name, float64 $value, Unit $unit) : void
     {
+        if (!$this->tabsOn) {
+            return;
+        }
+
         array<Metric> $list = array<Metric>();
         if ($this->passExtras->has($pass)) {
             $list = $this->passExtras[$pass];

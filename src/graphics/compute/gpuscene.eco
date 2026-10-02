@@ -486,7 +486,7 @@ public class GpuScene
     private GpuScan? $scan;
     private array<SceneCullJob> $jobs;
 
-    public constructor(Device $device)
+    public constructor(Device $device, GpuSceneSettings $settings = GpuSceneSettings())
     {
         $this->device = $device;
         $this->bank = null;
@@ -501,10 +501,10 @@ public class GpuScene
         $this->mainViews = false;
         $this->outlining = false;
         $this->showChunks = false;
-        $this->minCasterTexels = visu::app::flags()->float('shadow.mintexels', 1.0) as float32;
-        $this->splitCull = visu::app::flags()->bool('scene.cullsplit', false);
-        $this->minPixels = visu::app::flags()->float('scene.minpixels', 0.0) as float32;
-        $this->showMeshlets = visu::app::flags()->bool('scene.meshlets', false);
+        $this->minCasterTexels = $settings->minCasterTexels;
+        $this->splitCull = $settings->splitCull;
+        $this->minPixels = $settings->minPixels;
+        $this->showMeshlets = $settings->showMeshlets;
         $this->interpolation = 1.0f;
         $this->chunks = SceneChunks($device);
         $this->transitions = 0;
@@ -533,6 +533,45 @@ public class GpuScene
         $this->alpha = null;
         $this->scan = null;
         $this->jobs = arr::room<SceneCullJob>(3);
+    }
+
+    /**
+     * Take the cull switches in `$settings`.
+     */
+    public function configure(const GpuSceneSettings& $settings) : void
+    {
+        $this->minCasterTexels = $settings->minCasterTexels;
+        $this->splitCull = $settings->splitCull;
+        $this->minPixels = $settings->minPixels;
+        $this->showMeshlets = $settings->showMeshlets;
+    }
+
+    /**
+     * The owner of the rows: the bank they point into, and whether the main views draw from the
+     * scene (`ModelSystem` on a bindless device) or the owner culls them itself.
+     */
+    public function own(ModelBank $bank, bool $mainViews) : void
+    {
+        $this->bank = $bank;
+        $this->mainViews = $mainViews;
+    }
+
+    /**
+     * This frame's inputs from the rows' owner: the global LOD multiplier and the interpolation
+     * alpha the movers resolve at.
+     */
+    public function frameInputs(float32 $lodBias, float32 $interpolation) : void
+    {
+        $this->lodBias = $lodBias;
+        $this->interpolation = $interpolation;
+    }
+
+    /**
+     * Whether any row glows this frame: the main cull then adds the outline view.
+     */
+    public function outlines(bool $on) : void
+    {
+        $this->outlining = $on;
     }
 
     /**
@@ -1022,12 +1061,12 @@ public class GpuScene
 
     /**
      * Record the main set's pass `$pass` (camera, mirror or outline) into an open encoder whose
-     * camera is bound: one indexed indirect draw per G-buffer class, each with the pass
-     * `$passFor` picks for that class (null skips the class). Binds the arena, the instances,
-     * the poses and the items at storage 0..5, the material table at 8, the texture table and the
-     * palette.
+     * camera is bound: one indexed indirect draw per G-buffer class, each with `$table`'s
+     * pipeline for that class in `$list` (null skips the class). Binds the arena, the
+     * instances, the poses and the items at storage 0..5, the material table at 8, the texture
+     * table and the palette.
      */
-    public function drawMain(RenderEncoder $enc, int32 $pass, function<GpuPass?(int32)> $passFor) : void
+    public function drawMain(RenderEncoder $enc, int32 $pass, ScenePassTable $table, SceneDrawList $list) : void
     {
         SceneCullSet $set = $this->main;
         if (!$set->culled || $pass < 0 || $pass >= $set->passes) {
@@ -1043,7 +1082,7 @@ public class GpuScene
         int32 $classes = $set->keys / $set->bins;
         int32 $k = 0;
         while ($k < $classes) {
-            GpuPass? $picked = $passFor($k);
+            GpuPass? $picked = $table->pass($list, $k);
             if ($picked != null) {
                 GpuPass $p = guard $picked;
                 $p->bind($enc);

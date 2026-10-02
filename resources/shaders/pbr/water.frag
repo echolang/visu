@@ -31,7 +31,6 @@ vec3 water_sphere_l(vec3 toLight, vec3 V, vec3 N, float sourceRadius)
 
 // Fog at slot 3; slot 0 is the water uniform. The shafts here are marched to the bed, so
 // the water looks them up itself (`water_fog_rays`) and hands the result to the shared fog.
-#define VISU_FOG_SKY_SLOT 3
 #define VISU_AERIAL_SLOT 4
 #include "visu/fog.glsl"
 #include "visu/godrays.glsl"
@@ -62,55 +61,10 @@ layout(set = 1, binding = 1) uniform sampler2D u_bed;
 layout(set = 1, binding = 2) uniform sampler2D u_mirror;
 layout(set = 1, binding = 7) uniform samplerCube u_prefilter;
 layout(set = 1, binding = 11) uniform sampler2DArray shadowmap;
-// legacy: fog_color of fog.glsl, with the sun's azimuth from the light block
-vec3 water_fog_color(vec3 dir)
-{
-    if (u_fog_color.w < 0.5) {
-        return u_fog_color.rgb;
-    }
-
-    vec2 uv = fog_sky_uv(fog_sky_horizon(dir, -u_sun_direction.xyz));
-    return u_fog_color.rgb * (textureLod(u_fog_sky, uv, 0.0).rgb + u_fog_floor.rgb);
-}
-
-// legacy: fog_apply of fog.glsl, with the lights' directions from the light block
-vec3 water_fog(vec3 color, vec3 relative)
-{
-    if (u_fog_density.w < 0.5) {
-        return color;
-    }
-    float len = length(relative);
-    if (len < 1e-3) {
-        return color;
-    }
-    float cutoff = u_fog_params.y;
-    if (cutoff > 0.0 && len > cutoff) {
-        return color;
-    }
-    vec3 dir = relative / len;
-    float dy = dir.y;
-    float start = u_fog_params.x;
-    float optical = fog_integral(dy, len);
-    float t = max(exp(-(optical - fog_integral(dy, min(len, start)))), 1.0 - u_fog_density.z);
-    float td = exp(-(optical - fog_integral(dy, min(len, start + u_fog_params.w))));
-    vec3 sunDir = normalize(-u_sun_direction.xyz);
-    float sun = pow(max(dot(dir, sunDir), 0.0), max(u_fog_sun.w, 1.0));
-    vec3 moonDir = normalize(-u_moon_direction.xyz);
-    float moon = pow(max(dot(dir, moonDir), 0.0), max(u_fog_moon.w, 1.0));
-    vec3 glow = u_fog_sun.rgb * sun + u_fog_moon.rgb * moon;
-    vec3 fog = water_fog_color(dir) * (1.0 - t) + glow * (1.0 - td);
-    return color * t + fog;
-}
-
-vec3 water_fog_rays_legacy(vec3 color, vec3 relative, vec2 uv);
-
 // the fog over the water at `relative`, with this frame's light shafts at `uv`: the shared
 // fog, the shafts looked up at the bed's distance and kept to the part in front of the surface
 vec3 water_fog_rays(vec3 color, vec3 relative, vec2 uv)
 {
-    if (u_fog_model.w < 0.5) {
-        return water_fog_rays_legacy(color, relative, uv);
-    }
     if (u_fog_shafts.w < 0.5) {
         return fog_apply(color, relative);
     }
@@ -131,48 +85,6 @@ vec3 water_fog_rays(vec3 color, vec3 relative, vec2 uv)
     float lit_sun = moonKey ? 1.0 : lit;
     float lit_moon = moonKey ? lit : 1.0;
     return fog_surface(color, relative, lit_sun, lit_moon, rays);
-}
-
-// legacy: water_fog with this frame's light shafts. Without the shafts bound it is water_fog.
-vec3 water_fog_rays_legacy(vec3 color, vec3 relative, vec2 uv)
-{
-    if (u_fog_shafts.w < 0.5) {
-        return water_fog(color, relative);
-    }
-    if (u_fog_density.w < 0.5) {
-        return color;
-    }
-    float len = length(relative);
-    if (len < 1e-3) {
-        return color;
-    }
-    float cutoff = u_fog_params.y;
-    if (cutoff > 0.0 && len > cutoff) {
-        return color;
-    }
-    vec3 dir = relative / len;
-    float dy = dir.y;
-    float start = u_fog_params.x;
-    float optical = fog_integral(dy, len);
-    float t = max(exp(-(optical - fog_integral(dy, min(len, start)))), 1.0 - u_fog_density.z);
-    float td = exp(-(optical - fog_integral(dy, min(len, start + u_fog_params.w))));
-    // the shaft texels here were marched to the bed under the surface: look them up at the
-    // bed's distance, then keep only the part of S in front of the surface
-    vec4 bed = texture(u_bed, uv);
-    float bedDist = bed.a >= 0.5 ? length(bed.xyz) : GODRAY_SKY_DEPTH;
-    vec2 shaft = godrays_fetch(uv, bedDist);
-    shaft.x *= clamp(len / max(bedDist, 1e-3), 0.0, 1.0);
-    float occlude = mix(1.0, shaft.y, u_fog_shafts.y);
-    vec3 sunDir = normalize(-u_sun_direction.xyz);
-    float sun = pow(max(dot(dir, sunDir), 0.0), max(u_fog_sun.w, 1.0));
-    vec3 moonDir = normalize(-u_moon_direction.xyz);
-    float moon = pow(max(dot(dir, moonDir), 0.0), max(u_fog_moon.w, 1.0));
-    vec3 glow = (u_fog_sun.rgb * sun + u_fog_moon.rgb * moon) * occlude;
-    vec3 fog = water_fog_color(dir) * (1.0 - t) + glow * (1.0 - td);
-    vec3 toLight = u_fog_shaft_light.w > 0.5 ? moonDir : sunDir;
-    float phase = godrays_phase2(dot(dir, toLight), u_fog_shaft_phase.xyz);
-    vec3 rays = u_fog_shaft_light.rgb * (phase * shaft.x * u_fog_shafts.x);
-    return color * t + fog + rays;
 }
 
 // One long wave. A phase that jumps by more than a pixel is dropped, so the

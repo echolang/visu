@@ -1,0 +1,48 @@
+/**
+ * The process flags as the renderer's typed settings, and the renderer taking them.
+ */
+
+use visu::app::{FlagValue, Flags, pointShadowSettings, rendererSettings};
+use visu::graphics::{
+    DeferredRenderer, Device, GpuSceneSettings, PointShadowSettings, RendererSettings, ToneCurve
+};
+
+test renderer_settings_default_without_flags
+{
+    RendererSettings $s = rendererSettings(Flags());
+    assert(!$s->toneLocal && !$s->exposureAuto && !$s->splitGeometry, 'off');
+    assert($s->toneCurve == ToneCurve::aces, 'aces');
+    assert($s->scene->minCasterTexels == 1.0f && $s->scene->minPixels == 0.0f, 'scene defaults');
+    PointShadowSettings $p = pointShadowSettings(Flags());
+    assert($p->enabled && $p->shadowDistance == 60.0f && $p->movingBias == 0.0f && !$p->debug, 'shadow defaults');
+}
+
+test renderer_settings_read_the_flags
+{
+    Flags $bag = Flags();
+    $bag->set('tonemap.curve', FlagValue::text('neutral'));
+    $bag->set('tonemap.local', FlagValue::boolean(true));
+    $bag->set('gbuffer.split', FlagValue::boolean(true));
+    $bag->set('scene.minpixels', FlagValue::floating(0.5));
+    $bag->set('light.shadowdistance', FlagValue::floating(40.0));
+    RendererSettings $s = rendererSettings($bag);
+    assert($s->toneCurve == ToneCurve::neutral && $s->toneLocal && $s->splitGeometry, 'renderer');
+    assert($s->scene->minPixels == 0.5f, 'scene');
+    assert(pointShadowSettings($bag)->shadowDistance == 40.0f, 'shadows');
+}
+
+test renderer_takes_its_settings
+{
+    RendererSettings $s = RendererSettings();
+    $s->toneCurve = .reinhard;
+    $s->exposureAuto = true;
+    $s->scene->minCasterTexels = 3.0f;
+    DeferredRenderer $renderer = DeferredRenderer(Device(), $s);
+    assert($renderer->toneMap->curve == ToneCurve::reinhard && $renderer->exposure->auto, 'built with them');
+    assert($renderer->scene->minCasterTexels == 3.0f, 'the scene too');
+    RendererSettings $later = RendererSettings();
+    $later->splitGeometry = true;
+    $renderer->apply($later);
+    assert($renderer->splitGeometry && $renderer->toneMap->curve == ToneCurve::aces, 'apply replaces them');
+    assert($renderer->scene->minCasterTexels == 1.0f, 'and reconfigures the scene');
+}

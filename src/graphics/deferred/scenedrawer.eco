@@ -1,0 +1,42 @@
+/**
+ * Something that draws the scene: a system's terrain, grass, models or debug lines. It is
+ * attached to the renderer once (`DeferredRenderer.attach`, in the order it should draw) and
+ * asked every scene frame to get ready for the views that exist (`SceneViews`). It answers with
+ * the views it has content for, and the renderer joins it to each: the G-buffer through
+ * `GeometryFiller.record`, the sun cascades through `ShadowCaster.cast`, the water mirror
+ * through `ReflectionCaster.reflect`, the outline mask through `OutlineCaster.mask`. A drawer
+ * implements the interface of each view it can answer for; a bit it sets for a view it does not
+ * implement is ignored. No drawer touches the frame's mailboxes.
+ */
+
+namespace visu::graphics;
+
+/**
+ * The G-buffer of the camera.
+ */
+public const int32 SCENE_VIEW_GBUFFER = 1;
+
+/**
+ * The key light's cascades.
+ */
+public const int32 SCENE_VIEW_CASCADES = 2;
+
+/**
+ * The water mirror.
+ */
+public const int32 SCENE_VIEW_MIRROR = 4;
+
+/**
+ * The outline mask.
+ */
+public const int32 SCENE_VIEW_OUTLINE = 8;
+
+public interface SceneDrawer
+{
+    /**
+     * Do this frame's work for the views in `$views` (cull, pack, upload, add a compute pass)
+     * and answer the `SCENE_VIEW_*` bits of the views to draw into. Runs after the G-buffer is
+     * allocated and before the geometry pass, once a scene frame, in attach order.
+     */
+    function prepare(RenderContext $ctx, SceneViews $views) : int32;
+}

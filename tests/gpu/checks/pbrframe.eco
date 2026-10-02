@@ -5,8 +5,8 @@
 
 use visu::geo::{AABB, Pose, PrimitiveBuilder, PrimitiveLayout, sphere};
 use visu::graphics::{
-    Camera, RenderContext, DeferredRenderer, DirectionalLight, DrawCallAssembler,
-    GBufferData, Mesh, MeshHandle, Pipeline, Projection, TargetRef,
+    AssemblerFiller, Camera, RenderContext, DeferredRenderer, DirectionalLight, DrawCallAssembler,
+    Mesh, MeshHandle, Pipeline, Projection, TargetRef,
     VertexBuilder, VertexLayout, instanceLayout
 };
 use visu::math::{Mat4, Quat, Vec3, Vec4, translate};
@@ -44,18 +44,17 @@ public function checkPbrFrame(GpuContext $gpu) : void
     Camera $camera = Camera(Projection::perspective);
     Pose $pose = Pose(Vec3(0.0f, 0.0f, 3.0f), Quat(), Vec3(1.0f, 1.0f, 1.0f));
 
+    $renderer->attach(AssemblerFiller<PbrCheckMaterial>($dca, $renderer->geometryPass($layout)));
     $gpu->runFrame(function(Pipeline $p, RenderContext $build) : void {
         TargetRef $out = offscreen64($p, 'pbrframe');
         $build->frame->set($camera->data($pose, 64, 64, 1.0f, 1.0f, 0.0f));
-        $renderer->render($build, $out, function(RenderContext $inner, GBufferData $gbuffer) : void {
-            $dca->clearInstances();
-            $dca->submit($handle, translate(Vec3(0.0f, 0.0f, 0.0f)), PbrCheckMaterial(
-                Vec4(1.0f, 1.0f, 1.0f, 0.0f),
-                Vec4(0.0f, 0.0f, 0.0f, 0.4f)
-            ));
-            assert($dca->pendingCount() == 1, 'one instance');
-            $renderer->draw($inner, $gbuffer, $dca, $layout);
-        });
+        $dca->clearInstances();
+        $dca->submit($handle, translate(Vec3(0.0f, 0.0f, 0.0f)), PbrCheckMaterial(
+            Vec4(1.0f, 1.0f, 1.0f, 0.0f),
+            Vec4(0.0f, 0.0f, 0.0f, 0.4f)
+        ));
+        assert($dca->pendingCount() == 1, 'one instance');
+        $renderer->render($build, $out);
     });
 
     array<uint8> $pixels = $gpu->readOffscreen('pbrframe');

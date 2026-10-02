@@ -55,11 +55,8 @@ public class SsaoPass : Pass
         RenderEncoder $enc = guard $ctx->beginRender($data->target, overwrite: true) else ($e) {
             return .error($e);
         }
-        Device $device = $ctx->device;
-        Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
-            return .quad($device);
-        });
-        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        Mesh $mesh = $this->gpu->quad;
+        GpuPass $pass = $this->gpu->quadPass($program, Raster::none());
         $pass->bind($enc);
         $this->gpu->camera->bind($enc);
         $enc->upload($this->gpu->ssaoUniforms($this->quality, $data->target->width, $data->target->height), slot: 0);
@@ -185,11 +182,8 @@ internal function ssaoBlur(
     RenderEncoder $enc = guard $ctx->beginRender($target, overwrite: true) else ($e) {
         return .error($e);
     }
-    Device $device = $ctx->device;
-    Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
-        return .quad($device);
-    });
-    GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+    Mesh $mesh = $gpu->quad;
+    GpuPass $pass = $gpu->quadPass($program, Raster::none());
     $pass->bind($enc);
 
     guard bindPooled($ctx, $enc, 0, $source, $gpu->linear) else ($e) {

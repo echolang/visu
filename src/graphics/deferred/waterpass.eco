@@ -258,11 +258,8 @@ public class MirrorSkyPass : Pass
         RenderEncoder $enc = guard openColorDepth($ctx, $color, $depth, .load, .load) else ($e) {
             return .error($e);
         }
-        Device $device = $ctx->device;
-        Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
-            return .cube($device);
-        });
-        GpuPass $pass = GpuPass($program, VertexLayout::pos3(), skyRaster());
+        Mesh $mesh = $this->gpu->skyCube;
+        GpuPass $pass = $this->gpu->cubePass($program, skyRaster());
         $pass->bind($enc);
         $enc->upload($this->water->camera->uniforms(), slot: 1);
         HeightFog $quiet = $this->fog;
@@ -292,15 +289,6 @@ public class MirrorSkyPass : Pass
         }
         $enc->upload($fog, slot: 3);
         guard bindSkyView($ctx, $enc, $this->gpu, $this->view) else ($e) {
-            $enc->endRender();
-            return .error($e);
-        }
-        // fog is off in the mirror: white in the fog sky table's place
-        uint32 $fogSlot = FOG_SKY_SKYBOX_SLOT;
-        if ($this->probe) {
-            $fogSlot = FOG_SKY_SKY_SLOT;
-        }
-        guard bindFogSky($ctx, $enc, $this->gpu, $fogSlot, null) else ($e) {
             $enc->endRender();
             return .error($e);
         }
@@ -353,7 +341,6 @@ public class WaterPass : Pass
         $io->reads($gbuffer->position);
         $io->reads($gbuffer->depth);
         readGodRays($io, $frame);
-        readFogSky($io, $this->lighting->fogSky);
         readAerial($io, $this->lighting->aerial);
         TextureRef $mirror = guard $this->water->color else {
             TargetRef $target = $pipeline->createTarget('water', $light->target->width, $light->target->height);
@@ -397,19 +384,14 @@ public class WaterPass : Pass
             return .error($e);
         }
         Device $device = $ctx->device;
-        Mesh $quad = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
-            return .quad($device);
-        });
-        $this->gpu->blit->draw($enc, $quad, $scene, $this->gpu->linear);
+        $this->gpu->blit->draw($enc, $this->gpu->quad, $scene, $this->gpu->linear);
 
         ShaderProgram $program = guard $this->gpu->shaders->program('water') else ($e) {
             $enc->endRender();
             return .error(.shader($e));
         }
-        Mesh $surface = $ctx->pool->cache<Mesh>('water.quad', function() : Mesh {
-            return waterQuad($device);
-        });
-        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::opaque());
+        Mesh $surface = $this->gpu->waterSurface;
+        GpuPass $pass = $this->gpu->quadPass($program, Raster::opaque());
         $pass->bind($enc);
         $this->gpu->camera->bind($enc);
         CameraData $camera = $ctx->frame->get<CameraData>();
@@ -469,10 +451,6 @@ public class WaterPass : Pass
 
         $enc->bindTexture(7, $prefilter, $this->gpu->cube);
         guard bindShadowOrDummy($ctx, $enc, $this->gpu) else ($e) {
-            $enc->endRender();
-            return .error($e);
-        }
-        guard bindFogSky($ctx, $enc, $this->gpu, FOG_SKY_WATER_SLOT, $this->lighting->fogSky) else ($e) {
             $enc->endRender();
             return .error($e);
         }

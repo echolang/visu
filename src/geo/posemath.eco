@@ -1,0 +1,81 @@
+/**
+ * Pose arithmetic the transform hierarchy and the GPU scene share: a world matrix back to a pose,
+ * a pose's matrix, and the world box of a local box under a pose.
+ */
+
+namespace visu::geo;
+
+use visu::math::{Mat4, Quat, Vec3, Vec4, length, scale, translate};
+
+/**
+ * `$world` as a pose: its translation, its column lengths as the scale, and the rotation left
+ * when they are divided out. A mirrored matrix keeps its handedness in a negative x scale. A
+ * sheared chain (a non-uniform scale under a rotation) is not a pose; it comes back as the
+ * nearest one.
+ */
+public function decomposePose(const Mat4& $world) : Pose
+{
+    Vec3 $x = Vec3($world->c0->x, $world->c0->y, $world->c0->z);
+    Vec3 $y = Vec3($world->c1->x, $world->c1->y, $world->c1->z);
+    Vec3 $z = Vec3($world->c2->x, $world->c2->y, $world->c2->z);
+    float32 $sx = length($x);
+    float32 $sy = length($y);
+    float32 $sz = length($z);
+    if (visu::math::dot(visu::math::cross($x, $y), $z) < 0.0f) {
+        $sx = 0.0f - $sx;
+    }
+
+    Vec3 $position = Vec3($world->c3->x, $world->c3->y, $world->c3->z);
+    if ($sx == 0.0f || $sy == 0.0f || $sz == 0.0f) {
+        return Pose($position, Quat(), Vec3($sx, $sy, $sz));
+    }
+
+    Mat4 $rotation = Mat4(
+        Vec4($x / $sx, 0.0f),
+        Vec4($y / $sy, 0.0f),
+        Vec4($z / $sz, 0.0f),
+        Vec4(0.0f, 0.0f, 0.0f, 1.0f)
+    );
+    return Pose($position, visu::math::normalize(Quat($rotation)), Vec3($sx, $sy, $sz));
+}
+
+/**
+ * The world box of `$local` under `$pose`: the centre carried through the pose, the half extents
+ * through the absolute rotation times the scale. As tight as `AABB.transformed` on the pose's
+ * matrix, without building it; a mover's row takes two a move.
+ */
+public function poseBounds(const AABB& $local, const Pose& $pose) : AABB
+{
+    Quat $q = $pose->orientation;
+    float32 $xx = $q->x * $q->x;
+    float32 $yy = $q->y * $q->y;
+    float32 $zz = $q->z * $q->z;
+    float32 $xy = $q->x * $q->y;
+    float32 $xz = $q->x * $q->z;
+    float32 $yz = $q->y * $q->z;
+    float32 $wx = $q->w * $q->x;
+    float32 $wy = $q->w * $q->y;
+    float32 $wz = $q->w * $q->z;
+    // the rows of the rotation Mat4(Quat) builds
+    Vec3 $r0 = Vec3(1.0f - 2.0f * ($yy + $zz), 2.0f * ($xy - $wz), 2.0f * ($xz + $wy));
+    Vec3 $r1 = Vec3(2.0f * ($xy + $wz), 1.0f - 2.0f * ($xx + $zz), 2.0f * ($yz - $wx));
+    Vec3 $r2 = Vec3(2.0f * ($xz - $wy), 2.0f * ($yz + $wx), 1.0f - 2.0f * ($xx + $yy));
+    Vec3 $s = $pose->scale;
+    Vec3 $c = ($local->min + $local->max) * 0.5f * $s;
+    Vec3 $e = ($local->max - $local->min) * 0.5f * visu::math::abs($s);
+    Vec3 $centre = $pose->position + Vec3(visu::math::dot($r0, $c), visu::math::dot($r1, $c), visu::math::dot($r2, $c));
+    Vec3 $half = Vec3(
+        visu::math::dot(visu::math::abs($r0), $e),
+        visu::math::dot(visu::math::abs($r1), $e),
+        visu::math::dot(visu::math::abs($r2), $e)
+    );
+    return AABB($centre - $half, $centre + $half);
+}
+
+/**
+ * The TRS matrix of `$pose`, as `Transform.local` builds it.
+ */
+public function poseMatrix(const Pose& $pose) : Mat4
+{
+    return translate($pose->position) * Mat4($pose->orientation) * scale($pose->scale);
+}

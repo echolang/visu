@@ -194,3 +194,23 @@ test arena_ranges_merge_what_comes_back
     assert($r->freeRanges() == 0, 'used up');
     assert($r->take(10) == 400, 'past the top again');
 }
+
+test arena_ranges_wait_out_the_frames_in_flight
+{
+    ArenaRanges $r = ArenaRanges();
+    int32 $a = $r->take(100);
+    int32 $b = $r->take(100);
+    assert($a == 0 && $b == 100, 'fresh ranges stack');
+    // freed in frame 10: frames 10 and 9 may still read it on the GPU
+    $r->retire($a, 100, 10 as uint64);
+    assert($r->retiredRanges() == 1, 'waiting, not free');
+    $r->reclaim(10 as uint64);
+    assert($r->take(100) == 200, 'the frame that freed it does not reuse it');
+    $r->reclaim(12 as uint64);
+    assert($r->retiredRanges() == 1, 'two frames later a frame in flight may still read it');
+    assert($r->take(50) == 300, 'still past the top');
+    $r->reclaim(13 as uint64);
+    assert($r->retiredRanges() == 0, 'every frame that could read it has finished');
+    assert($r->freeRanges() == 1, 'back on the free list');
+    assert($r->take(100) == 0, 'reused once no frame reads it');
+}

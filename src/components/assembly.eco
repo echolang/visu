@@ -136,3 +136,27 @@ internal function attachPartModel(
         $world->attach($e, StaticModel($part->model));
     }
 }
+
+/**
+ * The assembly root `$e` belongs to: `$e` itself when it is one, else the first ancestor that
+ * is, or `Entity::none()` outside any assembly. O(depth).
+ */
+public function assemblyRootOf(Entities $entities, Entity $e) : Entity
+{
+    Entity $walk = $e;
+    int32 $depth = 0;
+    while ($walk != Entity::none() && $depth < 32) {
+        if ($entities->has<AssemblyInstance>($walk)) {
+            return $walk;
+        }
+
+        if (!$entities->has<Transform>($walk)) {
+            return Entity::none();
+        }
+
+        $walk = $entities->get<Transform>($walk)->parent;
+        $depth = $depth + 1;
+    }
+
+    return Entity::none();
+}

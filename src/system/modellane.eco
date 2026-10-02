@@ -10,7 +10,7 @@ namespace visu::system;
 
 use visu::geo::Frustum;
 use visu::graphics::{
-    DeferredRenderer, Device, DrawCallAssembler, GpuPass, MaterialGpu, MeshHandle, Model, ModelBank,
+    DeferredRenderer, Device, DrawCallAssembler, GpuPass, MaterialGpu, Mesh, MeshHandle, Model, ModelBank,
     Raster, RenderEncoder, ShaderProgram, VertexLayout
 };
 use visu::math::Vec3;
@@ -176,12 +176,15 @@ internal class ModelLane<P>
      */
     public function register(ModelBank $bank, Model $model, ModelHandles $h) : void
     {
+        Mesh $mesh = guard $model->mesh else {
+            die("model: '{$model->id}' has no classic mesh; the bank dropped them for the GPU main views (models.gpu)");
+        }
         foreach ($model->lods as $lod) {
             $h->lodStart[] = $h->handles->count() as int32;
             foreach ($lod->primitives as $prim) {
                 MaterialGpu $m = $bank->materialOf($model, $prim->slot);
                 MeshHandle $handle = $this->dca->register(
-                    $model->mesh,
+                    $mesh,
                     $lod->bounds,
                     firstIndex: $prim->firstIndex,
                     indexCount: $prim->indexCount,

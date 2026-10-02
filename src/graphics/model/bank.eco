@@ -129,6 +129,12 @@ public class ModelBank
     public MeshArena $arena;
 
     /**
+     * False once `dropClassicMeshes` ran: every model's classic mesh is freed as its form reaches
+     * the arena.
+     */
+    private bool $classic = true;
+
+    /**
      * The bindless side of the materials, on a device that has it: every map in a `TextureTable`
      * slot (one slot per distinct texture, by label), every material a row of the material
      * table at its dense index. Made with the first material; null on a device without
@@ -203,8 +209,9 @@ public class ModelBank
     /**
      * Take a model built at runtime (`buildModel`) under its own id, so `acquire` hands it out
      * like a catalog model. Its materials are the cooked ones, shared by id with every other
-     * model. The id must be new: an edit adopts a fresh id and drops the old one, so a mesh a
-     * frame in flight reads is never rewritten.
+     * model. The id must be new: an edit adopts a fresh id and drops the old one, and the arena
+     * holds the dropped model's ranges until the frames in flight that drew it have finished, so
+     * a mesh a frame in flight reads is never rewritten.
      */
     public function adopt(Model $model) : void
     {
@@ -624,6 +631,31 @@ public class ModelBank
 
         $model->arena = $this->arena->add($form, $slots, $skinned);
         $model->form = null;
+        if (!$this->classic) {
+            $model->dropMesh();
+        }
+    }
+
+    /**
+     * Free the classic mesh of every model held and of every model loaded from now on: the main
+     * views draw from the GPU scene, which reads only the arena, so the second copy of each
+     * model's vertices is VRAM nobody reads. Call it before the scene's first frame; a CPU main
+     * view cannot be built on this bank afterwards.
+     */
+    public function dropClassicMeshes() : void
+    {
+        $this->classic = false;
+        foreach ($this->models as $id => $model) {
+            $model->dropMesh();
+        }
+    }
+
+    /**
+     * The bank still keeps classic meshes for the CPU main views.
+     */
+    public const function keepsClassicMeshes() : bool
+    {
+        return $this->classic;
     }
 
     /**

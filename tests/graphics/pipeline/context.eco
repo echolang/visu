@@ -22,24 +22,27 @@ test context_lerp_uses_compensation
     assert($end->lerp(10.0f, 20.0f) == 20.0f, 'next tick');
 }
 
-test target_fingerprint_includes_attachments
+test target_key_includes_size_and_depth_stencil
 {
     TargetRef $t = TargetRef('x', 8, 8);
-    string $plain = visu::graphics::targetFingerprint($t);
+    visu::graphics::TargetKey $plain = visu::graphics::targetKey($t);
+    assert(visu::graphics::targetKeyMatches($plain, $t), 'matches what it was built from');
     $t->depthStencil = true;
-    string $depth = visu::graphics::targetFingerprint($t);
-    assert($plain != $depth, 'depth stencil');
+    assert(!visu::graphics::targetKeyMatches($plain, $t), 'depth stencil');
+    visu::graphics::TargetKey $depth = visu::graphics::targetKey($t);
     $t->width = 16;
-    assert($depth != visu::graphics::targetFingerprint($t), 'size');
+    assert(!visu::graphics::targetKeyMatches($depth, $t), 'size');
 }
 
-test target_fingerprint_includes_texture_options
+test target_key_includes_attachments_and_options
 {
     TargetRef $t = TargetRef('x', 8, 8);
+    visu::graphics::TargetKey $bare = visu::graphics::targetKey($t);
     TextureRef $c = TextureRef('x.attachment.color_a', 8, 8, TextureOptions());
     $t->colorAttachments->push($c);
-    string $rgba8 = visu::graphics::targetFingerprint($t);
+    assert(!visu::graphics::targetKeyMatches($bare, $t), 'an attachment more');
+    visu::graphics::TargetKey $rgba8 = visu::graphics::targetKey($t);
+    assert(visu::graphics::targetKeyMatches($rgba8, $t), 'same attachment');
     $c->options = TextureOptions($format: .rgba16f);
-    string $rgba16f = visu::graphics::targetFingerprint($t);
-    assert($rgba8 != $rgba16f, 'format');
+    assert(!visu::graphics::targetKeyMatches($rgba8, $t), 'format');
 }

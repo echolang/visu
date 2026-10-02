@@ -4,7 +4,6 @@ layout(location = 0) in vec3 v_direction;
 layout(location = 0) out vec4 frag_color;
 
 #include "visu/camera.glsl"
-#define VISU_FOG_SKY_SLOT 2
 #define VISU_FOG_SKY_ONLY
 #define VISU_FOG_RAYS
 #include "visu/fog.glsl"

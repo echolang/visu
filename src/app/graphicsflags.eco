@@ -1,0 +1,48 @@
+/**
+ * The process flags as the graphics layer's typed settings: the one place `--flag` words for
+ * the renderer, the GPU scene and the point shadows are read. Graphics itself reads no flag.
+ */
+
+namespace visu::app;
+
+use visu::graphics::{GpuSceneSettings, PointShadowSettings, RendererSettings, ToneCurve, toneCurveNamed};
+
+/**
+ * `tonemap.local`, `tonemap.curve`, `exposure.auto`, `gbuffer.split`, then `sceneSettings`.
+ */
+public function rendererSettings(const Flags& $bag) : RendererSettings
+{
+    RendererSettings $out = RendererSettings();
+    $out->toneLocal = $bag->bool('tonemap.local', false);
+    $out->toneCurve = toneCurveNamed($bag->str('tonemap.curve', 'aces')) ?? ToneCurve::aces;
+    $out->exposureAuto = $bag->bool('exposure.auto', false);
+    $out->splitGeometry = $bag->bool('gbuffer.split', false);
+    $out->scene = sceneSettings($bag);
+    return $out;
+}
+
+/**
+ * `shadow.mintexels`, `scene.cullsplit`, `scene.minpixels`, `scene.meshlets`.
+ */
+public function sceneSettings(const Flags& $bag) : GpuSceneSettings
+{
+    GpuSceneSettings $out = GpuSceneSettings();
+    $out->minCasterTexels = $bag->float('shadow.mintexels', 1.0) as float32;
+    $out->splitCull = $bag->bool('scene.cullsplit', false);
+    $out->minPixels = $bag->float('scene.minpixels', 0.0) as float32;
+    $out->showMeshlets = $bag->bool('scene.meshlets', false);
+    return $out;
+}
+
+/**
+ * `light.shadows`, `light.movingbias`, `light.shadowdistance`, `light.vsmdebug`.
+ */
+public function pointShadowSettings(const Flags& $bag) : PointShadowSettings
+{
+    PointShadowSettings $out = PointShadowSettings();
+    $out->enabled = $bag->bool('light.shadows', true);
+    $out->movingBias = $bag->float('light.movingbias', 0.0) as float32;
+    $out->shadowDistance = $bag->float('light.shadowdistance', 60.0) as float32;
+    $out->debug = $bag->bool('light.vsmdebug', false);
+    return $out;
+}

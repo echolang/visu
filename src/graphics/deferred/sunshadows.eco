@@ -1,0 +1,67 @@
+/**
+ * The key light's cascades: the depth array it owns (rebuilt only when the quality's resolution
+ * changes) and the cascade pass, added on the frames a key light is up and shadows are on.
+ */
+
+namespace visu::graphics;
+
+internal class SunShadows
+{
+    private Device $device;
+    private Texture? $map;
+    private array<ShadowCaster> $casters;
+
+    public constructor(Device $device)
+    {
+        $this->device = $device;
+        $this->map = null;
+        $this->casters = arr::room<ShadowCaster>(4);
+    }
+
+    /**
+     * Add the cascade pass for `$key` at `$quality`. Its setup publishes `ShadowMapData`, which
+     * the casters fill and the light pass reads.
+     */
+    public function add(Pipeline $pipeline, const DirectionalLight& $key, ShadowQuality $quality) : void
+    {
+        $pipeline->add(ShadowMapPass($this->ensureMap($quality), $key, $quality, $this->casters));
+    }
+
+    public function destroy() : void
+    {
+        $this->map = dropTexture($this->map);
+    }
+
+    private function ensureMap(ShadowQuality $quality) : Texture
+    {
+        Texture $have = guard $this->map else {
+            Texture $fresh = makeShadowMap($this->device, $quality);
+            $this->map = $fresh;
+            return $fresh;
+        }
+        if ($have->desc->width == $quality->resolution
+            && $have->desc->height == $quality->resolution
+            && $have->desc->arrayLength == SHADOW_CASCADES) {
+            return $have;
+        }
+
+        // the device buries the old map until no frame in flight samples it
+        $have->destroy();
+        Texture $resized = makeShadowMap($this->device, $quality);
+        $this->map = $resized;
+        return $resized;
+    }
+}
+
+internal function makeShadowMap(Device $device, ShadowQuality $quality) : Texture
+{
+    TextureDesc $desc = TextureDesc(
+        $format: .depth32f,
+        $width: $quality->resolution,
+        $height: $quality->resolution
+    );
+    $desc->kind = .array2D;
+    $desc->arrayLength = SHADOW_CASCADES;
+    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET;
+    return Texture($device, 'deferred.shadow', $desc);
+}

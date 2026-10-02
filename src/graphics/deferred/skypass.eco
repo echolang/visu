@@ -17,7 +17,6 @@ public class SkyPass : Pass
     private DirectionalLight $sun;
     private Moon $moon;
     private TextureRef $view;
-    private TextureRef? $fogSky;
     private FogLighting $fogLighting;
 
     public constructor(
@@ -27,8 +26,7 @@ public class SkyPass : Pass
         DirectionalLight $sun,
         Moon $moon,
         TextureRef $view,
-        FogLighting $fogLighting,
-        TextureRef? $fogSky = null
+        FogLighting $fogLighting
     )
     {
         $this->gpu = $gpu;
@@ -37,7 +35,6 @@ public class SkyPass : Pass
         $this->sun = $sun;
         $this->moon = $moon;
         $this->view = $view;
-        $this->fogSky = $fogSky;
         $this->fogLighting = $fogLighting;
     }
 
@@ -54,7 +51,6 @@ public class SkyPass : Pass
         $io->reads($gbuffer->depth);
         readGodRays($io, $frame);
         readSkyView($io, $this->view);
-        readFogSky($io, $this->fogSky);
         $io->writes($light->target);
     }
 
@@ -66,11 +62,8 @@ public class SkyPass : Pass
         RenderEncoder $enc = guard beginSkyPass($ctx) else ($e) {
             return .error($e);
         }
-        Device $device = $ctx->device;
-        Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
-            return .cube($device);
-        });
-        GpuPass $pass = GpuPass($program, VertexLayout::pos3(), skyRaster());
+        Mesh $mesh = $this->gpu->skyCube;
+        GpuPass $pass = $this->gpu->cubePass($program, skyRaster());
         $pass->bind($enc);
         $this->gpu->camera->bind($enc);
         CameraData $camera = $ctx->frame->get<CameraData>();
@@ -90,10 +83,6 @@ public class SkyPass : Pass
         }
         $enc->upload($fog, slot: 3);
         guard bindSkyView($ctx, $enc, $this->gpu, $this->view) else ($e) {
-            $enc->endRender();
-            return .error($e);
-        }
-        guard bindFogSky($ctx, $enc, $this->gpu, FOG_SKY_SKY_SLOT, $this->fogSky) else ($e) {
             $enc->endRender();
             return .error($e);
         }

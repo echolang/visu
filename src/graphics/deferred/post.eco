@@ -1,0 +1,262 @@
+/**
+ * The end of the frame after the light pass: the god rays through the fog and their history,
+ * the auto exposure and its history, the tone-map chain, and the look (the curve's matrices and
+ * the background mapped back through it) solved only when a setting moved. The renderer hands it
+ * its look fields every frame; it owns every texture and pass of its own.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec4;
+
+internal class PostChain
+{
+    private Device $device;
+    private GodRayHistory? $godRayHistory;
+    private ExposureHistory? $exposureHistory;
+
+    /**
+     * The display end's passes, built on the first tone-mapped frame and re-added every frame.
+     */
+    private ToneMapChain? $toneChain;
+
+    /**
+     * The curve settings `look` was built from; `ToneMap.lookChanged` against them decides a
+     * rebuild, so the matrices are solved when a setting moves, never per frame.
+     */
+    private ToneMap $lookFor;
+    private ToneLook $look;
+
+    /**
+     * The background mapped back through the look's curve for the light pass's clear, and the
+     * background it was solved for: re-solved only when either moves.
+     */
+    private Vec4 $clear;
+    private Vec4 $clearFor;
+
+    /**
+     * `visu::runtime::seconds()` at the last tone-mapped frame, for the exposure adaptation.
+     */
+    private float64 $toneSeconds;
+
+    public constructor(Device $device, Vec4 $background)
+    {
+        $this->device = $device;
+        $this->godRayHistory = null;
+        $this->exposureHistory = null;
+        $this->toneChain = null;
+        $this->lookFor = ToneMap();
+        $this->look = ToneLook($this->lookFor);
+        $this->clearFor = $background;
+        $this->clear = sceneBackground($background, $this->lookFor, $this->look);
+        $this->toneSeconds = 0.0;
+    }
+
+    /**
+     * The light pass's clear for `$background` under `$toneMap`: rebuilds the look when a curve
+     * setting moved and re-solves the clear when the look or the background did. A few compares
+     * on a still frame.
+     */
+    public function clear(const ToneMap& $toneMap, Vec4 $background) : Vec4
+    {
+        bool $changed = false;
+        if ($toneMap->lookChanged($this->lookFor)) {
+            $this->look = ToneLook($toneMap);
+            $this->lookFor = $toneMap;
+            $changed = true;
+        }
+
+        Vec4 $was = $this->clearFor;
+        if ($changed || $background->x != $was->x || $background->y != $was->y || $background->z != $was->z || $background->w != $was->w) {
+            $this->clear = sceneBackground($background, $this->lookFor, $this->look);
+            $this->clearFor = $background;
+        }
+
+        return $this->clear;
+    }
+
+    /**
+     * The shaft march and resolve, when this frame can have shafts. A frame that cannot keeps
+     * the textures (the sun comes back) but not their content; switching off frees them.
+     */
+    public function addGodRays(
+        RenderContext $ctx,
+        DeferredGpu $gpu,
+        const GodRays& $godRays,
+        const HeightFog& $fog,
+        const DirectionalLight& $sun,
+        const Moon& $moon
+    ) : void
+    {
+        if (!$godRays->enabled) {
+            $this->dropGodRays();
+            return;
+        }
+
+        DirectionalLight $key = keyLight($sun, $moon);
+        float32 $strength = 0.0f;
+        if ($key->intensity > 0.0f) {
+            $strength = godRayStrength($godRays, $key->direction);
+        }
+
+        // a high sun, no key light, no fog or no cascades: nothing to draw, nothing to pay
+        if ($strength <= 0.0f || !$fog->enabled || $ctx->frame->find<ShadowMapData>() == null) {
+            $this->idleGodRays();
+            return;
+        }
+
+        GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
+        GodRaySize $size = godRaySize($gbuffer->target->width, $gbuffer->target->height, $godRays->scale);
+        GodRayHistory $history = $this->ensureGodRays($size);
+        $ctx->pipeline->add(GodRayPass($gpu, $history, $godRays, $fog, $sun, $moon, $strength));
+        $ctx->pipeline->add(GodRayResolvePass($gpu));
+    }
+
+    /**
+     * A frame without the shaft passes: keep the textures, forget their content.
+     */
+    public function idleGodRays() : void
+    {
+        GodRayHistory $held = guard $this->godRayHistory else {
+            return;
+        }
+        $held->filled = false;
+    }
+
+    /**
+     * The display end: the meter and auto exposure when `exposure.auto`, the grid and the base
+     * when `toneMap.local`, then the resolve into `$output`. Neither on is the resolve alone,
+     * which with the default settings is the old blit plus the curve.
+     */
+    public function addToneMap(
+        RenderContext $ctx,
+        DeferredGpu $gpu,
+        const ToneMap& $toneMap,
+        const Exposure& $exposure,
+        const DirectionalLight& $sun,
+        const Moon& $moon,
+        const Sky& $sky,
+        TargetRef $output,
+        TextureRef $scene
+    ) : void
+    {
+        float64 $now = visu::runtime::seconds();
+        float32 $dt = ($now - $this->toneSeconds) as float32;
+        $this->toneSeconds = $now;
+        if ($dt < 0.0f) {
+            $dt = 0.0f;
+        } else if ($dt > 0.25f) {
+            // a stall or a resumed window adapts one quarter second's worth, not the whole gap
+            $dt = 0.25f;
+        }
+
+        bool $filled = false;
+        float32 $lux = 0.0f;
+        if ($exposure->auto) {
+            ExposureHistory $history = $this->ensureExposure();
+            $filled = $history->filled;
+            // only the meter reads the ground illuminance
+            $lux = groundIlluminance($sun, $moon, $sky);
+        } else {
+            $this->dropExposure();
+        }
+
+        float32 $blend = 0.0f;
+        IblData? $ibl = $ctx->frame->find<IblData>();
+        if ($ibl != null) {
+            IblData $found = guard $ibl;
+            $blend = $found->blend;
+        }
+
+        ToneMapUniforms $uniforms = toneMapUniforms(
+            $toneMap,
+            $exposure,
+            $this->look,
+            $output->width,
+            $output->height,
+            $lux,
+            $blend,
+            $dt,
+            $filled
+        );
+        $ctx->frame->set(ToneMapData($uniforms, $scene));
+        $this->ensureToneChain($gpu)->add($ctx->pipeline, $toneMap, $this->exposureHistory, $output);
+    }
+
+    /**
+     * Whether last frame ran auto exposure with a usable history.
+     */
+    public const function exposureLive() : bool
+    {
+        ExposureHistory $held = guard $this->exposureHistory else {
+            return false;
+        }
+        return $held->filled;
+    }
+
+    /**
+     * Whether last frame ran the shaft passes.
+     */
+    public const function godRaysLive() : bool
+    {
+        GodRayHistory $held = guard $this->godRayHistory else {
+            return false;
+        }
+        return $held->filled;
+    }
+
+    public function destroy() : void
+    {
+        $this->dropGodRays();
+        $this->dropExposure();
+    }
+
+    private function ensureToneChain(DeferredGpu $gpu) : ToneMapChain
+    {
+        ToneMapChain $have = guard $this->toneChain else {
+            ToneMapChain $fresh = ToneMapChain($gpu);
+            $this->toneChain = $fresh;
+            return $fresh;
+        }
+        return $have;
+    }
+
+    private function ensureExposure() : ExposureHistory
+    {
+        ExposureHistory $have = guard $this->exposureHistory else {
+            ExposureHistory $fresh = ExposureHistory($this->device);
+            $this->exposureHistory = $fresh;
+            return $fresh;
+        }
+        return $have;
+    }
+
+    private function dropExposure() : void
+    {
+        ExposureHistory $held = guard $this->exposureHistory else {
+            return;
+        }
+        $held->destroy();
+        $this->exposureHistory = null;
+    }
+
+    private function ensureGodRays(GodRaySize $size) : GodRayHistory
+    {
+        GodRayHistory $have = guard $this->godRayHistory else {
+            GodRayHistory $fresh = GodRayHistory($this->device, $size);
+            $this->godRayHistory = $fresh;
+            return $fresh;
+        }
+        $have->fit($size);
+        return $have;
+    }
+
+    private function dropGodRays() : void
+    {
+        GodRayHistory $held = guard $this->godRayHistory else {
+            return;
+        }
+        $held->destroy();
+        $this->godRayHistory = null;
+    }
+}

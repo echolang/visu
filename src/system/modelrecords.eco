@@ -1,0 +1,217 @@
+/**
+ * What `ModelSystem` keeps per model, per model entity and per frame: the handle slots, the
+ * records, the skin and dynamic draw entries, the movers' shadow bookkeeping, the highlights and
+ * the previews, and the budgets that size them.
+ */
+
+namespace visu::system;
+
+use visu::ecs::Entity;
+use visu::geo::AABB;
+use visu::graphics::Model;
+use visu::math::{Mat4, Vec4};
+
+/**
+ * One model's assembler handles, lod-major: level `l` is `$handles[$lodStart[l] .. $lodStart[l + 1])`.
+ */
+internal class ModelHandles
+{
+    public Model $model;
+    public array<visu::graphics::MeshHandle> $handles;
+    public array<int32> $lodStart;
+
+    /**
+     * Some material of the model casts a shadow; false keeps its GPU scene rows out of every
+     * shadow view.
+     */
+    public bool $anyCast;
+
+    /**
+     * Placed statics, dynamics and skins drawing this model. `evict` waits for zero.
+     */
+    public int32 $users;
+
+    /**
+     * Evicted: the handles went back to the mesh table and the slot waits for reuse.
+     */
+    public bool $dead;
+
+    public constructor(Model $model)
+    {
+        $this->model = $model;
+        $this->handles = array<visu::graphics::MeshHandle>();
+        $this->lodStart = array<int32>();
+        $this->anyCast = false;
+        $this->users = 0;
+        $this->dead = false;
+    }
+}
+
+/**
+ * Evictions `drainEvictions` may hold at once before the queue grows.
+ */
+internal const int32 MODEL_EVICT_RESERVE = 64;
+
+/**
+ * One skin this frame: where it stands and where its joints start in the frame palette.
+ * `fill` writes these; the GBuffer pass and every cascade read the same list.
+ */
+internal struct SkinDraw
+{
+    public Entity $entity;
+    public int32 $handles;
+    public Mat4 $world;
+    public AABB $bounds;
+    public Vec4 $tint;
+    public float32 $lodBias;
+    public float32 $base;
+}
+
+/**
+ * One casting mover's shadow bookkeeping: where it was when its shadows were last redrawn,
+ * and everything it swept since.
+ */
+internal struct MoverTrack
+{
+    public AABB $drawn;
+    public AABB $swept;
+    public bool $moved;
+}
+
+/**
+ * Metres from the eye within which a moving caster redraws its point-light shadows every
+ * frame; past it, every `MOVER_SHADOW_EVERY` frames, over everything it swept meanwhile.
+ */
+public const float32 MOVER_SHADOW_NEAR = 20.0f;
+public const int32 MOVER_SHADOW_EVERY = 4;
+
+/**
+ * One acquired dynamic in the CPU main view's draw list: its handles, world and bounds (current
+ * while it rests, interpolated each frame while it moves), look and whether it is hidden.
+ */
+internal struct DynamicDraw
+{
+    public Entity $entity;
+    public int32 $handles;
+    public Mat4 $world;
+    public AABB $bounds;
+    public Vec4 $tint;
+    public float32 $lodBias;
+    public bool $hidden;
+}
+
+internal enum ModelKind
+{
+    case statics;
+    case dynamic;
+    case skinned;
+}
+
+/**
+ * What `ModelSystem` holds for one model entity: its GPU scene row, its model's handle slot,
+ * which kind drew it, its place in the static set or the dynamic draw list, and the update its
+ * row last moved in.
+ */
+internal struct ModelRecord
+{
+    public int32 $row;
+    public int32 $handles;
+    public ModelKind $kind;
+    public int32 $slot;
+    public uint32 $movedIn;
+    public bool $moving;
+    public bool $shown;
+
+    /**
+     * The fill a skin was last packed in; a skin that misses one leaves the scene until it is back.
+     */
+    public int32 $frame;
+
+    /**
+     * The outline style slot its row glows in, -1 for none (`highlight`).
+     */
+    public int32 $outline = -1;
+
+    /**
+     * Its entity has a parent, or is an assembly root: a move then walks the assembly. Read once at
+     * acquire; a body or a car root without either moves on the fast path.
+     */
+    public bool $linked = true;
+
+    /**
+     * An editor drag (`beginEdit`) holds its row in the active set until `endEdit`.
+     */
+    public bool $editing = false;
+
+    /**
+     * Already in `refreshes`: a burst of edits of one entity is one rewrite.
+     */
+    public bool $refreshQueued = false;
+
+    /**
+     * Its index in the moving list while `moving`, -1 otherwise.
+     */
+    public int32 $movingAt = -1;
+}
+
+/**
+ * Model arrivals `fill` acquires in one frame at most; the rest wait for the next. A map load of a
+ * few thousand is one frame; a scatter of a million ramps in over a couple of seconds.
+ */
+public const int32 MODEL_ACQUIRE_BUDGET = 8192;
+
+/**
+ * Milliseconds of a displayed frame the acquisitions may take, checked every
+ * `MODEL_ACQUIRE_CHECK` arrivals: a big scatter ramps in without a hitch. Under a pinned clock
+ * (dcapture `fixedStep`) only the count holds, so a run acquires the same rows every frame.
+ */
+public const float64 MODEL_ACQUIRE_MS = 2.0;
+internal const int32 MODEL_ACQUIRE_CHECK = 256;
+
+/**
+ * Model entities `highlight` may hold at once. An assembly root counts each part it expands to.
+ */
+public const int32 MODEL_HIGHLIGHTS = 16;
+
+/**
+ * One highlighted model entity and the outline style slot it glows in.
+ */
+internal struct ModelHighlight
+{
+    public Entity $entity;
+    public int32 $style;
+}
+
+/**
+ * Forms `preview` takes in one frame; the rest are dropped. A placement ghost is one.
+ */
+public const int32 MODEL_PREVIEWS = 8;
+
+/**
+ * One `preview` call: the form, its root in the world and the outline style slot it draws in.
+ */
+internal struct ModelPreview
+{
+    public PreviewForm $form;
+    public Mat4 $root;
+    public int32 $style;
+}
+
+/**
+ * The tables `ModelSystem` writes and its main views read: every model's handle slot (indexed by
+ * `ModelRecord.handles`), the acquired dynamics' draw list, and this frame's posed skins. A class,
+ * so the CPU views hold the same tables rather than a copy.
+ */
+internal class ModelTables
+{
+    public array<ModelHandles> $models;
+    public array<DynamicDraw> $dynamics;
+    public array<SkinDraw> $skins;
+
+    public constructor()
+    {
+        $this->models = array<ModelHandles>();
+        $this->dynamics = array<DynamicDraw>();
+        $this->skins = array<SkinDraw>();
+    }
+}

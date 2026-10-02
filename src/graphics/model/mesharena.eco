@@ -5,9 +5,11 @@
  * material runs every LOD level is cut into. The `ModelBank` owns
  * one and adds a model when it loads or adopts it, so nothing here runs in a frame that did not
  * load something. A CPU mirror keeps every word, so growing a buffer is one fresh buffer and one
- * upload at that load step; a removed model's ranges go back on a free list that merges
- * neighbours, so a road rebuilt many times does not fragment it. The buffers a frame in flight
- * read are released by the device once no frame reads them.
+ * upload at that load step; a removed model's ranges wait out the frames in flight (a frame
+ * still on the GPU reads them), then go back on a free list that merges neighbours, so a road
+ * rebuilt many times does not fragment it and a fresh model never overwrites words a frame in
+ * flight draws. The buffers a frame in flight read are released by the device once no frame
+ * reads them.
  */
 
 namespace visu::graphics;
@@ -131,6 +133,11 @@ public class MeshArena
      */
     public function add(const ModelForm& $form, const array<ArenaSlot>& $slots, bool $skinned) : ArenaModel
     {
+        uint64 $now = $this->device->frameIndex();
+        $this->wordRanges->reclaim($now);
+        $this->detailRanges->reclaim($now);
+        $this->meshletRanges->reclaim($now);
+        $this->runRanges->reclaim($now);
         int32 $wordCount = $form->words->count() as int32;
         int32 $vertexCount = $form->vertexList->count() as int32;
         int32 $triangleCount = $form->triangles->count() as int32;
@@ -245,15 +252,18 @@ public class MeshArena
     }
 
     /**
-     * Give a model's ranges back. Its words stay until something reuses them; no view points
-     * at them once the model has no users.
+     * Give a model's ranges back once no frame in flight reads them. Its words stay until
+     * something reuses them; no view points at them once the model has no users, but the frames
+     * already submitted were recorded against them, so a range freed in frame `F` is reused from
+     * frame `F + FRAMES_IN_FLIGHT + 1` on.
      */
     public function remove(const ArenaModel& $model) : void
     {
-        $this->wordRanges->give($model->firstWord, $model->words);
-        $this->detailRanges->give($model->firstDetail, $model->details);
-        $this->meshletRanges->give($model->firstMeshlet, $model->meshlets);
-        $this->runRanges->give($model->firstRun, $model->runs);
+        uint64 $frame = $this->device->frameIndex();
+        $this->wordRanges->retire($model->firstWord, $model->words, $frame);
+        $this->detailRanges->retire($model->firstDetail, $model->details, $frame);
+        $this->meshletRanges->retire($model->firstMeshlet, $model->meshlets, $frame);
+        $this->runRanges->retire($model->firstRun, $model->runs, $frame);
     }
 
     /**
@@ -379,12 +389,67 @@ internal class ArenaRanges
     private array<int32> $freeStart;
     private array<int32> $freeCount;
 
+    /**
+     * Ranges given back while frames in flight may still read them, and the frame each was
+     * given back in. `reclaim` moves them to the free list once those frames are done.
+     */
+    private array<int32> $retiredStart;
+    private array<int32> $retiredCount;
+    private array<uint64> $retiredFrame;
+
     public constructor()
     {
         $this->top = 0;
         $this->capacity = 0;
         $this->freeStart = array<int32>();
         $this->freeCount = array<int32>();
+        $this->retiredStart = array<int32>();
+        $this->retiredCount = array<int32>();
+        $this->retiredFrame = array<uint64>();
+    }
+
+    /**
+     * Give `$n` back from `$start` as of frame `$frame`: free once every frame up to it has
+     * finished on the GPU (`reclaim`).
+     */
+    public function retire(int32 $start, int32 $n, uint64 $frame) : void
+    {
+        if ($n <= 0) {
+            return;
+        }
+
+        $this->retiredStart->push($start);
+        $this->retiredCount->push($n);
+        $this->retiredFrame->push($frame);
+    }
+
+    /**
+     * Free every retired range no frame in flight can read at frame `$now`. A frame waits for
+     * the one `FRAMES_IN_FLIGHT` before it, so a range retired in frame `F` is safe from
+     * `F + FRAMES_IN_FLIGHT + 1`.
+     */
+    public function reclaim(uint64 $now) : void
+    {
+        usize $i = 0;
+        while ($i < $this->retiredFrame->count()) {
+            if ($now <= $this->retiredFrame[$i] + (FRAMES_IN_FLIGHT as uint64)) {
+                $i = $i + 1;
+                continue;
+            }
+
+            $this->give($this->retiredStart[$i], $this->retiredCount[$i]);
+            $this->retiredStart->remove($i);
+            $this->retiredCount->remove($i);
+            $this->retiredFrame->remove($i);
+        }
+    }
+
+    /**
+     * Ranges still waiting out the frames in flight, for tests.
+     */
+    public const function retiredRanges() : int32
+    {
+        return $this->retiredStart->count() as int32;
     }
 
     public function take(int32 $n) : int32

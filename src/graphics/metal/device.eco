@@ -34,6 +34,13 @@ public class Device : DeviceProtocol
     internal float64 $contentsScale;
     internal bool $encoderOpen;
     internal mtl::RenderCommandEncoder? $activeEnc;
+
+    /**
+     * The blit encoder `fillBuffer` / `copyBuffer` left open on the scene command buffer, so a
+     * pass's run of counter clears and copies shares one encoder. Ended before any other
+     * encoder, debug group, commit or present (`endBlit`).
+     */
+    internal mtl::BlitCommandEncoder? $pendingBlit;
     internal bool $inFrame;
     internal bool $sceneCommitted;
     internal DeviceLimits $limits;
@@ -66,6 +73,7 @@ public class Device : DeviceProtocol
         $this->layer = null;
         $this->drawable = null;
         $this->cmd = null;
+        $this->pendingBlit = null;
         $this->preCmd = null;
         $this->preEnc = null;
         $this->preScope = -1;
@@ -266,6 +274,7 @@ public class Device : DeviceProtocol
     {
         assert($this->inFrame, 'endFrame outside beginFrame');
         assert(!$this->encoderOpen, 'endFrame with an open encoder');
+        $this->endBlit();
         if (!$this->sceneCommitted) {
             mtlCommitPreRender($this, false);
         }
@@ -394,6 +403,7 @@ public class Device : DeviceProtocol
     {
         assert($this->inFrame, 'beginRender outside beginFrame');
         assert(!$this->encoderOpen, 'beginRender while an encoder is open');
+        $this->endBlit();
         mtl::CommandBuffer $cmd = guard $this->cmd else {
             die('beginRender without a command buffer');
         }
@@ -470,6 +480,7 @@ public class Device : DeviceProtocol
     {
         assert($this->inFrame, 'beginCompute outside beginFrame');
         assert(!$this->encoderOpen, 'beginCompute while an encoder is open');
+        $this->endBlit();
         mtl::CommandBuffer $cmd = guard $this->cmd else {
             die('beginCompute without a command buffer');
         }
@@ -802,7 +813,6 @@ public class Device : DeviceProtocol
         }
         mtl::BlitCommandEncoder $blit = $this->openBlit();
         $blit->fillBuffer($buf, $offset as usize, $bytes as usize, $byte);
-        $blit->endEncoding();
     }
 
     public function copyBuffer(Buffer $src, uint64 $srcOffset, Buffer $dst, uint64 $dstOffset, uint64 $bytes) : void
@@ -820,22 +830,38 @@ public class Device : DeviceProtocol
         }
         mtl::BlitCommandEncoder $blit = $this->openBlit();
         $blit->copyFromBuffer($from, $srcOffset as usize, $to, $dstOffset as usize, $bytes as usize);
-        $blit->endEncoding();
     }
 
     /**
-     * A blit encoder on the scene command buffer, in order with the frame's other encoders.
+     * The open blit encoder on the scene command buffer, in order with the frame's other
+     * encoders; a fresh one when none is open.
      */
     private function openBlit() : mtl::BlitCommandEncoder
     {
         assert($this->inFrame, 'blit outside beginFrame');
-        mtl::CommandBuffer $cmd = guard $this->cmd else {
-            die('metal: blit without a command buffer');
+        mtl::BlitCommandEncoder $open = guard $this->pendingBlit else {
+            mtl::CommandBuffer $cmd = guard $this->cmd else {
+                die('metal: blit without a command buffer');
+            }
+            mtl::BlitCommandEncoder $blit = guard $cmd->blitCommandEncoder() else {
+                die('metal: blitCommandEncoder failed');
+            }
+            $this->pendingBlit = $blit;
+            return $blit;
         }
-        mtl::BlitCommandEncoder $blit = guard $cmd->blitCommandEncoder() else {
-            die('metal: blitCommandEncoder failed');
+        return $open;
+    }
+
+    /**
+     * End the blit encoder `openBlit` left open, if any.
+     */
+    internal function endBlit() : void
+    {
+        mtl::BlitCommandEncoder $open = guard $this->pendingBlit else {
+            return;
         }
-        return $blit;
+        $open->endEncoding();
+        $this->pendingBlit = null;
     }
 
     public function createTexture(const TextureDesc& $desc) : result<TextureHandle, DeviceError>
@@ -961,6 +987,7 @@ public class Device : DeviceProtocol
 
         // inside a frame the source mip was written by the frame's own command buffer, so the blit has to ride along with it
         if ($this->inFrame) {
+            $this->endBlit();
             mtl::CommandBuffer $cmd = guard $this->cmd else {
                 die('generateMipmaps without a command buffer');
             }
@@ -1169,6 +1196,7 @@ public class Device : DeviceProtocol
     private function acquireBackbuffer() : Texture
     {
         assert($this->inFrame, 'backbuffer outside beginFrame');
+        $this->endBlit();
         FrameSlot $slot = $this->slots[$this->slot];
         bool $hadWork = $slot->stamps->pending->count() > 0 || $this->preEnc != null;
 
@@ -1224,11 +1252,14 @@ public class Device : DeviceProtocol
 
     public function gpuBegin(const string& $name) : GpuProfileScope
     {
+        // a pass's blits stay its own: nothing merges across a profile scope
+        $this->endBlit();
         return mtlGpuBegin($this, $name, .graphics);
     }
 
     public function gpuEnd(GpuProfileScope $scope) : void
     {
+        $this->endBlit();
         mtlGpuEnd($this, $scope);
     }
 
@@ -1264,6 +1295,7 @@ public class Device : DeviceProtocol
 
     private function abortFrame() : void
     {
+        $this->endBlit();
         mtlCommitPreRender($this, true);
         mtl::RenderCommandEncoder? $held = $this->activeEnc;
 

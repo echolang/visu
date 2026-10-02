@@ -134,9 +134,7 @@ SkyScatter sky_scatter_to(thread const float3& dir, thread const float& limit, t
         t_max = ground.x;
     }
     t_max = fast::min(t_max, limit);
-    bool midpoint = _104.u_sky_ozone.w > 0.5;
     float n = float(view_samples);
-    float step_len = t_max / n;
     float3 to_sun = _104.u_sky_sun.xyz;
     float3 sum_r = float3(0.0);
     float3 sum_m = float3(0.0);
@@ -147,38 +145,29 @@ SkyScatter sky_scatter_to(thread const float3& dir, thread const float& limit, t
     float3 moon_m = float3(0.0);
     for (int i = 0; i < view_samples; i++)
     {
-        float t = (float(i) + 0.5) * step_len;
-        float dt = step_len;
-        if (midpoint)
-        {
-            float a = float(i) / n;
-            float b = float(i + 1) / n;
-            t = (t_max * 0.5) * ((a * a) + (b * b));
-            dt = t_max * ((b * b) - (a * a));
-        }
+        float a = float(i) / n;
+        float b = float(i + 1) / n;
+        float t = (t_max * 0.5) * ((a * a) + (b * b));
+        float dt = t_max * ((b * b) - (a * a));
         float3 p = o + (dir * t);
         float h = fast::max(length(p) - rg, 0.0);
         float param_6 = h;
         float3 dens = sky_density(param_6, _104) * dt;
-        float3 depth_here = depth_view + dens;
-        if (midpoint)
-        {
-            depth_here = depth_view + (dens * 0.5);
-        }
+        float3 depth_here = depth_view + (dens * 0.5);
         depth_view += dens;
-        bool _396;
+        bool _373;
         if (moon_on)
         {
             float3 param_7 = p;
             float3 param_8 = to_moon;
             float param_9 = rg;
-            _396 = sky_ray_sphere(param_7, param_8, param_9).x <= 0.0;
+            _373 = sky_ray_sphere(param_7, param_8, param_9).x <= 0.0;
         }
         else
         {
-            _396 = moon_on;
+            _373 = moon_on;
         }
-        if (_396)
+        if (_373)
         {
             float3 param_10 = p;
             float3 param_11 = to_moon;

@@ -1,0 +1,463 @@
+/**
+ * The CPU main views of `ModelSystem`: the fallback for a device without bindless textures, or
+ * `--flag models.gpu=false`. Statics sit in an octree the camera culls through, dynamics and
+ * skins come from `ModelSystem`'s tables, every instance picks its LOD by distance and the two
+ * `ModelLane`s batch them by material for the camera, the water mirror and the outline mask.
+ * The shadow cascades draw from the GPU scene either way. `ModelSystem` builds this only when
+ * the main views do not come from the GPU scene, so a GPU frame keeps no lane, no octree and no
+ * per-frame mover worlds.
+ */
+
+namespace visu::system;
+
+use visu::asset::MODEL_MAX_LODS;
+use visu::console::lodColor;
+use visu::ecs::Entity;
+use visu::geo::{AABB, Frustum, Plane};
+use visu::graphics::{
+    CameraData, DebugLines, DeferredRenderer, Device, DrawCallAssembler, ModelBank, ModelInstanceData,
+    RenderEncoder, SKIN_PALETTE_SLOT, SkinInstanceData, TransientSlice, WaterDraw, WaterFrame, lodIndex,
+    modelLayout, skinnedLayout, waterAbove
+};
+use visu::math::{Mat4, Vec3, Vec4, length};
+
+/**
+ * The knobs a CPU draw reads off `ModelSystem`: its global LOD multiplier, and whether the
+ * debug overlay boxes each submitted instance or draws the octree.
+ */
+internal struct CpuDrawTuning
+{
+    public float32 $lodBias;
+    public bool $showBounds;
+    public bool $showOctree;
+}
+
+internal class CpuModelViews
+{
+    public StaticSet $statics;
+    public ModelLane<ModelInstanceData> $rigid;
+    public ModelLane<SkinInstanceData> $skinned;
+
+    /**
+     * Counts from the last camera draw, for the console.
+     */
+    public int32 $submitted;
+    public int32 $distanceCulled;
+    public int32 $dynamicCount;
+    public array<int32> $lodHistogram;
+    private ModelTables $tables;
+
+    public constructor(Device $device, const AABB& $world, ModelTables $tables)
+    {
+        $this->statics = StaticSet($world);
+        $this->rigid = ModelLane<ModelInstanceData>(
+            $device,
+            modelLayout(),
+            'model',
+            'model+parallax',
+            'outline_mask'
+        );
+        $this->skinned = ModelLane<SkinInstanceData>(
+            $device,
+            skinnedLayout(),
+            'model+skinned',
+            'model+skinned_parallax',
+            'outline_mask+skinned'
+        );
+        $this->tables = $tables;
+        $this->submitted = 0;
+        $this->distanceCulled = 0;
+        $this->dynamicCount = 0;
+        $this->lodHistogram = array<int32>();
+        int32 $i = 0;
+        while ($i < MODEL_MAX_LODS) {
+            $this->lodHistogram[] = 0;
+            $i = $i + 1;
+        }
+    }
+
+    /**
+     * Register `$h`'s model into its lane's assembler, every level and primitive.
+     */
+    public function register(ModelBank $bank, ModelHandles $h) : void
+    {
+        if ($h->model->skinned()) {
+            $this->skinned->register($bank, $h->model, $h);
+            return;
+        }
+
+        $this->rigid->register($bank, $h->model, $h);
+    }
+
+    public function unregister(ModelHandles $h) : void
+    {
+        if ($h->model->skinned()) {
+            $this->skinned->unregister($h);
+            return;
+        }
+
+        $this->rigid->unregister($h);
+    }
+
+    /**
+     * Each lane's passes once the renderer has linked its programs.
+     */
+    public function ensure(DeferredRenderer $renderer, bool $wireframe) : void
+    {
+        $this->rigid->ensure($renderer, $wireframe);
+        $this->skinned->ensure($renderer, $wireframe);
+    }
+
+    /**
+     * A raster knob flipped (wireframe): the passes are rebuilt on the next draw.
+     */
+    public function reset() : void
+    {
+        $this->rigid->reset();
+        $this->skinned->reset();
+    }
+
+    public function clear() : void
+    {
+        $this->rigid->clear();
+        $this->skinned->clear();
+        $this->statics->clear();
+    }
+
+    public const function commandCount() : int32
+    {
+        return $this->rigid->dca->commandCount() + $this->skinned->dca->commandCount();
+    }
+
+    public const function frustumCulled() : int32
+    {
+        return $this->rigid->dca->culledCount() + $this->skinned->dca->culledCount();
+    }
+
+    /**
+     * Cull, pick LODs, build the batches and record them into the geometry pass's encoder,
+     * after the overlay lines for the frozen cull. Nothing before the lanes are ready.
+     */
+    public function record(
+        RenderEncoder $enc,
+        ModelBank $bank,
+        const CameraData& $camera,
+        DebugLines $lines,
+        const CpuDrawTuning& $tuning,
+        TransientSlice? $palette
+    ) : void
+    {
+        if (!$this->rigid->ready()) {
+            return;
+        }
+
+        visu::profile::begin('cull');
+        $this->submitAll($camera->cullFrustum, $camera->cullPosition, $lines, $tuning);
+        $this->rigid->dca->build($camera->cullFrustum, $camera->cullPosition);
+        $this->skinned->dca->build($camera->cullFrustum, $camera->cullPosition);
+        if ($camera->cullFrozen) {
+            $lines->frustum($camera->cullCorners(), Vec4(1.00f, 0.85f, 0.15f, 1.0f));
+            $lines->cross($camera->cullPosition, 4.0f);
+        }
+
+        visu::profile::end();
+        bool $geometry = $this->rigid->dca->commandCount() > 0;
+        bool $skins = $this->skinned->dca->commandCount() > 0;
+        if (!$geometry && !$skins) {
+            return;
+        }
+
+        visu::profile::begin('draw');
+        if ($geometry) {
+            $this->rigid->draw($enc, $bank);
+        }
+
+        if ($skins) {
+            visu::profile::begin('skinned');
+            bindPalette($enc, $palette);
+            $this->skinned->draw($enc, $bank);
+            visu::profile::end();
+        }
+
+        visu::profile::end();
+    }
+
+    /**
+     * Models inside the mirror sphere and above the plane. LOD stays on the play camera.
+     */
+    public function prepareReflection(const CameraData& $view, WaterFrame $water, const CpuDrawTuning& $tuning) : void
+    {
+        if ($water->mirrorIndex < 0) {
+            return;
+        }
+
+        visu::profile::begin('reflect/cull');
+        $this->rigid->clearReflect();
+        $this->skinned->clearReflect();
+        WaterDraw $chosen = $water->draws[$water->mirrorIndex as usize];
+        Vec3 $eye = $view->cullPosition;
+        Vec3 $origin = $chosen->origin;
+        float32 $radius = $chosen->radius;
+        Plane $plane = $chosen->plane;
+        Frustum $frustum = $water->camera->cullFrustum;
+        $this->statics->query($frustum);
+        const array<uint32>& $ids = $this->statics->visible();
+        foreach ($ids as $id) {
+            StaticInstance $inst = $this->statics->get($id);
+            if (!$inst->live || !waterAbove($inst->bounds, $plane)) {
+                continue;
+            }
+
+            if (length($inst->bounds->closest($origin) - $origin) > $radius) {
+                continue;
+            }
+
+            ModelHandles $h = $this->tables->models[$inst->handles as usize];
+            $this->submitVisible($this->rigid->reflectDca, $h, $inst->world, $inst->bounds, ModelInstanceData($inst->tint), $inst->lodBias, $eye, false, null, $tuning);
+        }
+
+        foreach ($this->tables->dynamics as $dyn) {
+            if ($dyn->hidden || !waterAbove($dyn->bounds, $plane)) {
+                continue;
+            }
+
+            if (length($dyn->bounds->closest($origin) - $origin) > $radius) {
+                continue;
+            }
+
+            ModelHandles $h = $this->tables->models[$dyn->handles as usize];
+            $this->submitVisible($this->rigid->reflectDca, $h, $dyn->world, $dyn->bounds, ModelInstanceData($dyn->tint), $dyn->lodBias, $eye, false, null, $tuning);
+        }
+
+        foreach ($this->tables->skins as $skin) {
+            if (!waterAbove($skin->bounds, $plane)) {
+                continue;
+            }
+
+            if (length($skin->bounds->closest($origin) - $origin) > $radius) {
+                continue;
+            }
+
+            ModelHandles $h = $this->tables->models[$skin->handles as usize];
+            SkinInstanceData $payload = SkinInstanceData($skin->tint, Vec4($skin->base, 0.0f, 0.0f, 0.0f));
+            $this->submitVisible($this->skinned->reflectDca, $h, $skin->world, $skin->bounds, $payload, $skin->lodBias, $eye, false, null, $tuning);
+        }
+
+        $this->rigid->buildReflect($frustum, $eye);
+        $this->skinned->buildReflect($frustum, $eye);
+        visu::profile::end();
+    }
+
+    /**
+     * Draw the lists `prepareReflection` built. The mirror camera is already at slot 1.
+     */
+    public function reflect(RenderEncoder $enc, ModelBank $bank, TransientSlice? $palette) : void
+    {
+        if ($this->rigid->reflects()) {
+            $this->rigid->drawReflect($enc, $bank);
+        }
+
+        if ($this->skinned->reflects()) {
+            bindPalette($enc, $palette);
+            $this->skinned->drawReflect($enc, $bank);
+        }
+    }
+
+    /**
+     * Start this frame's outline lists.
+     */
+    public function outlineBegin() : void
+    {
+        $this->rigid->outlineDca->clearInstances();
+        $this->skinned->outlineDca->clearInstances();
+    }
+
+    /**
+     * One rigid instance into the outline list, at the LOD the camera picks.
+     */
+    public function outlineRigid(
+        ModelHandles $h,
+        const Mat4& $world,
+        const AABB& $bounds,
+        ModelInstanceData $payload,
+        float32 $lodBias,
+        Vec3 $eye,
+        const CpuDrawTuning& $tuning
+    ) : void
+    {
+        $this->submitVisible($this->rigid->outlineDca, $h, $world, $bounds, $payload, $lodBias, $eye, false, null, $tuning);
+    }
+
+    /**
+     * One skin into the outline list, at the LOD the camera picks.
+     */
+    public function outlineSkinned(
+        ModelHandles $h,
+        const Mat4& $world,
+        const AABB& $bounds,
+        SkinInstanceData $payload,
+        float32 $lodBias,
+        Vec3 $eye,
+        const CpuDrawTuning& $tuning
+    ) : void
+    {
+        $this->submitVisible($this->skinned->outlineDca, $h, $world, $bounds, $payload, $lodBias, $eye, false, null, $tuning);
+    }
+
+    /**
+     * Cull and batch the outline lists; true when something will draw.
+     */
+    public function outlineBuild(const Frustum& $frustum, Vec3 $eye) : bool
+    {
+        $this->rigid->buildOutline($frustum, $eye);
+        $this->skinned->buildOutline($frustum, $eye);
+        return $this->rigid->outlines() || $this->skinned->outlines();
+    }
+
+    /**
+     * Draw the outline lists into the open mask encoder.
+     */
+    public function mask(RenderEncoder $enc, ModelBank $bank, TransientSlice? $palette) : void
+    {
+        $this->rigid->outline($enc, $bank);
+        if ($this->skinned->outlines()) {
+            bindPalette($enc, $palette);
+            $this->skinned->outline($enc, $bank);
+        }
+    }
+
+    /**
+     * Query the octree for statics inside `$frustum`, walk the dynamics and the skins, submit
+     * each at the LOD its distance from `$eye` earns. Records the console counters and the
+     * debug lines.
+     */
+    private function submitAll(const Frustum& $frustum, Vec3 $eye, DebugLines $lines, const CpuDrawTuning& $tuning) : void
+    {
+        $this->rigid->dca->clearInstances();
+        $this->skinned->dca->clearInstances();
+        $this->submitted = 0;
+        $this->distanceCulled = 0;
+        $this->dynamicCount = 0;
+        int32 $i = 0;
+        while ($i < MODEL_MAX_LODS) {
+            $this->lodHistogram[$i as usize] = 0;
+            $i = $i + 1;
+        }
+
+        if ($tuning->showOctree) {
+            $this->statics->draw($lines);
+        }
+
+        $this->statics->query($frustum);
+        const array<uint32>& $ids = $this->statics->visible();
+        foreach ($ids as $id) {
+            StaticInstance $inst = $this->statics->get($id);
+            if (!$inst->live) {
+                continue;
+            }
+
+            ModelHandles $h = $this->tables->models[$inst->handles as usize];
+            $this->submitVisible($this->rigid->dca, $h, $inst->world, $inst->bounds, ModelInstanceData($inst->tint), $inst->lodBias, $eye, true, $lines, $tuning);
+        }
+
+        foreach ($this->tables->dynamics as $dyn) {
+            if ($dyn->hidden) {
+                continue;
+            }
+
+            $this->dynamicCount = $this->dynamicCount + 1;
+            ModelHandles $h = $this->tables->models[$dyn->handles as usize];
+            $this->submitVisible($this->rigid->dca, $h, $dyn->world, $dyn->bounds, ModelInstanceData($dyn->tint), $dyn->lodBias, $eye, true, $lines, $tuning);
+        }
+
+        foreach ($this->tables->skins as $skin) {
+            ModelHandles $h = $this->tables->models[$skin->handles as usize];
+            SkinInstanceData $payload = SkinInstanceData($skin->tint, Vec4($skin->base, 0.0f, 0.0f, 0.0f));
+            $this->submitVisible($this->skinned->dca, $h, $skin->world, $skin->bounds, $payload, $skin->lodBias, $eye, true, $lines, $tuning);
+        }
+    }
+
+    /**
+     * Submit one instance at the LOD its distance from `$eye` earns, or nothing past its cull
+     * distance. `$record` counts it for the console and, with `showBounds`, boxes it in `$lines`.
+     */
+    private function submitVisible<P>(
+        DrawCallAssembler<P> $dca,
+        ModelHandles $h,
+        const Mat4& $world,
+        const AABB& $bounds,
+        P $payload,
+        float32 $lodBias,
+        Vec3 $eye,
+        bool $record,
+        DebugLines? $lines,
+        const CpuDrawTuning& $tuning
+    ) : void
+    {
+        float32 $dist = length($bounds->closest($eye) - $eye);
+        if ($h->model->cullDistance > 0.0f && $dist > $h->model->cullDistance) {
+            if ($record) {
+                $this->distanceCulled = $this->distanceCulled + 1;
+            }
+
+            return;
+        }
+
+        int32 $lod = lodIndex($h->model->lods, $dist, $h->model->lodBias * $lodBias * $tuning->lodBias);
+        if ($record && $tuning->showBounds && $lines != null) {
+            DebugLines $overlay = guard $lines;
+            $overlay->box($bounds, lodColor($lod));
+        }
+
+        int32 $level = clampLevel($h, $lod);
+        if ($level < 0) {
+            return;
+        }
+
+        if ($record) {
+            $this->lodHistogram[$level as usize] = $this->lodHistogram[$level as usize] + 1;
+            $this->submitted = $this->submitted + 1;
+        }
+
+        int32 $start = $h->lodStart[$level as usize];
+        int32 $end = $h->lodStart[($level + 1) as usize];
+        int32 $n = $start;
+        while ($n < $end) {
+            $dca->submit($h->handles[$n as usize], $world, $payload, 0.0f);
+            $n = $n + 1;
+        }
+    }
+}
+
+/**
+ * `$lod` clamped to the levels `$h` holds; -1 for a model with none.
+ */
+internal function clampLevel(ModelHandles $h, int32 $lod) : int32
+{
+    int32 $last = ($h->lodStart->count() as int32) - 2;
+    if ($last < 0) {
+        return -1;
+    }
+
+    if ($lod < 0) {
+        return 0;
+    }
+
+    if ($lod > $last) {
+        return $last;
+    }
+
+    return $lod;
+}
+
+/**
+ * Bind this frame's joint palette at slot 2, the slice the movers put in the ring, which every
+ * pass of the frame shares. Nothing to bind with no skin on screen.
+ */
+internal function bindPalette(RenderEncoder $enc, TransientSlice? $palette) : void
+{
+    TransientSlice $slice = guard $palette else {
+        return;
+    }
+    $enc->bindUniform(SKIN_PALETTE_SLOT, $slice);
+}

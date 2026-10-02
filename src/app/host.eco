@@ -76,6 +76,17 @@ public class Host
     private FullscreenTextureRenderer $blit;
     private Overlay? $overlay;
 
+    /**
+     * The frame blackboard and the two graphs, kept across frames: each frame clears and
+     * refills them, so building the graph allocates nothing once its passes have been seen.
+     * Cleared again after present, so nothing the frame published outlives it.
+     */
+    private Frame $frame;
+    private Pipeline $scenePipe;
+    private Pipeline? $presentPipe;
+    private HostPassData? $hostPass;
+    private SceneTargetData? $sceneTargetData;
+
     public constructor(HostConfig $config, Services $services)
     {
         $this->script = $services->find<DCapture>();
@@ -106,6 +117,11 @@ public class Host
             hostHints($config)
         );
         $this->pool = Pool($this->device);
+        $this->frame = Frame();
+        $this->scenePipe = Pipeline($this->pool, $this->frame);
+        $this->presentPipe = null;
+        $this->hostPass = null;
+        $this->sceneTargetData = null;
         $this->dispatcher = Dispatcher();
         $this->input = InputHub($this->window, $this->dispatcher);
         $this->inputContext = ContextMap($this->dispatcher, $this->input);
@@ -256,7 +272,7 @@ public class Host
     }
 
     /**
-     * Record and present one frame. Locals (pipeline, frame, texture refs) drop before
+     * Record and present one frame. The passes and the blackboard's facts are dropped before
      * the caller runs afterPresent, so a scene switch can destroy GPU objects.
      */
     private function buildAndPresent(
@@ -267,20 +283,74 @@ public class Host
     {
         profiler()->bindFrame($this->device->frameIndex(), $this->frameIndex);
         visu::profile::begin('build');
-        Frame $frame = Frame();
-        Pipeline $scenePipe = Pipeline($this->pool, $frame);
+        Frame $frame = $this->frame;
+        Pipeline $scenePipe = $this->scenePipe;
+        $frame->clear();
+        $scenePipe->reset();
         RenderContext $ctx = RenderContext($this->device, $scenePipe, $frame, $this->pool, $compensation);
         TargetRef $sceneTarget = $this->sceneTarget($scenePipe);
         $sceneTarget->depthStencil = $this->config->sceneDepth;
         TextureRef $color = $scenePipe->createColor($sceneTarget, $this->config->colorName, TextureOptions());
-        $frame->set(HostPassData($sceneTarget, $color));
-        $frame->set(SceneTargetData($sceneTarget));
+        $this->publishSceneTarget($frame, $sceneTarget, $color);
         $this->publishCameraOverride($frame);
         $scenePipe->add(ClearPass($sceneTarget, ClearPassOptions(color: $this->config->clearColor)));
         $scene($ctx, $sceneTarget);
         $this->addUi($scenePipe, $sceneTarget, $ui);
         visu::profile::end();
-        return $this->finishFrame($scenePipe, $frame, $color, $compensation);
+        bool $presented = $this->finishFrame($scenePipe, $frame, $color, $compensation);
+        $frame->clear();
+        $scenePipe->release();
+        Pipeline? $present = $this->presentPipe;
+        if ($present != null) {
+            Pipeline $held = guard $present;
+            $held->release();
+        }
+
+        return $presented;
+    }
+
+    /**
+     * The scene target facts. Their refs are the pipeline's cached ones, so the facts are built
+     * once and republished.
+     */
+    private function publishSceneTarget(Frame $frame, TargetRef $target, TextureRef $color) : void
+    {
+        HostPassData $pass = guard $this->hostPass else {
+            HostPassData $fresh = HostPassData($target, $color);
+            $this->hostPass = $fresh;
+            $frame->set($fresh);
+            $this->publishSceneTargetData($frame, $target);
+            return;
+        }
+        $pass->renderTarget = $target;
+        $pass->outputTexture = $color;
+        $frame->set($pass);
+        $this->publishSceneTargetData($frame, $target);
+    }
+
+    private function publishSceneTargetData(Frame $frame, TargetRef $target) : void
+    {
+        SceneTargetData $data = guard $this->sceneTargetData else {
+            SceneTargetData $fresh = SceneTargetData($target);
+            $this->sceneTargetData = $fresh;
+            $frame->set($fresh);
+            return;
+        }
+        $frame->set($data);
+    }
+
+    /**
+     * The present graph for this frame, ending on `$window`.
+     */
+    private function presentPipeline(RenderTarget $window) : Pipeline
+    {
+        Pipeline $held = guard $this->presentPipe else {
+            Pipeline $fresh = Pipeline($this->pool, $this->frame, $window);
+            $this->presentPipe = $fresh;
+            return $fresh;
+        }
+        $held->reset($window);
+        return $held;
     }
 
     public const function shouldStop() : bool
@@ -416,7 +486,7 @@ public class Host
         }
 
         RenderTarget $windowRt = $this->window->renderTarget();
-        Pipeline $presentPipe = Pipeline($this->pool, $frame, $windowRt);
+        Pipeline $presentPipe = $this->presentPipeline($windowRt);
         BackbufferData $back = $frame->get<BackbufferData>();
         Texture $sceneColor = guard $this->pool->getTexture($color) else ($e) {
             $this->instruments->noteRender((time::instant::now() - $t0)->as_nanos() as float64);
@@ -425,12 +495,20 @@ public class Host
         TextureRef $src = $presentPipe->importTexture($color->name, $sceneColor);
         $presentPipe->add(ClearPass($back->target, ClearPassOptions()));
         $this->blit->pass($presentPipe, $back->target, $src);
-        Sample $sample = $this->instruments->sample();
         Overlay? $maybeOverlay = $this->overlay;
 
         if ($maybeOverlay != null) {
             Overlay $overlay = guard $maybeOverlay;
-            $overlay->pass($presentPipe, $back->target, $sample);
+            if ($overlay->enabled) {
+                // the collapsed HUD reads the loop line only; the tab mail is built for the panel
+                Sample $sample = $this->instruments->sample(tabs: $overlay->expanded);
+                $overlay->pass($presentPipe, $back->target, $sample);
+            } else {
+                $this->instruments->skip();
+                $overlay->idle();
+            }
+        } else {
+            $this->instruments->skip();
         }
 
         DebugConsole? $maybeConsole = $this->console;

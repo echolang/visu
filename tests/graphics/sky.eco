@@ -3,7 +3,7 @@
  */
 
 use visu::graphics::{
-    DirectionalLight, IblBlend, Moon, Sky, SkyUniforms, fogLight, keyLight, moonKeyed, nightAmbient, probeCamera, skyUniforms
+    DirectionalLight, IblBlend, Moon, Sky, SkyUniforms, keyLight, moonKeyed, nightAmbient, probeCamera, skyUniforms
 };
 use visu::math::{Mat4, Vec3, Vec4, normalize};
 
@@ -44,17 +44,16 @@ test sky_uniforms_pack
     assert($bake->moonColor->w == 0.0f, 'no moon disc in the bake');
 }
 
-test sky_ozone_and_the_legacy_march
+test sky_ozone_takes_the_green
 {
     Sky $sky = Sky();
     SkyUniforms $u = skyUniforms($sky, Vec3(0.0f, 300.0f, 0.0f), false, 16.0f, 8.0f);
     assert($u->ozone->y > $u->ozone->x && $u->ozone->y > $u->ozone->z, 'ozone takes the green');
-    assert($u->ozone->w == 1.0f, 'the midpoint march');
-    $sky->legacy = true;
-    SkyUniforms $old = skyUniforms($sky, Vec3(0.0f, 300.0f, 0.0f), false, 16.0f, 8.0f);
-    assert($old->ozone->y == 0.0f && $old->ozone->w == 0.0f, 'the legacy sky: no ozone, the uniform march');
+    $sky->ozoneScale = 0.0f;
+    SkyUniforms $none = skyUniforms($sky, Vec3(0.0f, 300.0f, 0.0f), false, 16.0f, 8.0f);
+    assert($none->ozone->y == 0.0f, 'no ozone');
     Sky $fresh = Sky();
-    assert(!$fresh->sameAtmosphere($sky), 'a legacy sky rebakes the probes');
+    assert(!$fresh->sameAtmosphere($sky), 'another ozone rebakes the probes');
 }
 
 test sky_ozone_pinks_the_low_sun
@@ -135,11 +134,8 @@ test disabled_moon_leaves_night_alone
     Moon $moon = Moon();
     Vec4 $ambient = nightAmbient($moon, $sky);
     assert($ambient->x == 0.0f && $ambient->y == 0.0f && $ambient->z == 0.0f, 'no night ambient');
-    Vec3 $fog = fogLight($moon, $sky);
-    assert($fog->x == 1.0f && $fog->y == 1.0f && $fog->z == 1.0f, 'fog colour untouched');
     $moon->enabled = true;
     assert(nightAmbient($moon, $sky)->z > 0.0f, 'starlight once enabled');
-    assert(fogLight($moon, $sky)->x < 0.1f, 'night fog dims once enabled');
 }
 
 test sun_light_reddens_low

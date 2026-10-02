@@ -147,9 +147,7 @@ public class IblPass : Pass
         }
 
         IblState $state = $env->states[$pending as usize];
-        Mesh $mesh = $ctx->pool->cache<Mesh>('cube', function() : Mesh {
-            return .cube($device);
-        });
+        Mesh $mesh = $this->gpu->skyCube;
         Sampler $sampler = $this->gpu->cube;
         Mat4 $projection = captureProjection();
         int32 $mips = $env->ibl->prefilterMips;
@@ -198,9 +196,7 @@ public class IblPass : Pass
         $device->transitionTexture($state->prefilter, ResourceState::shaderRead);
 
         if (!$env->brdfReady) {
-            Mesh $quad = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
-                return .quad($device);
-            });
+            Mesh $quad = $this->gpu->quad;
             visu::profile::begin('brdf');
             guard $this->bakeBrdf($ctx, $quad) else ($e) {
                 visu::profile::end();
@@ -227,7 +223,7 @@ public class IblPass : Pass
         ShaderProgram $program = guard $this->gpu->shaders->program('bake_irradiance') else ($e) {
             return .error(.shader($e));
         }
-        GpuPass $pass = GpuPass($program, VertexLayout::pos3(), captureRaster());
+        GpuPass $pass = $this->gpu->cubePass($program, captureRaster());
         float32 $samples = $this->environment->ibl->irradianceSamples;
         bakeCubeFaces(
             $ctx->device,
@@ -255,7 +251,7 @@ public class IblPass : Pass
         ShaderProgram $program = guard $this->gpu->shaders->program('bake_prefilter') else ($e) {
             return .error(.shader($e));
         }
-        GpuPass $pass = GpuPass($program, VertexLayout::pos3(), captureRaster());
+        GpuPass $pass = $this->gpu->cubePass($program, captureRaster());
         IblQuality $ibl = $this->environment->ibl;
         float32 $steps = ($ibl->prefilterMips - 1) as float32;
         float32 $roughness = ($mip as float32) / $steps;
@@ -286,7 +282,7 @@ public class IblPass : Pass
         RenderPassDesc $desc = RenderPassDesc();
         $desc->colors[] = $color;
         RenderEncoder $enc = $ctx->device->beginRender($desc);
-        GpuPass $pass = GpuPass($program, VertexLayout::pos3uv2(), Raster::none());
+        GpuPass $pass = $this->gpu->quadPass($program, Raster::none());
         $pass->bind($enc);
         $quad->draw($enc);
         $enc->endRender();

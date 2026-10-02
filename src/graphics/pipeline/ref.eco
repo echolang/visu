@@ -1,7 +1,8 @@
 /**
  * Graph handles. Distinct types so a texture cannot be passed where a target is required.
  * Classes because width / attachments are mutated after create (PHP RenderTargetResource).
- * Identity is the name; names are unique per Pipeline.
+ * Identity is the name; names are unique per Pipeline. A Pipeline keeps its refs across frames
+ * and refills them, so a ref seen last frame is this frame's ref of that name.
  */
 
 namespace visu::graphics;
@@ -18,6 +19,13 @@ public class TargetRef
     public bool $depthStencil;
     public const bool $imported;
 
+    /**
+     * The attachment refs `Pipeline.createColor` / `createDepth` made for this target, by short
+     * name, reused every frame so their full names are built once.
+     */
+    internal map<string, TextureRef> $colorCache;
+    internal TextureRef? $depthCache;
+
     public constructor(string $name, int32 $width, int32 $height, bool $imported = false)
     {
         $this->name = $name;
@@ -29,6 +37,8 @@ public class TargetRef
         $this->depthAttachment = null;
         $this->depthStencil = false;
         $this->imported = $imported;
+        $this->colorCache = map<string, TextureRef>();
+        $this->depthCache = null;
     }
 
     /**

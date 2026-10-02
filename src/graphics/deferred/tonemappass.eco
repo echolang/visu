@@ -244,10 +244,9 @@ internal function openStage(
     return $enc;
 }
 
-internal function drawStage(RenderContext $ctx, RenderEncoder $enc, function<Mesh()> $quad) : status<PipelineError>
+internal function drawStage(RenderContext $ctx, RenderEncoder $enc, Mesh $quad) : status<PipelineError>
 {
-    Mesh $mesh = $ctx->pool->cache<Mesh>('quad', $quad);
-    $mesh->draw($enc);
+    $quad->draw($enc);
     $enc->endRender();
     return .ok;
 }
@@ -283,7 +282,7 @@ internal function bindStage(
 public class ToneStagePass : Pass
 {
     private DeferredGpu $gpu;
-    private function<Mesh()> $quad;
+    private Mesh $quad;
     private GpuPass $draw;
     private string $name;
     private ToneImage $input;
@@ -314,7 +313,7 @@ public class ToneStagePass : Pass
 
     internal constructor(
         DeferredGpu $gpu,
-        function<Mesh()> $quad,
+        Mesh $quad,
         string $name,
         string $program,
         ToneImage $input,
@@ -395,7 +394,7 @@ public class ToneStagePass : Pass
 public class ExposurePass : Pass
 {
     private DeferredGpu $gpu;
-    private function<Mesh()> $quad;
+    private Mesh $quad;
     private GpuPass $plain;
 
     /**
@@ -409,7 +408,7 @@ public class ExposurePass : Pass
     internal ExposureHistory? $history;
     private TextureRef? $previous;
 
-    internal constructor(DeferredGpu $gpu, function<Mesh()> $quad)
+    internal constructor(DeferredGpu $gpu, Mesh $quad)
     {
         $this->gpu = $gpu;
         $this->quad = $quad;
@@ -492,7 +491,7 @@ public class ExposurePass : Pass
 public class ToneMapPass : Pass
 {
     private DeferredGpu $gpu;
-    private function<Mesh()> $quad;
+    private Mesh $quad;
 
     /**
      * One resolve per curve, each without and with the local operator (which reads the grid
@@ -511,7 +510,7 @@ public class ToneMapPass : Pass
      */
     internal ToneCurve $curve;
 
-    internal constructor(DeferredGpu $gpu, function<Mesh()> $quad)
+    internal constructor(DeferredGpu $gpu, Mesh $quad)
     {
         $this->gpu = $gpu;
         $this->quad = $quad;
@@ -609,10 +608,7 @@ internal class ToneMapChain
 
     public constructor(DeferredGpu $gpu)
     {
-        Device $device = $gpu->device;
-        function<Mesh()> $quad = function() : Mesh {
-            return .quad($device);
-        };
+        Mesh $quad = $gpu->quad;
         int32 $atlas = TONEMAP_GRID_W * TONEMAP_GRID_SLICES;
         // the luma's size follows the scene; `add` sets it
         $this->luma = ToneStagePass($gpu, $quad, 'deferred.tonemap.luma', 'tonemap_luma', .scene, $gpu->linear, 'tonemap.luma', 1, 1, .luma, 'luma', .r16f);

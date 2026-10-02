@@ -362,3 +362,86 @@ test pipeline_duplicate_name_dies
     TargetRef $a = $pipeline->createTarget('same', 8, 8);
     TargetRef $b = $pipeline->createTarget('same', 8, 8);
 }
+
+/**
+ * Two frames of the same graph on one Pipeline: `reset` keeps the refs and the scheduler, and the
+ * second frame orders exactly as the first.
+ */
+internal function pipelineReaderWriterFrame(Pipeline $pipeline, Frame $frame, int32 $tick) : array<string>
+{
+    $frame->set(Log());
+    // no attachments: a pooled one would need a GPU
+    TargetRef $x = $pipeline->createTarget('x', 8, 8);
+    TextureRef $side = $pipeline->createTexture('side', 4, 4, TextureOptions());
+
+    $pipeline->add(CallbackPass(
+        'reader',
+        setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
+            $io->reads($x);
+            $io->reads($side);
+        },
+        execute: function(RenderContext $ctx) : status<PipelineError> {
+            $ctx->frame->get<Log>()->names->push('reader');
+            return .ok;
+        }
+    ));
+    $pipeline->add(CallbackPass(
+        'side',
+        setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
+            $io->writes($side);
+        },
+        execute: function(RenderContext $ctx) : status<PipelineError> {
+            $ctx->frame->get<Log>()->names->push('side');
+            return .ok;
+        }
+    ));
+    $pipeline->add(CallbackPass(
+        'writer',
+        setup: function(Pipeline $pipe, Frame $f, IoSink $io) : void {
+            $io->writes($x);
+        },
+        execute: function(RenderContext $ctx) : status<PipelineError> {
+            $ctx->frame->get<Log>()->names->push('writer');
+            return .ok;
+        }
+    ));
+
+    guard $pipeline->execute($tick, collect: false) else ($e) {
+        die($e->message());
+    }
+    return $frame->get<Log>()->names;
+}
+
+test pipeline_reset_reschedules_the_same_graph_the_same_way
+{
+    Device $gpu = Device();
+    Pool $pool = Pool($gpu);
+    Frame $frame = Frame();
+    Pipeline $pipeline = Pipeline($pool, $frame);
+    array<string> $first = pipelineReaderWriterFrame($pipeline, $frame, 0);
+    TargetRef $refBefore = $pipeline->createTarget('probe', 2, 2);
+    $refBefore->depthStencil = true;
+    $frame->clear();
+    $pipeline->reset();
+    array<string> $second = pipelineReaderWriterFrame($pipeline, $frame, 1);
+    assert($first->count() == 3 && $second->count() == 3, 'three passes each frame');
+    assert($first[0] == 'side' && $first[1] == 'writer' && $first[2] == 'reader', 'writers before the reader, in add order');
+    assert($second[0] == $first[0] && $second[1] == $first[1] && $second[2] == $first[2], 'same order');
+    // the same name is the same ref, refilled: last frame's flags do not leak into this one
+    TargetRef $refAfter = $pipeline->createTarget('probe', 3, 3);
+    assert(!$refAfter->depthStencil && $refAfter->width == 3, 'refilled');
+    $refAfter->width = 7;
+    assert($refBefore->width == 7, 'one ref per name');
+}
+
+test pipeline_reset_frees_the_names
+{
+    Device $gpu = Device();
+    Pool $pool = Pool($gpu);
+    Frame $frame = Frame();
+    Pipeline $pipeline = Pipeline($pool, $frame);
+    $pipeline->createTarget('again', 8, 8);
+    $pipeline->reset();
+    TargetRef $t = $pipeline->createTarget('again', 8, 8);
+    assert($t->name == 'again', 'a reset frame claims the name afresh');
+}

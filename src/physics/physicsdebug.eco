@@ -1,7 +1,7 @@
 /**
  * The physics world as wireframe in the GBuffer: every body but the heightfields, and bounding
- * boxes or contact points when asked. A `GeometryFiller` the scene calls from its geometry fill,
- * after the models. Off, it joins nothing and costs a flag check; on, it walks every body each
+ * boxes or contact points when asked. A `SceneDrawer` the scene attaches to its renderer after
+ * the models. Off, it draws nothing and costs a flag check; on, it walks every body each
  * frame, which is fine for a debug view and nothing else. The `physics.debug` flag or the
  * `physics debug` verb switches it.
  *
@@ -16,14 +16,15 @@ use visu::app::{Flags, flags};
 use visu::components::Vehicle;
 use visu::ecs::Entities;
 use visu::graphics::{
-    DebugLines, DeferredRenderer, Device, GBufferData, GeometryFiller, GeometryFillers, GpuPass, PipelineError,
-    Raster, RenderContext, RenderEncoder, ShaderProgram, debugLineLayout, debugLinePass
+    DebugLines, DeferredRenderer, Device, GeometryFiller, GpuPass, PipelineError, Raster, RenderContext,
+    RenderEncoder, SCENE_VIEW_GBUFFER, SceneDrawer, SceneViews, ShaderProgram, debugLineLayout, debugLinePass
 };
 use visu::math::{Vec3, Vec4, length};
 
-public class PhysicsDebug : GeometryFiller
+public class PhysicsDebug : SceneDrawer, GeometryFiller
 {
     private PhysicsWorld $world;
+    private Entities $entities;
     private DeferredRenderer $renderer;
     private DebugLines $lines;
     private GpuPass? $pass;
@@ -35,9 +36,10 @@ public class PhysicsDebug : GeometryFiller
     private GpuPass? $xrayPass;
     private int32 $flagsSeen;
 
-    public constructor(PhysicsWorld $world, DeferredRenderer $renderer, Device $device)
+    public constructor(PhysicsWorld $world, Entities $entities, DeferredRenderer $renderer, Device $device)
     {
         $this->world = $world;
+        $this->entities = $entities;
         $this->renderer = $renderer;
         $this->lines = DebugLines($device);
         $this->pass = null;
@@ -47,10 +49,11 @@ public class PhysicsDebug : GeometryFiller
     }
 
     /**
-     * Join this frame's geometry fill when the overlay is on.
+     * Draw into the G-buffer when the overlay is on.
      */
-    public function fill(Entities $entities, RenderContext $ctx, GBufferData $gbuffer) : void
+    public function prepare(RenderContext $ctx, SceneViews $views) : int32
     {
+        Entities $entities = $this->entities;
         Flags $bag = flags();
         if ($bag->version != $this->flagsSeen) {
             $this->flagsSeen = $bag->version;
@@ -63,7 +66,7 @@ public class PhysicsDebug : GeometryFiller
         }
 
         if (!$this->world->debugging) {
-            return;
+            return 0;
         }
 
         visu::profile::begin('physics.debug');
@@ -95,10 +98,12 @@ public class PhysicsDebug : GeometryFiller
         }
 
         $this->ensurePass();
-        if (!$this->lines->empty() || !$this->xray->empty()) {
-            $ctx->frame->get<GeometryFillers>()->add($this);
-        }
         visu::profile::end();
+        if (!$this->lines->empty() || !$this->xray->empty()) {
+            return SCENE_VIEW_GBUFFER;
+        }
+
+        return 0;
     }
 
     public function name() : string

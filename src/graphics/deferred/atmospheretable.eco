@@ -1,0 +1,171 @@
+/**
+ * A table of the atmosphere marched once per texel: the sky-view table the sky reads, and the
+ * aerial table every pass that fogs a surface reads. Each depends only on the sun, the moon, the
+ * atmosphere knobs and the eye height (`skyViewKey`), so it is refilled only when one of those
+ * moved; a paused clock and a still eye cost nothing. The layouts live in `visu/sky_view.glsl`
+ * and `visu/aerial.glsl`.
+ */
+
+namespace visu::graphics;
+
+use visu::math::Vec3;
+
+/**
+ * What one table is: its graph resource, its refill pass's label, the program that fills it,
+ * and its size and layer count.
+ */
+internal struct AtmosphereTableDesc
+{
+    public string $name;
+    public string $label;
+    public string $program;
+    public int32 $width;
+    public int32 $height;
+    public int32 $layers;
+}
+
+/**
+ * One table and the atmosphere it was last filled under, with the pass that refills it, built
+ * once and re-added on the frames the sky moved.
+ */
+internal class AtmosphereTable
+{
+    private Texture $texture;
+    private AtmosphereTableDesc $desc;
+    private bool $filled;
+    private SkyUniforms $built;
+    private AtmosphereTablePass $pass;
+
+    public constructor(Device $device, DeferredGpu $gpu, AtmosphereTableDesc $desc)
+    {
+        TextureDesc $texture = TextureDesc(
+            $format: .rgba16f,
+            $kind: .array2D,
+            $width: $desc->width,
+            $height: $desc->height
+        );
+        $texture->arrayLength = $desc->layers;
+        // transfer so dcapture can read the table back; the play path never copies it
+        $texture->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET | TEXTURE_TRANSFER_SRC;
+        $texture->label = $desc->name;
+        $this->texture = Texture($device, $desc->name, $texture);
+        $this->desc = $desc;
+        $this->filled = false;
+        // a placeholder until the first fill; `filled` false never compares against it
+        $this->built = skyUniforms(Sky(), Vec3(0.0f, 0.0f, 0.0f), false, 0.0f, 0.0f);
+        $this->pass = AtmosphereTablePass($gpu, $this->texture, $desc);
+    }
+
+    /**
+     * Imports the table into this frame's graph and, when `$fill` and the atmosphere moved since
+     * it was last filled, adds the pass that refills it ahead of every pass that reads it.
+     * `$uniforms` is the sky the table stands for; its sample counts are the table's quality.
+     * Without `$fill` the table is only bound, never read, so a frame that does not use it costs
+     * nothing and the next one refills only if the sky moved meanwhile.
+     */
+    public function prepare(Pipeline $pipeline, const SkyUniforms& $uniforms, bool $fill) : TextureRef
+    {
+        TextureRef $ref = $pipeline->importTexture($this->desc->name, $this->texture);
+        if (!$fill) {
+            return $ref;
+        }
+
+        SkyUniforms $key = skyViewKey($uniforms);
+        if ($this->filled && $key == $this->built) {
+            return $ref;
+        }
+
+        $this->built = $key;
+        $this->filled = true;
+        $this->pass->refill($ref, $key);
+        $pipeline->add($this->pass);
+        return $ref;
+    }
+
+    public function destroy() : void
+    {
+        $this->texture->destroy();
+    }
+}
+
+/**
+ * Fills every layer of a table in one draw, one march per texel.
+ */
+internal class AtmosphereTablePass : Pass
+{
+    private DeferredGpu $gpu;
+    private Texture $texture;
+    private AtmosphereTableDesc $desc;
+    private TextureRef? $ref;
+    private SkyUniforms $sky;
+
+    public constructor(DeferredGpu $gpu, Texture $texture, AtmosphereTableDesc $desc)
+    {
+        $this->gpu = $gpu;
+        $this->texture = $texture;
+        $this->desc = $desc;
+        $this->ref = null;
+        $this->sky = skyUniforms(Sky(), Vec3(0.0f, 0.0f, 0.0f), false, 0.0f, 0.0f);
+    }
+
+    /**
+     * This frame's refill: the table's graph handle and the sky to march.
+     */
+    public function refill(TextureRef $ref, const SkyUniforms& $sky) : void
+    {
+        $this->ref = $ref;
+        $this->sky = $sky;
+    }
+
+    public function name() : string
+    {
+        return $this->desc->label;
+    }
+
+    public function setup(Pipeline $pipeline, Frame $frame, IoSink $io) : void
+    {
+        TextureRef $ref = guard $this->ref;
+        $io->writes($ref);
+    }
+
+    public function execute(RenderContext $ctx) : status<PipelineError>
+    {
+        ShaderProgram $program = guard $this->gpu->shaders->program($this->desc->program) else ($e) {
+            return .error(.shader($e));
+        }
+        RenderPassDesc $desc = RenderPassDesc();
+        int32 $layer = 0;
+        while ($layer < $this->desc->layers) {
+            ColorTarget $color = ColorTarget($this->texture, face: $layer);
+            // every texel is written
+            $color->load = .dontCare;
+            $color->store = .store;
+            $desc->colors[] = $color;
+            $layer = $layer + 1;
+        }
+
+        RenderEncoder $enc = $ctx->device->beginRender($desc);
+        GpuPass $pass = $this->gpu->quadPass($program, Raster::none());
+        $pass->bind($enc);
+        $enc->upload($this->sky, slot: 2);
+        $this->gpu->quad->draw($enc);
+        $enc->endRender();
+        return .ok;
+    }
+}
+
+/**
+ * The main view's or the water mirror's sky-view table (`name`, `label`).
+ */
+internal function skyViewTableDesc(string $name, string $label) : AtmosphereTableDesc
+{
+    return AtmosphereTableDesc($name, $label, 'sky_view', SKY_VIEW_WIDTH, SKY_VIEW_HEIGHT, SKY_VIEW_LAYERS);
+}
+
+/**
+ * The aerial table.
+ */
+internal function aerialTableDesc() : AtmosphereTableDesc
+{
+    return AtmosphereTableDesc('fog.aerial', 'deferred.aerial', 'aerial', AERIAL_WIDTH, AERIAL_ELEVATION, AERIAL_LAYERS);
+}

@@ -34,8 +34,7 @@ layout(std140, set = 0, binding = VISU_SKY_SLOT) uniform SkyUniforms {
     vec4 u_sky_moon_params;
     // rgb moon tint, w 1 draws the moon disc and the stars
     vec4 u_sky_moon_color;
-    // rgb ozone absorption at its peak density (1/m), w 1 marches with midpoint attenuation
-    // over quadratic steps (0 the uniform march visu had before)
+    // rgb ozone absorption at its peak density (1/m)
     vec4 u_sky_ozone;
 };
 
@@ -171,11 +170,9 @@ struct SkyScatter {
 
 /**
  * The split march along `dir`, stopped at `limit` metres (the atmosphere edge or the ground
- * when nearer). With `u_sky_ozone.w` set each sample is attenuated by the optical depth up
- * to itself, half its own step, and the steps grow quadratically from the observer, so a
- * horizon ray a thousand kilometres long still resolves the air next to the eye. Without it
- * the march is the one visu had: uniform steps, each attenuated through its whole step, which
- * over a long horizon ray takes the blue out and leaves the horizon yellow.
+ * when nearer). Each sample is attenuated by the optical depth up to itself, half its own
+ * step, and the steps grow quadratically from the observer, so a horizon ray a thousand
+ * kilometres long still resolves the air next to the eye.
  */
 SkyScatter sky_scatter_to(vec3 dir, float limit, int view_samples, int light_samples)
 {
@@ -194,9 +191,7 @@ SkyScatter sky_scatter_to(vec3 dir, float limit, int view_samples, int light_sam
     }
 
     t_max = min(t_max, limit);
-    bool midpoint = u_sky_ozone.w > 0.5;
     float n = float(view_samples);
-    float step_len = t_max / n;
     vec3 to_sun = u_sky_sun.xyz;
     vec3 sum_r = vec3(0.0);
     vec3 sum_m = vec3(0.0);
@@ -209,24 +204,15 @@ SkyScatter sky_scatter_to(vec3 dir, float limit, int view_samples, int light_sam
     vec3 moon_m = vec3(0.0);
 
     for (int i = 0; i < view_samples; i++) {
-        float t = (float(i) + 0.5) * step_len;
-        float dt = step_len;
-
-        if (midpoint) {
-            float a = float(i) / n;
-            float b = float(i + 1) / n;
-            t = t_max * 0.5 * (a * a + b * b);
-            dt = t_max * (b * b - a * a);
-        }
+        float a = float(i) / n;
+        float b = float(i + 1) / n;
+        float t = t_max * 0.5 * (a * a + b * b);
+        float dt = t_max * (b * b - a * a);
 
         vec3 p = o + dir * t;
         float h = max(length(p) - rg, 0.0);
         vec3 dens = sky_density(h) * dt;
-        vec3 depth_here = depth_view + dens;
-
-        if (midpoint) {
-            depth_here = depth_view + 0.5 * dens;
-        }
+        vec3 depth_here = depth_view + 0.5 * dens;
 
         depth_view += dens;
 

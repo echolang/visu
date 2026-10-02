@@ -9,10 +9,7 @@
  *   (`visu/aerial.glsl`, bound at VISU_AERIAL_SLOT), per channel, so far ridges fade into
  *   the sky behind them. Sky pixels skip it: the sky already is the whole atmosphere.
  *
- * `u_fog_model.w` 0 is the fog visu had before (`--flag fog.model=legacy`): grey haze mixed
- * toward the fog's sky table (`visu/fog_sky.glsl`, at VISU_FOG_SKY_SLOT) with an analytic
- * glow. It stays until the new frame is signed off. Mirrors visu::graphics::FogUniforms. D0
- * (density at the camera) is collapsed on the CPU.
+ * Mirrors visu::graphics::FogUniforms. D0 (density at the camera) is collapsed on the CPU.
  */
 #ifndef VISU_FOG_GLSL
 #define VISU_FOG_GLSL
@@ -23,28 +20,19 @@
 
 #include "visu/phase.glsl"
 #include "visu/aerial.glsl"
-#include "visu/fog_sky.glsl"
 
 layout(std140, set = 0, binding = VISU_FOG_SLOT) uniform FogUniforms {
     // x density at the camera (D0, 1/m), y height falloff k (1/m), z max opacity, w 1 enabled
     vec4 u_fog_density;
-    // legacy: rgb inscattering colour or tint, w 1 multiplies the fog's sky table
-    vec4 u_fog_color;
-    // x start distance, y cutoff distance (0 none), z sky distance, w legacy directional start
+    // x start distance, y cutoff distance (0 none), z sky distance
     vec4 u_fog_params;
-    // legacy: rgb directional inscattering colour (already sun tinted), w exponent
-    vec4 u_fog_sun;
-    // legacy: rgb added to the sky table's colour, the starlight the table has no stars for
-    vec4 u_fog_floor;
-    // legacy: rgb directional inscattering towards the moon (already moon tinted), w exponent
-    vec4 u_fog_moon;
     // x shaft scatter, y glow occlusion, w 1 when the resolved shafts are bound
     vec4 u_fog_shafts;
     // rgb key light radiance for the shafts, w 1 when the moon is the key light
     vec4 u_fog_shaft_light;
     // x core anisotropy, y wide anisotropy, z wide lobe share
     vec4 u_fog_shaft_phase;
-    // xyz unit vector towards the sun, w 1 the lit medium and the aerial perspective (0 legacy)
+    // xyz unit vector towards the sun
     vec4 u_fog_model;
     // xyz unit vector towards the moon, w share of the forward lobe in the medium's phase
     vec4 u_fog_to_moon;
@@ -62,15 +50,9 @@ layout(std140, set = 0, binding = VISU_FOG_SLOT) uniform FogUniforms {
     vec4 u_fog_aerial_extinction;
 };
 
-#ifndef VISU_FOG_SKY_SLOT
-#define VISU_FOG_SKY_SLOT 13
-#endif
-
 #ifndef VISU_AERIAL_SLOT
 #define VISU_AERIAL_SLOT 14
 #endif
-
-layout(set = 1, binding = VISU_FOG_SKY_SLOT) uniform sampler2D u_fog_sky;
 
 // the sky and the skybox fog only sky pixels, which take no aerial perspective, so they bind
 // no table
@@ -94,57 +76,6 @@ float fog_integral(float dy, float len)
     }
 
     return d0 * (1.0 - exp(-x)) / (k * dy);
-}
-
-/**
- * Legacy inscattering colour along `dir`. Constant radiance when fromSky is off; otherwise the
- * sky at the horizon of this azimuth (lifted above the ground, the sun's azimuth straight up or
- * down) plus the night floor, tinted.
- */
-vec3 fog_color(vec3 dir)
-{
-    vec3 tint = u_fog_color.rgb;
-
-    if (u_fog_color.w < 0.5) {
-        return tint;
-    }
-
-    vec2 uv = fog_sky_uv(fog_sky_horizon(dir, u_fog_model.xyz));
-    return tint * (textureLod(u_fog_sky, uv, 0.0).rgb + u_fog_floor.rgb);
-}
-
-/**
- * The legacy fog: grey haze toward `fog_color`, the analytic glow on top.
- */
-vec3 fog_apply_legacy(vec3 color, vec3 relative)
-{
-    if (u_fog_density.w < 0.5) {
-        return color;
-    }
-
-    float len = length(relative);
-
-    if (len < 1e-3) {
-        return color;
-    }
-
-    float cutoff = u_fog_params.y;
-
-    if (cutoff > 0.0 && len > cutoff) {
-        return color;
-    }
-
-    vec3 dir = relative / len;
-    float dy = dir.y;
-    float start = u_fog_params.x;
-    float optical = fog_integral(dy, len);
-    float t = max(exp(-(optical - fog_integral(dy, min(len, start)))), 1.0 - u_fog_density.z);
-    float td = exp(-(optical - fog_integral(dy, min(len, start + u_fog_params.w))));
-    float sun = pow(max(dot(dir, u_fog_model.xyz), 0.0), u_fog_sun.w);
-    float moon = pow(max(dot(dir, u_fog_to_moon.xyz), 0.0), max(u_fog_moon.w, 1.0));
-    vec3 glow = u_fog_sun.rgb * sun + u_fog_moon.rgb * moon;
-    vec3 fog = fog_color(dir) * (1.0 - t) + glow * (1.0 - td);
-    return color * t + fog;
 }
 
 /**
@@ -269,10 +200,6 @@ vec3 fog_surface(vec3 color, vec3 relative, float lit_sun, float lit_moon, vec3 
  */
 vec3 fog_apply(vec3 color, vec3 relative)
 {
-    if (u_fog_model.w < 0.5) {
-        return fog_apply_legacy(color, relative);
-    }
-
     return fog_surface(color, relative, 1.0, 1.0, vec3(0.0));
 }
 
@@ -283,11 +210,6 @@ vec3 fog_apply(vec3 color, vec3 relative)
 vec3 fog_apply_sky(vec3 color, vec3 dir)
 {
     vec3 d = normalize(dir);
-
-    if (u_fog_model.w < 0.5) {
-        return fog_apply_legacy(color, d * u_fog_params.z);
-    }
-
     return fog_height(color, d, u_fog_params.z, 1.0, 1.0, vec3(0.0));
 }
 
@@ -323,57 +245,12 @@ vec3 fog_apply_rays(vec3 color, vec3 relative, vec2 uv)
 }
 
 /**
- * The legacy shaft path: the directional glow dims by the shadowed share of its ray and the
- * key light's shadowed inscatter is added on top.
- */
-vec3 fog_apply_rays_legacy(vec3 color, vec3 relative, vec2 uv, float fetchDist)
-{
-
-    if (u_fog_density.w < 0.5) {
-        return color;
-    }
-
-    float len = length(relative);
-
-    if (len < 1e-3) {
-        return color;
-    }
-
-    float cutoff = u_fog_params.y;
-
-    if (cutoff > 0.0 && len > cutoff) {
-        return color;
-    }
-
-    vec3 dir = relative / len;
-    float dy = dir.y;
-    float start = u_fog_params.x;
-    float optical = fog_integral(dy, len);
-    float t = max(exp(-(optical - fog_integral(dy, min(len, start)))), 1.0 - u_fog_density.z);
-    float td = exp(-(optical - fog_integral(dy, min(len, start + u_fog_params.w))));
-    vec2 shaft = godrays_fetch(uv, fetchDist);
-    float occlude = mix(1.0, shaft.y, u_fog_shafts.y);
-    float sun = pow(max(dot(dir, u_fog_model.xyz), 0.0), u_fog_sun.w);
-    float moon = pow(max(dot(dir, u_fog_to_moon.xyz), 0.0), max(u_fog_moon.w, 1.0));
-    vec3 glow = (u_fog_sun.rgb * sun + u_fog_moon.rgb * moon) * occlude;
-    vec3 fog = fog_color(dir) * (1.0 - t) + glow * (1.0 - td);
-    vec3 toLight = u_fog_shaft_light.w > 0.5 ? u_fog_to_moon.xyz : u_fog_model.xyz;
-    float phase = godrays_phase2(dot(dir, toLight), u_fog_shaft_phase.xyz);
-    vec3 rays = u_fog_shaft_light.rgb * (phase * shaft.x * u_fog_shafts.x);
-    return color * t + fog + rays;
-}
-
-/**
  * The shaft path proper. `fetchDist` is the distance the shaft texels were marched to for
  * this pixel: its own for geometry, the march's sky sentinel for the sky. The lit share of
  * the key light's path dims its light in the medium; the shafts' inscatter adds on top.
  */
 vec3 fog_apply_rays_at(vec3 color, vec3 relative, vec2 uv, float fetchDist)
 {
-    if (u_fog_model.w < 0.5) {
-        return fog_apply_rays_legacy(color, relative, uv, fetchDist);
-    }
-
     float len = length(relative);
 
     if (len < 1e-3) {
@@ -398,11 +275,6 @@ vec3 fog_apply_sky_rays(vec3 color, vec3 dir, vec2 uv)
     }
 
     vec3 d = normalize(dir);
-
-    if (u_fog_model.w < 0.5) {
-        return fog_apply_rays_legacy(color, d * u_fog_params.z, uv, GODRAY_SKY_DEPTH);
-    }
-
     vec4 shafts = fog_shafts(d, uv, GODRAY_SKY_DEPTH);
     bool moonKey = u_fog_shaft_light.w > 0.5;
     float lit_sun = moonKey ? 1.0 : shafts.x;

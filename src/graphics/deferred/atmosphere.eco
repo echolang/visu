@@ -1,0 +1,144 @@
+/**
+ * Everything the renderer keeps about the air: the sky-view tables of the main view and the
+ * water mirror, the aerial table, and the fog's sky dome with what it was solved for. Each is
+ * refilled or re-solved only when the sun, the moon, the atmosphere or the eye moved, and each
+ * table is built the first frame it is asked for.
+ */
+
+namespace visu::graphics;
+
+use visu::math::{Vec3, normalize};
+
+internal class Atmosphere
+{
+    private Device $device;
+    private DeferredGpu $gpu;
+    private AtmosphereTable? $skyViewMain;
+    private AtmosphereTable? $skyViewMirror;
+    private AtmosphereTable? $aerial;
+
+    /**
+     * `fogAmbient`'s sky dome and what it was solved for: the atmosphere, the sun's elevation
+     * and the eye height. The dome average does not depend on the sun's azimuth, so it is
+     * re-solved only when the sun climbs or sinks by `FOG_AMBIENT_SUN_STEP`.
+     */
+    private Vec3 $dome;
+    private Sky $domeSky;
+    private float32 $domeSunY;
+    private float32 $domeAltitude;
+    private bool $domeValid;
+
+    public constructor(Device $device, DeferredGpu $gpu)
+    {
+        $this->device = $device;
+        $this->gpu = $gpu;
+        $this->skyViewMain = null;
+        $this->skyViewMirror = null;
+        $this->aerial = null;
+        $this->dome = Vec3(0.0f, 0.0f, 0.0f);
+        $this->domeSky = Sky();
+        $this->domeSunY = 0.0f;
+        $this->domeAltitude = 0.0f;
+        $this->domeValid = false;
+    }
+
+    /**
+     * The fog's lighting for an eye at `$eye`, the sky dome re-solved only when it moved.
+     */
+    public function lighting(
+        const DirectionalLight& $sun,
+        const Moon& $moon,
+        const Sky& $sky,
+        const AerialPerspective& $aerial,
+        Vec3 $eye
+    ) : FogLighting
+    {
+        Vec3 $toSun = normalize(-$sky->direction);
+        float32 $climb = $toSun->y - $this->domeSunY;
+        float32 $rise = $eye->y - $this->domeAltitude;
+        if ($climb < 0.0f) {
+            $climb = -$climb;
+        }
+
+        if ($rise < 0.0f) {
+            $rise = -$rise;
+        }
+
+        if (!$this->domeValid
+            || $climb > FOG_AMBIENT_SUN_STEP
+            || $rise > FOG_AMBIENT_ALTITUDE_STEP
+            || !$sky->sameAtmosphere($this->domeSky)) {
+            visu::profile::begin('fog/ambient');
+            $this->dome = skyDomeRadiance($sky, $eye->y);
+            visu::profile::end();
+            $this->domeSky = $sky;
+            $this->domeSunY = $toSun->y;
+            $this->domeAltitude = $eye->y;
+            $this->domeValid = true;
+        }
+
+        Vec3 $ambient = fogAmbient($this->dome, $sun, $moon, $sky);
+        return fogLighting($sun, $moon, $sky, $aerial, $ambient);
+    }
+
+    /**
+     * The main view's sky-view table for this frame, refilled when stale.
+     */
+    public function mainSkyView(Pipeline $pipeline, const Sky& $sky, const Moon& $moon, Vec3 $eye) : TextureRef
+    {
+        SkyUniforms $uniforms = skyUniforms($sky, $eye, false, SKY_VIEW_SAMPLES, SKY_LIGHT_SAMPLES, $moon);
+        AtmosphereTable $table = guard $this->skyViewMain else {
+            AtmosphereTable $fresh = AtmosphereTable($this->device, $this->gpu, skyViewTableDesc('sky.view', 'deferred.sky.view'));
+            $this->skyViewMain = $fresh;
+            return $fresh->prepare($pipeline, $uniforms, true);
+        }
+        return $table->prepare($pipeline, $uniforms, true);
+    }
+
+    /**
+     * The water mirror's table, at the reflected eye's height and the mirror's sample counts.
+     */
+    public function mirrorSkyView(Pipeline $pipeline, const Sky& $sky, const Moon& $moon, Vec3 $eye) : TextureRef
+    {
+        SkyUniforms $uniforms = skyUniforms($sky, $eye, false, MIRROR_SKY_VIEW_SAMPLES, MIRROR_SKY_LIGHT_SAMPLES, $moon);
+        AtmosphereTable $table = guard $this->skyViewMirror else {
+            AtmosphereTable $fresh = AtmosphereTable($this->device, $this->gpu, skyViewTableDesc('reflect.sky.view', 'reflect.sky.view'));
+            $this->skyViewMirror = $fresh;
+            return $fresh->prepare($pipeline, $uniforms, true);
+        }
+        return $table->prepare($pipeline, $uniforms, true);
+    }
+
+    /**
+     * This frame's aerial table, built on first use and refilled when `$fill` and the sky moved.
+     */
+    public function aerial(Pipeline $pipeline, const Sky& $sky, const Moon& $moon, Vec3 $eye, bool $fill) : TextureRef
+    {
+        SkyUniforms $uniforms = skyUniforms($sky, $eye, false, AERIAL_VIEW_SAMPLES, AERIAL_LIGHT_SAMPLES, $moon);
+        AtmosphereTable $table = guard $this->aerial else {
+            AtmosphereTable $fresh = AtmosphereTable($this->device, $this->gpu, aerialTableDesc());
+            $this->aerial = $fresh;
+            return $fresh->prepare($pipeline, $uniforms, $fill);
+        }
+        return $table->prepare($pipeline, $uniforms, $fill);
+    }
+
+    public function destroy() : void
+    {
+        $this->skyViewMain = dropTable($this->skyViewMain);
+        $this->skyViewMirror = dropTable($this->skyViewMirror);
+        $this->aerial = dropTable($this->aerial);
+    }
+}
+
+/**
+ * Destroys a table if there is one; always returns null.
+ */
+internal function dropTable(AtmosphereTable? $table) : AtmosphereTable?
+{
+    AtmosphereTable $held = guard $table else {
+        return null;
+    }
+    $held->destroy();
+    return null;
+}

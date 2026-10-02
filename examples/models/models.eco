@@ -24,7 +24,7 @@ use visu::math::{Quat, Vec3, Vec4};
 use visu::quickstart::{App, Options, Quickstart};
 use visu::console::{CameraConsole, DeferredViewConsole, ModelConsole, ShadowConsole};
 use visu::runtime::DebugConsole;
-use visu::system::{CameraSystem, ModelSystem, OrbitCameraSystem};
+use visu::system::{CameraSystem, ModelSystem, OrbitCameraSystem, RendererSystem};
 
 const string BALL = 'props/ball/ball';
 const int32 GRID = 7;
@@ -89,7 +89,7 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
     });
 
     $opt->ready = function(App $app) : void {
-        DeferredRenderer $renderer = DeferredRenderer($app->device);
+        DeferredRenderer $renderer = DeferredRenderer($app->device, visu::app::rendererSettings(visu::app::flags()));
         guard $renderer->load() else ($e) {
             die($e->message());
         }
@@ -103,6 +103,9 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
         $app->systems->bind(OrbitCameraSystem($app->input));
         $app->systems->bind(SpinSystem());
         $app->systems->bind($models);
+        $renderer->attach($models);
+        // last: every system that publishes for the frame (the camera above all) has run
+        $app->systems->bind(RendererSystem($renderer));
         $app->systems->bindConsole(CameraConsole($cameras));
         $app->systems->bindConsole(ModelConsole($models));
         $app->systems->bindConsole(DeferredViewConsole($renderer));
@@ -113,16 +116,6 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
         }
 
         $app->services->set(ModelScene($renderer, $bank, $models));
-    };
-
-    $opt->render = function(App $app, RenderContext $ctx, visu::graphics::TargetRef $target) : void {
-        ModelScene $scene = $app->services->get<ModelScene>();
-        SceneTargetData $target2 = $ctx->frame->get<SceneTargetData>();
-        Entities $world = $app->entities;
-        ModelSystem $models = $scene->models;
-        $scene->renderer->render($ctx, $target2->target, function(RenderContext $pass, GBufferData $gbuffer) : void {
-            $models->fill($world, $pass, $gbuffer);
-        });
     };
 
     $opt->initializeScene = function(App $app) : void {

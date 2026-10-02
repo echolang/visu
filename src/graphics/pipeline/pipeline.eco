@@ -2,6 +2,10 @@
  * Per-frame pass list. `setup()` runs at `add()`; `execute()` runs in scheduled I/O order.
  * Pending clears live here until `RenderContext.beginRender` consumes them.
  * Every pass runs inside a `visu::profile` scope named after it.
+ *
+ * A Pipeline lives across frames: `reset` empties the pass list and keeps the storage, the
+ * scheduler and the graph handles (a target or texture of the same name is the same ref every
+ * frame, refilled), so a frame that builds the graph the last one did allocates nothing here.
  */
 
 namespace visu::graphics;
@@ -28,16 +32,10 @@ public struct Io
     public Access $access;
 }
 
-public class PendingClear
+public struct PendingClear
 {
     public TargetRef $target;
     public ClearPassOptions $options;
-
-    public constructor(TargetRef $target, ClearPassOptions $options)
-    {
-        $this->target = $target;
-        $this->options = $options;
-    }
 }
 
 public class Pipeline
@@ -48,6 +46,14 @@ public class Pipeline
     private map<string, bool> $names;
     private array<Io> $io;
     private map<string, PendingClear> $clears;
+    private GraphSchedule $schedule;
+
+    /**
+     * Graph handles by name, kept across frames so a ref is refilled, not rebuilt.
+     */
+    private map<string, TargetRef> $targetRefs;
+    private map<string, TextureRef> $textureRefs;
+    private BackbufferData? $backbufferData;
 
     /**
      * Offscreen graph: no window backbuffer. Host records the scene into this, then a second
@@ -61,6 +67,10 @@ public class Pipeline
         $this->names = map<string, bool>();
         $this->io = array<Io>();
         $this->clears = map<string, PendingClear>();
+        $this->schedule = GraphSchedule();
+        $this->targetRefs = map<string, TargetRef>();
+        $this->textureRefs = map<string, TextureRef>();
+        $this->backbufferData = null;
     }
 
     public constructor(Pool $pool, Frame $frame, RenderTarget $backbuffer)
@@ -71,9 +81,42 @@ public class Pipeline
         $this->names = map<string, bool>();
         $this->io = array<Io>();
         $this->clears = map<string, PendingClear>();
+        $this->schedule = GraphSchedule();
+        $this->targetRefs = map<string, TargetRef>();
+        $this->textureRefs = map<string, TextureRef>();
+        $this->backbufferData = null;
+        $this->publishBackbuffer($backbuffer);
+    }
 
-        TargetRef $bb = $this->importTarget('backbuffer', $backbuffer);
-        $this->frame->set(BackbufferData($bb));
+    /**
+     * Start the next frame of an offscreen graph: no passes, no claims, no clears. The frame
+     * blackboard is the caller's to clear.
+     */
+    public function reset() : void
+    {
+        $this->passes->clear();
+        $this->names->clear();
+        $this->io->clear();
+        $this->clears->clear();
+    }
+
+    /**
+     * Start the next frame of a graph that ends on the window: `reset`, then import `$backbuffer`
+     * and publish it again.
+     */
+    public function reset(RenderTarget $backbuffer) : void
+    {
+        $this->reset();
+        $this->publishBackbuffer($backbuffer);
+    }
+
+    /**
+     * Drop the frame's passes and clears once it is presented, so nothing they hold outlives the
+     * frame (a scene switch destroys GPU objects right after).
+     */
+    public function release() : void
+    {
+        $this->reset();
     }
 
     public function createTarget(string $name, int32 $width, int32 $height) : TargetRef
@@ -100,8 +143,20 @@ public class Pipeline
 
     public function createColor(TargetRef $target, string $name, TextureOptions $options) : TextureRef
     {
+        if ($target->colorCache->has($name)) {
+            TextureRef $have = $target->colorCache[$name];
+            $this->claimName($have->name);
+            $have->width = $target->width;
+            $have->height = $target->height;
+            $have->options = $options;
+            $target->colorAttachments->push($have);
+            return $have;
+        }
+
         string $full = "{$target->name}.attachment.color_{$name}";
-        TextureRef $ref = $this->makeTexture($full, $target->width, $target->height, $options, false);
+        $this->claimName($full);
+        TextureRef $ref = TextureRef($full, $target->width, $target->height, $options, false);
+        $target->colorCache[$name] = $ref;
         $target->colorAttachments->push($ref);
         return $ref;
     }
@@ -113,8 +168,18 @@ public class Pipeline
 
     public function createDepth(TargetRef $target, TextureOptions $options) : TextureRef
     {
-        string $full = "{$target->name}.attachment.depth";
-        TextureRef $ref = $this->makeTexture($full, $target->width, $target->height, $options, false);
+        TextureRef $ref = guard $target->depthCache else {
+            string $full = "{$target->name}.attachment.depth";
+            $this->claimName($full);
+            TextureRef $fresh = TextureRef($full, $target->width, $target->height, $options, false);
+            $target->depthCache = $fresh;
+            $target->depthAttachment = $fresh;
+            return $fresh;
+        }
+        $this->claimName($ref->name);
+        $ref->width = $target->width;
+        $ref->height = $target->height;
+        $ref->options = $options;
         $target->depthAttachment = $ref;
         return $ref;
     }
@@ -150,9 +215,9 @@ public class Pipeline
             return null;
         }
 
-        PendingClear $held = $this->clears[$target->name];
+        ClearPassOptions $options = $this->clears[$target->name]->options;
         $this->clears->remove($target->name);
-        return $held->options;
+        return $options;
     }
 
     /**
@@ -177,21 +242,32 @@ public class Pipeline
         $this->pool->setCurrentTick($tick);
         // imports and declarations happen before execute, often on the previous tick
         // this pipeline still owns those names for the tick it is running
-        array<string> $claimed = $this->names->keys();
-        foreach ($claimed as $name) {
+        foreach ($this->names as $name => $claimed) {
             $this->pool->touch($name);
         }
-        array<int32> $order = guard schedule($this->passes->count() as int32, $this->io) else ($e) {
-            return .error($e);
+
+        $this->schedule->begin();
+        usize $edges = $this->io->count();
+        usize $e = 0;
+        while ($e < $edges) {
+            $this->schedule->record($this->io->at($e));
+            $e = $e + 1;
+        }
+
+        guard $this->schedule->run($this->passes->count() as int32) else ($err) {
+            return .error($err);
         }
         $this->touchIo();
 
         RenderContext $ctx = RenderContext($this->pool->device, $this, $this->frame, $this->pool, $compensation);
         Profiler $prof = profiler();
-
-        foreach ($order as $index) {
-            guard $this->flushClearsForReads($index, $ctx) else ($e) {
-                return .error($e);
+        usize $count = $this->schedule->order->count();
+        usize $k = 0;
+        while ($k < $count) {
+            int32 $index = $this->schedule->order[$k];
+            $k = $k + 1;
+            guard $this->flushClearsForReads($index, $ctx) else ($err) {
+                return .error($err);
             }
             $this->transitionReads($index);
             Pass $pass = $this->passes[$index as usize];
@@ -203,13 +279,13 @@ public class Pipeline
             status<PipelineError> $ran = $pass->execute($ctx);
             $this->pool->device->gpuEnd($gpu);
             $prof->close($mark);
-            guard $ran else ($e) {
-                return .error($e);
+            guard $ran else ($err) {
+                return .error($err);
             }
         }
 
-        guard $this->flushClears($ctx) else ($e) {
-            return .error($e);
+        guard $this->flushClears($ctx) else ($err) {
+            return .error($err);
         }
 
         if ($collect) {
@@ -225,19 +301,65 @@ public class Pipeline
         $this->io->push(Io($passIndex, $resource, $access));
     }
 
+    private function publishBackbuffer(RenderTarget $backbuffer) : void
+    {
+        // the backbuffer ref is cached by name and always imported, so it is one object for the
+        // pipeline's life and so is the fact that carries it
+        TargetRef $bb = $this->importTarget('backbuffer', $backbuffer);
+        BackbufferData $data = guard $this->backbufferData else {
+            BackbufferData $fresh = BackbufferData($bb);
+            $this->backbufferData = $fresh;
+            $this->frame->set($fresh);
+            return;
+        }
+        $this->frame->set($data);
+    }
+
+    /**
+     * The cached ref for `$name`, refilled to this frame's size and stripped of last frame's
+     * attachments; a fresh one the first time, or when `$imported` changed.
+     */
     private function makeTarget(string $name, int32 $width, int32 $height, bool $imported) : TargetRef
     {
         $this->claimName($name);
-        return TargetRef($name, $width, $height, $imported);
+        if ($this->targetRefs->has($name)) {
+            TargetRef $have = $this->targetRefs[$name];
+            if ($have->imported == $imported) {
+                $have->width = $width;
+                $have->height = $height;
+                $have->contentScaleX = 1.0f;
+                $have->contentScaleY = 1.0f;
+                $have->colorAttachments->clear();
+                $have->depthAttachment = null;
+                $have->depthStencil = false;
+                return $have;
+            }
+        }
+
+        TargetRef $fresh = TargetRef($name, $width, $height, $imported);
+        $this->targetRefs[$name] = $fresh;
+        return $fresh;
     }
 
     private function makeTexture(string $name, int32 $width, int32 $height, TextureOptions $options, bool $imported) : TextureRef
     {
         $this->claimName($name);
-        return TextureRef($name, $width, $height, $options, $imported);
+        if ($this->textureRefs->has($name)) {
+            TextureRef $have = $this->textureRefs[$name];
+            if ($have->imported == $imported) {
+                $have->width = $width;
+                $have->height = $height;
+                $have->options = $options;
+                return $have;
+            }
+        }
+
+        TextureRef $fresh = TextureRef($name, $width, $height, $options, $imported);
+        $this->textureRefs[$name] = $fresh;
+        return $fresh;
     }
 
-    private function claimName(string $name) : void
+    private function claimName(const string& $name) : void
     {
         assert(!$this->names->has($name), 'pipeline: duplicate resource name');
         $this->names[$name] = true;
@@ -245,49 +367,42 @@ public class Pipeline
 
     private function touchIo() : void
     {
-        array<Io> $edges = $this->io;
-
-        foreach ($edges as $edge) {
-            array<GraphRes> $res = expandIo($edge->resource);
-
-            foreach ($res as $r) {
-                $this->pool->touch($r->name);
-            }
+        usize $edges = $this->io->count();
+        usize $e = 0;
+        while ($e < $edges) {
+            Io& $edge = $this->io->at($e);
+            match ($edge->resource) {
+                ResourceIo::target($ref) => {
+                    $this->pool->touchTarget($ref);
+                },
+                ResourceIo::texture($ref) => {
+                    $this->pool->touch($ref->name);
+                },
+            };
+            $e = $e + 1;
         }
     }
 
     private function transitionReads(int32 $passIndex) : void
     {
-        array<Io> $edges = $this->io;
-
-        foreach ($edges as $edge) {
-            if ($edge->passIndex != $passIndex) {
+        usize $edges = $this->io->count();
+        usize $e = 0;
+        while ($e < $edges) {
+            Io& $edge = $this->io->at($e);
+            $e = $e + 1;
+            if ($edge->passIndex != $passIndex || $edge->access == Access::write) {
                 continue;
             }
 
-            bool $isRead = match ($edge->access) {
-                Access::read => true,
-                Access::write => false,
+            match ($edge->resource) {
+                ResourceIo::target($ref) => {
+                    $this->transitionTarget($ref);
+                },
+                ResourceIo::texture($ref) => {
+                    $this->transitionTexture($ref);
+                },
             };
-
-            if (!$isRead) {
-                continue;
-            }
-
-            $this->transitionResource($edge->resource);
         }
-    }
-
-    private function transitionResource(ResourceIo $resource) : void
-    {
-        match ($resource) {
-            ResourceIo::target($ref) => {
-                $this->transitionTarget($ref);
-            },
-            ResourceIo::texture($ref) => {
-                $this->transitionTexture($ref);
-            },
-        };
     }
 
     private function transitionTarget(TargetRef $ref) : void
@@ -295,10 +410,11 @@ public class Pipeline
         RenderTarget $rt = guard $this->pool->getTarget($ref) else {
             return;
         }
-        array<Texture> $colors = $rt->colors;
-
-        foreach ($colors as $colorTex) {
-            $this->pool->device->transitionTexture($colorTex, .shaderRead);
+        usize $n = $rt->colors->count();
+        usize $i = 0;
+        while ($i < $n) {
+            $this->pool->device->transitionTexture($rt->colors[$i], .shaderRead);
+            $i = $i + 1;
         }
 
         Texture $depth = guard $rt->depth else {
@@ -317,24 +433,21 @@ public class Pipeline
 
     private function flushClearsForReads(int32 $passIndex, RenderContext $ctx) : status<PipelineError>
     {
-        array<Io> $edges = $this->io;
+        if ($this->clears->empty()) {
+            return .ok;
+        }
 
-        foreach ($edges as $edge) {
-            if ($edge->passIndex != $passIndex) {
+        usize $edges = $this->io->count();
+        usize $e = 0;
+        while ($e < $edges) {
+            Io& $edge = $this->io->at($e);
+            $e = $e + 1;
+            if ($edge->passIndex != $passIndex || $edge->access == Access::write) {
                 continue;
             }
 
-            bool $isRead = match ($edge->access) {
-                Access::read => true,
-                Access::write => false,
-            };
-
-            if (!$isRead) {
-                continue;
-            }
-
-            guard $this->flushClearOf($edge->resource, $ctx) else ($e) {
-                return .error($e);
+            guard $this->flushClearOf($edge->resource, $ctx) else ($err) {
+                return .error($err);
             }
         }
 
@@ -357,31 +470,32 @@ public class Pipeline
 
     private function flushParentOf(TextureRef $ref, RenderContext $ctx) : status<PipelineError>
     {
-        array<string> $names = $this->clears->keys();
-
-        foreach ($names as $name) {
-            PendingClear $held = $this->clears[$name];
-            array<TextureRef> $texes = $held->target->textures();
-
-            foreach ($texes as $tex) {
-                if ($tex->name == $ref->name) {
-                    return $this->flushNamed($name, $ctx);
-                }
+        string $parent = '';
+        bool $found = false;
+        foreach ($this->clears as $name => $held) {
+            if (targetHolds($held->target, $ref->name)) {
+                $parent = $name;
+                $found = true;
+                break;
             }
         }
 
-        return .ok;
+        if (!$found) {
+            return .ok;
+        }
+
+        return $this->flushNamed($parent, $ctx);
     }
 
-    private function flushNamed(string $name, RenderContext $ctx) : status<PipelineError>
+    private function flushNamed(const string& $name, RenderContext $ctx) : status<PipelineError>
     {
         if (!$this->clears->has($name)) {
             return .ok;
         }
 
-        PendingClear $held = $this->clears[$name];
-        RenderEncoder $enc = guard $ctx->beginRender($held->target) else ($e) {
-            return .error($e);
+        TargetRef $target = $this->clears[$name]->target;
+        RenderEncoder $enc = guard $ctx->beginRender($target) else ($err) {
+            return .error($err);
         }
         $enc->endRender();
         return .ok;
@@ -389,16 +503,44 @@ public class Pipeline
 
     private function flushClears(RenderContext $ctx) : status<PipelineError>
     {
-        array<string> $names = $this->clears->keys();
+        // each flush consumes its clear through beginRender
+        while (!$this->clears->empty()) {
+            string $next = '';
+            foreach ($this->clears as $name => $held) {
+                $next = $name;
+                break;
+            }
 
-        foreach ($names as $name) {
-            PendingClear $held = $this->clears[$name];
-            RenderEncoder $enc = guard $ctx->beginRender($held->target) else ($e) {
-                return .error($e);
+            TargetRef $target = $this->clears[$next]->target;
+            RenderEncoder $enc = guard $ctx->beginRender($target) else ($err) {
+                return .error($err);
             }
             $enc->endRender();
+            // a clear beginRender did not take would spin; it always takes the target's own
+            $this->clears->remove($next);
         }
 
         return .ok;
     }
+}
+
+/**
+ * Whether `$name` is one of `$target`'s attachments.
+ */
+internal function targetHolds(TargetRef $target, const string& $name) : bool
+{
+    usize $n = $target->colorAttachments->count();
+    usize $i = 0;
+    while ($i < $n) {
+        if ($target->colorAttachments[$i]->name == $name) {
+            return true;
+        }
+
+        $i = $i + 1;
+    }
+
+    TextureRef $depth = guard $target->depthAttachment else {
+        return false;
+    }
+    return $depth->name == $name;
 }

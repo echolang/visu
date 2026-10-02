@@ -12,11 +12,18 @@ public class BakedShaders
     private function<string?(string, ShaderKind)> $lookup;
     private map<string, ShaderProgram> $programs;
 
+    /**
+     * Set once the owner warmed every program it means to: a link after that happens inside a
+     * frame and hitches it, so it is logged.
+     */
+    public bool $warmed;
+
     public constructor(Device $device, function<string?(string, ShaderKind)> $lookup)
     {
         $this->device = $device;
         $this->lookup = $lookup;
         $this->programs = map<string, ShaderProgram>();
+        $this->warmed = false;
     }
 
     /**
@@ -31,6 +38,10 @@ public class BakedShaders
         ShaderProgram $program = guard bakedProgram($this->device, $name, $this->lookup, label: $name) else ($e) {
             return .error($e);
         }
+        if ($this->warmed) {
+            visu::app::info("shader: '{$name}' linked after warm-up, the frame that asked for it hitches");
+        }
+
         $this->programs[$name] = $program;
         return .ok($program);
     }

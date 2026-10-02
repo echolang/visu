@@ -52,13 +52,6 @@ public struct Sky
      */
     public float32 $ozoneScale;
 
-    /**
-     * The atmosphere visu had before the aerial perspective: no ozone, and the uniform march
-     * that dims each sample through its whole step (`--flag fog.model=legacy`). Kept until the
-     * new frame is signed off.
-     */
-    public bool $legacy;
-
     public constructor()
     {
         $this->direction = Vec3(0.3f, -0.8f, -0.5f);
@@ -69,7 +62,6 @@ public struct Sky
         $this->exposure = 1.0f;
         $this->groundAlbedo = Vec3(0.30f, 0.27f, 0.20f);
         $this->ozoneScale = 1.0f;
-        $this->legacy = false;
     }
 
     /**
@@ -93,19 +85,14 @@ public struct Sky
             && $this->mieAnisotropy == $other->mieAnisotropy
             && $this->exposure == $other->exposure
             && $this->groundAlbedo == $other->groundAlbedo
-            && $this->ozoneScale == $other->ozoneScale
-            && $this->legacy == $other->legacy;
+            && $this->ozoneScale == $other->ozoneScale;
     }
 
     /**
-     * The ozone this sky absorbs with, per metre at the layer's peak: none on the legacy sky.
+     * The ozone this sky absorbs with, per metre at the layer's peak.
      */
     public const function ozone() : Vec3
     {
-        if ($this->legacy) {
-            return Vec3(0.0f, 0.0f, 0.0f);
-        }
-
         return Vec3(SKY_OZONE_R, SKY_OZONE_G, SKY_OZONE_B) * $this->ozoneScale;
     }
 
@@ -232,8 +219,7 @@ public struct SkyUniforms
     public Vec4 $moonColor;
 
     /**
-     * Ozone absorption at its peak in rgb, 1 in w marches with midpoint attenuation over
-     * quadratic steps (0 the legacy uniform march).
+     * Ozone absorption at its peak in rgb; w is unused.
      */
     public Vec4 $ozone;
 }
@@ -272,11 +258,6 @@ public function skyUniforms(
     }
 
     Vec3 $ozone = $sky->ozone();
-    float32 $midpoint = 1.0f;
-
-    if ($sky->legacy) {
-        $midpoint = 0.0f;
-    }
 
     return SkyUniforms(
         Vec4($toSun->x, $toSun->y, $toSun->z, $sky->sunIntensity),
@@ -298,7 +279,7 @@ public function skyUniforms(
         $moonAt,
         $moonParams,
         $moonColor,
-        Vec4($ozone->x, $ozone->y, $ozone->z, $midpoint)
+        Vec4($ozone->x, $ozone->y, $ozone->z, 0.0f)
     );
 }
 

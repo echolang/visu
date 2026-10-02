@@ -70,105 +70,17 @@ internal class DeferredCache
         BakedShaders $shaders = $this->programs->shaders($device, function(string $name, ShaderKind $kind) : string? {
             return pbrBytes($name, $kind);
         });
-        guard $shaders->program('gbuffer_instanced') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        guard $shaders->program('lightpass') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        guard $shaders->program('water') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        guard $shaders->program('debug_view') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        guard $shaders->program('model') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        guard $shaders->program('model+parallax') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        guard $shaders->program('model+skinned_parallax') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        guard $shaders->program('debug_lines') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        // the outline programs first run when something is hovered; compiling them there would
-        // hitch that frame
-        guard $shaders->program('outline_mask') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        guard $shaders->program('outline_mask+skinned') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        guard $shaders->program('outline') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        // the light pass's other variants: the environment ones as the sky bakes, the spot ones
-        // the first time a spot lights (a car's headlamps at dusk)
-        array<string> $lightVariants = [
-            'lightpass+ibl',
-            'lightpass+env_cubemap',
-            'lightpass+spot',
-            'lightpass+ibl_spot',
-            'lightpass+env_cubemap_spot',
-        ];
-        foreach ($lightVariants as $name) {
+        // every baked program, so none links on its first frame: the outline when something is
+        // first hovered, a spot variant when a car's headlamps first light at dusk, the shaft and
+        // tone-map stages when a setting or a console verb asks for them mid-play
+        array<string> $programs = pbrPrograms();
+        foreach ($programs as $name) {
             guard $shaders->program($name) else ($e) {
                 $this->programs->drop();
                 return .error($e);
             }
         }
-        // the shaft passes first run at the first sunset with god rays on
-        guard $shaders->program('godrays') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        guard $shaders->program('godrays_resolve') else ($e) {
-            $this->programs->drop();
-            return .error($e);
-        }
-        // the tone-map chain: the resolve runs every frame, the stages as soon as a setting asks,
-        // which may be a console verb in the middle of play; every curve's resolve, plain and
-        // local, since `tonemap curve` switches between them in play
-        array<string> $toneMap = [
-            'tonemap_luma',
-            'tonemap_coarse',
-            'tonemap_reduce',
-            'tonemap_exposure',
-            'tonemap_exposure+probe',
-            'tonemap_grid',
-            'tonemap_blur',
-            'tonemap_blur+base',
-            'tonemap_upsample',
-            // the fog's sky table refills the first time the fog takes the sky's colour
-            'fog_sky',
-            // the aerial table fills on the first scene frame, and again whenever the sky moves
-            'aerial',
-        ];
-        array<ToneCurve> $curves = toneCurves();
-        foreach ($curves as $curve) {
-            $toneMap[] = $curve->program(false);
-            $toneMap[] = $curve->program(true);
-        }
-        foreach ($toneMap as $name) {
-            guard $shaders->program($name) else ($e) {
-                $this->programs->drop();
-                return .error($e);
-            }
-        }
+
         // the GPU-driven kernels and depth programs, which the first lamp, shadow page or
         // scene cull would otherwise compile mid-frame
         guard $device->gpuShaders->warm($device) else ($e) {
@@ -176,6 +88,7 @@ internal class DeferredCache
             return .error($e);
         }
         $this->warmed = true;
+        $shaders->warmed = true;
         return .ok($shaders);
     }
 }
@@ -206,6 +119,24 @@ internal class DeferredGpu
      */
     public Buffer $noLights;
     public array<Vec4> $kernel;
+
+    /**
+     * The fullscreen quad and the sky cube (`skyCube`) every pass draws, built once.
+     */
+    public Mesh $quad;
+    public Mesh $skyCube;
+
+    /**
+     * The water surface's quad (`waterQuad`).
+     */
+    public Mesh $waterSurface;
+
+    /**
+     * Each program's pass over `quad` / `cube`, built the first frame it draws: a GpuPass
+     * builds its pipeline key string, so a pass that draws every frame takes it from here.
+     */
+    private map<uint32, GpuPass> $quadPasses = map<uint32, GpuPass>();
+    private map<uint32, GpuPass> $cubePasses = map<uint32, GpuPass>();
 
     public static function load(Device $device) : result<DeferredGpu, ShaderError>
     {
@@ -239,7 +170,10 @@ internal class DeferredGpu
             $device->createSampler(SamplerDesc()),
             shadowDummy($device),
             noLightsBuffer($device),
-            ssaoKernel(SSAO_MAX_SAMPLES)
+            ssaoKernel(SSAO_MAX_SAMPLES),
+            Mesh::quad($device),
+            Mesh::cube($device),
+            waterQuad($device)
         ));
     }
 
@@ -277,13 +211,64 @@ internal class DeferredGpu
         return $uniforms;
     }
 
+    /**
+     * `$program` over the fullscreen quad with `$raster`.
+     */
+    public function quadPass(ShaderProgram $program, Raster $raster) : GpuPass
+    {
+        return keptPass($this->quadPasses, $program, VertexLayout::pos3uv2(), $raster);
+    }
+
+    /**
+     * `$program` over the sky cube with `$raster`.
+     */
+    public function cubePass(ShaderProgram $program, Raster $raster) : GpuPass
+    {
+        return keptPass($this->cubePasses, $program, VertexLayout::pos3(), $raster);
+    }
+
     public function destroy() : void
     {
+        $this->quad->destroy();
+        $this->skyCube->destroy();
+        $this->waterSurface->destroy();
         $this->white->destroy();
         $this->noise->destroy();
         $this->shadowDummy->destroy();
         $this->noLights->destroy();
     }
+}
+
+/**
+ * The pass `$kept` holds for `$program`, or a fresh one when it has none or holds another raster.
+ * The layout is only read on a miss.
+ */
+internal function keptPass(map<uint32, GpuPass>& $kept, ShaderProgram $program, VertexLayout $layout, Raster $raster) : GpuPass
+{
+    if ($kept->has($program->id)) {
+        GpuPass $have = $kept[$program->id];
+        if (sameRaster($have->raster, $raster)) {
+            return $have;
+        }
+    }
+
+    GpuPass $made = GpuPass($program, $layout, $raster);
+    $kept[$program->id] = $made;
+    return $made;
+}
+
+internal function sameRaster(const Raster& $a, const Raster& $b) : bool
+{
+    return $a->depthTest == $b->depthTest
+        && $a->depthWrite == $b->depthWrite
+        && $a->depthCompare == $b->depthCompare
+        && $a->cull == $b->cull
+        && $a->fill == $b->fill
+        && $a->front == $b->front
+        && $a->blend == $b->blend
+        && $a->colorWrite == $b->colorWrite
+        && $a->depthBias == $b->depthBias
+        && $a->depthSlope == $b->depthSlope;
 }
 
 /**

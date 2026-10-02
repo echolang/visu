@@ -27,15 +27,33 @@ public class StoredTarget
     public RenderTarget $target;
     public array<string> $ownedTextures;
     public bool $imported;
-    public string $fingerprint;
 
-    public constructor(RenderTarget $target, array<string> $ownedTextures, bool $imported, string $fingerprint)
+    /**
+     * What the target was built for; a ref that no longer matches it rebuilds the target.
+     */
+    public TargetKey $key;
+
+    public constructor(RenderTarget $target, array<string> $ownedTextures, bool $imported, TargetKey $key)
     {
         $this->target = $target;
         $this->ownedTextures = $ownedTextures;
         $this->imported = $imported;
-        $this->fingerprint = $fingerprint;
+        $this->key = $key;
     }
+}
+
+/**
+ * The size, the depth-stencil flag and every attachment (name and options) a pooled target was
+ * built from. Built when a target is created; compared field by field every `getTarget`, so the
+ * check builds no string.
+ */
+public struct TargetKey
+{
+    public int32 $width;
+    public int32 $height;
+    public bool $depthStencil;
+    public array<string> $names;
+    public array<TextureOptions> $options;
 }
 
 public class StoredTexture
@@ -62,6 +80,11 @@ public class Pool
     private array<GpuObject> $cachedOwned;
     private int32 $tick;
 
+    /**
+     * `collect`'s list of names the tick passed by, kept so a collect allocates nothing.
+     */
+    private array<string> $stale;
+
     public constructor(Device $device)
     {
         $this->device = $device;
@@ -71,6 +94,7 @@ public class Pool
         $this->cached = map<string, map<type_id, erased>>();
         $this->cachedOwned = array<GpuObject>();
         $this->tick = 0;
+        $this->stale = array<string>();
     }
 
     public function setCurrentTick(int32 $tick) : void
@@ -88,8 +112,17 @@ public class Pool
      */
     public function setTarget(TargetRef $ref, RenderTarget $target) : void
     {
+        if ($this->targets->has($ref->name)) {
+            StoredTarget $held = $this->targets[$ref->name];
+            if ($held->imported) {
+                $held->target = $target;
+                $this->touch($ref->name);
+                return;
+            }
+        }
+
         array<string> $none = array<string>();
-        $this->targets[$ref->name] = StoredTarget($target, $none, true, targetFingerprint($ref));
+        $this->targets[$ref->name] = StoredTarget($target, $none, true, targetKey($ref));
         $this->touch($ref->name);
     }
 
@@ -103,10 +136,12 @@ public class Pool
     {
         if ($this->textures->has($ref->name)) {
             StoredTexture $held = $this->textures[$ref->name];
-            if (!$held->imported) {
-                $this->touch($ref->name);
-                return;
+            $this->touch($ref->name);
+            if ($held->imported) {
+                $held->texture = $texture;
             }
+
+            return;
         }
 
         $this->textures[$ref->name] = StoredTexture($texture, true, null);
@@ -118,7 +153,7 @@ public class Pool
      */
     public function getTarget(TargetRef $ref) : result<RenderTarget, PoolError>
     {
-        $this->touchExpanded($ref);
+        $this->touchTarget($ref);
 
         if ($ref->imported) {
             if (!$this->targets->has($ref->name)) {
@@ -131,7 +166,7 @@ public class Pool
 
         if ($this->targets->has($ref->name)) {
             StoredTarget $held = $this->targets[$ref->name];
-            if ($held->fingerprint == targetFingerprint($ref)) {
+            if (targetKeyMatches($held->key, $ref)) {
                 return .ok($held->target);
             }
 
@@ -236,13 +271,18 @@ public class Pool
      */
     public function collect() : void
     {
-        array<string> $names = $this->used->keys();
-
-        foreach ($names as $name) {
-            if (!$this->used->has($name) || $this->used[$name] >= $this->tick) {
-                continue;
+        $this->stale->clear();
+        foreach ($this->used as $name => $at) {
+            if ($at < $this->tick) {
+                $this->stale->push($name);
             }
+        }
 
+        usize $count = $this->stale->count();
+        usize $i = 0;
+        while ($i < $count) {
+            string $name = $this->stale[$i];
+            $i = $i + 1;
             if (!$this->targets->has($name)) {
                 continue;
             }
@@ -255,10 +295,11 @@ public class Pool
             $this->used->remove($name);
         }
 
-        $names = $this->used->keys();
-
-        foreach ($names as $name) {
-            if (!$this->used->has($name) || $this->used[$name] >= $this->tick) {
+        $i = 0;
+        while ($i < $count) {
+            string $name = $this->stale[$i];
+            $i = $i + 1;
+            if (!$this->used->has($name)) {
                 continue;
             }
 
@@ -378,13 +419,23 @@ public class Pool
         return false;
     }
 
-    private function touchExpanded(TargetRef $ref) : void
+    /**
+     * Touch `$ref` and each of its attachments.
+     */
+    public function touchTarget(TargetRef $ref) : void
     {
-        array<GraphRes> $res = expandIo(.target($ref));
-
-        foreach ($res as $r) {
-            $this->touch($r->name);
+        $this->touch($ref->name);
+        usize $n = $ref->colorAttachments->count();
+        usize $i = 0;
+        while ($i < $n) {
+            $this->touch($ref->colorAttachments[$i]->name);
+            $i = $i + 1;
         }
+
+        TextureRef $depth = guard $ref->depthAttachment else {
+            return;
+        }
+        $this->touch($depth->name);
     }
 
     private function createTarget(TargetRef $ref) : result<RenderTarget, PoolError>
@@ -447,7 +498,7 @@ public class Pool
             $target->depth = $ds;
         }
 
-        $this->targets[$ref->name] = StoredTarget($target, $owned, false, targetFingerprint($ref));
+        $this->targets[$ref->name] = StoredTarget($target, $owned, false, targetKey($ref));
         return .ok($target);
     }
 
@@ -488,22 +539,68 @@ public class Pool
     }
 }
 
-internal function targetFingerprint(TargetRef $ref) : string
+/**
+ * What `$ref` asks the pool to build: its size, depth-stencil flag and attachments.
+ */
+public function targetKey(TargetRef $ref) : TargetKey
 {
-    string $fp = "{$ref->width}x{$ref->height}";
-
-    if ($ref->depthStencil) {
-        $fp->append('|rboDS');
+    array<string> $names = array<string>();
+    array<TextureOptions> $options = array<TextureOptions>();
+    foreach ($ref->colorAttachments as $tex) {
+        $names->push($tex->name);
+        $options->push($tex->options);
     }
 
-    array<TextureRef> $texes = $ref->textures();
-
-    foreach ($texes as $tex) {
-        $fp->append('|');
-        $fp->append($tex->name);
-        $fp->append('|');
-        $fp->append($tex->options->key());
+    TextureRef? $depth = $ref->depthAttachment;
+    if ($depth != null) {
+        TextureRef $held = guard $depth;
+        $names->push($held->name);
+        $options->push($held->options);
     }
 
-    return $fp;
+    return TargetKey($ref->width, $ref->height, $ref->depthStencil, $names, $options);
+}
+
+/**
+ * Whether `$ref` still asks for the target `$key` was built from. Allocates nothing.
+ */
+public function targetKeyMatches(const TargetKey& $key, TargetRef $ref) : bool
+{
+    if ($key->width != $ref->width || $key->height != $ref->height || $key->depthStencil != $ref->depthStencil) {
+        return false;
+    }
+
+    usize $colors = $ref->colorAttachments->count();
+    usize $total = $colors;
+    if ($ref->depthAttachment != null) {
+        $total = $total + 1;
+    }
+
+    if ($key->names->count() != $total) {
+        return false;
+    }
+
+    usize $i = 0;
+    while ($i < $colors) {
+        TextureRef $tex = $ref->colorAttachments[$i];
+        if (!sameAttachment($key, $i, $tex)) {
+            return false;
+        }
+
+        $i = $i + 1;
+    }
+
+    TextureRef $depth = guard $ref->depthAttachment else {
+        return true;
+    }
+    return sameAttachment($key, $colors, $depth);
+}
+
+internal function sameAttachment(const TargetKey& $key, usize $at, TextureRef $tex) : bool
+{
+    TextureOptions $want = $key->options[$at];
+    return $key->names[$at] == $tex->name
+        && $want->format == $tex->options->format
+        && $want->kind == $tex->options->kind
+        && $want->mips == $tex->options->mips;
 }

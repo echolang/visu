@@ -1,5 +1,6 @@
 /**
- * A decoded model: one GPU mesh (shared vertices + indices), its LOD table, and one `Material` per
+ * A decoded model: its arena form for the GPU-driven views, the classic GPU mesh (shared vertices
+ * and indices) the CPU views draw, its LOD table, and one `Material` per
  * slot resolved from a cooked `.vmat` whose catalog id is the slot string. `Assets.load<Model>`
  * builds it through `decodeModel`.
  * The `ModelBank` owns every live model and is the only thing that destroys one; the destructor
@@ -15,7 +16,12 @@ use visu::geo::AABB;
 public class Model
 {
     public const string $id;
-    public Mesh $mesh;
+
+    /**
+     * The classic vertex and index buffers the CPU main views register; null once the bank
+     * dropped them because every main view draws from the GPU scene (`ModelBank.dropClassicMeshes`).
+     */
+    public Mesh? $mesh;
     public const AABB $bounds;
 
     /**
@@ -81,8 +87,20 @@ public class Model
             return;
         }
 
-        $this->mesh->destroy();
+        $this->dropMesh();
         $this->dead = true;
+    }
+
+    /**
+     * Free the classic mesh; the arena form stays.
+     */
+    public function dropMesh() : void
+    {
+        Mesh $held = guard $this->mesh else {
+            return;
+        }
+        $held->destroy();
+        $this->mesh = null;
     }
 
     public const function lodCount() : int32

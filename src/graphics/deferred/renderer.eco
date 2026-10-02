@@ -1,6 +1,8 @@
 /**
  * Deferred PBR: fill a packed GBuffer, shade it once into linear HDR, tone-map the result.
- * Not an ECS system; the app owns one and calls `render` with the geometry it wants in the buffer, so the same renderer serves an ECS scene and a hand-rolled one.
+ * Not an ECS system; the app owns one, attaches what draws the scene once (`attach`, a
+ * `SceneDrawer` each) and calls `render` every frame (`visu::system::RendererSystem` does it for
+ * an ECS scene), so the same renderer serves an ECS scene and a hand-rolled one.
  *
  * Programs come from the module bake (`tools/shaders.php --bake`), so nothing has to ship shader files.
  */
@@ -40,13 +42,6 @@ public class DeferredRenderer
     public AerialPerspective $aerial;
 
     /**
-     * The fog and sky visu had before the aerial perspective (`--flag fog.model=legacy`): the
-     * horizon-coloured haze, the uniform sky march, no ozone. Kept to diff against until the new
-     * frame is signed off.
-     */
-    public bool $legacyFog;
-
-    /**
      * Light shafts from the key light through the height fog. Off by default. Runs only with
      * shadows on, fog on and a key light up; any other frame adds no pass and drops the history.
      */
@@ -55,14 +50,13 @@ public class DeferredRenderer
     /**
      * The display end of the frame: the local operator, the curve and the white balance. The
      * default is ACES with nothing local; `curve = .neutral` is the frame visu drew before. The
-     * curve is seeded from `--flag tonemap.curve=<aces|neutral|reinhard|filmic>`, the local
-     * operator from `--flag tonemap.local`.
+     * curve and the local operator start from the `RendererSettings` it was built with.
      */
     public ToneMap $toneMap;
 
     /**
      * The camera exposure. Off by default (0 EV); auto meters the ground illuminance and adapts.
-     * Seeded from `--flag exposure.auto`.
+     * `auto` starts from the `RendererSettings` it was built with.
      */
     public Exposure $exposure;
 
@@ -101,7 +95,7 @@ public class DeferredRenderer
 
     /**
      * One GBuffer encoder per filler instead of one for all, so each system gets its own GPU
-     * time. A profiling aid (`--flag gbuffer.split=true`); the merged pass is the fast one.
+     * time. A profiling aid (`RendererSettings.splitGeometry`); the merged pass is the fast one.
      */
     public bool $splitGeometry;
 
@@ -114,87 +108,44 @@ public class DeferredRenderer
     public Device $device;
     private DeferredGpu? $gpu;
     private Environment? $environment;
-    private Texture? $shadowMap;
-    private GodRayHistory? $godRayHistory;
-    private ExposureHistory? $exposureHistory;
 
     /**
-     * The display end's passes, built on the first tone-mapped frame and re-added every frame.
+     * The air (sky-view and aerial tables, the fog's dome), built at `load`; the end of the
+     * frame (god rays, exposure, the tone map and the look); the key light's cascades.
      */
-    private ToneMapChain? $toneChain;
-
-    /**
-     * The curve settings `look` was built from; `ToneMap.lookChanged` against them decides a
-     * rebuild, so the matrices are solved when a setting moves, never per frame.
-     */
-    private ToneMap $lookFor;
-    private ToneLook $look;
-
-    /**
-     * `background` mapped back through the look's curve for the light pass's clear, and the
-     * background it was solved for: re-solved only when either moves.
-     */
-    private Vec4 $clear;
-    private Vec4 $clearFor;
-
-    /**
-     * `visu::runtime::seconds()` at the last tone-mapped frame, for the exposure adaptation.
-     */
-    private float64 $toneSeconds;
-    private SkyViewLut? $skyViewMain;
-    private SkyViewLut? $skyViewMirror;
-
-    /**
-     * The fog's sky table while the legacy fog takes the sky's colour; freed the first frame
-     * it does not.
-     */
-    private FogSkyLut? $fogSky;
-
-    /**
-     * The aerial table, built on the first scene frame.
-     */
-    private AerialLut? $aerialLut;
-
-    /**
-     * `fogAmbient`'s sky dome and what it was solved for: the atmosphere, the sun's elevation
-     * and the eye height. The dome average does not depend on the sun's azimuth, so it is
-     * re-solved only when the sun climbs or sinks by `FOG_AMBIENT_SUN_STEP`.
-     */
-    private Vec3 $dome;
-    private Sky $domeSky;
-    private float32 $domeSunY;
-    private float32 $domeAltitude;
-    private bool $domeValid;
-    private array<ShadowCaster> $casters;
+    private Atmosphere? $atmosphere;
+    private PostChain $post;
+    private SunShadows $sunShadows;
     private GeometryFillers $geometry;
+
+    /**
+     * What draws the scene, in attach order, and each one's view interfaces, recast once at
+     * attach (null where it does not implement one).
+     */
+    private array<SceneDrawer> $drawers;
+    private array<GeometryFiller?> $fillers;
+    private array<ShadowCaster?> $casters;
+    private array<ReflectionCaster?> $reflectors;
+    private array<OutlineCaster?> $outliners;
+    private SceneViews $views;
     private OutlineData $outline;
     private OutlineStyle[4] $outlineStyles;
 
-    public constructor(Device $device)
+    public constructor(Device $device, RendererSettings $settings = RendererSettings())
     {
         $this->sun = DirectionalLight();
         $this->moon = Moon();
         $this->sky = Sky();
         $this->fog = HeightFog();
         $this->aerial = AerialPerspective();
-        $this->legacyFog = visu::app::flags()->str('fog.model', 'atmosphere') == 'legacy';
-        $this->sky->legacy = $this->legacyFog;
         $this->godRays = GodRays();
         $this->toneMap = ToneMap();
-        $this->toneMap->local = visu::app::flags()->bool('tonemap.local', false);
-        string $curveWord = visu::app::flags()->str('tonemap.curve', 'aces');
-        $this->toneMap->curve = toneCurveNamed($curveWord) ?? ToneCurve::aces;
+        $this->toneMap->local = $settings->toneLocal;
+        $this->toneMap->curve = $settings->toneCurve;
         $this->exposure = Exposure();
-        $this->exposure->auto = visu::app::flags()->bool('exposure.auto', false);
-        $this->exposureHistory = null;
-        $this->toneChain = null;
-        $this->lookFor = ToneMap();
-        $this->look = ToneLook($this->lookFor);
-        $this->toneSeconds = 0.0;
+        $this->exposure->auto = $settings->exposureAuto;
         $this->iblBlend = IblBlend();
         $this->background = Vec4(0.05f, 0.05f, 0.06f, 1.0f);
-        $this->clearFor = $this->background;
-        $this->clear = sceneBackground($this->background, $this->lookFor, $this->look);
         $this->renderSkybox = true;
         $this->ssao = SsaoQuality::ultra();
         $this->ibl = IblQuality();
@@ -203,21 +154,18 @@ public class DeferredRenderer
         $this->device = $device;
         $this->gpu = null;
         $this->environment = null;
-        $this->shadowMap = null;
-        $this->godRayHistory = null;
-        $this->casters = arr::room<ShadowCaster>(4);
+        $this->atmosphere = null;
+        $this->post = PostChain($device, $this->background);
+        $this->sunShadows = SunShadows($device);
         $this->geometry = GeometryFillers();
-        $this->splitGeometry = visu::app::flags()->bool('gbuffer.split', false);
-        $this->scene = GpuScene($device);
-        $this->skyViewMain = null;
-        $this->skyViewMirror = null;
-        $this->fogSky = null;
-        $this->aerialLut = null;
-        $this->dome = Vec3(0.0f, 0.0f, 0.0f);
-        $this->domeSky = Sky();
-        $this->domeSunY = 0.0f;
-        $this->domeAltitude = 0.0f;
-        $this->domeValid = false;
+        $this->drawers = arr::room<SceneDrawer>(8);
+        $this->fillers = arr::room<GeometryFiller?>(8);
+        $this->casters = arr::room<ShadowCaster?>(8);
+        $this->reflectors = arr::room<ReflectionCaster?>(8);
+        $this->outliners = arr::room<OutlineCaster?>(8);
+        $this->views = SceneViews();
+        $this->splitGeometry = $settings->splitGeometry;
+        $this->scene = GpuScene($device, $settings->scene);
         $this->outline = OutlineData();
         OutlineStyle[4] $styles;
         int32 $i = 0;
@@ -230,12 +178,43 @@ public class DeferredRenderer
     }
 
     /**
+     * Take `$settings` as they stand now: the curve, the local operator, auto exposure, the
+     * geometry split and the GPU scene's cull. A console or a settings screen calls this; the
+     * look fields stay the app's to write directly.
+     */
+    public function apply(const RendererSettings& $settings) : void
+    {
+        $this->toneMap->local = $settings->toneLocal;
+        $this->toneMap->curve = $settings->toneCurve;
+        $this->exposure->auto = $settings->exposureAuto;
+        $this->splitGeometry = $settings->splitGeometry;
+        $this->scene->configure($settings->scene);
+    }
+
+    /**
      * How highlight slot `$slot` glows. Casters tag instances with a slot; see `OutlineCaster`.
      */
     public function outlineStyle(int32 $slot, OutlineStyle $style) : void
     {
         assert($slot >= 0 && $slot < OUTLINE_STYLES, 'outline style slot out of range');
         $this->outlineStyles[$slot] = $style;
+    }
+
+    /**
+     * Draw `$drawer` in every scene frame from now on, after the drawers attached before it. Its
+     * view interfaces are looked up here, once.
+     */
+    public function attach(SceneDrawer $drawer) : void
+    {
+        $this->drawers->push($drawer);
+        GeometryFiller? $filler = $drawer as GeometryFiller?;
+        ShadowCaster? $caster = $drawer as ShadowCaster?;
+        ReflectionCaster? $reflector = $drawer as ReflectionCaster?;
+        OutlineCaster? $outliner = $drawer as OutlineCaster?;
+        $this->fillers->push($filler);
+        $this->casters->push($caster);
+        $this->reflectors->push($reflector);
+        $this->outliners->push($outliner);
     }
 
     /**
@@ -247,6 +226,7 @@ public class DeferredRenderer
             return .error($e);
         }
         $this->gpu = $gpu;
+        $this->atmosphere = Atmosphere($this->device, $gpu);
         return .ok;
     }
 
@@ -330,21 +310,17 @@ public class DeferredRenderer
     }
 
     /**
-     * Adds the deferred passes for this frame. `$fill` runs after GBuffer allocation (and after
-     * `ShadowMapData` is on the frame when shadows are on) so geometry systems can submit
-     * independently to the GBuffer and to the shadow mailbox.
+     * Adds the deferred passes for this frame into `$output`. The attached drawers prepare after
+     * the G-buffer is allocated and the views it can have this frame (the cascades, the mirror,
+     * the outline) are published, then draw through the views they answered for.
      */
-    public function render(
-        RenderContext $ctx,
-        TargetRef $output,
-        function<void(RenderContext, GBufferData)> $fill
-    ) : void
+    public function render(RenderContext $ctx, TargetRef $output) : void
     {
         assert($this->gpu != null, 'DeferredRenderer.render before load');
         DeferredGpu $gpu = guard $this->gpu;
         Environment? $env = $this->environment;
         Environment $held = guard $env else {
-            $this->addScene($ctx, $output, $fill, $gpu, null);
+            $this->addScene($ctx, $output, $gpu, null);
             return;
         }
         $held->releaseEquirect();
@@ -354,13 +330,12 @@ public class DeferredRenderer
             $held->blend = $this->iblBlend;
         }
 
-        $this->addScene($ctx, $output, $fill, $gpu, $held);
+        $this->addScene($ctx, $output, $gpu, $held);
     }
 
     private function addScene(
         RenderContext $ctx,
         TargetRef $output,
-        function<void(RenderContext, GBufferData)> $fill,
         DeferredGpu $gpu,
         Environment? $env
     ) : void
@@ -368,63 +343,36 @@ public class DeferredRenderer
         Pipeline $pipeline = $ctx->pipeline;
         $pipeline->add(GBufferPass($gpu->camera, $output->width, $output->height));
         GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
-
-        DeferredView $view = $this->view;
-        if ($view->isScene()) {
-            ShadowQuality? $shadows = $this->shadows;
-            // with neither sun nor moon up the cascades would shade nothing: skip all five
-            DirectionalLight $key = keyLight($this->sun, $this->moon);
-            bool $cascades = $shadows != null && $key->intensity > 0.0f && $ctx->frame->find<CameraData>() != null;
-            // the cull reads the cascades the shadow pass's setup publishes and the main views,
-            // and runs first
-            if ($this->scene->active() && ($cascades || $this->scene->mainViews)) {
-                $pipeline->add(SceneCullPass($this->scene));
-            }
-
-            if ($cascades) {
-                ShadowQuality $quality = guard $shadows;
-                $pipeline->add(ShadowMapPass(
-                    $this->ensureShadowMap($quality),
-                    $key,
-                    $quality,
-                    $this->casters
-                ));
-            }
-        }
-
-        if ($view->isScene()) {
+        bool $scene = $this->view->isScene();
+        if ($scene) {
+            $this->addDepthViews($ctx);
             $this->outline->reset();
             $ctx->frame->set($this->outline);
-        }
-
-        WaterFrame? $water = $ctx->frame->find<WaterFrame>();
-        if ($water != null && $view->isScene()) {
-            WaterFrame $held = guard $water;
-            if ($held->active && $held->mirror) {
-                $pipeline->add(MirrorGBufferPass($held));
+            WaterFrame? $water = $ctx->frame->find<WaterFrame>();
+            if ($water != null) {
+                WaterFrame $held = guard $water;
+                if ($held->active && $held->mirror) {
+                    $pipeline->add(MirrorGBufferPass($held));
+                }
             }
         }
 
-        $this->geometry->reset();
-        $ctx->frame->set($this->geometry);
-        $fill($ctx, $gbuffer);
+        $this->prepareDrawers($ctx, $gbuffer, $scene);
         $pipeline->add(GeometryPass($gbuffer, $this->geometry, $gpu->camera, $this->splitGeometry));
 
         // clustered point lights shadow through the atlas: requests read this frame's G-buffer
-        if ($view->isScene() && $ctx->frame->find<LightClusterData>() != null) {
+        if ($scene && $ctx->frame->find<LightClusterData>() != null) {
             $pipeline->add(VsmPass($this->scene, $gbuffer));
             $pipeline->add(VsmRasterPass($this->scene, $gbuffer, $gpu));
         }
 
         // only a frame with something highlighted pays for the mask and the composite
-        bool $outlining = $view->isScene() && $this->outline->active();
+        bool $outlining = $scene && $this->outline->active();
         if ($outlining) {
             $pipeline->add(OutlineMaskPass($gpu, $this->outline));
         }
 
-        bool $runSsao = $this->ssao != null && ($view->isScene() || $view->needsSsao());
-
-        if ($runSsao) {
+        if ($this->ssao != null && ($scene || $this->view->needsSsao())) {
             SsaoQuality $quality = guard $this->ssao;
             $pipeline->add(SsaoPass($gpu, $quality));
             $pipeline->add(SsaoBlurPass($gpu));
@@ -437,95 +385,192 @@ public class DeferredRenderer
             $pipeline->add(IblPass($gpu, $environment));
         }
 
-        if ($view->isScene()) {
-            $this->addGodRays($ctx, $gpu);
-        }
-
-        if ($view->isScene()) {
-            $this->refreshLook();
-            Vec3 $eye = $ctx->frame->get<CameraData>()->position;
-            FogLighting $fogLit = $this->fogLightingAt($eye);
-            // before the light pass, so its read orders the refills ahead of every pass that fogs
-            TextureRef? $fogSky = $this->fogSkyTable($pipeline, $gpu, $eye);
-            TextureRef $aerial = $this->aerialTable($pipeline, $gpu, $eye, $fogLit->aerialScale > 0.0f);
-            LightPass $lighting = LightPass($gpu, $env, $this->sun, $this->sky, $this->moon, $this->fog, $this->clear, $fogLit, $aerial, $fogSky);
-            $pipeline->add($lighting);
-
-            if ($this->renderSkybox && $env != null) {
-                Environment $environment = guard $env;
-                if ($environment->isProbe()) {
-                    TextureRef $table = $this->mainSkyView($pipeline, $gpu, $ctx->frame->get<CameraData>()->position);
-                    $pipeline->add(SkyPass($gpu, $this->sky, $this->fog, $this->sun, $this->moon, $table, $fogLit, $fogSky));
-                } else {
-                    $pipeline->add(SkyboxPass($gpu, $this->sky, $this->fog, $this->sun, $this->moon, $fogLit, $fogSky));
-                }
-            }
-
-            LightPassData $light = $ctx->frame->get<LightPassData>();
-            TextureRef $present = $light->output;
-            WaterFrame? $waterNow = $ctx->frame->find<WaterFrame>();
-            if ($waterNow != null) {
-                WaterFrame $held = guard $waterNow;
-                if ($held->active) {
-                    if ($held->mirror) {
-                        $pipeline->add(MirrorLightPass($lighting, $held, Vec4(0.0f, 0.0f, 0.0f, 0.0f)));
-                        if ($this->renderSkybox && $env != null) {
-                            Environment $environment = guard $env;
-                            TextureRef? $mirrorTable = null;
-                            if ($environment->isProbe()) {
-                                $mirrorTable = $this->mirrorSkyView($pipeline, $gpu, $held->camera->position);
-                            }
-
-                            // a probe reads the mirror's sky-view table; an HDRI samples its cube
-                            $pipeline->add(MirrorSkyPass(
-                                $gpu,
-                                $held,
-                                $this->sky,
-                                $this->fog,
-                                $this->sun,
-                                $this->moon,
-                                $environment->isProbe(),
-                                $fogLit,
-                                $mirrorTable
-                            ));
-                        }
-                    }
-
-                    $pipeline->add(WaterPass($gpu, $held, $lighting));
-                    if ($held->presented != null) {
-                        TextureRef $shown = guard $held->presented;
-                        $present = $shown;
-                    }
-                }
-            }
-
-            $this->addToneMap($ctx, $gpu, $output, $present);
-            if ($outlining) {
-                $pipeline->add(OutlinePass($gpu, $output, $this->outlineStyles, $this->outline->bounds));
-            }
-
+        if (!$scene) {
+            // a debug view runs no shaft pass, so the history stops following the scene
+            $this->post->idleGodRays();
+            $pipeline->add(DeferredViewPass($gpu, $output, $this->view->params()));
             return;
         }
 
-        // a debug view runs no shaft pass, so the history stops following the scene
-        $this->idleGodRays();
-        $pipeline->add(DeferredViewPass($gpu, $output, $view->params()));
+        $this->post->addGodRays($ctx, $gpu, $this->godRays, $this->fog, $this->sun, $this->moon);
+        $this->addLighting($ctx, $gpu, $env, $output);
+        if ($outlining) {
+            $pipeline->add(OutlinePass($gpu, $output, $this->outlineStyles, $this->outline->bounds));
+        }
     }
 
     /**
-     * The common fill: cull/sort the assembler and draw it into the GBuffer with the instanced
-     * geometry program, as one filler of this frame's geometry pass.
+     * Every drawer prepares for this frame's views and joins the ones it answered for, in
+     * attach order.
      */
-    public function draw<P>(
+    private function prepareDrawers(RenderContext $ctx, GBufferData $gbuffer, bool $scene) : void
+    {
+        $this->geometry->reset();
+        SceneViews $views = $this->views;
+        $views->gbuffer = $gbuffer;
+        $views->shadows = $ctx->frame->find<ShadowMapData>();
+        $views->mirror = null;
+        $views->outline = $scene;
+        WaterFrame? $water = $ctx->frame->find<WaterFrame>();
+        if ($scene && $water != null) {
+            WaterFrame $held = guard $water;
+            if ($held->active && $held->mirror) {
+                $views->mirror = $held;
+            }
+        }
+
+        usize $n = $this->drawers->count();
+        usize $i = 0;
+        while ($i < $n) {
+            int32 $wants = $this->drawers[$i]->prepare($ctx, $views);
+            $this->join($i, $wants, $views);
+            $i = $i + 1;
+        }
+    }
+
+    private function join(usize $i, int32 $wants, SceneViews $views) : void
+    {
+        if (($wants & SCENE_VIEW_GBUFFER) != 0) {
+            GeometryFiller? $filler = $this->fillers[$i];
+            if ($filler != null) {
+                GeometryFiller $f = guard $filler;
+                $this->geometry->add($f);
+            }
+        }
+
+        if (($wants & SCENE_VIEW_CASCADES) != 0) {
+            ShadowCaster? $caster = $this->casters[$i];
+            ShadowMapData? $shadows = $views->shadows;
+            if ($caster != null && $shadows != null) {
+                ShadowCaster $c = guard $caster;
+                ShadowMapData $data = guard $shadows;
+                $data->add($c);
+            }
+        }
+
+        if (($wants & SCENE_VIEW_MIRROR) != 0) {
+            ReflectionCaster? $reflector = $this->reflectors[$i];
+            WaterFrame? $mirror = $views->mirror;
+            if ($reflector != null && $mirror != null) {
+                ReflectionCaster $r = guard $reflector;
+                WaterFrame $water = guard $mirror;
+                $water->casters[] = $r;
+            }
+        }
+
+        if (($wants & SCENE_VIEW_OUTLINE) != 0 && $views->outline) {
+            OutlineCaster? $outliner = $this->outliners[$i];
+            if ($outliner != null) {
+                OutlineCaster $o = guard $outliner;
+                $this->outline->add($o, $o->outlineBounds());
+            }
+        }
+    }
+
+    /**
+     * The GPU scene's cull, when it has views to cull for, and the key light's cascades, which
+     * the cull reads and which run first.
+     */
+    private function addDepthViews(RenderContext $ctx) : void
+    {
+        ShadowQuality? $shadows = $this->shadows;
+        // with neither sun nor moon up the cascades would shade nothing: skip all five
+        DirectionalLight $key = keyLight($this->sun, $this->moon);
+        bool $cascades = $shadows != null && $key->intensity > 0.0f && $ctx->frame->find<CameraData>() != null;
+        if ($this->scene->active() && ($cascades || $this->scene->mainViews)) {
+            $ctx->pipeline->add(SceneCullPass($this->scene));
+        }
+
+        if ($cascades) {
+            ShadowQuality $quality = guard $shadows;
+            $this->sunShadows->add($ctx->pipeline, $key, $quality);
+        }
+    }
+
+    /**
+     * The light pass, the sky behind it, the water and its mirror, then the tone map into
+     * `$output`.
+     */
+    private function addLighting(RenderContext $ctx, DeferredGpu $gpu, Environment? $env, TargetRef $output) : void
+    {
+        Pipeline $pipeline = $ctx->pipeline;
+        Atmosphere $air = guard $this->atmosphere;
+        Vec4 $clear = $this->post->clear($this->toneMap, $this->background);
+        Vec3 $eye = $ctx->frame->get<CameraData>()->position;
+        FogLighting $fogLit = $air->lighting($this->sun, $this->moon, $this->sky, $this->aerial, $eye);
+        // before the light pass, so its read orders the refill ahead of every pass that fogs
+        TextureRef $aerial = $air->aerial($pipeline, $this->sky, $this->moon, $eye, $fogLit->aerialScale > 0.0f);
+        LightPass $lighting = LightPass($gpu, $env, $this->sun, $this->sky, $this->moon, $this->fog, $clear, $fogLit, $aerial);
+        $pipeline->add($lighting);
+        if ($this->renderSkybox && $env != null) {
+            Environment $environment = guard $env;
+            if ($environment->isProbe()) {
+                TextureRef $table = $air->mainSkyView($pipeline, $this->sky, $this->moon, $eye);
+                $pipeline->add(SkyPass($gpu, $this->sky, $this->fog, $this->sun, $this->moon, $table, $fogLit));
+            } else {
+                $pipeline->add(SkyboxPass($gpu, $this->sky, $this->fog, $this->sun, $this->moon, $fogLit));
+            }
+        }
+
+        TextureRef $present = $ctx->frame->get<LightPassData>()->output;
+        WaterFrame? $waterNow = $ctx->frame->find<WaterFrame>();
+        if ($waterNow != null) {
+            WaterFrame $held = guard $waterNow;
+            if ($held->active) {
+                if ($held->mirror) {
+                    $this->addMirror($ctx, $gpu, $env, $held, $lighting, $fogLit);
+                }
+
+                $pipeline->add(WaterPass($gpu, $held, $lighting));
+                if ($held->presented != null) {
+                    TextureRef $shown = guard $held->presented;
+                    $present = $shown;
+                }
+            }
+        }
+
+        $this->post->addToneMap($ctx, $gpu, $this->toneMap, $this->exposure, $this->sun, $this->moon, $this->sky, $output, $present);
+    }
+
+    /**
+     * The water mirror's light pass and its sky: a probe reads the mirror's sky-view table, an
+     * HDRI samples its cube.
+     */
+    private function addMirror(
         RenderContext $ctx,
-        GBufferData $gbuffer,
-        DrawCallAssembler<P> $dca,
-        const VertexLayout& $layout
+        DeferredGpu $gpu,
+        Environment? $env,
+        WaterFrame $water,
+        LightPass $lighting,
+        FogLighting $fogLit
     ) : void
     {
-        assert($this->gpu != null, 'DeferredRenderer.draw before load');
-        GeometryFillers $fillers = $ctx->frame->get<GeometryFillers>();
-        $fillers->add(AssemblerFiller<P>($dca, $this->geometryPass($layout)));
+        Pipeline $pipeline = $ctx->pipeline;
+        $pipeline->add(MirrorLightPass($lighting, $water, Vec4(0.0f, 0.0f, 0.0f, 0.0f)));
+        Environment $environment = guard $env else {
+            return;
+        }
+        if (!$this->renderSkybox) {
+            return;
+        }
+
+        TextureRef? $mirrorTable = null;
+        if ($environment->isProbe()) {
+            Atmosphere $air = guard $this->atmosphere;
+            $mirrorTable = $air->mirrorSkyView($pipeline, $this->sky, $this->moon, $water->camera->position);
+        }
+
+        $pipeline->add(MirrorSkyPass(
+            $gpu,
+            $water,
+            $this->sky,
+            $this->fog,
+            $this->sun,
+            $this->moon,
+            $environment->isProbe(),
+            $fogLit,
+            $mirrorTable
+        ));
     }
 
     /**
@@ -557,313 +602,11 @@ public class DeferredRenderer
     }
 
     /**
-     * The shaft march and resolve, when this frame can have shafts. A frame that cannot keeps
-     * the textures (the sun comes back) but not their content; switching off frees them.
-     */
-    private function addGodRays(RenderContext $ctx, DeferredGpu $gpu) : void
-    {
-        if (!$this->godRays->enabled) {
-            $this->dropGodRays();
-            return;
-        }
-
-        DirectionalLight $key = keyLight($this->sun, $this->moon);
-        float32 $strength = 0.0f;
-        if ($key->intensity > 0.0f) {
-            $strength = godRayStrength($this->godRays, $key->direction);
-        }
-
-        // a high sun, no key light, no fog or no cascades: nothing to draw, nothing to pay
-        if ($strength <= 0.0f || !$this->fog->enabled || $ctx->frame->find<ShadowMapData>() == null) {
-            $this->idleGodRays();
-            return;
-        }
-
-        GBufferData $gbuffer = $ctx->frame->get<GBufferData>();
-        GodRaySize $size = godRaySize($gbuffer->target->width, $gbuffer->target->height, $this->godRays->scale);
-        GodRayHistory $history = $this->ensureGodRays($size);
-        $ctx->pipeline->add(GodRayPass($gpu, $history, $this->godRays, $this->fog, $this->sun, $this->moon, $strength));
-        $ctx->pipeline->add(GodRayResolvePass($gpu));
-    }
-
-    /**
-     * The display end: the meter and auto exposure when `exposure.auto`, the grid and the base
-     * when `toneMap.local`, then the resolve into `$output`. Neither on is the resolve alone,
-     * which with the default settings is the old blit plus the curve.
-     */
-    private function addToneMap(RenderContext $ctx, DeferredGpu $gpu, TargetRef $output, TextureRef $scene) : void
-    {
-        $this->refreshLook();
-
-        float64 $now = visu::runtime::seconds();
-        float32 $dt = ($now - $this->toneSeconds) as float32;
-        $this->toneSeconds = $now;
-        if ($dt < 0.0f) {
-            $dt = 0.0f;
-        } else if ($dt > 0.25f) {
-            // a stall or a resumed window adapts one quarter second's worth, not the whole gap
-            $dt = 0.25f;
-        }
-
-        bool $meter = $this->exposure->auto;
-        bool $filled = false;
-        float32 $lux = 0.0f;
-        if ($meter) {
-            ExposureHistory $history = $this->ensureExposure();
-            $filled = $history->filled;
-            // only the meter reads the ground illuminance
-            $lux = groundIlluminance($this->sun, $this->moon, $this->sky);
-        } else {
-            $this->dropExposure();
-        }
-
-        float32 $blend = 0.0f;
-        IblData? $ibl = $ctx->frame->find<IblData>();
-        if ($ibl != null) {
-            IblData $found = guard $ibl;
-            $blend = $found->blend;
-        }
-
-        ToneMapUniforms $uniforms = toneMapUniforms(
-            $this->toneMap,
-            $this->exposure,
-            $this->look,
-            $output->width,
-            $output->height,
-            $lux,
-            $blend,
-            $dt,
-            $filled
-        );
-        $ctx->frame->set(ToneMapData($uniforms, $scene));
-        $this->ensureToneChain($gpu)->add($ctx->pipeline, $this->toneMap, $this->exposureHistory, $output);
-    }
-
-    /**
-     * Rebuilds the look when a curve setting moved and re-solves the clear colour when the look
-     * or the background did. A few compares on a still frame.
-     */
-    private function refreshLook() : void
-    {
-        bool $changed = false;
-        if ($this->toneMap->lookChanged($this->lookFor)) {
-            $this->look = ToneLook($this->toneMap);
-            $this->lookFor = $this->toneMap;
-            $changed = true;
-        }
-
-        Vec4 $bg = $this->background;
-        Vec4 $was = $this->clearFor;
-        if ($changed || $bg->x != $was->x || $bg->y != $was->y || $bg->z != $was->z || $bg->w != $was->w) {
-            $this->clear = sceneBackground($bg, $this->lookFor, $this->look);
-            $this->clearFor = $bg;
-        }
-    }
-
-    private function ensureToneChain(DeferredGpu $gpu) : ToneMapChain
-    {
-        ToneMapChain $have = guard $this->toneChain else {
-            ToneMapChain $fresh = ToneMapChain($gpu);
-            $this->toneChain = $fresh;
-            return $fresh;
-        }
-        return $have;
-    }
-
-    private function ensureExposure() : ExposureHistory
-    {
-        ExposureHistory $have = guard $this->exposureHistory else {
-            ExposureHistory $fresh = ExposureHistory($this->device);
-            $this->exposureHistory = $fresh;
-            return $fresh;
-        }
-        return $have;
-    }
-
-    private function dropExposure() : void
-    {
-        ExposureHistory $held = guard $this->exposureHistory else {
-            return;
-        }
-        $held->destroy();
-        $this->exposureHistory = null;
-    }
-
-    /**
      * Whether last frame ran auto exposure with a usable history. For the console and tests.
      */
     public const function exposureLive() : bool
     {
-        ExposureHistory $held = guard $this->exposureHistory else {
-            return false;
-        }
-        return $held->filled;
-    }
-
-    /**
-     * A frame without the shaft passes: keep the textures, forget their content.
-     */
-    private function idleGodRays() : void
-    {
-        GodRayHistory $held = guard $this->godRayHistory else {
-            return;
-        }
-        $held->filled = false;
-    }
-
-    private function ensureGodRays(GodRaySize $size) : GodRayHistory
-    {
-        GodRayHistory $have = guard $this->godRayHistory else {
-            GodRayHistory $fresh = GodRayHistory($this->device, $size);
-            $this->godRayHistory = $fresh;
-            return $fresh;
-        }
-        $have->fit($size);
-        return $have;
-    }
-
-    /**
-     * The main view's sky-view table for this frame, refilled when stale.
-     */
-    private function mainSkyView(Pipeline $pipeline, DeferredGpu $gpu, Vec3 $eye) : TextureRef
-    {
-        SkyViewLut $lut = guard $this->skyViewMain else {
-            SkyViewLut $fresh = SkyViewLut($this->device, 'sky.view', 'deferred.sky.view');
-            $this->skyViewMain = $fresh;
-            return $fresh->prepare($pipeline, $gpu, $this->skyViewUniforms($eye, SKY_VIEW_SAMPLES, SKY_LIGHT_SAMPLES));
-        }
-        return $lut->prepare($pipeline, $gpu, $this->skyViewUniforms($eye, SKY_VIEW_SAMPLES, SKY_LIGHT_SAMPLES));
-    }
-
-    /**
-     * The water mirror's table, at the reflected eye's height and the mirror's sample counts.
-     */
-    private function mirrorSkyView(Pipeline $pipeline, DeferredGpu $gpu, Vec3 $eye) : TextureRef
-    {
-        SkyViewLut $lut = guard $this->skyViewMirror else {
-            SkyViewLut $fresh = SkyViewLut($this->device, 'reflect.sky.view', 'reflect.sky.view');
-            $this->skyViewMirror = $fresh;
-            return $fresh->prepare($pipeline, $gpu, $this->skyViewUniforms($eye, MIRROR_SKY_VIEW_SAMPLES, MIRROR_SKY_LIGHT_SAMPLES));
-        }
-        return $lut->prepare($pipeline, $gpu, $this->skyViewUniforms($eye, MIRROR_SKY_VIEW_SAMPLES, MIRROR_SKY_LIGHT_SAMPLES));
-    }
-
-    /**
-     * This frame's fog sky table when the fog is on and takes the sky's colour, refilled when
-     * stale; null otherwise, which frees it.
-     */
-    private function fogSkyTable(Pipeline $pipeline, DeferredGpu $gpu, Vec3 $eye) : TextureRef?
-    {
-        if (!$this->legacyFog || !$this->fog->enabled || !$this->fog->fromSky) {
-            $this->dropFogSky();
-            return null;
-        }
-
-        SkyUniforms $sky = $this->skyViewUniforms($eye, FOG_SKY_VIEW_SAMPLES, FOG_SKY_LIGHT_SAMPLES);
-        FogSkyLut $lut = guard $this->fogSky else {
-            FogSkyLut $fresh = FogSkyLut($this->device);
-            $this->fogSky = $fresh;
-            return $fresh->prepare($pipeline, $gpu, $sky);
-        }
-        return $lut->prepare($pipeline, $gpu, $sky);
-    }
-
-    /**
-     * This frame's aerial table, built on first use and refilled when `$fill` and the sky moved.
-     */
-    private function aerialTable(Pipeline $pipeline, DeferredGpu $gpu, Vec3 $eye, bool $fill) : TextureRef
-    {
-        SkyUniforms $sky = $this->skyViewUniforms($eye, AERIAL_VIEW_SAMPLES, AERIAL_LIGHT_SAMPLES);
-        AerialLut $lut = guard $this->aerialLut else {
-            AerialLut $fresh = AerialLut($this->device);
-            $this->aerialLut = $fresh;
-            return $fresh->prepare($pipeline, $gpu, $sky, $fill);
-        }
-        return $lut->prepare($pipeline, $gpu, $sky, $fill);
-    }
-
-    /**
-     * The fog's lighting for an eye at `$eye`, the sky dome re-solved only when it moved.
-     */
-    private function fogLightingAt(Vec3 $eye) : FogLighting
-    {
-        Vec3 $toSun = normalize(-$this->sky->direction);
-        float32 $climb = $toSun->y - $this->domeSunY;
-        float32 $rise = $eye->y - $this->domeAltitude;
-
-        if ($climb < 0.0f) {
-            $climb = -$climb;
-        }
-
-        if ($rise < 0.0f) {
-            $rise = -$rise;
-        }
-
-        // the legacy fog has no lit medium
-        if (!$this->legacyFog && (!$this->domeValid
-            || $climb > FOG_AMBIENT_SUN_STEP
-            || $rise > FOG_AMBIENT_ALTITUDE_STEP
-            || !$this->sky->sameAtmosphere($this->domeSky))) {
-            visu::profile::begin('fog/ambient');
-            $this->dome = skyDomeRadiance($this->sky, $eye->y);
-            visu::profile::end();
-            $this->domeSky = $this->sky;
-            $this->domeSunY = $toSun->y;
-            $this->domeAltitude = $eye->y;
-            $this->domeValid = true;
-        }
-
-        Vec3 $ambient = fogAmbient($this->dome, $this->sun, $this->moon, $this->sky);
-        return fogLighting($this->sun, $this->moon, $this->sky, $this->aerial, $ambient, $this->legacyFog);
-    }
-
-    private function dropAerial() : void
-    {
-        AerialLut $held = guard $this->aerialLut else {
-            return;
-        }
-        $held->destroy();
-        $this->aerialLut = null;
-    }
-
-    private function dropFogSky() : void
-    {
-        FogSkyLut $held = guard $this->fogSky else {
-            return;
-        }
-        $held->destroy();
-        $this->fogSky = null;
-    }
-
-    private function skyViewUniforms(Vec3 $eye, float32 $viewSamples, float32 $lightSamples) : SkyUniforms
-    {
-        return skyUniforms($this->sky, $eye, false, $viewSamples, $lightSamples, $this->moon);
-    }
-
-    private function dropSkyViews() : void
-    {
-        SkyViewLut? $main = $this->skyViewMain;
-        if ($main != null) {
-            SkyViewLut $held = guard $main;
-            $held->destroy();
-            $this->skyViewMain = null;
-        }
-
-        SkyViewLut? $mirror = $this->skyViewMirror;
-        if ($mirror != null) {
-            SkyViewLut $held = guard $mirror;
-            $held->destroy();
-            $this->skyViewMirror = null;
-        }
-    }
-
-    private function dropGodRays() : void
-    {
-        GodRayHistory $held = guard $this->godRayHistory else {
-            return;
-        }
-        $held->destroy();
-        $this->godRayHistory = null;
+        return $this->post->exposureLive();
     }
 
     /**
@@ -871,30 +614,7 @@ public class DeferredRenderer
      */
     public const function godRaysLive() : bool
     {
-        GodRayHistory $held = guard $this->godRayHistory else {
-            return false;
-        }
-        return $held->filled;
-    }
-
-    private function ensureShadowMap(ShadowQuality $quality) : Texture
-    {
-        Texture $have = guard $this->shadowMap else {
-            Texture $fresh = makeShadowMap($this->device, $quality);
-            $this->shadowMap = $fresh;
-            return $fresh;
-        }
-        if ($have->desc->width == $quality->resolution
-            && $have->desc->height == $quality->resolution
-            && $have->desc->arrayLength == SHADOW_CASCADES) {
-            return $have;
-        }
-
-        // the device buries the old map until no frame in flight samples it
-        $have->destroy();
-        Texture $resized = makeShadowMap($this->device, $quality);
-        $this->shadowMap = $resized;
-        return $resized;
+        return $this->post->godRaysLive();
     }
 
     private function dropEnvironment() : void
@@ -910,29 +630,18 @@ public class DeferredRenderer
     {
         $this->scene->destroy();
         $this->dropEnvironment();
-        $this->shadowMap = dropTexture($this->shadowMap);
-        $this->dropGodRays();
-        $this->dropExposure();
-        $this->dropSkyViews();
-        $this->dropFogSky();
-        $this->dropAerial();
+        $this->sunShadows->destroy();
+        $this->post->destroy();
+        Atmosphere? $air = $this->atmosphere;
+        if ($air != null) {
+            Atmosphere $held = guard $air;
+            $held->destroy();
+            $this->atmosphere = null;
+        }
         DeferredGpu $gpu = guard $this->gpu else {
             return;
         }
         $gpu->destroy();
         $this->gpu = null;
     }
-}
-
-internal function makeShadowMap(Device $device, ShadowQuality $quality) : Texture
-{
-    TextureDesc $desc = TextureDesc(
-        $format: .depth32f,
-        $width: $quality->resolution,
-        $height: $quality->resolution
-    );
-    $desc->kind = .array2D;
-    $desc->arrayLength = SHADOW_CASCADES;
-    $desc->usage = TEXTURE_SAMPLED | TEXTURE_RENDER_TARGET;
-    return Texture($device, 'deferred.shadow', $desc);
 }

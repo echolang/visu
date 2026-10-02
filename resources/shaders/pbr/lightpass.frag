@@ -20,7 +20,6 @@ layout(location = 0) out vec4 fragment_color;
 #include "visu/pbr/shade.glsl"
 #include "visu/shadow.glsl"
 
-#define VISU_FOG_SKY_SLOT 13
 #define VISU_AERIAL_SLOT 14
 #define VISU_FOG_RAYS
 #include "visu/fog.glsl"

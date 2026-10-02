@@ -143,9 +143,7 @@ SkyScatter sky_scatter_to(thread const float3& dir, thread const float& limit, t
         t_max = ground.x;
     }
     t_max = fast::min(t_max, limit);
-    bool midpoint = _142.u_sky_ozone.w > 0.5;
     float n = float(view_samples);
-    float step_len = t_max / n;
     float3 to_sun = _142.u_sky_sun.xyz;
     float3 sum_r = float3(0.0);
     float3 sum_m = float3(0.0);
@@ -156,38 +154,29 @@ SkyScatter sky_scatter_to(thread const float3& dir, thread const float& limit, t
     float3 moon_m = float3(0.0);
     for (int i = 0; i < view_samples; i++)
     {
-        float t = (float(i) + 0.5) * step_len;
-        float dt = step_len;
-        if (midpoint)
-        {
-            float a = float(i) / n;
-            float b = float(i + 1) / n;
-            t = (t_max * 0.5) * ((a * a) + (b * b));
-            dt = t_max * ((b * b) - (a * a));
-        }
+        float a = float(i) / n;
+        float b = float(i + 1) / n;
+        float t = (t_max * 0.5) * ((a * a) + (b * b));
+        float dt = t_max * ((b * b) - (a * a));
         float3 p = o + (dir * t);
         float h = fast::max(length(p) - rg, 0.0);
         float param_6 = h;
         float3 dens = sky_density(param_6, _142) * dt;
-        float3 depth_here = depth_view + dens;
-        if (midpoint)
-        {
-            depth_here = depth_view + (dens * 0.5);
-        }
+        float3 depth_here = depth_view + (dens * 0.5);
         depth_view += dens;
-        bool _476;
+        bool _453;
         if (moon_on)
         {
             float3 param_7 = p;
             float3 param_8 = to_moon;
             float param_9 = rg;
-            _476 = sky_ray_sphere(param_7, param_8, param_9).x <= 0.0;
+            _453 = sky_ray_sphere(param_7, param_8, param_9).x <= 0.0;
         }
         else
         {
-            _476 = moon_on;
+            _453 = moon_on;
         }
-        if (_476)
+        if (_453)
         {
             float3 param_10 = p;
             float3 param_11 = to_moon;
@@ -325,10 +314,10 @@ float3 sky_inscatter(thread const float3& dir, thread float3& transmittance, thr
     int param_2 = int(_142.u_sky_params.y);
     float3 param_3;
     float param_4;
-    float3 _756 = sky_inscatter_n(param, param_1, param_2, param_3, param_4, _142);
+    float3 _733 = sky_inscatter_n(param, param_1, param_2, param_3, param_4, _142);
     transmittance = param_3;
     t_ground = param_4;
-    return _756;
+    return _733;
 }
 
 static inline __attribute__((always_inline))
@@ -351,10 +340,10 @@ float3 sky_ground(thread const float3& dir, thread const float& t_ground, consta
     float3 param_4 = mirrored;
     float3 param_5;
     float param_6;
-    float3 _830 = sky_inscatter(param_4, param_5, param_6, _142);
+    float3 _807 = sky_inscatter(param_4, param_5, param_6, _142);
     float3 up_transmittance = param_5;
     float up_ground = param_6;
-    float3 ambient = _830 * 0.5;
+    float3 ambient = _807 * 0.5;
     return _142.u_sky_ground.xyz * (sun + ambient);
 }
 

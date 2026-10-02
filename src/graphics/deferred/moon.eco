@@ -14,8 +14,6 @@ internal const float32 MOON_SKY_AMBIENT = 0.35f;
 // complete (about -8 degrees); sky.glsl's SKY_DUSK_START / SKY_DUSK_END mirror these
 internal const float32 MOON_DUSK_START = 0.035f;
 internal const float32 MOON_DUSK_END = -0.14f;
-// night fog radiance against the night ambient
-internal const float32 MOON_FOG_LIFT = 1.5f;
 
 /**
  * Moon parameters. The app writes `direction` and `illumination` from its calendar every
@@ -152,57 +150,4 @@ public function nightAmbient(const Moon& $moon, const Sky& $sky) : Vec4
     float32 $night = nightFactor($sky);
     Vec3 $up = ($moon->light->color * ($moon->light->intensity * MOON_SKY_AMBIENT) + $moon->starlight) * $night;
     return Vec4($up->x, $up->y, $up->z, 0.35f);
-}
-
-/**
- * Scale for a constant fog colour: one in daylight, the night hemisphere ambient once the sun
- * is gone, so night fog is moonlit haze rather than a white wall. Nothing changes by day,
- * nor while the moon is disabled.
- */
-public function fogLight(const Moon& $moon, const Sky& $sky) : Vec3
-{
-    if (!$moon->enabled) {
-        return Vec3(1.0f, 1.0f, 1.0f);
-    }
-
-    float32 $night = nightFactor($sky);
-    Vec3 $ambient = $moon->light->color * ($moon->light->intensity * MOON_SKY_AMBIENT) + $moon->starlight;
-    // the haze at night reads a little brighter than the ground it hangs over
-    Vec3 $dark = $ambient * MOON_FOG_LIFT;
-    return Vec3(1.0f, 1.0f, 1.0f) * (1.0f - $night) + $dark * $night;
-}
-
-/**
- * What a sky-coloured fog adds to the fog's sky table at night: the starlight the table has no
- * stars for, lifted like `fogLight`'s haze and faded in by `nightFactor`. Zero with the moon
- * disabled, so other visu apps keep their nights; the moonlit sky itself is in the table.
- */
-public function fogSkyFloor(const Moon& $moon, const Sky& $sky) : Vec3
-{
-    if (!$moon->enabled) {
-        return Vec3(0.0f, 0.0f, 0.0f);
-    }
-
-    return $moon->starlight * (MOON_FOG_LIFT * nightFactor($sky));
-}
-
-/**
- * Moon colour scaled for the fog glow, the `fogSunTint` rule: zero below the horizon.
- */
-public function fogMoonTint(const Moon& $moon, const Sky& $sky) : Vec3
-{
-    float32 $denom = $sky->sunIntensity;
-
-    if ($denom < 0.001f) {
-        $denom = 0.001f;
-    }
-
-    // the moon glow reads against a dark sky, so it is lifted against the sun's scale
-    float32 $scale = 4.0f * $moon->light->intensity / $denom;
-
-    if ($scale > 1.0f) {
-        $scale = 1.0f;
-    }
-
-    return $moon->light->color * $scale;
 }

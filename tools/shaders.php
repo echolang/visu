@@ -67,6 +67,8 @@ const BAKES = [
         'ns' => 'visu::graphics',
         'prefix' => 'pbr',
         'title' => 'Baked deferred PBR shaders.',
+        // `pbrPrograms()`, which the renderer links at load
+        'names' => true,
     ],
     [
         'dir' => 'ui',

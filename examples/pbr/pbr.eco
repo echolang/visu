@@ -14,7 +14,7 @@ use visu::os::{resourceRoot, writableRoot};
 use visu::ecs::{Entities, Entity, Schedule, System};
 use visu::geo::{AABB, Transform, PrimitiveBuilder, PrimitiveLayout, sphere};
 use visu::graphics::{
-    Camera, RenderContext, DeferredRenderer, DrawCallAssembler, GBufferData, IblQuality, Mesh, MeshHandle,
+    AssemblerFiller, Camera, RenderContext, DeferredRenderer, DrawCallAssembler, IblQuality, Mesh, MeshHandle,
     HdrPixels, SceneTargetData, Texture, TextureOptions, TextureRef, VertexBuilder,
     VertexLayout, instanceLayout
 };
@@ -64,11 +64,13 @@ public class SphereSystem : System
     public DeferredRenderer $renderer;
     public MeshHandle $sphere;
     public VertexLayout $layout;
+    private bool $attached;
 
     public constructor(DrawCallAssembler<SphereInstance> $dca, DeferredRenderer $renderer)
     {
         $this->dca = $dca;
         $this->renderer = $renderer;
+        $this->attached = false;
         $this->sphere = MeshHandle::none();
         $this->layout = VertexLayout::pos3n3()->join(
             instanceLayout<SphereInstance>(2, function(VertexBuilder $b, ptr<const SphereInstance> $p) : void {
@@ -106,12 +108,14 @@ public class SphereSystem : System
             ));
         });
 
+        // the assembler draws through the renderer once attached; the renderer is loaded by now
+        if (!$this->attached) {
+            $this->renderer->attach(AssemblerFiller<SphereInstance>($dca, $this->renderer->geometryPass($this->layout)));
+            $this->attached = true;
+        }
+
         SceneTargetData $scene = $ctx->frame->get<SceneTargetData>();
-        VertexLayout $layout = $this->layout;
-        DeferredRenderer $renderer = $this->renderer;
-        $renderer->render($ctx, $scene->target, function(RenderContext $inner, GBufferData $gbuffer) : void {
-            $renderer->draw($inner, $gbuffer, $dca, $layout);
-        });
+        $this->renderer->render($ctx, $scene->target);
     }
 }
 
@@ -145,7 +149,7 @@ Quickstart $qs = Quickstart(function(Options $opt) : void
     $opt->debugConsole = true;
 
     $opt->ready = function(App $app) : void {
-        DeferredRenderer $renderer = DeferredRenderer($app->device);
+        DeferredRenderer $renderer = DeferredRenderer($app->device, visu::app::rendererSettings(visu::app::flags()));
         #[if: os == ios]
         $renderer->ibl = IblQuality::mobile();
         #[end]
