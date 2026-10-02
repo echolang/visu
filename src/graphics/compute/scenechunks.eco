@@ -1,0 +1,550 @@
+/**
+ * The GPU scene's candidate lists: a fixed 2D grid of spatial chunks over the scene's extent,
+ * each holding the rows that rest in it (statics, sleeping or idle movers), and the active set,
+ * the rows that move or are being edited. Every row is in exactly one of them. A chunk owns one
+ * slice of the shared member list, with slack; adding to a full slice moves that chunk's slice
+ * somewhere roomier (a local copy, never a world rebuild), and removing swaps the last member
+ * into the hole, so both are O(1) amortised and touch the GPU with a word or two. A chunk's box
+ * grows to cover whatever joins it and never shrinks between rebuilds, which keeps it
+ * conservative for the cull. The active set is one more slice, the same way, at row 0 of the
+ * chunk table; spatial chunk `c` is row `c + 1`. The cull walks only the chunks that hold
+ * something (`occupied`, kept as chunks fill and empty), so a large grid costs nothing per frame.
+ * The grid is laid out once per scene (`layout`); rows outside it fall into the edge chunks.
+ */
+
+namespace visu::graphics;
+
+use visu::geo::AABB;
+use visu::math::{Vec3, Vec4, length};
+
+/**
+ * Spatial chunks a scene may have: a 32 km estate in 64 m chunks. A layout that would need more
+ * takes bigger chunks.
+ */
+public const int32 SCENE_CHUNKS_MAX = 262144;
+
+/**
+ * Metres a chunk spans when the scene does not say.
+ */
+public const float32 SCENE_CHUNK_METRES = 64.0f;
+
+/**
+ * Members a slice holds when it is first opened, and the least it grows by.
+ */
+internal const int32 SCENE_CHUNK_ROOM = 16;
+
+/**
+ * One chunk row (std430 `SceneChunk`, 48 bytes): its box, its slice of the member list, the
+ * union of its members' instance flags and the largest member's bounding radius (float bits),
+ * which the screen-size cull tests a whole chunk by.
+ */
+public struct SceneChunkGpu
+{
+    public Vec4 $lo;
+    public Vec4 $hi;
+    public uint32 $first;
+    public uint32 $members;
+    public uint32 $flags;
+    public uint32 $radius = 0;
+}
+
+public class SceneChunks
+{
+    public float32 $metres;
+    public int32 $cols;
+    public int32 $rows;
+
+    /**
+     * Spatial chunks; the table holds one more row, the active set's, at 0.
+     */
+    public int32 $count;
+
+    /**
+     * Slices moved because a chunk outgrew its room, since the layout: the `scene` verb.
+     */
+    public int32 $relocations;
+    public GpuTable<uint32> $list;
+    public GpuTable<SceneChunkGpu> $table;
+
+    /**
+     * The rows of every spatial chunk holding a member, in no order; the cull walks these.
+     */
+    public GpuTable<uint32> $occupiedTable;
+
+    /**
+     * The farthest any spatial chunk's box reaches past its own cell on x or z, toward the inside
+     * of the grid (an edge cell runs on outward), in metres. A member joins the chunk of its box
+     * centre, so a big one sticks out into the cells around it; a cull that addresses cells near a
+     * point widens its window by this. Conservative like the bounds: it only grows.
+     */
+    public float32 $overhang;
+    private array<int32> $occupiedRows;
+    private array<int32> $occupiedAt;
+    private float32 $originX;
+    private float32 $originZ;
+    private array<int32> $first;
+    private array<int32> $size;
+    private array<int32> $room;
+    private array<AABB> $bounds;
+    private array<bool> $bounded;
+    private array<uint32> $flags;
+
+    /**
+     * The largest bounding radius (half the box diagonal) any member brought, conservative like
+     * the bounds: it only grows.
+     */
+    private array<float32> $radius;
+    private array<uint32> $members;
+    private ArenaRanges $ranges;
+
+    public constructor(Device $device)
+    {
+        $this->metres = SCENE_CHUNK_METRES;
+        $this->cols = 1;
+        $this->rows = 1;
+        $this->count = 1;
+        $this->relocations = 0;
+        $this->overhang = 0.0f;
+        $this->list = GpuTable<uint32>($device, 'scene.lists');
+        $this->table = GpuTable<SceneChunkGpu>($device, 'scene.chunks');
+        $this->occupiedTable = GpuTable<uint32>($device, 'scene.occupied');
+        $this->occupiedRows = array<int32>();
+        $this->occupiedAt = array<int32>();
+        $this->originX = -1000000.0f;
+        $this->originZ = -1000000.0f;
+        $this->first = array<int32>();
+        $this->size = array<int32>();
+        $this->room = array<int32>();
+        $this->bounds = array<AABB>();
+        $this->bounded = array<bool>();
+        $this->flags = array<uint32>();
+        $this->radius = array<float32>();
+        $this->members = array<uint32>();
+        $this->ranges = ArenaRanges();
+        $this->openGrid();
+    }
+
+    /**
+     * Lay the grid over `$world` in chunks of `$metres`, bigger when `SCENE_CHUNKS_MAX` would not
+     * cover it. Only while nothing is placed: at scene construction.
+     */
+    public function layout(const AABB& $world, float32 $metres) : void
+    {
+        float32 $m = $metres;
+        if ($m <= 0.0f) {
+            $m = SCENE_CHUNK_METRES;
+        }
+
+        float32 $width = $world->max->x - $world->min->x;
+        float32 $depth = $world->max->z - $world->min->z;
+        int32 $cols = chunkSpan($width, $m);
+        int32 $rows = chunkSpan($depth, $m);
+        while ($cols * $rows > SCENE_CHUNKS_MAX) {
+            $m = $m * 2.0f;
+            $cols = chunkSpan($width, $m);
+            $rows = chunkSpan($depth, $m);
+        }
+
+        $this->metres = $m;
+        $this->cols = $cols;
+        $this->rows = $rows;
+        $this->count = $cols * $rows;
+        $this->originX = $world->min->x;
+        $this->originZ = $world->min->z;
+        $this->clear();
+    }
+
+    /**
+     * Room for `$rows` members in all, taken now, so slices opened and moved in a displayed frame
+     * push into capacity they already have.
+     */
+    public function reserve(int32 $rows) : void
+    {
+        int32 $words = $rows * 2 + SCENE_CHUNK_ROOM * 64;
+        $this->members->reserve($words as usize);
+        $this->list->reserve($words);
+        $this->occupiedRows->reserve($this->count as usize);
+    }
+
+    /**
+     * Give the active set room for `$movers` rows now, so a burst of bodies starting to move at
+     * once (a stress spawn, a wake) appends without moving its slice in a displayed frame.
+     */
+    public function reserveActive(int32 $movers) : void
+    {
+        usize $c = $this->active() as usize;
+        if ($this->room[$c] >= $movers) {
+            return;
+        }
+
+        int32 $start = $this->ranges->take($movers);
+        while (($this->members->count() as int32) < $this->ranges->top) {
+            $this->members[] = 0;
+        }
+
+        int32 $i = 0;
+        while ($i < $this->size[$c]) {
+            uint32 $id = $this->members[($this->first[$c] + $i) as usize];
+            $this->members[($start + $i) as usize] = $id;
+            $this->list->set($start + $i, $id);
+            $i = $i + 1;
+        }
+
+        if ($this->room[$c] > 0) {
+            $this->ranges->give($this->first[$c], $this->room[$c]);
+        }
+
+        $this->first[$c] = $start;
+        $this->room[$c] = $movers;
+        $this->publish(0);
+    }
+
+    /**
+     * The row of the chunk whose cell holds `$p` (xz), the edge cell for a point outside the grid.
+     */
+    public const function at(Vec3 $p) : int32
+    {
+        int32 $x = chunkCell($p->x - $this->originX, $this->metres, $this->cols);
+        int32 $z = chunkCell($p->z - $this->originZ, $this->metres, $this->rows);
+        return $z * $this->cols + $x + 1;
+    }
+
+    /**
+     * The active set's row.
+     */
+    public const function active() : int32
+    {
+        return 0;
+    }
+
+    /**
+     * The row of occupied chunk `$i` (`0 .. occupiedCount`), in no order.
+     */
+    public const function occupiedRow(int32 $i) : int32
+    {
+        return $this->occupiedRows[$i as usize];
+    }
+
+    /**
+     * Spatial chunks holding a member now.
+     */
+    public const function occupiedCount() : int32
+    {
+        return $this->occupiedRows->count() as int32;
+    }
+
+    /**
+     * The box `$chunk`'s members reach, conservatively: everything that ever joined it since the
+     * layout. A zero box while it never held anything.
+     */
+    public const function box(int32 $chunk) : AABB
+    {
+        return $this->bounds[$chunk as usize];
+    }
+
+    public const function members(int32 $chunk) : int32
+    {
+        return $this->size[$chunk as usize];
+    }
+
+    /**
+     * Chunks holding anything, and the most one holds: the `scene` verb.
+     */
+    public const function largest() : int32
+    {
+        int32 $most = 0;
+        foreach ($this->occupiedRows as $row) {
+            if ($this->size[$row as usize] > $most) {
+                $most = $this->size[$row as usize];
+            }
+        }
+
+        return $most;
+    }
+
+    /**
+     * Put row `$id` at the end of `$chunk`'s slice and return its slot there.
+     */
+    public function join(int32 $chunk, int32 $id) : int32
+    {
+        usize $c = $chunk as usize;
+        if ($this->size[$c] >= $this->room[$c]) {
+            $this->relocate($chunk);
+        }
+
+        int32 $slot = $this->size[$c];
+        int32 $at = $this->first[$c] + $slot;
+        $this->members[$at as usize] = $id as uint32;
+        $this->list->set($at, $id as uint32);
+        $this->size[$c] = $slot + 1;
+        if ($slot == 0 && $chunk != 0) {
+            int32 $k = $this->occupiedRows->count() as int32;
+            $this->occupiedRows[] = $chunk;
+            $this->occupiedAt[$c] = $k;
+            $this->occupiedTable->set($k, $chunk as uint32);
+        }
+
+        $this->publish($chunk);
+        return $slot;
+    }
+
+    /**
+     * Take slot `$slot` out of `$chunk`: the last member moves into it. Returns the row that now
+     * sits at `$slot`, or -1 when the slot was the last.
+     */
+    public function leave(int32 $chunk, int32 $slot) : int32
+    {
+        usize $c = $chunk as usize;
+        int32 $last = $this->size[$c] - 1;
+        int32 $moved = -1;
+        if ($slot != $last) {
+            int32 $from = $this->first[$c] + $last;
+            int32 $to = $this->first[$c] + $slot;
+            uint32 $id = $this->members[$from as usize];
+            $this->members[$to as usize] = $id;
+            $this->list->set($to, $id);
+            $moved = $id as int32;
+        }
+
+        $this->size[$c] = $last;
+        if ($last == 0 && $chunk != 0) {
+            int32 $k = $this->occupiedAt[$c];
+            int32 $end = ($this->occupiedRows->count() as int32) - 1;
+            if ($k != $end) {
+                int32 $other = $this->occupiedRows[$end as usize];
+                $this->occupiedRows[$k as usize] = $other;
+                $this->occupiedAt[$other as usize] = $k;
+                $this->occupiedTable->set($k, $other as uint32);
+            }
+
+            $this->occupiedRows->pop();
+            $this->occupiedAt[$c] = -1;
+        }
+
+        $this->publish($chunk);
+        return $moved;
+    }
+
+    /**
+     * `$chunk`'s box now covers `$box` and its flags `$flags`. Publishes the row only when either
+     * grew, so a row rewritten in place costs nothing here.
+     */
+    public function grow(int32 $chunk, const AABB& $box, uint32 $flags) : void
+    {
+        usize $c = $chunk as usize;
+        bool $changed = false;
+        if (!$this->bounded[$c]) {
+            $this->bounds[$c] = $box;
+            $this->bounded[$c] = true;
+            $changed = true;
+        } else if (!$this->bounds[$c]->contains($box)) {
+            AABB $grown = $this->bounds[$c];
+            $grown->extend($box);
+            $this->bounds[$c] = $grown;
+            $changed = true;
+        }
+
+        uint32 $union = $this->flags[$c] | $flags;
+        if ($union != $this->flags[$c]) {
+            $this->flags[$c] = $union;
+            $changed = true;
+        }
+
+        float32 $r = length($box->max - $box->min) * 0.5f;
+        if ($r > $this->radius[$c]) {
+            $this->radius[$c] = $r;
+            $changed = true;
+        }
+
+        if ($changed) {
+            $this->overhang = std::math::max($this->overhang, $this->overhangOf($chunk));
+            $this->publish($chunk);
+        }
+    }
+
+    /**
+     * The world x of the grid's west edge, z of its north edge.
+     */
+    public const function origin() : Vec3
+    {
+        return Vec3($this->originX, 0.0f, $this->originZ);
+    }
+
+    /**
+     * Forget every member; the grid stays.
+     */
+    public function clear() : void
+    {
+        $this->list->clear();
+        $this->table->clear();
+        $this->occupiedTable->clear();
+        $this->relocations = 0;
+        $this->overhang = 0.0f;
+        $this->openGrid();
+    }
+
+    /**
+     * Bytes the lists and chunk rows hold, for the `scene` verb.
+     */
+    public const function bytes() : int64
+    {
+        return ($this->members->capacity() as int64) * 4 + (($this->count + 1) as int64) * (mem::size<SceneChunkGpu>() as int64);
+    }
+
+    /**
+     * How far spatial chunk row `$chunk`'s box reaches past its cell toward the grid's inside.
+     */
+    private const function overhangOf(int32 $chunk) : float32
+    {
+        if ($chunk <= 0) {
+            return 0.0f;
+        }
+
+        int32 $cell = $chunk - 1;
+        int32 $x = $cell % $this->cols;
+        int32 $z = $cell / $this->cols;
+        Vec3 $west = Vec3($this->originX + ($x as float32) * $this->metres, 0.0f, $this->originZ + ($z as float32) * $this->metres);
+        return chunkOverhang($this->bounds[$chunk as usize], $west, $this->metres, $x == 0, $x == $this->cols - 1, $z == 0, $z == $this->rows - 1);
+    }
+
+    private function openGrid() : void
+    {
+        int32 $n = $this->count + 1;
+        $this->first = arr::room<int32>($n as usize);
+        $this->size = arr::room<int32>($n as usize);
+        $this->room = arr::room<int32>($n as usize);
+        $this->bounds = arr::room<AABB>($n as usize);
+        $this->bounded = arr::room<bool>($n as usize);
+        $this->flags = arr::room<uint32>($n as usize);
+        $this->radius = arr::room<float32>($n as usize);
+        $this->occupiedRows = array<int32>();
+        $this->occupiedAt = arr::room<int32>($n as usize);
+        $this->members = array<uint32>();
+        $this->ranges = ArenaRanges();
+        int32 $c = 0;
+        while ($c < $n) {
+            $this->first[] = 0;
+            $this->size[] = 0;
+            $this->room[] = 0;
+            $this->bounds[] = AABB(Vec3(0.0f), Vec3(0.0f));
+            $this->bounded[] = false;
+            $this->flags[] = 0;
+            $this->radius[] = 0.0f;
+            $this->occupiedAt[] = -1;
+            $this->publish($c);
+            $c = $c + 1;
+        }
+    }
+
+    /**
+     * Give `$chunk` a slice twice the size and copy its members over; the old one goes back.
+     */
+    private function relocate(int32 $chunk) : void
+    {
+        usize $c = $chunk as usize;
+        int32 $room = $this->room[$c] * 2;
+        if ($room < SCENE_CHUNK_ROOM) {
+            $room = SCENE_CHUNK_ROOM;
+        }
+
+        int32 $start = $this->ranges->take($room);
+        while (($this->members->count() as int32) < $this->ranges->top) {
+            $this->members[] = 0;
+        }
+
+        int32 $i = 0;
+        int32 $n = $this->size[$c];
+        int32 $from = $this->first[$c];
+        while ($i < $n) {
+            uint32 $id = $this->members[($from + $i) as usize];
+            $this->members[($start + $i) as usize] = $id;
+            $this->list->set($start + $i, $id);
+            $i = $i + 1;
+        }
+
+        if ($this->room[$c] > 0) {
+            $this->ranges->give($from, $this->room[$c]);
+            $this->relocations = $this->relocations + 1;
+        }
+
+        $this->first[$c] = $start;
+        $this->room[$c] = $room;
+    }
+
+    private function publish(int32 $chunk) : void
+    {
+        usize $c = $chunk as usize;
+        AABB $b = $this->bounds[$c];
+        $this->table->set($chunk, SceneChunkGpu(
+            $lo: Vec4($b->min, 0.0f),
+            $hi: Vec4($b->max, 0.0f),
+            $first: $this->first[$c] as uint32,
+            $members: $this->size[$c] as uint32,
+            $flags: $this->flags[$c],
+            $radius: mem::bit_cast<uint32, float32>($this->radius[$c])
+        ));
+    }
+}
+
+/**
+ * How far `$box` reaches past the cell of `$metres` whose west / north corner is `$corner` (x,
+ * z), on x or z. A side that is the grid's edge runs on outward, so it is not counted.
+ */
+internal function chunkOverhang(const AABB& $box, Vec3 $corner, float32 $metres, bool $westEdge, bool $eastEdge, bool $northEdge, bool $southEdge) : float32
+{
+    float32 $out = 0.0f;
+    if (!$westEdge) {
+        $out = std::math::max($out, $corner->x - $box->min->x);
+    }
+    if (!$eastEdge) {
+        $out = std::math::max($out, $box->max->x - ($corner->x + $metres));
+    }
+    if (!$northEdge) {
+        $out = std::math::max($out, $corner->z - $box->min->z);
+    }
+    if (!$southEdge) {
+        $out = std::math::max($out, $box->max->z - ($corner->z + $metres));
+    }
+
+    return $out;
+}
+
+/**
+ * Cells of `$metres` that cover `$span`, at least one.
+ */
+internal function chunkSpan(float32 $span, float32 $metres) : int32
+{
+    int32 $n = (std::math::ceil($span / $metres)) as int32;
+    if ($n < 1) {
+        return 1;
+    }
+
+    return $n;
+}
+
+/**
+ * The cell of `$offset` metres into a row of `$cells`, clamped to the row.
+ */
+internal function chunkCell(float32 $offset, float32 $metres, int32 $cells) : int32
+{
+    float32 $f = std::math::floor($offset / $metres);
+    if ($f < 0.0f) {
+        return 0;
+    }
+
+    if ($f >= ($cells as float32)) {
+        return $cells - 1;
+    }
+
+    return $f as int32;
+}
+
+test chunk_overhang_counts_only_the_inside {
+    AABB $box = AABB(Vec3(-3.0f, 0.0f, 10.0f), Vec3(70.0f, 5.0f, 60.0f));
+    // an inner cell [0, 64] x [0, 64]: 3 m west, 6 m east
+    assert(chunkOverhang($box, Vec3(0.0f), 64.0f, false, false, false, false) == 6.0f);
+    // the grid's east edge: what sticks out east runs on outward
+    assert(chunkOverhang($box, Vec3(0.0f), 64.0f, false, true, false, false) == 3.0f);
+    assert(chunkOverhang($box, Vec3(0.0f), 64.0f, true, true, false, false) == 0.0f);
+}
+

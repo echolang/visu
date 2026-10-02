@@ -1,0 +1,49 @@
+/**
+ * The chase camera's boom: it settles behind the target's heading, lengthens with speed, and a
+ * look eases back.
+ */
+
+use visu::components::ChaseCamera;
+use visu::geo::Transform;
+use visu::math::{Quat, Vec3, length};
+
+test chase_settles_behind_the_heading
+{
+    ChaseCamera $c = ChaseCamera();
+    Transform $t = Transform();
+    for (int32 $i = 0; $i < 300; $i++) {
+        $c->place($t, Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 0.0f), 1.0f / 60.0f);
+    }
+
+    // facing +X, the eye sits behind on -X, above, looking at the target
+    assert($t->position->x < -5.0f);
+    assert(std::math::abs($t->position->z) < 0.05f);
+    assert($t->position->y > 1.4f);
+    Vec3 $look = $t->forward();
+    assert($look->x > 0.9f);
+
+    // faster is farther
+    float32 $still = length($t->position);
+    for (int32 $i = 0; $i < 300; $i++) {
+        $c->place($t, Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 0.0f, 0.0f), Vec3(20.0f, 0.0f, 0.0f), 1.0f / 60.0f);
+    }
+    assert(length($t->position) > $still + 1.0f);
+}
+
+test chase_look_eases_back_and_snaps_from_a_camera
+{
+    ChaseCamera $c = ChaseCamera();
+    Transform $t = Transform();
+    $c->look(200.0f, 0.0f);
+    assert(std::math::abs($c->lookYaw) > 0.5f);
+    for (int32 $i = 0; $i < 600; $i++) {
+        $c->place($t, Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f), Vec3(0.0f, 0.0f, 0.0f), 1.0f / 60.0f);
+    }
+    assert(std::math::abs($c->lookYaw) < 0.01f);
+
+    Transform $rts = Transform();
+    $rts->position = Vec3(0.0f, 30.0f, 0.0f);
+    $rts->lookAt(Vec3(-10.0f, 0.0f, 0.0f));
+    $c->snapFrom($rts);
+    assert(std::math::abs($c->yaw + std::math::PI_F32 * 0.5f) < 0.01f);
+}

@@ -1,0 +1,191 @@
+/**
+ * A third-person camera behind a moving target: a car, a horse, a boat. An ECS component on a
+ * camera entity; `ChaseCameraSystem` drives the one that also has `ActiveCamera`.
+ *
+ * The boom swings toward the way the target faces (its model +Z), and above `blendFrom` m/s some
+ * of the way toward where it is going, so a slide reads as a slide. It lengthens with speed. A
+ * drag with the right (or middle) button looks around; let go and after `lookHold` seconds the view
+ * eases back behind. The eye stays `clearance` above `ground`.
+ */
+
+namespace visu::components;
+
+use visu::ecs::Entity;
+use visu::geo::{Heightmap, Transform};
+use visu::math::{Vec3, length, radians};
+
+public struct ChaseCamera
+{
+    /**
+     * What it chases, or null to hold still.
+     */
+    public Entity? $target = null;
+
+    /**
+     * Metres behind the look-at at a standstill, more per m/s, and at most.
+     */
+    public float32 $distance = 6.5f;
+    public float32 $speedDistance = 0.08f;
+    public float32 $maxDistance = 10.0f;
+    public float32 $minDistance = 3.0f;
+
+    /**
+     * Metres above the target's origin the camera looks at, and degrees it looks down.
+     */
+    public float32 $height = 1.4f;
+    public float32 $pitch = 12.0f;
+
+    /**
+     * How fast the boom catches up with the heading and with its length, per second.
+     */
+    public float32 $ease = 3.5f;
+
+    /**
+     * Between `blendFrom` and `blendTo` m/s the boom turns up to `velocityShare` of the way from
+     * the heading toward the velocity.
+     */
+    public float32 $blendFrom = 3.0f;
+    public float32 $blendTo = 10.0f;
+    public float32 $velocityShare = 0.5f;
+
+    /**
+     * Degrees of look per cursor pixel, seconds a look holds after the drag, and the share of it
+     * given back per second after that.
+     */
+    public float32 $lookSpeed = 0.25f;
+    public float32 $lookHold = 1.0f;
+    public float32 $lookReturn = 2.0f;
+
+    /**
+     * Metres of boom per scroll unit.
+     */
+    public float32 $zoom = 0.8f;
+
+    /**
+     * The ground the eye stays `clearance` above, if any.
+     */
+    public Heightmap? $ground = null;
+    public float32 $clearance = 0.6f;
+
+    /**
+     * Where the boom points now (radians about world up, 0 looking along +Z), the look offsets,
+     * the boom's eased length, seconds since the last look, and the target's last position.
+     */
+    public float32 $yaw = 0.0f;
+    public float32 $lookYaw = 0.0f;
+    public float32 $lookPitch = 0.0f;
+    public float32 $shown = 6.5f;
+    public float32 $idle = 0.0f;
+    public Vec3 $last;
+    public bool $seeded = false;
+
+    init
+    {
+        $this->last = Vec3(0.0f, 0.0f, 0.0f);
+    }
+
+    /**
+     * Chase `$e` from the next update on, swinging in from where the boom points now.
+     */
+    public function follow(Entity $e) : void
+    {
+        $this->target = $e;
+        $this->seeded = false;
+    }
+
+    public function release() : void
+    {
+        $this->target = null;
+    }
+
+    /**
+     * Start the boom where another camera looks from, so a switch swings smoothly instead of
+     * cutting.
+     */
+    public function snapFrom(const Transform& $camera) : void
+    {
+        Vec3 $look = $camera->forward();
+        if (length(Vec3($look->x, 0.0f, $look->z)) > 0.001f) {
+            $this->yaw = std::math::atan2($look->x, $look->z);
+        }
+
+        $this->lookYaw = 0.0f;
+        $this->lookPitch = 0.0f;
+        $this->idle = 0.0f;
+    }
+
+    /**
+     * Step the boom `$dt` seconds after a target at `$at` facing `$heading` (its +Z) moving at
+     * `$velocity`, and put `$transform` at its end looking at the target.
+     */
+    public function place(Transform& $transform, Vec3 $at, Vec3 $heading, Vec3 $velocity, float32 $dt) : void
+    {
+        float32 $k = 1.0f - std::math::exp(-$this->ease * $dt);
+        float32 $want = $this->yaw;
+        if (length(Vec3($heading->x, 0.0f, $heading->z)) > 0.001f) {
+            $want = std::math::atan2($heading->x, $heading->z);
+        }
+
+        Vec3 $flat = Vec3($velocity->x, 0.0f, $velocity->z);
+        float32 $speed = length($flat);
+        float32 $ahead = $flat->x * $heading->x + $flat->z * $heading->z;
+        if ($speed > $this->blendFrom && $ahead > 0.0f) {
+            float32 $t = std::math::clamp(($speed - $this->blendFrom) / std::math::max($this->blendTo - $this->blendFrom, 0.1f), 0.0f, 1.0f);
+            float32 $moving = std::math::atan2($flat->x, $flat->z);
+            $want = $want + chaseAngle($moving - $want) * $t * $this->velocityShare;
+        }
+
+        $this->yaw = chaseAngle($this->yaw + chaseAngle($want - $this->yaw) * $k);
+
+        // a look holds a moment after the drag, then eases back behind
+        $this->idle = $this->idle + $dt;
+        if ($this->idle > $this->lookHold) {
+            float32 $back = std::math::min($this->lookReturn * $dt, 1.0f);
+            $this->lookYaw = $this->lookYaw * (1.0f - $back);
+            $this->lookPitch = $this->lookPitch * (1.0f - $back);
+        }
+
+        float32 $length = std::math::clamp($this->distance + $this->speedDistance * $speed, $this->minDistance, $this->maxDistance);
+        $this->shown = $this->shown + ($length - $this->shown) * $k;
+
+        float32 $turn = $this->yaw + $this->lookYaw;
+        float32 $tilt = std::math::clamp(radians($this->pitch) + $this->lookPitch, -0.2f, 1.3f);
+        Vec3 $aim = $at + Vec3(0.0f, $this->height, 0.0f);
+        float32 $across = std::math::cos($tilt) * $this->shown;
+        Vec3 $eye = $aim + Vec3(-std::math::sin($turn) * $across, std::math::sin($tilt) * $this->shown, -std::math::cos($turn) * $across);
+
+        Heightmap? $held = $this->ground;
+        if ($held != null) {
+            Heightmap $map = guard $held;
+            float32? $floor = $map->sample($eye->x, $eye->z);
+            if ($floor != null) {
+                float32 $least = guard $floor;
+                $eye->y = std::math::max($eye->y, $least + $this->clearance);
+            }
+        }
+
+        $transform->position = $eye;
+        $transform->lookAt($aim);
+    }
+
+    /**
+     * Turn the view by a cursor drag of `$dx`, `$dy` pixels.
+     */
+    public function look(float32 $dx, float32 $dy) : void
+    {
+        $this->lookYaw = chaseAngle($this->lookYaw - radians($dx * $this->lookSpeed));
+        $this->lookPitch = std::math::clamp($this->lookPitch + radians($dy * $this->lookSpeed), -0.5f, 1.0f);
+        $this->idle = 0.0f;
+    }
+}
+
+/**
+ * `$a` within (-pi, pi].
+ */
+internal function chaseAngle(float32 $a) : float32
+{
+    float32 $pi = std::math::PI_F32;
+    float32 $tau = std::math::TAU_F32;
+    float32 $out = $a - std::math::floor(($a + $pi) / $tau) * $tau;
+    return $out;
+}

@@ -1,0 +1,269 @@
+/**
+ * The pick index: every `Pickable` as a leaf of one dynamic AABB tree (`AabbTree`, fat leaves),
+ * kept by the component's own hooks: a leaf on attach, a move on `changed<Pickable>` (which costs
+ * nothing while the box stays inside its fat box), gone on detach. Nothing runs per frame; a
+ * query costs O(log n + what it finds). Rays and overlaps take a layer mask; the tree returns
+ * candidates by their fat boxes and the exact box decides.
+ * Answers are written into the system's own scratch, sized at `reserve`, so a query in the
+ * displayed frame allocates nothing. Bound, it is the world's singleton
+ * (`Entities.getSingleton<PickSystem>()`), so code that holds the entities finds the index there.
+ */
+
+namespace visu::system;
+
+use visu::components::Pickable;
+use visu::ecs::{Entities, Entity, EntityHook, Schedule, System, View};
+use visu::geo::{AABB, AabbTree, Ray};
+use visu::math::{Vec3, length};
+
+/**
+ * Metres a pickable's fat box reaches past its box: a prop nudged by less moves no leaf.
+ */
+public const float32 PICK_MARGIN = 0.25f;
+
+/**
+ * What a ray found: the entity, its distance along the ray and its tag.
+ */
+public struct PickHit
+{
+    public Entity $entity;
+    public float32 $distance;
+    public int32 $tag;
+}
+
+public class PickSystem : System
+{
+    private AabbTree $tree;
+
+    /**
+     * Each pickable entity's leaf, and each tree item's entity (the item is a slot here, reused
+     * through `free`).
+     */
+    private View<int32> $leaves;
+    private array<Entity> $owners;
+    private array<int32> $free;
+    private array<int32> $found;
+    private array<EntityHook> $hooks;
+
+    public constructor()
+    {
+        $this->tree = AabbTree(PICK_MARGIN);
+        $this->leaves = View<int32>();
+        $this->owners = array<Entity>();
+        $this->free = array<int32>();
+        $this->found = array<int32>();
+        $this->hooks = array<EntityHook>();
+    }
+
+    public function name() : string
+    {
+        return 'pick';
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->update = false;
+        $schedule->render = false;
+    }
+
+    public function register(Entities $entities) : void
+    {
+        PickSystem $sys = $this;
+        // the world's own index: whatever holds the entities finds it there
+        $entities->setSingleton<PickSystem>($this);
+        $this->hooks[] = $entities->onAttach<Pickable>(function(Entities $w, Entity $e, const Pickable& $p) : void {
+            $sys->add($e, $p);
+        });
+        $this->hooks[] = $entities->onChange<Pickable>(function(Entities $w, Entity $e, const Pickable& $p) : void {
+            $sys->refit($e, $p);
+        });
+        $this->hooks[] = $entities->onDetach<Pickable>(function(Entities $w, Entity $e, const Pickable& $p) : void {
+            $sys->drop($e);
+        });
+        foreach ($entities->view<Pickable>() as $id => &$p) {
+            $this->add($id, $p);
+        }
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+        foreach ($this->hooks as $hook) {
+            $entities->release($hook);
+        }
+
+        $this->hooks->clear();
+        $entities->removeSingleton<PickSystem>();
+        $this->tree->clear();
+        $this->leaves = View<int32>();
+        $this->owners->clear();
+        $this->free->clear();
+    }
+
+    public function update(Entities $entities) : void
+    {
+    }
+
+    public function render(Entities $entities, visu::graphics::RenderContext $ctx) : void
+    {
+    }
+
+    /**
+     * Room for `$count` pickables and query answers as many, taken now.
+     */
+    public function reserve(int32 $count) : void
+    {
+        $this->tree->reserve($count);
+        $this->leaves->reserve($count as usize);
+        $this->owners->reserve($count as usize);
+        $this->free->reserve($count as usize);
+        $this->found->reserve($count as usize);
+    }
+
+    public const function count() : int32
+    {
+        return $this->tree->count();
+    }
+
+    public const function depth() : int32
+    {
+        return $this->tree->height();
+    }
+
+    /**
+     * The pickable on `$layers` whose box `$ray` enters first, nearer than `$limit`.
+     */
+    public function ray(Entities $entities, const Ray& $ray, float32 $limit, uint32 $layers) : PickHit?
+    {
+        visu::profile::begin('pick/ray');
+        $this->found->clear();
+        $this->tree->ray($ray, $limit, $this->found);
+        PickHit? $best = null;
+        float32 $near = $limit;
+        foreach ($this->found as $slot) {
+            Entity $e = $this->owners[$slot as usize];
+            Pickable $p = $entities->get<Pickable>($e);
+            if (($p->layers & $layers) == 0) {
+                continue;
+            }
+
+            float32 $d = guard $p->box->hitDistance($ray) else {
+                continue;
+            }
+            if ($d < $near) {
+                $near = $d;
+                $best = PickHit($e, $d, $p->tag);
+            }
+        }
+
+        visu::profile::end();
+        return $best;
+    }
+
+    /**
+     * Append to `$into` every pickable on `$layers` whose box overlaps `$box`.
+     */
+    public function overlap(Entities $entities, const AABB& $box, uint32 $layers, array<Entity>& $into) : void
+    {
+        visu::profile::begin('pick/overlap');
+        $this->found->clear();
+        $this->tree->overlap($box, $this->found);
+        foreach ($this->found as $slot) {
+            Entity $e = $this->owners[$slot as usize];
+            Pickable $p = $entities->get<Pickable>($e);
+            if (($p->layers & $layers) != 0 && $p->box->intersects($box)) {
+                $into[] = $e;
+            }
+        }
+
+        visu::profile::end();
+    }
+
+    /**
+     * Whether any pickable on `$layers` overlaps `$box` on the ground plane (heights ignored).
+     */
+    public function any(Entities $entities, const AABB& $box, uint32 $layers) : bool
+    {
+        AABB $tall = AABB(Vec3($box->min->x, -1000000.0f, $box->min->z), Vec3($box->max->x, 1000000.0f, $box->max->z));
+        $this->found->clear();
+        $this->tree->overlap($tall, $this->found);
+        foreach ($this->found as $slot) {
+            Pickable $p = $entities->get<Pickable>($this->owners[$slot as usize]);
+            if (($p->layers & $layers) != 0 && $p->box->intersects($tall)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * The pickable on `$layers` whose box centre is nearest `$at` on the ground plane, within
+     * `$within` metres.
+     */
+    public function nearest(Entities $entities, Vec3 $at, float32 $within, uint32 $layers) : Entity?
+    {
+        AABB $reach = AABB(Vec3($at->x - $within, -1000000.0f, $at->z - $within), Vec3($at->x + $within, 1000000.0f, $at->z + $within));
+        $this->found->clear();
+        $this->tree->overlap($reach, $this->found);
+        Entity? $best = null;
+        float32 $near = $within;
+        foreach ($this->found as $slot) {
+            Entity $e = $this->owners[$slot as usize];
+            Pickable $p = $entities->get<Pickable>($e);
+            if (($p->layers & $layers) == 0) {
+                continue;
+            }
+
+            Vec3 $c = $p->box->center();
+            float32 $d = length(Vec3($c->x - $at->x, 0.0f, $c->z - $at->z));
+            if ($d <= $near) {
+                $near = $d;
+                $best = $e;
+            }
+        }
+
+        return $best;
+    }
+
+    internal function add(Entity $e, const Pickable& $p) : void
+    {
+        if ($this->leaves->contains($e)) {
+            $this->refit($e, $p);
+            return;
+        }
+
+        int32 $slot = $this->owners->count() as int32;
+        if ($this->free->count() > 0) {
+            $slot = $this->free->pop();
+            $this->owners[$slot as usize] = $e;
+        } else {
+            $this->owners[] = $e;
+        }
+
+        $this->leaves->attach($e, $this->tree->insert($p->box, $slot));
+    }
+
+    internal function refit(Entity $e, const Pickable& $p) : void
+    {
+        if (!$this->leaves->contains($e)) {
+            $this->add($e, $p);
+            return;
+        }
+
+        $this->tree->move($this->leaves->get($e), $p->box);
+    }
+
+    internal function drop(Entity $e) : void
+    {
+        if (!$this->leaves->contains($e)) {
+            return;
+        }
+
+        int32 $leaf = $this->leaves->get($e);
+        int32 $slot = $this->tree->item($leaf);
+        $this->tree->remove($leaf);
+        $this->owners[$slot as usize] = Entity::none();
+        $this->free[] = $slot;
+        $this->leaves->erase($e);
+    }
+}

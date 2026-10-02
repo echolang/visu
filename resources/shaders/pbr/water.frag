@@ -326,7 +326,12 @@ void main()
                         continue;
                     }
                     vec3 Lc = toLight / max(dist, 1e-4);
-                    vec3 radiance = light_radiance(l, dist, u_cluster_z.w);
+                    // outside a spot's cone: no light, so no shadow lookup either
+                    float cone = light_cone(l, -Lc);
+                    if (cone <= 0.0) {
+                        continue;
+                    }
+                    vec3 radiance = light_radiance(l, dist, u_cluster_z.w) * cone;
                     vec3 Ls = water_sphere_l(toLight, V, N, l.source.x);
                     vec3 H = normalize(V + Ls);
                     vec3 fres;

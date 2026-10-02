@@ -1,0 +1,32 @@
+/**
+ * Where a vehicle's wheel model sits in its root's frame, as `wheelPose` works it out.
+ */
+
+namespace visu::physics;
+
+use visu::components::Vehicle;
+use visu::math::{Quat, Vec3};
+
+public struct VehicleWheelPose
+{
+    public Vec3 $position;
+    public Quat $orientation;
+}
+
+/**
+ * Wheel `$i`'s node: its authored x and z, its centre as high as the suspension holds it, turned
+ * by the steering and its spin about the axle (+X).
+ */
+public function wheelPose(const Vehicle& $v, int32 $i) : VehicleWheelPose
+{
+    VehicleWheel $w = $v->spec->wheels[$i as usize];
+    VehicleWheelState $s = $v->wheels[$i as usize];
+    Vec3 $rest = $v->rest[$i as usize];
+    float32 $centre = $w->mount->y - ($w->restLength - $s->compression);
+    Quat $turn = Quat(angleAxis: $s->spin, Vec3(1.0f, 0.0f, 0.0f));
+    if ($w->steers) {
+        $turn = Quat(angleAxis: $v->steerAngle, Vec3(0.0f, 1.0f, 0.0f)) * $turn;
+    }
+
+    return VehicleWheelPose(Vec3($rest->x, $centre, $rest->z), $turn);
+}

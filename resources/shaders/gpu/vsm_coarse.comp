@@ -1,8 +1,9 @@
 #version 450
 
 // visu::graphics::ShadowAtlas: every visible light that casts and stands within the shadow
-// distance asks for the one coarsest page of all six faces, so every lookup has a level to fall
-// back to wherever a receiver between two request samples lands
+// distance asks for the one coarsest page of all six faces (a spot, of the faces its cone
+// reaches), so every lookup has a level to fall back to wherever a receiver between two request
+// samples lands
 layout(local_size_x = 64) in;
 
 #include "visu/vsmcull.glsl"
@@ -23,6 +24,26 @@ layout(std430, set = 2, binding = 3) buffer Requests {
     uint requests[];
 };
 
+// the widest angle a cube face spans from its axis, to its corners: atan(sqrt(2))
+#define VSM_FACE_REACH 0.9553166
+
+// whether light `l` can shine through `face`: always for one that shines every way, and for a
+// spot when its outer cone comes within the face's corners of the face's axis
+bool face_reached(LightGpu l, uint face)
+{
+    if (l.spot.w <= 0.0) {
+        return true;
+    }
+    vec3 n;
+    vec3 r;
+    vec3 u;
+    vsm_basis(face, n, r, u);
+    // the outer cosine back out of the cone's scale and offset
+    float outer = acos(clamp(-l.flicker.w / l.spot.w, -1.0, 1.0));
+    float off = acos(clamp(dot(n, l.spot.xyz), -1.0, 1.0));
+    return off < outer + VSM_FACE_REACH;
+}
+
 void main()
 {
     uint i = gl_GlobalInvocationID.x;
@@ -37,6 +58,9 @@ void main()
     }
 
     for (uint face = 0u; face < 6u; face++) {
+        if (!face_reached(l, face)) {
+            continue;
+        }
         uint bit = slot * VSM_REQUEST_WORDS * 32u + vsm_page_index(face, VSM_MIPS - 1u, uvec2(0u));
         atomicOr(requests[bit >> 5u], 1u << (bit & 31u));
     }

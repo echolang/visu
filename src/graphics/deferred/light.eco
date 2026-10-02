@@ -27,13 +27,36 @@ internal function lightingOf(Environment? $env) : Lighting
     return $held->lighting();
 }
 
-internal function lightProgram(DeferredGpu $gpu, Lighting $mode) : result<ShaderProgram, ShaderError>
+/**
+ * The light-pass program for `$mode`, with the spot cone when the light table holds a lit spot.
+ */
+internal function lightProgram(DeferredGpu $gpu, Lighting $mode, bool $spots) : result<ShaderProgram, ShaderError>
 {
+    if ($spots) {
+        return match ($mode) {
+            Lighting::ibl => $gpu->shaders->program('lightpass+ibl_spot'),
+            Lighting::environment => $gpu->shaders->program('lightpass+env_cubemap_spot'),
+            Lighting::sun => $gpu->shaders->program('lightpass+spot'),
+        };
+    }
+
     return match ($mode) {
         Lighting::ibl => $gpu->shaders->program('lightpass+ibl'),
         Lighting::environment => $gpu->shaders->program('lightpass+env_cubemap'),
         Lighting::sun => $gpu->shaders->program('lightpass'),
     };
+}
+
+/**
+ * Whether this frame's light table holds a lit spot.
+ */
+internal function frameSpots(LightClusterData? $clusters) : bool
+{
+    LightClusterData $held = guard $clusters else {
+        return false;
+    }
+
+    return $held->table->spots > 0;
 }
 
 internal function iblParams(Environment? $env) : Vec4

@@ -1,0 +1,33 @@
+#version 450
+
+// visu::graphics::GpuScan, the way back up: every value of block b (from u_scan.y, u_scan.x
+// of them, or the level's count scan_args left when u_scan.w = level + 1) gains the scanned
+// total of the blocks before it, `sums[u_scan.z + b]`
+layout(local_size_x = 1024) in;
+
+layout(std140, set = 0, binding = 0) uniform ScanParams {
+    uvec4 u_scan;
+};
+
+layout(std430, set = 2, binding = 0) buffer Values {
+    uint values[];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer Sums {
+    uint sums[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer Levels {
+    uint levels[];
+};
+
+void main()
+{
+    uint i = gl_WorkGroupID.x * 1024u + gl_LocalInvocationID.x;
+    uint count = u_scan.w == 0u ? u_scan.x : levels[12u + u_scan.w - 1u];
+    if (i >= count || gl_WorkGroupID.x == 0u) {
+        return;
+    }
+
+    values[u_scan.y + i] += sums[u_scan.z + gl_WorkGroupID.x];
+}

@@ -1,0 +1,63 @@
+/**
+ * How a `PhysicsWorld` runs. Read when the world is built; `gravity` can change later through
+ * `PhysicsWorld.setGravity`.
+ */
+
+namespace visu::physics;
+
+use visu::math::Vec3;
+
+public struct PhysicsSettings
+{
+    public Vec3 $gravity = Vec3(0.0f, -9.81f, 0.0f);
+
+    /**
+     * Seconds one step advances. It matches the app's tick rate, which is both the pass and the
+     * update rate of the game loop.
+     */
+    public float32 $step = 1.0f / 60.0f;
+
+    /**
+     * Whether the world steps once per simulation pass or once per update.
+     */
+    public PhysicsClock $clock = PhysicsClock::pass;
+
+    /**
+     * Bodies the world makes room for up front, so adding up to this many in play grows no table.
+     */
+    public int32 $capacity = 4096;
+
+    /**
+     * Steps one update may run on the `pass` clock. An app that runs many passes in one update (a
+     * time skip) would otherwise pay a physics step for each; past this the passes still run, the
+     * world waits.
+     */
+    public int32 $maxStepsPerUpdate = 8;
+
+    /**
+     * Seconds a body must stay under its sleep thresholds before it sleeps and stops costing a
+     * step. Bullet keeps it in one global, so it holds for every world in the process: the last
+     * world built sets it. Bullet's default is 2.
+     */
+    public float32 $sleepSeconds = 2.0f;
+
+    /**
+     * Linear (m/s) and angular (rad/s) speeds a dynamic body must stay under to sleep. Bullet's
+     * defaults.
+     */
+    public float32 $sleepLinear = 0.8f;
+    public float32 $sleepAngular = 1.0f;
+
+    /**
+     * Threads a step runs on. Above one the world is Bullet's parallel one: the step still
+     * returns only when it is done, so queries, poses and the ownership rules are the same, but
+     * results are not bit-exact against one thread. Clamped to what the machine has; one where
+     * Bullet cannot run threads.
+     */
+    public int32 $threads = 1;
+
+    /**
+     * Track contacts and dispatch `ContactBegan` / `ContactEnded`. Off costs nothing.
+     */
+    public bool $contacts = false;
+}

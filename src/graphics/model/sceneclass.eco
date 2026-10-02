@@ -1,0 +1,41 @@
+/**
+ * One G-buffer pipeline class of the GPU-driven main views: what the raster state and the program
+ * of a meshlet's draw depend on. Rigid or skinned picks the program, double-sided and the depth
+ * bias the raster, parallax the program variant. A material and whether its model is skinned
+ * name one class (`ModelBank.gbufferClass`); the main view draws one indirect batch per class it
+ * kept. Biased classes are one per distinct (bias, slope) pair, the roads. A cut-out class
+ * (an alpha cutoff, the foliage cards) draws a depth pre-pass first and then shades against it,
+ * since a fragment that may discard defeats the GPU's hidden surface removal.
+ */
+
+namespace visu::graphics;
+
+/**
+ * Classes the main views sort by. Past it a material shares class 0's state; the bank warns.
+ */
+public const int32 SCENE_CLASSES_MAX = 16;
+
+public struct SceneClass
+{
+    public bool $skinned;
+    public bool $doubleSided;
+    public bool $parallax;
+    public bool $cutout;
+    public float32 $depthBias;
+    public float32 $depthSlope;
+
+    public const function biased() : bool
+    {
+        return $this->depthBias != 0.0f || $this->depthSlope != 0.0f;
+    }
+
+    public const function same(const SceneClass& $other) : bool
+    {
+        return $this->skinned == $other->skinned
+            && $this->doubleSided == $other->doubleSided
+            && $this->parallax == $other->parallax
+            && $this->cutout == $other->cutout
+            && $this->depthBias == $other->depthBias
+            && $this->depthSlope == $other->depthSlope;
+    }
+}

@@ -1,0 +1,206 @@
+/**
+ * GpuScene row bookkeeping, GPU-free: ids stay stable and are reused after release, a row moves
+ * into and out of the moving list without changing id, and the list stays packed when one row in
+ * the middle stops. The pose a mover's row carries decomposes and recomposes its world matrix.
+ */
+
+use visu::geo::{AABB, Pose};
+use visu::graphics::{Device, GpuScene, SCENE_CHUNKS_MAX, SceneRow};
+use visu::math::{Mat4, Quat, Vec3, Vec4, scale, translate};
+use visu::system::decomposePose;
+
+internal function sceneRow() : SceneRow
+{
+    return SceneRow(0, AABB(Vec3(-1.0f), Vec3(1.0f)), 1.0f, Vec4(1.0f), 0.0f, true, false, true);
+}
+
+internal function scenePoseAt(float32 $x) : Pose
+{
+    return Pose(Vec3($x, 0.0f, 0.0f), Quat(), Vec3(1.0f, 1.0f, 1.0f));
+}
+
+test gpu_scene_ids_are_stable_and_reused
+{
+    Device $device = Device();
+    GpuScene $scene = GpuScene($device);
+    int32 $a = $scene->acquire();
+    int32 $b = $scene->acquire();
+    assert($a != $b, 'distinct ids');
+    $scene->write($a, sceneRow(), Mat4(1.0f));
+    $scene->write($b, sceneRow(), Mat4(1.0f));
+    assert($scene->rowCount() == 2, 'two rows');
+    $scene->release($a, AABB(Vec3(0.0f), Vec3(0.0f)));
+    assert($scene->rowCount() == 1, 'one released');
+    int32 $c = $scene->acquire();
+    assert($c == $a, 'a released id comes back');
+    $device->shutdown();
+}
+
+test gpu_scene_a_row_moves_and_rests_under_one_id
+{
+    Device $device = Device();
+    GpuScene $scene = GpuScene($device);
+    int32 $id = $scene->acquire();
+    $scene->write($id, sceneRow(), Mat4(1.0f));
+    assert(!$scene->moving($id), 'written exact, it rests');
+    $scene->write($id, sceneRow(), moving: scenePoseAt(0.0f), scenePoseAt(1.0f));
+    assert($scene->moving($id), 'written with two poses, it moves');
+    assert($scene->moverCount() == 1, 'one row resolves');
+    $scene->write($id, sceneRow(), moving: scenePoseAt(1.0f), scenePoseAt(2.0f));
+    assert($scene->moverCount() == 1, 'a second update keeps one entry');
+    $scene->write($id, sceneRow(), Mat4(1.0f));
+    assert(!$scene->moving($id), 'an exact write brings it to rest');
+    assert($scene->moverCount() == 0, 'nothing resolves');
+    $device->shutdown();
+}
+
+test gpu_scene_moving_list_stays_packed
+{
+    Device $device = Device();
+    GpuScene $scene = GpuScene($device);
+    int32 $a = $scene->acquire();
+    int32 $b = $scene->acquire();
+    int32 $c = $scene->acquire();
+    $scene->write($a, sceneRow(), moving: scenePoseAt(0.0f), scenePoseAt(1.0f));
+    $scene->write($b, sceneRow(), moving: scenePoseAt(0.0f), scenePoseAt(1.0f));
+    $scene->write($c, sceneRow(), moving: scenePoseAt(0.0f), scenePoseAt(1.0f));
+    $scene->write($a, sceneRow(), Mat4(1.0f));
+    assert($scene->moverCount() == 2, 'two still move');
+    assert($scene->moving($b) && $scene->moving($c), 'the others keep moving');
+    $scene->release($c, AABB(Vec3(0.0f), Vec3(0.0f)));
+    assert($scene->moverCount() == 1, 'a released row leaves the list');
+    assert($scene->moving($b), 'b still moves');
+    $device->shutdown();
+}
+
+test model_pose_decomposes_a_world_matrix
+{
+    Quat $q = visu::math::normalize(Quat(angleAxis: 0.7f, visu::math::normalize(Vec3(0.3f, 1.0f, 0.2f))));
+    Mat4 $world = translate(Vec3(4.0f, -2.0f, 9.0f)) * Mat4($q) * scale(Vec3(1.5f, 2.0f, 0.5f));
+    Pose $p = decomposePose($world);
+    Mat4 $back = translate($p->position) * Mat4($p->orientation) * scale($p->scale);
+    float32 $err = visu::math::length(Vec3($back->c0->x - $world->c0->x, $back->c1->y - $world->c1->y, $back->c2->z - $world->c2->z));
+    $err = $err + visu::math::length(Vec3($back->c3->x - $world->c3->x, $back->c3->y - $world->c3->y, $back->c3->z - $world->c3->z));
+    $err = $err + visu::math::length(Vec3($back->c1->x - $world->c1->x, $back->c2->x - $world->c2->x, $back->c0->z - $world->c0->z));
+    assert($err < 0.0005f, 'the pose recomposes the matrix');
+}
+
+internal function sceneRowAt(float32 $x, float32 $z) : SceneRow
+{
+    return SceneRow(0, AABB(Vec3($x - 1.0f, 0.0f, $z - 1.0f), Vec3($x + 1.0f, 2.0f, $z + 1.0f)), 1.0f, Vec4(1.0f), 0.0f, true, false, true);
+}
+
+internal function sceneOnGrid(Device $device) : GpuScene
+{
+    GpuScene $scene = GpuScene($device);
+    $scene->layout(AABB(Vec3(0.0f), Vec3(256.0f, 100.0f, 256.0f)), 64.0f);
+    return $scene;
+}
+
+test gpu_scene_lays_a_chunk_grid
+{
+    Device $device = Device();
+    GpuScene $scene = sceneOnGrid($device);
+    assert($scene->chunks->count == 16, 'four by four chunks of 64 m');
+    assert($scene->chunks->at(Vec3(10.0f, 0.0f, 10.0f)) == 1, 'the first cell, after the active set row');
+    assert($scene->chunks->at(Vec3(70.0f, 0.0f, 10.0f)) == 2, 'one along x');
+    assert($scene->chunks->at(Vec3(10.0f, 0.0f, 70.0f)) == 5, 'one row along z');
+    assert($scene->chunks->at(Vec3(-500.0f, 0.0f, 9999.0f)) == 13, 'outside the grid falls into the edge cell');
+    GpuScene $huge = GpuScene($device);
+    $huge->layout(AABB(Vec3(0.0f), Vec3(100000.0f, 1.0f, 100000.0f)), 64.0f);
+    assert($huge->chunks->count <= SCENE_CHUNKS_MAX, 'a big world takes bigger chunks');
+    $device->shutdown();
+}
+
+test gpu_scene_rows_rest_in_their_chunk_and_move_in_the_active_set
+{
+    Device $device = Device();
+    GpuScene $scene = sceneOnGrid($device);
+    int32 $a = $scene->acquire();
+    int32 $b = $scene->acquire();
+    $scene->write($a, sceneRowAt(10.0f, 10.0f), Mat4(1.0f));
+    $scene->write($b, sceneRowAt(12.0f, 12.0f), Mat4(1.0f));
+    assert($scene->chunkOf($a) == 1 && $scene->chunkOf($b) == 1, 'both rest in the first chunk');
+    assert($scene->chunks->members(1) == 2, 'two members');
+    assert($scene->chunks->occupiedCount() == 1, 'one chunk holds something');
+    assert($scene->activeCount() == 0, 'nothing active');
+
+    // a move takes it to the active set under the same id, and back on rest
+    $scene->write($a, sceneRowAt(10.0f, 10.0f), moving: scenePoseAt(0.0f), scenePoseAt(1.0f));
+    assert($scene->inActiveSet($a) && $scene->chunkOf($a) == -1, 'moving: active');
+    assert($scene->chunks->members(1) == 1, 'it left its chunk');
+    assert($scene->activeCount() == 1, 'one active');
+    $scene->write($a, sceneRowAt(70.0f, 10.0f), Mat4(1.0f));
+    assert($scene->chunkOf($a) == 2, 'at rest again, in the chunk it stopped in');
+    assert($scene->activeCount() == 0, 'the active set is empty');
+    assert($scene->chunks->members(2) == 1 && $scene->chunks->members(1) == 1, 'one member each');
+    assert($scene->chunks->occupiedCount() == 2, 'two chunks hold something');
+
+    // an exact write that crosses a chunk edge moves membership, a pin keeps it active
+    $scene->write($b, sceneRowAt(200.0f, 200.0f), Mat4(1.0f));
+    assert($scene->chunkOf($b) == 16, 'a teleport changes chunk');
+    assert($scene->chunks->members(1) == 0, 'the old chunk is empty');
+    assert($scene->chunks->occupiedCount() == 2, 'the emptied chunk left the occupied list');
+    $scene->pin($b, true);
+    $scene->write($b, sceneRowAt(200.0f, 200.0f), Mat4(1.0f));
+    assert($scene->inActiveSet($b), 'pinned: active although written exact');
+    $scene->pin($b, false);
+    $scene->write($b, sceneRowAt(10.0f, 10.0f), Mat4(1.0f));
+    assert($scene->chunkOf($b) == 1, 'unpinned: rests where it is put');
+    $scene->release($b, AABB(Vec3(0.0f), Vec3(0.0f)));
+    assert($scene->chunks->members(1) == 0, 'released: out of its chunk');
+    $device->shutdown();
+}
+
+test gpu_scene_chunk_lists_stay_packed_through_many_moves
+{
+    Device $device = Device();
+    GpuScene $scene = sceneOnGrid($device);
+    array<int32> $ids = array<int32>();
+    int32 $i = 0;
+    while ($i < 100) {
+        int32 $id = $scene->acquire();
+        $scene->write($id, sceneRowAt(10.0f, 10.0f), Mat4(1.0f));
+        $ids[] = $id;
+        $i = $i + 1;
+    }
+
+    assert($scene->chunks->members(1) == 100, 'a hundred in one chunk, past its first room');
+    assert($scene->chunks->relocations > 0, 'the slice moved as it filled');
+    // every other row wakes, then they all come to rest in the next chunk over
+    $i = 0;
+    while ($i < 100) {
+        if (($i % 2) == 0) {
+            $scene->write($ids[$i as usize], sceneRowAt(10.0f, 10.0f), moving: scenePoseAt(0.0f), scenePoseAt(1.0f));
+        }
+
+        $i = $i + 1;
+    }
+
+    assert($scene->activeCount() == 50 && $scene->chunks->members(1) == 50, 'half active, half resting');
+    $i = 0;
+    while ($i < 100) {
+        if (($i % 2) == 0) {
+            $scene->write($ids[$i as usize], sceneRowAt(70.0f, 10.0f), Mat4(1.0f));
+        }
+
+        $i = $i + 1;
+    }
+
+    assert($scene->activeCount() == 0, 'all at rest');
+    assert($scene->chunks->members(1) == 50 && $scene->chunks->members(2) == 50, 'split across two chunks');
+    assert($scene->moverCount() == 0, 'none resolving');
+    $device->shutdown();
+}
+
+test model_pose_bounds_match_the_matrix_box
+{
+    AABB $local = AABB(Vec3(-1.0f, 0.0f, -0.5f), Vec3(2.0f, 3.0f, 0.5f));
+    Quat $q = visu::math::normalize(Quat(angleAxis: 1.1f, visu::math::normalize(Vec3(0.2f, 1.0f, -0.4f))));
+    Pose $p = Pose(Vec3(10.0f, -3.0f, 7.0f), $q, Vec3(1.5f, 0.5f, 2.0f));
+    AABB $fast = visu::system::poseBounds($local, $p);
+    Mat4 $world = translate($p->position) * Mat4($q) * scale($p->scale);
+    AABB $slow = $local->transformed($world);
+    float32 $err = visu::math::length($fast->min - $slow->min) + visu::math::length($fast->max - $slow->max);
+    assert($err < 0.0005f, 'the pose box is the matrix box');
+}

@@ -1,0 +1,114 @@
+#version 450
+
+// visu::graphics::GpuScene, the chunk stage: one workgroup per (view, tile) of 256 candidates,
+// the occupied spatial chunks in list order (a local set: the window of grid cells round the
+// view's reach sphere, row by row) and then the active set's blocks, keeps the chunks
+// whose box meets the view and whose members' flags can meet what it requires (a block always
+// passes; its rows are tested one by one). Mode 0 counts each tile's chunk pairs; mode 1, after
+// the counts were scanned into offsets (view after view, tile after tile), writes them, so the
+// chunk pairs come out view after view and in chunk order within a view
+layout(local_size_x = 256) in;
+
+#include "visu/scenecull.glsl"
+
+layout(std430, set = 2, binding = 0) readonly buffer Chunks {
+    SceneChunk chunks[];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer Views {
+    SceneView views[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer Occupied {
+    uint occupied[];
+};
+
+layout(std430, set = 2, binding = 3) writeonly buffer ChunkPairs {
+    uvec2 chunkPairs[];
+};
+
+// one count per (view, tile), view-major; scanned in place between the modes
+layout(std430, set = 2, binding = 4) buffer Tiles {
+    uint tiles[];
+};
+
+// a local window cell outside the view's reach
+#define SCENE_NO_CHUNK 0xFFFFFFFFu
+
+shared uint s_scan[256];
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x;
+    uint spatial = scene_spatial_candidates();
+    uint total = spatial + scene_active_blocks();
+    uint perView = scene_chunk_tiles();
+    uint g = gl_WorkGroupID.x;
+    uint v = g / perView;
+    uint i = (g - v * perView) * 256u + t;
+    SceneView view = views[v];
+    // an empty view (a page set's views past this frame's dirty pages) keeps nothing: the whole
+    // workgroup shares the view, so it leaves before the scan and its barriers
+    if (view.meta.x == SCENE_PASS_NONE) {
+        if (u_mode.x == 0u && t == 0u) {
+            tiles[g] = 0u;
+        }
+        return;
+    }
+    uint require = u_mode.y | view.meta.y | SCENE_INSTANCE_LIVE;
+
+    // the chunk row candidate i names; a window cell past the view's reach names none
+    uint name = SCENE_ACTIVE_BLOCK | (i - spatial);
+    bool spatialCandidate = i < spatial;
+    if (spatialCandidate && u_local.x > 0u) {
+        // every view of a local set carries its reach sphere
+        float reach = view.sphere.w + u_grid.w;
+        uvec2 lo = scene_grid_cell(view.sphere.xz - vec2(reach));
+        uvec2 hi = scene_grid_cell(view.sphere.xz + vec2(reach));
+        uvec2 cell = lo + uvec2(i % u_local.x, i / u_local.x);
+        name = (cell.x <= hi.x && cell.y <= hi.y) ? cell.y * u_local.y + cell.x + 1u : SCENE_NO_CHUNK;
+    } else if (spatialCandidate) {
+        name = occupied[i];
+    }
+
+    bool keep = false;
+    if (i < total) {
+        if (spatialCandidate && name != SCENE_NO_CHUNK) {
+            SceneChunk c = chunks[name];
+            keep = c.range.y > 0u
+                && (c.range.z & require) == require
+                && scene_box_visible(view, c.lo.xyz, c.hi.xyz)
+                && scene_box_reached(view, c.lo.xyz, c.hi.xyz)
+                && !scene_too_small(view, c.lo.xyz, c.hi.xyz, uintBitsToFloat(c.range.w));
+        } else if (!spatialCandidate) {
+            keep = true;
+        }
+    }
+
+    uint own = keep ? 1u : 0u;
+    s_scan[t] = own;
+    barrier();
+    for (uint o = 1u; o < 256u; o <<= 1u) {
+        uint add = 0u;
+        if (t >= o) {
+            add = s_scan[t - o];
+        }
+        barrier();
+        s_scan[t] += add;
+        barrier();
+    }
+
+    if (u_mode.x == 0u) {
+        if (t == 0u) {
+            tiles[g] = s_scan[255];
+        }
+        return;
+    }
+
+    if (keep) {
+        uint at = tiles[g] + s_scan[t] - own;
+        if (at < u_caps.x) {
+            chunkPairs[at] = uvec2(name, v);
+        }
+    }
+}

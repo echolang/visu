@@ -39,6 +39,11 @@ public class Systems
     private array<function<void(Entities)>> $begins;
 
     /**
+     * `begin` ran for the update in progress, so `update` does not roll the move log again.
+     */
+    private bool $begun;
+
+    /**
      * Simulation passes run so far. Starts at zero, so the first tick() is pass one and a ticker
      * with offset one runs on it.
      */
@@ -58,6 +63,7 @@ public class Systems
         $this->updaters = array<System>();
         $this->renderers = array<System>();
         $this->tickers = array<Ticker>();
+        $this->begun = false;
         $this->begins = array<function<void(Entities)>>();
         $this->passes = 0;
         $this->handlers = array<ConsoleCommandHandler>();
@@ -136,15 +142,17 @@ public class Systems
     }
 
     /**
-     * Once per update, before its `tick` passes (there may be none). Bind order.
+     * Once per update, before its `tick` passes (there may be none). Bind order. It starts the
+     * update's move log (`Entities.roll`) before any handler runs.
      */
     public function begin(Entities $entities) : void
     {
-        foreach ($this->begins as $begin) {
-            // a foreach binding over closures is untyped in echoc (see COMPILER_BUGS.md), so
-            // the call goes through a typed local, as tick does with its tickers
-            function<void(Entities)> $fn = $begin;
-            $fn($entities);
+        $entities->roll();
+        $this->begun = true;
+        foreach ($this->begins as $each) {
+            // a typed local: echoc leaves a foreach binding over closures untyped (COMPILER_BUGS)
+            function<void(Entities)> $begin = $each;
+            $begin($entities);
         }
     }
 
@@ -183,8 +191,17 @@ public class Systems
         return $this->passes;
     }
 
+    /**
+     * The update phase. A scene that runs no `begin` (no simulation passes) rolls the move log
+     * here, so every update rolls it exactly once.
+     */
     public function update(Entities $entities) : void
     {
+        if (!$this->begun) {
+            $entities->roll();
+        }
+
+        $this->begun = false;
         foreach ($this->updaters as $system) {
             $system->update($entities);
         }

@@ -1,0 +1,77 @@
+#version 450
+
+// visu::graphics::GpuScene, before any cull: each moving instance's world matrix for this frame.
+// Its pose block is three rows: the matrix every consumer reads, then the previous and the
+// current pose, which mix at the frame's interpolation alpha exactly as Transform.mix does
+// (position and scale lerp, orientation slerps, shortest way round). A still instance is not in
+// the list and costs nothing
+layout(local_size_x = 64) in;
+
+#include "visu/scene.glsl"
+
+layout(std140, set = 0, binding = 0) uniform ResolveParams {
+    // x alpha
+    vec4 u_alpha;
+    // x moving instances
+    uvec4 u_count;
+};
+
+layout(std430, set = 2, binding = 0) buffer Poses {
+    ScenePose poses[];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer Moving {
+    uint moving[];
+};
+
+vec4 scene_slerp(vec4 a, vec4 b, float t)
+{
+    float cosTheta = dot(a, b);
+    vec4 end = b;
+    if (cosTheta < 0.0) {
+        end = -b;
+        cosTheta = -cosTheta;
+    }
+
+    if (cosTheta > 0.9995) {
+        return mix(a, end, t);
+    }
+
+    float angle = acos(cosTheta);
+    return (a * sin((1.0 - t) * angle) + end * sin(t * angle)) / sin(angle);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_count.x) {
+        return;
+    }
+
+    uint p = moving[i];
+    ScenePose was = poses[p + 1u];
+    ScenePose now = poses[p + 2u];
+    float t = u_alpha.x;
+    vec3 position = mix(was.r0.xyz, now.r0.xyz, t);
+    vec4 q = scene_slerp(was.r1, now.r1, t);
+    vec3 s = mix(was.r2.xyz, now.r2.xyz, t);
+
+    // Mat4(Quat) as the CPU builds it, scaled per column: translate * rotate * scale
+    float xx = q.x * q.x;
+    float yy = q.y * q.y;
+    float zz = q.z * q.z;
+    float xz = q.x * q.z;
+    float xy = q.x * q.y;
+    float yz = q.y * q.z;
+    float wx = q.w * q.x;
+    float wy = q.w * q.y;
+    float wz = q.w * q.z;
+    vec3 c0 = vec3(1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz), 2.0 * (xz - wy)) * s.x;
+    vec3 c1 = vec3(2.0 * (xy - wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx)) * s.y;
+    vec3 c2 = vec3(2.0 * (xz + wy), 2.0 * (yz - wx), 1.0 - 2.0 * (xx + yy)) * s.z;
+    poses[p] = ScenePose(
+        vec4(c0.x, c1.x, c2.x, position.x),
+        vec4(c0.y, c1.y, c2.y, position.y),
+        vec4(c0.z, c1.z, c2.z, position.z)
+    );
+}

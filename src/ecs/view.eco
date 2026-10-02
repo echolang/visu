@@ -1,10 +1,18 @@
 /**
  * Packed component list for one type.
  * EnTT sparse set: dense arrays of entities and T (structs sit inline), sparse index for O(1) lookup.
+ * The sparse index is paged: a view pays for a 4096 entity page only once it holds an entity in it,
+ * so a component a few hundred entities carry costs a few pages however far the ids reach.
  * A T& into the payload is invalidated if this view grows.
  */
 
 namespace visu::ecs;
+
+internal const uint32 ECS_PAGE_SHIFT = 12;
+internal const uint32 ECS_PAGE_SIZE = 4096;
+internal const uint32 ECS_PAGE_MASK = 4095;
+internal const int32 ECS_PAGE_NONE = -1;
+internal const uint32 ECS_SLOT_NONE = 0xFFFFFFFF;
 
 private class LifecycleHook<T>
 {
@@ -52,7 +60,16 @@ public struct ViewCursor<T> : contract::iterator<T>, contract::keyed<Entity>
 
 public class View<T> : contract::iterable<T>
 {
-    private array<uint32> $sparse;
+    /**
+     * Sparse page table: the offset of an entity page's slots in `slots`, or `ECS_PAGE_NONE`.
+     */
+    private array<int32> $pages;
+
+    /**
+     * Page pool: each committed page is `ECS_PAGE_SIZE` dense indices, `ECS_SLOT_NONE` where the
+     * entity carries no `T`.
+     */
+    private array<uint32> $slots;
     private array<Entity> $dense;
     private array<T> $payload;
     private array<LifecycleHook<T>> $attachHooks;
@@ -62,7 +79,8 @@ public class View<T> : contract::iterable<T>
 
     public constructor()
     {
-        $this->sparse = array<uint32>();
+        $this->pages = array<int32>();
+        $this->slots = array<uint32>();
         $this->dense = array<Entity>();
         $this->payload = array<T>();
         $this->attachHooks = array<LifecycleHook<T>>();
@@ -87,15 +105,29 @@ public class View<T> : contract::iterable<T>
         $this->payload->reserve($n);
     }
 
-    public function contains(Entity $e) : bool
+    /**
+     * Commit the sparse pages for entity indices `[$from, $to)`, so an attach there later (a
+     * planting in the displayed frame) allocates nothing. Pair it with `reserve` for the dense
+     * side and `Entities.reserve` for the ids.
+     */
+    public function commit(uint32 $from, uint32 $to) : void
     {
-        uint32 $idx = $e->index();
-        if (($idx as usize) >= $this->sparse->count()) {
-            return false;
+        if ($to <= $from) {
+            return;
         }
 
-        uint32 $denseIdx = $this->sparse[$idx as usize];
-        if ($denseIdx == ENTITY_NULL_ID) {
+        uint32 $page = $from >> ECS_PAGE_SHIFT;
+        uint32 $last = ($to - 1) >> ECS_PAGE_SHIFT;
+        while ($page <= $last) {
+            $this->ensurePage($page << ECS_PAGE_SHIFT);
+            $page = $page + 1;
+        }
+    }
+
+    public const function contains(Entity $e) : bool
+    {
+        uint32 $denseIdx = $this->slot($e->index());
+        if ($denseIdx == ECS_SLOT_NONE) {
             return false;
         }
 
@@ -105,7 +137,7 @@ public class View<T> : contract::iterable<T>
     public function get(Entity $e) : T&
     {
         assert($this->contains($e), 'view: get of missing component');
-        uint32 $denseIdx = $this->sparse[$e->index() as usize];
+        uint32 $denseIdx = $this->slot($e->index());
         return $this->payload->at($denseIdx as usize);
     }
 
@@ -115,7 +147,7 @@ public class View<T> : contract::iterable<T>
             return null;
         }
 
-        uint32 $denseIdx = $this->sparse[$e->index() as usize];
+        uint32 $denseIdx = $this->slot($e->index());
         return &$this->payload[$denseIdx as usize];
     }
 
@@ -146,17 +178,16 @@ public class View<T> : contract::iterable<T>
     public function attach(Entity $e, T $component) : T&
     {
         uint32 $idx = $e->index();
-        $this->ensureSparse($idx);
+        $this->ensurePage($idx);
 
         if ($this->contains($e)) {
-            uint32 $denseIdx = $this->sparse[$idx as usize];
-            usize $i = $denseIdx as usize;
+            usize $i = $this->slot($idx) as usize;
             $this->payload[$i] = $component;
             return $this->payload->at($i);
         }
 
         uint32 $denseIdx = $this->dense->count() as uint32;
-        $this->sparse[$idx as usize] = $denseIdx;
+        $this->setSlot($idx, $denseIdx);
         $this->dense->push($e);
         $this->payload->push($component);
         return $this->payload->at($denseIdx as usize);
@@ -173,7 +204,7 @@ public class View<T> : contract::iterable<T>
         }
 
         uint32 $idx = $e->index();
-        uint32 $denseIdx = $this->sparse[$idx as usize];
+        uint32 $denseIdx = $this->slot($idx);
         usize $last = $this->dense->count() - 1;
 
         if (($denseIdx as usize) != $last) {
@@ -181,12 +212,12 @@ public class View<T> : contract::iterable<T>
             $this->dense[$denseIdx as usize] = $moved;
             T& $dest = $this->payload->at($denseIdx as usize);
             $dest = $this->payload[$last];
-            $this->sparse[$moved->index() as usize] = $denseIdx;
+            $this->setSlot($moved->index(), $denseIdx);
         }
 
         $this->dense->pop();
         $this->payload->pop();
-        $this->sparse[$idx as usize] = ENTITY_NULL_ID;
+        $this->setSlot($idx, ECS_SLOT_NONE);
     }
 
     /**
@@ -270,11 +301,56 @@ public class View<T> : contract::iterable<T>
         return &$this->detachHooks;
     }
 
-    private function ensureSparse(uint32 $idx) : void
+    /**
+     * The dense index of entity index `$idx`, or `ECS_SLOT_NONE`: two array reads, no page is
+     * committed for a miss.
+     */
+    #[inline]
+    private const function slot(uint32 $idx) : uint32
     {
-        usize $need = ($idx as usize) + 1;
-        while ($this->sparse->count() < $need) {
-            $this->sparse->push(ENTITY_NULL_ID);
+        usize $page = ($idx >> ECS_PAGE_SHIFT) as usize;
+        if ($page >= $this->pages->count()) {
+            return ECS_SLOT_NONE;
+        }
+
+        int32 $at = $this->pages[$page];
+        if ($at == ECS_PAGE_NONE) {
+            return ECS_SLOT_NONE;
+        }
+
+        return $this->slots[($at as usize) + (($idx & ECS_PAGE_MASK) as usize)];
+    }
+
+    /**
+     * Write the dense index of an entity whose page is committed.
+     */
+    #[inline]
+    private function setSlot(uint32 $idx, uint32 $denseIdx) : void
+    {
+        int32 $at = $this->pages[($idx >> ECS_PAGE_SHIFT) as usize];
+        $this->slots[($at as usize) + (($idx & ECS_PAGE_MASK) as usize)] = $denseIdx;
+    }
+
+    /**
+     * Commit the page that holds entity index `$idx`: the page table grows to reach it and the
+     * pool gains one page of `ECS_SLOT_NONE`. A committed page is never given back.
+     */
+    private function ensurePage(uint32 $idx) : void
+    {
+        usize $page = ($idx >> ECS_PAGE_SHIFT) as usize;
+        while ($this->pages->count() <= $page) {
+            $this->pages->push(ECS_PAGE_NONE);
+        }
+
+        if ($this->pages[$page] != ECS_PAGE_NONE) {
+            return;
+        }
+
+        $this->pages[$page] = $this->slots->count() as int32;
+        uint32 $i = 0;
+        while ($i < ECS_PAGE_SIZE) {
+            $this->slots->push(ECS_SLOT_NONE);
+            $i = $i + 1;
         }
     }
 }

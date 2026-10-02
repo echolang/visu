@@ -6,6 +6,13 @@
 
 using namespace metal;
 
+struct ScenePose
+{
+    float4 r0;
+    float4 r1;
+    float4 r2;
+};
+
 struct SkinPalette
 {
     float4 u_skin_rows[3072];
@@ -16,57 +23,68 @@ struct Items
     uint4 items[1];
 };
 
-struct SceneCluster
+struct SceneMeshlet
 {
     float4 sphere;
+    float4 cone;
     uint4 range;
+    uint4 material;
 };
 
-struct SceneCluster_1
+struct SceneMeshlet_1
 {
     float4 sphere;
+    float4 cone;
     uint4 range;
+    uint4 material;
 };
 
-struct Clusters
+struct Meshlets
 {
-    SceneCluster_1 clusters[1];
+    SceneMeshlet_1 meshlets[1];
 };
 
 struct SceneInstance
 {
-    float4x4 world;
     float4 lo;
     float4 hi;
     uint4 meta;
+    uint4 extra;
 };
 
 struct SceneInstance_1
 {
-    float4x4 world;
     float4 lo;
     float4 hi;
     uint4 meta;
+    uint4 extra;
 };
 
-struct Movers
+struct Instances
 {
-    SceneInstance_1 movers[1];
+    SceneInstance_1 instances[1];
 };
 
-struct Statics
+struct Detail
 {
-    SceneInstance_1 statics[1];
-};
-
-struct Indices
-{
-    uint vertexAt[1];
+    uint detail[1];
 };
 
 struct Words
 {
     uint words[1];
+};
+
+struct ScenePose_1
+{
+    float4 r0;
+    float4 r1;
+    float4 r2;
+};
+
+struct Poses
+{
+    ScenePose_1 poses[1];
 };
 
 struct CameraUniforms
@@ -83,72 +101,74 @@ struct CameraUniforms
 struct vs_out
 {
     float2 v_uv [[user(locn0)]];
+    uint v_material [[user(locn1)]];
     float4 gl_Position [[position]];
 };
 
 static inline __attribute__((always_inline))
-float4x4 skin_matrix(thread const uint4& joints, thread const float4& weights, thread const float& base, constant SkinPalette& _39)
+float4x4 scene_world(thread const ScenePose& p)
+{
+    return float4x4(float4(float4(p.r0.x, p.r1.x, p.r2.x, 0.0)), float4(float4(p.r0.y, p.r1.y, p.r2.y, 0.0)), float4(float4(p.r0.z, p.r1.z, p.r2.z, 0.0)), float4(float4(p.r0.w, p.r1.w, p.r2.w, 1.0)));
+}
+
+static inline __attribute__((always_inline))
+float4x4 skin_matrix(thread const uint4& joints, thread const float4& weights, thread const float& base, constant SkinPalette& _45)
 {
     uint b = uint(base + 0.5);
     uint4 at = uint4(b) + (joints * uint4(3u));
-    float4 r0 = (((_39.u_skin_rows[at.x] * weights.x) + (_39.u_skin_rows[at.y] * weights.y)) + (_39.u_skin_rows[at.z] * weights.z)) + (_39.u_skin_rows[at.w] * weights.w);
-    float4 r1 = (((_39.u_skin_rows[at.x + 1u] * weights.x) + (_39.u_skin_rows[at.y + 1u] * weights.y)) + (_39.u_skin_rows[at.z + 1u] * weights.z)) + (_39.u_skin_rows[at.w + 1u] * weights.w);
-    float4 r2 = (((_39.u_skin_rows[at.x + 2u] * weights.x) + (_39.u_skin_rows[at.y + 2u] * weights.y)) + (_39.u_skin_rows[at.z + 2u] * weights.z)) + (_39.u_skin_rows[at.w + 2u] * weights.w);
+    float4 r0 = (((_45.u_skin_rows[at.x] * weights.x) + (_45.u_skin_rows[at.y] * weights.y)) + (_45.u_skin_rows[at.z] * weights.z)) + (_45.u_skin_rows[at.w] * weights.w);
+    float4 r1 = (((_45.u_skin_rows[at.x + 1u] * weights.x) + (_45.u_skin_rows[at.y + 1u] * weights.y)) + (_45.u_skin_rows[at.z + 1u] * weights.z)) + (_45.u_skin_rows[at.w + 1u] * weights.w);
+    float4 r2 = (((_45.u_skin_rows[at.x + 2u] * weights.x) + (_45.u_skin_rows[at.y + 2u] * weights.y)) + (_45.u_skin_rows[at.z + 2u] * weights.z)) + (_45.u_skin_rows[at.w + 2u] * weights.w);
     return float4x4(float4(float4(r0.x, r1.x, r2.x, 0.0)), float4(float4(r0.y, r1.y, r2.y, 0.0)), float4(float4(r0.z, r1.z, r2.z, 0.0)), float4(float4(r0.w, r1.w, r2.w, 1.0)));
 }
 
-vertex vs_out vs(const device Words& _308 [[buffer(6)]], const device Indices& _294 [[buffer(7)]], constant CameraUniforms& _396 [[buffer(3)]], constant SkinPalette& _39 [[buffer(4)]], const device Clusters& _228 [[buffer(8)]], const device Statics& _284 [[buffer(9)]], const device Movers& _271 [[buffer(10)]], const device Items& _211 [[buffer(11)]], uint gl_VertexIndex [[vertex_id]])
+vertex vs_out vs(const device Words& _362 [[buffer(6)]], const device Detail& _335 [[buffer(7)]], constant CameraUniforms& _461 [[buffer(3)]], constant SkinPalette& _45 [[buffer(4)]], const device Meshlets& _287 [[buffer(8)]], const device Instances& _324 [[buffer(9)]], const device Poses& _399 [[buffer(10)]], const device Items& _270 [[buffer(11)]], uint gl_VertexIndex [[vertex_id]])
 {
     vs_out out = {};
     uint vertex0 = uint(int(gl_VertexIndex));
-    uint4 item = _211.items[vertex0 / 192u];
+    uint4 item = _270.items[vertex0 / 192u];
     uint corner = vertex0 % 192u;
-    SceneCluster _234;
-    _234.sphere = _228.clusters[item.x].sphere;
-    _234.range = _228.clusters[item.x].range;
-    SceneCluster c = _234;
-    if ((corner / 3u) >= c.range.y)
+    SceneMeshlet _293;
+    _293.sphere = _287.meshlets[item.x].sphere;
+    _293.cone = _287.meshlets[item.x].cone;
+    _293.range = _287.meshlets[item.x].range;
+    _293.material = _287.meshlets[item.x].material;
+    SceneMeshlet c = _293;
+    if ((corner / 3u) >= c.range.z)
     {
         out.v_uv = float2(0.0);
+        out.v_material = 0u;
         out.gl_Position = float4(2.0, 2.0, 2.0, 1.0);
         return out;
     }
-    SceneInstance inst;
-    if ((item.y & 2147483648u) != 0u)
-    {
-        uint _275 = item.y & 2147483647u;
-        SceneInstance _279;
-        _279.world = _271.movers[_275].world;
-        _279.lo = _271.movers[_275].lo;
-        _279.hi = _271.movers[_275].hi;
-        _279.meta = _271.movers[_275].meta;
-        inst = _279;
-    }
-    else
-    {
-        SceneInstance _289;
-        _289.world = _284.statics[item.y].world;
-        _289.lo = _284.statics[item.y].lo;
-        _289.hi = _284.statics[item.y].hi;
-        _289.meta = _284.statics[item.y].meta;
-        inst = _289;
-    }
-    uint at = _294.vertexAt[c.range.x + corner];
-    float3 position = float3(as_type<float>(_308.words[at]), as_type<float>(_308.words[at + 1u]), as_type<float>(_308.words[at + 2u]));
-    out.v_uv = float2(as_type<float>(_308.words[at + 3u]), as_type<float>(_308.words[at + 4u]));
-    float4x4 model = inst.world;
+    SceneInstance _330;
+    _330.lo = _324.instances[item.y].lo;
+    _330.hi = _324.instances[item.y].hi;
+    _330.meta = _324.instances[item.y].meta;
+    _330.extra = _324.instances[item.y].extra;
+    SceneInstance inst = _330;
+    uint at = _335.detail[c.range.x + ((_335.detail[c.range.y + (corner / 3u)] >> (8u * (corner % 3u))) & 255u)];
+    float3 position = float3(as_type<float>(_362.words[at]), as_type<float>(_362.words[at + 1u]), as_type<float>(_362.words[at + 2u]));
+    out.v_uv = float2(as_type<float>(_362.words[at + 3u]), as_type<float>(_362.words[(at + 3u) + 1u]));
+    out.v_material = c.material.y;
+    ScenePose _406;
+    _406.r0 = _399.poses[inst.meta.z].r0;
+    _406.r1 = _399.poses[inst.meta.z].r1;
+    _406.r2 = _399.poses[inst.meta.z].r2;
+    ScenePose param = _406;
+    float4x4 model = scene_world(param);
     if ((c.range.w & 1u) != 0u)
     {
-        uint j = _308.words[at + 5u];
+        uint j = _362.words[at + 12u];
         uint4 joints = uint4(j & 255u, (j >> 8u) & 255u, (j >> 16u) & 255u, j >> 24u);
-        float4 weights = unpack_unorm4x8_to_float(_308.words[at + 6u]);
-        uint4 param = joints;
-        float4 param_1 = weights;
-        float param_2 = inst.hi.w;
-        model = model * skin_matrix(param, param_1, param_2, _39);
+        float4 weights = unpack_unorm4x8_to_float(_362.words[at + 13u]);
+        uint4 param_1 = joints;
+        float4 param_2 = weights;
+        float param_3 = inst.hi.w;
+        model = model * skin_matrix(param_1, param_2, param_3, _45);
     }
     float4 world = model * float4(position, 1.0);
-    out.gl_Position = _396.u_projection_view * world;
+    out.gl_Position = _461.u_projection_view * world;
     return out;
 }
 

@@ -46,9 +46,9 @@ public class MaterialGpu
     public bool $parallax;
 
     /**
-     * Which depth-only bucket the GPU-driven views draw this material's clusters in: -1 casts
-     * no shadow, 0 is the one opaque bucket every material without an alpha cutoff shares, and
-     * each alpha-tested material has a bucket of its own so its maps bind. Set by the bank.
+     * Which depth-only bucket the GPU-driven views draw this material's meshlets in: -1 casts no
+     * shadow, `SCENE_BUCKET_OPAQUE` every caster without an alpha cutoff, `SCENE_BUCKET_ALPHA`
+     * every cut-out one (its cutoff read from the material table). Set by the bank.
      */
     public int32 $shadowBucket;
 
@@ -129,9 +129,21 @@ public class ModelBank
     public MeshArena $arena;
 
     /**
-     * The material index of alpha-tested shadow bucket `k` at `k - 1`.
+     * The bindless side of the materials, on a device that has it: every map in a `TextureTable`
+     * slot (one slot per distinct texture, by label), every material a row of the material
+     * table at its dense index. Made with the first material; null on a device without
+     * bindless textures, where nothing GPU-driven draws the main views.
      */
-    private array<int32> $alphaBuckets;
+    private TextureTable? $table;
+    private map<string, int32> $tableSlots;
+    private array<ModelMaterialGpu> $materialRows;
+    private Buffer? $materialBuffer;
+
+    /**
+     * The G-buffer classes models drew in so far, in the order they first appeared.
+     */
+    private array<SceneClass> $classes;
+    private bool $classesWarned;
 
     public constructor(Device $device, Assets $assets)
     {
@@ -145,7 +157,12 @@ public class ModelBank
         $this->flatNormal = null;
         $this->sampler = null;
         $this->arena = MeshArena($device);
-        $this->alphaBuckets = array<int32>();
+        $this->table = null;
+        $this->tableSlots = map<string, int32>();
+        $this->materialRows = array<ModelMaterialGpu>();
+        $this->materialBuffer = null;
+        $this->classes = arr::room<SceneClass>(SCENE_CLASSES_MAX as usize);
+        $this->classesWarned = false;
     }
 
     /**
@@ -254,20 +271,89 @@ public class ModelBank
     }
 
     /**
-     * Shadow buckets in use: the opaque one plus one per alpha-tested material.
+     * Whether the materials have their bindless side: the GPU-driven programs need it.
      */
-    public const function shadowBuckets() : int32
+    public const function bindless() : bool
     {
-        return 1 + ($this->alphaBuckets->count() as int32);
+        return $this->table != null && $this->materialBuffer != null;
     }
 
     /**
-     * The material alpha-tested bucket `$bucket` (1 or more) binds.
+     * The texture table every material map sits in. Only when `bindless`.
      */
-    public const function bucketMaterial(int32 $bucket) : MaterialGpu
+    public function textureTable() : TextureTable
     {
-        assert($bucket >= 1 && ($bucket as usize) <= $this->alphaBuckets->count(), 'bank: shadow bucket');
-        return $this->byIndex[$this->alphaBuckets[($bucket - 1) as usize] as usize];
+        TextureTable $t = guard $this->table else {
+            die('bank: no texture table on this device');
+        }
+        return $t;
+    }
+
+    /**
+     * The material table, one `ModelMaterialGpu` row per material index. Only when `bindless`.
+     */
+    public function materialTable() : Buffer
+    {
+        Buffer $b = guard $this->materialBuffer else {
+            die('bank: no material table yet');
+        }
+        return $b;
+    }
+
+    /**
+     * Distinct textures in the table, for the `scene` verb.
+     */
+    public const function tableTextures() : int32
+    {
+        return $this->tableSlots->count() as int32;
+    }
+
+    /**
+     * The G-buffer class `$m` draws in on a model that is (or is not) skinned, registered the
+     * first time it is asked for. At a load step: the arena asks while it takes a model.
+     */
+    public function gbufferClass(MaterialGpu $m, bool $skinned) : int32
+    {
+        SceneClass $want = SceneClass(
+            $skinned: $skinned,
+            $doubleSided: $m->doubleSided,
+            $parallax: $m->parallax,
+            $cutout: $m->material->alphaCutoff > 0.0f,
+            $depthBias: $m->material->depthBias,
+            $depthSlope: $m->material->depthSlope
+        );
+        int32 $i = 0;
+        int32 $n = $this->classes->count() as int32;
+        while ($i < $n) {
+            if ($this->classes[$i as usize]->same($want)) {
+                return $i;
+            }
+
+            $i = $i + 1;
+        }
+
+        if ($n >= SCENE_CLASSES_MAX) {
+            if (!$this->classesWarned) {
+                int32 $cap = SCENE_CLASSES_MAX;
+                info("model: more than {$cap} G-buffer classes; further ones draw as class 0");
+                $this->classesWarned = true;
+            }
+
+            return 0;
+        }
+
+        $this->classes[] = $want;
+        return $n;
+    }
+
+    public const function classCount() : int32
+    {
+        return $this->classes->count() as int32;
+    }
+
+    public const function gclass(int32 $index) : SceneClass
+    {
+        return $this->classes[$index as usize];
     }
 
     public const function modelCount() : int32
@@ -290,6 +376,7 @@ public class ModelBank
     public function destroy() : void
     {
         $this->dropAcquired();
+        $this->dropTable();
         Texture? $white = $this->white;
         if ($white != null) {
             Texture $w = guard $white;
@@ -342,7 +429,8 @@ public class ModelBank
 
         $this->materials->clear();
         $this->byIndex->clear();
-        $this->alphaBuckets->clear();
+        $this->dropTable();
+        $this->classes->clear();
         $this->arena->clear();
         foreach ($ids as $id) {
             $this->assets->forget($id);
@@ -400,42 +488,142 @@ public class ModelBank
             $params
         );
         if ($material->castShadow) {
-            $gpu->shadowBucket = 0;
-            // shadow.frag only discards with a cutoff, so every other caster shares one bucket
+            // the depth programs only discard with a cutoff, so every other caster is opaque
+            $gpu->shadowBucket = SCENE_BUCKET_OPAQUE as int32;
             if ($material->alphaCutoff > 0.0f) {
-                $this->alphaBuckets[] = $index;
-                $gpu->shadowBucket = $this->alphaBuckets->count() as int32;
+                $gpu->shadowBucket = SCENE_BUCKET_ALPHA as int32;
             }
         }
 
         $this->materials[$material->id] = $gpu;
         $this->byIndex[] = $gpu;
+        $this->tableRow($gpu);
         return $gpu;
     }
 
     /**
-     * Move a model's depth form into the arena, its clusters tagged with their slot's bucket.
+     * Give `$gpu` its material table row (and its maps their table slots), at a load step. The
+     * table buffer grows by doubling from the CPU rows, so a frame in flight keeps the rows it
+     * saw. Nothing on a device without bindless textures.
+     */
+    private function tableRow(MaterialGpu $gpu) : void
+    {
+        if (!$this->device->limits()->bindless) {
+            return;
+        }
+
+        if ($this->table == null) {
+            TextureTable $fresh = TextureTable($this->device);
+            $fresh->setSampler(0, $this->modelSampler());
+            $this->table = $fresh;
+        }
+
+        ModelMaterialData $p = $gpu->params;
+        ModelMaterialGpu $row = ModelMaterialGpu(
+            $baseColor: $p->baseColor,
+            $factors: $p->factors,
+            $uvScale: $p->uvScale,
+            $emissive: $p->emissive,
+            $albedo: $this->tableSlot($gpu->albedo),
+            $normal: $this->tableSlot($gpu->normal),
+            $roughness: $this->tableSlot($gpu->roughness),
+            $metallic: $this->tableSlot($gpu->metallic),
+            $ao: $this->tableSlot($gpu->ao),
+            $alpha: $this->tableSlot($gpu->alpha),
+            $emissiveMap: $this->tableSlot($gpu->emissive),
+            $height: $this->tableSlot($gpu->height)
+        );
+        assert(($gpu->index as usize) == $this->materialRows->count(), 'bank: material rows follow the dense index');
+        $this->materialRows[] = $row;
+        uint64 $rowBytes = mem::size<ModelMaterialGpu>() as uint64;
+        uint64 $need = ($this->materialRows->count() as uint64) * $rowBytes;
+        Buffer? $have = $this->materialBuffer;
+        bool $grow = true;
+        if ($have != null) {
+            Buffer $held = guard $have;
+            $grow = $held->handle->bytes < $need;
+        }
+
+        if ($grow) {
+            uint64 $cap = 64 as uint64;
+            while ($cap * $rowBytes < $need) {
+                $cap = $cap * 2;
+            }
+
+            dropBuffer($this->materialBuffer);
+            Buffer $fresh = Buffer($this->device, BufferDesc(BUFFER_STORAGE, $cap * $rowBytes, 'bank.materials'));
+            ptr<const ModelMaterialGpu> $all = ptr<const ModelMaterialGpu>(&$this->materialRows[0]);
+            $fresh->upload(ptr<const uint8>($all:$), $need, 0 as uint64);
+            $this->materialBuffer = $fresh;
+            return;
+        }
+
+        Buffer $buffer = guard $this->materialBuffer;
+        ptr<const ModelMaterialGpu> $src = ptr<const ModelMaterialGpu>(&$this->materialRows[$gpu->index as usize]);
+        $buffer->upload(ptr<const uint8>($src:$), $rowBytes, ($gpu->index as uint64) * $rowBytes);
+    }
+
+    /**
+     * `$texture`'s slot in the table, added on first use. A full table hands out the white
+     * fallback's slot, which is never full: it was the first texture in.
+     */
+    private function tableSlot(Texture $texture) : uint32
+    {
+        string $key = $texture->desc->label;
+        if ($this->tableSlots->has($key)) {
+            return $this->tableSlots[$key] as uint32;
+        }
+
+        TextureTable $table = guard $this->table;
+        int32 $slot = $table->add($texture);
+        if ($slot == TEXTURE_TABLE_FULL) {
+            info("model: texture table full; '{$key}' samples white");
+            return $this->tableSlot($this->whiteTexture());
+        }
+
+        $this->tableSlots[$key] = $slot;
+        return $slot as uint32;
+    }
+
+    private function dropTable() : void
+    {
+        TextureTable? $table = $this->table;
+        if ($table != null) {
+            TextureTable $held = guard $table;
+            $held->destroy();
+        }
+
+        $this->table = null;
+        $this->tableSlots->clear();
+        $this->materialRows->clear();
+        $this->materialBuffer = dropBuffer($this->materialBuffer);
+    }
+
+    /**
+     * Move a model's arena form into the arena, each meshlet tagged with its slot's shadow
+     * bucket, material and G-buffer class.
      */
     private function arenaAdd(Model $model) : void
     {
-        ModelDepth $depth = guard $model->depth else {
+        ModelForm $form = guard $model->form else {
             return;
         }
-        array<uint32> $buckets = array<uint32>();
+        bool $skinned = $model->skinned();
+        array<ArenaSlot> $slots = array<ArenaSlot>();
         int32 $slot = 0;
         while (($slot as usize) < $model->materials->count()) {
             MaterialGpu $m = $this->materialOf($model, $slot);
-            if ($m->shadowBucket < 0) {
-                $buckets[] = SCENE_BUCKET_NONE;
-            } else {
-                $buckets[] = $m->shadowBucket as uint32;
+            uint32 $bucket = SCENE_BUCKET_NONE;
+            if ($m->shadowBucket >= 0) {
+                $bucket = $m->shadowBucket as uint32;
             }
 
+            $slots[] = ArenaSlot($bucket, $m->index, $this->gbufferClass($m, $skinned), $m->doubleSided);
             $slot = $slot + 1;
         }
 
-        $model->arena = $this->arena->add($depth, $buckets, $model->skinned());
-        $model->depth = null;
+        $model->arena = $this->arena->add($form, $slots, $skinned);
+        $model->form = null;
     }
 
     /**

@@ -10,6 +10,10 @@
  * rendered with the same projection, so a 3 x 3 filter never leaves its cell. Dirty pages are
  * drawn into cells of a small scratch depth target (dirty page k in scratch cell k) and copied
  * into their physical cell, so no pass ever loads or stores the whole atlas.
+ *
+ * A light's generation word holds its generation in the low bits (VSM_GEN_MASK) and, from
+ * VSM_MOVED_SHIFT up, the low 16 bits of the frame it was last retired, so the request can ask
+ * a light that moved this frame for coarser pages.
  */
 #ifndef VISU_VSM_GLSL
 #define VISU_VSM_GLSL
@@ -29,6 +33,16 @@
 #define VSM_NEAR 0.05
 #define VSM_NONE 0xFFFFFFFFu
 #define VSM_GEN_MASK 0x7FFFu
+#define VSM_MOVED_SHIFT 16u
+// a page's frustum, guard included, lies inside the ball of this many light radii round the
+// light: its far plane is at the radius, and its corners at sqrt(1 + 2 (1 + 1/32)^2) of it
+#define VSM_PAGE_REACH 1.77
+
+// whether the light whose generation word is `word` was retired on `frame`: it moved this frame
+bool vsm_moved_now(uint word, uint frame)
+{
+    return (word >> VSM_MOVED_SHIFT) == (frame & 0xFFFFu);
+}
 
 // first page of each mip inside a face
 uint vsm_mip_offset(uint mip)

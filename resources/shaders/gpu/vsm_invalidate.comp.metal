@@ -38,6 +38,7 @@ struct LightGpu
     float4 color_intensity;
     float4 source;
     float4 flicker;
+    float4 spot;
 };
 
 struct LightTableBuffer
@@ -188,7 +189,7 @@ float3 vsm_view(thread const uint& face, thread const float3& d)
     return float3(dot(d, r), dot(d, u), dot(d, n));
 }
 
-kernel void cs(constant VsmParams& _280 [[buffer(2)]], const device LightTableBuffer& _334 [[buffer(6)]], device Generations& _319 [[buffer(7)]], const device Boxes& _360 [[buffer(8)]], device PageTable& _242 [[buffer(9)]], const device ChangedLights& _308 [[buffer(10)]], uint3 gl_GlobalInvocationID [[thread_position_in_grid]])
+kernel void cs(constant VsmParams& _280 [[buffer(2)]], const device LightTableBuffer& _345 [[buffer(6)]], device Generations& _320 [[buffer(7)]], const device Boxes& _371 [[buffer(8)]], device PageTable& _242 [[buffer(9)]], const device ChangedLights& _308 [[buffer(10)]], uint3 gl_GlobalInvocationID [[thread_position_in_grid]])
 {
     uint slot = gl_GlobalInvocationID.x;
     if (slot >= _280.u_vsm_counts.x)
@@ -200,39 +201,40 @@ kernel void cs(constant VsmParams& _280 [[buffer(2)]], const device LightTableBu
     {
         if (_308.changedSlots[i] == slot)
         {
-            _319.gens[slot]++;
+            uint gen = ((_320.gens[slot] & 32767u) + 1u) & 32767u;
+            _320.gens[slot] = gen | ((_280.u_vsm_counts.y & 65535u) << 16u);
             return;
         }
     }
-    float4 pr = _334.lights[slot].position_radius;
+    float4 pr = _345.lights[slot].position_radius;
     if (pr.w <= 0.0)
     {
         return;
     }
-    float _460;
-    float _472;
-    float _484;
+    float _471;
+    float _483;
+    float _495;
     for (uint b = 0u; b < _280.u_vsm_counts.w; b++)
     {
-        float3 lo = _360.boxes[b * 2u].xyz;
-        float3 hi = _360.boxes[(b * 2u) + 1u].xyz;
+        float3 lo = _371.boxes[b * 2u].xyz;
+        float3 hi = _371.boxes[(b * 2u) + 1u].xyz;
         float3 closest = fast::clamp(pr.xyz, lo, hi);
         float3 d = closest - pr.xyz;
         if (dot(d, d) > (pr.w * pr.w))
         {
             continue;
         }
-        bool _401 = all(pr.xyz >= lo);
-        bool _409;
-        if (_401)
+        bool _412 = all(pr.xyz >= lo);
+        bool _420;
+        if (_412)
         {
-            _409 = all(pr.xyz <= hi);
+            _420 = all(pr.xyz <= hi);
         }
         else
         {
-            _409 = _401;
+            _420 = _412;
         }
-        if (_409)
+        if (_420)
         {
             for (uint face = 0u; face < 6u; face++)
             {
@@ -252,29 +254,29 @@ kernel void cs(constant VsmParams& _280 [[buffer(2)]], const device LightTableBu
             {
                 if ((c & 1u) != 0u)
                 {
-                    _460 = hi.x;
+                    _471 = hi.x;
                 }
                 else
                 {
-                    _460 = lo.x;
+                    _471 = lo.x;
                 }
                 if ((c & 2u) != 0u)
                 {
-                    _472 = hi.y;
+                    _483 = hi.y;
                 }
                 else
                 {
-                    _472 = lo.y;
+                    _483 = lo.y;
                 }
                 if ((c & 4u) != 0u)
                 {
-                    _484 = hi.z;
+                    _495 = hi.z;
                 }
                 else
                 {
-                    _484 = lo.z;
+                    _495 = lo.z;
                 }
-                float3 corner = float3(_460, _472, _484);
+                float3 corner = float3(_471, _483, _495);
                 uint param_3 = face_1;
                 float3 param_4 = corner - pr.xyz;
                 float3 v = vsm_view(param_3, param_4);
@@ -285,14 +287,14 @@ kernel void cs(constant VsmParams& _280 [[buffer(2)]], const device LightTableBu
                 }
                 front = true;
                 float2 f = v.xy / float2(v.z);
-                float4 _518 = r;
-                float2 _521 = fast::min(_518.xy, f);
-                r.x = _521.x;
-                r.y = _521.y;
-                float4 _526 = r;
-                float2 _529 = fast::max(_526.zw, f);
-                r.z = _529.x;
-                r.w = _529.y;
+                float4 _529 = r;
+                float2 _532 = fast::min(_529.xy, f);
+                r.x = _532.x;
+                r.y = _532.y;
+                float4 _537 = r;
+                float2 _540 = fast::max(_537.zw, f);
+                r.z = _540.x;
+                r.w = _540.y;
             }
             if (!front)
             {
@@ -302,35 +304,35 @@ kernel void cs(constant VsmParams& _280 [[buffer(2)]], const device LightTableBu
             {
                 r = float4(-1.0, -1.0, 1.0, 1.0);
             }
-            bool _546 = r.x > 1.0;
-            bool _553;
-            if (!_546)
+            bool _557 = r.x > 1.0;
+            bool _564;
+            if (!_557)
             {
-                _553 = r.y > 1.0;
+                _564 = r.y > 1.0;
             }
             else
             {
-                _553 = _546;
+                _564 = _557;
             }
-            bool _560;
-            if (!_553)
+            bool _571;
+            if (!_564)
             {
-                _560 = r.z < (-1.0);
+                _571 = r.z < (-1.0);
             }
             else
             {
-                _560 = _553;
+                _571 = _564;
             }
-            bool _567;
-            if (!_560)
+            bool _578;
+            if (!_571)
             {
-                _567 = r.w < (-1.0);
+                _578 = r.w < (-1.0);
             }
             else
             {
-                _567 = _560;
+                _578 = _571;
             }
-            if (_567)
+            if (_578)
             {
                 continue;
             }

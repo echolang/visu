@@ -18,7 +18,8 @@ layout(std140, set = 0, binding = 0) uniform VsmParams {
     vec4 u_vsm_cluster_z;
     // x light rows, y frame, z most dirty pages, w changed boxes
     uvec4 u_vsm_counts;
-    // x shadow distance: lights farther from the eye light without a shadow
+    // x shadow distance: lights farther from the eye light without a shadow; y lights changed
+    // this frame; z levels coarser a light that moved this frame asks for
     vec4 u_vsm_shadow;
 };
 

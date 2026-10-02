@@ -14,6 +14,7 @@ struct LightGpu
     float4 color_intensity;
     float4 source;
     float4 flicker;
+    float4 spot;
 };
 
 struct LightCounters
@@ -32,6 +33,7 @@ struct LightGpu_1
     float4 color_intensity;
     float4 source;
     float4 flicker;
+    float4 spot;
 };
 
 struct LightTableBuffer
@@ -60,17 +62,90 @@ constant uint3 gl_WorkGroupSize [[maybe_unused]] = uint3(64u, 1u, 1u);
 static inline __attribute__((always_inline))
 bool light_casts(thread const LightGpu& l, thread const float3& eye, thread const float& limit)
 {
-    bool _96 = l.source.y < 0.5;
-    bool _109;
-    if (!_96)
+    bool _143 = l.source.y < 0.5;
+    bool _156;
+    if (!_143)
     {
-        _109 = distance(l.position_radius.xyz, eye) > limit;
+        _156 = distance(l.position_radius.xyz, eye) > limit;
     }
     else
     {
-        _109 = _96;
+        _156 = _143;
     }
-    return !_109;
+    return !_156;
+}
+
+static inline __attribute__((always_inline))
+void vsm_basis(thread const uint& face, thread float3& n, thread float3& r, thread float3& u)
+{
+    if (face == 0u)
+    {
+        n = float3(1.0, 0.0, 0.0);
+        r = float3(0.0, 0.0, -1.0);
+        u = float3(0.0, 1.0, 0.0);
+    }
+    else
+    {
+        if (face == 1u)
+        {
+            n = float3(-1.0, 0.0, 0.0);
+            r = float3(0.0, 0.0, 1.0);
+            u = float3(0.0, 1.0, 0.0);
+        }
+        else
+        {
+            if (face == 2u)
+            {
+                n = float3(0.0, 1.0, 0.0);
+                r = float3(1.0, 0.0, 0.0);
+                u = float3(0.0, 0.0, -1.0);
+            }
+            else
+            {
+                if (face == 3u)
+                {
+                    n = float3(0.0, -1.0, 0.0);
+                    r = float3(1.0, 0.0, 0.0);
+                    u = float3(0.0, 0.0, 1.0);
+                }
+                else
+                {
+                    if (face == 4u)
+                    {
+                        n = float3(0.0, 0.0, 1.0);
+                        r = float3(1.0, 0.0, 0.0);
+                        u = float3(0.0, 1.0, 0.0);
+                    }
+                    else
+                    {
+                        n = float3(0.0, 0.0, -1.0);
+                        r = float3(-1.0, 0.0, 0.0);
+                        u = float3(0.0, 1.0, 0.0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static inline __attribute__((always_inline))
+bool face_reached(thread const LightGpu& l, thread const uint& face)
+{
+    if (l.spot.w <= 0.0)
+    {
+        return true;
+    }
+    uint param = face;
+    float3 param_1;
+    float3 param_2;
+    float3 param_3;
+    vsm_basis(param, param_1, param_2, param_3);
+    float3 n = param_1;
+    float3 r = param_2;
+    float3 u = param_3;
+    float outer = acos(fast::clamp((-l.flicker.w) / l.spot.w, -1.0, 1.0));
+    float off = acos(fast::clamp(dot(n, l.spot.xyz), -1.0, 1.0));
+    return off < (outer + 0.955316603183746337890625);
 }
 
 static inline __attribute__((always_inline))
@@ -109,34 +184,41 @@ uint vsm_page_index(thread const uint& face, thread const uint& mip, thread cons
     return (((face * 341u) + vsm_mip_offset(param)) + (page.y * vsm_mip_side(param_1))) + page.x;
 }
 
-kernel void cs(const device LightTableBuffer& _149 [[buffer(6)]], constant VsmParams& _159 [[buffer(2)]], const device LightKeys& _138 [[buffer(7)]], const device LightCounters& _124 [[buffer(8)]], device Requests& _204 [[buffer(9)]], uint3 gl_GlobalInvocationID [[thread_position_in_grid]])
+kernel void cs(const device LightTableBuffer& _241 [[buffer(6)]], constant VsmParams& _251 [[buffer(2)]], const device LightKeys& _230 [[buffer(7)]], const device LightCounters& _216 [[buffer(8)]], device Requests& _304 [[buffer(9)]], uint3 gl_GlobalInvocationID [[thread_position_in_grid]])
 {
     uint i = gl_GlobalInvocationID.x;
-    if (i >= min(_124.lightCounters[0], 4096u))
+    if (i >= min(_216.lightCounters[0], 4096u))
     {
         return;
     }
-    uint slot = _138.keys[i] & 8191u;
-    LightGpu _154;
-    _154.position_radius = _149.lights[slot].position_radius;
-    _154.color_intensity = _149.lights[slot].color_intensity;
-    _154.source = _149.lights[slot].source;
-    _154.flicker = _149.lights[slot].flicker;
-    LightGpu l = _154;
+    uint slot = _230.keys[i] & 8191u;
+    LightGpu _246;
+    _246.position_radius = _241.lights[slot].position_radius;
+    _246.color_intensity = _241.lights[slot].color_intensity;
+    _246.source = _241.lights[slot].source;
+    _246.flicker = _241.lights[slot].flicker;
+    _246.spot = _241.lights[slot].spot;
+    LightGpu l = _246;
     LightGpu param = l;
-    float3 param_1 = _159.u_vsm_eye.xyz;
-    float param_2 = _159.u_vsm_shadow.x;
+    float3 param_1 = _251.u_vsm_eye.xyz;
+    float param_2 = _251.u_vsm_shadow.x;
     if (!light_casts(param, param_1, param_2))
     {
         return;
     }
     for (uint face = 0u; face < 6u; face++)
     {
-        uint param_3 = face;
-        uint param_4 = 4u;
-        uint2 param_5 = uint2(0u);
-        uint bit = ((slot * 64u) * 32u) + vsm_page_index(param_3, param_4, param_5);
-        uint _213 = atomic_fetch_or_explicit((device atomic_uint*)&_204.requests[bit >> 5u], 1u << (bit & 31u), memory_order_relaxed);
+        LightGpu param_3 = l;
+        uint param_4 = face;
+        if (!face_reached(param_3, param_4))
+        {
+            continue;
+        }
+        uint param_5 = face;
+        uint param_6 = 4u;
+        uint2 param_7 = uint2(0u);
+        uint bit = ((slot * 64u) * 32u) + vsm_page_index(param_5, param_6, param_7);
+        uint _313 = atomic_fetch_or_explicit((device atomic_uint*)&_304.requests[bit >> 5u], 1u << (bit & 31u), memory_order_relaxed);
     }
 }
 

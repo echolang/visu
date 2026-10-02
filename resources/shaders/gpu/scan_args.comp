@@ -1,0 +1,33 @@
+#version 450
+
+// visu::graphics::GpuScan.scanIndirect, before the levels: the count the GPU left at
+// `counts[u_scan.y]` (at most u_scan.x) becomes each level's value count and its dispatch, so a
+// scan sized on the GPU runs the blocks it needs, not the capacity's
+layout(local_size_x = 1) in;
+
+layout(std140, set = 0, binding = 0) uniform ScanParams {
+    uvec4 u_scan;
+};
+
+layout(std430, set = 2, binding = 0) readonly buffer Counts {
+    uint counts[];
+};
+
+// per level its dispatch (groups, 1, 1, 0), then the levels' value counts from word 12
+layout(std430, set = 2, binding = 1) writeonly buffer Levels {
+    uint levels[];
+};
+
+void main()
+{
+    uint n = min(counts[u_scan.y], u_scan.x);
+    for (uint l = 0u; l < 3u; l++) {
+        uint groups = (n + 1023u) / 1024u;
+        levels[l * 4u] = groups;
+        levels[l * 4u + 1u] = 1u;
+        levels[l * 4u + 2u] = 1u;
+        levels[l * 4u + 3u] = 0u;
+        levels[12u + l] = n;
+        n = groups;
+    }
+}

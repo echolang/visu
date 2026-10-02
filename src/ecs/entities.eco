@@ -2,9 +2,23 @@
  * Entity allocator plus a View<T> per component type.
  * Components are structs in a sparse set; this class is the shared registry.
  * Device is never stored here.
+ * It also keeps the move log: `move` is the one call a per-update pose writer (a physics body,
+ * a car, an animated node, the camera) makes before it writes a `Transform`. The first move of
+ * an entity in an update keeps its previous pose for interpolation and appends it to the log;
+ * `roll` starts the next update and settles whatever moved in the last one, so a still entity
+ * reads back exactly where it stands. Readers (`moveReader`) take what moved since they last
+ * looked, so a system that runs once a frame sees every update that ran in between, and the
+ * log never grows past the slowest reader. Nothing is walked per update but what moved.
  */
 
 namespace visu::ecs;
+
+use visu::geo::Transform;
+
+/**
+ * A move log cursor that no reader holds.
+ */
+internal const uint64 MOVE_READER_FREE = 0xFFFFFFFFFFFFFFFF;
 
 private class Slot<T>
 {
@@ -57,6 +71,26 @@ public class Entities
     private map<type_id, erased> $singletons;
     private int32 $hookIndex;
 
+    /**
+     * The update each entity last moved in, for the ones that ever moved. Its own sparse set,
+     * not a component: nothing attaches it but `move`.
+     */
+    private View<uint32> $moveStamp;
+    private uint32 $update;
+
+    /**
+     * Entities that moved this update, once each.
+     */
+    private array<Entity> $moved;
+
+    /**
+     * Every first move per update since the slowest reader looked, and the sequence number of
+     * its first entry.
+     */
+    private array<Entity> $moveLog;
+    private uint64 $moveBase;
+    private array<uint64> $moveReaders;
+
     public constructor()
     {
         $this->generations = array<uint32>();
@@ -67,6 +101,12 @@ public class Entities
         $this->storeOf = map<type_id, StoreBox>();
         $this->singletons = map<type_id, erased>();
         $this->hookIndex = 0;
+        $this->moveStamp = View<uint32>();
+        $this->update = 1;
+        $this->moved = array<Entity>();
+        $this->moveLog = array<Entity>();
+        $this->moveBase = 0;
+        $this->moveReaders = array<uint64>();
     }
 
     /**
@@ -80,6 +120,47 @@ public class Entities
         usize $want = $this->generations->count() + $more;
         $this->generations->reserve($want);
         $this->freelist->reserve($want);
+    }
+
+    /**
+     * Make room for `$more` entities that will carry `T`, as `reserve` does for the ids, plus the
+     * view's dense storage and the sparse pages of exactly the indices the next `$more` creates
+     * hand out (the free list's top, then fresh ones). A spawn in the displayed frame into that
+     * room allocates nothing, as long as nothing else creates in between.
+     */
+    public function reserveFor<T>(usize $more) : void
+    {
+        $this->reserve($more);
+        View<T> $view = $this->view<T>();
+        $view->reserve($view->size() + $more);
+
+        usize $left = $more;
+        usize $i = $this->freelist->count();
+        while ($left > 0 && $i > 0) {
+            $i = $i - 1;
+            uint32 $idx = $this->freelist[$i];
+            $view->commit($idx, $idx + 1);
+            $left = $left - 1;
+        }
+
+        if ($left > 0) {
+            $view->commit($this->nextIndex, $this->nextIndex + ($left as uint32));
+        }
+    }
+
+    /**
+     * Create `$count` entities into `$into` in one pass (a scatter, a map load): the id tables
+     * grow once, not per create. Recycled indices go first, as `create` would take them.
+     */
+    public function createMany(usize $count, array<Entity>& $into) : void
+    {
+        $this->reserve($count);
+        $into->reserve($into->count() + $count);
+        usize $i = 0;
+        while ($i < $count) {
+            $into->push($this->create());
+            $i = $i + 1;
+        }
     }
 
     public function create() : Entity
@@ -114,11 +195,14 @@ public class Entities
     {
         assert($this->valid($e), 'entities: destroy of invalid entity');
         $this->detachAll($e);
+        $this->moveStamp->erase($e);
 
         uint32 $idx = $e->index();
-        uint32 $ver = $this->generations[$idx as usize] + 1;
-        if ($ver > ENTITY_VERSION_MASK) {
+        uint32 $ver = $this->generations[$idx as usize];
+        if ($ver == ENTITY_VERSION_MAX) {
             $ver = 0;
+        } else {
+            $ver = $ver + 1;
         }
         $this->generations[$idx as usize] = $ver;
         $this->freelist->push($idx);
@@ -426,6 +510,166 @@ public class Entities
         }
 
         $view->fire(.change, $this, $e, $view->get($e));
+    }
+
+    /**
+     * `$e` is about to be moved: call it before writing its `Transform` in an update (a tick or
+     * the update phase) and write the pose it returns. The first call in an update keeps the pose
+     * as the previous one for interpolation and logs `$e`; later calls in the same update only
+     * hand the Transform back. It fires no hooks: a continuous mover is not an edit, and
+     * `changed<Transform>` stays for teleports and authored moves. O(1).
+     */
+    public function move(Entity $e) : Transform&
+    {
+        assert($this->valid($e), 'entities: move of invalid entity');
+        if (!$this->moveStamp->contains($e)) {
+            $this->moveStamp->attach($e, 0);
+        }
+
+        uint32& $stamp = $this->moveStamp->get($e);
+        if ($stamp != $this->update) {
+            $stamp = $this->update;
+            $this->get<Transform>($e)->storePrevious();
+            $this->moved[] = $e;
+            $this->moveLog[] = $e;
+        }
+
+        return $this->get<Transform>($e);
+    }
+
+    /**
+     * Start the next update: everything that moved in the last one takes its current pose as its
+     * previous one, so an entity that stops moving reads back where it stands, and the log drops
+     * what every reader has taken. `Systems` calls this once per update, before its first write.
+     * O(moved last update).
+     */
+    public function roll() : void
+    {
+        foreach ($this->moved as $e) {
+            if ($this->valid($e) && $this->has<Transform>($e)) {
+                $this->get<Transform>($e)->storePrevious();
+            }
+        }
+
+        $this->moved->clear();
+        $this->update = $this->update + 1;
+        $this->trimMoves();
+    }
+
+    /**
+     * Room for `$movers` entities moving in one update and in the log, so a pile or a swarm
+     * logs into capacity taken at load.
+     */
+    public function reserveMoves(usize $movers) : void
+    {
+        $this->moved->reserve($movers);
+        $this->moveLog->reserve($movers * 2);
+        $this->moveStamp->reserve($movers);
+    }
+
+    /**
+     * A new move log reader, reading from now on. Release it with `releaseMoveReader`, or the log
+     * keeps everything since it last read.
+     */
+    public function moveReader() : int32
+    {
+        uint64 $now = $this->moveBase + ($this->moveLog->count() as uint64);
+        int32 $i = 0;
+        while (($i as usize) < $this->moveReaders->count()) {
+            if ($this->moveReaders[$i as usize] == MOVE_READER_FREE) {
+                $this->moveReaders[$i as usize] = $now;
+                return $i;
+            }
+
+            $i = $i + 1;
+        }
+
+        $this->moveReaders[] = $now;
+        return ($this->moveReaders->count() as int32) - 1;
+    }
+
+    public function releaseMoveReader(int32 $reader) : void
+    {
+        if ($reader < 0 || ($reader as usize) >= $this->moveReaders->count()) {
+            return;
+        }
+
+        $this->moveReaders[$reader as usize] = MOVE_READER_FREE;
+    }
+
+    /**
+     * Append to `$into` every entity logged since `$reader` last read, oldest first, and move the
+     * reader to the end. An entity that moved in several updates in between comes once per update:
+     * the reader keeps its own stamp if it wants one entry. O(new entries).
+     */
+    public function moves(int32 $reader, array<Entity>& $into) : void
+    {
+        assert($reader >= 0 && ($reader as usize) < $this->moveReaders->count(), 'entities: unknown move reader');
+        uint64 $from = $this->moveReaders[$reader as usize];
+        assert($from != MOVE_READER_FREE, 'entities: read through a released move reader');
+        usize $i = ($from - $this->moveBase) as usize;
+        usize $n = $this->moveLog->count();
+        while ($i < $n) {
+            $into[] = $this->moveLog[$i];
+            $i = $i + 1;
+        }
+
+        $this->moveReaders[$reader as usize] = $this->moveBase + ($n as uint64);
+    }
+
+    /**
+     * The update in progress: `roll` counts one on. A reader that runs less often than updates
+     * compares it to tell whether an update ran since it last looked.
+     */
+    public const function updateIndex() : uint32
+    {
+        return $this->update;
+    }
+
+    /**
+     * Whether `$e` moved in this update.
+     */
+    public function movedNow(Entity $e) : bool
+    {
+        if (!$this->moveStamp->contains($e)) {
+            return false;
+        }
+
+        return $this->moveStamp->get($e) == $this->update;
+    }
+
+    /**
+     * Drop the log entries every reader has taken; with no reader, all of them.
+     */
+    private function trimMoves() : void
+    {
+        uint64 $end = $this->moveBase + ($this->moveLog->count() as uint64);
+        uint64 $keepFrom = $end;
+        foreach ($this->moveReaders as $cursor) {
+            if ($cursor != MOVE_READER_FREE && $cursor < $keepFrom) {
+                $keepFrom = $cursor;
+            }
+        }
+
+        usize $drop = ($keepFrom - $this->moveBase) as usize;
+        if ($drop == 0) {
+            return;
+        }
+
+        if ($drop == $this->moveLog->count()) {
+            $this->moveLog->clear();
+        } else {
+            usize $n = $this->moveLog->count();
+            usize $i = $drop;
+            while ($i < $n) {
+                $this->moveLog[$i - $drop] = $this->moveLog[$i];
+                $i = $i + 1;
+            }
+
+            $this->moveLog->truncate($n - $drop);
+        }
+
+        $this->moveBase = $keepFrom;
     }
 
     private function listen<T>(HookKind $kind, function<void(Entities, Entity, const T&)> $fn) : EntityHook

@@ -1,0 +1,114 @@
+/**
+ * Makes a dynamic body drive on wheels. Put it on the root that carries the chassis `Collider`
+ * and a dynamic `RigidBody`; `VehicleSystem` then casts the wheels, works out the springs and the
+ * tires, and pushes the body inside every physics step. Bullet still owns the chassis: its mass,
+ * its inertia, its collisions.
+ *
+ * The driver writes `controls`. Wheel models are optional: give each wheel's node with
+ * `wheelNode` and `VehicleSystem` turns, steers and lifts it every update the car moved.
+ */
+
+namespace visu::components;
+
+use visu::ecs::Entity;
+use visu::math::Vec3;
+use visu::physics::{VehicleControls, VehicleSpec, VehicleWheelState};
+
+public struct Vehicle
+{
+    public VehicleSpec $spec;
+    public VehicleControls $controls;
+
+    /**
+     * Each wheel as the last step left it, in `spec.wheels` order.
+     */
+    public fixed_array<VehicleWheelState, 6> $wheels;
+
+    /**
+     * The model node each wheel turns, `Entity::none()` for none, and its local position as it was
+     * authored, which the suspension lifts.
+     */
+    public fixed_array<Entity, 6> $nodes;
+    public fixed_array<Vec3, 6> $rest;
+
+    /**
+     * Radians the steered wheels point left of straight ahead.
+     */
+    public float32 $steerAngle;
+
+    /**
+     * Metres per second along the chassis forward and to its left, and the wheels on the ground,
+     * as of the last step.
+     */
+    public float32 $forwardSpeed;
+    public float32 $sideSpeed;
+    public int32 $grounded;
+
+    /**
+     * Someone is at the wheel. A driven vehicle still sleeps once it and everything it touches
+     * are still, like a parked one, and wakes on the first step its controls ask to throttle or
+     * steer. It is never held awake: Bullet keeps a whole island awake round a body that cannot
+     * sleep, so a car resting against a pile would hold every box of it awake.
+     */
+    public bool $driven;
+
+    /**
+     * Whether the last step pushed it (it was awake).
+     */
+    public bool $awake;
+
+    /**
+     * Whether a step ran since the wheels were last posed.
+     */
+    internal bool $stepped;
+
+    /**
+     * Whether the body's sleep thresholds were set from the spec, and which way the last step ran
+     * the wheels (it alternates, so the clamps favour no side).
+     */
+    internal bool $tuned;
+    internal bool $sweep;
+
+    public constructor(VehicleSpec $spec)
+    {
+        $this->spec = $spec;
+        $this->controls = VehicleControls();
+        for (usize $i = 0; $i < 6; $i++) {
+            $this->wheels[$i] = VehicleWheelState();
+            $this->nodes[$i] = Entity::none();
+            $this->rest[$i] = Vec3(0.0f, 0.0f, 0.0f);
+        }
+
+        $this->steerAngle = 0.0f;
+        $this->forwardSpeed = 0.0f;
+        $this->sideSpeed = 0.0f;
+        $this->grounded = 0;
+        $this->driven = false;
+        $this->awake = false;
+        $this->stepped = false;
+        $this->tuned = false;
+        $this->sweep = false;
+    }
+
+    /**
+     * Turn `$node` as wheel `$wheel`, a child of the vehicle's root authored at `$rest` (its local
+     * position, the wheel's centre).
+     */
+    public function wheelNode(int32 $wheel, Entity $node, Vec3 $rest) : void
+    {
+        if ($wheel < 0 || $wheel >= 6) {
+            return;
+        }
+
+        $this->nodes[$wheel as usize] = $node;
+        $this->rest[$wheel as usize] = $rest;
+    }
+
+    /**
+     * Metres per second the vehicle covers along its forward.
+     */
+    public const function speed() : float32
+    {
+        return $this->forwardSpeed;
+    }
+}

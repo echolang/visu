@@ -2,7 +2,9 @@
 
 // visu::graphics::ShadowAtlas, receivers: one G-buffer sample per step x step block asks, for
 // every shadowed light its clustered lists give that pixel, for the page its footprint wants
-// and for the coarsest page of that face, so a lookup always has a level to fall back to
+// and for the coarsest page of that face, so a lookup always has a level to fall back to. A
+// light that moved this frame asks `u_vsm_shadow.z` levels coarser: its pages are redrawn every
+// frame anyway, and the lookup walks down to whatever level was drawn
 layout(local_size_x = 8, local_size_y = 8) in;
 
 #include "visu/vsmcull.glsl"
@@ -21,6 +23,10 @@ layout(std430, set = 2, binding = 5) readonly buffer State {
 
 layout(std430, set = 2, binding = 6) readonly buffer LightCounters {
     uint lightCounters[];
+};
+
+layout(std430, set = 2, binding = 7) readonly buffer Generations {
+    uint gens[];
 };
 
 void request(uint slot, uint page)
@@ -76,13 +82,22 @@ void main()
                 continue;
             }
             vec3 d = world - l.position_radius.xyz;
-            if (dot(d, d) >= l.position_radius.w * l.position_radius.w) {
+            float dd = dot(d, d);
+            if (dd >= l.position_radius.w * l.position_radius.w) {
+                continue;
+            }
+            // a receiver outside a spot's cone is never lit by it, so it needs no page
+            if (light_cone(l, d * inversesqrt(max(dd, 1e-8))) <= 0.0) {
                 continue;
             }
             uint face = vsm_face(d);
             vec3 v = vsm_view(face, d);
             vec2 f = v.xy / max(v.z, 1e-6);
-            uint mip = vsm_mip(footprint, v.z, bias);
+            float lightBias = bias;
+            if (vsm_moved_now(gens[slot], u_vsm_counts.y)) {
+                lightBias += u_vsm_shadow.z;
+            }
+            uint mip = vsm_mip(footprint, v.z, lightBias);
             request(slot, vsm_page_index(face, mip, vsm_page_xy(f, mip)));
         }
     }

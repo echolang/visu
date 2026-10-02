@@ -361,8 +361,31 @@ public struct Transform
     }
 
     /**
+     * The pose `storePrevious` kept, or the current one when none was kept.
+     */
+    public const function previousPose() : Pose
+    {
+        if ($this->previous == null) {
+            return Pose($this->position, $this->orientation, $this->scale);
+        }
+
+        Pose $prev = guard $this->previous;
+        return $prev;
+    }
+
+    /**
+     * The current TRS as a pose.
+     */
+    public const function pose() : Pose
+    {
+        return Pose($this->position, $this->orientation, $this->scale);
+    }
+
+    /**
      * Interpolate between the previous pose and the current TRS.
-     * Position and scale lerp; orientation slerps. Current TRS when nothing was stored.
+     * Position and scale lerp; orientation slerps. Current TRS when nothing was stored, or when
+     * the previous pose is the current one: a resting body reads back exactly where it is, so
+     * its bounds do not wobble with the frame's alpha and nothing downstream thinks it moved.
      */
     public const function mix(float32 $alpha) : Pose
     {
@@ -371,6 +394,10 @@ public struct Transform
         }
 
         Pose $prev = guard $this->previous;
+        if ($prev->position == $this->position && $prev->orientation == $this->orientation && $prev->scale == $this->scale) {
+            return Pose($this->position, $this->orientation, $this->scale);
+        }
+
         return Pose(
             visu::math::mix($prev->position, $this->position, $alpha),
             slerp($prev->orientation, $this->orientation, $alpha),

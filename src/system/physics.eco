@@ -1,0 +1,400 @@
+/**
+ * Keeps a `PhysicsWorld` in step with the entities and steps it. A `Collider` or `Sensor` gets
+ * its body when it is attached and loses it on detach; `changed<Transform>` re-places a body,
+ * `changed<Collider>` / `changed<Sensor>` / `changed<RigidBody>` rebuild one. Nothing walks the
+ * colliders per frame.
+ *
+ * On the `pass` clock, one step per simulation pass, capped per update by
+ * `PhysicsSettings.maxStepsPerUpdate`; on the `update` clock, one step per update in the update
+ * phase, so bind it after whatever drives a kinematic body there. Nothing steps while
+ * `PhysicsWorld.paused`. A step reads the kinematic bodies' transforms, advances, and writes back
+ * only the dynamic bodies that moved, so its cost follows what is awake, not what exists. Dynamic transforms are interpolated
+ * by the render like any mover: `begin` stores the previous pose of what the last update moved,
+ * and a body woken mid-update stores its own before its first write.
+ *
+ * A `PhysicsStepper` added with `addStepper` runs inside every step, after the kinematic read and
+ * before the advance: the hook for code that pushes bodies itself, such as `VehicleSystem`.
+ *
+ * Given a dispatcher, a step also reports each dynamic body that starts moving (`BodyWoke`) and
+ * each one that falls asleep (`BodySlept`), in O(awake): what moved is the step's own list, and
+ * what stopped is whatever was awake and is missing from it.
+ */
+
+namespace visu::system;
+
+use visu::components::{Collider, RigidBody, Sensor};
+use visu::ecs::{Entities, Entity, EntityHook, Schedule, System, View};
+use visu::geo::Transform;
+use visu::graphics::RenderContext;
+use visu::math::{Quat, Vec3};
+use visu::physics::{BodySlept, BodyWoke, ContactBegan, ContactEnded, PhysicsClock, PhysicsStepper, PhysicsWorld};
+use visu::signal::Dispatcher;
+
+public class PhysicsSystem : System
+{
+    public PhysicsWorld $world;
+    private Dispatcher? $signals;
+
+    /**
+     * Entities whose bodies wait to be built: attached since the last step, or edited. Built at
+     * the next `begin` or step, so an entity that gains a `Collider` and a `RigidBody` one after
+     * the other is built once, as what it ended up being.
+     */
+    internal array<Entity> $pending;
+
+    private int32 $steps;
+
+    /**
+     * Rows told awake. A freed or rebuilt row is dropped the next time the list is swept.
+     */
+    private array<int32> $awake;
+    private int64 $stepCount;
+    private array<EntityHook> $hooks;
+    private array<PhysicsStepper> $steppers;
+    private array<int32> $stepperIds;
+    private int32 $nextStepper;
+
+    public constructor(PhysicsWorld $world, Dispatcher? $signals = null)
+    {
+        $this->world = $world;
+        $this->signals = $signals;
+        $this->pending = arr::room<Entity>(256);
+        $this->steps = 0;
+        $this->awake = arr::room<int32>($world->settings->capacity as usize);
+        $this->stepCount = 0;
+        $this->hooks = arr::room<EntityHook>(8);
+        $this->steppers = arr::room<PhysicsStepper>(8);
+        $this->stepperIds = arr::room<int32>(8);
+        $this->nextStepper = 0;
+    }
+
+    /**
+     * Run `$stepper` inside every step from now on, in the order they were added. The id it
+     * returns takes it out again (`removeStepper`), as a stepper's own `unregister` should.
+     */
+    public function addStepper(PhysicsStepper $stepper) : int32
+    {
+        int32 $id = $this->nextStepper;
+        $this->nextStepper = $id + 1;
+        $this->steppers[] = $stepper;
+        $this->stepperIds[] = $id;
+        return $id;
+    }
+
+    public function removeStepper(int32 $id) : void
+    {
+        for (usize $i = 0; $i < $this->stepperIds->count(); $i++) {
+            if ($this->stepperIds[$i] == $id) {
+                $this->steppers->remove($i);
+                $this->stepperIds->remove($i);
+                return;
+            }
+        }
+    }
+
+    /**
+     * Every collider and sensor already in the world gets its body now (scene load), and the hooks
+     * keep later ones in step.
+     */
+    public function register(Entities $entities) : void
+    {
+        PhysicsSystem $sys = $this;
+        $this->hooks[] = $entities->onAttach<Collider>(function(Entities $w, Entity $e, const Collider& $c) : void {
+            $sys->pending[] = $e;
+        });
+        $this->hooks[] = $entities->onAttach<Sensor>(function(Entities $w, Entity $e, const Sensor& $s) : void {
+            $sys->pending[] = $e;
+        });
+        $this->hooks[] = $entities->onAttach<RigidBody>(function(Entities $w, Entity $e, const RigidBody& $b) : void {
+            $sys->pending[] = $e;
+        });
+        $this->hooks[] = $entities->onDetach<Collider>(function(Entities $w, Entity $e, const Collider& $c) : void {
+            $sys->world->remove($e);
+        });
+        $this->hooks[] = $entities->onDetach<Sensor>(function(Entities $w, Entity $e, const Sensor& $s) : void {
+            $sys->world->removeSensor($e);
+        });
+        $this->hooks[] = $entities->onDetach<RigidBody>(function(Entities $w, Entity $e, const RigidBody& $b) : void {
+            // rebuilt as static next step, unless the collider goes too
+            $sys->world->remove($e);
+            $sys->pending[] = $e;
+        });
+        $this->hooks[] = $entities->onChange<Collider>(function(Entities $w, Entity $e, const Collider& $c) : void {
+            $sys->pending[] = $e;
+        });
+        $this->hooks[] = $entities->onChange<Sensor>(function(Entities $w, Entity $e, const Sensor& $s) : void {
+            $sys->pending[] = $e;
+        });
+        $this->hooks[] = $entities->onChange<RigidBody>(function(Entities $w, Entity $e, const RigidBody& $b) : void {
+            $sys->pending[] = $e;
+        });
+        $this->hooks[] = $entities->onChange<Transform>(function(Entities $w, Entity $e, const Transform& $t) : void {
+            $sys->moved($w, $e);
+        });
+
+        visu::profile::begin('physics/load');
+        foreach ($entities->ids<Collider>() as $e) {
+            $this->build($entities, $e);
+        }
+
+        foreach ($entities->ids<Sensor>() as $e) {
+            $this->build($entities, $e);
+        }
+        visu::profile::end();
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+        foreach ($this->hooks as $hook) {
+            $entities->release($hook);
+        }
+
+        $this->hooks->clear();
+        $this->pending->clear();
+        $this->awake->clear();
+        $this->world->clear();
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->render = false;
+        PhysicsSystem $sys = $this;
+        $schedule->begin(function(Entities $entities) : void {
+            $sys->begin($entities);
+        });
+        if ($this->world->settings->clock == PhysicsClock::update) {
+            return;
+        }
+
+        $schedule->update = false;
+        $schedule->every(1, function(Entities $entities, int64 $pass) : void {
+            $sys->step($entities);
+        });
+    }
+
+    /**
+     * The `update` clock's one step. The `pass` clock opts out of this phase.
+     */
+    public function update(Entities $entities) : void
+    {
+        $this->step($entities);
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+    }
+
+    /**
+     * Once per update, before its passes: the step budget refills and pending bodies are built
+     * even when no pass will run (a paused clock still gets its colliders). What the last update
+     * moved settles through the move log (`Entities.roll`).
+     */
+    internal function begin(Entities $entities) : void
+    {
+        $this->steps = 0;
+        $this->flush($entities);
+    }
+
+    internal function step(Entities $entities) : void
+    {
+        if ($this->world->paused || $this->steps >= $this->world->settings->maxStepsPerUpdate) {
+            return;
+        }
+
+        $this->steps = $this->steps + 1;
+        visu::profile::begin('physics');
+        $this->flush($entities);
+
+        visu::profile::begin('kinematic');
+        // one view for the step, and a root's pose read in place: no copy, no chain, no matrix
+        View<Transform> $transforms = $entities->view<Transform>();
+        foreach ($this->world->kinematics as $slot) {
+            Entity $e = $this->world->entityAt($slot);
+            Transform& $t = $transforms->get($e);
+            if ($t->parent == Entity::none()) {
+                $this->world->drive($slot, $t->position, $t->orientation);
+            } else {
+                $this->world->drive($slot, $t->worldPosition($entities), $t->worldOrientation($entities));
+            }
+        }
+        visu::profile::end();
+
+        float32 $dt = $this->world->settings->step;
+        foreach ($this->steppers as $stepper) {
+            $stepper->beforeStep($entities, $this->world, $dt);
+        }
+
+        visu::profile::begin('step');
+        $this->world->step();
+        visu::profile::end();
+
+        visu::profile::begin('sync');
+        foreach ($this->world->poses as $pose) {
+            $this->follow($entities, $pose);
+        }
+        visu::profile::end();
+
+        if ($this->signals != null) {
+            visu::profile::begin('sleep');
+            $this->report();
+            visu::profile::end();
+        }
+
+        if ($this->world->settings->contacts) {
+            visu::profile::begin('events');
+            $this->announce();
+            visu::profile::end();
+        }
+
+        visu::profile::end();
+    }
+
+    /**
+     * `$e`'s transform was changed by hand. A body that is still waiting is built from the new
+     * pose anyway; a dynamic one is teleported and its interpolation dropped; a new scale
+     * rebuilds the shape at the next build.
+     */
+    internal function moved(Entities $entities, Entity $e) : void
+    {
+        Transform& $t = $entities->get<Transform>($e);
+        if ($this->world->rescaled($e, $t->worldScale($entities))) {
+            $this->pending[] = $e;
+        }
+
+        bool $dynamic = $this->world->place($e, $t->worldPosition($entities), $t->worldOrientation($entities));
+        if ($dynamic) {
+            $t->resetPrevious();
+        }
+    }
+
+    /**
+     * Build every pending body. Entities destroyed since, or that lost the component, are skipped.
+     */
+    private function flush(Entities $entities) : void
+    {
+        if ($this->pending->empty()) {
+            return;
+        }
+
+        foreach ($this->pending as $e) {
+            if ($entities->valid($e)) {
+                $this->build($entities, $e);
+            }
+        }
+
+        $this->pending->clear();
+    }
+
+    private function build(Entities $entities, Entity $e) : void
+    {
+        if (!$entities->has<Transform>($e)) {
+            return;
+        }
+
+        Transform $t = $entities->get<Transform>($e);
+        Vec3 $position = $t->worldPosition($entities);
+        Quat $orientation = $t->worldOrientation($entities);
+        Vec3 $scale = $t->worldScale($entities);
+
+        if ($entities->has<Collider>($e)) {
+            Collider $c = $entities->get<Collider>($e);
+            RigidBody? $rb = null;
+            if ($entities->has<RigidBody>($e)) {
+                $rb = $entities->get<RigidBody>($e);
+                assert($t->parent == Entity::none(), 'physics: a rigid body must be on a root entity');
+            }
+            $this->world->add($e, $c, $rb, $position, $orientation, $scale);
+        }
+
+        if ($entities->has<Sensor>($e)) {
+            Sensor $s = $entities->get<Sensor>($e);
+            $this->world->addSensor($e, $s, $position, $orientation, $scale);
+        }
+    }
+
+    /**
+     * Write a moved dynamic body back into its root transform through `Entities.move`, which keeps
+     * the previous pose on its first write of the update.
+     */
+    private function follow(Entities $entities, bt::BodyPose $pose) : void
+    {
+        if ($pose->slot < 0) {
+            return;
+        }
+
+        Entity $e = $this->world->entityAt($pose->slot);
+        if ($e == Entity::none()) {
+            return;
+        }
+
+        Transform& $t = $entities->move($e);
+        Quat $orientation = Quat($pose->at->rotation->x, $pose->at->rotation->y, $pose->at->rotation->z, $pose->at->rotation->w);
+        Vec3 $origin = Vec3($pose->at->origin->x, $pose->at->origin->y, $pose->at->origin->z);
+        $t->orientation = $orientation;
+        $t->position = $origin - $orientation * $this->world->rows[$pose->slot as usize]->lever;
+    }
+
+    /**
+     * `BodyWoke` for each body this step moved that was not awake, `BodySlept` for each awake one
+     * it did not move.
+     */
+    private function report() : void
+    {
+        Dispatcher $signals = guard $this->signals else {
+            return;
+        }
+
+        $this->stepCount = $this->stepCount + 1;
+        foreach ($this->world->poses as $pose) {
+            if ($pose->slot < 0) {
+                continue;
+            }
+
+            usize $slot = $pose->slot as usize;
+            $this->world->rows[$slot]->seen = $this->stepCount;
+            if (!$this->world->rows[$slot]->awake) {
+                $this->world->rows[$slot]->awake = true;
+                $this->awake[] = $pose->slot;
+                $signals->dispatch(BodyWoke($this->world->rows[$slot]->entity));
+            }
+        }
+
+        usize $keep = 0;
+        for (usize $i = 0; $i < $this->awake->count(); $i++) {
+            int32 $slot = $this->awake[$i];
+            BodyRow $row = $this->world->rows[$slot as usize];
+            if ($row->body == null || !$row->awake) {
+                continue;
+            }
+
+            if ($row->seen != $this->stepCount) {
+                $this->world->rows[$slot as usize]->awake = false;
+                $signals->dispatch(BodySlept($row->entity));
+                continue;
+            }
+
+            $this->awake[$keep] = $slot;
+            $keep = $keep + 1;
+        }
+
+        $this->awake->truncate($keep);
+    }
+
+    private function announce() : void
+    {
+        Dispatcher $signals = guard $this->signals else {
+            return;
+        }
+
+        foreach ($this->world->events as $event) {
+            match ($event) {
+                bt::ContactEvent::began($a, $b) => {
+                    $signals->dispatch(ContactBegan($this->world->entityAt($a->slot()), $this->world->entityAt($b->slot())));
+                },
+                bt::ContactEvent::ended($a, $b) => {
+                    $signals->dispatch(ContactEnded($this->world->entityAt($a->slot()), $this->world->entityAt($b->slot())));
+                },
+            };
+        }
+    }
+}

@@ -1,0 +1,570 @@
+/**
+ * The vehicle tire model: its pure pieces on their own, then a car on a flat ground box stepped
+ * by hand through `PhysicsSystem` and `VehicleSystem`.
+ */
+
+use visu::components::{Collider, RigidBody, Vehicle};
+use visu::ecs::{Entities, Entity, Systems};
+use visu::geo::Transform;
+use visu::math::{Quat, Vec2, Vec3, dot, length};
+use visu::physics::{
+    BodyKind, ColliderShape, PhysicsBody, PhysicsSettings, PhysicsStepper, PhysicsWorld, TireCurve, VehicleSpec, VehicleWheel,
+    contactEffectiveMass, solveSlip, tireLoad, tireSlipAngle, tireSlipRatio, wheelOmegaClamp
+};
+use visu::system::{PhysicsSystem, VehicleSystem};
+
+internal function carNear(float32 $a, float32 $b, float32 $eps) : bool
+{
+    return std::math::abs($a - $b) <= $eps;
+}
+
+test tire_curve_passes_its_points_and_never_overshoots
+{
+    array<Vec2> $points = [Vec2(0.0f, 0.0f), Vec2(0.1f, 1.0f), Vec2(0.4f, 0.8f), Vec2(1.0f, 0.7f)];
+    TireCurve $c = TireCurve($points);
+    assert(carNear($c->at(0.0f), 0.0f, 0.0001f));
+    assert(carNear($c->at(0.1f), 1.0f, 0.0001f));
+    assert(carNear($c->at(0.4f), 0.8f, 0.0001f));
+    assert(carNear($c->at(-3.0f), 0.0f, 0.0001f));
+    assert(carNear($c->at(9.0f), 0.7f, 0.0001f));
+    assert(carNear($c->peak(), 1.0f, 0.0001f));
+
+    // rising to the peak, falling after it, never above it
+    float32 $last = -1.0f;
+    for (int32 $i = 0; $i <= 50; $i++) {
+        float32 $y = $c->at(($i as float32) * 0.002f);
+        assert($y >= $last - 0.00001f);
+        assert($y <= 1.00001f);
+        $last = $y;
+    }
+
+    for (int32 $i = 0; $i <= 90; $i++) {
+        float32 $y = $c->at(0.1f + ($i as float32) * 0.01f);
+        assert($y <= $last + 0.00001f);
+        $last = $y;
+    }
+
+    TireCurve $flat = TireCurve(0.5f);
+    assert($flat->at(3.0f) == 0.5f);
+}
+
+test slip_stays_bounded_at_a_standstill
+{
+    // a wheel spinning on the spot reads the low-speed slip, not infinity
+    assert(carNear(tireSlipRatio(1.0f, 0.0f, 1.0f), 1.0f, 0.0001f));
+    assert(tireSlipRatio(0.0f, 0.0f, 1.0f) == 0.0f);
+    assert(carNear(tireSlipRatio(22.0f, 20.0f, 1.0f), 0.1f, 0.0001f));
+    // locked at speed is minus one
+    assert(carNear(tireSlipRatio(0.0f, 15.0f, 1.0f), -1.0f, 0.0001f));
+}
+
+test slip_angle_reads_the_same_in_reverse
+{
+    assert(carNear(tireSlipAngle(5.0f, 1.0f, 1.0f), tireSlipAngle(-5.0f, 1.0f, 1.0f), 0.00001f));
+    assert(tireSlipAngle(5.0f, 1.0f, 1.0f) > 0.0f);
+    assert(tireSlipAngle(5.0f, -1.0f, 1.0f) < 0.0f);
+}
+
+test load_response_runs_from_rest_to_instant
+{
+    assert(carNear(tireLoad(1000.0f, 3000.0f, 0.0f, 9000.0f), 1000.0f, 0.01f));
+    assert(carNear(tireLoad(1000.0f, 3000.0f, 1.0f, 9000.0f), 3000.0f, 0.01f));
+    assert(carNear(tireLoad(1000.0f, 4000.0f, 0.5f, 9000.0f), 2000.0f, 0.1f));
+    assert(carNear(tireLoad(1000.0f, 50000.0f, 1.0f, 3000.0f), 3000.0f, 0.01f));
+    assert(tireLoad(1000.0f, -5.0f, 0.5f, 3000.0f) == 0.0f);
+}
+
+test clamps_never_reverse_the_slip
+{
+    // with grip to spare the solve stops at the impulse that zeroes the slip, shared by a 1.2 kg m2
+    // wheel and 300 kg of chassis, and never past it; short of grip it gives what the curve allows
+    float32 $share = 0.3f * 0.3f / 1.2f + 1.0f / 300.0f;
+    TireCurve $flat = TireCurve(1.0f);
+    float32 $j = solveSlip($flat, 2.0f, $share, 1.0f, 1000000.0f);
+    assert(carNear(2.0f - $j * $share, 0.0f, 0.001f));
+    assert(2.0f - $j * $share >= 0.0f);
+    assert(carNear(solveSlip($flat, -2.0f, $share, 1.0f, 5.0f), -5.0f, 0.01f));
+
+    // tread faster than the road may not end slower than it, and the other way
+    assert(wheelOmegaClamp(5.0f, 1.0f, 10.0f, 0.3f) == 10.0f);
+    assert(wheelOmegaClamp(12.0f, 1.0f, 10.0f, 0.3f) == 12.0f);
+    assert(wheelOmegaClamp(15.0f, -1.0f, 10.0f, 0.3f) == 10.0f);
+}
+
+test effective_mass_is_the_mass_at_the_centre
+{
+    Vec3 $inv = Vec3(1.0f / 1800.0f, 1.0f / 2000.0f, 1.0f / 400.0f);
+    float32 $m = contactEffectiveMass(1.0f / 1200.0f, $inv, Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 0.0f, 0.0f), 1.0f, 1.0f);
+    assert(carNear($m, 1200.0f, 0.5f));
+
+    // off the centre a push also turns the body, so it shows less mass, and less still unscaled
+    Vec3 $lever = Vec3(0.8f, -0.6f, 1.2f);
+    float32 $off = contactEffectiveMass(1.0f / 1200.0f, $inv, $lever, Vec3(1.0f, 0.0f, 0.0f), 1.0f, 1.0f);
+    float32 $calm = contactEffectiveMass(1.0f / 1200.0f, $inv, $lever, Vec3(1.0f, 0.0f, 0.0f), 0.3f, 0.3f);
+    assert($off < 1200.0f);
+    assert($calm > $off);
+}
+
+/**
+ * A 1200 kg graybox sedan: four wheels, rear biased drive, front biased brakes, both axles
+ * barred.
+ */
+internal function carTestSpec() : VehicleSpec
+{
+    VehicleSpec $spec = VehicleSpec();
+    for (int32 $i = 0; $i < 4; $i++) {
+        bool $front = $i < 2;
+        float32 $x = 0.78f;
+        if ($i % 2 == 1) {
+            $x = -0.78f;
+        }
+        float32 $z = -1.25f;
+        if ($front) {
+            $z = 1.25f;
+        }
+
+        VehicleWheel $w = VehicleWheel(Vec3($x, 0.53f, $z), 0.32f, front: $front);
+        if ($front) {
+            $w->spring = 32000.0f;
+            $w->drive = 0.15f;
+            $w->brake = 0.325f;
+        } else {
+            $w->drive = 0.35f;
+            $w->brake = 0.175f;
+        }
+        $w->pair = $i + 1 - 2 * ($i % 2);
+        $spec->add($w);
+    }
+
+    return $spec;
+}
+
+/**
+ * A flat 400 m ground box with its top at y = 0 and a car standing on it, both systems bound and
+ * registered, stepped by hand on the pass clock.
+ */
+internal class CarRig
+{
+    public Entities $entities;
+    public Systems $systems;
+    public PhysicsWorld $world;
+    public Entity $car;
+
+    public constructor(float32 $yaw = 0.0f, float32 $height = 0.05f, float32 $roll = 0.0f, float32 $grip = 1.0f)
+    {
+        $this->entities = Entities();
+        $this->systems = Systems();
+        PhysicsSettings $settings = PhysicsSettings();
+        $settings->capacity = 16;
+        $settings->maxStepsPerUpdate = 100000;
+        $this->world = PhysicsWorld($settings);
+        PhysicsSystem $physics = PhysicsSystem($this->world);
+        $this->systems->bind($physics);
+        $this->systems->bind(VehicleSystem($physics));
+
+        Entity $ground = $this->entities->create();
+        Transform $gt = Transform();
+        $gt->position = Vec3(0.0f, -1.0f, 0.0f);
+        $this->entities->attach<Transform>($ground, $gt);
+        Collider $floor = Collider(ColliderShape::box(Vec3(200.0f, 1.0f, 200.0f)));
+        $floor->grip = $grip;
+        $this->entities->attach<Collider>($ground, $floor);
+
+        $this->car = $this->entities->create();
+        Transform $t = Transform();
+        $t->position = Vec3(0.0f, $height, 0.0f);
+        $t->orientation = Quat(angleAxis: $yaw, Vec3(0.0f, 1.0f, 0.0f)) * Quat(angleAxis: $roll, Vec3(0.0f, 0.0f, 1.0f));
+        $this->entities->attach<Transform>($this->car, $t);
+        $this->entities->attach<Collider>($this->car, Collider(ColliderShape::box(Vec3(0.87f, 0.5f, 2.05f)), offset: Vec3(0.0f, 0.7f, 0.0f)));
+        RigidBody $rb = RigidBody(BodyKind::dynamic, 1200.0f);
+        $rb->linearDamping = 0.0f;
+        $rb->angularDamping = 0.05f;
+        $this->entities->attach<RigidBody>($this->car, $rb);
+        $this->entities->attach<Vehicle>($this->car, Vehicle(carTestSpec()));
+        $this->systems->register($this->entities);
+    }
+
+    public function run(int32 $steps) : void
+    {
+        $this->systems->begin($this->entities);
+        for (int32 $i = 0; $i < $steps; $i++) {
+            $this->systems->tick($this->entities);
+        }
+        $this->systems->update($this->entities);
+    }
+
+    public function vehicle() : Vehicle&
+    {
+        return $this->entities->get<Vehicle>($this->car);
+    }
+
+    public function pose() : Transform
+    {
+        return $this->entities->get<Transform>($this->car);
+    }
+
+    public function body() : PhysicsBody
+    {
+        PhysicsBody $b = guard $this->world->body($this->car);
+        return $b;
+    }
+
+    /**
+     * Gravity turned `$angle` radians about `$axis`: a slope without tilting the ground.
+     */
+    public function tilt(Vec3 $axis, float32 $angle) : void
+    {
+        $this->world->setGravity(Quat(angleAxis: $angle, $axis) * Vec3(0.0f, -9.81f, 0.0f));
+    }
+}
+
+test a_car_settles_on_its_springs_and_sleeps
+{
+    CarRig $rig = CarRig();
+    $rig->run(180);
+    Vehicle& $v = $rig->vehicle();
+    assert($v->grounded == 4);
+
+    // each spring carries a quarter of the car: sag is m g / 4 k
+    float32 $front = 1200.0f * 9.81f * 0.25f / 32000.0f;
+    float32 $rear = 1200.0f * 9.81f * 0.25f / 30000.0f;
+    assert(carNear($v->wheels[0]->compression, $front, 0.01f));
+    assert(carNear($v->wheels[3]->compression, $rear, 0.01f));
+    // the wheel's centre stands a radius above the ground
+    float32 $centre = 0.53f - (0.3f - $v->wheels[0]->compression);
+    assert(carNear($rig->pose()->position->y + $centre, 0.32f, 0.02f));
+
+    // nobody in it: it goes to sleep, and a sleeping car is skipped
+    $rig->run(300);
+    assert(!$rig->vehicle()->awake);
+}
+
+test each_wheel_takes_the_grip_of_the_ground_it_stands_on
+{
+    CarRig $rig = CarRig($grip: 0.6f);
+    $rig->run(30);
+    Vehicle& $v = $rig->vehicle();
+    assert($v->grounded == 4);
+    for (usize $i = 0; $i < 4; $i++) {
+        assert(carNear($v->wheels[$i]->surface, 0.6f, 0.0001f));
+    }
+}
+
+test throttle_drives_it_and_the_brakes_stop_it
+{
+    CarRig $rig = CarRig();
+    $rig->run(60);
+    $rig->vehicle()->driven = true;
+    $rig->vehicle()->controls->throttle = 1.0f;
+    $rig->run(300);
+    float32 $fast = $rig->vehicle()->forwardSpeed;
+    assert($fast > 15.0f);
+    // straight ahead along +Z, upright
+    assert(std::math::abs($rig->pose()->position->x) < 0.5f);
+    Vec3 $up = $rig->pose()->orientation * Vec3(0.0f, 1.0f, 0.0f);
+    assert($up->y > 0.95f);
+
+    // from about 20 m/s to a stop well inside a car park
+    while ($rig->vehicle()->forwardSpeed < 20.0f) {
+        $rig->run(10);
+    }
+    float32 $from = $rig->pose()->position->z;
+    $rig->vehicle()->controls->throttle = 0.0f;
+    $rig->vehicle()->controls->brake = 1.0f;
+    $rig->run(360);
+    assert(std::math::abs($rig->vehicle()->forwardSpeed) < 0.3f);
+    assert($rig->pose()->position->z - $from < 30.0f);
+
+    // the handbrake holds it, and it falls asleep once let go
+    $rig->vehicle()->controls->handbrake = true;
+    $rig->vehicle()->driven = false;
+    $rig->run(300);
+    assert(!$rig->vehicle()->awake);
+}
+
+test a_driven_car_at_rest_sleeps_with_what_it_leans_on
+{
+    // a box touching the bumper shares the car's island: held awake, the car would keep it awake
+    CarRig $rig = CarRig();
+    Entity $box = $rig->entities->create();
+    Transform $bt = Transform();
+    $bt->position = Vec3(0.0f, 0.5f, 2.56f);
+    $rig->entities->attach<Transform>($box, $bt);
+    $rig->entities->attach<Collider>($box, Collider(ColliderShape::box(Vec3(0.5f, 0.5f, 0.5f))));
+    $rig->entities->attach<RigidBody>($box, RigidBody(BodyKind::dynamic, 40.0f));
+    $rig->vehicle()->driven = true;
+    $rig->run(400);
+    assert(!$rig->vehicle()->awake);
+    PhysicsBody $leaning = guard $rig->world->body($box);
+    assert(!$leaning->awake());
+
+    // the throttle wakes it on the next step
+    $rig->vehicle()->controls->throttle = 1.0f;
+    $rig->run(1);
+    assert($rig->vehicle()->awake);
+    $rig->run(60);
+    assert($rig->vehicle()->forwardSpeed > 1.0f);
+}
+
+test steering_turns_it_the_way_it_is_told
+{
+    CarRig $rig = CarRig();
+    $rig->run(60);
+    $rig->vehicle()->driven = true;
+    $rig->vehicle()->controls->throttle = 1.0f;
+    $rig->run(120);
+    // steer right: the heading swings from +Z toward -X
+    $rig->vehicle()->controls->steer = 1.0f;
+    $rig->run(90);
+    Vec3 $heading = $rig->pose()->orientation * Vec3(0.0f, 0.0f, 1.0f);
+    assert($heading->x < -0.2f);
+
+    CarRig $other = CarRig();
+    $other->run(60);
+    $other->vehicle()->driven = true;
+    $other->vehicle()->controls->throttle = 1.0f;
+    $other->run(120);
+    $other->vehicle()->controls->steer = -1.0f;
+    $other->run(90);
+    Vec3 $leftward = $other->pose()->orientation * Vec3(0.0f, 0.0f, 1.0f);
+    assert($leftward->x > 0.2f);
+}
+
+test full_lock_at_speed_stays_on_its_wheels
+{
+    CarRig $rig = CarRig();
+    $rig->run(60);
+    $rig->vehicle()->driven = true;
+    $rig->vehicle()->controls->throttle = 1.0f;
+    while ($rig->vehicle()->forwardSpeed < 25.0f) {
+        $rig->run(10);
+    }
+
+    $rig->vehicle()->controls->steer = 1.0f;
+    for (int32 $i = 0; $i < 30; $i++) {
+        $rig->run(10);
+        Vec3 $up = $rig->pose()->orientation * Vec3(0.0f, 1.0f, 0.0f);
+        assert($up->y > 0.7f);
+    }
+}
+
+test a_paused_world_moves_no_car
+{
+    CarRig $rig = CarRig();
+    $rig->run(60);
+    $rig->vehicle()->driven = true;
+    $rig->vehicle()->controls->throttle = 1.0f;
+    $rig->run(60);
+    Vec3 $at = $rig->pose()->position;
+    $rig->world->paused = true;
+    $rig->run(120);
+    assert(length($rig->pose()->position - $at) < 0.0001f);
+}
+
+test wheel_nodes_follow_the_suspension
+{
+    CarRig $rig = CarRig();
+    Entity $node = $rig->entities->create();
+    Transform $t = Transform();
+    $t->parent = $rig->car;
+    $t->position = Vec3(0.78f, 0.32f, 1.25f);
+    $rig->entities->attach<Transform>($node, $t);
+    $rig->vehicle()->wheelNode(0, $node, Vec3(0.78f, 0.32f, 1.25f));
+    $rig->vehicle()->driven = true;
+    $rig->run(120);
+    Transform $now = $rig->entities->get<Transform>($node);
+    assert(carNear($now->position->x, 0.78f, 0.0001f));
+    assert(carNear($now->position->y, 0.53f - (0.3f - $rig->vehicle()->wheels[0]->compression), 0.0001f));
+}
+
+internal class CountingStepper : PhysicsStepper
+{
+    public int32 $calls = 0;
+
+    public function beforeStep(Entities $entities, PhysicsWorld $world, float32 $dt) : void
+    {
+        $this->calls = $this->calls + 1;
+    }
+}
+
+test a_stepper_runs_once_a_step_within_the_cap_and_never_paused
+{
+    Entities $entities = Entities();
+    Systems $systems = Systems();
+    PhysicsSettings $settings = PhysicsSettings();
+    $settings->capacity = 4;
+    $settings->maxStepsPerUpdate = 3;
+    PhysicsWorld $world = PhysicsWorld($settings);
+    PhysicsSystem $physics = PhysicsSystem($world);
+    $systems->bind($physics);
+    $systems->register($entities);
+    CountingStepper $counter = CountingStepper();
+    int32 $id = $physics->addStepper($counter);
+
+    $systems->begin($entities);
+    for (int32 $i = 0; $i < 5; $i++) {
+        $systems->tick($entities);
+    }
+    assert($counter->calls == 3);
+
+    $world->paused = true;
+    $systems->begin($entities);
+    $systems->tick($entities);
+    assert($counter->calls == 3);
+
+    $world->paused = false;
+    $physics->removeStepper($id);
+    $systems->begin($entities);
+    $systems->tick($entities);
+    assert($counter->calls == 3);
+}
+
+test rear_brakes_still_bite_near_a_stop
+{
+    CarRig $rig = CarRig();
+    $rig->run(60);
+    $rig->vehicle()->driven = true;
+    $rig->vehicle()->spec->wheels[0]->brake = 0.0f;
+    $rig->vehicle()->spec->wheels[1]->brake = 0.0f;
+    $rig->vehicle()->controls->throttle = 1.0f;
+    while ($rig->vehicle()->forwardSpeed < 4.0f) {
+        $rig->run(1);
+    }
+
+    $rig->vehicle()->controls->throttle = 0.0f;
+    $rig->vehicle()->controls->brake = 1.0f;
+    while ($rig->vehicle()->forwardSpeed > 3.0f) {
+        $rig->run(1);
+    }
+
+    // two rear wheels at 700 N m each over a 0.32 m radius stop 1200 kg at about 3.6 m/s2, so
+    // 3 m/s to 0.5 takes about 41 steps, and no slower near the end
+    int32 $steps = 0;
+    while ($rig->vehicle()->forwardSpeed > 0.5f && $steps < 400) {
+        $rig->run(1);
+        $steps = $steps + 1;
+    }
+    assert($steps >= 30);
+    assert($steps <= 52);
+}
+
+test a_parked_car_holds_on_a_slope
+{
+    // brake and handbrake, as a driver leaves it, on 20 degrees: it settles within 2 cm and sleeps
+    CarRig $rig = CarRig();
+    $rig->run(60);
+    $rig->vehicle()->controls->brake = 1.0f;
+    $rig->vehicle()->controls->handbrake = true;
+    $rig->body()->wake();
+    $rig->tilt(Vec3(1.0f, 0.0f, 0.0f), 0.349f);
+    $rig->run(30);
+    float32 $from = $rig->pose()->position->z;
+    $rig->run(300);
+    assert(std::math::abs($rig->pose()->position->z - $from) < 0.02f);
+    assert(!$rig->vehicle()->awake);
+
+    // the handbrake alone on 15 degrees
+    CarRig $hand = CarRig();
+    $hand->run(60);
+    $hand->vehicle()->controls->handbrake = true;
+    $hand->body()->wake();
+    $hand->tilt(Vec3(1.0f, 0.0f, 0.0f), 0.262f);
+    $hand->run(30);
+    float32 $start = $hand->pose()->position->z;
+    $hand->run(300);
+    assert(std::math::abs($hand->pose()->position->z - $start) < 0.02f);
+    assert(!$hand->vehicle()->awake);
+}
+
+test slip_angle_holds_its_floor_at_a_standstill
+{
+    // a creep sideways at a standstill is a small angle, not a slide
+    assert(tireSlipAngle(0.0f, 0.03f, 1.0f) < 0.05f);
+    assert(carNear(tireSlipAngle(0.0f, 2.0f, 1.0f), std::math::atan2(2.0f, 1.0f), 0.0001f));
+    // above the floor it is the plain angle
+    assert(carNear(tireSlipAngle(10.0f, 1.0f, 1.0f), std::math::atan2(1.0f, 10.0f), 0.0001f));
+}
+
+test pulling_away_on_a_cross_slope_keeps_its_grip
+{
+    CarRig $flat = CarRig();
+    $flat->run(60);
+    $flat->vehicle()->driven = true;
+    $flat->vehicle()->controls->throttle = 1.0f;
+    $flat->run(30);
+
+    CarRig $slope = CarRig();
+    $slope->run(60);
+    $slope->vehicle()->driven = true;
+    $slope->tilt(Vec3(0.0f, 0.0f, 1.0f), 0.175f);
+    $slope->run(30);
+    $slope->vehicle()->controls->throttle = 1.0f;
+    $slope->run(30);
+    assert($slope->vehicle()->forwardSpeed > $flat->vehicle()->forwardSpeed * 0.95f);
+}
+
+test a_sideways_slide_is_caught
+{
+    CarRig $rig = CarRig();
+    $rig->run(60);
+    $rig->vehicle()->driven = true;
+    $rig->body()->applyImpulse(Vec3(1200.0f * 15.0f, 0.0f, 0.0f), wake: true);
+    bool $caught = false;
+    for (int32 $i = 0; $i < 90; $i++) {
+        $rig->run(1);
+        float32 $fwd = $rig->vehicle()->forwardSpeed;
+        float32 $side = $rig->vehicle()->sideSpeed;
+        float32 $beta = std::math::atan2(std::math::abs($side), std::math::abs($fwd));
+        if (std::math::sqrt($fwd * $fwd + $side * $side) > 3.0f && $beta < $rig->vehicle()->spec->driftLimit) {
+            $caught = true;
+            break;
+        }
+    }
+    assert($caught);
+}
+
+test air_right_settles_without_overshoot
+{
+    // driven and in the air, rolled 40 degrees: it rights itself and stays right
+    CarRig $rig = CarRig($height: 300.0f, $roll: 0.7f);
+    $rig->vehicle()->driven = true;
+    $rig->run(1);
+    float32 $last = 1.0f;
+    for (int32 $i = 0; $i < 48; $i++) {
+        $rig->run(5);
+        Vec3 $up = $rig->pose()->orientation * Vec3(0.0f, 1.0f, 0.0f);
+        float32 $roll = std::math::atan2(-$up->x, $up->y);
+        assert($roll > -0.02f);
+        assert($roll < $last + 0.01f);
+        $last = $roll;
+    }
+    assert($last < 0.09f);
+
+    // nobody driving: no push in the air
+    CarRig $loose = CarRig($height: 300.0f, $roll: 0.7f);
+    $loose->run(60);
+    Vec3 $up = $loose->pose()->orientation * Vec3(0.0f, 1.0f, 0.0f);
+    assert(carNear(std::math::atan2(-$up->x, $up->y), 0.7f, 0.02f));
+}
+
+test a_car_pushes_back_on_what_it_stands_on
+{
+    // a light frictionless slab under the car: pulling away kicks it backward
+    CarRig $rig = CarRig($height: 0.25f);
+    Entity $slab = $rig->entities->create();
+    Transform $st = Transform();
+    $st->position = Vec3(0.0f, 0.1f, 0.0f);
+    $rig->entities->attach<Transform>($slab, $st);
+    Collider $sc = Collider(ColliderShape::box(Vec3(1.5f, 0.1f, 3.0f)));
+    $sc->friction = 0.0f;
+    $rig->entities->attach<Collider>($slab, $sc);
+    RigidBody $srb = RigidBody(BodyKind::dynamic, 100.0f);
+    $rig->entities->attach<RigidBody>($slab, $srb);
+    $rig->run(60);
+    float32 $from = $rig->entities->get<Transform>($slab)->position->z;
+    $rig->vehicle()->driven = true;
+    $rig->vehicle()->controls->throttle = 1.0f;
+    $rig->run(15);
+    float32 $moved = $rig->entities->get<Transform>($slab)->position->z - $from;
+    assert($moved < -0.1f);
+}

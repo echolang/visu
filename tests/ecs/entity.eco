@@ -7,7 +7,7 @@ use visu::ecs::Entity;
 test entity_null_is_all_bits
 {
     Entity $n = Entity::none();
-    assert($n->id == 0xFFFFFFFF, 'none id');
+    assert($n->id == 0xFFFFFFFFFFFFFFFF, 'none id');
     assert($n == Entity::none(), 'eq');
 }
 
@@ -31,4 +31,24 @@ test entity_string
 {
     Entity $e = Entity(index: 3, version: 1);
     assert("{$e}" == '3v1', 'str');
+}
+
+test entity_index_past_twenty_bits
+{
+    Entity $e = Entity(index: 5000000, version: 70000);
+    assert($e->index() == 5000000, 'index');
+    assert($e->version() == 70000, 'version');
+    Entity $max = Entity(index: 0xFFFFFFFE, version: 0xFFFFFFFF);
+    assert($max->index() == 0xFFFFFFFE, 'max index');
+    assert($max->version() == 0xFFFFFFFF, 'max version');
+    assert($max != Entity::none(), 'max is not none');
+}
+
+test entity_fold_matches_old_packing
+{
+    Entity $e = Entity(index: 12345, version: 7);
+    uint32 $old = ((7 as uint32) << 20) | (12345 as uint32);
+    assert($e->fold() == $old, 'fold');
+    Entity $zero = Entity(index: 0, version: 0);
+    assert($zero->fold() == 0, 'zero');
 }

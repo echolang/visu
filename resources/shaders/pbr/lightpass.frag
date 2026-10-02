@@ -2,6 +2,11 @@
 
 #pragma visu variant ibl USE_IBL=1
 #pragma visu variant env_cubemap USE_ENV_CUBEMAP=1
+// a frame whose light table holds a lit spot: the cone costs the whole pass registers, so a
+// frame of lights that shine every way runs without it
+#pragma visu variant spot VISU_SPOTS=1
+#pragma visu variant ibl_spot USE_IBL=1 VISU_SPOTS=1
+#pragma visu variant env_cubemap_spot USE_ENV_CUBEMAP=1 VISU_SPOTS=1
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 fragment_color;
@@ -162,6 +167,14 @@ void main()
                     }
                     vec3 Lc = toLight / max(dist, 1e-4);
                     vec3 radiance = light_radiance(l, dist, u_cluster_z.w);
+#ifdef VISU_SPOTS
+                    // outside a spot's cone: no light, so no shadow lookup either
+                    float cone = light_cone(l, -Lc);
+                    if (cone <= 0.0) {
+                        continue;
+                    }
+                    radiance *= cone;
+#endif
                     vec3 Ls = pbr_sphere_l(toLight, s.V, s.N, l.source.x);
                     float vis = 1.0;
                     float fade = vsm_light_fade(l, u_camera_position.xyz, u_vsm);

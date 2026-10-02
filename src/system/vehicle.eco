@@ -1,0 +1,129 @@
+/**
+ * Drives every `Vehicle`. Inside each physics step (a `PhysicsStepper`, after the kinematic read
+ * and before the advance) it runs the tire model on each awake vehicle; in update it turns, steers
+ * and lifts the wheel nodes of the ones that moved, through the move log so they interpolate.
+ *
+ * Cost follows what is awake: a parked vehicle falls asleep with its body and is skipped without
+ * a ray, and its wheels are not written. A driven one sleeps the same way and wakes on the step its
+ * controls ask to throttle or steer.
+ * Four wheels are four rays and a few dozen multiplies a step.
+ *
+ * Bind it after `PhysicsSystem`, so its update poses the wheels the step just moved.
+ */
+
+namespace visu::system;
+
+use visu::components::Vehicle;
+use visu::ecs::{Entities, Entity, Schedule, System};
+use visu::geo::Transform;
+use visu::graphics::RenderContext;
+use visu::physics::{PhysicsBody, PhysicsStepper, PhysicsWorld, VehicleControls, VehicleWheelPose, stepVehicle, wheelPose};
+
+public class VehicleSystem : System, PhysicsStepper
+{
+    private PhysicsSystem $physics;
+    private int32 $stepper;
+
+    public constructor(PhysicsSystem $physics)
+    {
+        $this->physics = $physics;
+        $this->stepper = -1;
+    }
+
+    public function register(Entities $entities) : void
+    {
+        $this->stepper = $this->physics->addStepper($this);
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+        if ($this->stepper >= 0) {
+            $this->physics->removeStepper($this->stepper);
+            $this->stepper = -1;
+        }
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->render = false;
+    }
+
+    public function beforeStep(Entities $entities, PhysicsWorld $world, float32 $dt) : void
+    {
+        visu::profile::begin('vehicles');
+        foreach ($entities->view<Vehicle>() as $e => &$v) {
+            PhysicsBody $body = guard $world->body($e) else {
+                $v->awake = false;
+                continue;
+            }
+
+            if (!$v->tuned) {
+                $body->setSleepThresholds($v->spec->sleepLinear, angular: $v->spec->sleepAngular);
+                $v->tuned = true;
+            }
+
+            if (!$body->awake() && $v->driven && controlsAsk($v->controls)) {
+                $body->wake();
+            }
+
+            if (!$body->awake()) {
+                $v->awake = false;
+                continue;
+            }
+
+            Vehicle& $held = $v;
+            stepVehicle($world, $body, $held, $dt);
+            $v->awake = true;
+            $v->stepped = true;
+        }
+        visu::profile::end();
+    }
+
+    /**
+     * Wheel nodes of the vehicles a step moved since the last update: the suspension's travel
+     * lifts each one, the steered ones turn, and every one spins with its wheel.
+     */
+    public function update(Entities $entities) : void
+    {
+        visu::profile::begin('vehicles');
+        foreach ($entities->view<Vehicle>() as $e => &$v) {
+            if (!$v->stepped) {
+                continue;
+            }
+
+            $v->stepped = false;
+            Vehicle& $held = $v;
+            poseWheels($entities, $held);
+        }
+        visu::profile::end();
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+    }
+}
+
+/**
+ * Whether `$c` asks a still vehicle to move: a throttle or a steer. A brake or a handbrake on a
+ * vehicle at rest has nothing to do, so it leaves it asleep.
+ */
+internal function controlsAsk(const VehicleControls& $c) : bool
+{
+    return $c->throttle != 0.0f || $c->steer != 0.0f;
+}
+
+internal function poseWheels(Entities $entities, const Vehicle& $v) : void
+{
+    int32 $n = std::math::min($v->spec->wheelCount, 6);
+    for (int32 $i = 0; $i < $n; $i++) {
+        Entity $node = $v->nodes[$i as usize];
+        if ($node == Entity::none() || !$entities->has<Transform>($node)) {
+            continue;
+        }
+
+        VehicleWheelPose $pose = wheelPose($v, $i);
+        Transform& $t = $entities->move($node);
+        $t->position = $pose->position;
+        $t->orientation = $pose->orientation;
+    }
+}

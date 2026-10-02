@@ -1,28 +1,29 @@
 /**
  * Versioned entity id.
- * Packed like EnTT's 32-bit entity: 20 bits of index, 12 bits of generation.
- * Destroy bumps the generation so a stale id is never valid after the index is recycled.
+ * 64 bits: 32 bits of index, 32 bits of generation. Destroy bumps the generation so a stale id is
+ * never valid after the index is recycled. The index space holds any estate a machine can keep
+ * resident; the old 20 bit index stopped at about a million.
  */
 
 namespace visu::ecs;
 
-internal const uint32 ENTITY_INDEX_MASK = 0x000FFFFF;
-internal const uint32 ENTITY_VERSION_SHIFT = 20;
-internal const uint32 ENTITY_VERSION_MASK = 0x00000FFF;
-internal const uint32 ENTITY_NULL_ID = 0xFFFFFFFF;
+internal const uint64 ENTITY_INDEX_MASK = 0x00000000FFFFFFFF;
+internal const uint64 ENTITY_VERSION_SHIFT = 32;
+internal const uint32 ENTITY_VERSION_MAX = 0xFFFFFFFF;
+internal const uint64 ENTITY_NULL_ID = 0xFFFFFFFFFFFFFFFF;
 
 public struct Entity
 {
-    public const uint32 $id;
+    public const uint64 $id;
 
-    public constructor(uint32 $id)
+    public constructor(uint64 $id)
     {
         $this->id = $id;
     }
 
     public constructor(index: uint32 $index, version: uint32 $version)
     {
-        $this->id = ($version << ENTITY_VERSION_SHIFT) | $index;
+        $this->id = (($version as uint64) << ENTITY_VERSION_SHIFT) | ($index as uint64);
     }
 
     public static function none() : Entity
@@ -33,13 +34,24 @@ public struct Entity
     #[inline]
     public const function index() : uint32
     {
-        return $this->id & ENTITY_INDEX_MASK;
+        return ($this->id & ENTITY_INDEX_MASK) as uint32;
     }
 
     #[inline]
     public const function version() : uint32
     {
-        return $this->id >> ENTITY_VERSION_SHIFT;
+        return ($this->id >> ENTITY_VERSION_SHIFT) as uint32;
+    }
+
+    /**
+     * The id folded to 32 bits for a hash or a phase (a torch's flicker, a mover's shadow turn).
+     * It equals the old 20 bit index, 12 bit version packing for every id that fitted it, so
+     * anything seeded from an id keeps its value across the widening.
+     */
+    #[inline]
+    public const function fold() : uint32
+    {
+        return $this->index() ^ ($this->version() << 20);
     }
 }
 

@@ -1,0 +1,81 @@
+/**
+ * A `Heightmap` as the backend's borrowed heightfield source. The samples are read where the map
+ * keeps them and never copied; the range comes from the map's cached `min` / `max`, so wrapping a
+ * 4097 x 4097 map costs nothing. The map's sample array never grows (`set` writes in place), which
+ * is what makes the borrow sound.
+ */
+
+namespace visu::physics;
+
+use visu::geo::Heightmap;
+use visu::math::Vec3;
+
+internal class HeightmapSamples : bt::HeightSamples
+{
+    internal const Heightmap $map;
+
+    /**
+     * The range as it was when the shape was built: the field is centred halfway between them,
+     * so the body offset must use the same two numbers even if the map widens later.
+     */
+    internal const float32 $lo;
+    internal const float32 $hi;
+
+    internal constructor(Heightmap $map)
+    {
+        $this->map = $map;
+        $this->lo = $map->min();
+        $this->hi = $map->max();
+    }
+
+    public const function width() : int32
+    {
+        return $this->map->width;
+    }
+
+    public const function length() : int32
+    {
+        return $this->map->height;
+    }
+
+    public const function heights() : ptr<const float32>
+    {
+        return $this->map->samples()->data();
+    }
+
+    public const function low() : float32
+    {
+        return $this->lo;
+    }
+
+    public const function high() : float32
+    {
+        return $this->hi;
+    }
+
+    /**
+     * Where the body goes so each sample lands on its own world point. The backend centres the
+     * field on `(width - 1) / 2` and halfway up its range; the map puts sample `ix` at
+     * `(ix - width / 2) / ppu`, so the two differ by half a cell on each axis.
+     */
+    internal const function centre() : Vec3
+    {
+        float32 $w = $this->map->width as float32;
+        float32 $h = $this->map->height as float32;
+        float32 $cell = 1.0f / $this->map->ppu;
+        return Vec3(
+            (($w - 1.0f) * 0.5f - $w * 0.5f) * $cell,
+            ($this->lo + $this->hi) * 0.5f,
+            (($h - 1.0f) * 0.5f - $h * 0.5f) * $cell,
+        );
+    }
+
+    /**
+     * World units per cell on X and Z; heights are already metres.
+     */
+    internal const function scaling() : bt::Vec3
+    {
+        float32 $cell = 1.0f / $this->map->ppu;
+        return bt::Vec3($cell, 1.0f, $cell);
+    }
+}

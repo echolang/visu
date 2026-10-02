@@ -1,53 +1,89 @@
 /**
- * The scene the GPU draws its depth-only views from: every model's LOD table, every placed
- * static as a persistent row, this frame's movers (dynamics and skins), and the views to cull
- * against. `cull` runs the kernels that pick levels, cull instances and clusters, and bucket
- * the surviving clusters into draw items by (pass, material bucket); `draw` records one pass as
- * one indirect draw per bucket, whatever the GPU found. The CPU never learns what was drawn.
+ * The scene the GPU draws its views from: every model's LOD table, one persistent instance row
+ * per model instance (static, moving or skinned, the same row for its whole life), each row's
+ * pose block, the spatial chunks and the active set the rows are candidates of, and the view
+ * sets to cull against. A row is written only when what it shows changes: a static once, a mover
+ * once per update it moved (its previous and current pose, which `scene_resolve` mixes on the GPU
+ * at each frame's alpha), a mover that stopped once more with its exact matrix, and never again
+ * while it rests.
+ * Where a row is a candidate follows from how it was last written: moving, or pinned (a skin, an
+ * edited prop, a preview), it is in the active set; written exact and not pinned it rests in the
+ * chunk of its box's centre. Moving between them is a swap-remove and an append, never a new row.
+ * A cull walks chunks first (one test per chunk and view), then the members of the visible
+ * chunks and the whole active set, then the meshlets of what passed, and for a G-buffer set the
+ * triangles; every stage counts, scans and writes at the scanned offset, so a run draws the same
+ * lists in the same order every time. Each set draws one indirect batch per (pass, key): shadow
+ * bucket for the depth sets, G-buffer class for the main set. The CPU never learns what was drawn.
  * The `DeferredRenderer` owns one per scene and adds its cull pass ahead of the shadow pass;
- * `ModelSystem` fills it (rows on place and release, movers each frame) and draws from it.
+ * `ModelSystem` fills it and draws from it.
  */
 
 namespace visu::graphics;
 
-use visu::geo::{AABB, Frustum, Plane};
+use visu::geo::{AABB, Frustum, Plane, Pose};
 use visu::math::{Mat4, Vec3, Vec4};
 
 /**
- * Passes a view can draw in: the five sun cascades now, a shadow atlas later.
+ * Views one set culls at most: a shadow atlas frame's dirty pages.
+ */
+public const int32 SCENE_VIEWS_MAX = 256;
+
+/**
+ * Passes the cascade set draws: the five sun cascades.
  */
 public const int32 SCENE_PASSES_MAX = 8;
 
 /**
- * Shadow buckets a frame can draw: the opaque one plus alpha-tested materials. A material past
- * the cap casts nothing through the scene; the bank has never come close.
+ * Draws a set may record: passes times draw keys (shadow buckets, or G-buffer classes).
  */
-public const int32 SCENE_BUCKETS_MAX = 128;
+public const int32 SCENE_SEGMENTS_MAX = 128;
 
 /**
- * Segments the scan hands out, passes times buckets. `scene_scan.comp` runs one group this wide.
+ * Depth bins a G-buffer set orders each class's pairs by, near first (`visu/scenecull.glsl`):
+ * stacked foliage drawn front to back lets the depth test reject what is behind before it shades.
  */
-public const int32 SCENE_SEGMENTS_MAX = 1024;
+public const int32 SCENE_DEPTH_BINS = 16;
 
 /**
- * (instance, view) pairs one frame can keep. Past this a pair is dropped and counted.
- */
-public const int32 SCENE_MAX_PAIRS = 65536;
-
-/**
- * Draw items one frame can keep, each a cluster in one view: 4 MB at 16 bytes. Past this an
- * item is dropped and counted.
- */
-public const int32 SCENE_MAX_ITEMS = 262144;
-
-/**
- * Vertices one draw item expands to: `DEPTH_CLUSTER_TRIANGLES` triangles.
+ * Vertices one depth draw item expands to: `MESHLET_TRIANGLES` triangles.
  */
 public const int32 SCENE_ITEM_VERTICES = 192;
+
+/**
+ * The main set's passes: the camera, the water mirror and the outline mask.
+ */
+public const int32 SCENE_PASS_CAMERA = 0;
+public const int32 SCENE_PASS_MIRROR = 1;
+public const int32 SCENE_PASS_OUTLINE = 2;
 
 public const uint32 SCENE_INSTANCE_LIVE = 1;
 public const uint32 SCENE_INSTANCE_CASTS = 2;
 public const uint32 SCENE_INSTANCE_SKINNED = 4;
+public const uint32 SCENE_INSTANCE_MOVING = 8;
+public const uint32 SCENE_INSTANCE_MAIN = 16;
+public const uint32 SCENE_INSTANCE_OUTLINE = 32;
+public const uint32 SCENE_INSTANCE_ACTIVE = 64;
+internal const uint32 SCENE_OUTLINE_SHIFT = 8;
+
+public const uint32 SCENE_VIEW_CLIP = 1;
+public const uint32 SCENE_VIEW_SPHERE = 2;
+public const uint32 SCENE_VIEW_CONE = 4;
+
+/**
+ * Where a row is a candidate when it is in no chunk: nowhere yet, or the active set.
+ */
+internal const int32 SCENE_HOME_NONE = -1;
+internal const int32 SCENE_HOME_ACTIVE = -2;
+
+/**
+ * A row's spatial chunk while it is in none.
+ */
+public const uint32 SCENE_CHUNK_NONE = 0xFFFFFFFF;
+
+/**
+ * Pose rows a moving instance holds: the frame's matrix, then its previous and current pose.
+ */
+internal const int32 SCENE_MOVING_POSE_ROWS = 3;
 
 /**
  * Boxes `GpuScene.changed` keeps one frame before it folds the rest into the last.
@@ -60,34 +96,105 @@ public const int32 SCENE_CHANGED_MAX = 64;
 public const uint32 SCENE_PASS_NONE = 0xFFFFFFFF;
 
 /**
- * The counter and argument words, as `visu/scenecull.glsl` lays them out: pairs kept and
- * dropped, items dropped, then per segment the items it holds, the scan cursor and its end;
- * the arguments are the cluster walk's dispatch, then one indirect draw per segment.
+ * The counter and argument words, as `visu/scenecull.glsl` lays them out.
  */
-internal const int32 SCENE_COUNTER_PAIRS = 0;
-internal const int32 SCENE_COUNTER_PAIRS_DROPPED = 1;
-internal const int32 SCENE_COUNT_BASE = 4;
-internal const int32 SCENE_COUNTER_WORDS = SCENE_COUNT_BASE + 3 * SCENE_SEGMENTS_MAX;
-internal const int32 SCENE_ARGS_DRAW_BASE = 4;
-internal const int32 SCENE_ARGS_WORDS = SCENE_ARGS_DRAW_BASE + 4 * SCENE_SEGMENTS_MAX;
+public const int32 SCENE_COUNTER_CHUNK_PAIRS = 0;
+public const int32 SCENE_COUNTER_PAIRS = 1;
+public const int32 SCENE_COUNTER_ITEMS = 2;
+public const int32 SCENE_COUNTER_TRIANGLES = 3;
+public const int32 SCENE_COUNTER_DROPPED_CHUNK_PAIRS = 4;
+public const int32 SCENE_COUNTER_DROPPED_PAIRS = 5;
+public const int32 SCENE_COUNTER_DROPPED_ITEMS = 6;
+public const int32 SCENE_COUNTER_DROPPED_TRIANGLES = 7;
+internal const int32 SCENE_COUNTER_VIEW_BASE = 8;
+internal const int32 SCENE_COUNTER_PASS_BASE = SCENE_COUNTER_VIEW_BASE + SCENE_VIEWS_MAX + 1;
+internal const int32 SCENE_COUNTER_MATRIX_SCAN = SCENE_COUNTER_PASS_BASE + 6;
+internal const int32 SCENE_COUNTER_PAIR_SCAN = SCENE_COUNTER_MATRIX_SCAN + 1;
+internal const int32 SCENE_COUNTER_WALK = SCENE_COUNTER_PAIR_SCAN + 1;
+internal const int32 SCENE_COUNTER_WALK_SCAN = SCENE_COUNTER_WALK + 1;
 
 /**
- * One instance row (std430 `SceneInstance`, 112 bytes): world matrix, world bounds with the
- * instance LOD bias in `lo.w` and the first palette row in `hi.w`, the scene model and flags.
+ * A G-buffer set's debug views (`visu/scenecull.glsl` SCENE_DEBUG_*).
+ */
+internal const uint32 SCENE_DEBUG_MESHLETS = 1;
+
+/**
+ * Meshlets a set's meshlet stage may walk per item it holds (`visu/scenecull.glsl`); what passes
+ * that is dropped and counted as dropped items.
+ */
+public const int32 SCENE_WALK_PER_ITEM = 2;
+internal const int32 SCENE_COUNTER_WORDS = SCENE_COUNTER_PAIR_SCAN + 8;
+internal const int32 SCENE_ARGS_MEMBERS = 0;
+internal const int32 SCENE_ARGS_MESHLETS = 4;
+internal const int32 SCENE_ARGS_TRIANGLES = 8;
+internal const int32 SCENE_ARGS_DRAW_BASE = 12;
+internal const int32 SCENE_DRAW_WORDS = 5;
+internal const int32 SCENE_ARGS_WORDS = SCENE_ARGS_DRAW_BASE + SCENE_DRAW_WORDS * SCENE_SEGMENTS_MAX;
+
+/**
+ * One instance row (std430 `SceneInstance`, 64 bytes): world bounds with the instance LOD bias
+ * in `lo.w` and the first palette row in `hi.w`, the scene model, flags, the first pose row, the
+ * spatial chunk and the tint as four halves.
  */
 public struct SceneInstanceGpu
 {
-    public Mat4 $world;
     public Vec4 $lo;
     public Vec4 $hi;
     public uint32 $model;
     public uint32 $flags;
+    public uint32 $pose;
+    public uint32 $chunk;
+    public uint32 $tintRG;
+    public uint32 $tintBA;
     public uint32 $pad0 = 0;
     public uint32 $pad1 = 0;
 }
 
 /**
- * One model row (std430 `SceneModel`, 96 bytes): its LOD table in the arena's cluster space.
+ * One pose row (std430 `ScenePose`, 48 bytes): the three affine rows of a world matrix, or for a
+ * mover's previous and current pose position, orientation and scale.
+ */
+public struct ScenePoseGpu
+{
+    public Vec4 $r0;
+    public Vec4 $r1;
+    public Vec4 $r2;
+}
+
+/**
+ * What an instance row shows, as its owner hands it over on every write. `main` draws it in the
+ * camera and the mirror (a preview ghost is outline only); `outline` is its outline style slot,
+ * -1 for none.
+ */
+public struct SceneRow
+{
+    public int32 $model;
+    public AABB $bounds;
+    public float32 $lodBias;
+    public Vec4 $tint;
+    public float32 $palette;
+    public bool $casts;
+    public bool $skinned;
+    public bool $live;
+    public bool $main = true;
+    public int32 $outline = -1;
+}
+
+/**
+ * `scene_resolve.comp`'s uniform: the frame's alpha and the moving instances.
+ */
+internal struct SceneResolveParams
+{
+    public Vec4 $alpha;
+    public uint32 $count;
+    public uint32 $pad0 = 0;
+    public uint32 $pad1 = 0;
+    public uint32 $pad2 = 0;
+}
+
+/**
+ * One model row (std430 `SceneModel`, 96 bytes): its LOD table in the arena's run space, level
+ * `l` being runs `start[l] .. start[l + 1]`.
  */
 public struct SceneModelGpu
 {
@@ -127,23 +234,35 @@ public struct SceneModelGpu
 }
 
 /**
- * One view (std430 `SceneView`, 112 bytes): six frustum planes and the pass it draws in.
+ * One view (std430 `SceneView`, 160 bytes): six frustum planes, the pass it draws in, the
+ * instance flags it requires, its own tests (`SCENE_VIEW_*`: a clip plane, a reach sphere, the eye
+ * the normal cones are tested from) and the smallest instance it draws.
  */
 public struct SceneViewGpu
 {
     public Vec4[6] $planes;
     public uint32 $pass;
-    public uint32 $kind;
-    public uint32 $pad0;
-    public uint32 $pad1;
+    public uint32 $require;
+    public uint32 $tests;
+
+    /**
+     * The smallest instance radius (metres, float bits) the view draws; 0 draws everything.
+     */
+    public uint32 $minRadius;
+    public Vec4 $clip;
+    public Vec4 $sphere;
+    public Vec4 $eye;
 
     public constructor(const Frustum& $frustum, int32 $pass)
     {
         $this->planes = scenePlanes($frustum);
         $this->pass = $pass as uint32;
-        $this->kind = 0;
-        $this->pad0 = 0;
-        $this->pad1 = 0;
+        $this->require = 0;
+        $this->tests = 0;
+        $this->minRadius = 0;
+        $this->clip = Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        $this->sphere = Vec4(0.0f);
+        $this->eye = Vec4(0.0f);
     }
 }
 
@@ -153,14 +272,58 @@ public struct SceneViewGpu
 internal struct SceneCullParams
 {
     public Vec4 $eye;
-    public uint32 $statics;
-    public uint32 $movers;
+    public uint32 $chunks;
+    public uint32 $active;
     public uint32 $views;
-    public uint32 $buckets;
-    public uint32 $maxPairs;
-    public uint32 $maxItems;
+    public uint32 $keys;
+    public uint32 $chunkPairCap;
+    public uint32 $pairCap;
+    public uint32 $itemCap;
+    public uint32 $triangleCap;
     public uint32 $mode;
+    public uint32 $require;
+    public uint32 $gbuffer;
     public uint32 $passes;
+    public uint32 $debug = 0;
+    public uint32 $debugPad0 = 0;
+    public uint32 $debugPad1 = 0;
+    public uint32 $debugPad2 = 0;
+
+    /**
+     * The chunk grid: its west x, north z, metres a cell, and the chunks' overhang.
+     */
+    public Vec4 $grid;
+
+    /**
+     * Cells a side of a local set's window round each view's reach sphere, 0 for a set whose
+     * views walk every occupied chunk; then the grid's columns and rows.
+     */
+    public uint32 $localSide = 0;
+    public uint32 $cols = 1;
+    public uint32 $rows = 1;
+    public uint32 $localPad = 0;
+}
+
+/**
+ * One set this frame's cull runs: its views (a CPU transient or a buffer the GPU wrote) and the
+ * uniform every stage reads.
+ */
+internal class SceneCullJob
+{
+    public SceneCullSet $set;
+    public TransientSlice? $cpuViews;
+    public Buffer? $gpuViews;
+    public int32 $views;
+    public SceneCullParams $params;
+
+    public constructor(SceneCullSet $set, TransientSlice? $cpuViews, Buffer? $gpuViews, int32 $views, SceneCullParams $params)
+    {
+        $this->set = $set;
+        $this->cpuViews = $cpuViews;
+        $this->gpuViews = $gpuViews;
+        $this->views = $views;
+        $this->params = $params;
+    }
 }
 
 internal function scenePlane(const Plane& $p) : Vec4
@@ -188,7 +351,7 @@ public class GpuScene
     public Device $device;
 
     /**
-     * The bank whose arena the rows point into and whose materials the alpha buckets bind.
+     * The bank whose arena the rows point into and whose material table the draws bind.
      * `ModelSystem` sets it before its first row.
      */
     public ModelBank? $bank;
@@ -200,34 +363,128 @@ public class GpuScene
 
     /**
      * This frame's joint palette in the ring, or null with no skin on screen. `ModelSystem`
-     * sets it in `fill`; every depth draw binds it at slot 2.
+     * sets it in `fill`; every draw binds it at slot 2.
      */
     public TransientSlice? $palette;
 
     /**
      * World boxes where casters changed this frame: statics placed, moved or removed, movers
-     * that moved (last and this frame's box). The shadow atlas drops the pages of every light
-     * these reach. Past `SCENE_CHANGED_MAX` the rest fold into the last box, which stays
-     * conservative.
+     * that moved. The shadow atlas drops the pages of every light these reach. Past
+     * `SCENE_CHANGED_MAX` the rest fold into the last box, which stays conservative.
      */
     public array<AABB> $changed;
 
     /**
-     * The sun cascades' set and the shadow atlas pages' set.
+     * The sun cascades' set, the shadow atlas pages' set and the main views' set.
      */
     public SceneCullSet $cascades;
     public SceneCullSet $pages;
+
+    /**
+     * Cells a side of the window the last page cull walked round each light, 0 when it walked
+     * every occupied chunk.
+     */
+    public int32 $pageWindow;
+    public SceneCullSet $main;
+
+    /**
+     * The main views come from the scene: `ModelSystem` draws the camera, the mirror and the
+     * outline through `drawMain` and culls none of them on the CPU.
+     */
+    public bool $mainViews;
+
+    /**
+     * Some row carries an outline bit this frame, so the main cull adds the outline view.
+     */
+    public bool $outlining;
+
+    /**
+     * Draw every occupied chunk's box in the main view (`gpuscene chunks on`), coloured by how
+     * many rows rest in it. O(occupied chunks) a frame; a debug view.
+     */
+    public bool $showChunks;
+
+    /**
+     * Shadow-map texels a sun caster's bounding radius has to reach to be drawn in a cascade
+     * (`--flag shadow.mintexels`, 1): smaller casters cover a texel or less, which the filter
+     * would blur away. 0 draws every caster.
+     */
+    public float32 $minCasterTexels;
+
+    /**
+     * Record each cull stage in its own compute encoder under its own profile scope
+     * (`--flag scene.cullsplit`), so every stage gets a GPU row under `deferred.scene`. A
+     * profiling aid: the split loses the shared barriers.
+     */
+    public bool $splitCull;
+
+    /**
+     * Pixels an instance's bounding radius has to cover in the camera and the mirror to be drawn
+     * (`--flag scene.minpixels`, 0 draws all). A chunk whose largest member cannot reach it is
+     * skipped whole, so a far scatter costs nothing past where it is sub-pixel.
+     */
+    public float32 $minPixels;
+
+    /**
+     * Tint every meshlet the camera and the mirror draw a colour hashed from its id
+     * (`gpuscene meshlets on`), so the cuts show. The draw item's tint carries it; nothing else
+     * changes and it costs nothing off. A debug view.
+     */
+    public bool $showMeshlets;
+
+    /**
+     * The frame's interpolation alpha the moving rows resolve at. `ModelSystem` sets it in `fill`.
+     */
+    public float32 $interpolation;
+    public SceneChunks $chunks;
+
+    /**
+     * Rows that changed between the active set and the chunks (or between chunks), since the
+     * last clear: the `scene` verb.
+     */
+    public int32 $transitions;
     private GpuTable<SceneModelGpu> $models;
-    private GpuTable<SceneInstanceGpu> $statics;
-    private array<SceneInstanceGpu> $movers;
+    private GpuTable<SceneInstanceGpu> $instances;
+    private GpuTable<ScenePoseGpu> $poses;
+
+    /**
+     * The first pose row of every moving instance, packed: `scene_resolve` walks this many.
+     */
+    private GpuTable<uint32> $movingTable;
+
+    /**
+     * Row ids free for reuse; each id's pose block (first row, rows it holds), its slot in the
+     * moving list (-1 while still), its home (a chunk, the active set or none) and its slot
+     * there, and whether it is pinned to the active set.
+     */
+    private array<int32> $freeRows;
+    private int32 $rowCount;
+    private array<int32> $poseOf;
+    private array<int32> $poseRows;
+    private array<int32> $movingAt;
+    private array<int32> $movingIds;
+    private array<int32> $freeSingles;
+    private array<int32> $freeTriples;
+    private int32 $poseCount;
+
+    /**
+     * Rows `reserve` made the active set room for: the cull sets size their chunk pairs and
+     * tiles for that many active rows up front, so a burst of bodies waking at once never
+     * reallocates a set in the displayed frame.
+     */
+    private int32 $moverRoom;
+    private array<int32> $homeOf;
+    private array<int32> $slotOf;
+    private array<bool> $pinnedTo;
     private array<SceneViewGpu> $views;
-    private TransientSlice? $moverSlice;
     private TransientSlice? $standIn;
     private uint64 $standInFrame;
     private uint64 $preparedFrame;
     private bool $prepared;
     private GpuPass? $opaque;
     private GpuPass? $alpha;
+    private GpuScan? $scan;
+    private array<SceneCullJob> $jobs;
 
     public constructor(Device $device)
     {
@@ -236,36 +493,91 @@ public class GpuScene
         $this->lodBias = 1.0f;
         $this->palette = null;
         $this->changed = arr::room<AABB>(SCENE_CHANGED_MAX as usize);
-        $this->cascades = SceneCullSet('scene.cascades');
-        $this->pages = SceneCullSet('scene.pages');
+        $this->cascades = SceneCullSet('scene.cascades', false, 16384, 262144, 1048576, 0, SHADOW_CASCADES, SCENE_SHADOW_BUCKETS, 0);
+        $this->pages = SceneCullSet('scene.pages', false, 8192, 65536, 262144, 0, 1, SCENE_SHADOW_BUCKETS, 0);
+        $this->pageWindow = 0;
+        $this->moverRoom = 0;
+        $this->main = SceneCullSet('scene.main', true, 4096, 65536, 262144, 4194304, 3, SCENE_CLASSES_MAX, SCENE_DEPTH_BINS);
+        $this->mainViews = false;
+        $this->outlining = false;
+        $this->showChunks = false;
+        $this->minCasterTexels = visu::app::flags()->float('shadow.mintexels', 1.0) as float32;
+        $this->splitCull = visu::app::flags()->bool('scene.cullsplit', false);
+        $this->minPixels = visu::app::flags()->float('scene.minpixels', 0.0) as float32;
+        $this->showMeshlets = visu::app::flags()->bool('scene.meshlets', false);
+        $this->interpolation = 1.0f;
+        $this->chunks = SceneChunks($device);
+        $this->transitions = 0;
         $this->models = GpuTable<SceneModelGpu>($device, 'scene.models');
-        $this->statics = GpuTable<SceneInstanceGpu>($device, 'scene.statics');
-        $this->movers = arr::room<SceneInstanceGpu>(64);
-        $this->views = arr::room<SceneViewGpu>(SCENE_PASSES_MAX);
-        $this->moverSlice = null;
+        $this->instances = GpuTable<SceneInstanceGpu>($device, 'scene.instances');
+        $this->poses = GpuTable<ScenePoseGpu>($device, 'scene.poses');
+        $this->movingTable = GpuTable<uint32>($device, 'scene.moving');
+        $this->freeRows = array<int32>();
+        $this->rowCount = 0;
+        $this->poseOf = array<int32>();
+        $this->poseRows = array<int32>();
+        $this->movingAt = array<int32>();
+        $this->movingIds = array<int32>();
+        $this->freeSingles = array<int32>();
+        $this->freeTriples = array<int32>();
+        $this->poseCount = 0;
+        $this->homeOf = array<int32>();
+        $this->slotOf = array<int32>();
+        $this->pinnedTo = array<bool>();
+        $this->views = arr::room<SceneViewGpu>(SCENE_PASSES_MAX as usize);
         $this->standIn = null;
         $this->standInFrame = 0;
         $this->preparedFrame = 0;
         $this->prepared = false;
         $this->opaque = null;
         $this->alpha = null;
+        $this->scan = null;
+        $this->jobs = arr::room<SceneCullJob>(3);
     }
 
     /**
-     * Something to draw: a static placed or a mover this frame.
+     * Instances moving this frame: the rows `scene_resolve` mixes.
      */
     public const function moverCount() : int32
     {
-        return $this->movers->count() as int32;
-    }
-
-    public const function active() : bool
-    {
-        return $this->statics->rows > 0 || $this->movers->count() > 0;
+        return $this->movingIds->count() as int32;
     }
 
     /**
-     * Row `$index` becomes `$model`'s LOD table. Its arena clusters must be uploaded; a model the
+     * Instance rows in use, the high water of every id handed out.
+     */
+    public const function rowCount() : int32
+    {
+        return $this->rowCount - ($this->freeRows->count() as int32);
+    }
+
+    /**
+     * Rows in the active set.
+     */
+    public const function activeCount() : int32
+    {
+        return $this->chunks->members($this->chunks->active());
+    }
+
+    /**
+     * Something to draw: a row was ever handed out.
+     */
+    public const function active() : bool
+    {
+        return $this->instances->rows > 0;
+    }
+
+    /**
+     * Lay the chunk grid over `$world` in chunks of `$metres`. Before the first row.
+     */
+    public function layout(const AABB& $world, float32 $metres) : void
+    {
+        assert($this->rowCount() == 0, 'gpu scene: layout before any row');
+        $this->chunks->layout($world, $metres);
+    }
+
+    /**
+     * Row `$index` becomes `$model`'s LOD table. Its arena form must be uploaded; a model the
      * arena does not hold gets an empty table and draws nothing.
      */
     public function setModel(int32 $index, Model $model) : void
@@ -290,41 +602,208 @@ public class GpuScene
             int32 $i = 0;
             while ($i < $levels) {
                 $row->distance[$i] = $model->lods[$i as usize]->distance;
-                $row->start[$i] = $arena->lodStart[$i as usize] as uint32;
+                $row->start[$i] = $arena->lodRun[$i as usize] as uint32;
                 $i = $i + 1;
             }
 
-            $row->start[$levels] = $arena->lodStart[$levels as usize] as uint32;
+            $row->start[$levels] = $arena->lodRun[$levels as usize] as uint32;
         }
 
         $this->models->set($index, $row);
     }
 
     /**
-     * Static row `$slot` draws scene model `$model` at `$world` from now on.
+     * Room for `$rows` instance rows (their pose rows and chunk members) and `$movers` moving at
+     * once, taken at the next prepare instead of by the row that needs it.
      */
-    public function placeStatic(
-        int32 $slot,
-        int32 $model,
-        const Mat4& $world,
-        const AABB& $bounds,
-        float32 $lodBias,
-        bool $casts
-    ) : void
+    public function reserve(int32 $rows, int32 $movers) : void
     {
-        $this->statics->set($slot, sceneInstance($model, $world, $bounds, $lodBias, 0.0f, $casts, false));
-        $this->change($bounds);
+        $this->instances->reserve($rows);
+        $this->poses->reserve($rows + $movers * SCENE_MOVING_POSE_ROWS);
+        $this->movingTable->reserve($movers);
+        $this->freeRows->reserve($rows as usize);
+        $this->poseOf->reserve($rows as usize);
+        $this->poseRows->reserve($rows as usize);
+        $this->movingAt->reserve($rows as usize);
+        $this->movingIds->reserve($movers as usize);
+        $this->freeSingles->reserve($rows as usize);
+        $this->freeTriples->reserve($movers as usize);
+        $this->homeOf->reserve($rows as usize);
+        $this->slotOf->reserve($rows as usize);
+        $this->pinnedTo->reserve($rows as usize);
+        $this->chunks->reserve($rows);
+        $this->chunks->reserveActive($movers);
+        $this->moverRoom = std::math::max($this->moverRoom, $movers);
+        // the main views and the cascades see most of a big scatter at once (far bushes keep
+        // their impostor); pages see a few lights' reach and keep their caps
+        int32 $all = $rows + $movers;
+        $this->main->fit(sceneCap($all, SCENE_MAIN_PAIRS_PER_ROW), sceneCap($all, SCENE_MAIN_ITEMS_PER_ROW), sceneCap($all, SCENE_MAIN_TRIANGLES_PER_ROW));
+        $this->cascades->fit(sceneCap($all, SCENE_CASCADE_PAIRS_PER_ROW), sceneCap($all, SCENE_CASCADE_ITEMS_PER_ROW), 0);
     }
 
     /**
-     * Static row `$slot`, last standing in `$bounds`, draws nothing until it is placed again.
+     * A new instance row id, stable until `release`. It draws nothing until written.
      */
-    public function releaseStatic(int32 $slot, const AABB& $bounds) : void
+    public function acquire() : int32
     {
-        SceneInstanceGpu $dead = sceneInstance(0, Mat4(), AABB(Vec3(0.0f), Vec3(0.0f)), 1.0f, 0.0f, false, false);
+        if ($this->freeRows->count() > 0) {
+            return $this->freeRows->pop();
+        }
+
+        int32 $id = $this->rowCount;
+        $this->rowCount = $this->rowCount + 1;
+        $this->poseOf[] = -1;
+        $this->poseRows[] = 0;
+        $this->movingAt[] = -1;
+        $this->homeOf[] = SCENE_HOME_NONE;
+        $this->slotOf[] = -1;
+        $this->pinnedTo[] = false;
+        return $id;
+    }
+
+    /**
+     * Row `$id`, last standing in `$bounds`, draws nothing and goes back for reuse: its pose block
+     * is freed, it leaves the moving list and its chunk or the active set.
+     */
+    public function release(int32 $id, const AABB& $bounds) : void
+    {
+        $this->leaveMoving($id);
+        $this->freePose($id);
+        $this->leaveHome($id);
+        $this->pinnedTo[$id as usize] = false;
+        SceneInstanceGpu $dead = sceneInstance(SceneRow(0, AABB(Vec3(0.0f), Vec3(0.0f)), 1.0f, Vec4(1.0f), 0.0f, false, false, false), 0, 0, SCENE_HOME_NONE);
         $dead->flags = 0;
-        $this->statics->set($slot, $dead);
+        $this->instances->set($id, $dead);
         $this->change($bounds);
+        $this->freeRows[] = $id;
+    }
+
+    /**
+     * Keep row `$id` in the active set however it is written (a skin, a prop being dragged, a
+     * preview), or let an exact write rest it in its chunk again. Takes effect at its next write.
+     */
+    public function pin(int32 $id, bool $on) : void
+    {
+        $this->pinnedTo[$id as usize] = $on;
+    }
+
+    public const function pinned(int32 $id) : bool
+    {
+        return $this->pinnedTo[$id as usize];
+    }
+
+    /**
+     * Row `$id` shows `$row` at exactly `$world` from now on: one pose row with the CPU's matrix,
+     * bit for bit, out of the moving list, and in the chunk of its box unless pinned.
+     */
+    public function write(int32 $id, const SceneRow& $row, const Mat4& $world) : void
+    {
+        $this->leaveMoving($id);
+        int32 $pose = $this->poseOf[$id as usize];
+        if ($pose < 0) {
+            $pose = $this->takePose($id, 1);
+        }
+
+        $this->poses->set($pose, scenePose($world));
+        int32 $home = $this->place($id, $this->pinnedTo[$id as usize], $row);
+        $this->instances->set($id, sceneInstance($row, $pose, 0, $home));
+    }
+
+    /**
+     * Row `$id` shows `$row` moving from `$was` to `$now` (world poses) over the frames until its
+     * next write: its pose block holds both and `scene_resolve` mixes them at each frame's alpha.
+     * It is in the active set while it moves. `$row.bounds` has to cover the whole way.
+     */
+    public function write(int32 $id, const SceneRow& $row, moving: const Pose& $was, const Pose& $now) : void
+    {
+        int32 $pose = $this->poseOf[$id as usize];
+        if ($pose >= 0 && $this->poseRows[$id as usize] < SCENE_MOVING_POSE_ROWS) {
+            $this->freePose($id);
+            $pose = -1;
+        }
+
+        if ($pose < 0) {
+            $pose = $this->takePose($id, SCENE_MOVING_POSE_ROWS);
+        }
+
+        $this->poses->set($pose + 1, scenePose(trs: $was));
+        $this->poses->set($pose + 2, scenePose(trs: $now));
+        int32 $home = $this->place($id, true, $row);
+        $this->instances->set($id, sceneInstance($row, $pose, SCENE_INSTANCE_MOVING, $home));
+        if ($this->movingAt[$id as usize] < 0) {
+            int32 $slot = $this->movingIds->count() as int32;
+            $this->movingIds[] = $id;
+            $this->movingAt[$id as usize] = $slot;
+            $this->movingTable->set($slot, $pose as uint32);
+        }
+    }
+
+    /**
+     * Row `$id` changes what it shows but not where: the instance row alone is rewritten (the
+     * tint, hidden, the palette row, the outline). Its pose block and its home stay.
+     */
+    public function restyle(int32 $id, const SceneRow& $row) : void
+    {
+        int32 $pose = $this->poseOf[$id as usize];
+        if ($pose < 0) {
+            return;
+        }
+
+        uint32 $flags = 0;
+        if ($this->movingAt[$id as usize] >= 0) {
+            $flags = SCENE_INSTANCE_MOVING;
+        }
+
+        int32 $home = $this->homeOf[$id as usize];
+        if ($home >= 0) {
+            $this->chunks->grow($home, $row->bounds, sceneFlags($row));
+        }
+
+        $this->instances->set($id, sceneInstance($row, $pose, $flags, $home));
+    }
+
+    /**
+     * Whether row `$id` is resolving between two poses.
+     */
+    public const function moving(int32 $id) : bool
+    {
+        return $this->movingAt[$id as usize] >= 0;
+    }
+
+    /**
+     * Whether row `$id` is a candidate of the active set (else of its chunk).
+     */
+    public const function inActiveSet(int32 $id) : bool
+    {
+        return $this->homeOf[$id as usize] == SCENE_HOME_ACTIVE;
+    }
+
+    /**
+     * The chunk row `$id` rests in (`SceneChunks.at`), or -1 in the active set or unplaced.
+     */
+    public const function chunkOf(int32 $id) : int32
+    {
+        int32 $home = $this->homeOf[$id as usize];
+        if ($home < 0) {
+            return -1;
+        }
+
+        return $home;
+    }
+
+    /**
+     * A box row `$id` lies in: its chunk's (conservative, never shrinking), or a zero box when it
+     * is in the active set or nowhere. What an owner reports as changed for a static it keeps no
+     * bounds of.
+     */
+    public const function homeBox(int32 $id) : AABB
+    {
+        int32 $home = $this->homeOf[$id as usize];
+        if ($home < 0) {
+            return AABB(Vec3(0.0f), Vec3(0.0f));
+        }
+
+        return $this->chunks->box($home);
     }
 
     /**
@@ -336,46 +815,42 @@ public class GpuScene
     }
 
     /**
-     * Forget this frame's movers. `ModelSystem.fill` calls it before it adds them again.
-     */
-    public function clearMovers() : void
-    {
-        $this->movers->clear();
-    }
-
-    /**
-     * One dynamic or skinned instance, this frame only. `$skinBase` is its first palette row.
-     */
-    public function addMover(
-        int32 $model,
-        const Mat4& $world,
-        const AABB& $bounds,
-        float32 $lodBias,
-        float32 $skinBase,
-        bool $skinned,
-        bool $casts
-    ) : void
-    {
-        $this->movers[] = sceneInstance($model, $world, $bounds, $lodBias, $skinBase, $casts, $skinned);
-    }
-
-    /**
-     * Drop every row: the scene's models and statics are gone (a reload, a new map).
+     * Drop every row: the scene's models and instances are gone (a reload, a new map). The chunk
+     * grid stays laid out.
      */
     public function clear() : void
     {
         $this->models->clear();
-        $this->statics->clear();
-        $this->movers->clear();
+        $this->instances->clear();
+        $this->poses->clear();
+        $this->movingTable->clear();
+        $this->chunks->clear();
+        $this->freeRows->clear();
+        $this->rowCount = 0;
+        $this->poseOf->clear();
+        $this->poseRows->clear();
+        $this->movingAt->clear();
+        $this->movingIds->clear();
+        $this->freeSingles->clear();
+        $this->freeTriples->clear();
+        $this->poseCount = 0;
+        $this->homeOf->clear();
+        $this->slotOf->clear();
+        $this->pinnedTo->clear();
+        $this->transitions = 0;
         $this->changed->clear();
         $this->cascades->culled = false;
         $this->pages->culled = false;
+        $this->main->culled = false;
+        $this->mainViews = false;
+        $this->outlining = false;
         $this->prepared = false;
     }
 
     /**
      * Once per frame, by whichever cull runs first: grow the tables, scatter their queued rows,
-     * and put the movers in the ring. False when there is nothing to cull.
+     * and resolve every moving row's matrix at the frame's alpha. False when there is nothing
+     * to cull.
      */
     public function prepare(RenderContext $ctx) : bool
     {
@@ -387,19 +862,36 @@ public class GpuScene
         ModelBank $bank = guard $this->bank else {
             return false;
         }
-        if (!$this->active() || $bank->arena->empty()) {
+        if (!$this->active() || $bank->arena->empty() || !$bank->bindless()) {
             return false;
         }
 
-        ComputeProgram $scatter = guard $this->device->gpuShaders->kernel($this->device, 'scene_scatter') else ($e) {
-            die($e->message());
-        }
+        ComputeProgram $scatter = sceneKernel($this->device, $this->device->gpuShaders, 'scene_scatter');
+        ComputeProgram $resolve = sceneKernel($this->device, $this->device->gpuShaders, 'scene_resolve');
         $this->models->grow($ctx);
-        $this->statics->grow($ctx);
-        $this->moverSlice = $this->uploadMovers();
+        $this->instances->grow($ctx);
+        $this->poses->grow($ctx);
+        $this->movingTable->grow($ctx);
+        $this->chunks->list->grow($ctx);
+        $this->chunks->table->grow($ctx);
+        $this->chunks->occupiedTable->grow($ctx);
         ComputeEncoder $enc = $ctx->beginCompute();
         $this->models->scatter($enc, $scatter);
-        $this->statics->scatter($enc, $scatter);
+        $this->instances->scatter($enc, $scatter);
+        $this->poses->scatter($enc, $scatter);
+        $this->movingTable->scatter($enc, $scatter);
+        $this->chunks->list->scatter($enc, $scatter);
+        $this->chunks->table->scatter($enc, $scatter);
+        $this->chunks->occupiedTable->scatter($enc, $scatter);
+        uint32 $moving = $this->movingIds->count() as uint32;
+        if ($moving > 0) {
+            $enc->barrier();
+            $enc->setKernel($resolve);
+            $enc->upload(SceneResolveParams($alpha: Vec4($this->interpolation, 0.0f, 0.0f, 0.0f), $count: $moving), slot: 0);
+            $enc->bindStorage(0, $this->poses->buffer());
+            $enc->bindStorage(1, $this->movingTable->buffer());
+            $enc->dispatch($moving);
+        }
         $enc->endCompute();
         $this->prepared = true;
         $this->preparedFrame = $frame;
@@ -407,44 +899,84 @@ public class GpuScene
     }
 
     /**
-     * Cull the sun cascades from `ShadowMapData` into the cascade set, one pass each.
+     * This frame's CPU-known culls in one encoder: the sun cascades from `ShadowMapData` when the
+     * shadow pass runs, and the main views when `mainViews` is on and the frame has a camera.
      */
-    public function cullCascades(RenderContext $ctx) : void
+    public function cullFrame(RenderContext $ctx) : void
     {
         $this->cascades->culled = false;
-        ShadowMapData $shadows = guard $ctx->frame->find<ShadowMapData>() else {
+        $this->main->culled = false;
+        CameraData $camera = guard $ctx->frame->find<CameraData>() else {
             return;
         }
         if (!$this->prepare($ctx)) {
             return;
         }
 
-        $this->views->clear();
-        int32 $c = 0;
-        while ($c < SHADOW_CASCADES) {
-            $this->views[] = SceneViewGpu($shadows->cascades[$c]->frustum, $c);
-            $c = $c + 1;
+        $this->jobs->clear();
+        ShadowMapData? $shadows = $ctx->frame->find<ShadowMapData>();
+        if ($shadows != null) {
+            ShadowMapData $held = guard $shadows;
+            $this->views->clear();
+            int32 $c = 0;
+            float32 $mapTexels = $held->map->width as float32;
+            while ($c < SHADOW_CASCADES) {
+                SceneViewGpu $v = SceneViewGpu($held->cascades[$c]->frustum, $c);
+                $v->minRadius = mem::bit_cast<uint32, float32>(cascadeTexel($held->cascades[$c], $mapTexels) * $this->minCasterTexels);
+                $this->views[] = $v;
+                $c = $c + 1;
+            }
+
+            TransientSlice $slice = transientRows<SceneViewGpu>($this->device, $this->views, 1);
+            $this->jobs[] = $this->job($camera, $this->cascades, $slice, null, SHADOW_CASCADES, SHADOW_CASCADES, SCENE_SHADOW_BUCKETS, SCENE_INSTANCE_CASTS, SCENE_CASCADE_CHUNK_SHARE);
         }
 
-        TransientSlice $slice = transientRows<SceneViewGpu>($this->device, $this->views, 1);
+        if ($this->mainViews) {
+            $this->views->clear();
+            $this->mainCameraView($camera);
+            $this->mirrorView($ctx);
+            $this->outlineView($camera);
+            TransientSlice $slice = transientRows<SceneViewGpu>($this->device, $this->views, 1);
+            ModelBank $bank = guard $this->bank;
+            int32 $classes = $bank->classCount();
+            if ($classes < 1) {
+                $classes = 1;
+            }
+
+            $this->jobs[] = $this->job($camera, $this->main, $slice, null, $this->views->count() as int32, 3, $classes * SCENE_DEPTH_BINS, 0, SCENE_MAIN_CHUNK_SHARE);
+        }
+
+        if ($this->jobs->count() == 0) {
+            return;
+        }
+
         visu::profile::begin('scene');
-        $this->cull($ctx, $this->cascades, $slice, null, $this->views->count() as int32, SHADOW_CASCADES);
+        $this->cull($ctx);
         visu::profile::end();
     }
 
     /**
      * Cull `$count` views the GPU wrote into `$views` (inactive ones carry pass
-     * `SCENE_PASS_NONE`) into the page set, all drawing in pass 0.
+     * `SCENE_PASS_NONE`) into the page set, all drawing in pass 0. Every live view carries a
+     * ball round its light that holds its frustum (`SCENE_VIEW_SPHERE`), none wider than `$reach`
+     * metres, so each one walks only the grid cells round its light rather than every occupied
+     * chunk of the scene.
      */
-    public function cullPages(RenderContext $ctx, Buffer $views, int32 $count) : void
+    public function cullPages(RenderContext $ctx, Buffer $views, int32 $count, float32 $reach) : void
     {
         $this->pages->culled = false;
+        CameraData $camera = guard $ctx->frame->find<CameraData>() else {
+            return;
+        }
         if (!$this->prepare($ctx)) {
             return;
         }
 
+        $this->jobs->clear();
+        $this->jobs[] = $this->job($camera, $this->pages, null, $views, $count, 1, SCENE_SHADOW_BUCKETS, SCENE_INSTANCE_CASTS, 0.0f, $reach);
+        $this->pageWindow = $this->jobs[0]->params->localSide as int32;
         visu::profile::begin('scene');
-        $this->cull($ctx, $this->pages, null, $views, $count, 1);
+        $this->cull($ctx);
         visu::profile::end();
     }
 
@@ -464,10 +996,10 @@ public class GpuScene
     }
 
     /**
-     * Record `$set`'s pass `$pass` with `$opaque` for the opaque bucket and `$alpha` for every
-     * alpha-tested one (its material bound): one indirect draw per bucket, whatever the GPU
-     * kept. Binds the arena, the instances and the items at storage 0..5 and the palette at
-     * slot 2; storage 6 and 7 are the caller's.
+     * Record `$set`'s pass `$pass`: the opaque bucket with `$opaque`, the cut-out one with
+     * `$alpha` and the texture table bound; one indirect draw each, whatever the GPU kept. Binds
+     * the arena, the instances, the poses and the items at storage 0..5, the material table at 8
+     * and the palette at slot 2; storage 6 and 7 are the caller's.
      */
     public function draw(RenderEncoder $enc, SceneCullSet $set, int32 $pass, GpuPass $opaque, GpuPass $alpha) : void
     {
@@ -478,34 +1010,123 @@ public class GpuScene
         ModelBank $bank = guard $this->bank else {
             return;
         }
-        TransientSlice $movers = guard $this->moverSlice else {
+        Buffer $args = sceneHeld($set->args);
+        $opaque->bind($enc);
+        $this->bindPulled($enc, $set, $bank);
+        int32 $segment = $pass * $set->keys;
+        $enc->drawIndirect($args, $set->drawOffset($segment + (SCENE_BUCKET_OPAQUE as int32)));
+        $alpha->bind($enc);
+        $this->bindTable($enc, $bank);
+        $enc->drawIndirect($args, $set->drawOffset($segment + (SCENE_BUCKET_ALPHA as int32)));
+    }
+
+    /**
+     * Record the main set's pass `$pass` (camera, mirror or outline) into an open encoder whose
+     * camera is bound: one indexed indirect draw per G-buffer class, each with the pass
+     * `$passFor` picks for that class (null skips the class). Binds the arena, the instances,
+     * the poses and the items at storage 0..5, the material table at 8, the texture table and the
+     * palette.
+     */
+    public function drawMain(RenderEncoder $enc, int32 $pass, function<GpuPass?(int32)> $passFor) : void
+    {
+        SceneCullSet $set = $this->main;
+        if (!$set->culled || $pass < 0 || $pass >= $set->passes) {
             return;
         }
-        Buffer $args = guard $set->args;
-        Buffer $items = guard $set->items;
-        $opaque->bind($enc);
-        $enc->bindUniform(SKIN_PALETTE_SLOT, $this->paletteOrStandIn());
 
-        $enc->bindStorage(0, $bank->arena->vertices());
-        $enc->bindStorage(1, $bank->arena->indexBuffer());
-        $enc->bindStorage(2, $bank->arena->clusterBuffer());
-        $enc->bindStorage(3, $this->statics->buffer());
-        $enc->bindStorage(4, transient: $movers);
-        $enc->bindStorage(5, $items);
-        int32 $b = 0;
-        while ($b < $set->buckets) {
-            uint64 $offset = ((SCENE_ARGS_DRAW_BASE + ($pass * $set->buckets + $b) * 4) * 4) as uint64;
-            if ($b == 1) {
-                $alpha->bind($enc);
-            }
-
-            if ($b > 0) {
-                $bank->bucketMaterial($b)->bind($enc);
-            }
-
-            $enc->drawIndirect($args, $offset);
-            $b = $b + 1;
+        ModelBank $bank = guard $this->bank else {
+            return;
         }
+        Buffer $args = sceneHeld($set->args);
+        Buffer $indices = sceneHeld($set->indices);
+        bool $bound = false;
+        int32 $classes = $set->keys / $set->bins;
+        int32 $k = 0;
+        while ($k < $classes) {
+            GpuPass? $picked = $passFor($k);
+            if ($picked != null) {
+                GpuPass $p = guard $picked;
+                $p->bind($enc);
+                if (!$bound) {
+                    $this->bindPulled($enc, $set, $bank);
+                    $enc->setIndexBuffer($indices, IndexType::uint32);
+                    $this->bindTable($enc, $bank);
+                    $bound = true;
+                }
+
+                $enc->drawIndexedIndirect($args, $set->drawOffset($pass * $classes + $k));
+            }
+
+            $k = $k + 1;
+        }
+    }
+
+    /**
+     * The last frame's counters of `$set`, read back with the device idle: what each stage kept
+     * and dropped. The `scene` verb; a debug stall, never the play path.
+     */
+    public function stats(SceneCullSet $set) : string
+    {
+        Buffer $counters = guard $set->counters else {
+            return "{$set->label}: not culled yet";
+        }
+        array<uint8> $c = guard $this->device->readbackBuffer($counters, 0 as uint64, ((SCENE_COUNTER_VIEW_BASE + 8) * 4) as uint64) else ($e) {
+            return "{$set->label}: {$e->message()}";
+        }
+        uint32 $chunkPairs = sceneWord($c, SCENE_COUNTER_CHUNK_PAIRS);
+        uint32 $pairs = sceneWord($c, SCENE_COUNTER_PAIRS);
+        uint32 $items = sceneWord($c, SCENE_COUNTER_ITEMS);
+        uint32 $tris = sceneWord($c, SCENE_COUNTER_TRIANGLES);
+        uint32 $d0 = sceneWord($c, SCENE_COUNTER_DROPPED_CHUNK_PAIRS);
+        uint32 $d1 = sceneWord($c, SCENE_COUNTER_DROPPED_PAIRS);
+        uint32 $d2 = sceneWord($c, SCENE_COUNTER_DROPPED_ITEMS);
+        uint32 $d3 = sceneWord($c, SCENE_COUNTER_DROPPED_TRIANGLES);
+        string $out = "{$set->label}: chunk pairs {$chunkPairs}/{$set->chunkPairCap} pairs {$pairs}/{$set->pairCap} items {$items}/{$set->itemCap}";
+        if ($set->gbuffer) {
+            $out->append(" triangles {$tris}/{$set->triangleCap}");
+        }
+
+        if ($set->gbuffer && $set->bins > 0) {
+            Buffer $args = sceneHeld($set->args);
+            int32 $classes = $set->keys / $set->bins;
+            int32 $draws = $set->passes * $classes;
+            array<uint8> $a = guard $this->device->readbackBuffer($args, 0 as uint64, ((SCENE_ARGS_DRAW_BASE + $draws * SCENE_DRAW_WORDS) * 4) as uint64) else ($e) {
+                return $out;
+            }
+            int32 $p = 0;
+            while ($p < $set->passes) {
+                uint32 $tris = 0;
+                int32 $k = 0;
+                while ($k < $classes) {
+                    $tris = $tris + sceneWord($a, SCENE_ARGS_DRAW_BASE + ($p * $classes + $k) * SCENE_DRAW_WORDS) / 3;
+                    $k = $k + 1;
+                }
+
+                $out->append(" pass{$p} {$tris} tris");
+                $p = $p + 1;
+            }
+        }
+
+        $out->append(" dropped {$d0} {$d1} {$d2} {$d3} views");
+        int32 $w = SCENE_COUNTER_VIEW_BASE;
+        while ($w < SCENE_COUNTER_VIEW_BASE + 8) {
+            uint32 $v = sceneWord($c, $w);
+            $out->append(" {$v}");
+            $w = $w + 1;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Free the working buffers. The renderer calls this when it shuts down.
+     */
+    public function destroy() : void
+    {
+        $this->clear();
+        $this->cascades->destroy();
+        $this->pages->destroy();
+        $this->main->destroy();
     }
 
     /**
@@ -534,146 +1155,537 @@ public class GpuScene
         return $fresh;
     }
 
-    /**
-     * Free the working buffers. The renderer calls this when it shuts down.
-     */
-    public function destroy() : void
+    private function bindPulled(RenderEncoder $enc, SceneCullSet $set, ModelBank $bank) : void
     {
-        $this->clear();
-        $this->cascades->destroy();
-        $this->pages->destroy();
+        $enc->bindUniform(SKIN_PALETTE_SLOT, $this->paletteOrStandIn());
+        $enc->bindStorage(0, $bank->arena->vertices());
+        $enc->bindStorage(1, $bank->arena->detailBuffer());
+        $enc->bindStorage(2, $bank->arena->meshletBuffer());
+        $enc->bindStorage(3, $this->instances->buffer());
+        $enc->bindStorage(4, $this->poses->buffer());
+        // the pulled G-buffer programs read the items' draw records, the depth ones the items
+        if ($set->gbuffer) {
+            $enc->bindStorage(5, sceneHeld($set->drawItems));
+        } else {
+            $enc->bindStorage(5, sceneHeld($set->items));
+        }
+
+        $enc->bindStorage(8, $bank->materialTable());
+    }
+
+    private function bindTable(RenderEncoder $enc, ModelBank $bank) : void
+    {
+        TextureTable $table = $bank->textureTable();
+        $table->refresh();
+        $enc->bindTextureTable($table);
     }
 
     /**
-     * Instance and cluster culling of `$count` views into `$set`, then the scan that writes its
-     * indirect draws, in one compute encoder. The views are a CPU transient or a GPU buffer.
+     * The camera's view of the main set: its cull frustum, MAIN rows, normal cones from its eye.
      */
-    private function cull(
-        RenderContext $ctx,
+    private function mainCameraView(CameraData $camera) : void
+    {
+        SceneViewGpu $v = SceneViewGpu($camera->cullFrustum, SCENE_PASS_CAMERA);
+        $v->require = SCENE_INSTANCE_MAIN;
+        $v->tests = SCENE_VIEW_CONE;
+        $v->eye = Vec4($camera->cullPosition, sceneScreenFactor($camera->projection, $camera->resolutionY, $this->minPixels));
+        $this->views[] = $v;
+    }
+
+    /**
+     * The water mirror's view when this frame draws one: the reflected camera's frustum, only
+     * what reaches above the water plane and within the mirror's sphere, as the CPU cull had it.
+     */
+    private function mirrorView(RenderContext $ctx) : void
+    {
+        WaterFrame $water = guard $ctx->frame->find<WaterFrame>() else {
+            return;
+        }
+        if (!$water->active || !$water->mirror || $water->mirrorIndex < 0) {
+            return;
+        }
+
+        WaterDraw $chosen = $water->draws[$water->mirrorIndex as usize];
+        SceneViewGpu $v = SceneViewGpu($water->camera->cullFrustum, SCENE_PASS_MIRROR);
+        $v->require = SCENE_INSTANCE_MAIN;
+        $v->tests = SCENE_VIEW_CLIP | SCENE_VIEW_SPHERE | SCENE_VIEW_CONE;
+        $v->clip = scenePlane($chosen->plane);
+        $v->sphere = Vec4($chosen->origin, $chosen->radius);
+        $v->eye = Vec4($water->camera->position, sceneScreenFactor($water->camera->projection, $water->camera->resolutionY, $this->minPixels));
+        $this->views[] = $v;
+    }
+
+    /**
+     * The outline view while some row glows: the camera's frustum, OUTLINE rows only.
+     */
+    private function outlineView(CameraData $camera) : void
+    {
+        if (!$this->outlining) {
+            return;
+        }
+
+        SceneViewGpu $v = SceneViewGpu($camera->cullFrustum, SCENE_PASS_OUTLINE);
+        $v->require = SCENE_INSTANCE_OUTLINE;
+        $this->views[] = $v;
+    }
+
+    private function job(
+        CameraData $camera,
         SceneCullSet $set,
         TransientSlice? $cpuViews,
         Buffer? $gpuViews,
-        int32 $count,
-        int32 $passes
-    ) : void
+        int32 $views,
+        int32 $passes,
+        int32 $keys,
+        uint32 $require,
+        float32 $chunkShare,
+        float32 $reach = 0.0f
+    ) : SceneCullJob
+    {
+        assert($views <= SCENE_VIEWS_MAX, 'gpu scene: more views than a set culls');
+        // a set's views together see at most `$chunkShare` of the candidates: every occupied
+        // chunk and every block of the active set. Grows as the chunks fill, never shrinks
+        // the active set is sized for the movers it was reserved for, so a wake burst fits
+        int32 $active = std::math::max($this->activeCount(), $this->moverRoom);
+        if ($chunkShare > 0.0f) {
+            int32 $blocks = ($active + SCENE_ACTIVE_BLOCK_ROWS - 1) / SCENE_ACTIVE_BLOCK_ROWS;
+            int32 $candidates = $this->chunks->occupiedCount() + $blocks;
+            $set->fitChunks((($candidates as float32) * $chunkShare) as int32 + 1);
+        }
+
+        int32 $side = $this->localSide($reach);
+        $set->ensure($this->device, $keys);
+        $set->fitTiles($this->device, $views * sceneChunkTiles(sceneSpatial($side, $this->chunks->occupiedCount()), $active) + 1);
+        $set->passes = $passes;
+        $set->keys = $keys;
+        uint32 $gbuffer = $set->bins as uint32;
+
+        SceneCullParams $params = SceneCullParams(
+            $eye: Vec4($camera->cullPosition, $this->lodBias),
+            $chunks: $this->chunks->occupiedCount() as uint32,
+            $active: $this->activeCount() as uint32,
+            $views: $views as uint32,
+            $keys: $keys as uint32,
+            $chunkPairCap: $set->chunkPairCap as uint32,
+            $pairCap: $set->pairCap as uint32,
+            $itemCap: $set->itemCap as uint32,
+            $triangleCap: $set->triangleCap as uint32,
+            $mode: 0,
+            $require: $require,
+            $gbuffer: $gbuffer,
+            $passes: $passes as uint32,
+            $grid: Vec4($this->chunks->origin()->x, $this->chunks->origin()->z, $this->chunks->metres, $this->chunks->overhang),
+            $localSide: $side as uint32,
+            $cols: $this->chunks->cols as uint32,
+            $rows: $this->chunks->rows as uint32
+        );
+        if ($set->gbuffer && $this->showMeshlets) {
+            $params->debug = SCENE_DEBUG_MESHLETS;
+        }
+        return SceneCullJob($set, $cpuViews, $gpuViews, $views, $params);
+    }
+
+    /**
+     * Cells a side of the window a local set walks round a view's reach sphere of at most
+     * `$reach` metres (widened by the chunks' overhang), or 0 when its views should walk every
+     * occupied chunk: no reach given, or a window holding as many cells as are occupied.
+     */
+    private const function localSide(float32 $reach) : int32
+    {
+        return sceneLocalSide($reach, $this->chunks->overhang, $this->chunks->metres, $this->chunks->occupiedCount());
+    }
+
+    /**
+     * Every job's four stages in one compute encoder, stage by stage across the jobs, so the
+     * jobs share each barrier. Each stage counts, scans and writes; see `visu/scenecull.glsl`.
+     */
+    private function cull(RenderContext $ctx) : void
     {
         ModelBank $bank = guard $this->bank else {
             return;
         }
-        CameraData $camera = guard $ctx->frame->find<CameraData>() else {
-            return;
-        }
-        TransientSlice $movers = guard $this->moverSlice else {
-            return;
-        }
         GpuShaders $shaders = $this->device->gpuShaders;
-        ComputeProgram $instances = guard $shaders->kernel($this->device, 'scene_instances') else ($e) {
-            die($e->message());
-        }
-        ComputeProgram $pairArgs = guard $shaders->kernel($this->device, 'scene_pair_args') else ($e) {
-            die($e->message());
-        }
-        ComputeProgram $clusters = guard $shaders->kernel($this->device, 'scene_clusters') else ($e) {
-            die($e->message());
-        }
-        ComputeProgram $scan = guard $shaders->kernel($this->device, 'scene_scan') else ($e) {
-            die($e->message());
-        }
-
-        $set->ensure($this->device);
-        Buffer $counters = guard $set->counters;
-        Buffer $args = guard $set->args;
-        Buffer $pairs = guard $set->pairs;
-        Buffer $items = guard $set->items;
-        $this->device->fillBuffer($counters, 0 as uint64, (SCENE_COUNTER_WORDS * 4) as uint64, 0 as uint32);
-        $set->buckets = $bank->shadowBuckets();
-        if ($set->buckets > SCENE_BUCKETS_MAX) {
-            $set->buckets = SCENE_BUCKETS_MAX;
+        ComputeProgram $chunkKernel = sceneKernel($this->device, $shaders, 'scene_chunks');
+        ComputeProgram $memberKernel = sceneKernel($this->device, $shaders, 'scene_members');
+        ComputeProgram $meshletKernel = sceneKernel($this->device, $shaders, 'scene_meshlets');
+        ComputeProgram $argsKernel = sceneKernel($this->device, $shaders, 'scene_args');
+        ComputeProgram $triangleKernel = sceneKernel($this->device, $shaders, 'scene_triangles');
+        GpuScan $scan = $this->ensureScan();
+        Buffer $chunkTable = $this->chunks->table->buffer();
+        Buffer $lists = $this->chunks->list->buffer();
+        foreach ($this->jobs as $job) {
+            SceneCullSet $set = $job->set;
+            // every list below is written over its whole live length before it is scanned, and
+            // the scans run over those lengths only: the counters are all that needs zeroing
+            $this->device->fillBuffer(sceneHeld($set->counters), 0 as uint64, (SCENE_COUNTER_WORDS * 4) as uint64, 0 as uint32);
         }
 
-        $set->passes = $passes;
-        SceneCullParams $params = SceneCullParams(
-            $eye: Vec4($camera->cullPosition, $this->lodBias),
-            $statics: $this->statics->rows as uint32,
-            $movers: $this->movers->count() as uint32,
-            $views: $count as uint32,
-            $buckets: $set->buckets as uint32,
-            $maxPairs: SCENE_MAX_PAIRS as uint32,
-            $maxItems: SCENE_MAX_ITEMS as uint32,
-            $mode: 0,
-            $passes: $passes as uint32
-        );
-        uint32 $rows = ($this->statics->rows as uint32) + ($this->movers->count() as uint32);
-        Buffer $clusterBuffer = $bank->arena->clusterBuffer();
-
-        ComputeEncoder $enc = $ctx->beginCompute();
-        $enc->setKernel($instances);
-        $enc->upload($params, slot: 0);
-        $enc->bindStorage(0, $this->statics->buffer());
-        $enc->bindStorage(1, transient: $movers);
-        $enc->bindStorage(2, $this->models->buffer());
-        sceneBindViews($enc, 3, $cpuViews, $gpuViews);
-        $enc->bindStorage(4, $pairs);
-        $enc->bindStorage(5, $counters);
-        $enc->dispatch($rows, $count as uint32);
+        ComputeEncoder $enc = $this->stage($ctx, null, 'chunks');
+        // the chunk stage: count per view, scan the views, write the chunk pairs
+        foreach ($this->jobs as $job) {
+            $this->chunkStage($enc, $chunkKernel, $job, $chunkTable, 0);
+        }
         $enc->barrier();
-
-        $enc->setKernel($pairArgs);
-        $enc->upload($params, slot: 0);
-        $enc->bindStorage(0, $counters);
-        $enc->bindStorage(1, $args);
-        $enc->dispatch(1);
+        foreach ($this->jobs as $job) {
+            $scan->scan($enc, sceneHeld($job->set->chunkTiles), 0, sceneJobTiles($job) + 1);
+            $enc->barrier();
+        }
+        foreach ($this->jobs as $job) {
+            $this->chunkStage($enc, $chunkKernel, $job, $chunkTable, 1);
+        }
         $enc->barrier();
+        foreach ($this->jobs as $job) {
+            $this->argsStage($enc, $argsKernel, $job, 0);
+        }
 
-        $enc->setKernel($clusters);
-        $enc->upload($params, slot: 0);
-        $this->bindClusterWalk($enc, $pairs, $clusterBuffer, $movers, $cpuViews, $gpuViews, $counters, $items);
-        $enc->dispatchIndirect($args, 0 as uint64);
+        // the member stage: count pairs per segment into the matrix, scan it, write the pairs
+        $enc = $this->stage($ctx, $enc, 'members');
+        foreach ($this->jobs as $job) {
+            $this->memberStage($enc, $memberKernel, $job, $chunkTable, $lists, $bank, 0);
+        }
+        $enc = $this->stage($ctx, $enc, 'members.scan');
+        foreach ($this->jobs as $job) {
+            SceneCullSet $set = $job->set;
+            $scan->scanIndirect($enc, sceneHeld($set->matrix), 0, sceneHeld($set->counters), SCENE_COUNTER_MATRIX_SCAN as uint32, $set->matrixWords($set->keys) as uint32);
+            $enc->barrier();
+        }
+        $enc = $this->stage($ctx, $enc, 'members.write');
+        foreach ($this->jobs as $job) {
+            $this->memberStage($enc, $memberKernel, $job, $chunkTable, $lists, $bank, 1);
+        }
         $enc->barrier();
+        foreach ($this->jobs as $job) {
+            $this->argsStage($enc, $argsKernel, $job, 1);
+        }
 
-        $enc->setKernel($scan);
-        $enc->upload($params, slot: 0);
-        $enc->bindStorage(0, $counters);
-        $enc->bindStorage(1, $args);
-        $enc->dispatch(SCENE_SEGMENTS_MAX as uint32);
+        // the meshlet stage: every pair's meshlets flattened (their counts scanned), counted per
+        // workgroup, the counts scanned, then the items written in that order
+        $enc = $this->stage($ctx, $enc, 'meshlets.walk');
+        foreach ($this->jobs as $job) {
+            SceneCullSet $set = $job->set;
+            $scan->scanIndirect($enc, sceneHeld($set->pairWalk), 0, sceneHeld($set->counters), SCENE_COUNTER_PAIR_SCAN as uint32, ($set->pairCap + 1) as uint32);
+            $enc->barrier();
+        }
+        foreach ($this->jobs as $job) {
+            $this->argsStage($enc, $argsKernel, $job, 3);
+        }
+        $enc = $this->stage($ctx, $enc, 'meshlets');
+        foreach ($this->jobs as $job) {
+            $this->meshletStage($enc, $meshletKernel, $job, $bank, 0);
+        }
+        $enc = $this->stage($ctx, $enc, 'meshlets.scan');
+        foreach ($this->jobs as $job) {
+            SceneCullSet $set = $job->set;
+            uint32 $groups = ($set->walkGroups() + 1) as uint32;
+            $scan->scanIndirect($enc, sceneHeld($set->walkItems), 0, sceneHeld($set->counters), SCENE_COUNTER_WALK_SCAN as uint32, $groups);
+            $enc->barrier();
+            if ($set->gbuffer) {
+                $scan->scanIndirect($enc, sceneHeld($set->walkTriangles), 0, sceneHeld($set->counters), SCENE_COUNTER_WALK_SCAN as uint32, $groups);
+                $enc->barrier();
+            }
+        }
+        $enc = $this->stage($ctx, $enc, 'meshlets.write');
+        foreach ($this->jobs as $job) {
+            $this->meshletStage($enc, $meshletKernel, $job, $bank, 1);
+        }
         $enc->barrier();
+        foreach ($this->jobs as $job) {
+            $this->argsStage($enc, $argsKernel, $job, 2);
+        }
 
-        SceneCullParams $write = $params;
-        $write->mode = 1;
-        $enc->setKernel($clusters);
-        $enc->upload($write, slot: 0);
-        $this->bindClusterWalk($enc, $pairs, $clusterBuffer, $movers, $cpuViews, $gpuViews, $counters, $items);
-        $enc->dispatchIndirect($args, 0 as uint64);
-        $enc->endCompute();
-        $set->culled = true;
-    }
+        // the triangle stage of every G-buffer set
+        $enc = $this->stage($ctx, $enc, 'triangles');
+        foreach ($this->jobs as $job) {
+            SceneCullSet $set = $job->set;
+            if (!$set->gbuffer) {
+                continue;
+            }
 
-    private function bindClusterWalk(
-        ComputeEncoder $enc,
-        Buffer $pairs,
-        Buffer $clusters,
-        TransientSlice $movers,
-        TransientSlice? $cpuViews,
-        Buffer? $gpuViews,
-        Buffer $counters,
-        Buffer $items
-    ) : void
-    {
-        $enc->bindStorage(0, $pairs);
-        $enc->bindStorage(1, $clusters);
-        $enc->bindStorage(2, $this->statics->buffer());
-        $enc->bindStorage(3, transient: $movers);
-        sceneBindViews($enc, 4, $cpuViews, $gpuViews);
-        $enc->bindStorage(5, $counters);
-        $enc->bindStorage(6, $items);
+            $enc->setKernel($triangleKernel);
+            $enc->upload($job->params, slot: 0);
+            $enc->bindStorage(0, sceneHeld($set->items));
+            $enc->bindStorage(1, $bank->arena->meshletBuffer());
+            $enc->bindStorage(2, $bank->arena->detailBuffer());
+            $enc->bindStorage(3, sceneHeld($set->indices));
+            $enc->bindStorage(4, $this->instances->buffer());
+            $enc->bindStorage(5, sceneHeld($set->drawItems));
+            $enc->dispatchIndirect(sceneHeld($set->args), (SCENE_ARGS_TRIANGLES * 4) as uint64);
+        }
+        $this->closeStage($enc);
+        foreach ($this->jobs as $job) {
+            $job->set->culled = true;
+        }
     }
 
     /**
-     * The movers in this frame's ring, one zero row when there are none so the binding holds.
+     * The encoder the next stage records into: the one it was given behind a barrier, or with
+     * `splitCull` a new encoder under scope `$name` (literals only, so equal names fold). The
+     * first stage passes null.
      */
-    private function uploadMovers() : TransientSlice
+    private function stage(RenderContext $ctx, ComputeEncoder? $current, const string& $name) : ComputeEncoder
     {
-        return transientRows<SceneInstanceGpu>($this->device, $this->movers, 1);
+        if ($current != null) {
+            ComputeEncoder $held = guard $current;
+            if (!$this->splitCull) {
+                $held->barrier();
+                return $held;
+            }
+
+            $held->endCompute();
+            visu::profile::end();
+        }
+
+        if ($this->splitCull) {
+            visu::profile::begin($name);
+        }
+
+        return $ctx->beginCompute();
+    }
+
+    private function closeStage(ComputeEncoder $enc) : void
+    {
+        $enc->endCompute();
+        if ($this->splitCull) {
+            visu::profile::end();
+        }
+    }
+
+    private function chunkStage(ComputeEncoder $enc, ComputeProgram $kernel, SceneCullJob $job, Buffer $chunkTable, uint32 $mode) : void
+    {
+        SceneCullSet $set = $job->set;
+        SceneCullParams $p = $job->params;
+        $p->mode = $mode;
+        $enc->setKernel($kernel);
+        $enc->upload($p, slot: 0);
+        $enc->bindStorage(0, $chunkTable);
+        sceneBindViews($enc, 1, $job->cpuViews, $job->gpuViews);
+        $enc->bindStorage(2, $this->chunks->occupiedTable->buffer());
+        $enc->bindStorage(3, sceneHeld($set->chunkPairs));
+        $enc->bindStorage(4, sceneHeld($set->chunkTiles));
+        $enc->dispatch(sceneJobTiles($job) * 256);
+    }
+
+    private function memberStage(
+        ComputeEncoder $enc,
+        ComputeProgram $kernel,
+        SceneCullJob $job,
+        Buffer $chunkTable,
+        Buffer $lists,
+        ModelBank $bank,
+        uint32 $mode
+    ) : void
+    {
+        SceneCullSet $set = $job->set;
+        SceneCullParams $p = $job->params;
+        $p->mode = $mode;
+        $enc->setKernel($kernel);
+        $enc->upload($p, slot: 0);
+        $enc->bindStorage(0, sceneHeld($set->chunkPairs));
+        $enc->bindStorage(1, $chunkTable);
+        $enc->bindStorage(2, $lists);
+        $enc->bindStorage(3, $this->instances->buffer());
+        $enc->bindStorage(4, $this->models->buffer());
+        $enc->bindStorage(5, $bank->arena->runBuffer());
+        sceneBindViews($enc, 6, $job->cpuViews, $job->gpuViews);
+        $enc->bindStorage(7, sceneHeld($set->matrix));
+        $enc->bindStorage(8, sceneHeld($set->pairs));
+        $enc->bindStorage(9, sceneHeld($set->counters));
+        $enc->bindStorage(10, sceneHeld($set->pairWalk));
+        $enc->dispatchIndirect(sceneHeld($set->args), (SCENE_ARGS_MEMBERS * 4) as uint64);
+    }
+
+    private function meshletStage(ComputeEncoder $enc, ComputeProgram $kernel, SceneCullJob $job, ModelBank $bank, uint32 $mode) : void
+    {
+        SceneCullSet $set = $job->set;
+        SceneCullParams $p = $job->params;
+        $p->mode = $mode;
+        $enc->setKernel($kernel);
+        $enc->upload($p, slot: 0);
+        $enc->bindStorage(0, sceneHeld($set->pairs));
+        $enc->bindStorage(1, $bank->arena->meshletBuffer());
+        $enc->bindStorage(2, $this->instances->buffer());
+        $enc->bindStorage(3, $this->poses->buffer());
+        sceneBindViews($enc, 4, $job->cpuViews, $job->gpuViews);
+        $enc->bindStorage(5, sceneHeld($set->pairItems));
+        $enc->bindStorage(6, sceneHeld($set->pairTriangles));
+        $enc->bindStorage(7, sceneHeld($set->items));
+        $enc->bindStorage(8, sceneHeld($set->counters));
+        $enc->bindStorage(9, sceneHeld($set->pairWalk));
+        $enc->bindStorage(10, sceneHeld($set->walkItems));
+        $enc->bindStorage(11, sceneHeld($set->walkTriangles));
+        $enc->dispatchIndirect(sceneHeld($set->args), (SCENE_ARGS_MESHLETS * 4) as uint64);
+    }
+
+    private function argsStage(ComputeEncoder $enc, ComputeProgram $kernel, SceneCullJob $job, uint32 $step) : void
+    {
+        SceneCullSet $set = $job->set;
+        SceneCullParams $p = $job->params;
+        $p->mode = $step;
+        $enc->setKernel($kernel);
+        $enc->upload($p, slot: 0);
+        $enc->bindStorage(0, sceneHeld($set->counters));
+        $enc->bindStorage(1, sceneHeld($set->args));
+        $enc->bindStorage(2, sceneHeld($set->matrix));
+        $enc->bindStorage(3, sceneHeld($set->pairItems));
+        $enc->bindStorage(4, sceneHeld($set->pairTriangles));
+        $enc->bindStorage(5, sceneHeld($set->chunkTiles));
+        sceneBindViews($enc, 6, $job->cpuViews, $job->gpuViews);
+        $enc->bindStorage(7, sceneHeld($set->pairWalk));
+        $enc->bindStorage(8, sceneHeld($set->walkItems));
+        $enc->bindStorage(9, sceneHeld($set->walkTriangles));
+        $enc->dispatch(128);
+    }
+
+    /**
+     * The scan every stage compacts through, sized once for the largest list any set scans.
+     */
+    private function ensureScan() : GpuScan
+    {
+        int32 $most = sceneScanNeed($this->cascades);
+        int32 $pages = sceneScanNeed($this->pages);
+        if ($pages > $most) {
+            $most = $pages;
+        }
+
+        int32 $main = sceneScanNeed($this->main);
+        if ($main > $most) {
+            $most = $main;
+        }
+
+        // a set that grew (its chunk pairs, its matrix keys) may want a longer scan
+        GpuScan? $have = $this->scan;
+        if ($have != null) {
+            GpuScan $held = guard $have;
+            if ($held->capacity >= ($most as uint32)) {
+                return $held;
+            }
+        }
+
+        GpuScan $fresh = guard GpuScan::load($this->device, $most as uint32) else ($e) {
+            die($e->message());
+        }
+        $this->scan = $fresh;
+        return $fresh;
+    }
+
+    /**
+     * Put row `$id` where its write says: the active set when `$active`, else the chunk of
+     * `$row`'s box centre (its old chunk when that is still the one). Returns the home.
+     */
+    private function place(int32 $id, bool $active, const SceneRow& $row) : int32
+    {
+        int32 $home = $this->homeOf[$id as usize];
+        if ($active) {
+            if ($home != SCENE_HOME_ACTIVE) {
+                $this->leaveHome($id);
+                $this->joinHome($id, SCENE_HOME_ACTIVE);
+            }
+
+            return SCENE_HOME_ACTIVE;
+        }
+
+        int32 $chunk = $this->chunks->at($row->bounds->center());
+        if ($home != $chunk) {
+            $this->leaveHome($id);
+            $this->joinHome($id, $chunk);
+        }
+
+        $this->chunks->grow($chunk, $row->bounds, sceneFlags($row));
+        return $chunk;
+    }
+
+    private function joinHome(int32 $id, int32 $home) : void
+    {
+        int32 $list = $home;
+        if ($home == SCENE_HOME_ACTIVE) {
+            $list = $this->chunks->active();
+        }
+
+        $this->slotOf[$id as usize] = $this->chunks->join($list, $id);
+        $this->homeOf[$id as usize] = $home;
+        $this->transitions = $this->transitions + 1;
+    }
+
+    private function leaveHome(int32 $id) : void
+    {
+        int32 $home = $this->homeOf[$id as usize];
+        if ($home == SCENE_HOME_NONE) {
+            return;
+        }
+
+        int32 $list = $home;
+        if ($home == SCENE_HOME_ACTIVE) {
+            $list = $this->chunks->active();
+        }
+
+        int32 $slot = $this->slotOf[$id as usize];
+        int32 $moved = $this->chunks->leave($list, $slot);
+        if ($moved >= 0) {
+            $this->slotOf[$moved as usize] = $slot;
+        }
+
+        $this->homeOf[$id as usize] = SCENE_HOME_NONE;
+        $this->slotOf[$id as usize] = -1;
+    }
+
+    /**
+     * A pose block of `$rows` rows for `$id`: a freed block of that size, or fresh rows past the
+     * last. O(1).
+     */
+    private function takePose(int32 $id, int32 $rows) : int32
+    {
+        int32 $at = -1;
+        if ($rows == 1 && $this->freeSingles->count() > 0) {
+            $at = $this->freeSingles->pop();
+        } else if ($rows == SCENE_MOVING_POSE_ROWS && $this->freeTriples->count() > 0) {
+            $at = $this->freeTriples->pop();
+        } else {
+            $at = $this->poseCount;
+            $this->poseCount = $this->poseCount + $rows;
+        }
+
+        $this->poseOf[$id as usize] = $at;
+        $this->poseRows[$id as usize] = $rows;
+        return $at;
+    }
+
+    private function freePose(int32 $id) : void
+    {
+        int32 $at = $this->poseOf[$id as usize];
+        if ($at < 0) {
+            return;
+        }
+
+        if ($this->poseRows[$id as usize] == 1) {
+            $this->freeSingles[] = $at;
+        } else {
+            $this->freeTriples[] = $at;
+        }
+
+        $this->poseOf[$id as usize] = -1;
+        $this->poseRows[$id as usize] = 0;
+    }
+
+    /**
+     * Take `$id` out of the moving list: the last entry moves into its slot. O(1).
+     */
+    private function leaveMoving(int32 $id) : void
+    {
+        int32 $slot = $this->movingAt[$id as usize];
+        if ($slot < 0) {
+            return;
+        }
+
+        int32 $last = ($this->movingIds->count() as int32) - 1;
+        if ($slot != $last) {
+            int32 $moved = $this->movingIds[$last as usize];
+            $this->movingIds[$slot as usize] = $moved;
+            $this->movingAt[$moved as usize] = $slot;
+            $this->movingTable->set($slot, $this->poseOf[$moved as usize] as uint32);
+        }
+
+        $this->movingIds->pop();
+        $this->movingAt[$id as usize] = -1;
     }
 
     private function ensurePasses() : void
@@ -699,7 +1711,178 @@ internal function depthPullPass(Device $device, const string& $program) : GpuPas
 }
 
 /**
+ * The world size of one shadow-map texel of `$cascade`: its ortho width over the map's texels.
+ * The light-space matrix scales world x by one over the ortho half width.
+ */
+internal function cascadeTexel(const ShadowCascade& $cascade, float32 $mapTexels) : float32
+{
+    Mat4 $m = $cascade->lightSpace;
+    float32 $scale = visu::math::length(Vec3($m->c0->x, $m->c1->x, $m->c2->x));
+    if ($scale <= 0.0f || $mapTexels <= 0.0f) {
+        return 0.0f;
+    }
+
+    return 2.0f / ($scale * $mapTexels);
+}
+
+internal function sceneKernel(Device $device, GpuShaders $shaders, const string& $name) : ComputeProgram
+{
+    ComputeProgram $k = guard $shaders->kernel($device, $name) else ($e) {
+        die($e->message());
+    }
+    return $k;
+}
+
+internal function sceneHeld(Buffer? $buffer) : Buffer
+{
+    Buffer $b = guard $buffer else {
+        die('gpu scene: a cull buffer before ensure');
+    }
+    return $b;
+}
+
+/**
+ * Per reserved scene row, the pairs, items and triangles the main set and the cascade set take
+ * room for, and the most of any a set ever holds. Measured on a 490k bush scatter: the camera's
+ * view keeps up to 0.45 pairs, 0.46 items and 6.4 triangles a row, the five cascades up to 1.35
+ * pairs and 2.7 items.
+ */
+internal const float32 SCENE_MAIN_PAIRS_PER_ROW = 1.0f;
+internal const float32 SCENE_MAIN_ITEMS_PER_ROW = 1.0f;
+internal const float32 SCENE_MAIN_TRIANGLES_PER_ROW = 12.0f;
+internal const float32 SCENE_CASCADE_PAIRS_PER_ROW = 2.0f;
+internal const float32 SCENE_CASCADE_ITEMS_PER_ROW = 4.0f;
+internal const int32 SCENE_CAP_MAX = 8388608;
+
+/**
+ * The share of the scene's candidates (occupied chunks plus active blocks) the main set's views
+ * and the five cascades see together at most. Measured on a whole-map scatter of 19 793 occupied
+ * chunks: the camera saw up to 7 876, the mirror a few, the cascades up to 2 951.
+ */
+internal const float32 SCENE_MAIN_CHUNK_SHARE = 1.1f;
+
+/**
+ * Active rows one chunk pair names (`visu/scene.glsl` SCENE_ACTIVE_BLOCK_ROWS).
+ */
+internal const int32 SCENE_ACTIVE_BLOCK_ROWS = 256;
+internal const float32 SCENE_CASCADE_CHUNK_SHARE = 1.1f;
+
+/**
+ * `$rows` times `$perRow`, at most `SCENE_CAP_MAX`.
+ */
+internal function sceneCap(int32 $rows, float32 $perRow) : int32
+{
+    float64 $want = ($rows as float64) * ($perRow as float64);
+    if ($want > SCENE_CAP_MAX as float64) {
+        return SCENE_CAP_MAX;
+    }
+
+    return $want as int32;
+}
+
+/**
+ * The screen-size factor a view's `eye.w` carries: `$pixels` over the focal length in pixels of
+ * `$projection` at `$height` pixels, so a radius r at distance d covers fewer than `$pixels`
+ * when r < factor * d. 0 (no test) when `$pixels` is not positive.
+ */
+internal function sceneScreenFactor(const Mat4& $projection, int32 $height, float32 $pixels) : float32
+{
+    float32 $focal = $projection->c1->y * ($height as float32) * 0.5f;
+    if ($pixels <= 0.0f || $focal <= 0.0f) {
+        return 0.0f;
+    }
+
+    return $pixels / $focal;
+}
+
+/**
+ * Cells a side of a local window round a ball of at most `$reach` metres, widened by the chunks'
+ * `$overhang`, on a grid of `$metres` cells; 0 (walk every occupied chunk) for no reach or a
+ * window holding as many cells as the `$occupied` chunks.
+ */
+internal function sceneLocalSide(float32 $reach, float32 $overhang, float32 $metres, int32 $occupied) : int32
+{
+    if ($reach <= 0.0f) {
+        return 0;
+    }
+
+    // an interval of length L touches at most floor(L / metres) + 2 cells; one more for
+    // rounding at a cell edge
+    float32 $cells = std::math::floor(2.0f * ($reach + $overhang) / $metres) + 3.0f;
+    if ($cells > 4096.0f) {
+        return 0;
+    }
+
+    int32 $side = $cells as int32;
+    if ($side * $side >= $occupied) {
+        return 0;
+    }
+
+    return $side;
+}
+
+/**
+ * The chunk stage's spatial candidates a view (`scene_spatial_candidates`): a local set's window
+ * of `$side` x `$side` cells, else every occupied chunk.
+ */
+internal function sceneSpatial(int32 $side, int32 $occupied) : int32
+{
+    if ($side > 0) {
+        return $side * $side;
+    }
+
+    return $occupied;
+}
+
+/**
+ * The chunk stage's tiles of 256 candidates a view (`scene_chunk_tiles`), at least one.
+ */
+internal function sceneChunkTiles(int32 $spatial, int32 $active) : int32
+{
+    int32 $blocks = ($active + SCENE_ACTIVE_BLOCK_ROWS - 1) / SCENE_ACTIVE_BLOCK_ROWS;
+    int32 $tiles = ($spatial + $blocks + 255) / 256;
+    if ($tiles < 1) {
+        return 1;
+    }
+
+    return $tiles;
+}
+
+/**
+ * Every (view, tile) workgroup of `$job`'s chunk stage.
+ */
+internal function sceneJobTiles(SceneCullJob $job) : uint32
+{
+    int32 $spatial = sceneSpatial($job->params->localSide as int32, $job->params->chunks as int32);
+    int32 $tiles = sceneChunkTiles($spatial, $job->params->active as int32);
+    return ($job->views * $tiles) as uint32;
+}
+
+/**
+ * The most values any scan of `$set` takes: its matrix or its pair counts.
+ */
+internal function sceneScanNeed(SceneCullSet $set) : int32
+{
+    int32 $keys = $set->matrixKeys;
+    if ($keys < 1) {
+        $keys = $set->keyCap;
+    }
+
+    int32 $matrix = $set->matrixWords($keys);
+    if ($set->tileCap > $matrix) {
+        $matrix = $set->tileCap;
+    }
+
+    if ($set->pairCap + 1 > $matrix) {
+        return $set->pairCap + 1;
+    }
+
+    return $matrix;
+}
+
+/**
  * Append `$box` to `$boxes`, or past `$max` grow the last box by it, which stays conservative.
+ * O(1): a frame with thousands of movers reports thousands of boxes.
  */
 internal function foldBox(array<AABB>& $boxes, const AABB& $box, int32 $max) : void
 {
@@ -728,30 +1911,108 @@ internal function sceneBindViews(ComputeEncoder $enc, uint32 $slot, TransientSli
     $enc->bindStorage($slot, $buffer);
 }
 
-internal function sceneInstance(
-    int32 $model,
-    const Mat4& $world,
-    const AABB& $bounds,
-    float32 $lodBias,
-    float32 $skinBase,
-    bool $casts,
-    bool $skinned
-) : SceneInstanceGpu
+internal function sceneWord(const array<uint8>& $b, int32 $word) : uint32
 {
-    uint32 $flags = SCENE_INSTANCE_LIVE;
-    if ($casts) {
+    usize $at = ($word * 4) as usize;
+    return ($b[$at] as uint32) | (($b[$at + 1] as uint32) << 8) | (($b[$at + 2] as uint32) << 16) | (($b[$at + 3] as uint32) << 24);
+}
+
+/**
+ * The instance flags `$row` shows with, before its candidate source and motion bits.
+ */
+internal function sceneFlags(const SceneRow& $row) : uint32
+{
+    uint32 $flags = 0;
+    if ($row->live) {
+        $flags = $flags | SCENE_INSTANCE_LIVE;
+        if ($row->main) {
+            $flags = $flags | SCENE_INSTANCE_MAIN;
+        }
+
+        if ($row->outline >= 0) {
+            $flags = $flags | SCENE_INSTANCE_OUTLINE | (($row->outline as uint32) << SCENE_OUTLINE_SHIFT);
+        }
+    }
+
+    if ($row->casts) {
         $flags = $flags | SCENE_INSTANCE_CASTS;
     }
 
-    if ($skinned) {
+    if ($row->skinned) {
         $flags = $flags | SCENE_INSTANCE_SKINNED;
     }
 
+    return $flags;
+}
+
+internal function sceneInstance(const SceneRow& $row, int32 $pose, uint32 $extra, int32 $home) : SceneInstanceGpu
+{
+    uint32 $flags = $extra | sceneFlags($row);
+    uint32 $chunk = SCENE_CHUNK_NONE;
+    if ($home == SCENE_HOME_ACTIVE) {
+        $flags = $flags | SCENE_INSTANCE_ACTIVE;
+    } else if ($home >= 0) {
+        $chunk = $home as uint32;
+    }
+
     return SceneInstanceGpu(
-        $world: $world,
-        $lo: Vec4($bounds->min, $lodBias),
-        $hi: Vec4($bounds->max, $skinBase),
-        $model: $model as uint32,
-        $flags: $flags
+        $lo: Vec4($row->bounds->min, $row->lodBias),
+        $hi: Vec4($row->bounds->max, $row->palette),
+        $model: $row->model as uint32,
+        $flags: $flags,
+        $pose: $pose as uint32,
+        $chunk: $chunk,
+        $tintRG: scenePackHalves($row->tint->x, $row->tint->y),
+        $tintBA: scenePackHalves($row->tint->z, $row->tint->w)
     );
 }
+
+/**
+ * The affine rows of `$world`, the column-major Mat4 the CPU built, word for word.
+ */
+public function scenePose(const Mat4& $world) : ScenePoseGpu
+{
+    return ScenePoseGpu(
+        $r0: Vec4($world->c0->x, $world->c1->x, $world->c2->x, $world->c3->x),
+        $r1: Vec4($world->c0->y, $world->c1->y, $world->c2->y, $world->c3->y),
+        $r2: Vec4($world->c0->z, $world->c1->z, $world->c2->z, $world->c3->z)
+    );
+}
+
+/**
+ * A world pose as a moving row's previous or current pose row: position, orientation, scale.
+ */
+public function scenePose(trs: const Pose& $pose) : ScenePoseGpu
+{
+    return ScenePoseGpu(
+        $r0: Vec4($pose->position, 0.0f),
+        $r1: Vec4($pose->orientation->x, $pose->orientation->y, $pose->orientation->z, $pose->orientation->w),
+        $r2: Vec4($pose->scale, 0.0f)
+    );
+}
+
+internal function scenePackHalves(float32 $lo, float32 $hi) : uint32
+{
+    return (floatToHalf($lo) as uint32) | ((floatToHalf($hi) as uint32) << 16);
+}
+
+test scene_local_side_covers_every_cell_a_ball_touches {
+    // a 25 m light, a page ball of 1.77 radii, 22 m of overhang, 64 m cells
+    float32 $reach = 25.0f * 1.77f + 22.0f;
+    int32 $side = sceneLocalSide($reach, 0.0f, 64.0f, 100000);
+    assert($side > 0);
+    float32 $x = -500.0f;
+    while ($x < 500.0f) {
+        int32 $lo = (std::math::floor(($x - $reach) / 64.0f)) as int32;
+        int32 $hi = (std::math::floor(($x + $reach) / 64.0f)) as int32;
+        assert($hi - $lo + 1 <= $side);
+        $x = $x + 0.37f;
+    }
+}
+
+test scene_local_side_walks_everything_when_the_window_is_no_smaller {
+    assert(sceneLocalSide(0.0f, 0.0f, 64.0f, 100000) == 0);
+    assert(sceneLocalSide(25.0f, 0.0f, 64.0f, 4) == 0);
+    assert(sceneLocalSide(1000000.0f, 0.0f, 64.0f, 100000) == 0);
+}
+

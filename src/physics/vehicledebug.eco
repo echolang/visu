@@ -1,0 +1,196 @@
+/**
+ * A `Vehicle` as the physics debug overlay draws it: what the last step of `stepVehicle` saw and
+ * did, in the chassis body's pose. Per wheel the suspension's travel and bump stop, the spring as
+ * a coil that squashes with its compression, the wheel turned by the steering and its spin, the
+ * contact with its normal, the load, the tire's forces, and the anti-roll bar to its pair. Per
+ * chassis the centre of mass, the velocity and the steering's heading.
+ *
+ * Forces draw one metre for one wheel's static share of the weight. Every point is worked out in
+ * place: nothing is built but the lines.
+ */
+
+namespace visu::physics;
+
+use visu::components::Vehicle;
+use visu::graphics::DebugLines;
+use visu::math::{Quat, Vec3, Vec4, cross, dot, length};
+
+/**
+ * Turns of the spring coil, segments per turn, and segments round a wheel's rim.
+ */
+internal const int32 VEHICLE_DEBUG_COIL_TURNS = 6;
+internal const int32 VEHICLE_DEBUG_COIL_STEPS = 8;
+internal const int32 VEHICLE_DEBUG_RIM_STEPS = 16;
+
+/**
+ * Metres the coil's top seat sits above the mount, so a spring at full compression still shows.
+ */
+internal const float32 VEHICLE_DEBUG_SEAT = 0.08f;
+
+/**
+ * The coil's radius as a share of the wheel's, and the seconds of travel the velocity arrow spans.
+ */
+internal const float32 VEHICLE_DEBUG_COIL_RADIUS = 0.35f;
+internal const float32 VEHICLE_DEBUG_LOOKAHEAD = 0.25f;
+
+/**
+ * Draw `$v` riding on `$body` into `$lines`, under gravity `$g` (m/s²).
+ */
+public function drawVehicleDebug(DebugLines $lines, const Vehicle& $v, PhysicsBody $body, float32 $g) : void
+{
+    VehicleSpec $spec = $v->spec;
+    int32 $n = std::math::min($spec->wheelCount, VEHICLE_MAX_WHEELS);
+    if ($n <= 0) {
+        return;
+    }
+
+    Quat $q = $body->orientation();
+    Vec3 $origin = $body->origin();
+    Vec3 $com = $body->position();
+    Vec3 $up = $q * Vec3(0.0f, 1.0f, 0.0f);
+    Vec3 $forward = $q * Vec3(0.0f, 0.0f, 1.0f);
+    Vec3 $left = $q * Vec3(1.0f, 0.0f, 0.0f);
+    float32 $restLoad = std::math::max($body->mass() * $g / ($n as float32), 1.0f);
+
+    Vec4 $grey = Vec4(0.55f, 0.55f, 0.6f, 1.0f);
+    Vec4 $red = Vec4(1.0f, 0.15f, 0.1f, 1.0f);
+
+    // chassis: centre of mass, velocity, and the steering's heading ahead of the front axle
+    $lines->cross($com, 0.3f);
+    $lines->line($com, $com + $body->velocity() * VEHICLE_DEBUG_LOOKAHEAD, Vec4(1.0f, 1.0f, 1.0f, 1.0f));
+    float32 $front = -1000000.0f;
+    for (int32 $i = 0; $i < $n; $i++) {
+        $front = std::math::max($front, $spec->wheels[$i as usize]->mount->z);
+    }
+    Vec3 $nose = $origin + $q * Vec3(0.0f, 0.0f, $front);
+    Vec3 $heading = $q * Vec3(std::math::sin($v->steerAngle), 0.0f, std::math::cos($v->steerAngle));
+    $lines->line($nose, $nose + $heading * 1.5f, Vec4(0.3f, 0.9f, 1.0f, 1.0f));
+
+    for (int32 $i = 0; $i < $n; $i++) {
+        VehicleWheel $w = $spec->wheels[$i as usize];
+        VehicleWheelState $s = $v->wheels[$i as usize];
+        Vec3 $mount = $origin + $q * $w->mount;
+        Vec3 $droop = $mount - $up * $w->restLength;
+        Vec3 $centre = $mount - $up * ($w->restLength - $s->compression);
+
+        // travel: the rail from full compression to full droop, the bump stop at its top
+        $lines->line($mount, $droop, $grey);
+        $lines->line($mount, $mount - $up * $w->bumpStop, $red);
+
+        // the spring, squashed to where the wheel rides
+        Vec4 $coil = Vec4(0.45f, 0.55f, 0.75f, 1.0f);
+        if ($s->contact) {
+            $coil = rampColor($s->compression / std::math::max($w->restLength, 0.001f));
+            if ($s->compression > $w->restLength - $w->bumpStop) {
+                $coil = $red;
+            }
+        }
+        drawCoil($lines, $mount + $up * VEHICLE_DEBUG_SEAT, $centre, $left, $forward, $w->radius * VEHICLE_DEBUG_COIL_RADIUS, $coil);
+
+        // the wheel in its steered plane, a spoke at its spin, tinted by the grip it uses
+        Vec3 $aim = $forward;
+        if ($w->steers) {
+            $aim = $q * Vec3(std::math::sin($v->steerAngle), 0.0f, std::math::cos($v->steerAngle));
+        }
+        Vec3 $axle = cross($up, $aim);
+        float32 $grip = $spec->gripRear;
+        if ($w->front) {
+            $grip = $spec->gripFront;
+        }
+        float32 $used = 0.0f;
+        float32 $limit = $s->load * $s->surface * $grip;
+        if ($s->contact && $limit > 0.0f) {
+            $used = std::math::sqrt($s->fx * $s->fx + $s->fy * $s->fy) / $limit;
+        }
+        drawRim($lines, $centre, $aim, $up, $axle, $w->radius, $s->spin, usedColor($used));
+
+        if (!$s->contact) {
+            // the ray that found nothing
+            $lines->line($mount, $mount - $up * ($w->restLength + $w->radius), Vec4(0.6f, 0.15f, 0.15f, 1.0f));
+            continue;
+        }
+
+        // contact, the ground's normal and the load pushing up from the patch
+        Vec3 $p = $s->point;
+        $lines->line($p - $aim * 0.1f, $p + $aim * 0.1f, Vec4(1.0f, 1.0f, 1.0f, 1.0f));
+        $lines->line($p - $axle * 0.1f, $p + $axle * 0.1f, Vec4(1.0f, 1.0f, 1.0f, 1.0f));
+        $lines->line($p, $p + $s->normal * 0.3f, Vec4(0.2f, 0.9f, 0.9f, 1.0f));
+        $lines->line($p, $p + $up * ($s->force / $restLoad), Vec4(1.0f, 0.85f, 0.1f, 1.0f));
+
+        // the tire's forces in its frame on the ground, the way the step measured them
+        Vec3 $f = $aim - $s->normal * dot($aim, $s->normal);
+        float32 $flen = length($f);
+        if ($flen > 0.0001f) {
+            $f = $f / $flen;
+            Vec3 $side = cross($s->normal, $f);
+            Vec3 $lift = $p + $s->normal * 0.02f;
+            $lines->line($lift, $lift + $f * ($s->fx / $restLoad), Vec4(0.2f, 1.0f, 0.3f, 1.0f));
+            $lines->line($lift, $lift + $side * ($s->fy / $restLoad), Vec4(1.0f, 0.3f, 1.0f, 1.0f));
+        }
+
+        // the anti-roll bar, once per pair, brighter the more it twists
+        if ($w->pair > $i && $w->pair < $n) {
+            VehicleWheel $o = $spec->wheels[$w->pair as usize];
+            float32 $twist = std::math::abs($s->compression - $v->wheels[$w->pair as usize]->compression);
+            float32 $t = std::math::min($twist / std::math::max($w->restLength * 0.5f, 0.001f), 1.0f);
+            Vec4 $bar = Vec4(0.35f + 0.65f * $t, 0.35f + 0.25f * $t, 0.35f, 1.0f);
+            $lines->line($mount, $origin + $q * $o->mount, $bar);
+        }
+    }
+}
+
+/**
+ * A helix from `$top` down to `$bottom` about the line between them, in the plane of `$a` and
+ * `$b`, so it squashes as the two meet.
+ */
+internal function drawCoil(DebugLines $lines, Vec3 $top, Vec3 $bottom, Vec3 $a, Vec3 $b, float32 $radius, Vec4 $color) : void
+{
+    int32 $steps = VEHICLE_DEBUG_COIL_TURNS * VEHICLE_DEBUG_COIL_STEPS;
+    float32 $turn = std::math::TAU_F32 / (VEHICLE_DEBUG_COIL_STEPS as float32);
+    Vec3 $last = $top + $a * $radius;
+    for (int32 $k = 1; $k <= $steps; $k++) {
+        float32 $angle = ($k as float32) * $turn;
+        Vec3 $along = $top + ($bottom - $top) * (($k as float32) / ($steps as float32));
+        Vec3 $next = $along + $a * (std::math::cos($angle) * $radius) + $b * (std::math::sin($angle) * $radius);
+        $lines->line($last, $next, $color);
+        $last = $next;
+    }
+}
+
+/**
+ * A wheel's rim round `$centre` in the plane of `$aim` and `$up`, and one spoke turned `$spin`
+ * about `$axle` (rolling forward turns the top toward `$aim`).
+ */
+internal function drawRim(DebugLines $lines, Vec3 $centre, Vec3 $aim, Vec3 $up, Vec3 $axle, float32 $radius, float32 $spin, Vec4 $color) : void
+{
+    float32 $step = std::math::TAU_F32 / (VEHICLE_DEBUG_RIM_STEPS as float32);
+    Vec3 $last = $centre + $up * $radius;
+    for (int32 $k = 1; $k <= VEHICLE_DEBUG_RIM_STEPS; $k++) {
+        float32 $angle = ($k as float32) * $step;
+        Vec3 $next = $centre + $up * (std::math::cos($angle) * $radius) + $aim * (std::math::sin($angle) * $radius);
+        $lines->line($last, $next, $color);
+        $last = $next;
+    }
+
+    Vec3 $spoke = $up * std::math::cos($spin) + $aim * std::math::sin($spin);
+    $lines->line($centre, $centre + $spoke * $radius, $color);
+    $lines->line($centre - $axle * 0.05f, $centre + $axle * 0.05f, $color);
+}
+
+/**
+ * Green at 0 through yellow at 0.5 to red at 1.
+ */
+internal function rampColor(float32 $t) : Vec4
+{
+    float32 $c = std::math::clamp($t, 0.0f, 1.0f);
+    return Vec4(std::math::min(2.0f * $c, 1.0f), std::math::min(2.0f * (1.0f - $c), 1.0f), 0.1f, 1.0f);
+}
+
+/**
+ * White while a tire has grip to spare, through orange to red as it uses all it has.
+ */
+internal function usedColor(float32 $used) : Vec4
+{
+    float32 $t = std::math::clamp(($used - 0.5f) * 2.0f, 0.0f, 1.0f);
+    return Vec4(1.0f, 1.0f - 0.85f * $t, 1.0f - 0.9f * std::math::min($t * 2.0f, 1.0f), 1.0f);
+}

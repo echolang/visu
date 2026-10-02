@@ -1,0 +1,553 @@
+/**
+ * PhysicsWorld and PhysicsSystem without a window: bodies follow their components, the heightfield
+ * lines up with the map, queries map back to entities, and a slide stops at a wall.
+ */
+
+use visu::components::{Collider, RigidBody, Sensor};
+use visu::ecs::{Entities, Entity, Systems};
+use visu::geo::{Heightmap, Ray, Transform};
+use visu::math::{Quat, Vec3, equal};
+use visu::physics::{BodyKind, BodySlept, BodyWoke, ColliderShape, CollisionMesh, PhysicsClock, PhysicsHit, PhysicsLayer, PhysicsSettings, PhysicsWorld};
+use visu::signal::{Dispatcher, Flow};
+use visu::system::PhysicsSystem;
+
+internal function within(float32 $a, float32 $b, float32 $eps = 0.01f) : bool
+{
+    return std::math::abs($a - $b) <= $eps;
+}
+
+internal function placed(Entities $w, Vec3 $at) : Entity
+{
+    Entity $e = $w->create();
+    Transform $t = Transform();
+    $t->position = $at;
+    $w->attach<Transform>($e, $t);
+    return $e;
+}
+
+/**
+ * A scene with a physics system bound and registered, ticked by hand.
+ */
+internal class Rig
+{
+    public Entities $entities;
+    public Systems $systems;
+    public PhysicsWorld $world;
+
+    public constructor()
+    {
+        $this->entities = Entities();
+        $this->systems = Systems();
+        PhysicsSettings $settings = PhysicsSettings();
+        $settings->capacity = 64;
+        $settings->maxStepsPerUpdate = 1000;
+        $this->world = PhysicsWorld($settings);
+        $this->systems->bind(PhysicsSystem($this->world));
+    }
+
+    public function start() : void
+    {
+        $this->systems->register($this->entities);
+    }
+
+    public function run(int32 $passes) : void
+    {
+        $this->systems->begin($this->entities);
+        for (int32 $i = 0; $i < $passes; $i++) {
+            $this->systems->tick($this->entities);
+        }
+    }
+}
+
+/**
+ * A map whose height is `x + 2 z` in world units, so every sample is distinct.
+ */
+internal function slopeMap(int32 $size, float32 $ppu) : Heightmap
+{
+    array<float32> $data = arr::room<float32>(($size * $size) as usize);
+    for (int32 $iz = 0; $iz < $size; $iz++) {
+        for (int32 $ix = 0; $ix < $size; $ix++) {
+            float32 $x = (($ix as float32) - ($size as float32) * 0.5f) / $ppu;
+            float32 $z = (($iz as float32) - ($size as float32) * 0.5f) / $ppu;
+            $data[] = $x * 0.25f + $z * 0.5f + 10.0f;
+        }
+    }
+
+    return Heightmap($data, $size, $size, $ppu);
+}
+
+internal function checkField(int32 $size, float32 $ppu) : void
+{
+    Rig $rig = Rig();
+    Heightmap $map = slopeMap($size, $ppu);
+    Entity $ground = placed($rig->entities, Vec3(0.0f, 0.0f, 0.0f));
+    $rig->entities->attach<Collider>($ground, Collider(ColliderShape::heightfield($map), layer: PhysicsLayer::terrain()));
+    $rig->start();
+
+    array<float32> $xs = [-3.0f, -1.25f, 0.0f, 0.6f, 2.5f];
+    foreach ($xs as $x) {
+        foreach ($xs as $z) {
+            float32 $want = guard $map->sample($x, $z) else {
+                die('sample inside the map');
+            }
+            PhysicsHit $hit = guard $rig->world->ray(Ray(Vec3($x, 100.0f, $z), Vec3(0.0f, -1.0f, 0.0f)), 200.0f) else {
+                die('ray over the field hits it');
+            }
+            assert($hit->entity == $ground);
+            assert(within($hit->point->y, $want, 0.001f));
+        }
+    }
+}
+
+test heightfield_lines_up_with_the_map_odd
+{
+    checkField(17, 2.0f);
+}
+
+test heightfield_lines_up_with_the_map_even
+{
+    checkField(16, 1.0f);
+}
+
+/**
+ * A 10 m square of two triangles at y = 0, ramped up to y = 2 along +x.
+ */
+internal function rampMesh() : CollisionMesh
+{
+    array<Vec3> $vertices = [
+        Vec3(-5.0f, 0.0f, -5.0f), Vec3(5.0f, 2.0f, -5.0f), Vec3(5.0f, 2.0f, 5.0f), Vec3(-5.0f, 0.0f, 5.0f),
+    ];
+    array<int32> $indices = [0, 2, 1, 0, 3, 2];
+    return CollisionMesh($vertices, $indices);
+}
+
+test mesh_collider_answers_rays_with_its_grip
+{
+    Rig $rig = Rig();
+    Entity $road = placed($rig->entities, Vec3(100.0f, 3.0f, 0.0f));
+    Collider $c = Collider(ColliderShape::mesh(rampMesh()), layer: PhysicsLayer::terrain());
+    $c->grip = 0.75f;
+    $rig->entities->attach<Collider>($road, $c);
+    $rig->start();
+
+    // the entity's position places it: x 100 is the middle of the ramp, 1 m up plus 3
+    PhysicsHit $hit = guard $rig->world->ray(Ray(Vec3(100.0f, 50.0f, 0.0f), Vec3(0.0f, -1.0f, 0.0f)), 100.0f) else {
+        die('ray over the mesh hits it');
+    }
+    assert($hit->entity == $road);
+    assert(within($hit->point->y, 4.0f, 0.001f));
+    assert(within($hit->grip, 0.75f, 0.0001f));
+    assert($hit->normal->y > 0.9f);
+
+    // only its layer answers, and it reports one body
+    assert($rig->world->ray(Ray(Vec3(100.0f, 50.0f, 0.0f), Vec3(0.0f, -1.0f, 0.0f)), 100.0f, mask: PhysicsLayer::world()) == null);
+    assert($rig->world->count() == 1);
+}
+
+test mesh_collider_follows_its_transform_scale
+{
+    Rig $rig = Rig();
+    Entity $road = placed($rig->entities, Vec3(0.0f, 0.0f, 0.0f));
+    $rig->entities->get<Transform>($road)->scale = Vec3(2.0f, 3.0f, 2.0f);
+    $rig->entities->attach<Collider>($road, Collider(ColliderShape::mesh(rampMesh())));
+    $rig->start();
+
+    // twice as wide, three times as tall: x 10 is the top edge's 2 m times 3
+    PhysicsHit $hit = guard $rig->world->ray(Ray(Vec3(9.0f, 50.0f, 0.0f), Vec3(0.0f, -1.0f, 0.0f)), 100.0f) else {
+        die('ray over the scaled mesh hits it');
+    }
+    assert(within($hit->point->y, 5.7f, 0.001f));
+    assert(within($hit->grip, 1.0f, 0.0001f));
+}
+
+test box_falls_onto_the_ground_and_sleeps
+{
+    Rig $rig = Rig();
+    Entity $ground = placed($rig->entities, Vec3(0.0f, -0.5f, 0.0f));
+    $rig->entities->attach<Collider>($ground, Collider(ColliderShape::box(Vec3(20.0f, 0.5f, 20.0f))));
+    Entity $crate = placed($rig->entities, Vec3(0.0f, 3.0f, 0.0f));
+    $rig->start();
+
+    // attached after register: built at the next begin
+    $rig->entities->attach<Collider>($crate, Collider(ColliderShape::box(Vec3(0.5f, 0.5f, 0.5f))));
+    $rig->entities->attach<RigidBody>($crate, RigidBody(BodyKind::dynamic, 2.0f));
+    assert(!$rig->world->has($crate));
+    $rig->run(0);
+    assert($rig->world->has($crate));
+    assert($rig->world->count() == 2);
+
+    $rig->run(30);
+    float32 $falling = $rig->entities->get<Transform>($crate)->position->y;
+    assert($falling < 3.0f);
+    assert($rig->world->awake() == 1);
+
+    for (int32 $i = 0; $i < 20; $i++) {
+        $rig->run(60);
+    }
+    Transform $t = $rig->entities->get<Transform>($crate);
+    assert(within($t->position->y, 0.5f, 0.02f));
+    assert($rig->world->awake() == 0);
+}
+
+test offset_collider_writes_the_entity_origin_back
+{
+    Rig $rig = Rig();
+    Entity $ground = placed($rig->entities, Vec3(0.0f, -0.5f, 0.0f));
+    $rig->entities->attach<Collider>($ground, Collider(ColliderShape::box(Vec3(20.0f, 0.5f, 20.0f))));
+    // a box that stands on its entity's origin
+    Entity $crate = placed($rig->entities, Vec3(0.0f, 2.0f, 0.0f));
+    $rig->entities->attach<Collider>($crate, Collider(ColliderShape::box(Vec3(0.5f, 0.5f, 0.5f)), offset: Vec3(0.0f, 0.5f, 0.0f)));
+    RigidBody $rb = RigidBody();
+    $rb->upright = true;
+    $rig->entities->attach<RigidBody>($crate, $rb);
+    $rig->start();
+
+    for (int32 $i = 0; $i < 20; $i++) {
+        $rig->run(60);
+    }
+    assert(within($rig->entities->get<Transform>($crate)->position->y, 0.0f, 0.02f));
+}
+
+test detach_and_destroy_leave_no_rows
+{
+    Rig $rig = Rig();
+    Entity $a = placed($rig->entities, Vec3(0.0f, 0.0f, 0.0f));
+    Entity $b = placed($rig->entities, Vec3(5.0f, 0.0f, 0.0f));
+    $rig->entities->attach<Collider>($a, Collider(ColliderShape::sphere(1.0f)));
+    $rig->entities->attach<Collider>($b, Collider(ColliderShape::sphere(1.0f)));
+    $rig->entities->attach<Sensor>($b, Sensor(ColliderShape::sphere(2.0f), layer: PhysicsLayer::pick()));
+    $rig->start();
+    assert($rig->world->count() == 3);
+    // two unit spheres share one shape; the sensor's radius is another
+    assert($rig->world->shapes() == 2);
+
+    $rig->entities->detach<Collider>($a);
+    assert($rig->world->count() == 2);
+    $rig->entities->destroy($b);
+    assert($rig->world->count() == 0);
+}
+
+test moved_static_follows_its_transform
+{
+    Rig $rig = Rig();
+    Entity $wall = placed($rig->entities, Vec3(0.0f, 0.0f, 0.0f));
+    $rig->entities->attach<Collider>($wall, Collider(ColliderShape::box(Vec3(1.0f, 1.0f, 1.0f))));
+    $rig->start();
+    $rig->run(1);
+
+    $rig->entities->get<Transform>($wall)->position = Vec3(10.0f, 0.0f, 0.0f);
+    $rig->entities->changed<Transform>($wall);
+    PhysicsHit $hit = guard $rig->world->ray(Ray(Vec3(10.0f, 10.0f, 0.0f), Vec3(0.0f, -1.0f, 0.0f)), 20.0f) else {
+        die('moved wall answers a ray');
+    }
+    assert($hit->entity == $wall);
+    assert(within($hit->point->y, 1.0f));
+    assert($rig->world->ray(Ray(Vec3(0.0f, 10.0f, 0.0f), Vec3(0.0f, -1.0f, 0.0f)), 20.0f) == null);
+}
+
+test ray_masks_pick_sensors_from_solids
+{
+    Rig $rig = Rig();
+    Entity $tree = placed($rig->entities, Vec3(0.0f, 0.0f, 0.0f));
+    $rig->entities->attach<Collider>($tree, Collider(ColliderShape::capsule(0.2f, 2.0f), offset: Vec3(0.0f, 1.2f, 0.0f)));
+    $rig->entities->attach<Sensor>($tree, Sensor(ColliderShape::box(Vec3(1.5f, 1.5f, 1.5f)), offset: Vec3(0.0f, 1.5f, 0.0f), layer: PhysicsLayer::pick()));
+    $rig->start();
+
+    // a ray past the trunk but through the canopy box only meets the sensor
+    Ray $side = Ray(Vec3(1.0f, 10.0f, 0.0f), Vec3(0.0f, -1.0f, 0.0f));
+    PhysicsHit $pick = guard $rig->world->ray($side, 20.0f, mask: PhysicsLayer::pick()) else {
+        die('pick sensor answers');
+    }
+    assert($pick->entity == $tree);
+    assert(within($pick->point->y, 3.0f));
+    assert($rig->world->ray($side, 20.0f, mask: PhysicsLayer::world()) == null);
+}
+
+test slide_stops_at_a_wall_and_runs_along_it
+{
+    Rig $rig = Rig();
+    Entity $wall = placed($rig->entities, Vec3(2.0f, 1.0f, 0.0f));
+    $rig->entities->attach<Collider>($wall, Collider(ColliderShape::box(Vec3(0.5f, 1.0f, 5.0f))));
+    $rig->start();
+
+    ColliderShape $capsule = ColliderShape::capsule(0.3f, 1.0f);
+    Vec3 $from = Vec3(0.0f, 1.0f, 0.0f);
+
+    // straight into the wall: stops a radius and a skin short of its face at x = 1.5
+    Vec3 $blocked = $rig->world->slide($capsule, from: $from, delta: Vec3(3.0f, 0.0f, 0.0f), mask: PhysicsLayer::world());
+    assert(within($blocked->x, 1.2f, 0.02f));
+
+    // at an angle: slides along the face instead of stopping
+    Vec3 $slid = $rig->world->slide($capsule, from: $from, delta: Vec3(3.0f, 0.0f, 3.0f), mask: PhysicsLayer::world());
+    assert(within($slid->x, 1.2f, 0.02f));
+    assert($slid->z > 2.5f);
+
+    // a layer left out of the mask is walked through
+    Vec3 $through = $rig->world->slide($capsule, from: $from, delta: Vec3(3.0f, 0.0f, 0.0f), mask: PhysicsLayer::terrain());
+    assert(within($through->x, 3.0f));
+}
+
+test slide_backs_out_of_a_start_inside
+{
+    Rig $rig = Rig();
+    Entity $crate = placed($rig->entities, Vec3(0.0f, 1.0f, 0.0f));
+    $rig->entities->attach<Collider>($crate, Collider(ColliderShape::box(Vec3(0.5f, 1.0f, 0.5f))));
+    $rig->start();
+
+    // the capsule overlaps the crate's +X face and walks away from it
+    Vec3 $out = $rig->world->slide(
+        ColliderShape::capsule(0.3f, 1.0f),
+        from: Vec3(0.6f, 1.0f, 0.0f),
+        delta: Vec3(1.0f, 0.0f, 0.0f),
+        mask: PhysicsLayer::world(),
+    );
+    assert(within($out->x, 1.6f));
+}
+
+test kinematic_body_pushes_a_dynamic_one
+{
+    Rig $rig = Rig();
+    Entity $ground = placed($rig->entities, Vec3(0.0f, -0.5f, 0.0f));
+    $rig->entities->attach<Collider>($ground, Collider(ColliderShape::box(Vec3(20.0f, 0.5f, 20.0f))));
+    Entity $ball = placed($rig->entities, Vec3(1.0f, 0.5f, 0.0f));
+    $rig->entities->attach<Collider>($ball, Collider(ColliderShape::sphere(0.5f)));
+    $rig->entities->attach<RigidBody>($ball, RigidBody());
+    Entity $pusher = placed($rig->entities, Vec3(-1.0f, 0.5f, 0.0f));
+    $rig->entities->attach<Collider>($pusher, Collider(ColliderShape::box(Vec3(0.5f, 0.5f, 0.5f))));
+    $rig->entities->attach<RigidBody>($pusher, RigidBody(BodyKind::kinematic));
+    $rig->start();
+    assert($rig->world->kinematicCount() == 1);
+
+    // the owner moves the pusher through its transform, one step at a time
+    for (int32 $i = 0; $i < 120; $i++) {
+        $rig->entities->get<Transform>($pusher)->position->x = -1.0f + ($i as float32) * 0.03f;
+        $rig->run(1);
+    }
+    assert($rig->entities->get<Transform>($ball)->position->x > 2.0f);
+}
+
+test a_still_kinematic_body_lets_a_crate_on_it_sleep
+{
+    Rig $rig = Rig();
+    Entity $table = placed($rig->entities, Vec3(0.0f, 0.5f, 0.0f));
+    $rig->entities->attach<Collider>($table, Collider(ColliderShape::box(Vec3(1.0f, 0.5f, 1.0f))));
+    $rig->entities->attach<RigidBody>($table, RigidBody(BodyKind::kinematic));
+    Entity $crate = placed($rig->entities, Vec3(0.0f, 1.25f, 0.0f));
+    $rig->entities->attach<Collider>($crate, Collider(ColliderShape::box(Vec3(0.25f, 0.25f, 0.25f))));
+    $rig->entities->attach<RigidBody>($crate, RigidBody());
+    $rig->start();
+
+    // the table's owner leaves its transform alone, so nothing drives it and both sleep
+    $rig->run(600);
+    assert($rig->world->awake() == 0);
+
+    // moving the table wakes the crate on it
+    $rig->entities->get<Transform>($table)->position->x = 0.02f;
+    $rig->run(1);
+    assert($rig->world->awake() == 1);
+}
+
+/**
+ * What a dispatcher heard: the last entity each signal named and how often.
+ */
+internal class SleepLog
+{
+    public int32 $woke = 0;
+    public int32 $slept = 0;
+    public Entity $last = Entity::none();
+}
+
+test a_body_reports_waking_and_sleeping_once_each
+{
+    Entities $entities = Entities();
+    Systems $systems = Systems();
+    Dispatcher $bus = Dispatcher();
+    SleepLog $log = SleepLog();
+    $bus->register<BodyWoke>(function(const BodyWoke& $s) : Flow {
+        $log->woke = $log->woke + 1;
+        $log->last = $s->entity;
+        return Flow::proceed;
+    });
+    $bus->register<BodySlept>(function(const BodySlept& $s) : Flow {
+        $log->slept = $log->slept + 1;
+        $log->last = $s->entity;
+        return Flow::proceed;
+    });
+    PhysicsSettings $settings = PhysicsSettings();
+    $settings->capacity = 8;
+    $settings->maxStepsPerUpdate = 1000;
+    PhysicsWorld $world = PhysicsWorld($settings);
+    $systems->bind(PhysicsSystem($world, $bus));
+    Entity $ground = placed($entities, Vec3(0.0f, -0.5f, 0.0f));
+    $entities->attach<Collider>($ground, Collider(ColliderShape::box(Vec3(10.0f, 0.5f, 10.0f))));
+    Entity $crate = placed($entities, Vec3(0.0f, 1.0f, 0.0f));
+    $entities->attach<Collider>($crate, Collider(ColliderShape::box(Vec3(0.25f, 0.25f, 0.25f))));
+    $entities->attach<RigidBody>($crate, RigidBody());
+    $systems->register($entities);
+
+    $systems->begin($entities);
+    $systems->tick($entities);
+    assert($log->woke == 1, 'a new body wakes');
+    assert($log->last == $crate);
+
+    $systems->begin($entities);
+    for (int32 $i = 0; $i < 600; $i++) {
+        $systems->tick($entities);
+    }
+    assert($log->woke == 1, 'no second wake while it falls and settles');
+    assert($log->slept == 1, 'it sleeps once');
+    assert($log->last == $crate);
+
+    // a teleport wakes it again
+    $entities->get<Transform>($crate)->position->y = 2.0f;
+    $entities->changed<Transform>($crate);
+    $systems->begin($entities);
+    $systems->tick($entities);
+    assert($log->woke == 2, 'a moved body wakes');
+}
+
+test a_threaded_world_steps_a_crate_to_rest
+{
+    Entities $entities = Entities();
+    Systems $systems = Systems();
+    PhysicsSettings $settings = PhysicsSettings();
+    $settings->capacity = 8;
+    $settings->maxStepsPerUpdate = 1000;
+    $settings->threads = 2;
+    PhysicsWorld $world = PhysicsWorld($settings);
+    assert($world->threads == 2);
+    $systems->bind(PhysicsSystem($world));
+    Entity $ground = placed($entities, Vec3(0.0f, -0.5f, 0.0f));
+    $entities->attach<Collider>($ground, Collider(ColliderShape::box(Vec3(10.0f, 0.5f, 10.0f))));
+    Entity $crate = placed($entities, Vec3(0.0f, 2.0f, 0.0f));
+    $entities->attach<Collider>($crate, Collider(ColliderShape::box(Vec3(0.25f, 0.25f, 0.25f))));
+    $entities->attach<RigidBody>($crate, RigidBody());
+    $systems->register($entities);
+
+    $systems->begin($entities);
+    for (int32 $i = 0; $i < 600; $i++) {
+        $systems->tick($entities);
+    }
+
+    // it lands on the ground, a quarter metre up, and sleeps
+    assert(within($entities->get<Transform>($crate)->position->y, 0.25f, 0.02f));
+    assert($world->awake() == 0);
+}
+
+test step_cap_holds_a_long_update
+{
+    Entities $entities = Entities();
+    Systems $systems = Systems();
+    PhysicsSettings $settings = PhysicsSettings();
+    $settings->capacity = 8;
+    $settings->maxStepsPerUpdate = 2;
+    PhysicsWorld $world = PhysicsWorld($settings);
+    $systems->bind(PhysicsSystem($world));
+    Entity $ball = placed($entities, Vec3(0.0f, 100.0f, 0.0f));
+    $entities->attach<Collider>($ball, Collider(ColliderShape::sphere(0.5f)));
+    $entities->attach<RigidBody>($ball, RigidBody());
+    $systems->register($entities);
+
+    $systems->begin($entities);
+    for (int32 $i = 0; $i < 100; $i++) {
+        $systems->tick($entities);
+    }
+
+    // two steps of free fall from rest, not a hundred
+    float32 $y = $entities->get<Transform>($ball)->position->y;
+    assert($y > 99.99f);
+}
+
+/**
+ * A world on the `update` clock, bound into `$systems`.
+ */
+internal function updateClockWorld(Systems $systems) : PhysicsWorld
+{
+    PhysicsSettings $settings = PhysicsSettings();
+    $settings->capacity = 8;
+    $settings->clock = PhysicsClock::update;
+    PhysicsWorld $world = PhysicsWorld($settings);
+    $systems->bind(PhysicsSystem($world));
+    return $world;
+}
+
+/**
+ * A dynamic ball high above nothing.
+ */
+internal function highBall(Entities $entities) : Entity
+{
+    Entity $ball = placed($entities, Vec3(0.0f, 100.0f, 0.0f));
+    $entities->attach<Collider>($ball, Collider(ColliderShape::sphere(0.5f)));
+    $entities->attach<RigidBody>($ball, RigidBody());
+    return $ball;
+}
+
+test update_clock_steps_once_per_update_whatever_the_passes
+{
+    Entities $once = Entities();
+    Systems $onceSystems = Systems();
+    updateClockWorld($onceSystems);
+    Entity $a = highBall($once);
+    $onceSystems->register($once);
+    $onceSystems->begin($once);
+    $onceSystems->tick($once);
+    $onceSystems->update($once);
+
+    Entities $many = Entities();
+    Systems $manySystems = Systems();
+    updateClockWorld($manySystems);
+    Entity $b = highBall($many);
+    $manySystems->register($many);
+    $manySystems->begin($many);
+    for (int32 $i = 0; $i < 100; $i++) {
+        $manySystems->tick($many);
+    }
+    $manySystems->update($many);
+
+    // one step of free fall in both, the passes step nothing
+    float32 $ya = $once->get<Transform>($a)->position->y;
+    float32 $yb = $many->get<Transform>($b)->position->y;
+    assert($ya < 100.0f);
+    assert($ya > 99.99f);
+    assert($ya == $yb);
+}
+
+test paused_world_steps_nothing
+{
+    Entities $entities = Entities();
+    Systems $systems = Systems();
+    PhysicsWorld $world = updateClockWorld($systems);
+    Entity $ball = highBall($entities);
+    $systems->register($entities);
+    $world->paused = true;
+    for (int32 $i = 0; $i < 10; $i++) {
+        $systems->begin($entities);
+        $systems->update($entities);
+    }
+    assert($entities->get<Transform>($ball)->position->y == 100.0f);
+
+    $world->paused = false;
+    $systems->begin($entities);
+    $systems->update($entities);
+    assert($entities->get<Transform>($ball)->position->y < 100.0f);
+}
+
+test a_new_scale_rebuilds_the_shape
+{
+    Rig $rig = Rig();
+    Entity $trunk = placed($rig->entities, Vec3(0.0f, 0.0f, 0.0f));
+    $rig->entities->attach<Collider>($trunk, Collider(ColliderShape::capsule(0.1f, 1.0f), offset: Vec3(0.0f, 0.6f, 0.0f)));
+    $rig->start();
+    Ray $past = Ray(Vec3(0.25f, 10.0f, 0.0f), Vec3(0.0f, -1.0f, 0.0f));
+    assert($rig->world->ray($past, 20.0f) == null);
+
+    // the tree grows: three times the radius reaches the ray
+    $rig->entities->get<Transform>($trunk)->scale = Vec3(3.0f, 3.0f, 3.0f);
+    $rig->entities->changed<Transform>($trunk);
+    $rig->run(0);
+    PhysicsHit $hit = guard $rig->world->ray($past, 20.0f) else {
+        die('the grown trunk answers');
+    }
+    assert($hit->entity == $trunk);
+    assert($rig->world->count() == 1);
+}

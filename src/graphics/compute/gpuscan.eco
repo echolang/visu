@@ -1,0 +1,205 @@
+/**
+ * Exclusive prefix sum of uint32 values on the GPU, in place: value i becomes the sum of the
+ * values before it. Blocks of `GPU_SCAN_BLOCK` scan in shared memory (`scan_block`) and write
+ * their totals, the totals scan the same way one level up, and `scan_add` hands each block the
+ * total of the blocks before it. Every add happens in a fixed order, so a compaction built on it
+ * (count, scan, then write at the scanned offset) comes out in the same order every run, which an
+ * atomic append never does. It is the one compaction primitive the GPU scene culls through.
+ */
+
+namespace visu::graphics;
+
+/**
+ * Values one workgroup scans in shared memory.
+ */
+public const uint32 GPU_SCAN_BLOCK = 1024;
+
+/**
+ * Levels of block totals a scan may need: `GPU_SCAN_BLOCK` cubed is past any buffer the scene
+ * compacts.
+ */
+internal const int32 GPU_SCAN_LEVELS = 3;
+
+/**
+ * One level as the kernels read it (std140 uvec4): x the value count, y the first value, z the
+ * first block total in the sums buffer, w 0 for a CPU count or the level plus one whose count
+ * `scan_args` left in the levels buffer.
+ */
+internal struct GpuScanParams
+{
+    public uint32 $count;
+    public uint32 $first;
+    public uint32 $sums;
+    public uint32 $level = 0;
+}
+
+/**
+ * Words of the levels buffer `scan_args` fills: per level a dispatch (four words), then the
+ * levels' value counts.
+ */
+internal const int32 GPU_SCAN_LEVEL_WORDS = 16;
+
+public class GpuScan
+{
+    /**
+     * Most values one scan takes.
+     */
+    public const uint32 $capacity;
+    private ComputeProgram $block;
+    private ComputeProgram $add;
+    private ComputeProgram $levelArgs;
+
+    /**
+     * An indirect scan's per-level dispatches and value counts (`scan_args`).
+     */
+    private Buffer $levels;
+
+    /**
+     * Every level's block totals end to end, sized once for `capacity`.
+     */
+    private Buffer $sums;
+
+    private constructor(uint32 $capacity, ComputeProgram $block, ComputeProgram $add, ComputeProgram $levelArgs, Buffer $sums, Buffer $levels)
+    {
+        $this->capacity = $capacity;
+        $this->block = $block;
+        $this->add = $add;
+        $this->levelArgs = $levelArgs;
+        $this->sums = $sums;
+        $this->levels = $levels;
+    }
+
+    /**
+     * The scan for up to `$capacity` values on `$device`. Links the two kernels on first use and
+     * sizes the totals buffer once.
+     */
+    public static function load(Device $device, uint32 $capacity) : result<GpuScan, ShaderError>
+    {
+        ComputeProgram $block = guard $device->gpuShaders->kernel($device, 'scan_block') else ($e) {
+            return .error($e);
+        }
+        ComputeProgram $add = guard $device->gpuShaders->kernel($device, 'scan_add') else ($e) {
+            return .error($e);
+        }
+        ComputeProgram $levelArgs = guard $device->gpuShaders->kernel($device, 'scan_args') else ($e) {
+            return .error($e);
+        }
+        uint32 $words = gpuScanSumWords($capacity);
+        Buffer $sums = Buffer($device, BufferDesc(BUFFER_STORAGE, ($words * 4) as uint64, 'gpuscan.sums'));
+        Buffer $levels = Buffer($device, BufferDesc(BUFFER_STORAGE | BUFFER_INDIRECT, (GPU_SCAN_LEVEL_WORDS * 4) as uint64, 'gpuscan.levels'));
+        return .ok(GpuScan($capacity, $block, $add, $levelArgs, $sums, $levels));
+    }
+
+    /**
+     * Record the scan of `$count` values of `$values`, starting at value `$first`, into `$enc`.
+     * The dispatches are fixed by `$count`, one block pass and one add pass a level; a caller
+     * whose live count is only known on the GPU scans a fixed count with a zero tail.
+     */
+    public function scan(ComputeEncoder $enc, Buffer $values, uint32 $first, uint32 $count) : void
+    {
+        assert($count <= $this->capacity, 'gpuscan: more values than the scan was sized for');
+        if ($count == 0) {
+            return;
+        }
+
+        $this->level($enc, $values, $first, $count, 0);
+    }
+
+    /**
+     * Record the scan of the count the GPU left at word `$word` of `$counts` (at most
+     * `$most`, which fixes the levels and the totals' layout), starting at value `$first` of
+     * `$values`. `scan_args` turns the count into each level's dispatch, so the blocks that run
+     * are the count's, not `$most`'s, and nothing past the count is read or written.
+     */
+    public function scanIndirect(ComputeEncoder $enc, Buffer $values, uint32 $first, Buffer $counts, uint32 $word, uint32 $most) : void
+    {
+        assert($most <= $this->capacity, 'gpuscan: more values than the scan was sized for');
+        if ($most == 0) {
+            return;
+        }
+
+        $enc->setKernel($this->levelArgs);
+        $enc->bindStorage(0, $counts);
+        $enc->bindStorage(1, $this->levels);
+        $enc->upload(GpuScanParams($count: $most, $first: $word, $sums: 0), slot: 0);
+        $enc->dispatch(1);
+        $enc->barrier();
+        $this->levelIndirect($enc, $values, $first, $most, 0, 0);
+    }
+
+    private function levelIndirect(ComputeEncoder $enc, Buffer $values, uint32 $first, uint32 $most, uint32 $sums, uint32 $level) : void
+    {
+        uint32 $groups = gpuScanGroups($most);
+        uint64 $dispatch = (($level * 4) * 4) as uint64;
+        $enc->setKernel($this->block);
+        $enc->bindStorage(0, $values);
+        $enc->bindStorage(1, $this->sums);
+        $enc->bindStorage(2, $this->levels);
+        $enc->upload(GpuScanParams($count: $most, $first: $first, $sums: $sums, $level: $level + 1), slot: 0);
+        $enc->dispatchIndirect($this->levels, $dispatch);
+        if ($groups == 1) {
+            return;
+        }
+
+        $enc->barrier();
+        $this->levelIndirect($enc, $this->sums, $sums, $groups, $sums + $groups, $level + 1);
+        $enc->barrier();
+        $enc->setKernel($this->add);
+        $enc->bindStorage(0, $values);
+        $enc->bindStorage(1, $this->sums);
+        $enc->bindStorage(2, $this->levels);
+        $enc->upload(GpuScanParams($count: $most, $first: $first, $sums: $sums, $level: $level + 1), slot: 0);
+        $enc->dispatchIndirect($this->levels, $dispatch);
+    }
+
+    private function level(ComputeEncoder $enc, Buffer $values, uint32 $first, uint32 $count, uint32 $sums) : void
+    {
+        uint32 $groups = gpuScanGroups($count);
+        $enc->setKernel($this->block);
+        $enc->bindStorage(0, $values);
+        $enc->bindStorage(1, $this->sums);
+        $enc->bindStorage(2, $this->levels);
+        $enc->upload(GpuScanParams($count: $count, $first: $first, $sums: $sums), slot: 0);
+        $enc->dispatch($groups * GPU_SCAN_BLOCK);
+        if ($groups == 1) {
+            return;
+        }
+
+        // the block totals scan in place one level up, then come back down as offsets
+        $enc->barrier();
+        $this->level($enc, $this->sums, $sums, $groups, $sums + $groups);
+        $enc->barrier();
+        $enc->setKernel($this->add);
+        $enc->bindStorage(0, $values);
+        $enc->bindStorage(1, $this->sums);
+        $enc->bindStorage(2, $this->levels);
+        $enc->upload(GpuScanParams($count: $count, $first: $first, $sums: $sums), slot: 0);
+        $enc->dispatch($groups * GPU_SCAN_BLOCK);
+    }
+}
+
+/**
+ * Workgroups one level of `$count` values takes.
+ */
+internal function gpuScanGroups(uint32 $count) : uint32
+{
+    return ($count + GPU_SCAN_BLOCK - 1) / GPU_SCAN_BLOCK;
+}
+
+/**
+ * Words the block totals of every level take for a scan of `$capacity` values, plus one so a
+ * one-block level still has a slot to write.
+ */
+internal function gpuScanSumWords(uint32 $capacity) : uint32
+{
+    uint32 $words = 1;
+    uint32 $n = $capacity;
+    int32 $level = 0;
+    while ($n > 1 && $level < GPU_SCAN_LEVELS) {
+        $n = gpuScanGroups($n);
+        $words = $words + $n;
+        $level = $level + 1;
+    }
+
+    return $words;
+}

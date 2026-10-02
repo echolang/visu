@@ -1,0 +1,156 @@
+/**
+ * The bindless texture table: four solid textures in table slots, one after a released slot came
+ * back. A draw picks a slot per pixel (each quarter of the target reads another one, so the index
+ * is non-uniform across the draw), and a kernel reads each slot into a buffer. Skips when the
+ * device has no bindless textures.
+ */
+
+use visu::graphics::{
+    BUFFER_STORAGE, Buffer, BufferDesc, CallbackPass, ClearPass, ClearPassOptions, ComputeEncoder,
+    ComputeProgram, Device, Frame, GpuPass, IoSink, Mesh, Pipeline, PipelineError, Raster,
+    RenderContext, RenderEncoder, Sampler, SamplerDesc, ShaderCollection, TargetRef, Texture,
+    TextureTable, VertexLayout
+};
+use visu::math::Vec4;
+
+/**
+ * The checks' uniform (std140 uvec4): the table slot each quarter or thread reads.
+ */
+internal struct TableCheckParams
+{
+    public uint32 $a;
+    public uint32 $b;
+    public uint32 $c;
+    public uint32 $d;
+}
+
+public function checkTextureTable(GpuContext $gpu) : void
+{
+    Device $device = $gpu->device;
+    if (!$device->limits()->bindless) {
+        echo 'gpucheck: no bindless textures here, texture table check skipped';
+        return;
+    }
+
+    ShaderCollection $shaders = ShaderCollection($device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('table_quad') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+    ComputeProgram $reader = guard $shaders->compute('table_read') else ($e) {
+        die($e->message());
+    }
+
+    Texture $red = solidTexture($device, 'tableRed', 255, 0, 0);
+    Texture $green = solidTexture($device, 'tableGreen', 0, 255, 0);
+    Texture $blue = solidTexture($device, 'tableBlue', 0, 0, 255);
+    Texture $white = solidTexture($device, 'tableWhite', 255, 255, 255);
+    Texture $spare = solidTexture($device, 'tableSpare', 9, 9, 9);
+    Sampler $samp = $device->createSampler(SamplerDesc());
+    TextureTable $table = TextureTable($device, 64);
+    $table->setSampler(0, $samp);
+    int32 $gone = $table->add($spare);
+    int32 $r = $table->add($red);
+    int32 $g = $table->add($green);
+    $table->release($gone);
+    int32 $b = $table->add($blue);
+    int32 $w = $table->add($white);
+    assert($b != $gone, 'table: a released slot waits out the frames in flight');
+    assert($table->count() == 4, 'table: four slots in use');
+    TableCheckParams $slots = TableCheckParams($a: $r as uint32, $b: $g as uint32, $c: $b as uint32, $d: $w as uint32);
+    Buffer $texels = Buffer($device, BufferDesc(BUFFER_STORAGE, (4 * 16) as uint64, 'table.texels'));
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'table');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'table-draw',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(RenderContext $ctx) : status<PipelineError> {
+                ComputeEncoder $kernel = $ctx->beginCompute();
+                $kernel->setKernel($reader);
+                $kernel->bindTextureTable($table);
+                $kernel->upload($slots, slot: 0);
+                $kernel->bindStorage(0, $texels);
+                $kernel->dispatch(4);
+                $kernel->endCompute();
+
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                Device $dev = $ctx->device;
+                Mesh $mesh = $ctx->pool->cache<Mesh>('quad', function() : Mesh {
+                    return .quad($dev);
+                });
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3uv2(), Raster::none());
+                $pass->bind($enc);
+                $enc->bindTextureTable($table);
+                $enc->upload($slots, slot: 0);
+                $mesh->draw($enc);
+                $enc->endRender();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('table');
+    array<uint8> $bytes = guard $device->readbackBuffer($texels, 0 as uint64, (4 * 16) as uint64) else ($e) {
+        die($e->message());
+    }
+    $texels->destroy();
+    $table->destroy();
+    $shaders->destroy();
+    $red->destroy();
+    $green->destroy();
+    $blue->destroy();
+    $white->destroy();
+    $spare->destroy();
+
+    // one pixel in the middle of each quarter, left to right: red, green, blue, white
+    array<int32> $want = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255];
+    int32 $q = 0;
+    while ($q < 4) {
+        usize $at = ((32 * 64 + $q * 16 + 8) * 4) as usize;
+        int32 $c = 0;
+        while ($c < 3) {
+            int32 $got = $pixels[$at + ($c as usize)] as int32;
+            int32 $expect = $want[($q * 3 + $c) as usize];
+            assert($got >= $expect - 3 && $got <= $expect + 3, 'table: each quarter samples its own slot');
+            $c = $c + 1;
+        }
+        $q = $q + 1;
+    }
+
+    // the kernel's texels, rgba32f: the red channel of each slot
+    array<float32> $red4 = [1.0f, 0.0f, 0.0f, 1.0f];
+    int32 $i = 0;
+    while ($i < 4) {
+        usize $at = ($i * 16) as usize;
+        uint32 $word = ($bytes[$at] as uint32)
+            | (($bytes[$at + 1] as uint32) << 8)
+            | (($bytes[$at + 2] as uint32) << 16)
+            | (($bytes[$at + 3] as uint32) << 24);
+        float32 $got = mem::bit_cast<float32, uint32>($word);
+        float32 $expect = $red4[$i as usize];
+        assert($got > $expect - 0.02f && $got < $expect + 0.02f, 'table: the kernel reads each slot');
+        $i = $i + 1;
+    }
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_texture_table
+{
+    GpuContext $gpu = gpuHidden('table');
+    checkTextureTable($gpu);
+    $gpu->end();
+}
+#[end]

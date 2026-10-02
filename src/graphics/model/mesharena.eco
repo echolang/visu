@@ -1,10 +1,13 @@
 /**
- * Every model's depth form in three storage buffers the GPU-driven views read by index: vertex
- * words, indices (already the word offset of their vertex) and cluster records. The `ModelBank`
- * owns one and adds a model when it loads or adopts it, so nothing here runs in a frame that
- * did not load something. A CPU mirror keeps every word, so growing a buffer is one fresh
- * buffer and one upload at that load step; a removed model's ranges go back on a free list.
- * The buffers a frame in flight read are released by the device once no frame reads them.
+ * Every model's arena form in storage buffers the GPU-driven views read by index: vertex words,
+ * the meshlet detail (each meshlet's vertex list, the word offset of each of its vertices, then
+ * its packed triangles, one buffer so a pulling program binds one), the meshlet records, and the
+ * material runs every LOD level is cut into. The `ModelBank` owns
+ * one and adds a model when it loads or adopts it, so nothing here runs in a frame that did not
+ * load something. A CPU mirror keeps every word, so growing a buffer is one fresh buffer and one
+ * upload at that load step; a removed model's ranges go back on a free list that merges
+ * neighbours, so a road rebuilt many times does not fragment it. The buffers a frame in flight
+ * read are released by the device once no frame reads them.
  */
 
 namespace visu::graphics;
@@ -12,150 +15,232 @@ namespace visu::graphics;
 use visu::math::Vec4;
 
 /**
- * Cluster flag: the model is skinned, so its vertices carry joints and weights and its bind
+ * Meshlet flag: the model is skinned, so its vertices carry joints and weights and its bind
  * pose bounds say nothing about where the posed triangles are.
  */
-public const uint32 SCENE_CLUSTER_SKINNED = 1;
+public const uint32 SCENE_MESHLET_SKINNED = 1;
 
 /**
- * Bucket of a cluster whose material casts no shadow: every depth view skips it.
+ * Bucket of a meshlet whose material casts no shadow: every depth view skips it.
  */
 public const uint32 SCENE_BUCKET_NONE = 0xFFFFFFFF;
 
 /**
- * One cluster as the kernels and `depth_pull.vert` read it, 32 bytes (std430 `vec4, uvec4`).
- * `sphere` is the model-space centre and radius, `firstIndex` its first entry in the arena
- * index buffer, `bucket` the shadow bucket of its material (`MaterialGpu.shadowBucket`).
+ * One meshlet as the kernels and the pulling programs read it, 64 bytes (std430 `vec4, vec4,
+ * uvec4, uvec4`). `sphere` is the model-space centre and radius, `cone` the normal cone (axis,
+ * sine cutoff, `MESHLET_CONE_OPEN` never culls); `range` its first vertex-list entry and its
+ * first triangle word (both in the detail buffer), its triangles and flags; `material` its
+ * shadow bucket, material index, G-buffer class and vertex count.
  */
-public struct SceneClusterGpu
+public struct SceneMeshletGpu
 {
     public Vec4 $sphere;
-    public uint32 $firstIndex;
+    public Vec4 $cone;
+    public uint32 $firstVertex;
+    public uint32 $firstTriangle;
     public uint32 $triangles;
-    public uint32 $bucket;
     public uint32 $flags;
+    public uint32 $bucket;
+    public uint32 $material;
+    public uint32 $gclass;
+    public uint32 $vertices;
 }
 
 /**
- * Where one model sits in the arena. Level `l` of its clusters is `lodStart[l] .. lodStart[l + 1]`,
- * global cluster indices.
+ * One material run (std430 `uvec4`): consecutive meshlets of one LOD level that share their
+ * G-buffer class and their shadow bucket, so one (instance, view) pair walks one run and every
+ * item it keeps lands in one draw segment.
+ */
+public struct SceneRunGpu
+{
+    public uint32 $firstMeshlet;
+    public uint32 $meshlets;
+    public uint32 $gclass;
+    public uint32 $bucket;
+}
+
+/**
+ * What the bank knows about one material slot of a model when the arena takes it: the shadow
+ * bucket, the material's dense index, its G-buffer class and whether it draws both faces (which
+ * turns the meshlet cone off).
+ */
+public struct ArenaSlot
+{
+    public uint32 $bucket;
+    public int32 $material;
+    public int32 $gclass;
+    public bool $doubleSided;
+}
+
+/**
+ * Where one model sits in the arena. Level `l` is runs `lodRun[l] .. lodRun[l + 1]`, global run
+ * indices.
  */
 public struct ArenaModel
 {
     public int32 $firstWord;
     public int32 $words;
-    public int32 $firstIndex;
-    public int32 $indices;
-    public int32 $firstCluster;
-    public int32 $clusters;
+    public int32 $firstDetail;
+    public int32 $details;
+    public int32 $firstMeshlet;
+    public int32 $meshlets;
+    public int32 $firstRun;
+    public int32 $runs;
     public int32 $stride;
     public bool $skinned;
-    public array<int32> $lodStart;
+    public array<int32> $lodRun;
 }
 
 public class MeshArena
 {
     private Device $device;
     private array<uint32> $words;
-    private array<uint32> $indices;
-    private array<SceneClusterGpu> $clusters;
+    private array<uint32> $detail;
+    private array<SceneMeshletGpu> $meshlets;
+    private array<SceneRunGpu> $runs;
     private ArenaRanges $wordRanges;
-    private ArenaRanges $indexRanges;
-    private ArenaRanges $clusterRanges;
+    private ArenaRanges $detailRanges;
+    private ArenaRanges $meshletRanges;
+    private ArenaRanges $runRanges;
     private Buffer? $wordBuffer;
-    private Buffer? $indexBuffer;
-    private Buffer? $clusterBuffer;
+    private Buffer? $detailBuffer;
+    private Buffer? $meshletBuffer;
+    private Buffer? $runBuffer;
 
     public constructor(Device $device)
     {
         $this->device = $device;
         $this->words = array<uint32>();
-        $this->indices = array<uint32>();
-        $this->clusters = array<SceneClusterGpu>();
+        $this->detail = array<uint32>();
+        $this->meshlets = array<SceneMeshletGpu>();
+        $this->runs = array<SceneRunGpu>();
         $this->wordRanges = ArenaRanges();
-        $this->indexRanges = ArenaRanges();
-        $this->clusterRanges = ArenaRanges();
+        $this->detailRanges = ArenaRanges();
+        $this->meshletRanges = ArenaRanges();
+        $this->runRanges = ArenaRanges();
         $this->wordBuffer = null;
-        $this->indexBuffer = null;
-        $this->clusterBuffer = null;
+        $this->detailBuffer = null;
+        $this->meshletBuffer = null;
+        $this->runBuffer = null;
     }
 
     /**
-     * Copy `$depth` in and upload it. `$buckets` is the shadow bucket of each material slot.
+     * Copy `$form` in and upload it. `$slots` describes each material slot. Within each level the
+     * meshlets are ordered by (class, bucket, slot), keeping their order otherwise, and cut into
+     * runs where class or bucket changes.
      */
-    public function add(const ModelDepth& $depth, const array<uint32>& $buckets, bool $skinned) : ArenaModel
+    public function add(const ModelForm& $form, const array<ArenaSlot>& $slots, bool $skinned) : ArenaModel
     {
-        int32 $wordCount = $depth->words->count() as int32;
-        int32 $indexCount = $depth->indices->count() as int32;
-        int32 $clusterCount = $depth->clusters->count() as int32;
+        int32 $wordCount = $form->words->count() as int32;
+        int32 $vertexCount = $form->vertexList->count() as int32;
+        int32 $triangleCount = $form->triangles->count() as int32;
+        int32 $detailCount = $vertexCount + $triangleCount;
+        int32 $meshletCount = $form->meshlets->count() as int32;
+        array<int32> $order = arenaOrder($form, $slots);
+        int32 $runCount = arenaRunCount($form, $slots, $order);
         int32 $firstWord = $this->wordRanges->take($wordCount);
-        int32 $firstIndex = $this->indexRanges->take($indexCount);
-        int32 $firstCluster = $this->clusterRanges->take($clusterCount);
+        int32 $firstDetail = $this->detailRanges->take($detailCount);
+        int32 $firstVertex = $firstDetail;
+        int32 $firstTriangle = $firstDetail + $vertexCount;
+        int32 $firstMeshlet = $this->meshletRanges->take($meshletCount);
+        int32 $firstRun = $this->runRanges->take($runCount);
         arenaFit<uint32>($this->words, $this->wordRanges->top, 0 as uint32);
-        arenaFit<uint32>($this->indices, $this->indexRanges->top, 0 as uint32);
-        arenaFit<SceneClusterGpu>($this->clusters, $this->clusterRanges->top, SceneClusterGpu(
-            $sphere: Vec4(0.0f),
-            $firstIndex: 0,
-            $triangles: 0,
-            $bucket: SCENE_BUCKET_NONE,
-            $flags: 0
-        ));
+        arenaFit<uint32>($this->detail, $this->detailRanges->top, 0 as uint32);
+        arenaFit<SceneMeshletGpu>($this->meshlets, $this->meshletRanges->top, arenaEmptyMeshlet());
+        arenaFit<SceneRunGpu>($this->runs, $this->runRanges->top, SceneRunGpu(0, 0, 0, SCENE_BUCKET_NONE));
 
         int32 $i = 0;
         while ($i < $wordCount) {
-            $this->words[($firstWord + $i) as usize] = $depth->words[$i as usize];
+            $this->words[($firstWord + $i) as usize] = $form->words[$i as usize];
             $i = $i + 1;
         }
 
-        uint32 $stride = $depth->stride as uint32;
+        uint32 $stride = $form->stride as uint32;
         $i = 0;
-        while ($i < $indexCount) {
-            $this->indices[($firstIndex + $i) as usize] = ($firstWord as uint32) + $depth->indices[$i as usize] * $stride;
+        while ($i < $vertexCount) {
+            $this->detail[($firstVertex + $i) as usize] = ($firstWord as uint32) + $form->vertexList[$i as usize] * $stride;
+            $i = $i + 1;
+        }
+
+        $i = 0;
+        while ($i < $triangleCount) {
+            $this->detail[($firstTriangle + $i) as usize] = $form->triangles[$i as usize];
             $i = $i + 1;
         }
 
         uint32 $flags = 0;
         if ($skinned) {
-            $flags = SCENE_CLUSTER_SKINNED;
+            $flags = SCENE_MESHLET_SKINNED;
         }
 
-        $i = 0;
-        while ($i < $clusterCount) {
-            DepthCluster $c = $depth->clusters[$i as usize];
-            uint32 $bucket = SCENE_BUCKET_NONE;
-            if ($c->slot >= 0 && ($c->slot as usize) < $buckets->count()) {
-                $bucket = $buckets[$c->slot as usize];
+        // meshlets in run order; each run its first meshlet, count and keys
+        array<int32> $lodRun = array<int32>();
+        int32 $run = $firstRun;
+        int32 $level = 0;
+        int32 $levels = ($form->lodStart->count() as int32) - 1;
+        while ($level < $levels) {
+            $lodRun[] = $run;
+            int32 $start = $form->lodStart[$level as usize];
+            int32 $end = $form->lodStart[($level + 1) as usize];
+            int32 $k = $start;
+            while ($k < $end) {
+                FormMeshlet $m = $form->meshlets[$order[$k as usize] as usize];
+                ArenaSlot $slot = arenaSlotOf($slots, $m->slot);
+                float32 $cutoff = $m->cutoff;
+                if ($slot->doubleSided) {
+                    $cutoff = MESHLET_CONE_OPEN;
+                }
+
+                $this->meshlets[($firstMeshlet + $k) as usize] = SceneMeshletGpu(
+                    $sphere: Vec4($m->center->x, $m->center->y, $m->center->z, $m->radius),
+                    $cone: Vec4($m->axis->x, $m->axis->y, $m->axis->z, $cutoff),
+                    $firstVertex: ($firstVertex + $m->firstVertex) as uint32,
+                    $firstTriangle: ($firstTriangle + $m->firstTriangle) as uint32,
+                    $triangles: $m->triangles as uint32,
+                    $flags: $flags,
+                    $bucket: $slot->bucket,
+                    $material: $slot->material as uint32,
+                    $gclass: $slot->gclass as uint32,
+                    $vertices: $m->vertices as uint32
+                );
+                bool $opens = $k == $start;
+                if (!$opens) {
+                    FormMeshlet $prev = $form->meshlets[$order[($k - 1) as usize] as usize];
+                    ArenaSlot $was = arenaSlotOf($slots, $prev->slot);
+                    $opens = $was->gclass != $slot->gclass || $was->bucket != $slot->bucket;
+                }
+
+                if ($opens) {
+                    $this->runs[$run as usize] = SceneRunGpu(($firstMeshlet + $k) as uint32, 0, $slot->gclass as uint32, $slot->bucket);
+                    $run = $run + 1;
+                }
+
+                SceneRunGpu& $open = $this->runs->at(($run - 1) as usize);
+                $open->meshlets = $open->meshlets + 1;
+                $k = $k + 1;
             }
 
-            $this->clusters[($firstCluster + $i) as usize] = SceneClusterGpu(
-                $sphere: Vec4($c->center->x, $c->center->y, $c->center->z, $c->radius),
-                $firstIndex: ($firstIndex + $c->firstIndex) as uint32,
-                $triangles: $c->triangles as uint32,
-                $bucket: $bucket,
-                $flags: $flags
-            );
-            $i = $i + 1;
+            $level = $level + 1;
         }
 
-        array<int32> $lodStart = array<int32>();
-        foreach ($depth->lodStart as $start) {
-            $lodStart[] = $firstCluster + $start;
-        }
-
+        $lodRun[] = $run;
         $this->sync();
-        $this->uploadWords($firstWord, $wordCount);
-        $this->uploadIndices($firstIndex, $indexCount);
-        $this->uploadClusters($firstCluster, $clusterCount);
+        arenaUpload<uint32>($this->wordBuffer, $this->words, $firstWord, $wordCount);
+        arenaUpload<uint32>($this->detailBuffer, $this->detail, $firstDetail, $detailCount);
+        arenaUpload<SceneMeshletGpu>($this->meshletBuffer, $this->meshlets, $firstMeshlet, $meshletCount);
+        arenaUpload<SceneRunGpu>($this->runBuffer, $this->runs, $firstRun, $runCount);
         return ArenaModel(
             $firstWord: $firstWord,
             $words: $wordCount,
-            $firstIndex: $firstIndex,
-            $indices: $indexCount,
-            $firstCluster: $firstCluster,
-            $clusters: $clusterCount,
-            $stride: $depth->stride,
+            $firstDetail: $firstDetail,
+            $details: $detailCount,
+            $firstMeshlet: $firstMeshlet,
+            $meshlets: $meshletCount,
+            $firstRun: $firstRun,
+            $runs: $runCount,
+            $stride: $form->stride,
             $skinned: $skinned,
-            $lodStart: $lodStart
+            $lodRun: $lodRun
         );
     }
 
@@ -166,8 +251,9 @@ public class MeshArena
     public function remove(const ArenaModel& $model) : void
     {
         $this->wordRanges->give($model->firstWord, $model->words);
-        $this->indexRanges->give($model->firstIndex, $model->indices);
-        $this->clusterRanges->give($model->firstCluster, $model->clusters);
+        $this->detailRanges->give($model->firstDetail, $model->details);
+        $this->meshletRanges->give($model->firstMeshlet, $model->meshlets);
+        $this->runRanges->give($model->firstRun, $model->runs);
     }
 
     /**
@@ -176,12 +262,17 @@ public class MeshArena
     public function clear() : void
     {
         $this->words->clear();
-        $this->indices->clear();
-        $this->clusters->clear();
+        $this->detail->clear();
+        $this->meshlets->clear();
+        $this->runs->clear();
         $this->wordRanges = ArenaRanges();
-        $this->indexRanges = ArenaRanges();
-        $this->clusterRanges = ArenaRanges();
-        $this->dropBuffers();
+        $this->detailRanges = ArenaRanges();
+        $this->meshletRanges = ArenaRanges();
+        $this->runRanges = ArenaRanges();
+        $this->wordBuffer = dropBuffer($this->wordBuffer);
+        $this->detailBuffer = dropBuffer($this->detailBuffer);
+        $this->meshletBuffer = dropBuffer($this->meshletBuffer);
+        $this->runBuffer = dropBuffer($this->runBuffer);
     }
 
     public const function empty() : bool
@@ -190,30 +281,45 @@ public class MeshArena
     }
 
     /**
-     * The vertex words. Only valid when not `empty`.
+     * Words, vertex list, triangles, meshlets and runs held, for the `scene` verb.
+     */
+    public const function bytes() : int64
+    {
+        int64 $words = ($this->wordRanges->top + $this->detailRanges->top) as int64;
+        int64 $meshlets = ($this->meshletRanges->top as int64) * (mem::size<SceneMeshletGpu>() as int64);
+        int64 $runs = ($this->runRanges->top as int64) * (mem::size<SceneRunGpu>() as int64);
+        return $words * 4 + $meshlets + $runs;
+    }
+
+    public const function meshletCount() : int32
+    {
+        return $this->meshletRanges->top;
+    }
+
+    /**
+     * The vertex words. Only valid when not `empty`; so for every buffer below.
      */
     public function vertices() : Buffer
     {
-        Buffer $b = guard $this->wordBuffer else {
-            die('mesh arena: no vertices yet');
-        }
-        return $b;
+        return arenaHeld($this->wordBuffer);
     }
 
-    public function indexBuffer() : Buffer
+    /**
+     * Every meshlet's vertex list and packed triangles.
+     */
+    public function detailBuffer() : Buffer
     {
-        Buffer $b = guard $this->indexBuffer else {
-            die('mesh arena: no indices yet');
-        }
-        return $b;
+        return arenaHeld($this->detailBuffer);
     }
 
-    public function clusterBuffer() : Buffer
+    public function meshletBuffer() : Buffer
     {
-        Buffer $b = guard $this->clusterBuffer else {
-            die('mesh arena: no clusters yet');
-        }
-        return $b;
+        return arenaHeld($this->meshletBuffer);
+    }
+
+    public function runBuffer() : Buffer
+    {
+        return arenaHeld($this->runBuffer);
     }
 
     /**
@@ -222,74 +328,49 @@ public class MeshArena
      */
     private function sync() : void
     {
-        if (arenaNeeds($this->wordBuffer, $this->wordRanges->capacity * 4)) {
-            $this->wordBuffer = arenaBuffer($this->device, $this->wordBuffer, $this->wordRanges->capacity * 4, 'arena.words');
-            $this->uploadWords(0, $this->wordRanges->top);
-        }
-
-        if (arenaNeeds($this->indexBuffer, $this->indexRanges->capacity * 4)) {
-            $this->indexBuffer = arenaBuffer($this->device, $this->indexBuffer, $this->indexRanges->capacity * 4, 'arena.indices');
-            $this->uploadIndices(0, $this->indexRanges->top);
-        }
-
-        int32 $clusterBytes = mem::size<SceneClusterGpu>() as int32;
-        if (arenaNeeds($this->clusterBuffer, $this->clusterRanges->capacity * $clusterBytes)) {
-            $this->clusterBuffer = arenaBuffer($this->device, $this->clusterBuffer, $this->clusterRanges->capacity * $clusterBytes, 'arena.clusters');
-            $this->uploadClusters(0, $this->clusterRanges->top);
-        }
-    }
-
-    private function uploadWords(int32 $first, int32 $count) : void
-    {
-        Buffer $b = guard $this->wordBuffer else {
-            return;
-        }
-        if ($count <= 0) {
-            return;
-        }
-
-        ptr<const uint32> $src = ptr<const uint32>(&$this->words[$first as usize]);
-        $b->upload(ptr<const uint8>($src:$), ($count as uint64) * 4, ($first as uint64) * 4);
-    }
-
-    private function uploadIndices(int32 $first, int32 $count) : void
-    {
-        Buffer $b = guard $this->indexBuffer else {
-            return;
-        }
-        if ($count <= 0) {
-            return;
-        }
-
-        ptr<const uint32> $src = ptr<const uint32>(&$this->indices[$first as usize]);
-        $b->upload(ptr<const uint8>($src:$), ($count as uint64) * 4, ($first as uint64) * 4);
-    }
-
-    private function uploadClusters(int32 $first, int32 $count) : void
-    {
-        Buffer $b = guard $this->clusterBuffer else {
-            return;
-        }
-        if ($count <= 0) {
-            return;
-        }
-
-        uint64 $size = mem::size<SceneClusterGpu>() as uint64;
-        ptr<const SceneClusterGpu> $src = ptr<const SceneClusterGpu>(&$this->clusters[$first as usize]);
-        $b->upload(ptr<const uint8>($src:$), ($count as uint64) * $size, ($first as uint64) * $size);
-    }
-
-    private function dropBuffers() : void
-    {
-        $this->wordBuffer = dropBuffer($this->wordBuffer);
-        $this->indexBuffer = dropBuffer($this->indexBuffer);
-        $this->clusterBuffer = dropBuffer($this->clusterBuffer);
+        $this->wordBuffer = arenaFitBuffer<uint32>($this->device, $this->wordBuffer, $this->words, $this->wordRanges, 'arena.words');
+        $this->detailBuffer = arenaFitBuffer<uint32>($this->device, $this->detailBuffer, $this->detail, $this->detailRanges, 'arena.detail');
+        $this->meshletBuffer = arenaFitBuffer<SceneMeshletGpu>($this->device, $this->meshletBuffer, $this->meshlets, $this->meshletRanges, 'arena.meshlets');
+        $this->runBuffer = arenaFitBuffer<SceneRunGpu>($this->device, $this->runBuffer, $this->runs, $this->runRanges, 'arena.runs');
     }
 }
 
 /**
+ * `$have`, or a fresh buffer sized to `$ranges`' capacity filled from `$mirror` when it outgrew it.
+ */
+internal function arenaFitBuffer<T>(Device $device, Buffer? $have, const array<T>& $mirror, ArenaRanges $ranges, string $label) : Buffer?
+{
+    int64 $bytes = ($ranges->capacity as int64) * (mem::size<T>() as int64);
+    if (!arenaNeeds($have, $bytes)) {
+        return $have;
+    }
+
+    Buffer? $fresh = arenaBuffer($device, $have, $bytes, $label);
+    arenaUpload<T>($fresh, $mirror, 0, $ranges->top);
+    return $fresh;
+}
+
+/**
+ * Upload `$count` mirror entries from `$first` into the same place of `$into`.
+ */
+internal function arenaUpload<T>(Buffer? $into, const array<T>& $mirror, int32 $first, int32 $count) : void
+{
+    Buffer $b = guard $into else {
+        return;
+    }
+    if ($count <= 0) {
+        return;
+    }
+
+    uint64 $size = mem::size<T>() as uint64;
+    ptr<const T> $src = ptr<const T>(&$mirror[$first as usize]);
+    $b->upload(ptr<const uint8>($src:$), ($count as uint64) * $size, ($first as uint64) * $size);
+}
+
+/**
  * First-fit ranges over one arena buffer, in elements. `top` is the high-water mark the mirror
- * spans, `capacity` what the GPU buffer holds; a take past it doubles the capacity.
+ * spans, `capacity` what the GPU buffer holds; a take past it doubles the capacity. Free ranges
+ * stay sorted by start and a range given back merges with the free ones it touches.
  */
 internal class ArenaRanges
 {
@@ -318,6 +399,11 @@ internal class ArenaRanges
                 int32 $start = $this->freeStart[$i];
                 $this->freeStart[$i] = $start + $n;
                 $this->freeCount[$i] = $this->freeCount[$i] - $n;
+                if ($this->freeCount[$i] == 0) {
+                    $this->freeStart->remove($i);
+                    $this->freeCount->remove($i);
+                }
+
                 return $start;
             }
 
@@ -348,9 +434,169 @@ internal class ArenaRanges
             return;
         }
 
-        $this->freeStart[] = $start;
-        $this->freeCount[] = $n;
+        // the first free range past `$start`
+        usize $at = 0;
+        usize $count = $this->freeStart->count();
+        while ($at < $count && $this->freeStart[$at] < $start) {
+            $at = $at + 1;
+        }
+
+        bool $joinsLeft = $at > 0 && $this->freeStart[$at - 1] + $this->freeCount[$at - 1] == $start;
+        bool $joinsRight = $at < $count && $start + $n == $this->freeStart[$at];
+        if ($joinsLeft && $joinsRight) {
+            $this->freeCount[$at - 1] = $this->freeCount[$at - 1] + $n + $this->freeCount[$at];
+            $this->freeStart->remove($at);
+            $this->freeCount->remove($at);
+        } else if ($joinsLeft) {
+            $this->freeCount[$at - 1] = $this->freeCount[$at - 1] + $n;
+        } else if ($joinsRight) {
+            $this->freeStart[$at] = $start;
+            $this->freeCount[$at] = $this->freeCount[$at] + $n;
+        } else {
+            arenaInsert($this->freeStart, $at, $start);
+            arenaInsert($this->freeCount, $at, $n);
+        }
     }
+
+    /**
+     * Free ranges, for tests: a give that touches a neighbour leaves one range.
+     */
+    public const function freeRanges() : int32
+    {
+        return $this->freeStart->count() as int32;
+    }
+}
+
+/**
+ * The meshlet order of `$form`: level by level, by (class, bucket, slot), the build order kept
+ * among equals. Insertion sort per level; levels hold tens to hundreds of meshlets.
+ */
+internal function arenaOrder(const ModelForm& $form, const array<ArenaSlot>& $slots) : array<int32>
+{
+    array<int32> $order = array<int32>();
+    $order->reserve($form->meshlets->count());
+    int32 $levels = ($form->lodStart->count() as int32) - 1;
+    int32 $level = 0;
+    while ($level < $levels) {
+        int32 $start = $form->lodStart[$level as usize];
+        int32 $end = $form->lodStart[($level + 1) as usize];
+        int32 $k = $start;
+        while ($k < $end) {
+            $order[] = $k;
+            int32 $j = $k;
+            while ($j > $start && arenaKey($form, $slots, $order[($j - 1) as usize]) > arenaKey($form, $slots, $order[$j as usize])) {
+                int32 $swap = $order[($j - 1) as usize];
+                $order[($j - 1) as usize] = $order[$j as usize];
+                $order[$j as usize] = $swap;
+                $j = $j - 1;
+            }
+
+            $k = $k + 1;
+        }
+
+        $level = $level + 1;
+    }
+
+    return $order;
+}
+
+/**
+ * The sort key of meshlet `$m`: class, then bucket (none last), then slot.
+ */
+internal function arenaKey(const ModelForm& $form, const array<ArenaSlot>& $slots, int32 $m) : int64
+{
+    int32 $slotIndex = $form->meshlets[$m as usize]->slot;
+    ArenaSlot $slot = arenaSlotOf($slots, $slotIndex);
+    int64 $bucket = 0xFFFF;
+    if ($slot->bucket != SCENE_BUCKET_NONE) {
+        $bucket = ($slot->bucket & 0xFFFF) as int64;
+    }
+
+    return (($slot->gclass as int64) << 40) | ($bucket << 20) | (($slotIndex & 0xFFFFF) as int64);
+}
+
+/**
+ * Runs `$order` cuts into: one per level per change of class or bucket.
+ */
+internal function arenaRunCount(const ModelForm& $form, const array<ArenaSlot>& $slots, const array<int32>& $order) : int32
+{
+    int32 $runs = 0;
+    int32 $levels = ($form->lodStart->count() as int32) - 1;
+    int32 $level = 0;
+    while ($level < $levels) {
+        int32 $start = $form->lodStart[$level as usize];
+        int32 $end = $form->lodStart[($level + 1) as usize];
+        int32 $k = $start;
+        while ($k < $end) {
+            ArenaSlot $slot = arenaSlotOf($slots, $form->meshlets[$order[$k as usize] as usize]->slot);
+            bool $opens = $k == $start;
+            if (!$opens) {
+                ArenaSlot $was = arenaSlotOf($slots, $form->meshlets[$order[($k - 1) as usize] as usize]->slot);
+                $opens = $was->gclass != $slot->gclass || $was->bucket != $slot->bucket;
+            }
+
+            if ($opens) {
+                $runs = $runs + 1;
+            }
+
+            $k = $k + 1;
+        }
+
+        $level = $level + 1;
+    }
+
+    return $runs;
+}
+
+/**
+ * Slot `$index`'s entry, or one that casts nothing and draws in class 0 for a slot past the list.
+ */
+internal function arenaSlotOf(const array<ArenaSlot>& $slots, int32 $index) : ArenaSlot
+{
+    if ($index >= 0 && ($index as usize) < $slots->count()) {
+        return $slots[$index as usize];
+    }
+
+    return ArenaSlot(SCENE_BUCKET_NONE, 0, 0, false);
+}
+
+internal function arenaEmptyMeshlet() : SceneMeshletGpu
+{
+    return SceneMeshletGpu(
+        $sphere: Vec4(0.0f),
+        $cone: Vec4(0.0f, 1.0f, 0.0f, MESHLET_CONE_OPEN),
+        $firstVertex: 0,
+        $firstTriangle: 0,
+        $triangles: 0,
+        $flags: 0,
+        $bucket: SCENE_BUCKET_NONE,
+        $material: 0,
+        $gclass: 0,
+        $vertices: 0
+    );
+}
+
+internal function arenaHeld(Buffer? $buffer) : Buffer
+{
+    Buffer $b = guard $buffer else {
+        die('mesh arena: no buffers yet');
+    }
+    return $b;
+}
+
+/**
+ * Put `$value` at `$at`, the entries from there one further on.
+ */
+internal function arenaInsert(array<int32>& $list, usize $at, int32 $value) : void
+{
+    $list[] = $value;
+    usize $i = $list->count() - 1;
+    while ($i > $at) {
+        $list[$i] = $list[$i - 1];
+        $i = $i - 1;
+    }
+
+    $list[$at] = $value;
 }
 
 /**
@@ -363,7 +609,7 @@ internal function arenaFit<T>(array<T>& $mirror, int32 $count, T $fill) : void
     }
 }
 
-internal function arenaNeeds(Buffer? $have, int32 $bytes) : bool
+internal function arenaNeeds(Buffer? $have, int64 $bytes) : bool
 {
     if ($bytes <= 0) {
         return false;
@@ -372,14 +618,14 @@ internal function arenaNeeds(Buffer? $have, int32 $bytes) : bool
     Buffer $b = guard $have else {
         return true;
     }
-    return ($b->handle->bytes as int64) < ($bytes as int64);
+    return ($b->handle->bytes as int64) < $bytes;
 }
 
 /**
  * A fresh storage buffer of `$bytes`; the old one is destroyed, which the device defers until
  * no frame in flight reads it.
  */
-internal function arenaBuffer(Device $device, Buffer? $old, int32 $bytes, string $label) : Buffer
+internal function arenaBuffer(Device $device, Buffer? $old, int64 $bytes, string $label) : Buffer?
 {
     dropBuffer($old);
     return Buffer($device, BufferDesc(BUFFER_STORAGE, $bytes as uint64, $label));

@@ -60,6 +60,7 @@ struct LightGpu
     float4 color_intensity;
     float4 source;
     float4 flicker;
+    float4 spot;
 };
 
 struct LightTableBuffer
@@ -72,7 +73,7 @@ constant uint3 gl_WorkGroupSize [[maybe_unused]] = uint3(64u, 1u, 1u);
 static inline __attribute__((always_inline))
 uint state_at(thread const uint& i, constant VsmParams& _209)
 {
-    return (_209.u_vsm_counts.z * 28u) + i;
+    return (_209.u_vsm_counts.z * 40u) + i;
 }
 
 static inline __attribute__((always_inline))
@@ -209,7 +210,7 @@ static inline __attribute__((always_inline))
 void write_plane(thread const uint& k, thread const uint& i, thread const float3& normal, thread const float& dist, device ViewsAndState& _235)
 {
     float len = fast::max(length(normal), 9.9999999747524270787835121154785e-07);
-    uint at = (k * 28u) + (i * 4u);
+    uint at = (k * 40u) + (i * 4u);
     _235.words[at] = as_type<uint>(normal.x / len);
     _235.words[at + 1u] = as_type<uint>(normal.y / len);
     _235.words[at + 2u] = as_type<uint>(normal.z / len);
@@ -274,7 +275,7 @@ kernel void cs(constant VsmParams& _209 [[buffer(2)]], const device LightTableBu
     }
     if (k >= taken)
     {
-        _235.words[(k * 28u) + 24u] = 4294967295u;
+        _235.words[(k * 40u) + 24u] = 4294967295u;
         return;
     }
     uint key = 4294967295u;
@@ -386,9 +387,14 @@ kernel void cs(constant VsmParams& _209 [[buffer(2)]], const device LightTableBu
     float3 param_46 = -n;
     float param_47 = dot(n, L) + pr.w;
     write_plane(param_44, param_45, param_46, param_47, _235);
-    _235.words[(k * 28u) + 24u] = 0u;
-    _235.words[((k * 28u) + 24u) + 1u] = 0u;
-    _235.words[((k * 28u) + 24u) + 2u] = 0u;
-    _235.words[((k * 28u) + 24u) + 3u] = 0u;
+    _235.words[(k * 40u) + 24u] = 0u;
+    _235.words[((k * 40u) + 24u) + 1u] = 0u;
+    _235.words[((k * 40u) + 24u) + 2u] = 2u;
+    _235.words[((k * 40u) + 24u) + 3u] = 0u;
+    _235.words[(k * 40u) + 32u] = as_type<uint>(L.x);
+    _235.words[((k * 40u) + 32u) + 1u] = as_type<uint>(L.y);
+    _235.words[((k * 40u) + 32u) + 2u] = as_type<uint>(L.z);
+    _235.words[((k * 40u) + 32u) + 3u] = as_type<uint>(pr.w * 1.769999980926513671875);
+    _235.words[(k * 40u) + 39u] = 0u;
 }
 

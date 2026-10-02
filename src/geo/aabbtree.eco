@@ -1,0 +1,464 @@
+/**
+ * A dynamic bounding volume tree over boxes (the Box2D / Bullet `btDbvt` design): every leaf
+ * holds a fat box, its tight box grown by `margin`, so a box that moves a little stays inside it
+ * and costs nothing; one that leaves it is removed and reinserted. An insert walks down taking
+ * the child whose union grows least (a surface area heuristic on the box's area), and every
+ * node on the way back up is rebalanced by one rotation, so the tree stays O(log n) deep however
+ * the boxes arrive. Nodes come from a pool that `reserve` sizes and a free list reuses, and the
+ * queries walk an explicit stack sized with it, so nothing here allocates once reserved.
+ * Queries return the items whose fat box qualifies; the caller tests its exact boxes.
+ */
+
+namespace visu::geo;
+
+use visu::math::{Vec3, max, min};
+
+/**
+ * No node: an empty child, the root of an empty tree, the end of the free list.
+ */
+public const int32 AABB_TREE_NULL = -1;
+
+/**
+ * One node: its (fat) box, its parent, its children (`left` is `AABB_TREE_NULL` on a leaf), its
+ * height (0 on a leaf, -1 while free) and, on a leaf, the caller's item.
+ */
+internal struct AabbTreeNode
+{
+    public AABB $box;
+    public int32 $parent;
+    public int32 $left;
+    public int32 $right;
+    public int32 $height;
+    public int32 $item;
+}
+
+public class AabbTree
+{
+    /**
+     * Metres a leaf's box is grown by on every side when it is inserted.
+     */
+    public const float32 $margin;
+    private array<AabbTreeNode> $nodes;
+    private int32 $root;
+    private int32 $free;
+    private int32 $leaves;
+    private array<int32> $stack;
+
+    public constructor(float32 $margin = 0.1f)
+    {
+        $this->margin = $margin;
+        $this->nodes = array<AabbTreeNode>();
+        $this->root = AABB_TREE_NULL;
+        $this->free = AABB_TREE_NULL;
+        $this->leaves = 0;
+        $this->stack = array<int32>();
+    }
+
+    /**
+     * Room for `$leaves` leaves (and their inner nodes) and a query stack as deep, taken now.
+     */
+    public function reserve(int32 $leaves) : void
+    {
+        int32 $want = $leaves * 2;
+        if (($this->nodes->capacity() as int32) >= $want) {
+            return;
+        }
+
+        $this->nodes->reserve($want as usize);
+        $this->stack->reserve(($want + 16) as usize);
+    }
+
+    public const function count() : int32
+    {
+        return $this->leaves;
+    }
+
+    /**
+     * Levels from the root to the deepest leaf, 0 for an empty tree.
+     */
+    public const function height() : int32
+    {
+        if ($this->root == AABB_TREE_NULL) {
+            return 0;
+        }
+
+        return $this->nodes[$this->root as usize]->height + 1;
+    }
+
+    /**
+     * Add `$box` for `$item` and return its proxy, stable until `remove`.
+     */
+    public function insert(const AABB& $box, int32 $item) : int32
+    {
+        int32 $leaf = $this->allocate();
+        AabbTreeNode& $n = $this->nodes->at($leaf as usize);
+        $n->box = $this->fatten($box);
+        $n->item = $item;
+        $n->height = 0;
+        $n->left = AABB_TREE_NULL;
+        $n->right = AABB_TREE_NULL;
+        $this->insertLeaf($leaf);
+        $this->leaves = $this->leaves + 1;
+        return $leaf;
+    }
+
+    public function remove(int32 $proxy) : void
+    {
+        $this->removeLeaf($proxy);
+        $this->release($proxy);
+        $this->leaves = $this->leaves - 1;
+    }
+
+    /**
+     * `$proxy`'s box is now `$box`. A box still inside its fat box changes nothing; else the leaf
+     * is reinserted with a fresh fat box. True when it was reinserted.
+     */
+    public function move(int32 $proxy, const AABB& $box) : bool
+    {
+        if ($this->nodes[$proxy as usize]->box->contains($box)) {
+            return false;
+        }
+
+        $this->removeLeaf($proxy);
+        AabbTreeNode& $n = $this->nodes->at($proxy as usize);
+        $n->box = $this->fatten($box);
+        $this->insertLeaf($proxy);
+        return true;
+    }
+
+    public const function item(int32 $proxy) : int32
+    {
+        return $this->nodes[$proxy as usize]->item;
+    }
+
+    public const function fat(int32 $proxy) : AABB
+    {
+        return $this->nodes[$proxy as usize]->box;
+    }
+
+    /**
+     * Append to `$into` every item whose fat box overlaps `$box`. O(log n + hits).
+     */
+    public function overlap(const AABB& $box, array<int32>& $into) : void
+    {
+        if ($this->root == AABB_TREE_NULL) {
+            return;
+        }
+
+        $this->stack->clear();
+        $this->stack[] = $this->root;
+        while ($this->stack->count() > 0) {
+            int32 $id = $this->stack->pop();
+            AabbTreeNode $n = $this->nodes[$id as usize];
+            if (!$n->box->intersects($box)) {
+                continue;
+            }
+
+            if ($n->left == AABB_TREE_NULL) {
+                $into[] = $n->item;
+                continue;
+            }
+
+            $this->stack[] = $n->left;
+            $this->stack[] = $n->right;
+        }
+    }
+
+    /**
+     * Append to `$into` every item whose fat box `$ray` enters within `$limit` metres. O(log n +
+     * hits); the caller tests its exact boxes and keeps the nearest.
+     */
+    public function ray(const Ray& $ray, float32 $limit, array<int32>& $into) : void
+    {
+        if ($this->root == AABB_TREE_NULL) {
+            return;
+        }
+
+        $this->stack->clear();
+        $this->stack[] = $this->root;
+        while ($this->stack->count() > 0) {
+            int32 $id = $this->stack->pop();
+            AabbTreeNode $n = $this->nodes[$id as usize];
+            float32 $d = guard $n->box->hitDistance($ray) else {
+                continue;
+            }
+            if ($d > $limit) {
+                continue;
+            }
+
+            if ($n->left == AABB_TREE_NULL) {
+                $into[] = $n->item;
+                continue;
+            }
+
+            $this->stack[] = $n->left;
+            $this->stack[] = $n->right;
+        }
+    }
+
+    public function clear() : void
+    {
+        $this->nodes->clear();
+        $this->root = AABB_TREE_NULL;
+        $this->free = AABB_TREE_NULL;
+        $this->leaves = 0;
+    }
+
+    private function fatten(const AABB& $box) : AABB
+    {
+        Vec3 $m = Vec3($this->margin);
+        return AABB($box->min - $m, $box->max + $m);
+    }
+
+    private function allocate() : int32
+    {
+        if ($this->free != AABB_TREE_NULL) {
+            int32 $id = $this->free;
+            $this->free = $this->nodes[$id as usize]->parent;
+            AabbTreeNode& $n = $this->nodes->at($id as usize);
+            $n->parent = AABB_TREE_NULL;
+            $n->height = 0;
+            return $id;
+        }
+
+        int32 $id = $this->nodes->count() as int32;
+        $this->nodes[] = AabbTreeNode(AABB(Vec3(0.0f), Vec3(0.0f)), AABB_TREE_NULL, AABB_TREE_NULL, AABB_TREE_NULL, 0, -1);
+        return $id;
+    }
+
+    private function release(int32 $id) : void
+    {
+        AabbTreeNode& $n = $this->nodes->at($id as usize);
+        $n->parent = $this->free;
+        $n->height = -1;
+        $this->free = $id;
+    }
+
+    private function insertLeaf(int32 $leaf) : void
+    {
+        if ($this->root == AABB_TREE_NULL) {
+            $this->root = $leaf;
+            $this->nodes->at($leaf as usize)->parent = AABB_TREE_NULL;
+            return;
+        }
+
+        // the sibling: down the tree by the cost of putting the leaf under each child
+        AABB $box = $this->nodes[$leaf as usize]->box;
+        int32 $at = $this->root;
+        while ($this->nodes[$at as usize]->left != AABB_TREE_NULL) {
+            AabbTreeNode $n = $this->nodes[$at as usize];
+            float32 $area = boxArea($n->box);
+            float32 $combined = boxArea($n->box->union($box));
+            float32 $cost = 2.0f * $combined;
+            float32 $inherit = 2.0f * ($combined - $area);
+            float32 $costLeft = $this->descend($n->left, $box) + $inherit;
+            float32 $costRight = $this->descend($n->right, $box) + $inherit;
+            if ($cost < $costLeft && $cost < $costRight) {
+                break;
+            }
+
+            if ($costLeft < $costRight) {
+                $at = $n->left;
+            } else {
+                $at = $n->right;
+            }
+        }
+
+        int32 $sibling = $at;
+        int32 $oldParent = $this->nodes[$sibling as usize]->parent;
+        int32 $parent = $this->allocate();
+        AabbTreeNode& $p = $this->nodes->at($parent as usize);
+        $p->parent = $oldParent;
+        $p->box = $box->union($this->nodes[$sibling as usize]->box);
+        $p->height = $this->nodes[$sibling as usize]->height + 1;
+        $p->left = $sibling;
+        $p->right = $leaf;
+        $p->item = -1;
+        if ($oldParent != AABB_TREE_NULL) {
+            AabbTreeNode& $op = $this->nodes->at($oldParent as usize);
+            if ($op->left == $sibling) {
+                $op->left = $parent;
+            } else {
+                $op->right = $parent;
+            }
+        } else {
+            $this->root = $parent;
+        }
+
+        $this->nodes->at($sibling as usize)->parent = $parent;
+        $this->nodes->at($leaf as usize)->parent = $parent;
+        $this->refit($parent);
+    }
+
+    /**
+     * What putting `$box` under child `$child` adds: the union's area for a leaf, its growth for
+     * an inner node.
+     */
+    private const function descend(int32 $child, const AABB& $box) : float32
+    {
+        AabbTreeNode $c = $this->nodes[$child as usize];
+        float32 $union = boxArea($c->box->union($box));
+        if ($c->left == AABB_TREE_NULL) {
+            return $union;
+        }
+
+        return $union - boxArea($c->box);
+    }
+
+    private function removeLeaf(int32 $leaf) : void
+    {
+        if ($leaf == $this->root) {
+            $this->root = AABB_TREE_NULL;
+            return;
+        }
+
+        int32 $parent = $this->nodes[$leaf as usize]->parent;
+        AabbTreeNode $p = $this->nodes[$parent as usize];
+        int32 $grand = $p->parent;
+        int32 $sibling = $p->left;
+        if ($sibling == $leaf) {
+            $sibling = $p->right;
+        }
+
+        if ($grand != AABB_TREE_NULL) {
+            AabbTreeNode& $g = $this->nodes->at($grand as usize);
+            if ($g->left == $parent) {
+                $g->left = $sibling;
+            } else {
+                $g->right = $sibling;
+            }
+
+            $this->nodes->at($sibling as usize)->parent = $grand;
+            $this->release($parent);
+            $this->refit($grand);
+        } else {
+            $this->root = $sibling;
+            $this->nodes->at($sibling as usize)->parent = AABB_TREE_NULL;
+            $this->release($parent);
+        }
+    }
+
+    /**
+     * From `$from` up to the root: balance each node, then fit its box and height to its
+     * children.
+     */
+    private function refit(int32 $from) : void
+    {
+        int32 $at = $from;
+        while ($at != AABB_TREE_NULL) {
+            $at = $this->balance($at);
+            AabbTreeNode $n = $this->nodes[$at as usize];
+            AabbTreeNode $l = $this->nodes[$n->left as usize];
+            AabbTreeNode $r = $this->nodes[$n->right as usize];
+            AabbTreeNode& $w = $this->nodes->at($at as usize);
+            $w->height = 1 + maxInt($l->height, $r->height);
+            $w->box = $l->box->union($r->box);
+            $at = $w->parent;
+        }
+    }
+
+    /**
+     * One rotation at `$a` when one child is more than a level taller than the other, the taller
+     * child's taller grandchild moving up. Returns the node now at `$a`'s place.
+     */
+    private function balance(int32 $a) : int32
+    {
+        AabbTreeNode $na = $this->nodes[$a as usize];
+        if ($na->left == AABB_TREE_NULL || $na->height < 2) {
+            return $a;
+        }
+
+        int32 $b = $na->left;
+        int32 $c = $na->right;
+        int32 $diff = $this->nodes[$c as usize]->height - $this->nodes[$b as usize]->height;
+        if ($diff > 1) {
+            return $this->rotate($a, $c, $b, false);
+        }
+
+        if ($diff < -1) {
+            return $this->rotate($a, $b, $c, true);
+        }
+
+        return $a;
+    }
+
+    /**
+     * Lift `$up` (a child of `$a` on the `$left` side when `$fromLeft`) above `$a`: its taller child
+     * stays under it, its shorter one moves under `$a` in its place. `$other` is `$a`'s other
+     * child.
+     */
+    private function rotate(int32 $a, int32 $up, int32 $other, bool $fromLeft) : int32
+    {
+        AabbTreeNode $nu = $this->nodes[$up as usize];
+        int32 $f = $nu->left;
+        int32 $g = $nu->right;
+        int32 $parent = $this->nodes[$a as usize]->parent;
+
+        // `up` takes `a`'s place
+        $this->nodes->at($up as usize)->parent = $parent;
+        if ($parent != AABB_TREE_NULL) {
+            AabbTreeNode& $pp = $this->nodes->at($parent as usize);
+            if ($pp->left == $a) {
+                $pp->left = $up;
+            } else {
+                $pp->right = $up;
+            }
+        } else {
+            $this->root = $up;
+        }
+
+        // the taller grandchild stays under `up`, the shorter goes to `a`
+        int32 $keep = $f;
+        int32 $give = $g;
+        if ($this->nodes[$g as usize]->height > $this->nodes[$f as usize]->height) {
+            $keep = $g;
+            $give = $f;
+        }
+
+        AabbTreeNode& $wa = $this->nodes->at($a as usize);
+        $wa->parent = $up;
+        if ($fromLeft) {
+            $wa->left = $give;
+            $wa->right = $other;
+        } else {
+            $wa->left = $other;
+            $wa->right = $give;
+        }
+
+        $this->nodes->at($give as usize)->parent = $a;
+        AabbTreeNode $la = $this->nodes[$this->nodes[$a as usize]->left as usize];
+        AabbTreeNode $ra = $this->nodes[$this->nodes[$a as usize]->right as usize];
+        AabbTreeNode& $wa2 = $this->nodes->at($a as usize);
+        $wa2->box = $la->box->union($ra->box);
+        $wa2->height = 1 + maxInt($la->height, $ra->height);
+
+        AabbTreeNode& $wu = $this->nodes->at($up as usize);
+        $wu->left = $a;
+        $wu->right = $keep;
+        $this->nodes->at($keep as usize)->parent = $up;
+        AabbTreeNode $ka = $this->nodes[$a as usize];
+        AabbTreeNode $kk = $this->nodes[$keep as usize];
+        AabbTreeNode& $wu2 = $this->nodes->at($up as usize);
+        $wu2->box = $ka->box->union($kk->box);
+        $wu2->height = 1 + maxInt($ka->height, $kk->height);
+        return $up;
+    }
+}
+
+/**
+ * The surface area of `$b`, the insert heuristic's cost.
+ */
+internal function boxArea(const AABB& $b) : float32
+{
+    Vec3 $d = $b->max - $b->min;
+    return 2.0f * ($d->x * $d->y + $d->y * $d->z + $d->z * $d->x);
+}
+
+internal function maxInt(int32 $a, int32 $b) : int32
+{
+    if ($a > $b) {
+        return $a;
+    }
+
+    return $b;
+}

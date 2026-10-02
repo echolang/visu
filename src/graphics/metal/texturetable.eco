@@ -1,0 +1,105 @@
+/**
+ * The Metal half of a `TextureTable`: a shared argument buffer laid out as the shaders declare
+ * set 3 (`visu/bindless.glsl`), `TEXTURE_TABLE_SAMPLERS` sampler resource ids then, from
+ * argument id `TEXTURE_TABLE_TEXTURE_BINDING`, `TEXTURE_TABLE_CAPACITY` texture ids, eight bytes
+ * each, and the residency list of the textures it names. Every encoder that binds the table makes that list resident in one call.
+ */
+
+namespace visu::graphics;
+
+internal const uint64 METAL_TABLE_ID_BYTES = 8;
+
+/**
+ * The argument buffer struct spirv-cross emits for set 3; a source that holds it compiles as
+ * MSL 3.
+ */
+internal const string METAL_TABLE_MARKER = 'spvDescriptorSetBuffer3';
+
+public class MetalTextureTable
+{
+    public mtl::Buffer $buffer;
+    public mtl::TextureSet $resident;
+
+    /**
+     * Each slot's position in `resident`, -1 while empty, and each position's slot.
+     */
+    public array<int32> $positionOf;
+    public array<int32> $slotAt;
+
+    public constructor(mtl::Buffer $buffer, int32 $capacity)
+    {
+        $this->buffer = $buffer;
+        $this->resident = mtl::TextureSet();
+        $this->resident->reserve($capacity as usize);
+        $this->positionOf = arr::room<int32>($capacity as usize);
+        $this->slotAt = arr::room<int32>($capacity as usize);
+        int32 $i = 0;
+        while ($i < $capacity) {
+            $this->positionOf[] = -1;
+            $i = $i + 1;
+        }
+    }
+
+    /**
+     * Name `$texture` in `$slot`: its resource id in the buffer and a place in the residency list.
+     */
+    public function write(int32 $slot, mtl::Texture $texture) : void
+    {
+        $this->writeId(metalTableTexture($slot), $texture->resourceId());
+        int32 $at = $this->positionOf[$slot as usize];
+        if ($at >= 0) {
+            $this->resident->set($at as usize, $texture);
+            return;
+        }
+
+        $this->positionOf[$slot as usize] = $this->resident->count() as int32;
+        $this->slotAt[] = $slot;
+        $this->resident->add($texture);
+    }
+
+    /**
+     * `$slot` names nothing: it leaves the residency list (the last entry moves into its place)
+     * and its id is zeroed, so a stray read samples nothing rather than a dead texture.
+     */
+    public function erase(int32 $slot) : void
+    {
+        int32 $at = $this->positionOf[$slot as usize];
+        if ($at < 0) {
+            return;
+        }
+
+        $this->writeId(metalTableTexture($slot), 0 as uint64);
+        usize $last = $this->resident->count() - 1;
+        int32 $moved = $this->slotAt[$last];
+        $this->resident->remove($at as usize);
+        if (($at as usize) != $last) {
+            $this->slotAt[$at as usize] = $moved;
+            $this->positionOf[$moved as usize] = $at;
+        }
+
+        $this->slotAt->pop();
+        $this->positionOf[$slot as usize] = -1;
+    }
+
+    public function writeSampler(int32 $index, mtl::SamplerState $sampler) : void
+    {
+        $this->writeId(($index as uint64) * METAL_TABLE_ID_BYTES, $sampler->resourceId());
+    }
+
+    private function writeId(uint64 $offset, uint64 $id) : void
+    {
+        ptr<uint8> $base = $this->buffer->contents();
+        ptr<uint8> $dst = $base;
+        $dst:$ = $base:$ + ($offset as isize);
+        uint64 $word = $id;
+        mem::copy<uint8>($dst, ptr<uint8>(&$word), METAL_TABLE_ID_BYTES);
+    }
+}
+
+/**
+ * The byte offset of texture slot `$slot`'s id in the argument buffer.
+ */
+internal function metalTableTexture(int32 $slot) : uint64
+{
+    return ((TEXTURE_TABLE_TEXTURE_BINDING as uint64) + ($slot as uint64)) * METAL_TABLE_ID_BYTES;
+}

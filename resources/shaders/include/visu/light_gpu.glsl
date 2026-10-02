@@ -1,6 +1,6 @@
 /**
  * One light table row and the helpers both the cull kernels and the shading loop use.
- * Mirrors visu::graphics::LightGpu (std430, 64 bytes) and the LIGHT_* constants.
+ * Mirrors visu::graphics::LightGpu (std430, 80 bytes) and the LIGHT_* constants.
  */
 #ifndef VISU_LIGHT_GPU_GLSL
 #define VISU_LIGHT_GPU_GLSL
@@ -24,9 +24,21 @@ struct LightGpu {
     vec4 color_intensity;
     // x source radius, y 1 when it casts, z normal offset, w slope bias
     vec4 source;
-    // x amplitude, y speed in radians a second, z phase
+    // x amplitude, y speed in radians a second, z phase, w a spot's cone offset
     vec4 flicker;
+    // xyz a spot's world axis, w its cone scale; (0, 0, 0, 0) with offset 1 shines every way
+    vec4 spot;
 };
+
+// how much of light `l` a spot sends along `fromLight` (unit, from the light outward): 1 inside
+// the inner cone, 0 past the outer, a square ramp between. The CPU folds both cosines into a
+// scale and an offset (`1 / (inner - outer)`, `-outer` times it), so this is one multiply-add; a
+// light that shines every way has scale 0 and offset 1
+float light_cone(LightGpu l, vec3 fromLight)
+{
+    float t = clamp(dot(l.spot.xyz, fromLight) * l.spot.w + l.flicker.w, 0.0, 1.0);
+    return t * t;
+}
 
 float light_intensity(LightGpu l, float seconds)
 {

@@ -1,0 +1,196 @@
+/**
+ * The meshlet builder and the arena's free ranges: every cooked triangle lands in exactly one
+ * meshlet and in cooked order, no meshlet passes its limits, every cone holds its triangles'
+ * normals, a flat sheet gets a tight cone, and given-back ranges merge with their neighbours.
+ */
+
+use visu::asset::{CookedModel, MODEL_VERTEX_BYTES, ModelLodDesc, ModelPrimitive};
+use visu::geo::AABB;
+use visu::graphics::{
+    ArenaRanges, FormMeshlet, IndexType, MESHLET_CONE_OPEN, MESHLET_TRIANGLES, MESHLET_VERTICES,
+    ModelForm, modelForm
+};
+use visu::math::{Vec3, cross, dot, length, normalize};
+
+internal function meshletPushWord(string& $out, uint32 $w) : void
+{
+    $out->push(($w & 0xFF) as uint8);
+    $out->push((($w >> 8) & 0xFF) as uint8);
+    $out->push((($w >> 16) & 0xFF) as uint8);
+    $out->push((($w >> 24) & 0xFF) as uint8);
+}
+
+internal function meshletPushFloat(string& $out, float32 $f) : void
+{
+    meshletPushWord($out, mem::bit_cast<uint32, float32>($f));
+}
+
+/**
+ * A `$n` x `$n` sheet of quads facing +y, lifted into a dome by `$bulge`, as one primitive in
+ * slot 0 of one level, uint16 indices.
+ */
+internal function meshletSheet(int32 $n, float32 $bulge) : CookedModel
+{
+    string $vertices = '';
+    int32 $side = $n + 1;
+    int32 $z = 0;
+    while ($z < $side) {
+        int32 $x = 0;
+        while ($x < $side) {
+            float32 $fx = ($x as float32) - ($n as float32) * 0.5f;
+            float32 $fz = ($z as float32) - ($n as float32) * 0.5f;
+            float32 $fy = 0.0f - $bulge * ($fx * $fx + $fz * $fz) * 0.01f;
+            meshletPushFloat($vertices, $fx);
+            meshletPushFloat($vertices, $fy);
+            meshletPushFloat($vertices, $fz);
+            // normal, tangent, uv: the builder copies them, the test does not read them
+            int32 $w = 0;
+            while ($w < 9) {
+                meshletPushFloat($vertices, 0.0f);
+                $w = $w + 1;
+            }
+
+            $x = $x + 1;
+        }
+
+        $z = $z + 1;
+    }
+
+    string $indices = '';
+    $z = 0;
+    while ($z < $n) {
+        int32 $x = 0;
+        while ($x < $n) {
+            int32 $a = $z * $side + $x;
+            int32 $b = $a + 1;
+            int32 $c = $a + $side;
+            int32 $d = $c + 1;
+            // counter-clockwise seen from above: the normal is +y
+            array<int32> $quad = [$a, $c, $b, $b, $c, $d];
+            foreach ($quad as $v) {
+                $indices->push(($v & 0xFF) as uint8);
+                $indices->push((($v >> 8) & 0xFF) as uint8);
+            }
+
+            $x = $x + 1;
+        }
+
+        $z = $z + 1;
+    }
+
+    ModelLodDesc $lod = ModelLodDesc();
+    $lod->distance = 0.0f;
+    $lod->bounds = AABB(Vec3(-100.0f), Vec3(100.0f));
+    $lod->primitives[] = ModelPrimitive(0, 0, $n * $n * 6);
+    array<ModelLodDesc> $lods = array<ModelLodDesc>();
+    $lods[] = $lod;
+    array<string> $slots = array<string>();
+    $slots[] = 'sheet';
+    return CookedModel($slots, $lods, AABB(Vec3(-100.0f), Vec3(100.0f)), 1.0f, 0.0f, IndexType::uint16, $vertices, $indices);
+}
+
+internal function meshletIndex(const CookedModel& $cooked, int32 $i) : uint32
+{
+    usize $at = ($i * 2) as usize;
+    return ($cooked->indices->byte($at) as uint32) | (($cooked->indices->byte($at + 1) as uint32) << 8);
+}
+
+internal function meshletCorner(const ModelForm& $form, const FormMeshlet& $m, uint32 $packed, uint32 $k) : uint32
+{
+    uint32 $local = ($packed >> (8 * $k)) & 0xFF;
+    return $form->vertexList[($m->firstVertex + ($local as int32)) as usize];
+}
+
+internal function meshletPosition(const ModelForm& $form, uint32 $v) : Vec3
+{
+    usize $at = ($v as usize) * ($form->stride as usize);
+    return Vec3(
+        mem::bit_cast<float32, uint32>($form->words[$at]),
+        mem::bit_cast<float32, uint32>($form->words[$at + 1]),
+        mem::bit_cast<float32, uint32>($form->words[$at + 2])
+    );
+}
+
+test meshlets_cover_every_triangle_once_in_order
+{
+    CookedModel $cooked = meshletSheet(40, 0.0f);
+    ModelForm $form = modelForm($cooked);
+    assert($form->meshlets->count() > 50, 'a 3200 triangle sheet takes many meshlets');
+    int32 $next = 0;
+    foreach ($form->meshlets as $m) {
+        assert($m->triangles >= 1 && $m->triangles <= MESHLET_TRIANGLES, 'meshlet triangle limit');
+        assert($m->vertices >= 3 && $m->vertices <= MESHLET_VERTICES, 'meshlet vertex limit');
+        int32 $t = 0;
+        while ($t < $m->triangles) {
+            uint32 $packed = $form->triangles[($m->firstTriangle + $t) as usize];
+            uint32 $k = 0;
+            while ($k < 3) {
+                assert(meshletCorner($form, $m, $packed, $k) == meshletIndex($cooked, $next), 'cooked triangle order');
+                $next = $next + 1;
+                $k = $k + 1;
+            }
+
+            $t = $t + 1;
+        }
+    }
+
+    assert($next == 40 * 40 * 6, 'every index once');
+    assert($form->lodStart->count() == 2, 'one level and its end');
+    assert($form->lodStart[1] == ($form->meshlets->count() as int32), 'the level spans every meshlet');
+}
+
+test meshlet_cones_hold_their_normals
+{
+    CookedModel $cooked = meshletSheet(24, 3.0f);
+    ModelForm $form = modelForm($cooked);
+    int32 $tight = 0;
+    foreach ($form->meshlets as $m) {
+        if ($m->cutoff >= MESHLET_CONE_OPEN) {
+            continue;
+        }
+
+        $tight = $tight + 1;
+        float32 $least = std::math::sqrt(1.0f - $m->cutoff * $m->cutoff);
+        int32 $t = 0;
+        while ($t < $m->triangles) {
+            uint32 $packed = $form->triangles[($m->firstTriangle + $t) as usize];
+            Vec3 $a = meshletPosition($form, meshletCorner($form, $m, $packed, 0));
+            Vec3 $b = meshletPosition($form, meshletCorner($form, $m, $packed, 1));
+            Vec3 $c = meshletPosition($form, meshletCorner($form, $m, $packed, 2));
+            Vec3 $n = normalize(cross($b - $a, $c - $a));
+            assert(dot($n, $m->axis) >= $least - 0.0001f, 'the cone holds every normal');
+            $t = $t + 1;
+        }
+    }
+
+    assert($tight > 0, 'a gentle dome keeps most cones');
+}
+
+test meshlet_flat_sheet_cone_points_up
+{
+    ModelForm $form = modelForm(meshletSheet(8, 0.0f));
+    foreach ($form->meshlets as $m) {
+        assert($m->axis->y > 0.999f, 'the axis is the sheet normal');
+        assert($m->cutoff < 0.001f, 'one normal: the tightest cone');
+        assert($m->radius > 0.0f, 'the sphere has room');
+    }
+}
+
+test arena_ranges_merge_what_comes_back
+{
+    ArenaRanges $r = ArenaRanges();
+    int32 $a = $r->take(100);
+    int32 $b = $r->take(100);
+    int32 $c = $r->take(100);
+    int32 $d = $r->take(100);
+    assert($a == 0 && $b == 100 && $c == 200 && $d == 300, 'fresh ranges stack');
+    $r->give($a, 100);
+    $r->give($c, 100);
+    assert($r->freeRanges() == 2, 'two holes');
+    $r->give($b, 100);
+    assert($r->freeRanges() == 1, 'the middle joins both neighbours');
+    int32 $big = $r->take(300);
+    assert($big == 0, 'the merged hole takes a range the pieces could not');
+    assert($r->freeRanges() == 0, 'used up');
+    assert($r->take(10) == 400, 'past the top again');
+}

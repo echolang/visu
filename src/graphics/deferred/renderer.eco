@@ -374,13 +374,15 @@ public class DeferredRenderer
             ShadowQuality? $shadows = $this->shadows;
             // with neither sun nor moon up the cascades would shade nothing: skip all five
             DirectionalLight $key = keyLight($this->sun, $this->moon);
-            if ($shadows != null && $key->intensity > 0.0f && $ctx->frame->find<CameraData>() != null) {
-                ShadowQuality $quality = guard $shadows;
-                // the cull reads the cascades the shadow pass's setup publishes, and runs first
-                if ($this->scene->active()) {
-                    $pipeline->add(SceneCullPass($this->scene));
-                }
+            bool $cascades = $shadows != null && $key->intensity > 0.0f && $ctx->frame->find<CameraData>() != null;
+            // the cull reads the cascades the shadow pass's setup publishes and the main views,
+            // and runs first
+            if ($this->scene->active() && ($cascades || $this->scene->mainViews)) {
+                $pipeline->add(SceneCullPass($this->scene));
+            }
 
+            if ($cascades) {
+                ShadowQuality $quality = guard $shadows;
                 $pipeline->add(ShadowMapPass(
                     $this->ensureShadowMap($quality),
                     $key,

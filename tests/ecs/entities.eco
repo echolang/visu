@@ -3,6 +3,8 @@
  */
 
 use visu::ecs::{Entities, Entity, EntityHook, View};
+use visu::geo::Transform;
+use visu::math::Vec3;
 
 test entities_create_and_valid
 {
@@ -375,4 +377,92 @@ test entities_missing_singleton_get_dies
 {
     Entities $world = Entities();
     Tag& $t = $world->getSingleton<Tag>();
+}
+
+test entities_create_many_takes_recycled_first
+{
+    Entities $world = Entities();
+    Entity $a = $world->create();
+    Entity $b = $world->create();
+    $world->destroy($a);
+    array<Entity> $made = array<Entity>();
+    $world->createMany(3, $made);
+    assert($made->count() == 3, 'count');
+    assert($made[0]->index() == $a->index(), 'recycled first');
+    assert($made[1]->index() == 2, 'then fresh');
+    assert($made[2]->index() == 3, 'fresh again');
+    assert($world->valid($b), 'b kept');
+    foreach ($made as $e) {
+        assert($world->valid($e), 'valid');
+    }
+}
+
+test entities_reserve_for_commits_the_next_indices
+{
+    Entities $world = Entities();
+    Entity $a = $world->create();
+    $world->destroy($a);
+    $world->reserveFor<Position>(2);
+    Entity $x = $world->create();
+    Entity $y = $world->create();
+    $world->attach($x, Position(1.0f, 0.0f));
+    $world->attach($y, Position(2.0f, 0.0f));
+    assert($world->get<Position>($x)->x == 1.0f, 'x');
+    assert($world->get<Position>($y)->x == 2.0f, 'y');
+}
+
+test entities_move_keeps_previous_once_per_update
+{
+    Entities $world = Entities();
+    Entity $e = $world->create();
+    Transform $t = Transform();
+    $t->position = Vec3(1.0f, 0.0f, 0.0f);
+    $world->attach($e, $t);
+    $world->roll();
+    Transform& $a = $world->move($e);
+    $a->position = Vec3(2.0f, 0.0f, 0.0f);
+    Transform& $b = $world->move($e);
+    $b->position = Vec3(3.0f, 0.0f, 0.0f);
+    Vec3 $half = $world->get<Transform>($e)->mixPosition(0.5f);
+    assert($half->x == 2.0f, 'previous is the pose before the first move of the update');
+    assert($world->movedNow($e), 'moved this update');
+    $world->roll();
+    assert(!$world->movedNow($e), 'a new update');
+    Vec3 $still = $world->get<Transform>($e)->mixPosition(0.5f);
+    assert($still->x == 3.0f, 'an entity that stops reads back where it stands');
+}
+
+test entities_move_log_reaches_every_reader
+{
+    Entities $world = Entities();
+    Entity $a = $world->create();
+    Entity $b = $world->create();
+    $world->attach($a, Transform());
+    $world->attach($b, Transform());
+    int32 $fast = $world->moveReader();
+    int32 $slow = $world->moveReader();
+    array<Entity> $got = array<Entity>();
+
+    $world->roll();
+    $world->move($a);
+    $world->move($a);
+    $world->moves($fast, $got);
+    assert($got->count() == 1, 'one entry per update');
+    $got->clear();
+
+    $world->roll();
+    $world->move($b);
+    $world->moves($fast, $got);
+    assert($got->count() == 1 && $got[0] == $b, 'the fast reader sees the new update');
+    $got->clear();
+
+    $world->roll();
+    $world->moves($slow, $got);
+    assert($got->count() == 2, 'the slow reader sees both updates');
+    assert($got[0] == $a && $got[1] == $b, 'oldest first');
+    $got->clear();
+    $world->releaseMoveReader($slow);
+    $world->roll();
+    $world->moves($fast, $got);
+    assert($got->count() == 0, 'nothing new');
 }

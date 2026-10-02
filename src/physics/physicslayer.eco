@@ -1,0 +1,123 @@
+/**
+ * Collision filtering in engine words. Every body sits in one layer and carries a mask of the
+ * layers it collides with; two bodies collide when each one's layer is in the other's mask. A
+ * query takes a mask of the layers it should see. The bits are the backend's, one for one, so a
+ * layer costs nothing to hand down.
+ */
+
+namespace visu::physics;
+
+public struct PhysicsLayer
+{
+    public int32 $bits;
+
+    public constructor(int32 $bits)
+    {
+        $this->bits = $bits;
+    }
+
+    /**
+     * The layer with only `$bit` set. The engine's layers take bits 0 to 7; an app's own start at
+     * `PhysicsLayer(bit: 8)`.
+     */
+    public constructor(bit: int32 $bit)
+    {
+        assert($bit >= 0 && $bit < 32, 'physics: a layer bit is 0 to 31');
+        $this->bits = 1 << $bit;
+    }
+
+    /**
+     * Where a dynamic body lands unless its collider names another layer.
+     */
+    public static function dynamic() : PhysicsLayer
+    {
+        return PhysicsLayer(1);
+    }
+
+    /**
+     * Static scenery: props, trunks, walls. Where a collider without a rigid body lands.
+     */
+    public static function world() : PhysicsLayer
+    {
+        return PhysicsLayer(2);
+    }
+
+    /**
+     * Where a kinematic body lands unless its collider names another layer.
+     */
+    public static function kinematic() : PhysicsLayer
+    {
+        return PhysicsLayer(4);
+    }
+
+    /**
+     * Small loose things that collide with the world but not with each other, if their mask says so.
+     */
+    public static function debris() : PhysicsLayer
+    {
+        return PhysicsLayer(8);
+    }
+
+    /**
+     * Where a `Sensor` lands unless it names another layer.
+     */
+    public static function sensor() : PhysicsLayer
+    {
+        return PhysicsLayer(16);
+    }
+
+    public static function character() : PhysicsLayer
+    {
+        return PhysicsLayer(32);
+    }
+
+    /**
+     * The ground: a heightfield. Kept apart from `world` so a walker that stands on the ground by
+     * other means can slide against scenery without scraping it.
+     */
+    public static function terrain() : PhysicsLayer
+    {
+        return PhysicsLayer(64);
+    }
+
+    /**
+     * Volumes that exist to be pointed at: a sensor on this layer answers a picking ray.
+     */
+    public static function pick() : PhysicsLayer
+    {
+        return PhysicsLayer(128);
+    }
+
+    public static function all() : PhysicsLayer
+    {
+        return PhysicsLayer(-1);
+    }
+
+    public static function none() : PhysicsLayer
+    {
+        return PhysicsLayer(0);
+    }
+
+    public const function has(PhysicsLayer $other) : bool
+    {
+        return ($this->bits & $other->bits) != 0;
+    }
+
+    /**
+     * This set with every layer of `$other` taken out.
+     */
+    public const function without(PhysicsLayer $other) : PhysicsLayer
+    {
+        return PhysicsLayer($this->bits & ~$other->bits);
+    }
+}
+
+operator (visu::physics::PhysicsLayer $a) | (visu::physics::PhysicsLayer $b) : visu::physics::PhysicsLayer
+{
+    return visu::physics::PhysicsLayer($a->bits | $b->bits);
+}
+
+operator (visu::physics::PhysicsLayer $a) == (visu::physics::PhysicsLayer $b) : bool
+{
+    return $a->bits == $b->bits;
+}

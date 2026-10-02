@@ -1,0 +1,164 @@
+/**
+ * A moving body as the step sees it, for code that pushes a body itself between the kinematic
+ * read and the step: a vehicle's wheels, a buoyancy pass, a magnet. `PhysicsWorld.body` hands
+ * one out per call; do not keep it past the step, because a rebuilt collider is a new body.
+ *
+ * Every pose and velocity here is the backend's, at the centre of mass, not the entity's
+ * interpolated transform. Points are world points, as the queries take them.
+ */
+
+namespace visu::physics;
+
+use visu::math::{Quat, Vec3};
+
+public struct PhysicsBody
+{
+    internal bt::Body $body;
+
+    /**
+     * The row's lever and shift: where the centre of mass sits from the entity's origin.
+     */
+    internal Vec3 $lever;
+    internal Vec3 $shift;
+    internal bool $turns;
+
+    internal constructor(bt::Body $body, Vec3 $lever, Vec3 $shift, bool $turns)
+    {
+        $this->body = $body;
+        $this->lever = $lever;
+        $this->shift = $shift;
+        $this->turns = $turns;
+    }
+
+    /**
+     * Where the entity's own origin is as the step sees it: the centre of mass less the
+     * collider's offset. A vehicle hangs its wheels from here.
+     */
+    public const function origin() : Vec3
+    {
+        if (!$this->turns) {
+            return $this->position() - $this->shift;
+        }
+
+        return $this->position() - $this->orientation() * $this->lever - $this->shift;
+    }
+
+    /**
+     * The centre of mass in world space: the collider's centre, which is where the body's
+     * impulses act and its velocities are measured.
+     */
+    public const function position() : Vec3
+    {
+        return fromBt($this->body->position());
+    }
+
+    public const function orientation() : Quat
+    {
+        return fromBt($this->body->rotation());
+    }
+
+    public const function velocity() : Vec3
+    {
+        return fromBt($this->body->velocity());
+    }
+
+    /**
+     * The velocity of the body's material at a world point: linear plus angular cross the lever.
+     */
+    public const function velocity(at: Vec3 $point) : Vec3
+    {
+        return fromBt($this->body->velocity(at: toBt($point - $this->position())));
+    }
+
+    public const function angularVelocity() : Vec3
+    {
+        return fromBt($this->body->angularVelocity());
+    }
+
+    public const function mass() : float32
+    {
+        return $this->body->mass();
+    }
+
+    public const function inverseMass() : float32
+    {
+        return $this->body->inverseMass();
+    }
+
+    /**
+     * The inverse of the principal inertia in the body's own frame. Take a lever and a direction
+     * into that frame (`conjugate(orientation())`) and an effective mass needs no matrix.
+     */
+    public const function inverseInertia() : Vec3
+    {
+        return fromBt($this->body->inverseInertia());
+    }
+
+    public const function awake() : bool
+    {
+        return $this->body->awake();
+    }
+
+    /**
+     * An impulse at a world point. Quiet by default: a sleeping body stays asleep and an awake
+     * one keeps its sleep timer, so a body held still by small pushes every step (a parked car
+     * on its springs) still goes to sleep. `wake: true` wakes it first.
+     */
+    public function applyImpulse(Vec3 $impulse, at: Vec3 $point, wake: bool $wake = false) : void
+    {
+        bt::Vec3 $lever = toBt($point - $this->position());
+        if ($wake) {
+            $this->body->applyImpulse(toBt($impulse), at: $lever);
+            return;
+        }
+
+        $this->body->push(toBt($impulse), at: $lever);
+    }
+
+    /**
+     * An impulse through the centre of mass, quiet unless `wake:`.
+     */
+    public function applyImpulse(Vec3 $impulse, wake: bool $wake = false) : void
+    {
+        if ($wake) {
+            $this->body->applyImpulse(toBt($impulse));
+            return;
+        }
+
+        $this->body->push(toBt($impulse));
+    }
+
+    /**
+     * An angular impulse in world space, quiet unless `wake:`.
+     */
+    public function applyTorqueImpulse(Vec3 $impulse, wake: bool $wake = false) : void
+    {
+        if ($wake) {
+            $this->body->applyTorqueImpulse(toBt($impulse));
+            return;
+        }
+
+        $this->body->pushTorque(toBt($impulse));
+    }
+
+    /**
+     * Never sleep while set: a body someone is steering.
+     */
+    public function setAlwaysAwake(bool $on) : void
+    {
+        $this->body->setAlwaysAwake($on);
+    }
+
+    /**
+     * Below `$linear` m/s and `angular:` rad/s for the world's sleep time, the body sleeps.
+     */
+    public function setSleepThresholds(float32 $linear, angular: float32 $angular) : void
+    {
+        $this->body->setSleepThresholds($linear, angular: $angular);
+    }
+
+    public function wake() : void
+    {
+        $this->body->activate();
+    }
+}

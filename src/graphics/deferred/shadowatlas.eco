@@ -4,9 +4,11 @@
  * changed stay cached from frame to frame; misses take a free or the least recently used
  * physical page, at most `VSM_MAX_DIRTY` a frame, coarse levels first; the GPU scene culls and
  * draws only those pages' casters. Nothing about which light or page is shown ever reaches the
- * CPU. A light is retired (its generation moves) when a box where casters or lights changed
- * reaches its sphere. `PointLightSystem` owns one on the clustered path; the page math lives in
- * `visu/vsm.glsl`, which these constants mirror.
+ * CPU. A light that was added, moved or removed is retired (its generation moves); a box where
+ * casters changed clears only the pages it reaches. A moving light's shadow cannot be cached,
+ * so while it moves it asks for pages `movingBias` levels coarser: fewer pages to cull and
+ * draw, the same lookup. `PointLightSystem` owns one on the clustered path; the page math lives
+ * in `visu/vsm.glsl`, which these constants mirror.
  */
 
 namespace visu::graphics;
@@ -72,9 +74,16 @@ public const int32 VSM_QUIET_FRAMES = 3;
 
 /**
  * The widest light radius a change is assumed to be seen by: a change farther than the shadow
- * distance plus this from the eye leaves every drawn shadow as it was.
+ * distance plus this from the eye leaves every drawn shadow as it was. A headlight-sized spot
+ * reaches about 25 m.
  */
-public const float32 VSM_LIGHT_REACH = 20.0f;
+public const float32 VSM_LIGHT_REACH = 25.0f;
+
+/**
+ * Light radii a page's frustum reaches from its light, guard included (`VSM_PAGE_REACH` in
+ * `visu/vsm.glsl`): the ball the GPU scene's local page cull walks the grid round.
+ */
+public const float32 VSM_PAGE_REACH = 1.77f;
 
 /**
  * The atlas kernels' uniform (std140 `VsmParams` in `visu/vsmcull.glsl`).
@@ -106,6 +115,15 @@ public class ShadowAtlas
      * Added to the page level a pixel's footprint picks: above 0 is coarser and cheaper.
      */
     public float32 $mipBias;
+
+    /**
+     * Levels coarser a light that moved this frame asks for: its pages are redrawn every frame
+     * it moves, so each level cuts what it culls and draws about fourfold. The lookup walks down
+     * to whatever level was drawn, and the frame after it stops asks for the fine pages again.
+     * `--flag light.movingbias`, off (0) by default: on thicket a moving headlight's cost is the
+     * page cull's fixed share, not its page count, and the lookup's longer walk ate the gain.
+     */
+    public float32 $movingBias;
 
     /**
      * Lights farther than this from the eye light without a shadow and take no pages; the
@@ -173,6 +191,7 @@ public class ShadowAtlas
         $this->device = $device;
         $this->enabled = visu::app::flags()->bool('light.shadows', true);
         $this->mipBias = 0.0f;
+        $this->movingBias = visu::app::flags()->float('light.movingbias', 0.0) as float32;
         $this->shadowDistance = visu::app::flags()->float('light.shadowdistance', 60.0) as float32;
         $this->debug = visu::app::flags()->bool('light.vsmdebug', false);
         $this->atlas = null;
@@ -270,7 +289,7 @@ public class ShadowAtlas
             $frame: $this->frame,
             $budget: $this->budget(),
             $boxes: $this->boxes->count() as uint32,
-            $shadow: Vec4($this->shadowDistance, $this->slots->count() as float32, 0.0f, 0.0f)
+            $shadow: Vec4($this->shadowDistance, $this->slots->count() as float32, $this->movingBias, 0.0f)
         );
 
         ComputeEncoder $enc = $ctx->beginCompute();
@@ -297,6 +316,7 @@ public class ShadowAtlas
         $enc->bindStorage(4, $requests);
         $enc->bindStorage(5, $viewsState, $stateOffset);
         $main->bindCounters($enc, 6);
+        $enc->bindStorage(7, $gens);
         $enc->dispatch($stepsX, $stepsY);
         $enc->setKernel($coarse);
         $enc->upload($params, slot: 0);
@@ -341,7 +361,7 @@ public class ShadowAtlas
         visu::profile::end();
 
         if ($this->drawing) {
-            $scene->cullPages($ctx, $viewsState, VSM_MAX_DIRTY);
+            $scene->cullPages($ctx, $viewsState, VSM_MAX_DIRTY, $lights->reach * VSM_PAGE_REACH);
         } else {
             $scene->pages->culled = false;
         }
@@ -522,7 +542,8 @@ public class ShadowAtlas
         }
         int32 $boxCount = $this->boxes->count() as int32;
         int32 $moverCount = $scene->moverCount();
-        string $out = "vsm: frame {$this->frame} movers {$moverCount} boxes {$boxCount} misses";
+        int32 $moved = $this->slots->count() as int32;
+        string $out = "vsm: frame {$this->frame} moved {$moved} (bias {$this->movingBias}) movers {$moverCount} boxes {$boxCount} misses";
         int32 $m = 0;
         while ($m < VSM_MIPS) {
             uint32 $miss = vsmWord($bytes, VSM_STATE_MISSES + $m);
@@ -537,22 +558,9 @@ public class ShadowAtlas
         uint32 $dropped = vsmWord($bytes, VSM_STATE_DROPPED);
         uint32 $bias = vsmWord($bytes, VSM_STATE_BIAS);
         $out->append(" candidates {$free} {$stale} {$recent} dirty {$dirty} dropped {$dropped} bias {$bias}/256");
-        Buffer $counters = guard $scene->pages->counters else {
-            return $out;
-        }
-        array<uint8> $c = guard $this->device->readbackBuffer($counters, 0 as uint64, ((SCENE_COUNT_BASE + VSM_MAX_DIRTY) * 4) as uint64) else ($e) {
-            return $out;
-        }
-        uint32 $items = 0;
-        int32 $i = 0;
-        while ($i < VSM_MAX_DIRTY) {
-            $items = $items + vsmWord($c, SCENE_COUNT_BASE + $i);
-            $i = $i + 1;
-        }
-
-        uint32 $pairs = vsmWord($c, SCENE_COUNTER_PAIRS);
-        uint32 $pairsDropped = vsmWord($c, SCENE_COUNTER_PAIRS_DROPPED);
-        $out->append("\nvsm: page cull pairs {$pairs} dropped {$pairsDropped} items {$items}");
+        $out->append(" window {$scene->pageWindow} cells (overhang {$scene->chunks->overhang} m)");
+        $out->append("\n");
+        $out->append($scene->stats($scene->pages));
         return $out;
     }
 

@@ -1,8 +1,15 @@
 /**
  * Draws every `StaticModel`, `DynamicModel` and `SkinnedModel` into the GBuffer and the shadow
- * cascades. Statics are placed once into an octree with a baked world matrix and culled by it;
- * dynamics and skins read their `Transform` every frame and are culled per instance by the
- * draw-call assembler. All pick a LOD by distance and batch by material. Rigid models go through
+ * cascades. Every model instance holds one GPU scene row for its whole life, written only when
+ * what it shows changes: components that arrive are queued by their attach hook and acquired in
+ * `fill` (at most `MODEL_ACQUIRE_BUDGET` a frame, so a million statics ramp in rather than
+ * flood one frame), a hand move or an edit (`changed<Transform>`, `changed<StaticModel>`) is
+ * rewritten exactly, and a per-update mover comes from the move log (`Entities.move`): its row
+ * gets the previous and the current pose once per update it moved and the GPU resolves between
+ * them, and one exact write once an update runs without it. A still or resting model costs
+ * nothing per frame. Statics also sit in an octree the CPU main view culls through; dynamics in
+ * a dense draw list whose worlds are recomputed only while they move. All pick a LOD by distance
+ * and batch by material. Rigid models go through
  * one `ModelLane`, skinned ones through a second whose programs read the frame's joint palette
  * at slot 2: `fill` packs every posed skin within reach into one array, and the first pass that
  * draws a skin copies it into the frame's ring once. Models and textures come from the
@@ -22,11 +29,14 @@ namespace visu::system;
 use visu::app::{FlagValue, Flags, flags, info};
 use visu::asset::{Assembly, AssemblyNode, AssemblyPart, MODEL_MAX_LODS};
 use visu::components::{AssemblyInstance, DynamicModel, SkinPose, SkinnedModel, StaticModel};
-use visu::ecs::{Entities, Entity, EntityHook, Schedule, System};
-use visu::geo::{AABB, Frustum, Plane, Transform};
+use visu::ecs::{Entities, Entity, EntityHook, Schedule, System, View};
+use std::time;
+use visu::geo::{AABB, Frustum, Plane, Pose, Transform};
 use visu::graphics::{
+    SCENE_CHUNK_METRES, SCENE_PASS_CAMERA, SCENE_PASS_MIRROR, SCENE_PASS_OUTLINE,
     CallbackPass, CameraData, DebugLines, DeferredRenderer, DrawCallAssembler, Frame, GBufferData, GeometryFiller, GeometryFillers,
     GpuPass, GpuScene, IoSink, Model, ModelBank, ModelInstanceData, OUTLINE_STYLES, OutlineCaster, OutlineData,
+    SceneRow,
     Pipeline, PipelineError, RenderContext,
     RenderEncoder, SHADOW_CASCADES, SKIN_PALETTE_ROWS, SKIN_PALETTE_SLOT, ShaderProgram,
     ReflectionCaster, ShadowCascade, ShadowCaster, ShadowMapData, SkinInstanceData, TransientSlice,
@@ -34,7 +44,7 @@ use visu::graphics::{
     waterAbove
 };
 use visu::console::lodColor;
-use visu::math::{Mat4, Vec3, Vec4, length, scale, translate};
+use visu::math::{Mat4, Quat, Vec3, Vec4, length, scale, translate};
 use visu::runtime::DebugConsole;
 
 /**
@@ -112,8 +122,8 @@ public const float32 MOVER_SHADOW_NEAR = 20.0f;
 public const int32 MOVER_SHADOW_EVERY = 4;
 
 /**
- * One dynamic this frame: its handles, interpolated world and bounds. `fill` packs these once;
- * the cascades and the GBuffer pass both read the list, so no parent chain is walked twice.
+ * One acquired dynamic in the CPU main view's draw list: its handles, world and bounds (current
+ * while it rests, interpolated each frame while it moves), look and whether it is hidden.
  */
 internal struct DynamicDraw
 {
@@ -123,7 +133,71 @@ internal struct DynamicDraw
     public AABB $bounds;
     public Vec4 $tint;
     public float32 $lodBias;
+    public bool $hidden;
 }
+
+internal enum ModelKind
+{
+    case statics;
+    case dynamic;
+    case skinned;
+}
+
+/**
+ * What `ModelSystem` holds for one model entity: its GPU scene row, its model's handle slot,
+ * which kind drew it, its place in the static set or the dynamic draw list, and the update its
+ * row last moved in.
+ */
+internal struct ModelRecord
+{
+    public int32 $row;
+    public int32 $handles;
+    public ModelKind $kind;
+    public int32 $slot;
+    public uint32 $movedIn;
+    public bool $moving;
+    public bool $shown;
+
+    /**
+     * The fill a skin was last packed in; a skin that misses one leaves the scene until it is back.
+     */
+    public int32 $frame;
+
+    /**
+     * The outline style slot its row glows in, -1 for none (`highlight`).
+     */
+    public int32 $outline = -1;
+
+    /**
+     * Its entity has a parent, or is an assembly root: a move then walks the assembly. Read once at
+     * acquire; a body or a car root without either moves on the fast path.
+     */
+    public bool $linked = true;
+
+    /**
+     * An editor drag (`beginEdit`) holds its row in the active set until `endEdit`.
+     */
+    public bool $editing = false;
+
+    /**
+     * Its index in the moving list while `moving`, -1 otherwise.
+     */
+    public int32 $movingAt = -1;
+}
+
+/**
+ * Model arrivals `fill` acquires in one frame at most; the rest wait for the next. A map load of a
+ * few thousand is one frame; a scatter of a million ramps in over a couple of seconds.
+ */
+public const int32 MODEL_ACQUIRE_BUDGET = 8192;
+
+/**
+ * Milliseconds of a displayed frame the acquisitions may take, checked every
+ * `MODEL_ACQUIRE_CHECK` arrivals: a big scatter ramps in without a hitch. Under a pinned clock
+ * (dcapture `fixedStep`) only the count holds, so a run acquires the same rows every frame.
+ */
+public const float64 MODEL_ACQUIRE_MS = 2.0;
+internal const int32 MODEL_ACQUIRE_CHECK = 256;
 
 /**
  * Model entities `highlight` may hold at once. An assembly root counts each part it expands to.
@@ -218,8 +292,41 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      * outline lists, built in `fill`, still name their handles until the pipeline has run.
      */
     private array<string> $evictions;
-    private map<Entity, int32> $dynamicOf;
-    private map<Entity, int32> $skinnedOf;
+
+    /**
+     * One record per acquired model entity, paged by entity index.
+     */
+    private View<ModelRecord> $records;
+
+    /**
+     * Model components attached since the last fill, in order, and entities whose component or
+     * transform was edited (`changed<T>`); both read in `fill`. A skinned model is acquired
+     * once and stays in `skinned`.
+     */
+    private array<Entity> $arrivals;
+    private usize $arrivalsRead;
+    private array<Entity> $refreshes;
+    private array<Entity> $skins;
+
+    /**
+     * The move log reader, what it read this fill, and the entities whose rows are resolving on
+     * the GPU.
+     */
+    private int32 $moveReader;
+    private array<Entity> $moved;
+    private array<Entity> $movingRecords;
+
+    /**
+     * The update each moving list entry last moved in, beside it: the rest check reads this array
+     * alone.
+     */
+    private array<uint32> $movingUpdates;
+
+    /**
+     * The fill each assembly root was last expanded in, so an assembly with many moving nodes
+     * (a windmill's hub and sails) walks its parts once a fill.
+     */
+    private View<int32> $expanded;
 
     /**
      * This frame's skins and their palette rows, kept across frames so the capacity survives.
@@ -242,11 +349,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     private bool $paletteWarned;
     private DebugLines $lines;
     private GpuPass? $linePass;
-    private EntityHook $moveStatic;
-    private EntityHook $changeStatic;
-    private EntityHook $detachStatic;
-    private EntityHook $detachDynamic;
-    private EntityHook $detachSkinned;
+    private array<EntityHook> $hooks;
 
     /**
      * The renderer's GPU scene: model rows on acquire, static rows on place and release, and
@@ -256,10 +359,32 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     private GpuScene $scene;
 
     /**
-     * Each casting mover's box last frame, so a still one changes no shadow.
+     * Each casting mover's shadow bookkeeping, paged by entity index, so a still one changes no
+     * shadow and a moving one hashes nothing.
      */
-    private map<Entity, MoverTrack> $moverBounds;
+    private View<MoverTrack> $tracks;
     private int32 $moverFrame;
+
+    /**
+     * The main views come from the GPU scene (`--flag models.gpu`, on by default where the device
+     * has bindless textures): the camera, the mirror and the outline are culled and drawn on the
+     * GPU, and no CPU structure (the static octree, the per-frame mover worlds) is kept for them.
+     * Off keeps the CPU assemblers. Read once, at construction.
+     */
+    private bool $gpu;
+    private ScenePasses $passes;
+
+    /**
+     * Rows the GPU main views draw previews with, pinned to the active set; the first
+     * `previewRowsUsed` are this frame's, the rest wait hidden.
+     */
+    private array<int32> $previewRows;
+    private int32 $previewRowsUsed;
+
+    /**
+     * Static model entities acquired, for the console in GPU mode (the octree counts its own).
+     */
+    private int32 $staticRecords;
 
     public constructor(ModelBank $bank, DeferredRenderer $renderer, const AABB& $world)
     {
@@ -267,8 +392,18 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->renderer = $renderer;
         $this->scene = $renderer->scene;
         $this->scene->bank = $bank;
-        $this->moverBounds = map<Entity, MoverTrack>();
+        $this->tracks = View<MoverTrack>();
         $this->moverFrame = 0;
+        $this->gpu = flags()->bool('models.gpu', true) && $bank->device->limits()->bindless;
+        $this->scene->mainViews = $this->gpu;
+        if ($this->scene->rowCount() == 0) {
+            $this->scene->layout($world, flags()->float('scene.chunk', SCENE_CHUNK_METRES as float64) as float32);
+        }
+
+        $this->passes = ScenePasses($bank->device);
+        $this->previewRows = arr::room<int32>((MODEL_PREVIEWS * 8) as usize);
+        $this->previewRowsUsed = 0;
+        $this->staticRecords = 0;
         $this->filling = null;
         $this->lodBias = flags()->float('model.lod', 1.0) as float32;
         $this->wireframe = flags()->bool('model.wire', false);
@@ -307,8 +442,16 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->models = array<ModelHandles>();
         $this->freeModels = array<int32>();
         $this->evictions = arr::room<string>(MODEL_EVICT_RESERVE as usize);
-        $this->dynamicOf = map<Entity, int32>();
-        $this->skinnedOf = map<Entity, int32>();
+        $this->records = View<ModelRecord>();
+        $this->arrivals = array<Entity>();
+        $this->arrivalsRead = 0;
+        $this->refreshes = array<Entity>();
+        $this->skins = array<Entity>();
+        $this->moveReader = -1;
+        $this->moved = array<Entity>();
+        $this->movingRecords = array<Entity>();
+        $this->movingUpdates = array<uint32>();
+        $this->expanded = View<int32>();
         $this->skinDraws = array<SkinDraw>();
         $this->dynamicDraws = array<DynamicDraw>();
         $this->palette = array<Vec4>();
@@ -318,11 +461,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->paletteWarned = false;
         $this->lines = DebugLines($bank->device);
         $this->linePass = null;
-        $this->moveStatic = EntityHook::none();
-        $this->changeStatic = EntityHook::none();
-        $this->detachStatic = EntityHook::none();
-        $this->detachDynamic = EntityHook::none();
-        $this->detachSkinned = EntityHook::none();
+        $this->hooks = array<EntityHook>();
     }
 
     /**
@@ -330,36 +469,94 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public const function staticCount() : int32
     {
+        if ($this->gpu) {
+            return $this->staticRecords;
+        }
+
         return $this->statics->count;
     }
 
     /**
-     * A detached static leaves the octree at once, before its entity is reused. A moved one
-     * (`Entities.changed<Transform>`) or a retinted one (`changed<StaticModel>`) is released and
-     * rejoins on the next fill; a dynamic or skinned part reads its Transform each frame and is
-     * left alone.
+     * Whether the main views come from the GPU scene.
+     */
+    public const function gpuViews() : bool
+    {
+        return $this->gpu;
+    }
+
+    /**
+     * Arrivals queue from the attach hooks (and one sweep here of what was attached before the
+     * system was bound), edits from the change hooks; a detach releases at once, before the
+     * entity is reused. Continuous movers come from the move log.
      */
     public function register(Entities $entities) : void
     {
         ModelSystem $sys = $this;
-        $this->moveStatic = $entities->onChange<Transform>(function(Entities $w, Entity $e, const Transform& $t) : void {
-            $sys->release($e);
+        $this->hooks[] = $entities->onAttach<StaticModel>(function(Entities $w, Entity $e, const StaticModel& $c) : void {
+            $sys->arrive($e);
         });
-        $this->changeStatic = $entities->onChange<StaticModel>(function(Entities $w, Entity $e, const StaticModel& $c) : void {
-            $sys->release($e);
+        $this->hooks[] = $entities->onAttach<DynamicModel>(function(Entities $w, Entity $e, const DynamicModel& $c) : void {
+            $sys->arrive($e);
         });
-        $this->detachStatic = $entities->onDetach<StaticModel>(function(Entities $w, Entity $e, const StaticModel& $c) : void {
+        $this->hooks[] = $entities->onAttach<SkinnedModel>(function(Entities $w, Entity $e, const SkinnedModel& $c) : void {
+            $sys->arrive($e);
+        });
+        $this->hooks[] = $entities->onChange<Transform>(function(Entities $w, Entity $e, const Transform& $t) : void {
+            $sys->refresh($e);
+        });
+        $this->hooks[] = $entities->onChange<StaticModel>(function(Entities $w, Entity $e, const StaticModel& $c) : void {
+            $sys->refresh($e);
+        });
+        $this->hooks[] = $entities->onChange<DynamicModel>(function(Entities $w, Entity $e, const DynamicModel& $c) : void {
+            $sys->refresh($e);
+        });
+        $this->hooks[] = $entities->onChange<SkinnedModel>(function(Entities $w, Entity $e, const SkinnedModel& $c) : void {
+            $sys->refresh($e);
+        });
+        $this->hooks[] = $entities->onDetach<StaticModel>(function(Entities $w, Entity $e, const StaticModel& $c) : void {
             $sys->release($e);
             $sys->dropHighlight($e);
         });
-        $this->detachDynamic = $entities->onDetach<DynamicModel>(function(Entities $w, Entity $e, const DynamicModel& $c) : void {
-            $sys->forgetDynamic($e);
+        $this->hooks[] = $entities->onDetach<DynamicModel>(function(Entities $w, Entity $e, const DynamicModel& $c) : void {
+            $sys->release($e);
             $sys->dropHighlight($e);
         });
-        $this->detachSkinned = $entities->onDetach<SkinnedModel>(function(Entities $w, Entity $e, const SkinnedModel& $c) : void {
-            $sys->forgetSkinned($e);
+        $this->hooks[] = $entities->onDetach<SkinnedModel>(function(Entities $w, Entity $e, const SkinnedModel& $c) : void {
+            $sys->release($e);
             $sys->dropHighlight($e);
         });
+        $this->moveReader = $entities->moveReader();
+
+        foreach ($entities->view<StaticModel>() as $id => &$static) {
+            $this->arrivals[] = $id;
+        }
+
+        foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
+            $this->arrivals[] = $id;
+        }
+
+        foreach ($entities->view<SkinnedModel>() as $id => &$skin) {
+            $this->arrivals[] = $id;
+        }
+    }
+
+    /**
+     * Room for `$models` model entities and `$movers` moving at once, so the queues, the records
+     * and the GPU scene's rows are sized at load.
+     */
+    public function reserve(int32 $models, int32 $movers) : void
+    {
+        $this->records->reserve($models as usize);
+        $this->arrivals->reserve($models as usize);
+        $this->moved->reserve(($movers * 2) as usize);
+        $this->movingRecords->reserve($movers as usize);
+        $this->movingUpdates->reserve($movers as usize);
+        $this->dynamicDraws->reserve($movers as usize);
+        if (!$this->gpu) {
+            $this->statics->reserve($models as usize);
+        }
+
+        $this->scene->reserve($models, $movers);
     }
 
     /**
@@ -367,19 +564,19 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public function unregister(Entities $entities) : void
     {
-        $entities->release($this->moveStatic);
-        $this->moveStatic = EntityHook::none();
-        $entities->release($this->changeStatic);
-        $this->changeStatic = EntityHook::none();
-        $entities->release($this->detachStatic);
-        $this->detachStatic = EntityHook::none();
-        $entities->release($this->detachDynamic);
-        $this->detachDynamic = EntityHook::none();
-        $entities->release($this->detachSkinned);
-        $this->detachSkinned = EntityHook::none();
+        foreach ($this->hooks as $hook) {
+            $entities->release($hook);
+        }
+
+        $this->hooks->clear();
+        $entities->releaseMoveReader($this->moveReader);
+        $this->moveReader = -1;
 
         $this->scene->clear();
-        $this->moverBounds->clear();
+        $this->tracks = View<MoverTrack>();
+        $this->previewRows->clear();
+        $this->previewRowsUsed = 0;
+        $this->staticRecords = 0;
         $this->rigid->clear();
         $this->skinned->clear();
         $this->models->clear();
@@ -387,8 +584,15 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->evictions->clear();
         $this->modelIndex->clear();
         $this->statics->clear();
-        $this->dynamicOf->clear();
-        $this->skinnedOf->clear();
+        $this->records = View<ModelRecord>();
+        $this->arrivals->clear();
+        $this->arrivalsRead = 0;
+        $this->refreshes->clear();
+        $this->skins->clear();
+        $this->moved->clear();
+        $this->movingRecords->clear();
+        $this->movingUpdates->clear();
+        $this->expanded = View<int32>();
         $this->skinDraws->clear();
         $this->dynamicDraws->clear();
         $this->palette->clear();
@@ -420,6 +624,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
                 $this->wireframe = $wire;
                 $this->rigid->reset();
                 $this->skinned->reset();
+                $this->passes->reset($wire);
             }
         }
 
@@ -480,7 +685,9 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
 
     public function clearHighlights() : void
     {
-        $this->highlights->clear();
+        while ($this->highlights->count() > 0) {
+            $this->dropHighlight($this->highlights[0]->entity);
+        }
     }
 
     /**
@@ -507,11 +714,79 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public function mask(RenderContext $ctx, RenderEncoder $enc) : void
     {
+        if ($this->gpu) {
+            ScenePasses $passes = $this->passes;
+            $this->scene->drawMain($enc, SCENE_PASS_OUTLINE, function(int32 $k) : GpuPass? {
+                return $passes->outline($k);
+            });
+            return;
+        }
+
         $this->rigid->outline($enc, $this->bank);
         if ($this->skinned->outlines()) {
             $this->bindPalette($enc);
             $this->skinned->outline($enc, $this->bank);
         }
+    }
+
+    /**
+     * An editor starts moving `$root` (and, for an assembly, every part): their rows leave their
+     * chunks for the active set and stay there through every exact rewrite of the drag, so no
+     * chunk is touched while it lasts. O(parts). Pair with `endEdit`, also after a cancel that put
+     * the old transform back.
+     */
+    public function beginEdit(Entities $entities, Entity $root) : void
+    {
+        $this->editParts($entities, $root, true);
+    }
+
+    /**
+     * The edit of `$root` is over: each part's row rests in the chunk of where it now stands, so
+     * only that chunk and the one it left changed. O(parts).
+     */
+    public function endEdit(Entities $entities, Entity $root) : void
+    {
+        $this->editParts($entities, $root, false);
+    }
+
+    /**
+     * Rows held in the active set by an edit now.
+     */
+    public function editing(Entity $e) : bool
+    {
+        return $this->records->contains($e) && $this->records->get($e)->editing;
+    }
+
+    private function editParts(Entities $entities, Entity $root, bool $on) : void
+    {
+        if (!$entities->valid($root)) {
+            return;
+        }
+
+        $this->editPart($root, $on);
+        if ($entities->has<AssemblyInstance>($root)) {
+            AssemblyInstance& $inst = $entities->get<AssemblyInstance>($root);
+            foreach ($inst->nodes as $name => $node) {
+                $this->editPart($node, $on);
+            }
+        }
+    }
+
+    private function editPart(Entity $e, bool $on) : void
+    {
+        if (!$this->records->contains($e)) {
+            return;
+        }
+
+        ModelRecord& $rec = $this->records->get($e);
+        if ($rec->kind == ModelKind::skinned || $rec->editing == $on) {
+            return;
+        }
+
+        $rec->editing = $on;
+        $this->scene->pin($rec->row, $on);
+        // the next fill rewrites it exactly, which places it by the pin
+        $this->refreshes[] = $e;
     }
 
     /**
@@ -534,16 +809,45 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     }
 
     /**
-     * Acquire new components, then one pass that writes the GBuffer with every visible instance.
+     * Acquire what arrived, apply edits and moves to the GPU scene rows, then one pass that
+     * writes the GBuffer with every visible instance.
      */
     public function fill(Entities $entities, RenderContext $ctx, GBufferData $gbuffer) : void
     {
         $this->ensurePasses();
         $this->drainEvictions();
-        $this->acquireAll($entities);
-        $this->packDynamics($entities, $ctx->compensation);
+        $this->moverFrame = $this->moverFrame + 1;
+        $this->scene->lodBias = $this->lodBias;
+        $this->scene->interpolation = $ctx->compensation;
+        Vec3 $eye = Vec3(0.0f);
+        CameraData? $view = $ctx->frame->find<CameraData>();
+        if ($view != null) {
+            CameraData $held = guard $view;
+            $eye = $held->cullPosition;
+        }
+
+        visu::profile::begin('acquire');
+        $this->acquireArrivals($entities);
+        $this->applyRefreshes($entities);
+        visu::profile::end();
+        visu::profile::begin('dynamics');
+        visu::profile::begin('moves');
+        $this->applyMoves($entities, $eye);
+        visu::profile::end();
+        if (!$this->gpu) {
+            visu::profile::begin('interpolate');
+            $this->interpolateMoving($entities, $ctx->compensation, $eye);
+            visu::profile::end();
+        }
+
+        visu::profile::end();
         $this->packSkins($entities, $ctx);
-        $this->packMovers($ctx);
+        $this->packMovers($ctx, $eye);
+        if ($this->gpu) {
+            $this->passes->ensure($this->bank);
+            $this->writePreviews();
+            $this->scene->outlining = $this->highlights->count() > 0 || $this->previewRowsUsed > 0;
+        }
         $this->filling = $entities;
         $ctx->frame->get<GeometryFillers>()->add($this);
         ShadowMapData? $shadows = $ctx->frame->find<ShadowMapData>();
@@ -638,6 +942,11 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         CameraData $view = guard $ctx->frame->find<CameraData>() else {
             return;
         }
+        if ($this->gpu) {
+            $this->outlineBox($entities, $mailbox);
+            return;
+        }
+
         visu::profile::begin('outline');
         $this->rigid->outlineDca->clearInstances();
         $this->skinned->outlineDca->clearInstances();
@@ -662,15 +971,16 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
                 continue;
             }
 
-            if ($this->dynamicOf->has($e) && $entities->has<DynamicModel>($e)) {
-                ModelHandles $h = $this->models[$this->dynamicOf[$e] as usize];
-                DynamicModel& $dynamic = $entities->get<DynamicModel>($e);
-                Transform& $t = $entities->get<Transform>($e);
-                Mat4 $world = $t->world($entities, $alpha);
-                AABB $bounds = $h->model->bounds->transformed($world);
-                $this->submitVisible($this->rigid->outlineDca, $h, $world, $bounds, ModelInstanceData($tag), $dynamic->lodBias, $eye, false);
-                $box = outlineUnion($box, $bounds, $any);
-                $any = true;
+            if ($this->records->contains($e) && $this->records->get($e)->kind == ModelKind::dynamic) {
+                ModelRecord $rec = $this->records->get($e);
+                DynamicDraw $dyn = $this->dynamicDraws[$rec->slot as usize];
+                if (!$dyn->hidden) {
+                    ModelHandles $h = $this->models[$rec->handles as usize];
+                    $this->submitVisible($this->rigid->outlineDca, $h, $dyn->world, $dyn->bounds, ModelInstanceData($tag), $dyn->lodBias, $eye, false);
+                    $box = outlineUnion($box, $dyn->bounds, $any);
+                    $any = true;
+                }
+
                 continue;
             }
 
@@ -756,6 +1066,31 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         CameraData $camera = guard $ctx->frame->find<CameraData>() else {
             return .ok;
         }
+        if ($this->gpu) {
+            $this->lines->clear();
+            if ($camera->cullFrozen) {
+                $this->lines->frustum($camera->cullCorners(), Vec4(1.00f, 0.85f, 0.15f, 1.0f));
+                $this->lines->cross($camera->cullPosition, 4.0f);
+            }
+
+            if ($this->scene->showChunks) {
+                $this->drawChunks();
+            }
+
+            visu::profile::begin('draw');
+            ScenePasses $passes = $this->passes;
+            // the cut-out classes' depth first, then every class shades
+            $this->scene->drawMain($enc, SCENE_PASS_CAMERA, function(int32 $k) : GpuPass? {
+                return $passes->cameraDepth($k);
+            });
+            $this->scene->drawMain($enc, SCENE_PASS_CAMERA, function(int32 $k) : GpuPass? {
+                return $passes->camera($k);
+            });
+            $this->drawLines($enc);
+            visu::profile::end();
+            return .ok;
+        }
+
         if (!$this->rigid->ready()) {
             return .ok;
         }
@@ -798,7 +1133,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public function prepareReflection(Entities $entities, RenderContext $ctx, WaterFrame $water) : void
     {
-        if ($water->mirrorIndex < 0) {
+        if ($water->mirrorIndex < 0 || $this->gpu) {
             return;
         }
 
@@ -832,7 +1167,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         }
 
         foreach ($this->dynamicDraws as $dyn) {
-            if (!waterAbove($dyn->bounds, $plane)) {
+            if ($dyn->hidden || !waterAbove($dyn->bounds, $plane)) {
                 continue;
             }
 
@@ -868,6 +1203,14 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     public function reflect(RenderContext $ctx, RenderEncoder $enc) : void
     {
+        if ($this->gpu) {
+            ScenePasses $passes = $this->passes;
+            $this->scene->drawMain($enc, SCENE_PASS_MIRROR, function(int32 $k) : GpuPass? {
+                return $passes->mirror($k);
+            });
+            return;
+        }
+
         if ($this->rigid->reflects()) {
             $this->rigid->drawReflect($enc, $this->bank);
         }
@@ -934,8 +1277,14 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         int32 $commands = $this->commandCount();
         int32 $culled = $this->frustumCulled();
         int32 $models = $this->models->count() as int32;
-        int32 $statics = $this->statics->count;
+        int32 $statics = $this->staticCount();
         $console->writeLine("model: {$models} models, {$statics} static, {$this->dynamicCount} dynamic, {$this->skinnedCount} skinned");
+        if ($this->gpu) {
+            int32 $rows = $this->scene->rowCount();
+            int32 $active = $this->scene->activeCount();
+            int32 $moving = $this->scene->moverCount();
+            $console->writeLine("model: gpu views, {$rows} scene rows, {$active} active, {$moving} moving (see `scene`)");
+        }
         int32 $rowCap = SKIN_PALETTE_ROWS;
         $console->writeLine("model: palette {$this->paletteRows}/{$rowCap} rows, {$this->paletteDropped} skins dropped");
         $console->writeLine("model: {$this->submitted} submitted, {$this->distanceCulled} past cull distance, {$culled} frustum culled, {$commands} draws");
@@ -997,6 +1346,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->wireframe = $on;
         $this->rigid->reset();
         $this->skinned->reset();
+        $this->passes->reset($on);
         flags()->set('model.wire', FlagValue::boolean($on));
         $this->flagsSeen = flags()->version;
         if ($on) {
@@ -1008,116 +1358,417 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
     }
 
     /**
-     * Load models for components that arrived since last fill, and place new statics.
+     * `$e` gained a model component: acquired at the next fill.
      */
-    private function acquireAll(Entities $entities) : void
+    internal function arrive(Entity $e) : void
     {
-        foreach ($entities->view<StaticModel>() as $id => &$static) {
-            if ($this->statics->has($id)) {
-                continue;
-            }
+        $this->arrivals[] = $e;
+    }
 
+    /**
+     * `$e`'s transform or model component was edited: its row is rewritten exactly at the next
+     * fill. A burst of edits of one entity is one rewrite.
+     */
+    internal function refresh(Entity $e) : void
+    {
+        $this->refreshes[] = $e;
+    }
+
+    /**
+     * Acquire up to `MODEL_ACQUIRE_BUDGET` arrivals: a row, the model's handles, and the static
+     * set or the dynamic draw list. An arrival that is gone, or already acquired, is skipped.
+     */
+    private function acquireArrivals(Entities $entities) : void
+    {
+        usize $n = $this->arrivals->count();
+        if ($this->arrivalsRead >= $n) {
+            return;
+        }
+
+        int32 $taken = 0;
+        bool $timed = !visu::runtime::clockPinned();
+        time::instant $start = time::instant::now();
+        while ($this->arrivalsRead < $n && $taken < MODEL_ACQUIRE_BUDGET) {
+            Entity $e = $this->arrivals[$this->arrivalsRead];
+            $this->arrivalsRead = $this->arrivalsRead + 1;
+            if ($entities->valid($e) && !$this->records->contains($e)) {
+                $this->acquireEntity($entities, $e);
+                $taken = $taken + 1;
+                if ($timed && ($taken % MODEL_ACQUIRE_CHECK) == 0) {
+                    time::instant $now = time::instant::now();
+                    float64 $ms = (($now - $start)->as_nanos() as float64) / 1000000.0;
+                    if ($ms > MODEL_ACQUIRE_MS) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if ($this->arrivalsRead >= $n) {
+            $this->arrivals->clear();
+            $this->arrivalsRead = 0;
+        }
+    }
+
+    private function acquireEntity(Entities $entities, Entity $e) : void
+    {
+        if ($entities->has<StaticModel>($e)) {
+            StaticModel& $static = $entities->get<StaticModel>($e);
             int32 $handles = $this->acquire($static->model);
             if ($handles < 0) {
-                continue;
+                return;
             }
 
-            Transform& $t = $entities->get<Transform>($id);
             ModelHandles $h = $this->models[$handles as usize];
-            $h->users = $h->users + 1;
-            Mat4 $world = $t->world($entities);
+            $this->addUser($handles);
+            Mat4 $world = $entities->get<Transform>($e)->world($entities);
             AABB $bounds = $h->model->bounds->transformed($world);
-            int32 $slot = $this->statics->place(
-                $id,
-                $handles,
-                $world,
-                $bounds,
-                $static->tint,
-                $static->lodBias
-            );
-            $this->scene->placeStatic($slot, $handles, $world, $bounds, $static->lodBias, $h->anyCast);
+            int32 $slot = -1;
+            if (!$this->gpu) {
+                $slot = $this->statics->place($e, $handles, $world, $bounds, $static->tint, $static->lodBias);
+            }
+
+            int32 $row = $this->scene->acquire();
+            ModelRecord $rec = ModelRecord($row, $handles, ModelKind::statics, $slot, 0, false, true, 0, $this->outlineOf($e));
+            $this->scene->write($row, $this->rowFor($rec, $bounds, $static->lodBias, $static->tint, 0.0f, $h->anyCast, false, true), $world);
+            $this->scene->change($bounds);
+            $this->records->attach($e, $rec);
+            $this->staticRecords = $this->staticRecords + 1;
+            return;
         }
 
-        foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
-            if ($this->dynamicOf->has($id)) {
-                continue;
-            }
-
+        if ($entities->has<DynamicModel>($e)) {
+            DynamicModel& $dynamic = $entities->get<DynamicModel>($e);
             int32 $handles = $this->acquire($dynamic->model);
             if ($handles < 0) {
-                continue;
+                return;
             }
 
-            $this->dynamicOf[$id] = $handles;
+            ModelHandles $h = $this->models[$handles as usize];
             $this->addUser($handles);
+            Mat4 $world = $entities->get<Transform>($e)->world($entities);
+            AABB $bounds = $h->model->bounds->transformed($world);
+            int32 $slot = $this->dynamicDraws->count() as int32;
+            $this->dynamicDraws[] = DynamicDraw($e, $handles, $world, $bounds, $dynamic->tint, $dynamic->lodBias, $dynamic->hidden);
+            int32 $row = $this->scene->acquire();
+            ModelRecord $rec = ModelRecord($row, $handles, ModelKind::dynamic, $slot, 0, false, !$dynamic->hidden, 0, $this->outlineOf($e));
+            $rec->linked = $entities->get<Transform>($e)->parent != Entity::none() || $entities->has<AssemblyInstance>($e);
+            $this->scene->write($row, $this->rowFor($rec, $bounds, $dynamic->lodBias, $dynamic->tint, 0.0f, $h->anyCast, false, !$dynamic->hidden), $world);
+            $this->records->attach($e, $rec);
+            if (!$dynamic->hidden && $h->anyCast) {
+                $this->scene->change($bounds);
+            }
+
+            return;
         }
 
-        foreach ($entities->view<SkinnedModel>() as $id => &$skin) {
-            if ($this->skinnedOf->has($id)) {
-                continue;
-            }
-
+        if ($entities->has<SkinnedModel>($e)) {
+            SkinnedModel& $skin = $entities->get<SkinnedModel>($e);
             int32 $handles = $this->acquire($skin->model);
             if ($handles < 0) {
-                continue;
+                return;
             }
 
             if (!$this->models[$handles as usize]->model->skinned()) {
                 info("model: '{$skin->model}' has no skeleton; a SkinnedModel needs one");
-                $this->skinnedOf[$id] = -1;
-                continue;
+                return;
             }
 
-            $this->skinnedOf[$id] = $handles;
             $this->addUser($handles);
+            int32 $row = $this->scene->acquire();
+            // a skin is posed every frame: it lives in the active set
+            $this->scene->pin($row, true);
+            $this->records->attach($e, ModelRecord($row, $handles, ModelKind::skinned, $this->skins->count() as int32, 0, false, false, 0, $this->outlineOf($e)));
+            $this->skins[] = $e;
         }
     }
 
     /**
-     * This frame's dynamics: each visible one's interpolated world and bounds, once. The
-     * cascades and the GBuffer pass read the list instead of walking the parent chains again.
-     * O(dynamics); the array keeps its capacity.
+     * Rewrite each edited entity's row exactly: a changed model id reacquires, a teleport or a
+     * retint rewrites in place. O(edits).
      */
-    private function packDynamics(Entities $entities, float32 $alpha) : void
+    private function applyRefreshes(Entities $entities) : void
     {
-        $this->dynamicDraws->clear();
-        if ($this->dynamicOf->count() == 0) {
+        if ($this->refreshes->count() == 0) {
             return;
         }
 
-        visu::profile::begin('dynamics');
-        foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
-            if ($dynamic->hidden || !$this->dynamicOf->has($id)) {
+        foreach ($this->refreshes as $e) {
+            if (!$entities->valid($e)) {
                 continue;
             }
 
-            int32 $handles = $this->dynamicOf[$id];
-            ModelHandles $h = $this->models[$handles as usize];
-            Transform& $t = $entities->get<Transform>($id);
-            Mat4 $world = $t->world($entities, $alpha);
-            $this->dynamicDraws[] = DynamicDraw($id, $handles, $world, $h->model->bounds->transformed($world), $dynamic->tint, $dynamic->lodBias);
+            if (!$this->records->contains($e)) {
+                continue;
+            }
+
+            ModelRecord& $rec = $this->records->get($e);
+            if ($rec->kind == ModelKind::statics) {
+                $this->refreshStatic($entities, $e);
+            } else if ($rec->kind == ModelKind::dynamic) {
+                $this->refreshDynamic($entities, $e);
+            }
         }
 
-        visu::profile::end();
+        $this->refreshes->clear();
+    }
+
+    private function refreshStatic(Entities $entities, Entity $e) : void
+    {
+        ModelRecord $rec = $this->records->get($e);
+        StaticModel& $static = $entities->get<StaticModel>($e);
+        ModelHandles $h = $this->models[$rec->handles as usize];
+        if (!$h->model->id->equals($static->model)) {
+            $this->release($e);
+            $this->acquireEntity($entities, $e);
+            return;
+        }
+
+        Mat4 $world = $entities->get<Transform>($e)->world($entities);
+        AABB $bounds = $h->model->bounds->transformed($world);
+        AABB $old = $bounds;
+        int32 $slot = -1;
+        if ($this->gpu) {
+            $old = $this->scene->homeBox($rec->row);
+        } else {
+            $old = $this->statics->get($rec->slot as uint32)->bounds;
+            $this->statics->release($e);
+            $slot = $this->statics->place($e, $rec->handles, $world, $bounds, $static->tint, $static->lodBias);
+        }
+
+        $this->scene->write($rec->row, $this->rowFor($rec, $bounds, $static->lodBias, $static->tint, 0.0f, $h->anyCast, false, true), $world);
+        $this->scene->change($old);
+        $this->scene->change($bounds);
+        ModelRecord& $held = $this->records->get($e);
+        $held->slot = $slot;
+    }
+
+    private function refreshDynamic(Entities $entities, Entity $e) : void
+    {
+        ModelRecord $rec = $this->records->get($e);
+        DynamicModel& $dynamic = $entities->get<DynamicModel>($e);
+        ModelHandles $h = $this->models[$rec->handles as usize];
+        if (!$h->model->id->equals($dynamic->model)) {
+            $this->release($e);
+            $this->acquireEntity($entities, $e);
+            return;
+        }
+
+        Mat4 $world = $entities->get<Transform>($e)->world($entities);
+        AABB $bounds = $h->model->bounds->transformed($world);
+        DynamicDraw& $draw = $this->dynamicDraws->at($rec->slot as usize);
+        bool $wasShown = !$draw->hidden;
+        AABB $old = $draw->bounds;
+        $draw->world = $world;
+        $draw->bounds = $bounds;
+        $draw->tint = $dynamic->tint;
+        $draw->lodBias = $dynamic->lodBias;
+        $draw->hidden = $dynamic->hidden;
+        SceneRow $row = $this->rowFor($rec, $bounds, $dynamic->lodBias, $dynamic->tint, 0.0f, $h->anyCast, false, !$dynamic->hidden);
+        $this->scene->write($rec->row, $row, $world);
+        $this->leaveMovingList($e);
+        // an exact move: every shadow it cast where it was and where it is now changes
+        $this->forgetMover($e);
+        if ($h->anyCast && $wasShown) {
+            $this->scene->change($old);
+        }
+
+        if ($h->anyCast && !$dynamic->hidden) {
+            $this->scene->change($bounds);
+        }
     }
 
     /**
-     * This frame's dynamics and skins as GPU scene movers, from the lists the two packs built.
-     * O(movers); the scene keeps its capacity.
+     * The move log since the last fill: each dynamic that moved in the latest update gets its
+     * row's previous and current world pose, once; one that moved only in an earlier update, and
+     * every moving row an update has run without, gets its exact pose and leaves the moving
+     * list. A moved entity inside an assembly brings every part of that assembly, since a part
+     * moves with any node above it (a sail with its hub). O(moved + parts of moved assemblies +
+     * stopped).
      */
-    private function packMovers(RenderContext $ctx) : void
+    private function applyMoves(Entities $entities, Vec3 $eye) : void
     {
-        visu::profile::begin('movers');
-        $this->moverFrame = $this->moverFrame + 1;
-        Vec3 $eye = Vec3(0.0f);
-        CameraData? $view = $ctx->frame->find<CameraData>();
-        if ($view != null) {
-            CameraData $held = guard $view;
-            $eye = $held->cullPosition;
+        $this->moved->clear();
+        $entities->moves($this->moveReader, $this->moved);
+        uint32 $update = $entities->updateIndex();
+        foreach ($this->moved as $e) {
+            if (!$entities->valid($e)) {
+                continue;
+            }
+
+            // a body or a car root (no parent, no assembly) is the whole move
+            if (!$this->movePart($entities, $e, $update, $eye)) {
+                continue;
+            }
+
+            Entity $root = assemblyRootOf($entities, $e);
+            if ($root == Entity::none()) {
+                continue;
+            }
+
+            if (!$this->expanded->contains($root)) {
+                $this->expanded->attach($root, -1);
+            }
+
+            int32& $seen = $this->expanded->get($root);
+            if ($seen == $this->moverFrame) {
+                continue;
+            }
+
+            $seen = $this->moverFrame;
+            $this->movePart($entities, $root, $update, $eye);
+            AssemblyInstance& $inst = $entities->get<AssemblyInstance>($root);
+            foreach ($inst->nodes as $name => $node) {
+                $this->movePart($entities, $node, $update, $eye);
+            }
         }
 
-        $this->scene->lodBias = $this->lodBias;
-        $this->scene->clearMovers();
+        // a row that moved in an older update than the one that just ran has come to rest
+        usize $i = 0;
+        while ($i < $this->movingUpdates->count()) {
+            if ($this->movingUpdates[$i] >= $update) {
+                $i = $i + 1;
+                continue;
+            }
+
+            $this->stopMoving($entities, $this->movingRecords[$i]);
+            $this->dropMoving($i);
+        }
+    }
+
+    /**
+     * One entity the log names, or a part of an assembly root it names: a dynamic that is
+     * shown takes its row's two poses. Statics and skins are written elsewhere.
+     */
+    private function movePart(Entities $entities, Entity $e, uint32 $update, Vec3 $eye) : bool
+    {
+        if (!$this->records->contains($e)) {
+            return true;
+        }
+
+        ModelRecord& $rec = $this->records->get($e);
+        if ($rec->kind != ModelKind::dynamic || $rec->movedIn == $update) {
+            return $rec->linked;
+        }
+
+        DynamicDraw& $draw = $this->dynamicDraws->at($rec->slot as usize);
+        if ($draw->hidden) {
+            return $rec->linked;
+        }
+
+        Transform& $t = $entities->get<Transform>($e);
+        ModelHandles $h = $this->models[$rec->handles as usize];
+        // a root's world pose is its own; only a part under a parent needs the chain and a
+        // decomposition
+        Pose $wasPose = $t->previousPose();
+        Pose $nowPose = $t->pose();
+        AABB $bounds = poseBounds($h->model->bounds, $wasPose);
+        if ($t->parent != Entity::none()) {
+            Mat4 $was = $t->world($entities, 0.0f);
+            Mat4 $now = $t->world($entities);
+            $wasPose = decomposePose($was);
+            $nowPose = decomposePose($now);
+            $bounds = $h->model->bounds->transformed($was);
+            $bounds->extend($h->model->bounds->transformed($now));
+        } else {
+            $bounds->extend(poseBounds($h->model->bounds, $nowPose));
+        }
+        SceneRow $row = $this->rowFor($rec, $bounds, $draw->lodBias, $draw->tint, 0.0f, $h->anyCast, false, true);
+        $this->scene->write($rec->row, $row, moving: $wasPose, $nowPose);
+        $rec->movedIn = $update;
+        if ($this->gpu) {
+            // the GPU views read the swept box; the shadows change where the row was rewritten
+            $draw->bounds = $bounds;
+            $this->noteMover($e, $bounds, $h->anyCast, $eye);
+        }
+
+        if (!$rec->moving) {
+            $rec->moving = true;
+            $rec->movingAt = $this->movingRecords->count() as int32;
+            $this->movingRecords[] = $e;
+            $this->movingUpdates[] = $update;
+        } else {
+            $this->movingUpdates[$rec->movingAt as usize] = $update;
+        }
+
+        return $rec->linked;
+    }
+
+    /**
+     * A moving row comes to rest: its exact pose, one last shadow change where it stopped.
+     */
+    private function stopMoving(Entities $entities, Entity $e) : void
+    {
+        ModelRecord& $rec = $this->records->get($e);
+        $rec->moving = false;
+        ModelHandles $h = $this->models[$rec->handles as usize];
+        Mat4 $world = $entities->get<Transform>($e)->world($entities);
+        AABB $bounds = $h->model->bounds->transformed($world);
+        DynamicDraw& $draw = $this->dynamicDraws->at($rec->slot as usize);
+        $draw->world = $world;
+        $draw->bounds = $bounds;
+        $this->scene->write($rec->row, $this->rowFor($rec, $bounds, $draw->lodBias, $draw->tint, 0.0f, $h->anyCast, false, !$draw->hidden), $world);
+        $this->settleMover($e, $bounds, $h->anyCast);
+    }
+
+    /**
+     * Take `$e` off the moving list, if it is on it (an exact rewrite overtook its motion).
+     */
+    private function leaveMovingList(Entity $e) : void
+    {
+        ModelRecord& $rec = $this->records->get($e);
+        if (!$rec->moving) {
+            return;
+        }
+
+        $rec->moving = false;
+        $this->dropMoving($rec->movingAt as usize);
+    }
+
+    /**
+     * Swap-remove moving list entry `$i`, whose record has already left it; the entry moved into
+     * its place learns its new index. O(1).
+     */
+    private function dropMoving(usize $i) : void
+    {
+        Entity $gone = $this->movingRecords[$i];
+        $this->records->get($gone)->movingAt = -1;
+        usize $last = $this->movingRecords->count() - 1;
+        if ($i != $last) {
+            Entity $kept = $this->movingRecords[$last];
+            $this->movingRecords[$i] = $kept;
+            $this->movingUpdates[$i] = $this->movingUpdates[$last];
+            $this->records->get($kept)->movingAt = $i as int32;
+        }
+
+        $this->movingRecords->pop();
+        $this->movingUpdates->pop();
+    }
+
+    /**
+     * The CPU main view's worlds for the dynamics that are moving, at this frame's alpha, and
+     * their shadow change boxes. A resting dynamic keeps the world it was left with. O(moving).
+     */
+    private function interpolateMoving(Entities $entities, float32 $alpha, Vec3 $eye) : void
+    {
+        foreach ($this->movingRecords as $e) {
+            ModelRecord $rec = $this->records->get($e);
+            ModelHandles $h = $this->models[$rec->handles as usize];
+            Mat4 $world = $entities->get<Transform>($e)->world($entities, $alpha);
+            AABB $bounds = $h->model->bounds->transformed($world);
+            DynamicDraw& $draw = $this->dynamicDraws->at($rec->slot as usize);
+            $draw->world = $world;
+            $draw->bounds = $bounds;
+            $this->noteMover($e, $bounds, $h->anyCast, $eye);
+        }
+    }
+
+    /**
+     * This frame's palette in the ring, and each posed skin's row. O(skins).
+     */
+    private function packMovers(RenderContext $ctx, Vec3 $eye) : void
+    {
+        visu::profile::begin('movers');
         $this->scene->palette = null;
         if ($this->palette->count() > 0) {
             uint64 $bytes = ($this->palette->count() as uint64) * (mem::size<Vec4>() as uint64);
@@ -1127,16 +1778,27 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             $this->scene->palette = $slice;
         }
 
-        foreach ($this->dynamicDraws as $dyn) {
-            ModelHandles $h = $this->models[$dyn->handles as usize];
-            $this->scene->addMover($dyn->handles, $dyn->world, $dyn->bounds, $dyn->lodBias, 0.0f, false, $h->anyCast);
-            $this->noteMover($dyn->entity, $dyn->bounds, $h->anyCast, $eye);
-        }
-
         foreach ($this->skinDraws as $skin) {
             ModelHandles $h = $this->models[$skin->handles as usize];
-            $this->scene->addMover($skin->handles, $skin->world, $skin->bounds, $skin->lodBias, $skin->base, true, $h->anyCast);
+            ModelRecord& $rec = $this->records->get($skin->entity);
+            SceneRow $row = $this->rowFor($rec, $skin->bounds, $skin->lodBias, $skin->tint, $skin->base, $h->anyCast, true, true);
+            $this->scene->write($rec->row, $row, $skin->world);
+            $rec->shown = true;
+            $rec->frame = $this->moverFrame;
             $this->noteMover($skin->entity, $skin->bounds, $h->anyCast, $eye);
+        }
+
+        // a skin that dropped out of the palette this frame draws nothing until it is back
+        foreach ($this->skins as $e) {
+            ModelRecord& $rec = $this->records->get($e);
+            if (!$rec->shown || $rec->frame == $this->moverFrame) {
+                continue;
+            }
+
+            $rec->shown = false;
+            ModelHandles $h = $this->models[$rec->handles as usize];
+            $this->scene->restyle($rec->row, SceneRow($rec->handles, AABB(Vec3(0.0f), Vec3(0.0f)), 1.0f, Vec4(1.0f), 0.0f, $h->anyCast, true, false));
+            $this->forgetMover($e);
         }
 
         visu::profile::end();
@@ -1153,13 +1815,13 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             return;
         }
 
-        if (!$this->moverBounds->has($e)) {
+        if (!$this->tracks->contains($e)) {
             $this->scene->change($bounds);
-            $this->moverBounds[$e] = MoverTrack($bounds, $bounds, false);
+            $this->tracks->attach($e, MoverTrack($bounds, $bounds, false));
             return;
         }
 
-        MoverTrack $track = $this->moverBounds[$e];
+        MoverTrack& $track = $this->tracks->get($e);
         if (!$track->moved) {
             if ($track->drawn == $bounds) {
                 return;
@@ -1172,15 +1834,13 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $track->swept->extend($bounds);
 
         // each mover takes its turn on its own frame of the cycle, so the redraws spread out
-        bool $turn = (($this->moverFrame + ($e->id as int32)) % MOVER_SHADOW_EVERY) == 0;
+        bool $turn = (($this->moverFrame + ($e->fold() as int32)) % MOVER_SHADOW_EVERY) == 0;
         if ($turn || length($bounds->center() - $eye) < MOVER_SHADOW_NEAR) {
             $this->scene->change($track->swept);
             $track->drawn = $bounds;
             $track->swept = $bounds;
             $track->moved = false;
         }
-
-        $this->moverBounds[$e] = $track;
     }
 
     /**
@@ -1196,7 +1856,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         $this->skinnedCount = 0;
         $this->paletteDropped = 0;
         $this->paletteRows = 0;
-        if ($this->skinnedOf->count() == 0) {
+        if ($this->skins->count() == 0) {
             return;
         }
 
@@ -1206,15 +1866,14 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         visu::profile::begin('palette');
         Vec3 $eye = $view->cullPosition;
         float32 $alpha = $ctx->compensation;
-        foreach ($entities->view<SkinnedModel>() as $id => &$skin) {
-            if (!$this->skinnedOf->has($id)) {
+        foreach ($this->skins as $id) {
+            SkinnedModel& $skin = $entities->get<SkinnedModel>($id);
+            // a hidden skin drops out like one past the palette: its row goes dark below
+            if ($skin->hidden) {
                 continue;
             }
 
-            int32 $handles = $this->skinnedOf[$id];
-            if ($handles < 0) {
-                continue;
-            }
+            int32 $handles = $this->records->get($id)->handles;
 
             SkinPose $pose = guard $skin->pose else {
                 continue;
@@ -1292,6 +1951,10 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         }
 
         foreach ($this->dynamicDraws as $dyn) {
+            if ($dyn->hidden) {
+                continue;
+            }
+
             $this->dynamicCount = $this->dynamicCount + 1;
             ModelHandles $h = $this->models[$dyn->handles as usize];
             $this->submitVisible($this->rigid->dca, $h, $dyn->world, $dyn->bounds, ModelInstanceData($dyn->tint), $dyn->lodBias, $eye, true);
@@ -1500,24 +2163,53 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         }
     }
 
+    /**
+     * `$e` stops drawing: its row goes back to the scene (its shadows change where it stood), it
+     * leaves the static set, the dynamic draw list (the last entry moves into its place) or the
+     * skin list, and its model loses a user. O(1) but for the moving list.
+     */
     internal function release(Entity $e) : void
     {
-        int32 $slot = $this->statics->find($e);
-        if ($slot >= 0) {
-            $this->scene->releaseStatic($slot, $this->statics->get($slot as uint32)->bounds);
+        if (!$this->records->contains($e)) {
+            return;
         }
 
-        $this->dropUser($this->statics->release($e));
-    }
-
-    internal function forgetDynamic(Entity $e) : void
-    {
+        ModelRecord $rec = $this->records->get($e);
+        $this->leaveMovingList($e);
         $this->forgetMover($e);
+        if ($rec->kind == ModelKind::statics) {
+            if ($this->gpu) {
+                $this->scene->release($rec->row, $this->scene->homeBox($rec->row));
+            } else {
+                $this->scene->release($rec->row, $this->statics->get($rec->slot as uint32)->bounds);
+                $this->statics->release($e);
+            }
 
-        if ($this->dynamicOf->has($e)) {
-            $this->dropUser($this->dynamicOf[$e]);
-            $this->dynamicOf->remove($e);
+            $this->staticRecords = $this->staticRecords - 1;
+        } else if ($rec->kind == ModelKind::dynamic) {
+            $this->scene->release($rec->row, $this->dynamicDraws[$rec->slot as usize]->bounds);
+            usize $last = $this->dynamicDraws->count() - 1;
+            if (($rec->slot as usize) != $last) {
+                DynamicDraw $moved = $this->dynamicDraws[$last];
+                $this->dynamicDraws[$rec->slot as usize] = $moved;
+                $this->records->get($moved->entity)->slot = $rec->slot;
+            }
+
+            $this->dynamicDraws->pop();
+        } else {
+            $this->scene->release($rec->row, AABB(Vec3(0.0f), Vec3(0.0f)));
+            usize $last = $this->skins->count() - 1;
+            if (($rec->slot as usize) != $last) {
+                Entity $moved = $this->skins[$last];
+                $this->skins[$rec->slot as usize] = $moved;
+                $this->records->get($moved)->slot = $rec->slot;
+            }
+
+            $this->skins->pop();
         }
+
+        $this->dropUser($rec->handles);
+        $this->records->erase($e);
     }
 
     /**
@@ -1530,6 +2222,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         while ($i < $n) {
             if ($this->highlights[$i]->entity == $e) {
                 $this->highlights->at($i)->style = $style;
+                $this->restyleOutline($e, $style);
                 return;
             }
 
@@ -1541,6 +2234,174 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
         }
 
         $this->highlights[] = ModelHighlight($e, $style);
+        $this->restyleOutline($e, $style);
+    }
+
+    /**
+     * In GPU mode the outline is a bit of `$e`'s row: record the style and rewrite the row at
+     * the next fill (a skin's row is rewritten every fill anyway).
+     */
+    private function restyleOutline(Entity $e, int32 $style) : void
+    {
+        if (!$this->gpu || !$this->records->contains($e)) {
+            return;
+        }
+
+        ModelRecord& $rec = $this->records->get($e);
+        if ($rec->outline == $style) {
+            return;
+        }
+
+        $rec->outline = $style;
+        if ($rec->kind != ModelKind::skinned) {
+            $this->refreshes[] = $e;
+        }
+    }
+
+    /**
+     * The style `$e` is highlighted in, -1 when it is not. O(highlights).
+     */
+    private const function outlineOf(Entity $e) : int32
+    {
+        foreach ($this->highlights as $h) {
+            if ($h->entity == $e) {
+                return $h->style;
+            }
+        }
+
+        return -1;
+    }
+
+    /**
+     * A row of `$rec`'s model with its outline style.
+     */
+    private const function rowFor(
+        const ModelRecord& $rec,
+        const AABB& $bounds,
+        float32 $lodBias,
+        Vec4 $tint,
+        float32 $palette,
+        bool $casts,
+        bool $skinned,
+        bool $live
+    ) : SceneRow
+    {
+        SceneRow $row = SceneRow($rec->handles, $bounds, $lodBias, $tint, $palette, $casts, $skinned, $live);
+        $row->outline = $rec->outline;
+        return $row;
+    }
+
+    /**
+     * GPU mode: the outline mailbox's box this frame, the union of what glows. Statics from their
+     * transform, dynamics from their swept box, skins from this frame's list, previews from their
+     * form. O(highlights + preview parts).
+     */
+    private function outlineBox(Entities $entities, OutlineData $mailbox) : void
+    {
+        bool $any = false;
+        AABB $box = AABB(Vec3(0.0f), Vec3(0.0f));
+        foreach ($this->highlights as $mark) {
+            Entity $e = $mark->entity;
+            if (!$this->records->contains($e) || !$entities->valid($e)) {
+                continue;
+            }
+
+            ModelRecord $rec = $this->records->get($e);
+            ModelHandles $h = $this->models[$rec->handles as usize];
+            AABB $bounds = $box;
+            if ($rec->kind == ModelKind::statics) {
+                $bounds = $h->model->bounds->transformed($entities->get<Transform>($e)->world($entities));
+            } else if ($rec->kind == ModelKind::dynamic) {
+                DynamicDraw $dyn = $this->dynamicDraws[$rec->slot as usize];
+                if ($dyn->hidden) {
+                    continue;
+                }
+
+                $bounds = $dyn->bounds;
+            } else {
+                bool $posed = false;
+                foreach ($this->skinDraws as $skin) {
+                    if ($skin->entity == $e) {
+                        $bounds = $skin->bounds;
+                        $posed = true;
+                    }
+                }
+
+                if (!$posed) {
+                    continue;
+                }
+            }
+
+            $box = outlineUnion($box, $bounds, $any);
+            $any = true;
+        }
+
+        foreach ($this->previews as $ghost) {
+            int32 $n = $ghost->form->count();
+            int32 $i = 0;
+            while ($i < $n) {
+                int32 $handles = $ghost->form->handles[$i as usize];
+                if ($handles >= 0) {
+                    Mat4 $world = $ghost->root * $ghost->form->locals[$i as usize];
+                    $box = outlineUnion($box, $this->models[$handles as usize]->model->bounds->transformed($world), $any);
+                    $any = true;
+                }
+
+                $i = $i + 1;
+            }
+        }
+
+        if ($any) {
+            $mailbox->add($this, $box);
+        }
+    }
+
+    /**
+     * GPU mode: this frame's `preview` calls as rows of their own, pinned to the active set,
+     * drawn only into the outline view; rows a previous frame used and this one did not are
+     * hidden. O(preview parts); rows are acquired once and kept.
+     */
+    private function writePreviews() : void
+    {
+        int32 $used = 0;
+        foreach ($this->previews as $ghost) {
+            int32 $n = $ghost->form->count();
+            int32 $i = 0;
+            while ($i < $n) {
+                int32 $handles = $this->previewHandles($ghost->form, $i);
+                $i = $i + 1;
+                if ($handles < 0) {
+                    continue;
+                }
+
+                ModelHandles $h = $this->models[$handles as usize];
+                if ($h->model->skinned()) {
+                    continue;
+                }
+
+                if ($used == ($this->previewRows->count() as int32)) {
+                    int32 $fresh = $this->scene->acquire();
+                    $this->scene->pin($fresh, true);
+                    $this->previewRows[] = $fresh;
+                }
+
+                Mat4 $world = $ghost->root * $ghost->form->locals[($i - 1) as usize];
+                SceneRow $row = SceneRow($handles, $h->model->bounds->transformed($world), 1.0f, Vec4(1.0f), 0.0f, false, false, true);
+                $row->main = false;
+                $row->outline = $ghost->style;
+                $this->scene->write($this->previewRows[$used as usize], $row, $world);
+                $used = $used + 1;
+            }
+        }
+
+        int32 $k = $used;
+        while ($k < $this->previewRowsUsed) {
+            SceneRow $gone = SceneRow(0, AABB(Vec3(0.0f), Vec3(0.0f)), 1.0f, Vec4(1.0f), 0.0f, false, false, false);
+            $this->scene->restyle($this->previewRows[$k as usize], $gone);
+            $k = $k + 1;
+        }
+
+        $this->previewRowsUsed = $used;
     }
 
     /**
@@ -1554,6 +2415,7 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             if ($this->highlights[$i]->entity == $e) {
                 $this->highlights[$i] = $this->highlights[$n - 1];
                 $this->highlights->truncate($n - 1);
+                $this->restyleOutline($e, -1);
                 return;
             }
 
@@ -1568,14 +2430,27 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
             || $entities->has<SkinnedModel>($e);
     }
 
-    internal function forgetSkinned(Entity $e) : void
+    /**
+     * A mover came to rest in `$bounds`: its shadows change once more over everything it swept
+     * and where it stopped, then it stops being tracked. Nothing more is reported while it rests.
+     */
+    private function settleMover(Entity $e, const AABB& $bounds, bool $casts) : void
     {
-        $this->forgetMover($e);
-
-        if ($this->skinnedOf->has($e)) {
-            $this->dropUser($this->skinnedOf[$e]);
-            $this->skinnedOf->remove($e);
+        if (!$casts) {
+            return;
         }
+
+        if (!$this->tracks->contains($e)) {
+            $this->scene->change($bounds);
+            return;
+        }
+
+        MoverTrack $gone = $this->tracks->get($e);
+        AABB $all = $gone->swept;
+        $all->extend($gone->drawn);
+        $all->extend($bounds);
+        $this->scene->change($all);
+        $this->tracks->erase($e);
     }
 
     /**
@@ -1583,15 +2458,39 @@ public class ModelSystem : System, GeometryFiller, ShadowCaster, OutlineCaster, 
      */
     private function forgetMover(Entity $e) : void
     {
-        if (!$this->moverBounds->has($e)) {
+        if (!$this->tracks->contains($e)) {
             return;
         }
 
-        MoverTrack $gone = $this->moverBounds[$e];
+        MoverTrack $gone = $this->tracks->get($e);
         AABB $all = $gone->swept;
         $all->extend($gone->drawn);
         $this->scene->change($all);
-        $this->moverBounds->remove($e);
+        $this->tracks->erase($e);
+    }
+
+    /**
+     * Every occupied chunk's box, green with a few members through magenta with thousands (the
+     * LOD ramp by the log of the count). The `gpuscene chunks` view.
+     */
+    private function drawChunks() : void
+    {
+        visu::graphics::SceneChunks $c = $this->scene->chunks;
+        int32 $n = $c->occupiedCount();
+        int32 $i = 0;
+        while ($i < $n) {
+            int32 $row = $c->occupiedRow($i);
+            int32 $members = $c->members($row);
+            int32 $shade = 0;
+            int32 $m = $members;
+            while ($m > 4) {
+                $m = $m / 4;
+                $shade = $shade + 1;
+            }
+
+            $this->lines->box($c->box($row), lodColor($shade));
+            $i = $i + 1;
+        }
     }
 
     /**
@@ -1654,4 +2553,101 @@ internal function previewPose(Assembly $assembly, AssemblyNode $node) : Mat4
     }
 
     return $pose;
+}
+
+/**
+ * `$world` as a pose: its translation, its column lengths as the scale, and the rotation left
+ * when they are divided out. A mirrored matrix keeps its handedness in a negative x scale. A
+ * sheared chain (a non-uniform scale under a rotation) is not a pose; it comes back as the
+ * nearest one.
+ */
+internal function decomposePose(const Mat4& $world) : Pose
+{
+    Vec3 $x = Vec3($world->c0->x, $world->c0->y, $world->c0->z);
+    Vec3 $y = Vec3($world->c1->x, $world->c1->y, $world->c1->z);
+    Vec3 $z = Vec3($world->c2->x, $world->c2->y, $world->c2->z);
+    float32 $sx = length($x);
+    float32 $sy = length($y);
+    float32 $sz = length($z);
+    if (visu::math::dot(visu::math::cross($x, $y), $z) < 0.0f) {
+        $sx = 0.0f - $sx;
+    }
+
+    Vec3 $position = Vec3($world->c3->x, $world->c3->y, $world->c3->z);
+    if ($sx == 0.0f || $sy == 0.0f || $sz == 0.0f) {
+        return Pose($position, Quat(), Vec3($sx, $sy, $sz));
+    }
+
+    Mat4 $rotation = Mat4(
+        Vec4($x / $sx, 0.0f),
+        Vec4($y / $sy, 0.0f),
+        Vec4($z / $sz, 0.0f),
+        Vec4(0.0f, 0.0f, 0.0f, 1.0f)
+    );
+    return Pose($position, visu::math::normalize(Quat($rotation)), Vec3($sx, $sy, $sz));
+}
+
+/**
+ * The assembly root `$e` belongs to: `$e` itself when it is one, else the first ancestor that
+ * is, or `Entity::none()` outside any assembly. O(depth).
+ */
+internal function assemblyRootOf(Entities $entities, Entity $e) : Entity
+{
+    Entity $walk = $e;
+    int32 $depth = 0;
+    while ($walk != Entity::none() && $depth < 32) {
+        if ($entities->has<AssemblyInstance>($walk)) {
+            return $walk;
+        }
+
+        if (!$entities->has<Transform>($walk)) {
+            return Entity::none();
+        }
+
+        $walk = $entities->get<Transform>($walk)->parent;
+        $depth = $depth + 1;
+    }
+
+    return Entity::none();
+}
+
+/**
+ * The world box of `$local` under `$pose`: the centre carried through the pose, the half extents
+ * through the absolute rotation times the scale. As tight as `AABB.transformed` on the pose's
+ * matrix, without building it; a mover's row takes two a move.
+ */
+internal function poseBounds(const AABB& $local, const Pose& $pose) : AABB
+{
+    Quat $q = $pose->orientation;
+    float32 $xx = $q->x * $q->x;
+    float32 $yy = $q->y * $q->y;
+    float32 $zz = $q->z * $q->z;
+    float32 $xy = $q->x * $q->y;
+    float32 $xz = $q->x * $q->z;
+    float32 $yz = $q->y * $q->z;
+    float32 $wx = $q->w * $q->x;
+    float32 $wy = $q->w * $q->y;
+    float32 $wz = $q->w * $q->z;
+    // the rows of the rotation Mat4(Quat) builds
+    Vec3 $r0 = Vec3(1.0f - 2.0f * ($yy + $zz), 2.0f * ($xy - $wz), 2.0f * ($xz + $wy));
+    Vec3 $r1 = Vec3(2.0f * ($xy + $wz), 1.0f - 2.0f * ($xx + $zz), 2.0f * ($yz - $wx));
+    Vec3 $r2 = Vec3(2.0f * ($xz - $wy), 2.0f * ($yz + $wx), 1.0f - 2.0f * ($xx + $yy));
+    Vec3 $s = $pose->scale;
+    Vec3 $c = ($local->min + $local->max) * 0.5f * $s;
+    Vec3 $e = ($local->max - $local->min) * 0.5f * visu::math::abs($s);
+    Vec3 $centre = $pose->position + Vec3(visu::math::dot($r0, $c), visu::math::dot($r1, $c), visu::math::dot($r2, $c));
+    Vec3 $half = Vec3(
+        visu::math::dot(visu::math::abs($r0), $e),
+        visu::math::dot(visu::math::abs($r1), $e),
+        visu::math::dot(visu::math::abs($r2), $e)
+    );
+    return AABB($centre - $half, $centre + $half);
+}
+
+/**
+ * The TRS matrix of `$pose`, as `Transform.local` builds it.
+ */
+internal function poseMatrix(const Pose& $pose) : Mat4
+{
+    return translate($pose->position) * Mat4($pose->orientation) * scale($pose->scale);
 }

@@ -1,0 +1,355 @@
+/**
+ * The `physics` verb: world status, the debug overlay, gravity, dropping test bodies onto
+ * whatever is below, a stress pile for profiling the step, and a straight-down ray.
+ */
+
+namespace visu::console;
+
+use visu::components::{Collider, RigidBody};
+use visu::ecs::{Entities, Entity};
+use visu::geo::{Ray, Transform};
+use visu::math::Vec3;
+use visu::physics::{ColliderShape, PhysicsHit, PhysicsLayer, PhysicsPile, PhysicsWorld, pileLayers, pileSide, stackPile};
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+/**
+ * Metres above the ground a dropped body starts, and the height a console ray starts from.
+ */
+internal const float32 PHYSICS_DROP_HEIGHT = 5.0f;
+internal const float32 PHYSICS_RAY_TOP = 10000.0f;
+
+/**
+ * A stress pile holds at most this many bodies.
+ */
+internal const int32 PHYSICS_STRESS_MAX = 4096;
+
+internal enum PhysicsConsoleAction
+{
+    case status;
+    case usage;
+    case debug(bool $on, bool $aabb, bool $contacts);
+    case debugVehicles(bool $on);
+    case gravity(Vec3 $g);
+    case sleep(float32 $seconds);
+    case drop(bool $sphere, float32 $size, float32 $x, float32 $z);
+    case stress(int32 $count, bool $sphere, float32 $size, float32 $x, float32 $z, string $model);
+    case clear;
+    case ray(float32 $x, float32 $z);
+}
+
+internal function parsePhysicsConsole(const ConsoleCommandSignal& $cmd) : PhysicsConsoleAction
+{
+    if (!$cmd->isAction('physics')) {
+        return .usage;
+    }
+
+    usize $n = $cmd->parts->count();
+    if ($n == 1) {
+        return .status;
+    }
+
+    string $arg = $cmd->parts[1];
+    if ($arg == 'debug') {
+        if ($n < 3) {
+            return .debug(true, false, false);
+        }
+
+        string $word = $cmd->parts[2];
+        if ($word == 'aabb') {
+            return .debug(true, true, false);
+        }
+
+        if ($word == 'contacts') {
+            return .debug(true, false, true);
+        }
+
+        if ($word == 'vehicles') {
+            if ($n < 4) {
+                return .debugVehicles(true);
+            }
+
+            bool $show = guard consoleSwitch($cmd->parts[3]) else {
+                return .usage;
+            }
+            return .debugVehicles($show);
+        }
+
+        bool $on = guard consoleSwitch($word) else {
+            return .usage;
+        }
+        return .debug($on, false, false);
+    }
+
+    if ($arg == 'gravity' && $n == 5) {
+        float32 $x = guard consoleFloat($cmd, 2) else {
+            return .usage;
+        }
+        float32 $y = guard consoleFloat($cmd, 3) else {
+            return .usage;
+        }
+        float32 $z = guard consoleFloat($cmd, 4) else {
+            return .usage;
+        }
+        return .gravity(Vec3($x, $y, $z));
+    }
+
+    if ($arg == 'sleep' && $n == 3) {
+        float32 $seconds = guard consoleFloat($cmd, 2) else {
+            return .usage;
+        }
+        if ($seconds < 0.0f) {
+            return .usage;
+        }
+        return .sleep($seconds);
+    }
+
+    if ($arg == 'drop' && $n == 6) {
+        string $kind = $cmd->parts[2];
+        if ($kind != 'box' && $kind != 'sphere') {
+            return .usage;
+        }
+
+        float32 $size = guard consoleFloat($cmd, 3) else {
+            return .usage;
+        }
+        float32 $x = guard consoleFloat($cmd, 4) else {
+            return .usage;
+        }
+        float32 $z = guard consoleFloat($cmd, 5) else {
+            return .usage;
+        }
+        if ($size <= 0.0f) {
+            return .usage;
+        }
+        return .drop($kind == 'sphere', $size, $x, $z);
+    }
+
+    if ($arg == 'stress' && ($n == 7 || $n == 8)) {
+        int64 $count = guard str::int($cmd->parts[2]) else {
+            return .usage;
+        }
+        string $kind = $cmd->parts[3];
+        if ($kind != 'box' && $kind != 'sphere') {
+            return .usage;
+        }
+
+        float32 $size = guard consoleFloat($cmd, 4) else {
+            return .usage;
+        }
+        float32 $x = guard consoleFloat($cmd, 5) else {
+            return .usage;
+        }
+        float32 $z = guard consoleFloat($cmd, 6) else {
+            return .usage;
+        }
+        if ($count < 1 || $count > PHYSICS_STRESS_MAX as int64 || $size <= 0.0f) {
+            return .usage;
+        }
+        string $model = '';
+        if ($n == 8) {
+            $model = $cmd->parts[7];
+        }
+        return .stress($count as int32, $kind == 'sphere', $size, $x, $z, $model);
+    }
+
+    if ($arg == 'clear' && $n == 2) {
+        return .clear;
+    }
+
+    if ($arg == 'ray' && $n == 4) {
+        float32 $x = guard consoleFloat($cmd, 2) else {
+            return .usage;
+        }
+        float32 $z = guard consoleFloat($cmd, 3) else {
+            return .usage;
+        }
+        return .ray($x, $z);
+    }
+
+    return .usage;
+}
+
+/**
+ * The float argument at `$index`, or null when it is missing or not a number.
+ */
+internal function consoleFloat(const ConsoleCommandSignal& $cmd, usize $index) : float32?
+{
+    if ($cmd->parts->count() <= $index) {
+        return null;
+    }
+
+    float64 $v = guard str::float($cmd->parts[$index]) else {
+        return null;
+    }
+    return $v as float32;
+}
+
+public class PhysicsConsole : ConsoleCommandHandler
+{
+    private PhysicsWorld $world;
+    private Entities $entities;
+
+    /**
+     * Bodies `physics drop` made, so `physics clear` takes back exactly those.
+     */
+    private array<Entity> $dropped;
+
+    public constructor(PhysicsWorld $world, Entities $entities)
+    {
+        $this->world = $world;
+        $this->entities = $entities;
+        $this->dropped = array<Entity>();
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('physics', $this, PHYSICS_USAGE);
+        array<string> $names = array<string>();
+        $names[] = 'physics';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        PhysicsConsoleAction $action = parsePhysicsConsole($cmd);
+        match ($action) {
+            PhysicsConsoleAction::status => {
+                $this->status($console);
+            },
+            PhysicsConsoleAction::usage => {
+                $console->writeLine('usage: physics [debug [on|off|aabb|contacts|vehicles [on|off]]|gravity <x> <y> <z>|sleep <seconds>|drop box|sphere <size> <x> <z>|stress <count> box|sphere <size> <x> <z> [model]|clear|ray <x> <z>]');
+            },
+            PhysicsConsoleAction::debug($on, $aabb, $contacts) => {
+                $this->world->showDebug($on, aabb: $aabb, contacts: $contacts);
+                $console->writeLine("physics debug {$on}");
+            },
+            PhysicsConsoleAction::debugVehicles($on) => {
+                $this->world->debugVehicles = $on;
+                if ($on && !$this->world->debugging) {
+                    $this->world->showDebug(true);
+                }
+                $console->writeLine("physics debug vehicles {$on}");
+            },
+            PhysicsConsoleAction::gravity($g) => {
+                $this->world->setGravity($g);
+                $console->writeLine("physics gravity {$g->x} {$g->y} {$g->z}");
+            },
+            PhysicsConsoleAction::sleep($seconds) => {
+                $this->world->setSleepSeconds($seconds);
+                $console->writeLine("physics sleep {$seconds} s");
+            },
+            PhysicsConsoleAction::drop($sphere, $size, $x, $z) => {
+                $this->drop($console, $sphere, $size, $x, $z);
+            },
+            PhysicsConsoleAction::stress($count, $sphere, $size, $x, $z, $model) => {
+                $this->stress($console, $count, $sphere, $size, $x, $z, $model);
+            },
+            PhysicsConsoleAction::clear => {
+                $this->clear($console);
+            },
+            PhysicsConsoleAction::ray($x, $z) => {
+                $this->ray($console, $x, $z);
+            },
+        };
+    }
+
+    private function status(DebugConsole $console) : void
+    {
+        Vec3 $g = $this->world->gravity();
+        int32 $bodies = $this->world->count();
+        int32 $awake = $this->world->awake();
+        int32 $kinematic = $this->world->kinematicCount();
+        int32 $shapes = $this->world->shapes();
+        bool $debug = $this->world->debugging;
+        float32 $sleep = $this->world->sleepSeconds();
+        bool $paused = $this->world->paused;
+        int32 $threads = $this->world->threads;
+        $console->writeLine("physics bodies {$bodies} awake {$awake} kinematic {$kinematic} shapes {$shapes} threads {$threads}");
+        $console->writeLine("physics gravity {$g->x} {$g->y} {$g->z} sleep {$sleep} s paused {$paused} debug {$debug}");
+    }
+
+    private function drop(DebugConsole $console, bool $sphere, float32 $size, float32 $x, float32 $z) : void
+    {
+        float32 $ground = 0.0f;
+        PhysicsHit? $below = $this->world->ray(
+            Ray(Vec3($x, PHYSICS_RAY_TOP, $z), Vec3(0.0f, -1.0f, 0.0f)),
+            PHYSICS_RAY_TOP * 2.0f,
+        );
+        if ($below != null) {
+            PhysicsHit $hit = guard $below;
+            $ground = $hit->point->y;
+        }
+
+        float32 $half = $size * 0.5f;
+        ColliderShape $shape = ColliderShape::box(Vec3($half, $half, $half));
+        if ($sphere) {
+            $shape = ColliderShape::sphere($half);
+        }
+
+        Entity $e = $this->entities->create();
+        Transform $t = Transform();
+        $t->position = Vec3($x, $ground + PHYSICS_DROP_HEIGHT + $half, $z);
+        $this->entities->attach<Transform>($e, $t);
+        $this->entities->attach<Collider>($e, Collider($shape));
+        $this->entities->attach<RigidBody>($e, RigidBody());
+        $this->dropped[] = $e;
+        float32 $y = $t->position->y;
+        $console->writeLine("physics dropped at {$x} {$y} {$z}");
+    }
+
+    /**
+     * `stackPile` over the ground the ray finds at x / z. The bodies join `dropped`, so
+     * `physics clear` takes them back.
+     */
+    private function stress(DebugConsole $console, int32 $count, bool $sphere, float32 $size, float32 $x, float32 $z, string $model) : void
+    {
+        float32 $ground = 0.0f;
+        PhysicsHit? $below = $this->world->ray(
+            Ray(Vec3($x, PHYSICS_RAY_TOP, $z), Vec3(0.0f, -1.0f, 0.0f)),
+            PHYSICS_RAY_TOP * 2.0f,
+        );
+        if ($below != null) {
+            PhysicsHit $hit = guard $below;
+            $ground = $hit->point->y;
+        }
+
+        PhysicsPile $pile = PhysicsPile($count, $sphere, $size, $x, $z, $model);
+        stackPile($this->entities, $pile, $ground, $this->dropped);
+        int32 $side = pileSide($pile);
+        int32 $layers = pileLayers($pile);
+        $console->writeLine("physics stress {$count} bodies, {$side} x {$side} x {$layers} over {$x} {$z}");
+    }
+
+    private function clear(DebugConsole $console) : void
+    {
+        int32 $n = 0;
+        foreach ($this->dropped as $e) {
+            if ($this->entities->valid($e)) {
+                $this->entities->destroy($e);
+                $n = $n + 1;
+            }
+        }
+
+        $this->dropped->clear();
+        $console->writeLine("physics cleared {$n}");
+    }
+
+    private function ray(DebugConsole $console, float32 $x, float32 $z) : void
+    {
+        PhysicsHit? $found = $this->world->ray(
+            Ray(Vec3($x, PHYSICS_RAY_TOP, $z), Vec3(0.0f, -1.0f, 0.0f)),
+            PHYSICS_RAY_TOP * 2.0f,
+        );
+        PhysicsHit $hit = guard $found else {
+            $console->writeLine('physics ray: nothing below');
+            return;
+        }
+
+        Entity $hitEntity = $hit->entity;
+        Vec3 $p = $hit->point;
+        $console->writeLine("physics ray: entity {$hitEntity} at {$p->x} {$p->y} {$p->z}");
+    }
+}
+
+internal const PHYSICS_USAGE = 'debug [on|off|aabb|contacts|vehicles [on|off]]|gravity <x> <y> <z>|sleep <seconds>|drop box|sphere <size> <x> <z>|stress <count> box|sphere <size> <x> <z> [model]|clear|ray <x> <z>';

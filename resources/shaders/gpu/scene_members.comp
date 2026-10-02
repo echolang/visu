@@ -1,0 +1,246 @@
+#version 450
+
+// visu::graphics::GpuScene, the member stage: one workgroup per chunk pair walks the chunk's
+// members (or one block of the active set) in list order. An instance passes when it carries
+// every flag the set and the view require, when its candidate source is this list (a row of the
+// active set is never drawn from a chunk, nor a chunk member from the active set), when its box
+// meets the view and when it is inside its model's cull distance. Its level is picked from the
+// play eye with the CPU's lodIndex loop (an empty level is skipped rather than clamped), and
+// every material run of the level that has something to draw in this set becomes one pair of the
+// run's key (see visu/scenecull.glsl). Mode 0 counts the pairs per segment into the matrix;
+// mode 1 writes them at the scanned offsets, in member order then run order within a segment:
+// each round's pairs go to a list in that order, and each finds its rank among the earlier pairs
+// of its key by walking the list
+layout(local_size_x = 64) in;
+
+#include "visu/scenecull.glsl"
+
+// pairs one member may emit in a round: the runs of its level that draw in this set
+#define SCENE_MEMBER_RUNS 8u
+#define SCENE_ROUND_PAIRS (64u * SCENE_MEMBER_RUNS)
+
+layout(std430, set = 2, binding = 0) readonly buffer ChunkPairs {
+    uvec2 chunkPairs[];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer Chunks {
+    SceneChunk chunks[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer Lists {
+    uint lists[];
+};
+
+layout(std430, set = 2, binding = 3) readonly buffer Instances {
+    SceneInstance instances[];
+};
+
+layout(std430, set = 2, binding = 4) readonly buffer Models {
+    SceneModel models[];
+};
+
+layout(std430, set = 2, binding = 5) readonly buffer Runs {
+    SceneRun runs[];
+};
+
+layout(std430, set = 2, binding = 6) readonly buffer Views {
+    SceneView views[];
+};
+
+layout(std430, set = 2, binding = 7) buffer Matrix {
+    uint matrix[];
+};
+
+layout(std430, set = 2, binding = 8) writeonly buffer Pairs {
+    uvec4 pairs[];
+};
+
+layout(std430, set = 2, binding = 9) readonly buffer Counters {
+    uint counters[];
+};
+
+// each pair's meshlet count, scanned before the meshlet stage flattens them
+layout(std430, set = 2, binding = 10) writeonly buffer PairWalk {
+    uint pairWalk[];
+};
+
+shared uint s_base[SCENE_KEYS_MAX];
+shared uint s_count[SCENE_KEYS_MAX];
+shared uint s_offset[64];
+shared uint s_keyOf[SCENE_ROUND_PAIRS];
+
+// the key run `run` sorts by in this set for an instance in depth bin `bin`, or none when it
+// draws nothing here
+uint run_key(SceneRun run, uint bin)
+{
+    if (run.range.y == 0u) {
+        return SCENE_BUCKET_NONE;
+    }
+
+    uint key = 0u;
+    if (u_mode.z == 0u) {
+        key = run.range.w;
+    } else {
+        key = run.range.z * u_mode.z + bin;
+    }
+    if (key >= u_counts.w) {
+        return SCENE_BUCKET_NONE;
+    }
+    return key;
+}
+
+// the first and end run of the level `row` draws at in `view`, and its depth bin in z; an empty
+// range when it does not draw
+uvec3 member_runs(uint row, SceneView view, uint require, bool fromActive)
+{
+    SceneInstance inst = instances[row];
+    uint flags = inst.meta.y;
+    if ((flags & require) != require) {
+        return uvec3(0u);
+    }
+
+    bool listed = (flags & SCENE_INSTANCE_ACTIVE) != 0u;
+    if (listed != fromActive) {
+        return uvec3(0u);
+    }
+
+    if (!scene_box_visible(view, inst.lo.xyz, inst.hi.xyz) || !scene_box_reached(view, inst.lo.xyz, inst.hi.xyz)) {
+        return uvec3(0u);
+    }
+
+    float radius = length(inst.hi.xyz - inst.lo.xyz) * 0.5;
+    if (radius < uintBitsToFloat(view.meta.w) || scene_too_small(view, inst.lo.xyz, inst.hi.xyz, radius)) {
+        return uvec3(0u);
+    }
+
+    SceneModel m = models[inst.meta.x];
+    vec3 eye = u_eye.xyz;
+    float dist = length(clamp(eye, inst.lo.xyz, inst.hi.xyz) - eye);
+    if (m.bias.y > 0.0 && dist > m.bias.y) {
+        return uvec3(0u);
+    }
+
+    float d = dist * (m.bias.x * inst.lo.w * u_eye.w);
+    uint levels = m.head.x;
+    uint level = 0u;
+    for (uint i = 1u; i < levels; i++) {
+        if (d < scene_lod_distance(m, i)) {
+            break;
+        }
+        level = i;
+    }
+
+    return uvec3(scene_lod_start(m, level), scene_lod_start(m, level + 1u), scene_depth_bin(dist));
+}
+
+void main()
+{
+    uint cp = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uvec2 named = chunkPairs[cp];
+    uint v = named.y;
+    SceneView view = views[v];
+    uint pass = view.meta.x;
+    uint keys = u_counts.w;
+    uint require = u_mode.y | view.meta.y | SCENE_INSTANCE_LIVE;
+    bool fromActive = (named.x & SCENE_ACTIVE_BLOCK) != 0u;
+    uint first;
+    uint count;
+    if (fromActive) {
+        uint block = named.x & ~SCENE_ACTIVE_BLOCK;
+        SceneChunk set = chunks[0];
+        first = set.range.x + block * SCENE_ACTIVE_BLOCK_ROWS;
+        count = min(SCENE_ACTIVE_BLOCK_ROWS, u_counts.y - block * SCENE_ACTIVE_BLOCK_ROWS);
+    } else {
+        SceneChunk c = chunks[named.x];
+        first = c.range.x;
+        count = c.range.y;
+    }
+
+    bool writing = u_mode.x == 1u;
+    uint passFirst = counters[SCENE_COUNTER_PASS_BASE + pass];
+    uint passPairs = counters[SCENE_COUNTER_PASS_BASE + pass + 1u] - passFirst;
+    for (uint k = t; k < keys; k += 64u) {
+        s_base[k] = writing ? matrix[scene_matrix_at(passFirst, passPairs, k, cp)] : 0u;
+        s_count[k] = 0u;
+    }
+    barrier();
+
+    for (uint i0 = 0u; i0 < count; i0 += 64u) {
+        uint i = i0 + t;
+        uvec3 range = uvec3(0u);
+        uint row = 0u;
+        if (i < count) {
+            row = lists[first + i];
+            range = member_runs(row, view, require, fromActive);
+        }
+
+        // this member's pairs, at most SCENE_MEMBER_RUNS, then where they start in the round
+        uint mine = 0u;
+        for (uint r = range.x; r < range.y && mine < SCENE_MEMBER_RUNS; r++) {
+            if (run_key(runs[r], range.z) != SCENE_BUCKET_NONE) {
+                mine += 1u;
+            }
+        }
+
+        s_offset[t] = mine;
+        barrier();
+        for (uint o = 1u; o < 64u; o <<= 1u) {
+            uint add = t >= o ? s_offset[t - o] : 0u;
+            barrier();
+            s_offset[t] += add;
+            barrier();
+        }
+
+        uint at = s_offset[t] - mine;
+        uint n = 0u;
+        for (uint r = range.x; r < range.y && n < mine; r++) {
+            uint key = run_key(runs[r], range.z);
+            if (key != SCENE_BUCKET_NONE) {
+                s_keyOf[at + n] = key;
+                atomicAdd(s_count[key], 1u);
+                n += 1u;
+            }
+        }
+        barrier();
+
+        if (writing) {
+            n = 0u;
+            for (uint r = range.x; r < range.y && n < mine; r++) {
+                SceneRun run = runs[r];
+                uint key = run_key(run, range.z);
+                if (key == SCENE_BUCKET_NONE) {
+                    continue;
+                }
+
+                // the earlier pairs of this key in the round
+                uint rank = 0u;
+                for (uint e = 0u; e < at + n; e++) {
+                    if (s_keyOf[e] == key) {
+                        rank += 1u;
+                    }
+                }
+
+                uint slot = s_base[key] + rank;
+                if (slot < u_caps.y) {
+                    pairs[slot] = uvec4(row, v, run.range.x, run.range.y);
+                    pairWalk[slot] = run.range.y;
+                }
+                n += 1u;
+            }
+        }
+        barrier();
+
+        for (uint k = t; k < keys; k += 64u) {
+            s_base[k] += s_count[k];
+            s_count[k] = 0u;
+        }
+        barrier();
+    }
+
+    if (!writing) {
+        for (uint k = t; k < keys; k += 64u) {
+            matrix[scene_matrix_at(passFirst, passPairs, k, cp)] = s_base[k];
+        }
+    }
+}

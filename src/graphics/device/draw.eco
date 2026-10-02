@@ -9,6 +9,11 @@ public struct DrawStats
 {
     public int32 $draws = 0;
     public int32 $indexed = 0;
+
+    /**
+     * Draws whose arguments the GPU wrote; their vertices and triangles are not counted.
+     */
+    public int32 $indirect = 0;
     public int32 $pipelineBinds = 0;
     public int64 $vertices = 0;
     public int64 $triangles = 0;
@@ -22,6 +27,7 @@ public struct DrawStats
         DrawStats $d = DrawStats();
         $d->draws = sub32($this->draws, $start->draws);
         $d->indexed = sub32($this->indexed, $start->indexed);
+        $d->indirect = sub32($this->indirect, $start->indirect);
         $d->pipelineBinds = sub32($this->pipelineBinds, $start->pipelineBinds);
         $d->vertices = sub64($this->vertices, $start->vertices);
         $d->triangles = sub64($this->triangles, $start->triangles);
@@ -65,6 +71,21 @@ public class DrawCounters
     public function drawIndexed(Topology $top, int32 $count, int32 $instances, int32 $cps = 0) : void
     {
         $this->add($top, $count, $instances, $cps, true);
+    }
+
+    /**
+     * A draw the GPU sized: counted as a draw (and indexed when it is), never as vertices.
+     */
+    public function drawIndirect(Topology $top, bool $indexed) : void
+    {
+        DrawStats $s = $this->frame;
+        $s->draws = $s->draws + 1;
+        $s->indirect = $s->indirect + 1;
+        if ($indexed) {
+            $s->indexed = $s->indexed + 1;
+        }
+
+        $this->frame = $s;
     }
 
     private function add(

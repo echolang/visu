@@ -1,8 +1,11 @@
 /**
- * One culled view set's working buffers: the (instance, view) pairs, the draw items, the
- * counters and the indirect arguments one `GpuScene.cull` fills and `GpuScene.draw` records.
- * The shadow cascades are one set, the shadow atlas pages another, so both can be culled in
- * one frame without sharing a counter. Allocated on first use, sized once.
+ * One culled view set's working buffers: the chunk pairs, the segment matrix, the (instance,
+ * view, run) pairs and their item and triangle counts, the draw items, the triangle indices of a
+ * G-buffer set, the counters and the indirect arguments one `GpuScene` cull fills and its draws
+ * record. The sun cascades, the shadow atlas pages and the main views (camera, mirror, outline)
+ * are one set each, so all three can be culled in a frame without sharing a counter. Every list
+ * has a fixed capacity, chosen per set; what passes it is dropped and counted. Allocated on first
+ * use, sized once.
  */
 
 namespace visu::graphics;
@@ -10,52 +13,296 @@ namespace visu::graphics;
 public class SceneCullSet
 {
     public string $label;
-    public Buffer? $pairs;
-    public Buffer? $items;
-    public Buffer? $counters;
-    public Buffer? $args;
 
     /**
-     * Passes and buckets the last cull sorted by; `draw` must match them.
+     * A G-buffer set sorts by class, tests normal cones and expands triangles into indices for an
+     * indexed draw; a depth set sorts by shadow bucket and draws items as they are.
+     */
+    public const bool $gbuffer;
+    public int32 $chunkPairCap;
+    public int32 $pairCap;
+    public int32 $itemCap;
+    public int32 $triangleCap;
+
+    /**
+     * Passes the matrix and the draws are laid out for at most, keys per pass, and the depth bins
+     * a G-buffer key spans (0 for a depth set): the matrix holds classes times bins keys a pass.
+     */
+    public const int32 $passCap;
+    public const int32 $keyCap;
+    public const int32 $bins;
+    public Buffer? $counters;
+    public Buffer? $args;
+    public Buffer? $chunkPairs;
+    public Buffer? $matrix;
+    public Buffer? $pairs;
+    public Buffer? $pairItems;
+    public Buffer? $pairTriangles;
+    public Buffer? $items;
+
+    /**
+     * A G-buffer set's per-item record for the vertex programs (`SceneDrawItem`, 32 bytes) and
+     * its triangle indices.
+     */
+    public Buffer? $drawItems;
+    public Buffer? $indices;
+
+    /**
+     * The chunk stage's count per (view, 256-candidate tile), scanned in place, and the words it
+     * holds (`fitTiles`).
+     */
+    public Buffer? $chunkTiles;
+    public int32 $tileCap;
+
+    /**
+     * Each pair's meshlet count, scanned into its first flat index, and per meshlet workgroup its
+     * kept items and triangles, scanned into their offsets (`scene_meshlets`).
+     */
+    public Buffer? $pairWalk;
+    public Buffer? $walkItems;
+    public Buffer? $walkTriangles;
+
+    /**
+     * Passes and keys the last cull sorted by; a draw must match them.
      */
     public int32 $passes;
-    public int32 $buckets;
+    public int32 $keys;
+
+    /**
+     * Keys a pass the allocated matrix holds: the keys the first cull used, raised when a later
+     * one uses more (a new G-buffer class). `keyCap` is only the most it may ever reach.
+     */
+    public int32 $matrixKeys;
 
     /**
      * The last cull ran this frame and wrote the arguments.
      */
     public bool $culled;
 
-    public constructor(string $label)
+    public constructor(
+        string $label,
+        bool $gbuffer,
+        int32 $chunkPairs,
+        int32 $pairs,
+        int32 $items,
+        int32 $triangles,
+        int32 $passes,
+        int32 $keys,
+        int32 $bins
+    )
     {
+        assert($passes * $keys <= SCENE_SEGMENTS_MAX, 'scene cull set: more draws than the args hold');
         $this->label = $label;
-        $this->pairs = null;
-        $this->items = null;
+        $this->gbuffer = $gbuffer;
+        $this->chunkPairCap = $chunkPairs;
+        $this->pairCap = $pairs;
+        $this->itemCap = $items;
+        $this->triangleCap = $triangles;
+        $this->passCap = $passes;
+        $this->keyCap = $keys;
+        if ($bins > 0) {
+            $this->keyCap = $keys * $bins;
+        }
+
+        $this->bins = $bins;
         $this->counters = null;
         $this->args = null;
+        $this->chunkPairs = null;
+        $this->matrix = null;
+        $this->pairs = null;
+        $this->pairItems = null;
+        $this->pairTriangles = null;
+        $this->items = null;
+        $this->drawItems = null;
+        $this->indices = null;
+        $this->chunkTiles = null;
+        $this->tileCap = 0;
+        $this->pairWalk = null;
+        $this->walkItems = null;
+        $this->walkTriangles = null;
         $this->passes = 0;
-        $this->buckets = 0;
+        $this->keys = 0;
+        $this->matrixKeys = 0;
         $this->culled = false;
     }
 
-    public function ensure(Device $device) : void
+    /**
+     * Raise the pair, item and (a G-buffer set's) triangle caps to at least `$pairs`, `$items`
+     * and `$triangles`, for a scene reserved for
+     * that many rows: a set sized for a few thousand instances drops whole chunks of a scatter of
+     * hundreds of thousands. Never lowers a cap. A set already allocated is dropped and comes
+     * back at its new size on the next `ensure`. Load only.
+     */
+    public function fit(int32 $pairs, int32 $items, int32 $triangles) : void
     {
-        if ($this->counters != null) {
+        bool $grew = false;
+        if ($this->gbuffer && $triangles > $this->triangleCap) {
+            $this->triangleCap = $triangles;
+            $grew = true;
+        }
+
+        if ($pairs > $this->pairCap) {
+            $this->pairCap = $pairs;
+            $grew = true;
+        }
+
+        if ($items > $this->itemCap) {
+            $this->itemCap = $items;
+            $grew = true;
+        }
+
+        if ($grew && $this->counters != null) {
+            $this->destroy();
+        }
+    }
+
+    /**
+     * Matrix entries for `$keys` keys over every chunk pair the set holds, plus the one the scan
+     * leaves the total in. The matrix is dense (a region per pass of its keys times its chunk
+     * pairs), so passes do not multiply it.
+     */
+    public const function matrixWords(int32 $keys) : int32
+    {
+        return $keys * $this->chunkPairCap + 1;
+    }
+
+    /**
+     * The byte offset of segment `$segment`'s draw in `args`.
+     */
+    public const function drawOffset(int32 $segment) : uint64
+    {
+        return ((SCENE_ARGS_DRAW_BASE + $segment * SCENE_DRAW_WORDS) * 4) as uint64;
+    }
+
+    /**
+     * Room for `$chunkPairs` chunk pairs a cull, rounded up to a power of two so a scene whose
+     * chunks fill as its rows ramp in reallocates a few times, never a frame of steady play. A
+     * set already allocated is dropped and comes back at the new size on the next `ensure`.
+     */
+    public function fitChunks(int32 $chunkPairs) : void
+    {
+        if ($chunkPairs <= $this->chunkPairCap) {
             return;
         }
 
-        $this->pairs = Buffer($device, BufferDesc(BUFFER_STORAGE, (SCENE_MAX_PAIRS * 16) as uint64, "{$this->label}.pairs"));
-        $this->items = Buffer($device, BufferDesc(BUFFER_STORAGE, (SCENE_MAX_ITEMS * 16) as uint64, "{$this->label}.items"));
-        $this->counters = Buffer($device, BufferDesc(BUFFER_STORAGE, (SCENE_COUNTER_WORDS * 4) as uint64, "{$this->label}.counters"));
-        $this->args = Buffer($device, BufferDesc(BUFFER_STORAGE | BUFFER_INDIRECT, (SCENE_ARGS_WORDS * 4) as uint64, "{$this->label}.args"));
+        int32 $cap = $this->chunkPairCap;
+        while ($cap < $chunkPairs) {
+            $cap = $cap * 2;
+        }
+
+        $this->chunkPairCap = $cap;
+        if ($this->counters != null) {
+            $this->destroy();
+        }
+    }
+
+    /**
+     * Room for `$words` chunk stage tile counts (views times tiles, plus the total), doubling.
+     * Its own buffer, so a set whose chunks fill keeps the rest of its lists.
+     */
+    public function fitTiles(Device $device, int32 $words) : void
+    {
+        if ($words <= $this->tileCap && $this->chunkTiles != null) {
+            return;
+        }
+
+        int32 $cap = 1024;
+        while ($cap < $words) {
+            $cap = $cap * 2;
+        }
+
+        $this->chunkTiles = dropBuffer($this->chunkTiles);
+        $this->tileCap = $cap;
+        string $l = $this->label;
+        $this->chunkTiles = Buffer($device, BufferDesc(BUFFER_STORAGE, ($cap * 4) as uint64, "{$l}.chunktiles"));
+    }
+
+    /**
+     * The buffers, the matrix sized for `$keys` keys a pass; more keys than it was sized for
+     * reallocates it.
+     */
+    public function ensure(Device $device, int32 $keys) : void
+    {
+        if ($this->counters != null && $keys <= $this->matrixKeys) {
+            return;
+        }
+
+        if ($this->counters != null) {
+            $this->destroy();
+        }
+
+        $this->matrixKeys = $keys;
+        string $l = $this->label;
+        $this->counters = Buffer($device, BufferDesc(BUFFER_STORAGE, (SCENE_COUNTER_WORDS * 4) as uint64, "{$l}.counters"));
+        $this->args = Buffer($device, BufferDesc(BUFFER_STORAGE | BUFFER_INDIRECT, (SCENE_ARGS_WORDS * 4) as uint64, "{$l}.args"));
+        $this->chunkPairs = Buffer($device, BufferDesc(BUFFER_STORAGE, ($this->chunkPairCap * 8) as uint64, "{$l}.chunkpairs"));
+        $this->matrix = Buffer($device, BufferDesc(BUFFER_STORAGE, ($this->matrixWords($this->matrixKeys) * 4) as uint64, "{$l}.matrix"));
+        $this->pairs = Buffer($device, BufferDesc(BUFFER_STORAGE, ($this->pairCap * 16) as uint64, "{$l}.pairs"));
+        $this->pairItems = Buffer($device, BufferDesc(BUFFER_STORAGE, (($this->pairCap + 1) * 4) as uint64, "{$l}.pairitems"));
+        // a depth set never reads the triangle counts, but the kernels bind them
+        int32 $triangleWords = 1;
+        if ($this->gbuffer) {
+            $triangleWords = $this->pairCap + 1;
+        }
+
+        $this->pairTriangles = Buffer($device, BufferDesc(BUFFER_STORAGE, ($triangleWords * 4) as uint64, "{$l}.pairtriangles"));
+        $this->pairWalk = Buffer($device, BufferDesc(BUFFER_STORAGE, (($this->pairCap + 1) * 4) as uint64, "{$l}.pairwalk"));
+        $this->walkItems = Buffer($device, BufferDesc(BUFFER_STORAGE, ($this->walkGroups() + 1) as uint64 * 4, "{$l}.walkitems"));
+        int32 $walkTriangleWords = 1;
+        if ($this->gbuffer) {
+            $walkTriangleWords = $this->walkGroups() + 1;
+        }
+
+        $this->walkTriangles = Buffer($device, BufferDesc(BUFFER_STORAGE, ($walkTriangleWords * 4) as uint64, "{$l}.walktriangles"));
+        $this->items = Buffer($device, BufferDesc(BUFFER_STORAGE, ($this->itemCap * 16) as uint64, "{$l}.items"));
+        if ($this->gbuffer) {
+            $this->drawItems = Buffer($device, BufferDesc(BUFFER_STORAGE, ($this->itemCap * 32) as uint64, "{$l}.drawitems"));
+            $this->indices = Buffer($device, BufferDesc(BUFFER_STORAGE | BUFFER_INDEX, (($this->triangleCap as uint64) * 12), "{$l}.indices"));
+        }
+    }
+
+    /**
+     * Meshlet workgroups the set may run: `SCENE_WALK_PER_ITEM` meshlets walked per item it
+     * holds, 64 a workgroup.
+     */
+    public const function walkGroups() : int32
+    {
+        return ($this->itemCap * SCENE_WALK_PER_ITEM + 63) / 64;
+    }
+
+    /**
+     * Bytes the set's buffers hold once allocated, for the `scene` verb.
+     */
+    public const function bytes() : int64
+    {
+        int64 $n = ((SCENE_COUNTER_WORDS + SCENE_ARGS_WORDS) as int64) * 4;
+        $n = $n + ($this->chunkPairCap as int64) * 8 + ($this->matrixWords($this->matrixKeys) as int64) * 4;
+        $n = $n + ($this->pairCap as int64) * 16 + (($this->pairCap + 1) as int64) * 8 + ($this->itemCap as int64) * 16;
+        $n = $n + (($this->walkGroups() + 1) as int64) * 8;
+        if ($this->gbuffer) {
+            $n = $n + (($this->pairCap + 1) as int64) * 4 + ($this->itemCap as int64) * 32 + ($this->triangleCap as int64) * 12;
+        }
+
+        return $n;
     }
 
     public function destroy() : void
     {
-        $this->pairs = dropBuffer($this->pairs);
-        $this->items = dropBuffer($this->items);
         $this->counters = dropBuffer($this->counters);
         $this->args = dropBuffer($this->args);
+        $this->chunkPairs = dropBuffer($this->chunkPairs);
+        $this->matrix = dropBuffer($this->matrix);
+        $this->pairs = dropBuffer($this->pairs);
+        $this->pairItems = dropBuffer($this->pairItems);
+        $this->pairTriangles = dropBuffer($this->pairTriangles);
+        $this->items = dropBuffer($this->items);
+        $this->drawItems = dropBuffer($this->drawItems);
+        $this->indices = dropBuffer($this->indices);
+        $this->chunkTiles = dropBuffer($this->chunkTiles);
+        $this->tileCap = 0;
+        $this->pairWalk = dropBuffer($this->pairWalk);
+        $this->walkItems = dropBuffer($this->walkItems);
+        $this->walkTriangles = dropBuffer($this->walkTriangles);
         $this->culled = false;
     }
 }

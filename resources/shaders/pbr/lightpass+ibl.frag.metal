@@ -85,6 +85,7 @@ struct LightGpu
     float4 color_intensity;
     float4 source;
     float4 flicker;
+    float4 spot;
 };
 
 struct CameraUniforms
@@ -171,6 +172,7 @@ struct LightGpu_1
     float4 color_intensity;
     float4 source;
     float4 flicker;
+    float4 spot;
 };
 
 struct LightTableBuffer
@@ -1581,6 +1583,7 @@ fragment fs_out fs(fs_in in [[stage_in]], const device LightTableBuffer& _3567 [
                 _3572.color_intensity = _3567.u_lights[slot].color_intensity;
                 _3572.source = _3567.u_lights[slot].source;
                 _3572.flicker = _3567.u_lights[slot].flicker;
+                _3572.spot = _3567.u_lights[slot].spot;
                 LightGpu l = _3572;
                 float4 pr = l.position_radius;
                 float3 toLight = pr.xyz - s.P;

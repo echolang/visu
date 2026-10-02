@@ -28,11 +28,21 @@ public class GpuTable<T>
     private int32 $capacity;
 
     /**
+     * Rows `grow` sizes the buffer for at least (`reserve`), so the rows under it never regrow it.
+     */
+    private int32 $floor;
+
+    /**
      * Rows in use: one past the highest row ever set since the last `clear`.
      */
     public int32 $rows;
     private array<uint32> $pending;
-    private map<int32, int32> $pendingAt;
+
+    /**
+     * Each row's record offset in `pending` this frame, -1 when it has none: a second set of a
+     * row finds its record without hashing.
+     */
+    private array<int32> $pendingAt;
     private int32 $records;
 
     public constructor(Device $device, string $label)
@@ -42,9 +52,10 @@ public class GpuTable<T>
         $this->label = $label;
         $this->table = null;
         $this->capacity = 0;
+        $this->floor = 0;
         $this->rows = 0;
         $this->pending = array<uint32>();
-        $this->pendingAt = map<int32, int32>();
+        $this->pendingAt = array<int32>();
         $this->records = 0;
     }
 
@@ -56,18 +67,24 @@ public class GpuTable<T>
     {
         assert($row >= 0, 'gpu table: row');
         usize $words = mem::size<T>() / 4;
+        while ($this->pendingAt->count() <= ($row as usize)) {
+            $this->pendingAt[] = -1;
+        }
+
         usize $at = 0;
-        if ($this->pendingAt->has($row)) {
-            $at = $this->pendingAt[$row] as usize;
+        if ($this->pendingAt[$row as usize] >= 0) {
+            $at = $this->pendingAt[$row as usize] as usize;
         } else {
             $at = $this->pending->count();
-            $this->pending[] = $row as uint32;
-            usize $w = 0;
-            while ($w < $words) {
-                $this->pending[] = 0;
-                $w = $w + 1;
+            // one record: the row, then its words, taken in one step (the copy below fills them)
+            if ($this->pending->room() < $words + 1) {
+                $this->pending->reserve(($at + $words + 1) * 2);
             }
-            $this->pendingAt[$row] = $at as int32;
+
+            $this->pending->spare();
+            $this->pending->commit($words + 1);
+            $this->pending[$at] = $row as uint32;
+            $this->pendingAt[$row as usize] = $at as int32;
             $this->records = $this->records + 1;
         }
 
@@ -77,6 +94,25 @@ public class GpuTable<T>
         mem::copy<uint8>(ptr<uint8>($dst:$), ptr<uint8>($src:$), $words * 4);
         if ($row >= $this->rows) {
             $this->rows = $row + 1;
+        }
+    }
+
+    /**
+     * Size the buffer for `$rows` rows at its next `grow`, and the queue for as many sets in one
+     * frame, so setting rows below it grows nothing in a displayed frame.
+     */
+    public function reserve(int32 $rows) : void
+    {
+        if ($rows <= $this->floor) {
+            return;
+        }
+
+        $this->floor = $rows;
+        usize $words = mem::size<T>() / 4;
+        $this->pending->reserve(($rows as usize) * ($words + 1));
+        $this->pendingAt->reserve($rows as usize);
+        while ($this->pendingAt->count() < ($rows as usize)) {
+            $this->pendingAt[] = -1;
         }
     }
 
@@ -103,12 +139,12 @@ public class GpuTable<T>
     public function grow(RenderContext $ctx) : void
     {
         // a table nothing was set in still gets a buffer, so a kernel can bind it
-        if ($this->table != null && $this->rows <= $this->capacity) {
+        if ($this->table != null && $this->rows <= $this->capacity && $this->floor <= $this->capacity) {
             return;
         }
 
         int32 $cap = 64;
-        while ($cap < $this->rows) {
+        while ($cap < $this->rows || $cap < $this->floor) {
             $cap = $cap * 2;
         }
 
@@ -145,9 +181,7 @@ public class GpuTable<T>
         $enc->bindStorage(0, $table);
         $enc->bindStorage(1, transient: $slice);
         $enc->dispatch($rowWords * ($this->records as uint32));
-        $this->pending->clear();
-        $this->pendingAt->clear();
-        $this->records = 0;
+        $this->forgetPending();
     }
 
     /**
@@ -164,8 +198,31 @@ public class GpuTable<T>
         $this->table = null;
         $this->capacity = 0;
         $this->rows = 0;
+        $this->forgetPending();
+    }
+
+    /**
+     * Rows queued and not yet scattered.
+     */
+    public const function queued() : int32
+    {
+        return $this->records;
+    }
+
+    /**
+     * Drop the queue: each record's row forgets its offset, O(records).
+     */
+    private function forgetPending() : void
+    {
+        usize $stride = (mem::size<T>() / 4) + 1;
+        usize $at = 0;
+        usize $n = $this->pending->count();
+        while ($at < $n) {
+            $this->pendingAt[$this->pending[$at] as usize] = -1;
+            $at = $at + $stride;
+        }
+
         $this->pending->clear();
-        $this->pendingAt->clear();
         $this->records = 0;
     }
 }

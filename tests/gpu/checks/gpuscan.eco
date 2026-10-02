@@ -1,0 +1,107 @@
+/**
+ * GpuScan agrees with a CPU exclusive scan: 5000 values starting 7 into a buffer (two levels of
+ * block totals) and 1.1 million (three levels), with the values around them left alone. The
+ * indirect scan reads its count from a GPU buffer and scans only that many of a larger capacity:
+ * the values past the count stay as they were.
+ */
+
+use visu::graphics::{
+    BUFFER_STORAGE, Buffer, CallbackPass, ComputeEncoder, Device, Frame, GpuScan, IoSink,
+    Pipeline, PipelineError, RenderContext
+};
+
+public function checkGpuScan(GpuContext $gpu) : void
+{
+    checkGpuScanCount($gpu, 5000, 7, 0);
+    checkGpuScanCount($gpu, 1100000, 0, 0);
+    checkGpuScanCount($gpu, 5000, 7, 70000);
+    checkGpuScanCount($gpu, 1100000, 3, 1500000);
+}
+
+/**
+ * Scan `$count` values from `$first`; with `$most` above zero through `scanIndirect`, the count
+ * in a GPU buffer and the levels laid out for `$most`.
+ */
+internal function checkGpuScanCount(GpuContext $gpu, uint32 $count, uint32 $first, uint32 $most) : void
+{
+    Device $device = $gpu->device;
+    uint32 $capacity = $count;
+    if ($most > $capacity) {
+        $capacity = $most;
+    }
+
+    GpuScan $scan = guard GpuScan::load($device, $capacity) else ($e) {
+        die($e->message());
+    }
+    uint32 $total = $first + $capacity + 3;
+    array<uint32> $values = array<uint32>();
+    $values->reserve($total as usize);
+    uint32 $i = 0;
+    while ($i < $total) {
+        // small odd counts, some zero, like a compaction's per-item survivors
+        uint32 $v = ((($i as uint64) * (2654435761 as uint64)) >> 29) as uint32;
+        $values[] = $v;
+        $i = $i + 1;
+    }
+
+    ptr<const uint32> $src = $values->data();
+    Buffer $buf = Buffer($device, BUFFER_STORAGE, ptr<const uint8>($src:$), ($total * 4) as uint64);
+    // the count at word 2 of its buffer, as a cull stage leaves it in its counters
+    array<uint32> $words = array<uint32>();
+    $words[] = 0;
+    $words[] = 0;
+    $words[] = $count;
+    $words[] = 0;
+    ptr<const uint32> $countSrc = $words->data();
+    Buffer $counts = Buffer($device, BUFFER_STORAGE, ptr<const uint8>($countSrc:$), 16 as uint64);
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        $p->add(CallbackPass(
+            'scan',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+            },
+            execute: function(RenderContext $ctx) : status<PipelineError> {
+                ComputeEncoder $enc = $ctx->beginCompute();
+                if ($most > 0) {
+                    $scan->scanIndirect($enc, $buf, $first, $counts, 2, $most);
+                } else {
+                    $scan->scan($enc, $buf, $first, $count);
+                }
+                $enc->endCompute();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $bytes = guard $device->readbackBuffer($buf, 0 as uint64, ($total * 4) as uint64) else ($e) {
+        die($e->message());
+    }
+    $buf->destroy();
+    $counts->destroy();
+    uint32 $running = 0;
+    $i = 0;
+    while ($i < $total) {
+        usize $at = ($i * 4) as usize;
+        uint32 $got = ($bytes[$at] as uint32)
+            | (($bytes[$at + 1] as uint32) << 8)
+            | (($bytes[$at + 2] as uint32) << 16)
+            | (($bytes[$at + 3] as uint32) << 24);
+        if ($i < $first || $i >= $first + $count) {
+            assert($got == $values[$i as usize], 'scan: values outside the range stay');
+        } else {
+            assert($got == $running, 'scan: each value is the sum of the ones before it');
+            $running = $running + $values[$i as usize];
+        }
+        $i = $i + 1;
+    }
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_scan
+{
+    GpuContext $gpu = gpuHidden('scan');
+    checkGpuScan($gpu);
+    $gpu->end();
+}
+#[end]

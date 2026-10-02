@@ -7,7 +7,7 @@
 
 namespace visu::graphics;
 
-use visu::math::Vec4;
+use visu::math::{Vec2, Vec4};
 
 /**
  * Most rows: a visible key keeps the slot in its low `LIGHT_SLOT_BITS` bits.
@@ -16,10 +16,14 @@ public const int32 LIGHT_SLOTS_MAX = 8192;
 public const uint32 LIGHT_SLOT_BITS = 13;
 
 /**
- * One light row (std430 `LightGpu` in `visu/light_gpu.glsl`, 64 bytes).
- * `positionRadius` xyz world position, w radius (0 marks a free slot); `colorIntensity` rgb
- * linear colour, w base intensity; `source` x source radius, y 1 when it casts, z normal offset,
- * w slope bias; `flicker` x amplitude, y speed in radians a second, z phase.
+ * One light row (std430 `LightGpu` in `visu/light_gpu.glsl`, 80 bytes).
+ * `positionRadius` xyz world position, w radius (0 marks a free slot or a dark light);
+ * `colorIntensity` rgb linear colour, w base intensity; `source` x source radius, y 1 when it
+ * casts, z normal offset, w slope bias; `flicker` x amplitude, y speed in radians a second,
+ * z phase, w a spot's cone offset; `spot` xyz a spot's world axis, w its cone scale. The cone is
+ * `clamp(dot(axis, d) * scale + offset)` squared, with scale `1 / (cos inner - cos outer)` and
+ * offset `-cos outer * scale` (`spotCone`); a light that shines every way has scale 0 and
+ * offset 1.
  */
 public struct LightGpu
 {
@@ -27,12 +31,23 @@ public struct LightGpu
     public Vec4 $colorIntensity;
     public Vec4 $source;
     public Vec4 $flicker;
+    public Vec4 $spot;
 }
 
 operator (const LightGpu& $a) == (const LightGpu& $b) : bool
 {
     return $a->positionRadius == $b->positionRadius && $a->colorIntensity == $b->colorIntensity
-        && $a->source == $b->source && $a->flicker == $b->flicker;
+        && $a->source == $b->source && $a->flicker == $b->flicker && $a->spot == $b->spot;
+}
+
+/**
+ * A row that shades nothing and is culled before anything reads it: a free slot, or a light
+ * whose radius or intensity is zero. It holds no position, so a dark light that moves never
+ * rewrites it.
+ */
+public function darkLight() : LightGpu
+{
+    return LightGpu(Vec4(0.0f), Vec4(0.0f), Vec4(0.0f), Vec4(0.0f), Vec4(0.0f));
 }
 
 public class LightTable
@@ -56,6 +71,19 @@ public class LightTable
      */
     public int32 $live;
 
+    /**
+     * Rows holding a lit spot (a cone scale above zero). The light pass runs its spot variant
+     * only while this is above zero, so a table of lights that shine every way never pays for
+     * the cone. Kept on every write, never counted.
+     */
+    public int32 $spots;
+
+    /**
+     * The largest radius any casting light has had since the table was cleared: how far a
+     * shadow page's casters can be from its light. It only grows, so it is always safe.
+     */
+    public float32 $reach;
+
     public constructor(Device $device)
     {
         $this->rows = GpuTable<LightGpu>($device, 'lights.table');
@@ -63,6 +91,8 @@ public class LightTable
         $this->mirror = array<LightGpu>();
         $this->changed = array<int32>();
         $this->live = 0;
+        $this->spots = 0;
+        $this->reach = 0.0f;
     }
 
     /**
@@ -96,8 +126,7 @@ public class LightTable
      */
     public function remove(int32 $slot) : void
     {
-        LightGpu $dark = LightGpu(Vec4(0.0f), Vec4(0.0f), Vec4(0.0f), Vec4(0.0f));
-        $this->write($slot, $dark);
+        $this->write($slot, darkLight());
         $this->free[] = $slot;
         $this->live = $this->live - 1;
     }
@@ -137,6 +166,8 @@ public class LightTable
         $this->mirror->clear();
         $this->changed->clear();
         $this->live = 0;
+        $this->spots = 0;
+        $this->reach = 0.0f;
     }
 
     /**
@@ -151,11 +182,52 @@ public class LightTable
         }
 
         while (($this->mirror->count() as int32) <= $slot) {
-            $this->mirror[] = LightGpu(Vec4(0.0f), Vec4(0.0f), Vec4(0.0f), Vec4(0.0f));
+            $this->mirror[] = darkLight();
         }
 
         $this->changed[] = $slot;
+        if ($this->mirror[$slot as usize]->spot->w > 0.0f) {
+            $this->spots = $this->spots - 1;
+        }
+        if ($row->spot->w > 0.0f) {
+            $this->spots = $this->spots + 1;
+        }
+        if ($row->source->y > 0.5f && $row->positionRadius->w > $this->reach) {
+            $this->reach = $row->positionRadius->w;
+        }
         $this->mirror[$slot as usize] = $row;
         $this->rows->set($slot, $row);
     }
+}
+
+/**
+ * A spot's cone as the row holds it: the scale in x and the offset in y, from the half-angles
+ * (radians) inside which it is full and past which it is dark.
+ */
+public function spotCone(float32 $inner, float32 $outer) : Vec2
+{
+    float32 $o = std::math::clamp($outer, 0.0002f, std::math::PI_F32);
+    float32 $i = std::math::clamp($inner, 0.0f, $o - 0.0001f);
+    float32 $cosOuter = std::math::cos($o);
+    float32 $scale = 1.0f / std::math::max(std::math::cos($i) - $cosOuter, 0.0001f);
+    return Vec2($scale, -$cosOuter * $scale);
+}
+
+test spot_cone_is_full_inside_dark_outside_and_ramps_between {
+    Vec2 $c = spotCone(0.3f, 0.5f);
+    float32 $axis = std::math::clamp(1.0f * $c->x + $c->y, 0.0f, 1.0f);
+    float32 $inner = std::math::clamp(std::math::cos(0.29f) * $c->x + $c->y, 0.0f, 1.0f);
+    float32 $between = std::math::clamp(std::math::cos(0.4f) * $c->x + $c->y, 0.0f, 1.0f);
+    float32 $outside = std::math::clamp(std::math::cos(0.51f) * $c->x + $c->y, 0.0f, 1.0f);
+    assert($axis == 1.0f);
+    assert($inner == 1.0f);
+    assert($between > 0.0f && $between < 1.0f);
+    assert($outside == 0.0f);
+}
+
+test spot_cone_keeps_inner_inside_outer {
+    Vec2 $c = spotCone(0.9f, 0.4f);
+    assert($c->x > 0.0f);
+    float32 $past = std::math::clamp(std::math::cos(0.41f) * $c->x + $c->y, 0.0f, 1.0f);
+    assert($past == 0.0f);
 }

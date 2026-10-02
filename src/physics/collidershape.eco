@@ -1,0 +1,57 @@
+/**
+ * What a collider is shaped like, in the entity's local units before its `Transform` scale. A
+ * value, not a backend object: `PhysicsWorld` turns it into one and shares that between every
+ * body of the same shape and scale.
+ */
+
+namespace visu::physics;
+
+use visu::geo::Heightmap;
+use visu::math::Vec3;
+
+public enum ColliderShape
+{
+    /**
+     * A box by half its size on each axis, centred on the collider.
+     */
+    case box(Vec3 $half);
+
+    case sphere(float32 $radius);
+
+    /**
+     * An upright capsule: `$height` is the straight middle part along +Y, and the two caps add
+     * `$radius` at each end, so the whole capsule is `height + 2 * radius` tall.
+     */
+    case capsule(float32 $radius, float32 $height);
+
+    /**
+     * An upright cylinder. `$half.y` is half its height; `$half.x` its radius.
+     */
+    case cylinder(Vec3 $half);
+
+    /**
+     * The heightmap's own samples, read in place: nothing is copied or scanned, and a height
+     * written into the map is felt by the next query. Static only. The entity's `Transform`
+     * position moves it; its rotation and scale are ignored, since the map already knows its
+     * cell size. Its range is the map's `min` to `max` when the collider is attached.
+     */
+    case heightfield(Heightmap $map);
+
+    /**
+     * A triangle mesh, for ground or scenery no primitive fits (a road). Static only. The
+     * entity's whole `Transform` places it, scale included; a rescale rebuilds its tree.
+     */
+    case mesh(CollisionMesh $mesh);
+}
+
+/**
+ * Whether a moving body can wear `$shape`: a heightfield and a mesh only stand still.
+ */
+public function colliderMoves(const ColliderShape& $shape) : bool
+{
+    return match ($shape) {
+        ColliderShape::heightfield($map) => false,
+        ColliderShape::mesh($mesh) => false,
+        else => true,
+    };
+}

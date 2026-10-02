@@ -6,49 +6,96 @@
 
 using namespace metal;
 
-struct ModelMaterialData
+struct ModelMaterial
 {
-    float4 u_base_color;
-    float4 u_factors;
-    float4 u_uv_scale;
+    float4 base_color;
+    float4 factors;
+    float4 uv_scale;
+    float4 emissive;
+    uint4 maps0;
+    uint4 maps1;
+};
+
+struct ModelMaterial_1
+{
+    float4 base_color;
+    float4 factors;
+    float4 uv_scale;
+    float4 emissive;
+    uint4 maps0;
+    uint4 maps1;
+};
+
+struct MaterialTable
+{
+    ModelMaterial_1 materials[1];
+};
+
+struct spvDescriptorSetBuffer3
+{
+    array<sampler, 16> u_tableSamplers [[id(0)]];
+    array<texture2d<float>, 4096> u_tableTextures [[id(16)]];
 };
 
 struct fs_in
 {
     float2 v_uv [[user(locn0)]];
+    uint v_material [[user(locn1)]];
 };
 
 static inline __attribute__((always_inline))
-bool alpha_cutout(thread const float2& meshUv, constant ModelMaterialData& _19, texture2d<float> map_albedo, sampler map_albedoSmplr, texture2d<float> map_alpha, sampler map_alphaSmplr)
+float4 table_sample(thread const uint& tex, thread const uint& samp, thread const float2& uv, constant array<texture2d<float>, 4096>& u_tableTextures, constant array<sampler, 16>& u_tableSamplers)
 {
-    float2 uv = meshUv * _19.u_uv_scale.xy;
-    int flags = int(_19.u_factors.z + 0.5);
+    uint _33 = tex;
+    uint _43 = samp;
+    return u_tableTextures[_33].sample(u_tableSamplers[_43], uv);
+}
+
+static inline __attribute__((always_inline))
+bool table_alpha_cutout(thread const ModelMaterial& mat, thread const float2& meshUv, constant array<texture2d<float>, 4096>& u_tableTextures, constant array<sampler, 16>& u_tableSamplers)
+{
+    float2 uv = meshUv * mat.uv_scale.xy;
+    int flags = int(mat.factors.z + 0.5);
     float alpha = 1.0;
     if ((flags & 1) != 0)
     {
-        alpha = map_albedo.sample(map_albedoSmplr, uv).w;
+        uint param = mat.maps0.x;
+        uint param_1 = 0u;
+        float2 param_2 = uv;
+        alpha = table_sample(param, param_1, param_2, u_tableTextures, u_tableSamplers).w;
     }
     if ((flags & 32) != 0)
     {
-        alpha = map_alpha.sample(map_alphaSmplr, uv).x;
+        uint param_3 = mat.maps1.y;
+        uint param_4 = 0u;
+        float2 param_5 = uv;
+        alpha = table_sample(param_3, param_4, param_5, u_tableTextures, u_tableSamplers).x;
     }
-    bool _71 = _19.u_base_color.w > 0.0;
-    bool _78;
-    if (_71)
+    bool _110 = mat.base_color.w > 0.0;
+    bool _117;
+    if (_110)
     {
-        _78 = alpha < _19.u_base_color.w;
+        _117 = alpha < mat.base_color.w;
     }
     else
     {
-        _78 = _71;
+        _117 = _110;
     }
-    return _78;
+    return _117;
 }
 
-fragment void fs(fs_in in [[stage_in]], constant ModelMaterialData& _19 [[buffer(2)]], texture2d<float> map_albedo [[texture(0)]], texture2d<float> map_alpha [[texture(5)]], sampler map_albedoSmplr [[sampler(0)]], sampler map_alphaSmplr [[sampler(5)]])
+fragment void fs(fs_in in [[stage_in]], constant spvDescriptorSetBuffer3& spvDescriptorSet3 [[buffer(18)]], const device MaterialTable& _124 [[buffer(14)]])
 {
-    float2 param = in.v_uv;
-    if (alpha_cutout(param, _19, map_albedo, map_albedoSmplr, map_alpha, map_alphaSmplr))
+    ModelMaterial _134;
+    _134.base_color = _124.materials[in.v_material].base_color;
+    _134.factors = _124.materials[in.v_material].factors;
+    _134.uv_scale = _124.materials[in.v_material].uv_scale;
+    _134.emissive = _124.materials[in.v_material].emissive;
+    _134.maps0 = _124.materials[in.v_material].maps0;
+    _134.maps1 = _124.materials[in.v_material].maps1;
+    ModelMaterial param = _134;
+    float2 param_1 = in.v_uv;
+    if (table_alpha_cutout(param, param_1, spvDescriptorSet3.u_tableTextures, spvDescriptorSet3.u_tableSamplers))
     {
         discard_fragment();
     }

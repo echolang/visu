@@ -1,0 +1,387 @@
+/**
+ * The form of a model that GPU-driven views pull their vertices from: every cooked vertex in
+ * arena word order (position, uv, normal, tangent, then joints and weights for a skinned model),
+ * and every LOD's primitives cut into meshlets of at most `MESHLET_VERTICES` vertices and
+ * `MESHLET_TRIANGLES` triangles. A meshlet keeps a local vertex list, its triangles as three
+ * local indices packed in one word, a bounding sphere and a normal cone. `buildModel` makes it
+ * from the cooked bytes, and the `ModelBank` moves it into its `MeshArena` and drops it, so the
+ * CPU copy lives only between load and upload.
+ * The builder is greedy and keeps the cooked triangle order: a meshlet takes triangles in turn
+ * until the next one would pass either limit, so the meshlets of a primitive, end to end, are its
+ * triangles in the order they were cooked.
+ */
+
+namespace visu::graphics;
+
+use visu::asset::{CookedModel, ModelPrimitive};
+use visu::math::{Vec3, cross, dot, length, max, min, normalize};
+
+/**
+ * Vertices and triangles one meshlet holds at most: the unit the GPU culls and draws, and the
+ * width of a local vertex index (six bits).
+ */
+public const int32 MESHLET_VERTICES = 64;
+public const int32 MESHLET_TRIANGLES = 64;
+
+/**
+ * Words per arena vertex of a rigid model: position xyz, uv, normal xyz, tangent xyzw. The depth
+ * views read the first five.
+ */
+public const int32 ARENA_RIGID_WORDS = 12;
+
+/**
+ * Words per arena vertex of a skinned model: the rigid twelve, then the four joint bytes and the
+ * four weight bytes as they were cooked.
+ */
+public const int32 ARENA_SKINNED_WORDS = 14;
+
+/**
+ * The normal cone cutoff that never culls: a meshlet whose normals spread past what a cone can
+ * bound, or one drawn double-sided.
+ */
+public const float32 MESHLET_CONE_OPEN = 1.0f;
+
+/**
+ * One meshlet of one primitive, so one material slot. `firstVertex` and `firstTriangle` index the
+ * form's vertex list and triangle words; the cone is the average normal and the sine cutoff of the
+ * sphere test `dot(centre - eye, axis) >= cutoff * |centre - eye| + radius`.
+ */
+public struct FormMeshlet
+{
+    public int32 $firstVertex;
+    public int32 $vertices;
+    public int32 $firstTriangle;
+    public int32 $triangles;
+    public int32 $slot;
+    public Vec3 $center;
+    public float32 $radius;
+    public Vec3 $axis;
+    public float32 $cutoff;
+}
+
+public class ModelForm
+{
+    /**
+     * `stride` words per vertex, in cooked vertex order, as raw bits.
+     */
+    public array<uint32> $words;
+    public int32 $stride;
+
+    /**
+     * Each meshlet's vertices, model-local vertex indices, meshlet after meshlet.
+     */
+    public array<uint32> $vertexList;
+
+    /**
+     * Each meshlet's triangles, three local vertex indices a word (bits 0, 8 and 16).
+     */
+    public array<uint32> $triangles;
+    public array<FormMeshlet> $meshlets;
+
+    /**
+     * Level `l` is meshlets `lodStart[l] .. lodStart[l + 1]`.
+     */
+    public array<int32> $lodStart;
+
+    public constructor(int32 $stride)
+    {
+        $this->words = array<uint32>();
+        $this->stride = $stride;
+        $this->vertexList = array<uint32>();
+        $this->triangles = array<uint32>();
+        $this->meshlets = array<FormMeshlet>();
+        $this->lodStart = array<int32>();
+    }
+}
+
+/**
+ * The arena form of `$cooked`. O(vertices + indices), at load or adopt time only.
+ */
+public function modelForm(const CookedModel& $cooked) : ModelForm
+{
+    bool $skinned = $cooked->skeleton != null;
+    int32 $stride = ARENA_RIGID_WORDS;
+    if ($skinned) {
+        $stride = ARENA_SKINNED_WORDS;
+    }
+
+    ModelForm $form = ModelForm($stride);
+    int32 $vertexBytes = $cooked->vertexBytes();
+    int32 $vertices = ($cooked->vertices->size() as int32) / $vertexBytes;
+    $form->words->reserve(($vertices * $stride) as usize);
+    int32 $v = 0;
+    while ($v < $vertices) {
+        usize $at = ($v * $vertexBytes) as usize;
+        // the cooked vertex is position 0, normal 12, tangent 24, uv 40, joints 48, weights 52
+        $form->words[] = u32le($cooked->vertices, $at);
+        $form->words[] = u32le($cooked->vertices, $at + 4);
+        $form->words[] = u32le($cooked->vertices, $at + 8);
+        $form->words[] = u32le($cooked->vertices, $at + 40);
+        $form->words[] = u32le($cooked->vertices, $at + 44);
+        $form->words[] = u32le($cooked->vertices, $at + 12);
+        $form->words[] = u32le($cooked->vertices, $at + 16);
+        $form->words[] = u32le($cooked->vertices, $at + 20);
+        $form->words[] = u32le($cooked->vertices, $at + 24);
+        $form->words[] = u32le($cooked->vertices, $at + 28);
+        $form->words[] = u32le($cooked->vertices, $at + 32);
+        $form->words[] = u32le($cooked->vertices, $at + 36);
+        if ($skinned) {
+            $form->words[] = u32le($cooked->vertices, $at + 48);
+            $form->words[] = u32le($cooked->vertices, $at + 52);
+        }
+
+        $v = $v + 1;
+    }
+
+    array<uint32> $indices = cookedIndices($cooked);
+    // the meshlet each vertex was last given a local index in, and that index
+    array<int32> $owner = array<int32>();
+    array<int32> $local = array<int32>();
+    $owner->reserve($vertices as usize);
+    $local->reserve($vertices as usize);
+    $v = 0;
+    while ($v < $vertices) {
+        $owner[] = -1;
+        $local[] = 0;
+        $v = $v + 1;
+    }
+
+    foreach ($cooked->lods as $lod) {
+        $form->lodStart[] = $form->meshlets->count() as int32;
+        foreach ($lod->primitives as $prim) {
+            formMeshlets($form, $indices, $prim, $owner, $local);
+        }
+    }
+
+    $form->lodStart[] = $form->meshlets->count() as int32;
+    return $form;
+}
+
+/**
+ * The cooked index list as local vertex indices, whatever its width.
+ */
+internal function cookedIndices(const CookedModel& $cooked) : array<uint32>
+{
+    int32 $width = indexWidth($cooked->indexType);
+    int32 $count = ($cooked->indices->size() as int32) / $width;
+    array<uint32> $out = array<uint32>();
+    $out->reserve($count as usize);
+    int32 $i = 0;
+    while ($i < $count) {
+        usize $at = ($i * $width) as usize;
+        if ($width == 2) {
+            uint32 $lo = $cooked->indices->byte($at) as uint32;
+            uint32 $hi = $cooked->indices->byte($at + 1) as uint32;
+            $out[] = $lo | ($hi << 8);
+        } else {
+            $out[] = u32le($cooked->indices, $at);
+        }
+
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+/**
+ * Cut one primitive into meshlets, triangles in cooked order: a triangle that would take the
+ * open meshlet past `MESHLET_VERTICES` or `MESHLET_TRIANGLES` closes it and opens the next.
+ * `$owner` and `$local` are scratch over every vertex of the model, stamped per meshlet, so no
+ * meshlet clears them.
+ */
+internal function formMeshlets(
+    ModelForm $form,
+    const array<uint32>& $indices,
+    const ModelPrimitive& $prim,
+    array<int32>& $owner,
+    array<int32>& $local
+) : void
+{
+    int32 $triangles = $prim->indexCount / 3;
+    if ($triangles <= 0) {
+        return;
+    }
+
+    int32 $meshlet = $form->meshlets->count() as int32;
+    int32 $firstVertex = $form->vertexList->count() as int32;
+    int32 $firstTriangle = $form->triangles->count() as int32;
+    int32 $t = 0;
+    while ($t < $triangles) {
+        usize $at = ($prim->firstIndex + $t * 3) as usize;
+        uint32 $a = $indices[$at];
+        uint32 $b = $indices[$at + 1];
+        uint32 $c = $indices[$at + 2];
+        // the distinct corners the open meshlet does not hold yet
+        int32 $fresh = formFresh($owner, $meshlet, $a);
+        if ($b != $a) {
+            $fresh = $fresh + formFresh($owner, $meshlet, $b);
+        }
+
+        if ($c != $a && $c != $b) {
+            $fresh = $fresh + formFresh($owner, $meshlet, $c);
+        }
+
+        int32 $used = ($form->vertexList->count() as int32) - $firstVertex;
+        int32 $tris = ($form->triangles->count() as int32) - $firstTriangle;
+        if ($tris >= MESHLET_TRIANGLES || $used + $fresh > MESHLET_VERTICES) {
+            formClose($form, $prim->slot, $firstVertex, $firstTriangle);
+            $meshlet = $meshlet + 1;
+            $firstVertex = $form->vertexList->count() as int32;
+            $firstTriangle = $form->triangles->count() as int32;
+        }
+
+        uint32 $la = formLocal($form, $owner, $local, $meshlet, $firstVertex, $a);
+        uint32 $lb = formLocal($form, $owner, $local, $meshlet, $firstVertex, $b);
+        uint32 $lc = formLocal($form, $owner, $local, $meshlet, $firstVertex, $c);
+        $form->triangles[] = $la | ($lb << 8) | ($lc << 16);
+        $t = $t + 1;
+    }
+
+    formClose($form, $prim->slot, $firstVertex, $firstTriangle);
+}
+
+/**
+ * 1 when `$v` has no local index in meshlet `$meshlet` yet.
+ */
+internal function formFresh(const array<int32>& $owner, int32 $meshlet, uint32 $v) : int32
+{
+    if ($owner[$v as usize] == $meshlet) {
+        return 0;
+    }
+
+    return 1;
+}
+
+/**
+ * `$v`'s local index in the open meshlet, giving it the next one on first use.
+ */
+internal function formLocal(
+    ModelForm $form,
+    array<int32>& $owner,
+    array<int32>& $local,
+    int32 $meshlet,
+    int32 $firstVertex,
+    uint32 $v
+) : uint32
+{
+    if ($owner[$v as usize] == $meshlet) {
+        return $local[$v as usize] as uint32;
+    }
+
+    int32 $index = ($form->vertexList->count() as int32) - $firstVertex;
+    $owner[$v as usize] = $meshlet;
+    $local[$v as usize] = $index;
+    $form->vertexList[] = $v;
+    return $index as uint32;
+}
+
+/**
+ * Bound the meshlet whose vertices start at `$firstVertex` and triangles at `$firstTriangle`
+ * (everything appended since) and add it: a sphere around its box centre that reaches every
+ * vertex, and the cone of its triangle normals.
+ */
+internal function formClose(ModelForm $form, int32 $slot, int32 $firstVertex, int32 $firstTriangle) : void
+{
+    int32 $vertices = ($form->vertexList->count() as int32) - $firstVertex;
+    int32 $triangles = ($form->triangles->count() as int32) - $firstTriangle;
+    if ($triangles <= 0) {
+        return;
+    }
+
+    Vec3 $lo = formPosition($form, $form->vertexList[$firstVertex as usize]);
+    Vec3 $hi = $lo;
+    int32 $i = 1;
+    while ($i < $vertices) {
+        Vec3 $p = formPosition($form, $form->vertexList[($firstVertex + $i) as usize]);
+        $lo = min($lo, $p);
+        $hi = max($hi, $p);
+        $i = $i + 1;
+    }
+
+    Vec3 $center = ($lo + $hi) * 0.5f;
+    float32 $radius = 0.0f;
+    $i = 0;
+    while ($i < $vertices) {
+        Vec3 $p = formPosition($form, $form->vertexList[($firstVertex + $i) as usize]);
+        float32 $d = length($p - $center);
+        if ($d > $radius) {
+            $radius = $d;
+        }
+
+        $i = $i + 1;
+    }
+
+    // the cone: the mean of the unit triangle normals, and how far the widest strays from it
+    Vec3 $sum = Vec3(0.0f);
+    int32 $t = 0;
+    while ($t < $triangles) {
+        Vec3 $n = formNormal($form, $firstVertex, $form->triangles[($firstTriangle + $t) as usize]);
+        $sum = $sum + $n;
+        $t = $t + 1;
+    }
+
+    Vec3 $axis = Vec3(0.0f, 1.0f, 0.0f);
+    float32 $cutoff = MESHLET_CONE_OPEN;
+    if (length($sum) > 0.000001f) {
+        $axis = normalize($sum);
+        float32 $least = 1.0f;
+        bool $degenerate = false;
+        $t = 0;
+        while ($t < $triangles) {
+            Vec3 $n = formNormal($form, $firstVertex, $form->triangles[($firstTriangle + $t) as usize]);
+            if (length($n) < 0.5f) {
+                $degenerate = true;
+            }
+
+            float32 $d = dot($axis, $n);
+            if ($d < $least) {
+                $least = $d;
+            }
+
+            $t = $t + 1;
+        }
+
+        if (!$degenerate && $least > 0.1f) {
+            $cutoff = std::math::sqrt(1.0f - $least * $least);
+        }
+    }
+
+    $form->meshlets[] = FormMeshlet(
+        $firstVertex: $firstVertex,
+        $vertices: $vertices,
+        $firstTriangle: $firstTriangle,
+        $triangles: $triangles,
+        $slot: $slot,
+        $center: $center,
+        $radius: $radius,
+        $axis: $axis,
+        $cutoff: $cutoff
+    );
+}
+
+/**
+ * The unit normal of one packed triangle, by its winding; zero for a degenerate one.
+ */
+internal function formNormal(ModelForm $form, int32 $firstVertex, uint32 $packed) : Vec3
+{
+    Vec3 $a = formPosition($form, $form->vertexList[($firstVertex + (($packed & 0xFF) as int32)) as usize]);
+    Vec3 $b = formPosition($form, $form->vertexList[($firstVertex + ((($packed >> 8) & 0xFF) as int32)) as usize]);
+    Vec3 $c = formPosition($form, $form->vertexList[($firstVertex + ((($packed >> 16) & 0xFF) as int32)) as usize]);
+    Vec3 $n = cross($b - $a, $c - $a);
+    float32 $len = length($n);
+    if ($len <= 0.0f) {
+        return Vec3(0.0f);
+    }
+
+    return $n / $len;
+}
+
+internal function formPosition(ModelForm $form, uint32 $vertex) : Vec3
+{
+    usize $at = ($vertex as usize) * ($form->stride as usize);
+    return Vec3(
+        mem::bit_cast<float32, uint32>($form->words[$at]),
+        mem::bit_cast<float32, uint32>($form->words[$at + 1]),
+        mem::bit_cast<float32, uint32>($form->words[$at + 2])
+    );
+}

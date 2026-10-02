@@ -1,0 +1,91 @@
+/**
+ * Physics without a window: a rolling heightfield, a row of crates and balls dropped onto it, and
+ * a kinematic paddle sweeping through them. Prints where everything is once a second of
+ * simulation, then how many bodies are still awake. The same components a game attaches;
+ * nothing here touches the backend.
+ *
+ *   echoc run -m examples --target physics
+ */
+
+use visu::components::{Collider, RigidBody};
+use visu::ecs::{Entities, Entity, Systems};
+use visu::geo::{Heightmap, Ray, Transform};
+use visu::math::Vec3;
+use visu::physics::{BodyKind, ColliderShape, PhysicsHit, PhysicsLayer, PhysicsSettings, PhysicsWorld};
+use visu::system::PhysicsSystem;
+
+function hills(int32 $size, float32 $ppu) : Heightmap
+{
+    array<float32> $data = arr::room<float32>(($size * $size) as usize);
+    for (int32 $iz = 0; $iz < $size; $iz++) {
+        for (int32 $ix = 0; $ix < $size; $ix++) {
+            float32 $x = (($ix as float32) - ($size as float32) * 0.5f) / $ppu;
+            float32 $z = (($iz as float32) - ($size as float32) * 0.5f) / $ppu;
+            $data[] = std::math::sin($x * 0.15f) * 1.5f + std::math::cos($z * 0.1f) * 1.0f;
+        }
+    }
+
+    return Heightmap($data, $size, $size, $ppu);
+}
+
+function spawn(Entities $w, Vec3 $at, ColliderShape $shape, BodyKind? $kind) : Entity
+{
+    Entity $e = $w->create();
+    Transform $t = Transform();
+    $t->position = $at;
+    $w->attach<Transform>($e, $t);
+    $w->attach<Collider>($e, Collider($shape));
+    BodyKind $held = guard $kind else {
+        return $e;
+    }
+    $w->attach<RigidBody>($e, RigidBody($held, 2.0f));
+    return $e;
+}
+
+Entities $entities = Entities();
+Systems $systems = Systems();
+PhysicsSettings $settings = PhysicsSettings();
+$settings->capacity = 64;
+PhysicsWorld $world = PhysicsWorld($settings);
+$systems->bind(PhysicsSystem($world));
+
+Heightmap $map = hills(129, 2.0f);
+Entity $ground = $entities->create();
+$entities->attach<Transform>($ground, Transform());
+$entities->attach<Collider>($ground, Collider(ColliderShape::heightfield($map), layer: PhysicsLayer::terrain()));
+
+array<Entity> $bodies = array<Entity>();
+for (int32 $i = 0; $i < 5; $i++) {
+    float32 $x = (($i - 2) as float32) * 3.0f;
+    $bodies[] = spawn($entities, Vec3($x, 8.0f, 0.0f), ColliderShape::box(Vec3(0.5f, 0.5f, 0.5f)), BodyKind::dynamic);
+    $bodies[] = spawn($entities, Vec3($x, 10.0f, 2.0f), ColliderShape::sphere(0.4f), BodyKind::dynamic);
+}
+Entity $paddle = spawn($entities, Vec3(-12.0f, 3.0f, 1.0f), ColliderShape::box(Vec3(0.3f, 1.0f, 3.0f)), BodyKind::kinematic);
+
+$systems->register($entities);
+echo "bodies {$world->count()} shapes {$world->shapes()}";
+
+for (int32 $second = 1; $second <= 8; $second++) {
+    // sixty updates of one pass each, as a 60 Hz frame loop runs them
+    for (int32 $frame = 0; $frame < 60; $frame++) {
+        $systems->begin($entities);
+        // the owner drives the paddle through its transform; the system reads it each step
+        Transform& $pt = $entities->get<Transform>($paddle);
+        $pt->position->x = $pt->position->x + 0.05f;
+        $systems->tick($entities);
+    }
+
+    string $line = "t={$second}s awake {$world->awake()}:";
+    foreach ($bodies as $e) {
+        Vec3 $p = $entities->get<Transform>($e)->position;
+        $line->append(" ({$p->x:.1f}, {$p->y:.1f})");
+    }
+    echo $line;
+}
+
+// the terrain layer only, so the crates in the way do not answer
+PhysicsHit $hit = guard $world->ray(Ray(Vec3(1.3f, 50.0f, 7.7f), Vec3(0.0f, -1.0f, 0.0f)), 100.0f, mask: PhysicsLayer::terrain()) else {
+    die('the ground is below');
+}
+float32 $want = $map->sample(1.3f, 7.7f) ?? 0.0f;
+echo "straight down onto the terrain hits y={$hit->point->y:.3f} (map {$want:.3f})";

@@ -3,8 +3,9 @@
 // visu::graphics::ShadowAtlas, allocation: miss k (coarse mips first) takes candidate k (never
 // used, then stale, then last frame's), up to the frame's dirty budget. A page taken from
 // another owner leaves that owner's entry empty (only if it still points here). The page's
-// entry, its dirty record, the six planes the scene culls its casters with, and the clear draw
-// are written here
+// entry, its dirty record, the six planes the scene culls its casters with, the ball round the
+// light that holds the page's frustum (the scene's local cull walks only the grid cells round
+// it; it culls nothing the planes would keep), and the clear draw are written here
 layout(local_size_x = 64) in;
 
 #include "visu/vsmcull.glsl"
@@ -164,6 +165,12 @@ void main()
     write_plane(k, 5u, -n, dot(n, L) + pr.w);
     words[k * SCENE_VIEW_WORDS + SCENE_VIEW_META] = 0u;
     words[k * SCENE_VIEW_WORDS + SCENE_VIEW_META + 1u] = 0u;
-    words[k * SCENE_VIEW_WORDS + SCENE_VIEW_META + 2u] = 0u;
+    words[k * SCENE_VIEW_WORDS + SCENE_VIEW_META + 2u] = SCENE_VIEW_SPHERE;
     words[k * SCENE_VIEW_WORDS + SCENE_VIEW_META + 3u] = 0u;
+    words[k * SCENE_VIEW_WORDS + SCENE_VIEW_SPHERE_WORD] = floatBitsToUint(L.x);
+    words[k * SCENE_VIEW_WORDS + SCENE_VIEW_SPHERE_WORD + 1u] = floatBitsToUint(L.y);
+    words[k * SCENE_VIEW_WORDS + SCENE_VIEW_SPHERE_WORD + 2u] = floatBitsToUint(L.z);
+    words[k * SCENE_VIEW_WORDS + SCENE_VIEW_SPHERE_WORD + 3u] = floatBitsToUint(pr.w * VSM_PAGE_REACH);
+    // a page draws every caster that reaches it, however small
+    words[k * SCENE_VIEW_WORDS + SCENE_VIEW_SCREEN] = 0u;
 }

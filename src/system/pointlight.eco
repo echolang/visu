@@ -3,6 +3,11 @@
  * gives it back when it goes, a moved or edited light rewrites its row, and each frame one
  * pass scatters the table and culls it into clusters (`LightClusterData`). Nothing walks the
  * lights per frame. Console lamps (`light add`) are rows too.
+ *
+ * A light rides the top of its Transform parents (its anchor: a prop's root, a car's root).
+ * When the move log says an anchor moved, its lights rewrite their rows every frame at the
+ * frame's alpha, like its models, until an update runs without it; then they write their exact
+ * row once and rest. O(moved + riding lights) a frame.
  */
 
 namespace visu::system;
@@ -11,10 +16,15 @@ use visu::components::PointLight;
 use visu::ecs::{Entities, Entity, EntityHook, Schedule, System};
 use visu::geo::Transform;
 use visu::graphics::{
-    CameraData, Device, LightClusterData, LightCull, LightCullPass, LightGpu, LightTable,
-    POINT_NORMAL_OFFSET, POINT_SHADOW_BIAS, PointLamp, RenderContext, ShadowAtlas
+    CameraData, Device, LIGHT_SLOTS_MAX, LightClusterData, LightCull, LightCullPass, LightGpu,
+    LightTable, POINT_NORMAL_OFFSET, POINT_SHADOW_BIAS, PointLamp, RenderContext, ShadowAtlas, darkLight, spotCone
 };
-use visu::math::{Mat4, Vec3, Vec4};
+use visu::math::{Mat4, Vec2, Vec3, Vec4, length};
+
+/**
+ * Entities the move log may hand over in one frame before the scratch list grows.
+ */
+internal const usize POINT_MOVES_ROOM = 4096;
 
 public const int32 POINT_DEBUG_MAX = 64;
 
@@ -44,6 +54,28 @@ public class PointLightSystem : System
     private EntityHook $detachHook;
     private EntityHook $moveHook;
     private EntityHook $changeHook;
+
+    /**
+     * The move log cursor, and what it handed over this frame.
+     */
+    private int32 $moveReader;
+    private array<Entity> $moved;
+
+    /**
+     * Each anchor's first riding light slot; per slot its entity, its anchor, the next slot on
+     * the same anchor (-1 ends the chain) and where it sits in `moving` (-1 when resting). Sized
+     * to `LIGHT_SLOTS_MAX` once, so a light that starts moving writes into room it has.
+     */
+    private map<Entity, int32> $firstRider;
+    private array<Entity> $entityOf;
+    private array<Entity> $anchorOf;
+    private array<int32> $nextRider;
+    private array<int32> $movingAt;
+
+    /**
+     * Slots whose anchor moved in an update this light has not yet come to rest after.
+     */
+    private array<int32> $moving;
 
     public constructor(Device $device)
     {
@@ -78,6 +110,21 @@ public class PointLightSystem : System
         $this->detachHook = EntityHook::none();
         $this->moveHook = EntityHook::none();
         $this->changeHook = EntityHook::none();
+        $this->moveReader = -1;
+        $this->moved = arr::room<Entity>(POINT_MOVES_ROOM);
+        $this->firstRider = map<Entity, int32>();
+        usize $slots = LIGHT_SLOTS_MAX as usize;
+        $this->entityOf = arr::room<Entity>($slots);
+        $this->anchorOf = arr::room<Entity>($slots);
+        $this->nextRider = arr::room<int32>($slots);
+        $this->movingAt = arr::room<int32>($slots);
+        $this->moving = arr::room<int32>($slots);
+        for (usize $i = 0; $i < $slots; $i++) {
+            $this->entityOf[] = Entity::none();
+            $this->anchorOf[] = Entity::none();
+            $this->nextRider[] = -1;
+            $this->movingAt[] = -1;
+        }
     }
 
     /**
@@ -103,6 +150,7 @@ public class PointLightSystem : System
         foreach ($entities->view<PointLight>() as $id => &$light) {
             $this->pending[] = $id;
         }
+        $this->moveReader = $entities->moveReader();
     }
 
     public function unregister(Entities $entities) : void
@@ -115,6 +163,21 @@ public class PointLightSystem : System
         $this->moveHook = EntityHook::none();
         $entities->release($this->changeHook);
         $this->changeHook = EntityHook::none();
+        if ($this->moveReader >= 0) {
+            $entities->releaseMoveReader($this->moveReader);
+            $this->moveReader = -1;
+        }
+
+        foreach ($this->moving as $slot) {
+            $this->movingAt[$slot as usize] = -1;
+        }
+        $this->moving->clear();
+        foreach ($this->slotOf as $e => $slot) {
+            $this->entityOf[$slot as usize] = Entity::none();
+            $this->anchorOf[$slot as usize] = Entity::none();
+            $this->nextRider[$slot as usize] = -1;
+        }
+        $this->firstRider->clear();
 
         $this->table->clear();
         $this->cull->destroy();
@@ -134,7 +197,7 @@ public class PointLightSystem : System
             return;
         }
 
-        LightGpu? $row = lightRow($entities, $e);
+        LightGpu? $row = lightRow($entities, $e, 0.0f, false);
         LightGpu $held = guard $row else {
             return;
         }
@@ -147,8 +210,122 @@ public class PointLightSystem : System
             return;
         }
 
-        $this->table->remove($this->slotOf[$e]);
+        int32 $slot = $this->slotOf[$e];
+        $this->unride($slot);
+        $this->table->remove($slot);
         $this->slotOf->remove($e);
+    }
+
+    /**
+     * Put `$slot` (light `$e`) on the chain of the top of its Transform parents.
+     */
+    private function ride(Entities $entities, Entity $e, int32 $slot) : void
+    {
+        Entity $anchor = lightAnchor($entities, $e);
+        usize $at = $slot as usize;
+        $this->entityOf[$at] = $e;
+        $this->anchorOf[$at] = $anchor;
+        $this->nextRider[$at] = -1;
+        if ($this->firstRider->has($anchor)) {
+            $this->nextRider[$at] = $this->firstRider[$anchor];
+        }
+        $this->firstRider[$anchor] = $slot;
+    }
+
+    /**
+     * Take `$slot` off its anchor's chain and out of the moving list.
+     */
+    private function unride(int32 $slot) : void
+    {
+        usize $at = $slot as usize;
+        Entity $anchor = $this->anchorOf[$at];
+        if ($this->firstRider->has($anchor)) {
+            int32 $first = $this->firstRider[$anchor];
+            if ($first == $slot) {
+                if ($this->nextRider[$at] >= 0) {
+                    $this->firstRider[$anchor] = $this->nextRider[$at];
+                } else {
+                    $this->firstRider->remove($anchor);
+                }
+            } else {
+                int32 $walk = $first;
+                while ($walk >= 0) {
+                    int32 $next = $this->nextRider[$walk as usize];
+                    if ($next == $slot) {
+                        $this->nextRider[$walk as usize] = $this->nextRider[$at];
+                        break;
+                    }
+                    $walk = $next;
+                }
+            }
+        }
+
+        $this->stopMoving($slot);
+        $this->entityOf[$at] = Entity::none();
+        $this->anchorOf[$at] = Entity::none();
+        $this->nextRider[$at] = -1;
+    }
+
+    private function stopMoving(int32 $slot) : void
+    {
+        int32 $i = $this->movingAt[$slot as usize];
+        if ($i < 0) {
+            return;
+        }
+
+        usize $last = $this->moving->count() - 1;
+        int32 $tail = $this->moving[$last];
+        $this->moving[$i as usize] = $tail;
+        $this->movingAt[$tail as usize] = $i;
+        $this->moving->pop();
+        $this->movingAt[$slot as usize] = -1;
+    }
+
+    /**
+     * Rows of the lights riding what moved: every anchor the move log names starts its lights
+     * moving; a moving light writes its row at the frame's alpha while its anchor moved in the
+     * latest update, and its exact row once when it did not, then rests.
+     */
+    private function follow(Entities $entities, float32 $alpha) : void
+    {
+        if ($this->moveReader < 0) {
+            return;
+        }
+
+        $this->moved->clear();
+        $entities->moves($this->moveReader, $this->moved);
+        foreach ($this->moved as $m) {
+            if (!$this->firstRider->has($m)) {
+                continue;
+            }
+
+            int32 $slot = $this->firstRider[$m];
+            while ($slot >= 0) {
+                if ($this->movingAt[$slot as usize] < 0) {
+                    $this->movingAt[$slot as usize] = $this->moving->count() as int32;
+                    $this->moving[] = $slot;
+                }
+                $slot = $this->nextRider[$slot as usize];
+            }
+        }
+
+        usize $i = 0;
+        while ($i < $this->moving->count()) {
+            int32 $slot = $this->moving[$i];
+            usize $at = $slot as usize;
+            bool $still = !$entities->movedNow($this->anchorOf[$at]);
+            LightGpu? $row = lightRow($entities, $this->entityOf[$at], $alpha, !$still);
+            if ($row != null) {
+                LightGpu $held = guard $row;
+                $this->table->set($slot, $held);
+            }
+
+            if ($still) {
+                $this->stopMoving($slot);
+                continue;
+            }
+            $i = $i + 1;
+        }
     }
 
     public function schedule(Schedule& $schedule) : void
@@ -230,17 +407,19 @@ public class PointLightSystem : System
                 continue;
             }
 
-            LightGpu? $row = lightRow($entities, $e);
+            LightGpu? $row = lightRow($entities, $e, 0.0f, false);
             LightGpu $held = guard $row else {
                 continue;
             }
             int32 $slot = $this->table->add($held);
             if ($slot >= 0) {
                 $this->slotOf[$e] = $slot;
+                $this->ride($entities, $e, $slot);
             }
         }
 
         $this->pending->clear();
+        $this->follow($entities, $ctx->compensation);
         CameraData $cam = guard $ctx->frame->find<CameraData>() else {
             visu::profile::end();
             return;
@@ -254,30 +433,70 @@ public class PointLightSystem : System
 }
 
 /**
- * `$e`'s table row: world position of its offset, colour, source, whether it casts, flicker.
- * Null without a `PointLight` or a `Transform`.
+ * `$e`'s table row: world position of its offset, colour, source, whether it casts, flicker,
+ * and a spot's world axis and cone. A light whose radius or intensity is zero gets the dark row.
+ * `$mix` takes the pose at the frame's `$alpha` between the last two updates. Null without a
+ * `PointLight` or a `Transform`.
  */
-internal function lightRow(Entities $entities, Entity $e) : LightGpu?
+internal function lightRow(Entities $entities, Entity $e, float32 $alpha, bool $mix) : LightGpu?
 {
     if (!$entities->valid($e) || !$entities->has<PointLight>($e) || !$entities->has<Transform>($e)) {
         return null;
     }
 
     PointLight $light = $entities->get<PointLight>($e);
+    if ($light->radius <= 0.0f || $light->intensity <= 0.0f) {
+        return darkLight();
+    }
+
     Transform& $transform = $entities->get<Transform>($e);
     Mat4 $world = $transform->world($entities);
+    if ($mix) {
+        $world = $transform->world($entities, $alpha);
+    }
     Vec3 $pos = ($world * Vec4($light->offset, 1.0f))->xyz();
     float32 $casts = 0.0f;
     if ($light->castShadow) {
         $casts = 1.0f;
     }
 
+    // a light that shines every way: no axis, scale 0, offset 1
+    Vec4 $spot = Vec4(0.0f, 0.0f, 0.0f, 0.0f);
+    float32 $offset = 1.0f;
+    Vec3 $axis = ($world * Vec4($light->direction, 0.0f))->xyz();
+    float32 $len = length($axis);
+    if ($len > 0.000001f) {
+        Vec2 $cone = spotCone($light->innerAngle, $light->outerAngle);
+        $spot = Vec4($axis / $len, $cone->x);
+        $offset = $cone->y;
+    }
+
     return LightGpu(
         Vec4($pos, $light->radius),
         Vec4($light->color, $light->intensity),
         Vec4($light->sourceRadius, $casts, POINT_NORMAL_OFFSET, POINT_SHADOW_BIAS),
-        Vec4($light->flicker, $light->flickerSpeed, lightPhase($e->id), 0.0f)
+        Vec4($light->flicker, $light->flickerSpeed, lightPhase($e->fold()), $offset),
+        $spot
     );
+}
+
+/**
+ * The top of `$e`'s Transform parents: what it rides.
+ */
+internal function lightAnchor(Entities $entities, Entity $e) : Entity
+{
+    Entity $walk = $e;
+    int32 $depth = 0;
+    while ($depth < 32 && $entities->has<Transform>($walk)) {
+        Entity $up = $entities->get<Transform>($walk)->parent;
+        if ($up == Entity::none() || !$entities->valid($up)) {
+            return $walk;
+        }
+        $walk = $up;
+        $depth = $depth + 1;
+    }
+
+    return $walk;
 }
 
 internal function lampRow(const PointLamp& $lamp, int32 $index) : LightGpu
@@ -291,7 +510,8 @@ internal function lampRow(const PointLamp& $lamp, int32 $index) : LightGpu
         Vec4($lamp->position, $lamp->radius),
         Vec4($lamp->color, $lamp->intensity),
         Vec4($lamp->sourceRadius, $casts, POINT_NORMAL_OFFSET, POINT_SHADOW_BIAS),
-        Vec4(0.0f, 0.0f, lightPhase($index as uint32), 0.0f)
+        Vec4(0.0f, 0.0f, lightPhase($index as uint32), 1.0f),
+        Vec4(0.0f, 0.0f, 0.0f, 0.0f)
     );
 }
 

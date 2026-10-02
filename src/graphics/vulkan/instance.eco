@@ -411,6 +411,28 @@ internal function vkCreateDevice(Device $device) : status<DeviceError>
     vk::PhysicalDeviceDynamicRenderingFeatures $dyn = vk::PhysicalDeviceDynamicRenderingFeatures();
     $dyn->dynamicRendering = vk::TRUE;
 
+    // bindless textures (TextureTable, set 3): descriptor indexing from Vulkan 1.2, enabled only
+    // as a whole, so the device either binds a table or reports it cannot
+    vk::PhysicalDeviceVulkan12Features $has12 = vk::PhysicalDeviceVulkan12Features();
+    vk::PhysicalDeviceFeatures2 $query = vk::PhysicalDeviceFeatures2();
+    $query->pNext:$ = ptr<uint8>(&$has12);
+    vk::GetPhysicalDeviceFeatures2($device->physical, &$query);
+    vk::PhysicalDeviceVulkan12Features $want12 = vk::PhysicalDeviceVulkan12Features();
+    $device->descriptorIndexing = $has12->descriptorIndexing == vk::TRUE
+        && $has12->descriptorBindingPartiallyBound == vk::TRUE
+        && $has12->descriptorBindingSampledImageUpdateAfterBind == vk::TRUE
+        && $has12->descriptorBindingUpdateUnusedWhilePending == vk::TRUE
+        && $has12->shaderSampledImageArrayNonUniformIndexing == vk::TRUE;
+    if ($device->descriptorIndexing) {
+        $want12->descriptorIndexing = vk::TRUE;
+        $want12->descriptorBindingPartiallyBound = vk::TRUE;
+        $want12->descriptorBindingSampledImageUpdateAfterBind = vk::TRUE;
+        $want12->descriptorBindingUpdateUnusedWhilePending = vk::TRUE;
+        $want12->shaderSampledImageArrayNonUniformIndexing = vk::TRUE;
+    }
+
+    $dyn->pNext:$ = ptr<uint8>(&$want12);
+
     vk::PhysicalDeviceFeatures $available = vk::PhysicalDeviceFeatures();
     vk::GetPhysicalDeviceFeatures($device->physical, &$available);
     vk::PhysicalDeviceFeatures $enable = vk::PhysicalDeviceFeatures();

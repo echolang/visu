@@ -75,6 +75,17 @@ public class Device : DeviceProtocol
     internal float32 $timestampPeriod;
     internal uint32 $timestampBits;
     internal bool $sync2;
+
+    /**
+     * Vulkan 1.2 descriptor indexing is enabled: a TextureTable binds (`limits.bindless`).
+     */
+    internal bool $descriptorIndexing;
+
+    /**
+     * Set 3, the texture table's layout: update-after-bind with descriptor indexing, empty
+     * without it so every pipeline layout still has four sets.
+     */
+    internal vk::DescriptorSetLayout $setLayout3;
     internal bool $debugLabels;
     public DrawCounters $draws;
     public GpuProfiler $gpuProfiler;
@@ -143,6 +154,8 @@ public class Device : DeviceProtocol
         $this->timestampPeriod = 0.0f;
         $this->timestampBits = 0;
         $this->sync2 = false;
+        $this->descriptorIndexing = false;
+        $this->setLayout3 = vk::DescriptorSetLayout::none();
         $this->debugLabels = false;
         $this->draws = DrawCounters();
         $this->gpuProfiler = GpuProfiler();
@@ -732,6 +745,107 @@ public class Device : DeviceProtocol
 
         vkNoteAlloc($this, $handle->bytes);
         return .ok($handle);
+    }
+
+    public function createTextureTable(int32 $capacity) : result<TextureTableHandle, DeviceError>
+    {
+        if (!$this->descriptorIndexing) {
+            return .error(.vulkan('descriptor indexing', 0));
+        }
+
+        vk::DescriptorPoolSize[2] $sizes;
+        $sizes[0] = vk::DescriptorPoolSize();
+        $sizes[0]->type = vk::DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        $sizes[0]->descriptorCount = TEXTURE_TABLE_CAPACITY as uint32;
+        $sizes[1] = vk::DescriptorPoolSize();
+        $sizes[1]->type = vk::DESCRIPTOR_TYPE_SAMPLER;
+        $sizes[1]->descriptorCount = TEXTURE_TABLE_SAMPLERS as uint32;
+        vk::DescriptorPoolCreateInfo $pci = vk::DescriptorPoolCreateInfo();
+        $pci->flags = vk::DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+        $pci->maxSets = 1;
+        $pci->poolSizeCount = 2;
+        $pci->pPoolSizes:$ = &$sizes[0];
+        vk::DescriptorPool $pool = vk::DescriptorPool::none();
+        guard vkCheck(vk::CreateDescriptorPool($this->logical, &$pci, null, &$pool), 'CreateDescriptorPool') else ($e) {
+            return .error($e);
+        }
+
+        vk::DescriptorSetAllocateInfo $ai = vk::DescriptorSetAllocateInfo();
+        $ai->descriptorPool = $pool;
+        $ai->descriptorSetCount = 1;
+        $ai->pSetLayouts:$ = &$this->setLayout3;
+        vk::DescriptorSet $set = vk::DescriptorSet::none();
+        guard vkCheck(vk::AllocateDescriptorSets($this->logical, &$ai, &$set), 'AllocateDescriptorSets') else ($e) {
+            vk::DestroyDescriptorPool($this->logical, $pool, null);
+            return .error($e);
+        }
+
+        TextureTableHandle $handle = TextureTableHandle($pool, $set);
+        // every sampler entry starts on the dummy, so a partially filled row is still valid
+        int32 $i = 0;
+        while ($i < TEXTURE_TABLE_SAMPLERS) {
+            $this->writeTableSampler($handle, $i, $this->dummySampler);
+            $i = $i + 1;
+        }
+
+        return .ok($handle);
+    }
+
+    public function writeTextureTable(TextureTableHandle $handle, int32 $slot, Texture $texture) : void
+    {
+        $this->writeTableImage($handle, $slot, $texture->handle->view);
+    }
+
+    public function eraseTextureTable(TextureTableHandle $handle, int32 $slot) : void
+    {
+        // partially bound: the slot could stay stale, but the dummy keeps it a valid image
+        $this->writeTableImage($handle, $slot, $this->dummyImage->view);
+    }
+
+    public function writeTextureTableSampler(TextureTableHandle $handle, int32 $index, Sampler $sampler) : void
+    {
+        $this->writeTableSampler($handle, $index, $sampler->handle);
+    }
+
+    /**
+     * Frees the table's pool at once: tables go down with their scene, after the device is idle.
+     */
+    public function destroyTextureTable(TextureTableHandle $handle) : void
+    {
+        if ($this->logical->handle == 0 || $handle->pool->handle == 0) {
+            return;
+        }
+
+        vk::DestroyDescriptorPool($this->logical, $handle->pool, null);
+    }
+
+    private function writeTableImage(TextureTableHandle $handle, int32 $slot, vk::ImageView $view) : void
+    {
+        vk::DescriptorImageInfo $info = vk::DescriptorImageInfo();
+        $info->imageLayout = vk::IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        $info->imageView = $view;
+        vk::WriteDescriptorSet $write = vk::WriteDescriptorSet();
+        $write->dstSet = $handle->set;
+        $write->dstBinding = TEXTURE_TABLE_TEXTURE_BINDING;
+        $write->dstArrayElement = $slot as uint32;
+        $write->descriptorCount = 1;
+        $write->descriptorType = vk::DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        $write->pImageInfo:$ = &$info;
+        vk::UpdateDescriptorSets($this->logical, 1, &$write, 0, null);
+    }
+
+    private function writeTableSampler(TextureTableHandle $handle, int32 $index, SamplerHandle $sampler) : void
+    {
+        vk::DescriptorImageInfo $info = vk::DescriptorImageInfo();
+        $info->sampler = $sampler->sampler;
+        vk::WriteDescriptorSet $write = vk::WriteDescriptorSet();
+        $write->dstSet = $handle->set;
+        $write->dstBinding = 0;
+        $write->dstArrayElement = $index as uint32;
+        $write->descriptorCount = 1;
+        $write->descriptorType = vk::DESCRIPTOR_TYPE_SAMPLER;
+        $write->pImageInfo:$ = &$info;
+        vk::UpdateDescriptorSets($this->logical, 1, &$write, 0, null);
     }
 
     /**

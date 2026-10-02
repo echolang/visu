@@ -1,0 +1,57 @@
+#version 450
+
+// visu::graphics::GpuScan, one level: every 1024 values of `values` (from u_scan.y, u_scan.x
+// of them, or with u_scan.w = level + 1 the count scan_args left for that level) become their
+// exclusive prefix within the block, in place, and the block's total goes to `sums[block]`. A
+// value past the count reads as zero and is left alone. Hillis-Steele in shared memory, one
+// value a thread, so the order of the adds, and the result, is fixed
+layout(local_size_x = 1024) in;
+
+layout(std140, set = 0, binding = 0) uniform ScanParams {
+    uvec4 u_scan;
+};
+
+layout(std430, set = 2, binding = 0) buffer Values {
+    uint values[];
+};
+
+layout(std430, set = 2, binding = 1) writeonly buffer Sums {
+    uint sums[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer Levels {
+    uint levels[];
+};
+
+shared uint s_scan[1024];
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x;
+    uint i = gl_WorkGroupID.x * 1024u + t;
+    uint count = u_scan.w == 0u ? u_scan.x : levels[12u + u_scan.w - 1u];
+    uint own = 0u;
+    if (i < count) {
+        own = values[u_scan.y + i];
+    }
+
+    s_scan[t] = own;
+    barrier();
+    for (uint o = 1u; o < 1024u; o <<= 1u) {
+        uint add = 0u;
+        if (t >= o) {
+            add = s_scan[t - o];
+        }
+        barrier();
+        s_scan[t] += add;
+        barrier();
+    }
+
+    if (i < count) {
+        values[u_scan.y + i] = s_scan[t] - own;
+    }
+
+    if (t == 1023u) {
+        sums[u_scan.z + gl_WorkGroupID.x] = s_scan[t];
+    }
+}

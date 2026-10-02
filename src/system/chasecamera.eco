@@ -1,0 +1,99 @@
+/**
+ * Drives the `ChaseCamera` that also has `ActiveCamera`. Bind it after whatever moves the target
+ * (after `PhysicsSystem` for a body), so the boom reads this update's pose; the render then
+ * interpolates the camera and the target together.
+ */
+
+namespace visu::system;
+
+use visu::components::{ActiveCamera, ChaseCamera};
+use visu::ecs::{Entities, Entity, Schedule, System};
+use visu::geo::Transform;
+use visu::graphics::RenderContext;
+use visu::math::{Vec2, Vec3};
+use visu::os::input::InputHub;
+
+public class ChaseCameraSystem : System
+{
+    private InputHub $input;
+
+    /**
+     * Seconds per update.
+     */
+    public float32 $dt;
+
+    public constructor(InputHub $input, float32 $dt = 0.016666668f)
+    {
+        $this->input = $input;
+        $this->dt = $dt;
+    }
+
+    public function register(Entities $entities) : void
+    {
+    }
+
+    public function unregister(Entities $entities) : void
+    {
+    }
+
+    public function schedule(Schedule& $schedule) : void
+    {
+        $schedule->render = false;
+    }
+
+    public function update(Entities $entities) : void
+    {
+        Entity $active = guard $entities->firstWith<ActiveCamera>() else {
+            return;
+        }
+
+        if (!$entities->has<ChaseCamera>($active) || !$entities->has<Transform>($active)) {
+            return;
+        }
+
+        ChaseCamera& $chase = $entities->get<ChaseCamera>($active);
+        Entity $target = guard $chase->target else {
+            return;
+        }
+        if (!$entities->has<Transform>($target)) {
+            $chase->release();
+            return;
+        }
+
+        visu::profile::begin('chase');
+        InputHub $input = $this->input;
+        if ($input->unclaimed()) {
+            bool $right = $input->down(button: .right) && !$input->hasBeenPressed(button: .right);
+            bool $middle = $input->down(button: .middle) && !$input->hasBeenPressed(button: .middle);
+            if ($right || $middle) {
+                Vec2 $delta = $input->mouseDelta();
+                if ($delta->x != 0.0f || $delta->y != 0.0f) {
+                    $chase->look($delta->x, $delta->y);
+                }
+            }
+
+            Vec2 $wheel = $input->mouseScroll();
+            if ($wheel->y != 0.0f) {
+                $chase->distance = std::math::clamp($chase->distance - $wheel->y * $chase->zoom, $chase->minDistance, $chase->maxDistance);
+            }
+        }
+
+        Transform& $t = $entities->get<Transform>($target);
+        Vec3 $at = $t->worldPosition($entities);
+        Vec3 $heading = $t->worldOrientation($entities) * Vec3(0.0f, 0.0f, 1.0f);
+        Vec3 $velocity = Vec3(0.0f, 0.0f, 0.0f);
+        if ($chase->seeded && $this->dt > 0.0f) {
+            $velocity = ($at - $chase->last) / $this->dt;
+        }
+        $chase->last = $at;
+        $chase->seeded = true;
+
+        Transform& $camera = $entities->get<Transform>($active);
+        $chase->place($camera, $at, $heading, $velocity, $this->dt);
+        visu::profile::end();
+    }
+
+    public function render(Entities $entities, RenderContext $ctx) : void
+    {
+    }
+}

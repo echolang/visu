@@ -1,0 +1,207 @@
+/**
+ * A bindless texture table: up to `capacity` textures and `TEXTURE_TABLE_SAMPLERS` samplers a
+ * shader indexes at run time (GLSL set 3, `visu/bindless.glsl`) instead of binding each one to a
+ * slot. A material holds a slot number; a draw that covers many materials binds the table once.
+ * Metal 3 keeps it as an argument buffer of `gpuResourceID`s plus the residency list every
+ * encoder that binds it declares; Vulkan as one update-after-bind descriptor set. Needs
+ * `DeviceLimits.bindless`.
+ * A released slot is handed out again only once every frame that could still read it has
+ * finished, so a slot is never rewritten under a draw in flight. A change of the device's
+ * anisotropy swaps its samplers' handles in place; the next bind rewrites the sampler row.
+ */
+
+namespace visu::graphics;
+
+/**
+ * The slot `TextureTable.add` returns when the table is full.
+ */
+public const int32 TEXTURE_TABLE_FULL = -1;
+
+public class TextureTable
+{
+    public Device $device;
+    public const TextureTableHandle $handle;
+    public const int32 $capacity;
+
+    /**
+     * The texture in each slot, kept alive while the table names it.
+     */
+    private array<Texture?> $textures;
+
+    /**
+     * Slots free now, LIFO, and slots released but maybe still read by a frame in flight, with
+     * the frame they were released in.
+     */
+    private array<int32> $free;
+    private array<int32> $retired;
+    private array<uint64> $retiredAt;
+    private int32 $used;
+
+    /**
+     * Each sampler row entry, and the device anisotropy it was written at.
+     */
+    private array<Sampler?> $samplers;
+    private int32 $samplerAniso;
+    private bool $dead;
+
+    public constructor(Device $device, int32 $capacity = TEXTURE_TABLE_CAPACITY)
+    {
+        assert($device->limits()->bindless, 'TextureTable: the device has no bindless textures');
+        assert($capacity > 0 && $capacity <= TEXTURE_TABLE_CAPACITY, 'TextureTable: capacity past what the shaders declare');
+        result<TextureTableHandle, DeviceError> $made = $device->createTextureTable($capacity);
+        TextureTableHandle $handle = guard $made else ($e) {
+            die($e->message());
+        }
+        $this->device = $device;
+        $this->handle = $handle;
+        $this->capacity = $capacity;
+        $this->textures = arr::room<Texture?>($capacity as usize);
+        $this->free = arr::room<int32>($capacity as usize);
+        $this->retired = arr::room<int32>($capacity as usize);
+        $this->retiredAt = arr::room<uint64>($capacity as usize);
+        $this->used = 0;
+        $this->samplers = arr::room<Sampler?>(TEXTURE_TABLE_SAMPLERS as usize);
+        int32 $i = 0;
+        while ($i < TEXTURE_TABLE_SAMPLERS) {
+            $this->samplers[] = null;
+            $i = $i + 1;
+        }
+
+        $this->samplerAniso = $device->anisotropy();
+        $this->dead = false;
+    }
+
+    /**
+     * Put `$texture` in a free slot and return it, or `TEXTURE_TABLE_FULL`. Not per frame: a
+     * material takes its slots when it is acquired.
+     */
+    public function add(Texture $texture) : int32
+    {
+        $this->recycle();
+        int32 $slot = TEXTURE_TABLE_FULL;
+        if ($this->free->count() > 0) {
+            $slot = $this->free->pop();
+        } else if ($this->used < $this->capacity) {
+            $slot = $this->used;
+            $this->used = $this->used + 1;
+            $this->textures[] = null;
+        } else {
+            return TEXTURE_TABLE_FULL;
+        }
+
+        $this->textures[$slot as usize] = $texture;
+        $this->device->writeTextureTable($this->handle, $slot, $texture);
+        return $slot;
+    }
+
+    /**
+     * Give `$slot` back. It is handed out again once the frames in flight are done with it.
+     */
+    public function release(int32 $slot) : void
+    {
+        assert($slot >= 0 && $slot < $this->used, 'TextureTable.release: no such slot');
+        if ($this->textures[$slot as usize] == null) {
+            return;
+        }
+
+        $this->textures[$slot as usize] = null;
+        $this->device->eraseTextureTable($this->handle, $slot);
+        $this->retired[] = $slot;
+        $this->retiredAt[] = $this->device->frameIndex();
+    }
+
+    /**
+     * The texture in `$slot`, or null.
+     */
+    public const function texture(int32 $slot) : Texture?
+    {
+        if ($slot < 0 || $slot >= $this->used) {
+            return null;
+        }
+
+        return $this->textures[$slot as usize];
+    }
+
+    /**
+     * Slots handed out and not released.
+     */
+    public const function count() : int32
+    {
+        return $this->used - ($this->free->count() as int32) - ($this->retired->count() as int32);
+    }
+
+    /**
+     * Sampler row entry `$index` samples with `$sampler` from now on.
+     */
+    public function setSampler(int32 $index, Sampler $sampler) : void
+    {
+        assert($index >= 0 && $index < TEXTURE_TABLE_SAMPLERS, 'TextureTable.setSampler: index out of range');
+        $this->samplers[$index as usize] = $sampler;
+        $this->device->writeTextureTableSampler($this->handle, $index, $sampler);
+    }
+
+    /**
+     * Before a bind: rewrite the sampler row when the device's anisotropy moved since it was
+     * written, so every entry names the sampler handle the device swapped in. O(1) otherwise.
+     */
+    public function refresh() : void
+    {
+        int32 $aniso = $this->device->anisotropy();
+        if ($aniso == $this->samplerAniso) {
+            return;
+        }
+
+        $this->samplerAniso = $aniso;
+        int32 $i = 0;
+        while ($i < TEXTURE_TABLE_SAMPLERS) {
+            Sampler? $held = $this->samplers[$i as usize];
+            if ($held != null) {
+                Sampler $s = guard $held;
+                $this->device->writeTextureTableSampler($this->handle, $i, $s);
+            }
+
+            $i = $i + 1;
+        }
+    }
+
+    public function destroy() : void
+    {
+        if ($this->dead) {
+            return;
+        }
+
+        $this->dead = true;
+        $this->device->destroyTextureTable($this->handle);
+        $this->textures->clear();
+        $this->samplers->clear();
+    }
+
+    /**
+     * Move retired slots whose frame has finished on the GPU back to the free list.
+     */
+    private function recycle() : void
+    {
+        if ($this->retired->count() == 0) {
+            return;
+        }
+
+        uint64 $now = $this->device->frameIndex();
+        usize $keep = 0;
+        usize $i = 0;
+        usize $n = $this->retired->count();
+        while ($i < $n) {
+            if ($now >= $this->retiredAt[$i] + (FRAMES_IN_FLIGHT as uint64) + 1) {
+                $this->free[] = $this->retired[$i];
+            } else {
+                $this->retired[$keep] = $this->retired[$i];
+                $this->retiredAt[$keep] = $this->retiredAt[$i];
+                $keep = $keep + 1;
+            }
+
+            $i = $i + 1;
+        }
+
+        $this->retired->truncate($keep);
+        $this->retiredAt->truncate($keep);
+    }
+}

@@ -1,0 +1,183 @@
+#version 450
+
+// visu::graphics::GpuScene, between the stages: step 0 takes the scanned view counts as the
+// chunk pair total and writes the member dispatch; step 1 takes the scanned matrix as the pair
+// total and writes the meshlet dispatch; step 2 gives every segment its draw (its items from the
+// scanned pair offsets, its triangles in a G-buffer set, where one draw spans a class's depth
+// bins) and writes the triangle dispatch. Every
+// total is clamped to its buffer and the excess counted as dropped
+layout(local_size_x = 128) in;
+
+#include "visu/scenecull.glsl"
+
+layout(std430, set = 2, binding = 0) buffer Counters {
+    uint counters[];
+};
+
+layout(std430, set = 2, binding = 1) writeonly buffer Args {
+    uint args[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer Matrix {
+    uint matrix[];
+};
+
+layout(std430, set = 2, binding = 3) readonly buffer PairItems {
+    uint pairItems[];
+};
+
+layout(std430, set = 2, binding = 4) readonly buffer PairTriangles {
+    uint pairTriangles[];
+};
+
+// the chunk stage's scanned (view, tile) counts
+layout(std430, set = 2, binding = 5) readonly buffer Tiles {
+    uint tiles[];
+};
+
+layout(std430, set = 2, binding = 6) readonly buffer Views {
+    SceneView views[];
+};
+
+// the scanned meshlet counts per pair, and per meshlet workgroup its kept items and triangles
+layout(std430, set = 2, binding = 7) readonly buffer PairWalk {
+    uint pairWalk[];
+};
+
+layout(std430, set = 2, binding = 8) readonly buffer WalkItems {
+    uint walkItems[];
+};
+
+layout(std430, set = 2, binding = 9) readonly buffer WalkTriangles {
+    uint walkTriangles[];
+};
+
+void dispatch_args(uint at, uint groups)
+{
+    args[at] = groups;
+    args[at + 1u] = 1u;
+    args[at + 2u] = 1u;
+    args[at + 3u] = 0u;
+}
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x;
+    uint step = u_mode.x;
+    if (step == 0u) {
+        // each view's first chunk pair, and the total past the last view
+        uint perView = scene_chunk_tiles();
+        for (uint v = t; v <= u_counts.z; v += 128u) {
+            counters[SCENE_COUNTER_VIEW_BASE + v] = tiles[v * perView];
+        }
+
+        if (t == 0u) {
+            uint total = tiles[u_counts.z * perView];
+            uint kept = min(total, u_caps.x);
+            counters[SCENE_COUNTER_CHUNK_PAIRS] = kept;
+            counters[SCENE_COUNTER_DROPPED_CHUNK_PAIRS] = total - kept;
+            dispatch_args(SCENE_ARGS_MEMBERS, kept);
+            // views run in pass order, so a pass's chunk pairs start at its first view's
+            uint v = 0u;
+            for (uint p = 0u; p < u_mode.w; p++) {
+                while (v < u_counts.z && views[v].meta.x != SCENE_PASS_NONE && views[v].meta.x < p) {
+                    v++;
+                }
+                counters[SCENE_COUNTER_PASS_BASE + p] = min(tiles[v * perView], kept);
+            }
+            counters[SCENE_COUNTER_PASS_BASE + u_mode.w] = kept;
+            counters[SCENE_COUNTER_MATRIX_SCAN] = u_counts.w * kept + 1u;
+        }
+        return;
+    }
+
+    uint chunkPairs = counters[SCENE_COUNTER_CHUNK_PAIRS];
+    if (step == 1u) {
+        if (t == 0u) {
+            uint total = matrix[u_counts.w * chunkPairs];
+            uint kept = min(total, u_caps.y);
+            counters[SCENE_COUNTER_PAIRS] = kept;
+            counters[SCENE_COUNTER_DROPPED_PAIRS] = total - kept;
+            counters[SCENE_COUNTER_PAIR_SCAN] = kept + 1u;
+        }
+        return;
+    }
+
+    uint pairs = counters[SCENE_COUNTER_PAIRS];
+    if (step == 3u) {
+        // the pairs' meshlets flattened: 64 a meshlet workgroup, at most SCENE_WALK_PER_ITEM
+        // times the items the set holds (what passes that is dropped as items)
+        if (t == 0u) {
+            uint total = pairWalk[pairs];
+            uint walk = min(total, u_caps.z * SCENE_WALK_PER_ITEM);
+            uint groups = (walk + 63u) / 64u;
+            counters[SCENE_COUNTER_WALK] = walk;
+            counters[SCENE_COUNTER_WALK_SCAN] = groups + 1u;
+            counters[SCENE_COUNTER_DROPPED_ITEMS] = total - walk;
+            dispatch_args(SCENE_ARGS_MESHLETS, groups);
+        }
+        return;
+    }
+
+    uint groups = (counters[SCENE_COUNTER_WALK] + 63u) / 64u;
+    uint itemsTotal = min(walkItems[groups], u_caps.z);
+    uint trianglesTotal = 0u;
+    if (u_mode.z != 0u) {
+        trianglesTotal = min(walkTriangles[groups], u_caps.w);
+    }
+
+    if (t == 0u) {
+        uint total = walkItems[groups];
+        uint kept = itemsTotal;
+        counters[SCENE_COUNTER_ITEMS] = kept;
+        counters[SCENE_COUNTER_DROPPED_ITEMS] += total - kept;
+        uint triangles = 0u;
+        if (u_mode.z != 0u) {
+            triangles = walkTriangles[groups];
+            uint tkept = min(triangles, u_caps.w);
+            counters[SCENE_COUNTER_TRIANGLES] = tkept;
+            counters[SCENE_COUNTER_DROPPED_TRIANGLES] = triangles - tkept;
+        }
+
+        dispatch_args(SCENE_ARGS_TRIANGLES, kept);
+    }
+
+    // one draw per (pass, draw key): a G-buffer class spans its depth bins
+    uint drawKeys = scene_draw_keys();
+    uint span = u_mode.z == 0u ? 1u : u_mode.z;
+    uint draws = u_mode.w * drawKeys;
+    for (uint s = t; s < draws; s += 128u) {
+        uint pass = s / drawKeys;
+        uint key = (s - pass * drawKeys) * span;
+        uint first = counters[SCENE_COUNTER_PASS_BASE + pass];
+        uint n = counters[SCENE_COUNTER_PASS_BASE + pass + 1u] - first;
+        uint m0 = scene_matrix_at(first, n, key, first);
+        uint m1 = scene_matrix_at(first, n, key + span, first);
+        uint p0 = min(matrix[m0], pairs);
+        uint p1 = min(matrix[m1], pairs);
+        // where pair p's items start; past the last pair walked, the total
+        uint walk = counters[SCENE_COUNTER_WALK];
+        bool in0 = p0 < pairs && pairWalk[p0] < walk;
+        bool in1 = p1 < pairs && pairWalk[p1] < walk;
+        uint i0 = in0 ? pairItems[p0] : itemsTotal;
+        uint i1 = in1 ? pairItems[p1] : itemsTotal;
+        uint at = SCENE_ARGS_DRAW_BASE + s * SCENE_DRAW_WORDS;
+        if (u_mode.z != 0u) {
+            uint t0 = in0 ? pairTriangles[p0] : trianglesTotal;
+            uint t1 = in1 ? pairTriangles[p1] : trianglesTotal;
+            // drawIndexedIndirect: index count, instances, first index, base vertex, first instance
+            args[at] = (t1 - t0) * 3u;
+            args[at + 1u] = 1u;
+            args[at + 2u] = t0 * 3u;
+            args[at + 3u] = 0u;
+            args[at + 4u] = 0u;
+        } else {
+            // drawIndirect: vertex count, instances, first vertex, first instance
+            args[at] = (i1 - i0) * SCENE_ITEM_VERTICES;
+            args[at + 1u] = 1u;
+            args[at + 2u] = i0 * SCENE_ITEM_VERTICES;
+            args[at + 3u] = 0u;
+            args[at + 4u] = 0u;
+        }
+    }
+}

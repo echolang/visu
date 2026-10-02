@@ -94,3 +94,37 @@ test view_get_missing_dies
     Entity $e = Entity(index: 0, version: 0);
     Position& $p = $view->get($e);
 }
+
+test view_pages_hold_far_indices
+{
+    View<Position> $view = View<Position>();
+    Entity $low = Entity(index: 4095, version: 0);
+    Entity $edge = Entity(index: 4096, version: 0);
+    Entity $far = Entity(index: 5000000, version: 2);
+    $view->attach($low, Position(1.0f, 0.0f));
+    $view->attach($edge, Position(2.0f, 0.0f));
+    $view->attach($far, Position(3.0f, 0.0f));
+    assert($view->get($low)->x == 1.0f, 'low');
+    assert($view->get($edge)->x == 2.0f, 'edge');
+    assert($view->get($far)->x == 3.0f, 'far');
+    assert(!$view->contains(Entity(index: 5000000, version: 1)), 'stale version');
+    assert(!$view->contains(Entity(index: 4999999, version: 0)), 'same page miss');
+    assert(!$view->contains(Entity(index: 9000000, version: 0)), 'past the table');
+    $view->erase($low);
+    assert(!$view->contains($low), 'erased');
+    assert($view->get($far)->x == 3.0f, 'moved into the hole');
+    assert($view->get($edge)->x == 2.0f, 'edge kept');
+}
+
+test view_commit_then_attach
+{
+    View<Position> $view = View<Position>();
+    $view->commit(8190, 8194);
+    Entity $a = Entity(index: 8191, version: 0);
+    Entity $b = Entity(index: 8192, version: 0);
+    assert(!$view->contains($a), 'committed is empty');
+    $view->attach($a, Position(1.0f, 0.0f));
+    $view->attach($b, Position(2.0f, 0.0f));
+    assert($view->get($a)->x == 1.0f, 'a');
+    assert($view->get($b)->x == 2.0f, 'b');
+}

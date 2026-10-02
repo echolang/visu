@@ -1,0 +1,499 @@
+/**
+ * One physics step of one vehicle, the whole tire model in order:
+ *
+ * 1. Query: a ray per wheel down the suspension axis from its mount, past the chassis itself.
+ * 2. Suspension: spring, bump stop, damper and anti-roll bar give each wheel's load, pushed up
+ *    into the chassis at the contact, and down into the ground when the ground is a dynamic body.
+ * 3. Measure: the tire's frame on the ground and the contact patch's velocity in it, relative to
+ *    the ground under it and predicted through this step's gravity so a parked car holds on a
+ *    slope.
+ * 4. Model: slip ratio and slip angle (both over at least `lowSpeed`) through the drawn curves,
+ *    scaled by load, grip and surface, each axis weakened by the other's slip.
+ * 5. Clamp: no impulse undoes more slip than this step holds. Longitudinally the wheel and the
+ *    chassis share the impulse; a brake that holds the wheel still leaves the chassis alone to
+ *    answer, through its effective mass at the patch, and one that cannot still works against
+ *    the spin up. The wheel may not spin through the road's speed; laterally the effective mass at
+ *    the patch caps it. A dynamic ground adds its own effective mass to every one of these.
+ * 6. Apply: the linear part through the centre of mass, the angular part with its pitch and roll
+ *    scaled, and the reaction whole into a dynamic ground. Wheels go one after another and each
+ *    reads the velocity the last one left, so four clamps never overshoot together.
+ * 7. Assist: yaw toward what the steering asks, out of a drift past its limit, upright in the air
+ *    while driven. Then drag.
+ *
+ * Every impulse on the chassis is quiet: a vehicle at rest on its springs is allowed to fall
+ * asleep. An impulse on the ground wakes it, so a crate run over moves.
+ */
+
+namespace visu::physics;
+
+use visu::components::Vehicle;
+use visu::geo::Ray;
+use visu::math::{Quat, Vec3, conjugate, cross, dot, length, sgn};
+
+/**
+ * Radians per second a wheel may spin. Half a turn per 60 Hz update, so a pose interpolated
+ * between two updates never turns the wheel backward.
+ */
+public const float32 VEHICLE_MAX_OMEGA = 160.0f;
+
+public function stepVehicle(PhysicsWorld $world, PhysicsBody $body, Vehicle& $v, float32 $dt) : void
+{
+    VehicleSpec $spec = $v->spec;
+    int32 $n = std::math::min($spec->wheelCount, VEHICLE_MAX_WHEELS);
+    if ($n <= 0 || $dt <= 0.0f) {
+        return;
+    }
+
+    Quat $q = $body->orientation();
+    Quat $qi = conjugate($q);
+    Vec3 $origin = $body->origin();
+    Vec3 $com = $body->position();
+    Vec3 $up = $q * Vec3(0.0f, 1.0f, 0.0f);
+    Vec3 $forward = $q * Vec3(0.0f, 0.0f, 1.0f);
+    Vec3 $left = $q * Vec3(1.0f, 0.0f, 0.0f);
+    float32 $mass = $body->mass();
+    float32 $invMass = $body->inverseMass();
+    Vec3 $invI = $body->inverseInertia();
+    Vec3 $gravity = $world->gravity();
+    float32 $g = length($gravity);
+    float32 $restLoad = $mass * $g / ($n as float32);
+    Vec3 $fall = $gravity * $dt;
+    Vec3 $sky = Vec3(0.0f, 1.0f, 0.0f);
+    if ($g > 0.0001f) {
+        $sky = $gravity * (-1.0f / $g);
+    }
+
+    Vec3 $vel = $body->velocity();
+    float32 $speed = dot($vel, $forward);
+    $v->forwardSpeed = $speed;
+    $v->sideSpeed = dot($vel, $left);
+
+    // steering, rate limited, positive to the left
+    VehicleControls $in = $v->controls;
+    float32 $target = -std::math::clamp($in->steer, -1.0f, 1.0f) * $spec->maxSteer($speed);
+    float32 $rate = $spec->steerRate;
+    if (std::math::abs($target) < std::math::abs($v->steerAngle) || $target * $v->steerAngle < 0.0f) {
+        $rate = $spec->steerReturn;
+    }
+    $v->steerAngle = $v->steerAngle + std::math::clamp($target - $v->steerAngle, -$rate * $dt, $rate * $dt);
+
+    // the dynamic body under each wheel, if any: a crate or another car feels the wheel back
+    fixed_array<PhysicsBody?, 6> $grounds;
+    for (usize $i = 0; $i < 6; $i++) {
+        $grounds[$i] = null;
+    }
+
+    // 1 + 2: query and suspension
+    for (int32 $i = 0; $i < $n; $i++) {
+        VehicleWheel $w = $spec->wheels[$i as usize];
+        Vec3 $mount = $origin + $q * $w->mount;
+        float32 $reach = $w->restLength + $w->radius;
+        PhysicsHit? $found = $world->ray(Ray($mount, $up * -1.0f), $reach, mask: $spec->rayMask, ignore: $body);
+        PhysicsHit $hit = guard $found else {
+            $v->wheels[$i as usize]->contact = false;
+            $v->wheels[$i as usize]->compression = 0.0f;
+            $v->wheels[$i as usize]->force = 0.0f;
+            $v->wheels[$i as usize]->load = 0.0f;
+            continue;
+        }
+
+        PhysicsBody? $under = $world->body($hit->entity);
+        $grounds[$i as usize] = $under;
+        float32 $c = std::math::clamp($reach - $hit->distance, 0.0f, $w->restLength);
+        float32 $closing = -dot($body->velocity(at: $mount) - groundVelocity($under, $hit->point), $up);
+        float32 $force = $w->spring * $c;
+        float32 $stop = $w->restLength - $w->bumpStop;
+        if ($c > $stop) {
+            $force = $force + 3.0f * $w->spring * ($c - $stop);
+        }
+
+        if ($closing > 0.0f) {
+            $force = $force + $w->bump * $closing;
+        } else {
+            $force = $force + $w->rebound * $closing;
+        }
+
+        $v->wheels[$i as usize]->contact = true;
+        $v->wheels[$i as usize]->point = $hit->point;
+        $v->wheels[$i as usize]->normal = $hit->normal;
+        $v->wheels[$i as usize]->surface = $hit->grip;
+        $v->wheels[$i as usize]->compression = $c;
+        $v->wheels[$i as usize]->force = $force;
+    }
+
+    float32 $total = 0.0f;
+    int32 $grounded = 0;
+    for (int32 $i = 0; $i < $n; $i++) {
+        VehicleWheel $w = $spec->wheels[$i as usize];
+        if (!$v->wheels[$i as usize]->contact) {
+            continue;
+        }
+
+        float32 $force = $v->wheels[$i as usize]->force;
+        if ($w->pair >= 0 && $w->pair < $n) {
+            float32 $bar = $spec->antiRollRear;
+            if ($w->front) {
+                $bar = $spec->antiRollFront;
+            }
+
+            float32 $c = $v->wheels[$i as usize]->compression;
+            if ($v->wheels[$w->pair as usize]->contact) {
+                $force = $force + $bar * ($c - $v->wheels[$w->pair as usize]->compression);
+            } else {
+                // the other wheel hangs free and carries nothing, so the bar twists only as far
+                // as that wheel's spring lets it
+                float32 $free = $spec->wheels[$w->pair as usize]->spring;
+                $force = $force + $bar * $free / std::math::max($free + $bar, 0.001f) * $c;
+            }
+        }
+
+        $force = std::math::max($force, 0.0f);
+        $v->wheels[$i as usize]->force = $force;
+        $total = $total + $force;
+        $grounded = $grounded + 1;
+        Vec3 $push = $up * ($force * $dt);
+        $body->applyImpulse($push, at: $v->wheels[$i as usize]->point);
+        groundPush($grounds[$i as usize], $push * -1.0f, $v->wheels[$i as usize]->point);
+    }
+    $v->grounded = $grounded;
+
+    // 3 to 6: the tires, alternating the order each step so the clamps favour no side
+    float32 $drive = driveForceAt($spec, $in->throttle, $speed);
+    float32 $brake = std::math::clamp($in->brake, 0.0f, 1.0f);
+    float32 $inertia = std::math::max($spec->wheelInertia, 0.01f);
+    float32 $peak = $spec->longitudinal->peak();
+    $v->sweep = !$v->sweep;
+    for (int32 $k = 0; $k < $n; $k++) {
+        int32 $i = $k;
+        if ($v->sweep) {
+            $i = $n - 1 - $k;
+        }
+
+        VehicleWheel $w = $spec->wheels[$i as usize];
+        VehicleWheelState $s = $v->wheels[$i as usize];
+        float32 $r = $w->radius;
+        float32 $omega = $s->omega + $drive * $w->drive * $r / $inertia * $dt;
+        float32 $braking = $brake * $spec->brakeTorque * $w->brake;
+        if ($in->handbrake && $w->handbrake) {
+            $braking = $braking + $spec->handbrakeTorque;
+        }
+
+        if (!$s->contact) {
+            $omega = towardZero($omega, ($braking + $spec->wheelDrag) / $inertia * $dt);
+            $s->omega = std::math::clamp($omega, -VEHICLE_MAX_OMEGA, VEHICLE_MAX_OMEGA);
+            $s->spin = wrapTurn($s->spin + $s->omega * $dt);
+            $s->slipRatio = 0.0f;
+            $s->slipAngle = 0.0f;
+            $s->fx = 0.0f;
+            $s->fy = 0.0f;
+            $v->wheels[$i as usize] = $s;
+            continue;
+        }
+
+        $braking = $braking + $spec->rollingResistance * $s->force * $r;
+
+        // the tire's frame on the ground and the patch's velocity in it, over the ground under it
+        // and after gravity this step
+        Vec3 $normal = $s->normal;
+        Vec3 $aim = $forward;
+        if ($w->steers) {
+            $aim = $q * Vec3(std::math::sin($v->steerAngle), 0.0f, std::math::cos($v->steerAngle));
+        }
+        Vec3 $f = $aim - $normal * dot($aim, $normal);
+        float32 $flen = length($f);
+        if ($flen < 0.0001f) {
+            $v->wheels[$i as usize] = $s;
+            continue;
+        }
+        $f = $f / $flen;
+        Vec3 $side = cross($normal, $f);
+        PhysicsBody? $under = $grounds[$i as usize];
+        Vec3 $patch = $body->velocity(at: $s->point) + $fall - groundVelocity($under, $s->point);
+        float32 $vx = dot($patch, $f);
+        float32 $vy = dot($patch, $side);
+        float32 $alpha = tireSlipAngle($vx, $vy, $spec->lowSpeed);
+        float32 $aa = std::math::abs($alpha);
+        float32 $load = tireLoad($restLoad, $s->force, $spec->loadResponse, $spec->loadMax * $restLoad);
+        float32 $useful = $mass * $s->force / std::math::max($total, 0.001f);
+        float32 $over = std::math::max(std::math::abs($vx), std::math::max($spec->lowSpeed, 0.001f));
+        float32 $reach = $spec->longByLateral->at($aa) * $load * $s->surface * $dt;
+        Vec3 $lever = $s->point - $com;
+        float32 $groundX = groundInverseMass($under, $s->point, $f);
+        float32 $groundY = groundInverseMass($under, $s->point, $side);
+
+        // longitudinal: the impulse and the slip it leaves agree (solved, not guessed from the
+        // slip before it), and it never undoes more slip than there is. Brakes can take
+        // `$hold` rad/s out of the wheel; if that holds it still, the wheel does not turn and
+        // the chassis alone answers the tire, through its effective mass at the patch
+        float32 $hold = $braking / $inertia * $dt;
+        float32 $jx = 0.0f;
+        float32 $slipAfter = 0.0f;
+        bool $locked = false;
+        if (std::math::abs($omega) <= $hold) {
+            float32 $slip = -$vx;
+            float32 $grip = longGrip($spec, $slip, $vx);
+            float32 $chassis = contactEffectiveMass($invMass, $invI, $qi * $lever, $qi * $f, $spec->pitchScale, $spec->rollScale);
+            float32 $still = 1.0f / std::math::max($chassis, 0.001f) + $groundX;
+            if (std::math::abs($slip) < $spec->lowSpeed) {
+                // a held tire creeping slower than `lowSpeed` grips statically: it stops the
+                // creep outright, up to the curve's peak. Read through the curve it would only
+                // ever take part of the creep away, and a parked car would never stop
+                float32 $most = $peak * $reach * $grip;
+                $jx = std::math::clamp($slip / $still, -$most, $most);
+            } else {
+                $jx = solveSlip($spec->longitudinal, $slip, $still, $over, $reach * $grip);
+            }
+            if (std::math::abs($jx) * $r / $inertia <= $hold - std::math::abs($omega)) {
+                $locked = true;
+                $omega = 0.0f;
+                $slipAfter = $slip - $jx * $still;
+            }
+        }
+
+        if (!$locked) {
+            // a brake that could not hold the wheel still works against the spin up the tire is
+            // about to give it: the wheel starts that far behind standing still, toward the
+            // road's own spin, and never ends turning backward
+            bool $caught = std::math::abs($omega) <= $hold;
+            if ($caught) {
+                $omega = -(sgn($vx) as float32) * ($hold - std::math::abs($omega));
+            } else {
+                $omega = towardZero($omega, $hold);
+            }
+
+            float32 $slip = $omega * $r - $vx;
+            float32 $chassisShare = 1.0f / std::math::max($useful, 0.001f) + $groundX;
+            float32 $share = $r * $r / $inertia + $chassisShare;
+            float32 $grip = longGrip($spec, $slip, $vx);
+            $jx = solveSlip($spec->longitudinal, $slip, $share, $over, $reach * $grip);
+            $slipAfter = $slip - $jx * $share;
+            float32 $road = ($vx + $jx * $chassisShare) / $r;
+            $omega = $omega - $jx * $r / $inertia;
+            if ($caught && $omega * $vx < 0.0f) {
+                $omega = 0.0f;
+            }
+            $omega = wheelOmegaClamp($omega, $slip, $road, $r);
+        }
+        float32 $kappa = $slipAfter / $over;
+
+        // lateral: the drawn grip against the slip angle, weakened by the slip ratio, capped by
+        // what stops the patch sliding sideways through the effective mass
+        float32 $latGrip = $spec->gripRear;
+        if ($w->front) {
+            $latGrip = $spec->gripFront;
+        }
+        if ($in->handbrake && $w->handbrake) {
+            $latGrip = $latGrip * $spec->gripHandbrake;
+        }
+        float32 $muy = $spec->lateral->at($aa) * $spec->lateralByLong->at(std::math::abs($kappa));
+        float32 $fy = -(sgn($vy) as float32) * $muy * $load * $latGrip * $s->surface;
+        float32 $meff = contactEffectiveMass($invMass, $invI, $qi * $lever, $qi * $side, $spec->pitchScale, $spec->rollScale);
+        float32 $jymax = std::math::abs($vy) / (1.0f / std::math::max($meff, 0.001f) + $groundY);
+        float32 $jy = std::math::clamp($fy * $dt, -$jymax, $jymax);
+
+        Vec3 $impulse = $f * $jx + $side * $jy;
+        pushTire($body, $impulse, $lever, $q, $qi, $spec->pitchScale, $spec->rollScale);
+        groundPush($under, $impulse * -1.0f, $s->point);
+
+        $s->omega = std::math::clamp($omega, -VEHICLE_MAX_OMEGA, VEHICLE_MAX_OMEGA);
+        $s->spin = wrapTurn($s->spin + $s->omega * $dt);
+        $s->load = $load;
+        $s->slipRatio = $kappa;
+        $s->slipAngle = $alpha;
+        $s->fx = $jx / $dt;
+        $s->fy = $jy / $dt;
+        $v->wheels[$i as usize] = $s;
+    }
+
+    // 7: assists over the whole car
+    if ($grounded >= 2 && $invI->y > 0.0f) {
+        Vec3 $spinNow = $body->angularVelocity();
+        float32 $yawRate = dot($spinNow, $up);
+        float32 $correct = 0.0f;
+        if (!$in->handbrake && std::math::abs($speed) > 3.0f) {
+            float32 $want = $speed * std::math::tan($v->steerAngle) / $spec->wheelbase();
+            float32 $cap = $g / std::math::abs($speed);
+            $want = std::math::clamp($want, -$cap, $cap);
+            $correct = std::math::clamp($spec->yawAssist * ($want - $yawRate) * $dt, -$spec->yawAssistMax * $dt, $spec->yawAssistMax * $dt);
+        }
+
+        // gated on the speed over the ground, not along the nose: a car sliding sideways is the
+        // drift this is for. The nose turns toward the velocity, or the tail when reversing
+        Vec3 $planar = $vel - $up * dot($vel, $up);
+        if (length($planar) > 3.0f) {
+            float32 $beta = std::math::atan2($v->sideSpeed, std::math::abs($speed));
+            float32 $over = std::math::abs($beta) - $spec->driftLimit;
+            if ($over > 0.0f) {
+                float32 $way = 1.0f;
+                if ($speed < -3.0f) {
+                    $way = -1.0f;
+                }
+                $correct = $correct + $way * (sgn($beta) as float32) * $spec->driftAssist * $over * $dt;
+            }
+        }
+
+        if ($correct != 0.0f) {
+            $body->applyTorqueImpulse($up * ($correct / $invI->y));
+        }
+    }
+
+    if ($grounded == 0 && $v->driven && $spec->airRight > 0.0f) {
+        // pitch and roll rates toward upright, `airRight` per radian of tilt, reached through the
+        // inertia at most `airRightMax` at a time, so it settles instead of swinging past
+        Vec3 $axis = cross($up, $sky);
+        float32 $sin = length($axis);
+        float32 $angle = std::math::atan2($sin, dot($up, $sky));
+        Vec3 $tilt = Vec3(0.0f, 0.0f, 0.0f);
+        if ($sin > 0.0001f) {
+            $tilt = $qi * ($axis * ($angle / $sin));
+        } else if (dot($up, $sky) < 0.0f) {
+            $tilt = Vec3(0.0f, 0.0f, std::math::PI_F32);
+        }
+
+        Vec3 $spin = $qi * $body->angularVelocity();
+        float32 $most = $spec->airRightMax * $dt;
+        Vec3 $turn = Vec3(0.0f, 0.0f, 0.0f);
+        if ($invI->x > 0.0f) {
+            $turn->x = std::math::clamp($spec->airRight * $tilt->x - $spin->x, -$most, $most) / $invI->x;
+        }
+        if ($invI->z > 0.0f) {
+            $turn->z = std::math::clamp($spec->airRight * $tilt->z - $spin->z, -$most, $most) / $invI->z;
+        }
+        $body->applyTorqueImpulse($q * $turn);
+    }
+
+    if ($spec->drag > 0.0f) {
+        Vec3 $now = $body->velocity();
+        $body->applyImpulse($now * (-$spec->drag * length($now) * $dt));
+    }
+}
+
+/**
+ * The velocity of the ground's material at `$point`: zero for static ground, which is all but a
+ * dynamic body.
+ */
+internal function groundVelocity(PhysicsBody? $ground, Vec3 $point) : Vec3
+{
+    PhysicsBody $b = guard $ground else {
+        return Vec3(0.0f, 0.0f, 0.0f);
+    }
+
+    return $b->velocity(at: $point);
+}
+
+/**
+ * How much velocity the ground gains along `$dir` at `$point` per unit of impulse there (its
+ * inverse effective mass), 0 for static ground.
+ */
+internal function groundInverseMass(PhysicsBody? $ground, Vec3 $point, Vec3 $dir) : float32
+{
+    PhysicsBody $b = guard $ground else {
+        return 0.0f;
+    }
+
+    Quat $gi = conjugate($b->orientation());
+    float32 $m = contactEffectiveMass($b->inverseMass(), $b->inverseInertia(), $gi * ($point - $b->position()), $gi * $dir, 1.0f, 1.0f);
+    if ($m <= 0.0f) {
+        return 0.0f;
+    }
+
+    return 1.0f / $m;
+}
+
+/**
+ * The wheel's reaction into a dynamic ground, whole and waking it: a quiet push on a sleeping body
+ * would bank velocity until something woke it.
+ */
+internal function groundPush(PhysicsBody? $ground, Vec3 $impulse, Vec3 $point) : void
+{
+    PhysicsBody $b = guard $ground else {
+        return;
+    }
+
+    $b->applyImpulse($impulse, at: $point, wake: true);
+}
+
+/**
+ * A tire impulse into the chassis: the linear part whole, the angular part with its pitch (local
+ * x) and roll (local z) scaled. Yaw stays whole: it is what steering is for.
+ */
+internal function pushTire(PhysicsBody $body, Vec3 $impulse, Vec3 $lever, Quat $q, Quat $qi, float32 $pitch, float32 $roll) : void
+{
+    $body->applyImpulse($impulse);
+    Vec3 $turn = $qi * cross($lever, $impulse);
+    $turn->x = $turn->x * $pitch;
+    $turn->z = $turn->z * $roll;
+    $body->applyTorqueImpulse($q * $turn);
+}
+
+/**
+ * The longitudinal impulse a tire gives for `$slip` m/s of tread over ground, where each unit of
+ * impulse takes `$share` m/s of slip away (the wheel spun down plus the chassis sped up) and the
+ * slip ratio reads over `$over`. It is the impulse the curve asks for at the slip it leaves:
+ * `j = reach * curve((|slip| - j share) / over)`, found by bisection between none and what zeroes
+ * the slip. A stiff tire on a light wheel would otherwise read its slip before the impulse,
+ * overshoot to the far side of the curve and lose its side grip with it. Signed like `$slip`.
+ */
+internal function solveSlip(const TireCurve& $curve, float32 $slip, float32 $share, float32 $over, float32 $reach) : float32
+{
+    float32 $a = std::math::abs($slip);
+    if ($a <= 0.0f || $reach <= 0.0f || $share <= 0.0f) {
+        return 0.0f;
+    }
+
+    float32 $lo = 0.0f;
+    float32 $hi = $a / $share;
+    for (int32 $i = 0; $i < 14; $i++) {
+        float32 $mid = ($lo + $hi) * 0.5f;
+        if ($mid > $reach * $curve->at(($a - $mid * $share) / $over)) {
+            $hi = $mid;
+        } else {
+            $lo = $mid;
+        }
+    }
+
+    float32 $j = ($lo + $hi) * 0.5f;
+    if ($slip < 0.0f) {
+        return -$j;
+    }
+
+    return $j;
+}
+
+/**
+ * The longitudinal grip for `$slip` against the ground at `$vx`: braking when the tread runs
+ * slower than the ground, driving when faster.
+ */
+internal function longGrip(const VehicleSpec& $spec, float32 $slip, float32 $vx) : float32
+{
+    if ($slip * $vx < 0.0f) {
+        return $spec->gripBrake;
+    }
+
+    return $spec->gripAccel;
+}
+
+/**
+ * `$value` moved toward zero by up to `$by`, never past it.
+ */
+internal function towardZero(float32 $value, float32 $by) : float32
+{
+    if ($value > 0.0f) {
+        return std::math::max($value - $by, 0.0f);
+    }
+
+    return std::math::min($value + $by, 0.0f);
+}
+
+/**
+ * An angle kept within one turn, so a wheel's spin never loses precision.
+ */
+internal function wrapTurn(float32 $angle) : float32
+{
+    float32 $tau = std::math::TAU_F32;
+    if ($angle >= $tau || $angle <= -$tau) {
+        return $angle - std::math::floor($angle / $tau) * $tau;
+    }
+
+    return $angle;
+}

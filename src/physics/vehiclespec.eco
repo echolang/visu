@@ -1,0 +1,296 @@
+/**
+ * How a vehicle drives: its wheels, engine, brakes, steering, tires and the handling layer over
+ * them. A class, so every vehicle of a kind shares one and a console tune reaches all of them at
+ * once.
+ *
+ * The tire model takes simulation-like inputs (slip ratio, slip angle, wheel load) and reads
+ * them through drawn curves, with more grip than a real tire where it helps, clamps so no force
+ * undoes more slip than one step holds, and pitch and roll taken out of what the tires do to the
+ * chassis. Assists sit above it and steer the whole car, never the tire.
+ */
+
+namespace visu::physics;
+
+use visu::math::Vec2;
+
+public const int32 VEHICLE_MAX_WHEELS = 6;
+
+public class VehicleSpec
+{
+    /**
+     * Up to six wheels; only the first `wheelCount` are used.
+     */
+    public fixed_array<VehicleWheel, 6> $wheels;
+    public int32 $wheelCount;
+
+    // engine and brakes
+
+    /**
+     * Newtons at the contact patches at full throttle, before the power limit takes over.
+     */
+    public float32 $driveForce;
+
+    /**
+     * Watts: above `power / driveForce` m/s the force falls off as power over speed.
+     */
+    public float32 $power;
+
+    /**
+     * Metres per second forward, and in reverse, past which the engine gives nothing.
+     */
+    public float32 $maxSpeed;
+    public float32 $reverseSpeed;
+
+    /**
+     * The share of `driveForce` reverse gets.
+     */
+    public float32 $reverseScale;
+
+    /**
+     * Newton metres over every wheel at full brake (split by `VehicleWheel.brake`), and per
+     * handbrake wheel.
+     */
+    public float32 $brakeTorque;
+    public float32 $handbrakeTorque;
+
+    /**
+     * Kilogram square metres per wheel, the driveline it turns included.
+     */
+    public float32 $wheelInertia;
+
+    /**
+     * Newton metres that slow a wheel off the ground: bearings and the driveline, so a wheel
+     * spun up in the air winds down.
+     */
+    public float32 $wheelDrag;
+
+    /**
+     * Rolling resistance as a share of the wheel's load, and air drag in newtons per (m/s)².
+     */
+    public float32 $rollingResistance;
+    public float32 $drag;
+
+    // steering
+
+    /**
+     * Radians of lock at a standstill and at `steerFadeSpeed` m/s and above, so a fast car does
+     * not swap ends on a touch of the key.
+     */
+    public float32 $steerLow;
+    public float32 $steerHigh;
+    public float32 $steerFadeSpeed;
+
+    /**
+     * Radians per second the wheels turn toward the lock asked for, and back toward straight.
+     */
+    public float32 $steerRate;
+    public float32 $steerReturn;
+
+    // tires
+
+    /**
+     * 0 to 1: how much of the instant load the tire feels (`rest^(1-r) * instant^r`). Lower is
+     * calmer under weight transfer.
+     */
+    public float32 $loadResponse;
+
+    /**
+     * The most load a tire takes, as a multiple of its rest load.
+     */
+    public float32 $loadMax;
+
+    /**
+     * Grip against slip ratio, grip against slip angle (radians), and the two combined-slip
+     * curves: lateral grip kept against slip ratio, longitudinal grip kept against slip angle.
+     */
+    public TireCurve $longitudinal;
+    public TireCurve $lateral;
+    public TireCurve $lateralByLong;
+    public TireCurve $longByLateral;
+
+    /**
+     * Multiplies the longitudinal curve while the tire drives the car, and while it brakes.
+     */
+    public float32 $gripAccel;
+    public float32 $gripBrake;
+
+    /**
+     * Multiplies the lateral curve on the front wheels and the rear, and on a wheel the handbrake
+     * holds.
+     */
+    public float32 $gripFront;
+    public float32 $gripRear;
+    public float32 $gripHandbrake;
+
+    /**
+     * Below this many m/s the slip ratio and the slip angle read over it instead of the wheel's
+     * speed, so a car pulling away does not see infinite slip, and a sideways creep at a
+     * standstill is not a full slide. A held tire creeping slower than this grips statically.
+     */
+    public float32 $lowSpeed;
+
+    // handling
+
+    /**
+     * How much of the pitch and the roll the tire impulses would give the chassis it gets. Bullet's
+     * collisions and the springs are never scaled.
+     */
+    public float32 $pitchScale;
+    public float32 $rollScale;
+
+    /**
+     * Newtons per metre of compression difference across an axle.
+     */
+    public float32 $antiRollFront;
+    public float32 $antiRollRear;
+
+    /**
+     * Pulls the yaw rate toward what the steering asks (per second of error), at most
+     * `yawAssistMax` rad/s² of correction.
+     */
+    public float32 $yawAssist;
+    public float32 $yawAssistMax;
+
+    /**
+     * Past `driftLimit` radians of body slip, yaw back toward the velocity at `driftAssist` per
+     * second of excess.
+     */
+    public float32 $driftLimit;
+    public float32 $driftAssist;
+
+    /**
+     * Rights the car in the air while someone drives it: the pitch and roll rate it aims for is
+     * `airRight` per radian of tilt, reached at most `airRightMax` rad/s² at a time. A parked car
+     * is never pushed, so a wreck on its side stays where it fell and goes to sleep.
+     */
+    public float32 $airRight;
+    public float32 $airRightMax;
+
+    /**
+     * What the wheel rays may stand on.
+     */
+    public PhysicsLayer $rayMask;
+
+    /**
+     * m/s and rad/s under which the parked body may fall asleep. Far below a crate's: a car still
+     * settling on its springs must not freeze mid bounce.
+     */
+    public float32 $sleepLinear;
+    public float32 $sleepAngular;
+
+    public constructor()
+    {
+        $this->wheelCount = 0;
+        $this->driveForce = 5200.0f;
+        $this->power = 75000.0f;
+        $this->maxSpeed = 33.0f;
+        $this->reverseSpeed = 8.0f;
+        $this->reverseScale = 0.45f;
+        $this->brakeTorque = 4000.0f;
+        $this->handbrakeTorque = 2000.0f;
+        $this->wheelInertia = 1.2f;
+        $this->wheelDrag = 20.0f;
+        $this->rollingResistance = 0.012f;
+        $this->drag = 0.42f;
+        $this->steerLow = 0.6f;
+        $this->steerHigh = 0.12f;
+        $this->steerFadeSpeed = 30.0f;
+        $this->steerRate = 2.8f;
+        $this->steerReturn = 4.0f;
+        $this->loadResponse = 0.5f;
+        $this->loadMax = 3.0f;
+        $this->longitudinal = TireCurve(0.0f);
+        $this->lateral = TireCurve(0.0f);
+        $this->lateralByLong = TireCurve(1.0f);
+        $this->longByLateral = TireCurve(1.0f);
+        $this->gripAccel = 1.0f;
+        $this->gripBrake = 1.15f;
+        $this->gripFront = 1.0f;
+        $this->gripRear = 1.08f;
+        $this->gripHandbrake = 0.6f;
+        $this->lowSpeed = 1.0f;
+        $this->pitchScale = 0.35f;
+        $this->rollScale = 0.3f;
+        $this->antiRollFront = 9000.0f;
+        $this->antiRollRear = 6000.0f;
+        $this->yawAssist = 1.0f;
+        $this->yawAssistMax = 3.0f;
+        $this->driftLimit = 0.7f;
+        $this->driftAssist = 4.0f;
+        $this->airRight = 1.5f;
+        $this->airRightMax = 4.0f;
+        $this->rayMask = PhysicsLayer::all();
+        $this->sleepLinear = 0.05f;
+        $this->sleepAngular = 0.05f;
+        $this->standardCurves();
+    }
+
+    /**
+     * Add a wheel; returns its index, -1 past `VEHICLE_MAX_WHEELS`.
+     */
+    public function add(VehicleWheel $wheel) : int32
+    {
+        if ($this->wheelCount >= VEHICLE_MAX_WHEELS) {
+            return -1;
+        }
+
+        int32 $i = $this->wheelCount;
+        $this->wheels[$i as usize] = $wheel;
+        $this->wheelCount = $i + 1;
+        return $i;
+    }
+
+    /**
+     * The lock the wheels may turn to at `$speed` m/s.
+     */
+    public const function maxSteer(float32 $speed) : float32
+    {
+        float32 $t = std::math::clamp(std::math::abs($speed) / std::math::max($this->steerFadeSpeed, 0.1f), 0.0f, 1.0f);
+        return $this->steerLow + ($this->steerHigh - $this->steerLow) * $t;
+    }
+
+    /**
+     * Metres between the frontmost and the rearmost axle, for the yaw assist.
+     */
+    public const function wheelbase() : float32
+    {
+        if ($this->wheelCount == 0) {
+            return 1.0f;
+        }
+
+        float32 $lo = $this->wheels[0]->mount->z;
+        float32 $hi = $lo;
+        for (usize $i = 1; $i < ($this->wheelCount as usize); $i++) {
+            $lo = std::math::min($lo, $this->wheels[$i]->mount->z);
+            $hi = std::math::max($hi, $this->wheels[$i]->mount->z);
+        }
+
+        return std::math::max($hi - $lo, 0.5f);
+    }
+
+    /**
+     * A road tire: stiff to about 12% slip ratio and 6° slip angle, then a gentle fall into a
+     * slide that keeps most of its grip. Combined slip trades side grip for drive and braking.
+     */
+    public function standardCurves() : void
+    {
+        array<Vec2> $long = [
+            Vec2(0.0f, 0.0f), Vec2(0.04f, 0.6f), Vec2(0.08f, 0.95f), Vec2(0.12f, 1.0f),
+            Vec2(0.2f, 0.95f), Vec2(0.4f, 0.85f), Vec2(1.0f, 0.75f), Vec2(3.0f, 0.7f)
+        ];
+        array<Vec2> $lat = [
+            Vec2(0.0f, 0.0f), Vec2(0.035f, 0.55f), Vec2(0.07f, 0.85f), Vec2(0.11f, 1.0f),
+            Vec2(0.17f, 0.98f), Vec2(0.35f, 0.88f), Vec2(0.79f, 0.78f), Vec2(1.571f, 0.7f)
+        ];
+        array<Vec2> $latByLong = [
+            Vec2(0.0f, 1.0f), Vec2(0.1f, 0.92f), Vec2(0.3f, 0.7f), Vec2(0.6f, 0.55f), Vec2(1.0f, 0.5f)
+        ];
+        array<Vec2> $longByLat = [
+            Vec2(0.0f, 1.0f), Vec2(0.1f, 0.9f), Vec2(0.3f, 0.7f), Vec2(0.8f, 0.55f), Vec2(1.571f, 0.5f)
+        ];
+        $this->longitudinal = TireCurve($long);
+        $this->lateral = TireCurve($lat);
+        $this->lateralByLong = TireCurve($latByLong);
+        $this->longByLateral = TireCurve($longByLat);
+    }
+}

@@ -1,0 +1,196 @@
+/**
+ * The GPU-driven main views' pipelines, one per G-buffer class (`SceneClass`) and view: the
+ * camera (back-face culled, or both faces, with the class's depth bias), the water mirror
+ * (front-face culled, since the reflection reverses winding; both faces stay unculled; no bias,
+ * as the mirror is half resolution) and the outline mask (the mask's own depth keeps the front
+ * surface, both faces, so two-sided cards outline too). Rigid or skinned, plain or parallax pick
+ * the program. A cut-out class also has a depth pre-pass per view (depth only, its cutout) and
+ * its shading pipeline then tests depth equal and writes none, so each pixel shades once. Built the first time a class draws, after the bank registered it at a load step;
+ * a raster knob that flips (wireframe) drops them all.
+ */
+
+namespace visu::system;
+
+use visu::graphics::{Device, GpuPass, ModelBank, Raster, SCENE_CLASSES_MAX, SceneClass, ShaderProgram, VertexLayout};
+
+internal class ScenePasses
+{
+    private Device $device;
+    private array<GpuPass?> $camera;
+    private array<GpuPass?> $mirror;
+    private array<GpuPass?> $outline;
+    private array<GpuPass?> $cameraDepth;
+    private array<GpuPass?> $mirrorDepth;
+    private bool $wireframe;
+
+    public constructor(Device $device)
+    {
+        $this->device = $device;
+        $this->camera = arr::room<GpuPass?>(SCENE_CLASSES_MAX as usize);
+        $this->mirror = arr::room<GpuPass?>(SCENE_CLASSES_MAX as usize);
+        $this->outline = arr::room<GpuPass?>(SCENE_CLASSES_MAX as usize);
+        $this->cameraDepth = arr::room<GpuPass?>(SCENE_CLASSES_MAX as usize);
+        $this->mirrorDepth = arr::room<GpuPass?>(SCENE_CLASSES_MAX as usize);
+        $this->wireframe = false;
+        $this->reset(false);
+    }
+
+    /**
+     * Forget every pipeline; the next draw builds them with `$wireframe`.
+     */
+    public function reset(bool $wireframe) : void
+    {
+        $this->wireframe = $wireframe;
+        $this->camera->clear();
+        $this->mirror->clear();
+        $this->outline->clear();
+        $this->cameraDepth->clear();
+        $this->mirrorDepth->clear();
+        GpuPass? $none = null;
+        int32 $i = 0;
+        while ($i < SCENE_CLASSES_MAX) {
+            $this->camera[] = $none;
+            $this->mirror[] = $none;
+            $this->outline[] = $none;
+            $this->cameraDepth[] = $none;
+            $this->mirrorDepth[] = $none;
+            $i = $i + 1;
+        }
+    }
+
+    /**
+     * Build the pipelines of every class the bank has registered and this table has not yet,
+     * outside any encoder (`fill`), so a draw only looks them up.
+     */
+    public function ensure(ModelBank $bank) : void
+    {
+        int32 $k = 0;
+        int32 $n = $bank->classCount();
+        while ($k < $n) {
+            if ($this->camera[$k as usize] == null) {
+                SceneClass $c = $bank->gclass($k);
+                $this->camera[$k as usize] = $this->build($c, 0);
+                $this->mirror[$k as usize] = $this->build($c, 1);
+                $this->outline[$k as usize] = $this->build($c, 2);
+                if ($c->cutout && !$this->wireframe) {
+                    $this->cameraDepth[$k as usize] = $this->prepass($c, 0);
+                    $this->mirrorDepth[$k as usize] = $this->prepass($c, 1);
+                }
+            }
+
+            $k = $k + 1;
+        }
+    }
+
+    public const function camera(int32 $k) : GpuPass?
+    {
+        return $this->camera[$k as usize];
+    }
+
+    public const function mirror(int32 $k) : GpuPass?
+    {
+        return $this->mirror[$k as usize];
+    }
+
+    public const function outline(int32 $k) : GpuPass?
+    {
+        return $this->outline[$k as usize];
+    }
+
+    /**
+     * Class `$k`'s depth pre-pass in the camera or the mirror, null for a class without a cutout.
+     */
+    public const function cameraDepth(int32 $k) : GpuPass?
+    {
+        return $this->cameraDepth[$k as usize];
+    }
+
+    public const function mirrorDepth(int32 $k) : GpuPass?
+    {
+        return $this->mirrorDepth[$k as usize];
+    }
+
+    /**
+     * Class `$c`'s depth pre-pass for view 0 (camera) or 1 (mirror): its raster, no colour.
+     */
+    private function prepass(const SceneClass& $c, int32 $view) : GpuPass
+    {
+        string $name = 'model_pull+prepass';
+        if ($c->skinned) {
+            $name = 'model_pull+skinned_prepass';
+        }
+
+        Raster $raster = $this->raster($c, $view);
+        $raster->colorWrite = false;
+        return GpuPass($this->program($name), VertexLayout::none(), $raster);
+    }
+
+    private function raster(const SceneClass& $c, int32 $view) : Raster
+    {
+        Raster $raster = Raster::opaque();
+        if ($this->wireframe) {
+            $raster->fill = .lines;
+        }
+
+        if ($view == 0) {
+            $raster->cull = .back;
+            $raster->depthBias = $c->depthBias;
+            $raster->depthSlope = $c->depthSlope;
+        } else {
+            $raster->cull = .front;
+        }
+
+        if ($c->doubleSided) {
+            $raster->cull = .none;
+        }
+
+        return $raster;
+    }
+
+    /**
+     * Class `$c`'s pipeline for view 0 (camera), 1 (mirror) or 2 (outline mask).
+     */
+    private function build(const SceneClass& $c, int32 $view) : GpuPass
+    {
+        if ($view == 2) {
+            string $mask = 'outline_pull';
+            if ($c->skinned) {
+                $mask = 'outline_pull+skinned';
+            }
+
+            Raster $raster = Raster();
+            $raster->depthTest = true;
+            $raster->depthWrite = true;
+            $raster->cull = .none;
+            return GpuPass($this->program($mask), VertexLayout::none(), $raster);
+        }
+
+        string $name = 'model_pull';
+        if ($c->skinned && $c->parallax) {
+            $name = 'model_pull+skinned_parallax';
+        } else if ($c->skinned) {
+            $name = 'model_pull+skinned';
+        } else if ($c->parallax) {
+            $name = 'model_pull+parallax';
+        }
+
+        Raster $raster = $this->raster($c, $view);
+        // a cut-out class shades against its own pre-pass in the camera: depth equal, written
+        // already. The half-resolution mirror shades directly; its pre-pass costs more vertex
+        // work than the overdraw it saves
+        if ($view == 0 && $c->cutout && !$this->wireframe) {
+            $raster->depthCompare = .equal;
+            $raster->depthWrite = false;
+        }
+
+        return GpuPass($this->program($name), VertexLayout::none(), $raster);
+    }
+
+    private function program(const string& $name) : ShaderProgram
+    {
+        ShaderProgram $p = guard $this->device->gpuShaders->program($this->device, $name) else ($e) {
+            die($e->message());
+        }
+        return $p;
+    }
+}

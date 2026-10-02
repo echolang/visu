@@ -1,0 +1,163 @@
+/**
+ * The dynamic AABB tree against brute force: overlaps and rays find every box a walk finds, the
+ * tree stays shallow through many inserts, moves inside the fat box reinsert nothing, and removals
+ * free their leaves for reuse.
+ */
+
+use visu::geo::{AABB, AabbTree, Ray};
+use visu::math::Vec3;
+
+internal function treeRand(uint32& $state) : float32
+{
+    $state = $state * 1664525 + 1013904223;
+    uint32 $top = $state >> 8;
+    return ($top as float32) / 16777216.0f;
+}
+
+internal function treeBox(uint32& $state) : AABB
+{
+    Vec3 $c = Vec3(treeRand($state) * 200.0f - 100.0f, treeRand($state) * 20.0f, treeRand($state) * 200.0f - 100.0f);
+    Vec3 $h = Vec3(0.2f + treeRand($state) * 2.0f, 0.2f + treeRand($state) * 2.0f, 0.2f + treeRand($state) * 2.0f);
+    return AABB($c - $h, $c + $h);
+}
+
+internal function treeHas(const array<int32>& $list, int32 $item) : bool
+{
+    foreach ($list as $each) {
+        if ($each == $item) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+test aabb_tree_overlap_and_ray_match_brute_force
+{
+    uint32 $seed = 7;
+    AabbTree $tree = AabbTree(0.1f);
+    $tree->reserve(2000);
+    array<AABB> $boxes = array<AABB>();
+    array<int32> $proxies = array<int32>();
+    int32 $i = 0;
+    while ($i < 2000) {
+        AABB $b = treeBox($seed);
+        $boxes[] = $b;
+        $proxies[] = $tree->insert($b, $i);
+        $i = $i + 1;
+    }
+
+    assert($tree->count() == 2000, 'every leaf in');
+    assert($tree->height() < 30, 'balanced: depth stays near log n');
+
+    int32 $q = 0;
+    while ($q < 50) {
+        AABB $probe = treeBox($seed);
+        array<int32> $found = array<int32>();
+        $tree->overlap($probe, $found);
+        $i = 0;
+        while ($i < 2000) {
+            if ($boxes[$i as usize]->intersects($probe)) {
+                assert(treeHas($found, $i), 'every overlapping box is found');
+            }
+
+            $i = $i + 1;
+        }
+
+        Ray $ray = Ray(Vec3(treeRand($seed) * 200.0f - 100.0f, 5.0f, -150.0f), Vec3(0.0f, 0.0f, 1.0f));
+        array<int32> $hits = array<int32>();
+        $tree->ray($ray, 1000.0f, $hits);
+        $i = 0;
+        while ($i < 2000) {
+            if ($boxes[$i as usize]->hitDistance($ray) != null) {
+                assert(treeHas($hits, $i), 'every box the ray enters is a candidate');
+            }
+
+            $i = $i + 1;
+        }
+
+        $q = $q + 1;
+    }
+}
+
+test aabb_tree_moves_inside_the_fat_box_are_free
+{
+    AabbTree $tree = AabbTree(0.5f);
+    int32 $p = $tree->insert(AABB(Vec3(0.0f), Vec3(1.0f)), 3);
+    assert(!$tree->move($p, AABB(Vec3(0.2f), Vec3(1.2f))), 'inside the margin: no reinsert');
+    assert($tree->move($p, AABB(Vec3(5.0f), Vec3(6.0f))), 'out of it: reinserted');
+    assert($tree->item($p) == 3, 'the item stays');
+    array<int32> $found = array<int32>();
+    $tree->overlap(AABB(Vec3(5.5f), Vec3(5.6f)), $found);
+    assert($found->count() == 1 && $found[0] == 3, 'found where it went');
+}
+
+test aabb_tree_removal_frees_and_reuses
+{
+    uint32 $seed = 11;
+    AabbTree $tree = AabbTree(0.1f);
+    array<int32> $proxies = array<int32>();
+    int32 $i = 0;
+    while ($i < 300) {
+        $proxies[] = $tree->insert(treeBox($seed), $i);
+        $i = $i + 1;
+    }
+
+    $i = 0;
+    while ($i < 300) {
+        if (($i % 3) != 0) {
+            $tree->remove($proxies[$i as usize]);
+        }
+
+        $i = $i + 1;
+    }
+
+    assert($tree->count() == 100, 'a third left');
+    array<int32> $all = array<int32>();
+    $tree->overlap(AABB(Vec3(-1000.0f), Vec3(1000.0f)), $all);
+    assert($all->count() == 100, 'and only those are found');
+    foreach ($all as $item) {
+        assert(($item % 3) == 0, 'the kept ones');
+    }
+
+    int32 $again = $tree->insert(AABB(Vec3(0.0f), Vec3(1.0f)), 999);
+    assert($again < 600, 'a freed node is reused');
+}
+
+test pick_system_ray_and_overlap_follow_the_component
+{
+    visu::ecs::Entities $world = visu::ecs::Entities();
+    visu::system::PickSystem $picks = visu::system::PickSystem();
+    $picks->register($world);
+    visu::ecs::Entity $a = $world->create();
+    $world->attach($a, visu::components::Pickable(AABB(Vec3(-0.5f, 0.0f, 4.5f), Vec3(0.5f, 1.0f, 5.5f)), 1, 7));
+    visu::ecs::Entity $b = $world->create();
+    $world->attach($b, visu::components::Pickable(AABB(Vec3(-0.5f, 0.0f, 9.5f), Vec3(0.5f, 1.0f, 10.5f)), 2, 8));
+    Ray $ray = Ray(Vec3(0.0f, 0.5f, 0.0f), Vec3(0.0f, 0.0f, 1.0f));
+    visu::system::PickHit $hit = guard $picks->ray($world, $ray, 100.0f, 0xFFFFFFFF) else {
+        assert(false, 'a hit');
+        return;
+    }
+    assert($hit->entity == $a && $hit->tag == 7, 'the nearer one');
+    visu::system::PickHit $other = guard $picks->ray($world, $ray, 100.0f, 2) else {
+        assert(false, 'a hit on layer 2');
+        return;
+    }
+    assert($other->entity == $b, 'the layer mask skips the nearer one');
+
+    // the box moves through the component: the index follows
+    visu::components::Pickable& $p = $world->get<visu::components::Pickable>($a);
+    $p->box = AABB(Vec3(50.0f, 0.0f, 50.0f), Vec3(51.0f, 1.0f, 51.0f));
+    $world->changed<visu::components::Pickable>($a);
+    visu::system::PickHit $after = guard $picks->ray($world, $ray, 100.0f, 0xFFFFFFFF) else {
+        assert(false, 'still a hit');
+        return;
+    }
+    assert($after->entity == $b, 'a moved away');
+    array<visu::ecs::Entity> $found = array<visu::ecs::Entity>();
+    $picks->overlap($world, AABB(Vec3(49.0f, 0.0f, 49.0f), Vec3(52.0f, 2.0f, 52.0f)), 0xFFFFFFFF, $found);
+    assert($found->count() == 1 && $found[0] == $a, 'found where it went');
+    $world->detach<visu::components::Pickable>($b);
+    assert($picks->ray($world, $ray, 100.0f, 0xFFFFFFFF) == null, 'detached: gone');
+    assert($world->getSingleton<visu::system::PickSystem>()->count() == 1, 'the world finds its index');
+}

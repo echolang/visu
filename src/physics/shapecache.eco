@@ -1,0 +1,180 @@
+/**
+ * Backend shapes, one per distinct primitive and scale. A scene's colliders repeat a handful of
+ * shapes (every trunk of one size, every crate), and a backend shape can back any number of
+ * bodies, so the cache hands the same one out again. Dimensions are quantised to a millimetre,
+ * which is also what makes two scales that differ only by float noise share a shape.
+ *
+ * A heightfield is not cached: it borrows its map, and a scene has one or two. Neither is a mesh:
+ * each one is its own triangles.
+ */
+
+namespace visu::physics;
+
+use visu::geo::Heightmap;
+use visu::math::Vec3;
+
+/**
+ * The largest quantised dimension: 20 bits of millimetres, a little over a kilometre.
+ */
+internal const uint64 SHAPE_QUANT_MAX = 0xFFFFF;
+
+/**
+ * A backend shape and how a body wearing it is placed: `shift` is added to the body origin in
+ * world space (a heightfield's centring), and a shape that does not `turn` keeps an identity
+ * rotation whatever its entity's orientation.
+ */
+internal struct BuiltShape
+{
+    internal bt::Shape $shape;
+    internal Vec3 $shift;
+    internal bool $turns;
+}
+
+internal class ShapeCache
+{
+    private map<uint64, bt::Shape> $shapes;
+
+    internal constructor()
+    {
+        $this->shapes = map<uint64, bt::Shape>();
+        $this->shapes->reserve(256);
+    }
+
+    internal const function count() : int32
+    {
+        return $this->shapes->count() as int32;
+    }
+
+    /**
+     * The backend shape for `$shape` at `$scale`, built the first time that pair is asked for. Null
+     * when the backend refuses it (a heightfield under two samples wide, an empty mesh).
+     */
+    internal function build(const ColliderShape& $shape, Vec3 $scale) : BuiltShape?
+    {
+        return match ($shape) {
+            ColliderShape::heightfield($map) => $this->field($map),
+            ColliderShape::mesh($mesh) => $this->triangles($mesh, $scale),
+            else => $this->primitive($shape, $scale),
+        };
+    }
+
+    private function field(Heightmap $map) : BuiltShape?
+    {
+        $src = HeightmapSamples($map);
+        bt::Shape $field = guard bt::Shape::heightfield(borrowing: $src, accelerate: true) else {
+            return null;
+        }
+        $field->setScaling($src->scaling());
+        return BuiltShape($field, $src->centre(), false);
+    }
+
+    private function triangles(CollisionMesh $mesh, Vec3 $scale) : BuiltShape?
+    {
+        bt::Shape $shape = guard bt::Shape::mesh(meshVertices($mesh), $mesh->indices) else {
+            return null;
+        }
+        if (!sameScale($scale, Vec3(1.0f, 1.0f, 1.0f))) {
+            $shape->setScaling(toBt($scale));
+        }
+
+        return BuiltShape($shape, Vec3(0.0f, 0.0f, 0.0f), true);
+    }
+
+    private function primitive(const ColliderShape& $shape, Vec3 $scale) : BuiltShape?
+    {
+        uint64 $key = shapeKey($shape, $scale);
+        if (!$this->shapes->has($key)) {
+            $this->shapes[$key] = shapeFromKey($key);
+        }
+
+        return BuiltShape($this->shapes->get($key), Vec3(0.0f, 0.0f, 0.0f), true);
+    }
+}
+
+/**
+ * Kind in the top three bits, then three 20-bit millimetre dimensions. Zero for a heightfield or a
+ * mesh, which are never keyed.
+ */
+internal function shapeKey(const ColliderShape& $shape, Vec3 $s) : uint64
+{
+    float32 $round = std::math::max($s->x, $s->z);
+    float32 $all = std::math::max($round, $s->y);
+    return match ($shape) {
+        ColliderShape::box($half) => packShape(1, $half->x * $s->x, $half->y * $s->y, $half->z * $s->z),
+        ColliderShape::sphere($radius) => packShape(2, $radius * $all, 0.0f, 0.0f),
+        ColliderShape::capsule($radius, $height) => packShape(3, $radius * $round, $height * $s->y, 0.0f),
+        ColliderShape::cylinder($half) => packShape(4, $half->x * $round, $half->y * $s->y, 0.0f),
+        ColliderShape::heightfield($map) => 0,
+        ColliderShape::mesh($mesh) => 0,
+    };
+}
+
+internal function packShape(uint64 $kind, float32 $a, float32 $b, float32 $c) : uint64
+{
+    return ($kind << 61) | (quantMm($a) << 40) | (quantMm($b) << 20) | quantMm($c);
+}
+
+internal function quantMm(float32 $metres) : uint64
+{
+    if ($metres <= 0.0f) {
+        return 0;
+    }
+
+    float32 $scaled = $metres * 1000.0f + 0.5f;
+    uint64 $mm = $scaled as uint64;
+    if ($mm > SHAPE_QUANT_MAX) {
+        return SHAPE_QUANT_MAX;
+    }
+
+    return $mm;
+}
+
+internal function unquantMm(uint64 $key, uint64 $shift) : float32
+{
+    uint64 $mm = ($key >> $shift) & SHAPE_QUANT_MAX;
+    if ($mm == 0) {
+        // a zero-size shape is degenerate in the backend; keep a millimetre
+        return 0.001f;
+    }
+
+    return ($mm as float32) / 1000.0f;
+}
+
+/**
+ * Build the shape the key describes, from the quantised numbers, so two colliders with one key get
+ * exactly one shape.
+ */
+internal function shapeFromKey(uint64 $key) : bt::Shape
+{
+    uint64 $kind = $key >> 61;
+    float32 $a = unquantMm($key, 40);
+    float32 $b = unquantMm($key, 20);
+    float32 $c = unquantMm($key, 0);
+    if ($kind == 1) {
+        return bt::Shape(box: bt::Vec3($a, $b, $c));
+    }
+
+    if ($kind == 2) {
+        return bt::Shape(sphere: $a);
+    }
+
+    if ($kind == 3) {
+        return bt::Shape(capsule: $a, height: $b);
+    }
+
+    return bt::Shape(cylinder: bt::Vec3($a, $b, $a));
+}
+
+/**
+ * A mesh's positions as the backend's vectors, for the one copy the backend keeps. Body build
+ * time only.
+ */
+internal function meshVertices(CollisionMesh $mesh) : array<bt::Vec3>
+{
+    $out = arr::room<bt::Vec3>($mesh->vertices->count());
+    foreach ($mesh->vertices as $v) {
+        $out[] = toBt($v);
+    }
+
+    return $out;
+}

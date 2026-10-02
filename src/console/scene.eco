@@ -1,0 +1,80 @@
+/**
+ * The `gpuscene` verb: what the GPU scene holds and what its last culls kept. Rows by where they
+ * are candidates (chunk or active set) and how many resolve between two poses, the chunk grid's
+ * occupancy, the arena and table sizes, and per view set the chunk pairs, pairs, items and
+ * triangles each stage kept against its cap, with what it dropped. `gpuscene chunks on` boxes the
+ * occupied chunks, `gpuscene meshlets on` tints every meshlet the camera draws. The counters are read back
+ * with the device idle: a debug stall, never the play path, so anything else it is given answers
+ * with the usage instead.
+ */
+
+namespace visu::console;
+
+use visu::graphics::{GpuScene, ModelBank, SceneChunks};
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal const GPUSCENE_USAGE = 'usage: gpuscene [chunks on|off|meshlets on|off]';
+
+public class SceneConsole : ConsoleCommandHandler
+{
+    private GpuScene $scene;
+    private ModelBank $bank;
+
+    public constructor(GpuScene $scene, ModelBank $bank)
+    {
+        $this->scene = $scene;
+        $this->bank = $bank;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('gpuscene', $this, '[chunks on|off|meshlets on|off]: bare, the rows, the chunk grid, the arena and what each cull set kept and dropped (a readback stall); chunks boxes every occupied chunk, meshlets tints the meshlets the camera draws');
+        array<string> $names = array<string>();
+        $names[] = 'gpuscene';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        GpuScene $s = $this->scene;
+        usize $n = $cmd->parts->count();
+        if ($n == 3 && ($cmd->parts[2] == 'on' || $cmd->parts[2] == 'off')) {
+            bool $on = $cmd->parts[2] == 'on';
+            if ($cmd->parts[1] == 'chunks') {
+                $s->showChunks = $on;
+                $console->writeLine("gpuscene: chunk boxes {$cmd->parts[2]}");
+                return;
+            }
+
+            if ($cmd->parts[1] == 'meshlets') {
+                $s->showMeshlets = $on;
+                $console->writeLine("gpuscene: meshlet colours {$cmd->parts[2]}");
+                return;
+            }
+        }
+
+        if ($n != 1) {
+            $console->writeLine(GPUSCENE_USAGE);
+            return;
+        }
+
+        SceneChunks $c = $s->chunks;
+        int32 $rows = $s->rowCount();
+        int32 $active = $s->activeCount();
+        int32 $moving = $s->moverCount();
+        $console->writeLine("scene: {$rows} rows, {$active} active, {$moving} moving, {$s->transitions} transitions");
+        int32 $occupied = $c->occupiedCount();
+        int32 $largest = $c->largest();
+        $console->writeLine("scene: chunks {$c->cols}x{$c->rows} of {$c->metres} m, {$occupied} occupied, largest {$largest}, {$c->relocations} relocations");
+        int64 $arena = $this->bank->arena->bytes() / 1024;
+        int32 $meshlets = $this->bank->arena->meshletCount();
+        int32 $classes = $this->bank->classCount();
+        int32 $textures = $this->bank->tableTextures();
+        int64 $lists = $c->bytes() / 1024;
+        $console->writeLine("scene: arena {$arena} KB, {$meshlets} meshlets, {$classes} classes, {$textures} table textures, lists {$lists} KB");
+        $console->writeLine($s->stats($s->main));
+        $console->writeLine($s->stats($s->cascades));
+        $console->writeLine($s->stats($s->pages));
+    }
+}

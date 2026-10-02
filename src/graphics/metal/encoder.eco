@@ -391,8 +391,52 @@ public class RenderEncoder : RenderEncoderProtocol
             die('metal: indirect buffer handle is empty');
         }
         $this->flushBindings();
-        $this->device->draws->draw($this->topology, 0, 0, $this->patchControlPoints);
+        $this->device->draws->drawIndirect($this->topology, $indexed: false);
         $this->enc->drawPrimitives(mtlTopology($this->topology), indirect: $args, $offset);
+    }
+
+    public function bindTextureTable(TextureTable $table) : void
+    {
+        assert(!$this->ended, 'bindTextureTable after endRender');
+        $table->refresh();
+        MetalTextureTable $t = guard $table->handle->table else {
+            die('metal: texture table handle is empty');
+        }
+        $this->enc->setVertexBuffer($t->buffer, 0, index: METAL_TEXTURE_TABLE_SLOT);
+        $this->enc->setFragmentBuffer($t->buffer, 0, index: METAL_TEXTURE_TABLE_SLOT);
+        $this->enc->useResources($t->resident, .read, .vertexAndFragment);
+    }
+
+    public function drawIndexedIndirect(Buffer $arguments, uint64 $offset = 0) : void
+    {
+        assert(!$this->ended, 'drawIndexedIndirect after endRender');
+        assert($this->pipelineSet, 'drawIndexedIndirect before setGpuPass');
+        assert($this->topology != Topology::patches, 'drawIndexedIndirect: patches are not supported');
+        mtl::Buffer $args = guard $arguments->handle->buffer else {
+            die('metal: indirect buffer handle is empty');
+        }
+        mtl::Buffer? $chosen = $this->indexTransient;
+
+        if ($chosen == null) {
+            Buffer $idx = guard $this->indexBuffer else {
+                die('drawIndexedIndirect without setIndexBuffer');
+            }
+            $chosen = $idx->handle->buffer;
+        }
+
+        mtl::Buffer $indices = guard $chosen else {
+            die('metal: index buffer handle is empty');
+        }
+        $this->flushBindings();
+        $this->device->draws->drawIndirect($this->topology, $indexed: true);
+        $this->enc->drawIndexedPrimitives(
+            mtlTopology($this->topology),
+            mtlIndexType($this->indexType),
+            $indices,
+            $this->indexOffset,
+            indirect: $args,
+            $offset
+        );
     }
 
     public function endRender() : void

@@ -1,7 +1,9 @@
 /**
  * Framework pipeline layout: set 0 = dynamic UBOs, set 1 = combined image samplers, set 2 =
- * storage buffers. One layout for graphics and compute. One set 0 per frame slot, written
- * against that slot's ring; sets 1 and 2 are minted per distinct binding tuple.
+ * storage buffers, set 3 = the bindless texture table (samplers at binding 0, sampled images at
+ * 16, update after bind; an empty layout without descriptor indexing). One layout for graphics
+ * and compute. One set 0 per frame slot, written against that slot's ring; sets 1 and 2 are
+ * minted per distinct binding tuple; a set 3 belongs to its `TextureTable`.
  */
 
 namespace visu::graphics;
@@ -68,7 +70,7 @@ internal function vkCreateDrawStack(Device $device) : status<DeviceError>
         return .error($e);
     }
 
-    vk::DescriptorSetLayoutBinding[8] $ssbo;
+    vk::DescriptorSetLayoutBinding[12] $ssbo;
     $i = 0;
 
     while ($i < STORAGE_SLOTS) {
@@ -90,12 +92,17 @@ internal function vkCreateDrawStack(Device $device) : status<DeviceError>
         return .error($e);
     }
 
-    vk::DescriptorSetLayout[3] $layouts;
+    guard vkCreateTableLayout($device) else ($e) {
+        return .error($e);
+    }
+
+    vk::DescriptorSetLayout[4] $layouts;
     $layouts[0] = $device->setLayout0;
     $layouts[1] = $device->setLayout1;
     $layouts[2] = $device->setLayout2;
+    $layouts[3] = $device->setLayout3;
     vk::PipelineLayoutCreateInfo $plci = vk::PipelineLayoutCreateInfo();
-    $plci->setLayoutCount = 3;
+    $plci->setLayoutCount = 4;
     $plci->pSetLayouts:$ = &$layouts[0];
     guard vkCheck(
         vk::CreatePipelineLayout($device->logical, &$plci, null, &$device->pipeLayout),
@@ -202,7 +209,72 @@ internal function vkCreateDrawStack(Device $device) : status<DeviceError>
     }
 
     $device->limits->vertexTextures = true;
+    $device->limits->bindless = $device->descriptorIndexing;
     return .ok;
+}
+
+/**
+ * Set 3: `TEXTURE_TABLE_CAPACITY` sampled images and `TEXTURE_TABLE_SAMPLERS` samplers, partially
+ * bound and written after bind, so a table fills slot by slot while frames that read other slots
+ * are in flight. Without descriptor indexing the layout is empty and no program may declare it.
+ */
+internal function vkCreateTableLayout(Device $device) : status<DeviceError>
+{
+    vk::DescriptorSetLayoutCreateInfo $s3 = vk::DescriptorSetLayoutCreateInfo();
+    if (!$device->descriptorIndexing) {
+        $s3->bindingCount = 0;
+        return vkCheck(
+            vk::CreateDescriptorSetLayout($device->logical, &$s3, null, &$device->setLayout3),
+            'CreateDescriptorSetLayout'
+        );
+    }
+
+    vk::DescriptorSetLayoutBinding[2] $table;
+    $table[0] = vk::DescriptorSetLayoutBinding();
+    $table[0]->binding = 0;
+    $table[0]->descriptorType = vk::DESCRIPTOR_TYPE_SAMPLER;
+    $table[0]->descriptorCount = TEXTURE_TABLE_SAMPLERS as uint32;
+    $table[0]->stageFlags = VK_ALL_STAGES;
+    $table[1] = vk::DescriptorSetLayoutBinding();
+    $table[1]->binding = TEXTURE_TABLE_TEXTURE_BINDING;
+    $table[1]->descriptorType = vk::DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    $table[1]->descriptorCount = TEXTURE_TABLE_CAPACITY as uint32;
+    $table[1]->stageFlags = VK_ALL_STAGES;
+    uint32[2] $flags;
+    $flags[0] = vk::DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
+        | vk::DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+        | vk::DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+    $flags[1] = $flags[0];
+    vk::DescriptorSetLayoutBindingFlagsCreateInfo $bf = vk::DescriptorSetLayoutBindingFlagsCreateInfo();
+    $bf->bindingCount = 2;
+    $bf->pBindingFlags:$ = &$flags[0];
+    $s3->pNext:$ = ptr<const uint8>(&$bf);
+    $s3->flags = vk::DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+    $s3->bindingCount = 2;
+    $s3->pBindings:$ = &$table[0];
+    return vkCheck(
+        vk::CreateDescriptorSetLayout($device->logical, &$s3, null, &$device->setLayout3),
+        'CreateDescriptorSetLayout'
+    );
+}
+
+/**
+ * Bind `$table` as set 3 at `$bindPoint` on the frame's command buffer.
+ */
+internal function vkBindTable(Device $device, TextureTable $table, uint32 $bindPoint) : void
+{
+    $table->refresh();
+    vk::DescriptorSet $set = $table->handle->set;
+    vk::CmdBindDescriptorSets(
+        $device->currentCmd(),
+        $bindPoint,
+        $device->pipeLayout,
+        TEXTURE_TABLE_SET,
+        1,
+        &$set,
+        0,
+        null
+    );
 }
 
 internal function vkCreateDummy(Device $device) : status<DeviceError>
@@ -320,6 +392,11 @@ internal function vkDestroyDrawStack(Device $device) : void
     if ($device->setLayout2->handle != 0) {
         vk::DestroyDescriptorSetLayout($device->logical, $device->setLayout2, null);
         $device->setLayout2 = vk::DescriptorSetLayout::none();
+    }
+
+    if ($device->setLayout3->handle != 0) {
+        vk::DestroyDescriptorSetLayout($device->logical, $device->setLayout3, null);
+        $device->setLayout3 = vk::DescriptorSetLayout::none();
     }
 
     if ($device->set0pool->handle != 0) {
@@ -441,8 +518,8 @@ internal function vkFlushStorage(Device $device, VkBindings& $b, uint32 $bindPoi
         die($e->message());
     }
 
-    vk::DescriptorBufferInfo[8] $infos;
-    vk::WriteDescriptorSet[8] $writes;
+    vk::DescriptorBufferInfo[12] $infos;
+    vk::WriteDescriptorSet[12] $writes;
     uint32 $n = 0;
     uint32 $i = 0;
 

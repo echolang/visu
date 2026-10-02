@@ -1,0 +1,232 @@
+/**
+ * The `vehicle` verb: every vehicle's speed and state, one vehicle's wheels (contact, spring,
+ * spin, slip and forces), and live tuning of the spec the vehicles share.
+ */
+
+namespace visu::console;
+
+use visu::components::Vehicle;
+use visu::ecs::{Entities, Entity};
+use visu::math::degrees;
+use visu::physics::VehicleSpec;
+use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole};
+use visu::signal::ConsoleCommandSignal;
+
+internal const string VEHICLE_USAGE = '[wheels [index]|tune <knob> <value>]';
+internal const string VEHICLE_KNOBS = 'spring bump rebound rest grip.accel grip.brake grip.front grip.rear grip.handbrake pitch roll load force power maxspeed brake handbrake steer steer.high yaw drift air air.max arb.front arb.rear drag inertia wheeldrag lowspeed';
+
+internal enum VehicleConsoleAction
+{
+    case status;
+    case usage;
+    case wheels(int32 $vehicle);
+    case tune(string $knob, float32 $value);
+}
+
+internal function parseVehicleConsole(const ConsoleCommandSignal& $cmd) : VehicleConsoleAction
+{
+    if (!$cmd->isAction('vehicle')) {
+        return .usage;
+    }
+
+    usize $n = $cmd->parts->count();
+    if ($n == 1) {
+        return .status;
+    }
+
+    string $arg = $cmd->parts[1];
+    if ($arg == 'wheels' && $n <= 3) {
+        if ($n == 2) {
+            return .wheels(0);
+        }
+
+        int64 $i = guard str::int($cmd->parts[2]) else {
+            return .usage;
+        }
+        if ($i < 0) {
+            return .usage;
+        }
+        return .wheels($i as int32);
+    }
+
+    if ($arg == 'tune' && $n == 4) {
+        float32 $value = guard consoleFloat($cmd, 3) else {
+            return .usage;
+        }
+        return .tune($cmd->parts[2], $value);
+    }
+
+    return .usage;
+}
+
+/**
+ * Set `$knob` on `$spec`; false for a knob it does not have. Per-wheel knobs set every wheel.
+ */
+internal function tuneVehicle(VehicleSpec $spec, const string& $knob, float32 $value) : bool
+{
+    if ($knob == 'spring' || $knob == 'bump' || $knob == 'rebound' || $knob == 'rest') {
+        for (usize $i = 0; $i < ($spec->wheelCount as usize); $i++) {
+            if ($knob == 'spring') {
+                $spec->wheels[$i]->spring = $value;
+            } else if ($knob == 'bump') {
+                $spec->wheels[$i]->bump = $value;
+            } else if ($knob == 'rebound') {
+                $spec->wheels[$i]->rebound = $value;
+            } else {
+                $spec->wheels[$i]->restLength = $value;
+            }
+        }
+
+        return true;
+    }
+
+    if ($knob == 'grip.accel') {
+        $spec->gripAccel = $value;
+    } else if ($knob == 'grip.brake') {
+        $spec->gripBrake = $value;
+    } else if ($knob == 'grip.front') {
+        $spec->gripFront = $value;
+    } else if ($knob == 'grip.rear') {
+        $spec->gripRear = $value;
+    } else if ($knob == 'grip.handbrake') {
+        $spec->gripHandbrake = $value;
+    } else if ($knob == 'pitch') {
+        $spec->pitchScale = $value;
+    } else if ($knob == 'roll') {
+        $spec->rollScale = $value;
+    } else if ($knob == 'load') {
+        $spec->loadResponse = $value;
+    } else if ($knob == 'force') {
+        $spec->driveForce = $value;
+    } else if ($knob == 'power') {
+        $spec->power = $value;
+    } else if ($knob == 'maxspeed') {
+        $spec->maxSpeed = $value;
+    } else if ($knob == 'brake') {
+        $spec->brakeTorque = $value;
+    } else if ($knob == 'handbrake') {
+        $spec->handbrakeTorque = $value;
+    } else if ($knob == 'steer') {
+        $spec->steerLow = $value;
+    } else if ($knob == 'steer.high') {
+        $spec->steerHigh = $value;
+    } else if ($knob == 'yaw') {
+        $spec->yawAssist = $value;
+    } else if ($knob == 'drift') {
+        $spec->driftAssist = $value;
+    } else if ($knob == 'air') {
+        $spec->airRight = $value;
+    } else if ($knob == 'air.max') {
+        $spec->airRightMax = $value;
+    } else if ($knob == 'arb.front') {
+        $spec->antiRollFront = $value;
+    } else if ($knob == 'arb.rear') {
+        $spec->antiRollRear = $value;
+    } else if ($knob == 'drag') {
+        $spec->drag = $value;
+    } else if ($knob == 'inertia') {
+        $spec->wheelInertia = $value;
+    } else if ($knob == 'wheeldrag') {
+        $spec->wheelDrag = $value;
+    } else if ($knob == 'lowspeed') {
+        $spec->lowSpeed = $value;
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
+public class VehicleConsole : ConsoleCommandHandler
+{
+    private Entities $entities;
+
+    public constructor(Entities $entities)
+    {
+        $this->entities = $entities;
+    }
+
+    public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
+    {
+        $registry->add('vehicle', $this, VEHICLE_USAGE);
+        array<string> $names = array<string>();
+        $names[] = 'vehicle';
+        return $names;
+    }
+
+    public function onConsoleCommand(const ConsoleCommandSignal& $cmd, DebugConsole $console) : void
+    {
+        VehicleConsoleAction $action = parseVehicleConsole($cmd);
+        match ($action) {
+            VehicleConsoleAction::status => {
+                $this->status($console);
+            },
+            VehicleConsoleAction::usage => {
+                string $usage = VEHICLE_USAGE;
+                string $knobs = VEHICLE_KNOBS;
+                $console->writeLine("usage: vehicle {$usage}");
+                $console->writeLine("knobs: {$knobs}");
+            },
+            VehicleConsoleAction::wheels($index) => {
+                $this->wheels($console, $index);
+            },
+            VehicleConsoleAction::tune($knob, $value) => {
+                $this->tune($console, $knob, $value);
+            },
+        };
+    }
+
+    private function status(DebugConsole $console) : void
+    {
+        int32 $i = 0;
+        foreach ($this->entities->view<Vehicle>() as $e => &$v) {
+            float32 $kmh = $v->forwardSpeed * 3.6f;
+            float32 $steer = degrees($v->steerAngle);
+            int32 $id = $e->index() as int32;
+            $console->writeLine("vehicle {$i} entity {$id}: {$kmh} km/h, side {$v->sideSpeed} m/s, steer {$steer} deg, grounded {$v->grounded}, awake {$v->awake}, driven {$v->driven}");
+            $console->writeLine("  controls throttle {$v->controls->throttle} brake {$v->controls->brake} steer {$v->controls->steer} handbrake {$v->controls->handbrake}");
+            $i = $i + 1;
+        }
+
+        if ($i == 0) {
+            $console->writeLine('vehicle: none');
+        }
+    }
+
+    private function wheels(DebugConsole $console, int32 $index) : void
+    {
+        int32 $i = 0;
+        foreach ($this->entities->view<Vehicle>() as $e => &$v) {
+            if ($i != $index) {
+                $i = $i + 1;
+                continue;
+            }
+
+            for (usize $w = 0; $w < ($v->spec->wheelCount as usize); $w++) {
+                visu::physics::VehicleWheelState $s = $v->wheels[$w];
+                float32 $alpha = degrees($s->slipAngle);
+                $console->writeLine("wheel {$w}: contact {$s->contact} c {$s->compression} m, F {$s->force} N, load {$s->load} N, w {$s->omega} rad/s, k {$s->slipRatio}, a {$alpha} deg, fx {$s->fx} N, fy {$s->fy} N, surface {$s->surface}");
+            }
+
+            return;
+        }
+
+        $console->writeLine("vehicle: no vehicle {$index}");
+    }
+
+    private function tune(DebugConsole $console, const string& $knob, float32 $value) : void
+    {
+        int32 $n = 0;
+        foreach ($this->entities->view<Vehicle>() as $e => &$v) {
+            if (!tuneVehicle($v->spec, $knob, $value)) {
+                string $knobs = VEHICLE_KNOBS;
+                $console->writeLine("vehicle: no knob '{$knob}'; knobs: {$knobs}");
+                return;
+            }
+
+            $n = $n + 1;
+        }
+
+        $console->writeLine("vehicle {$knob} {$value} ({$n} vehicles)");
+    }
+}

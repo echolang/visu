@@ -1,0 +1,88 @@
+/**
+ * An indexed draw sized by its argument buffer: the index buffer holds a left and a right quad,
+ * the arguments ask for six indices from the seventh on, and only the right half fills.
+ */
+
+use visu::graphics::{
+    BUFFER_INDEX, BUFFER_INDIRECT, BUFFER_STORAGE, Buffer, CallbackPass, ClearPass,
+    ClearPassOptions, Frame, GpuPass, IndexType, IoSink, Mesh, Pipeline, PipelineError, Raster,
+    RenderContext, RenderEncoder, ShaderCollection, TargetRef, VertexLayout
+};
+use visu::math::Vec4;
+
+public function checkIndexedIndirect(GpuContext $gpu) : void
+{
+    ShaderCollection $shaders = ShaderCollection($gpu->device, shaderDir());
+    guard $shaders->scan() else ($e) {
+        die($e->message());
+    }
+
+    $ref = guard $shaders->shader('solid') else ($e) {
+        die($e->message());
+    }
+    guard $ref->load() else ($e) {
+        die($e->message());
+    }
+
+    array<float32> $verts = [
+        -1.0f, -1.0f, 0.0f,
+        0.0f, -1.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        -1.0f, 1.0f, 0.0f,
+        0.0f, -1.0f, 0.0f,
+        1.0f, -1.0f, 0.0f,
+        1.0f, 1.0f, 0.0f,
+        0.0f, 1.0f, 0.0f
+    ];
+    array<uint16> $indices = [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7];
+    array<uint32> $words = [6, 1, 6, 0, 0];
+    Mesh $quads = Mesh($gpu->device, $verts, stride: 12);
+    ptr<const uint16> $idx = $indices->data();
+    Buffer $index = Buffer($gpu->device, BUFFER_INDEX, ptr<const uint8>($idx:$), (12 * 2) as uint64);
+    ptr<const uint32> $argWords = $words->data();
+    Buffer $args = Buffer($gpu->device, BUFFER_STORAGE | BUFFER_INDIRECT, ptr<const uint8>($argWords:$), (5 * 4) as uint64);
+
+    $gpu->runFrame(function(Pipeline $p) : void {
+        TargetRef $t = offscreen64($p, 'indexedindirect');
+        $p->add(ClearPass($t, ClearPassOptions(color: Vec4(0.0f, 0.0f, 0.0f, 1.0f))));
+        $p->add(CallbackPass(
+            'indexed-indirect',
+            setup: function(Pipeline $pipe, Frame $frame, IoSink $io) : void {
+                $io->writes($t);
+            },
+            execute: function(RenderContext $ctx) : status<PipelineError> {
+                RenderEncoder $enc = guard $ctx->beginRender($t) else ($e) {
+                    return .error($e);
+                }
+                GpuPass $pass = GpuPass($ref->program(), VertexLayout::pos3(), Raster::none());
+                $pass->bind($enc);
+                $enc->upload(QuadParams(Vec4(1.0f, 0.0f, 0.0f, 1.0f)), slot: 0);
+                $enc->setVertexBuffer(0, $quads->vertices);
+                $enc->setIndexBuffer($index, IndexType::uint16);
+                $enc->drawIndexedIndirect($args, 0 as uint64);
+                $enc->endRender();
+                return .ok;
+            }
+        ));
+    });
+
+    array<uint8> $pixels = $gpu->readOffscreen('indexedindirect');
+    $quads->destroy();
+    $index->destroy();
+    $args->destroy();
+    $shaders->destroy();
+    usize $left = ((32 * 64 + 8) * 4) as usize;
+    usize $right = ((32 * 64 + 56) * 4) as usize;
+    assert($pixels[$left] < 16, 'indexed indirect: the skipped quad stays clear');
+    assert($pixels[$right] > 240, 'indexed indirect: the quad the arguments name fills');
+}
+
+#[if: os != darwin]
+#[group: "glfw"]
+test gpu_indexed_indirect
+{
+    GpuContext $gpu = gpuHidden('indexedindirect');
+    checkIndexedIndirect($gpu);
+    $gpu->end();
+}
+#[end]

@@ -157,6 +157,7 @@ public class Device : DeviceProtocol
         $this->limits->tessFactorAlign = TESS_FACTOR_ALIGN;
         $this->limits->vertexTextures = true;
         $this->limits->maxAnisotropy = 16;
+        $this->limits->bindless = $gpu->supportsMetal3();
         $this->ready = true;
         announceVersion();
         string $line = $info->line();
@@ -694,6 +695,55 @@ public class Device : DeviceProtocol
         // rc drop
     }
 
+    public function createTextureTable(int32 $capacity) : result<TextureTableHandle, DeviceError>
+    {
+        mtl::Device $gpu = guard $this->gpu else {
+            return .error(.noDevice);
+        }
+        // the layout is the shaders': every declared texture id, then the sampler ids
+        uint64 $bytes = metalTableTexture(TEXTURE_TABLE_CAPACITY);
+        mtl::Buffer $buf = guard $gpu->newBuffer($bytes as usize, .shared) else {
+            return .error(.outOfMemory($bytes));
+        }
+        mem::zero<uint8>($buf->contents(), $bytes as usize);
+        return .ok(TextureTableHandle(MetalTextureTable($buf, $capacity)));
+    }
+
+    public function writeTextureTable(TextureTableHandle $handle, int32 $slot, Texture $texture) : void
+    {
+        MetalTextureTable $table = guard $handle->table else {
+            die('metal: texture table handle is empty');
+        }
+        mtl::Texture $tex = guard $texture->handle->texture else {
+            die('metal: texture table entry has no texture');
+        }
+        $table->write($slot, $tex);
+    }
+
+    public function eraseTextureTable(TextureTableHandle $handle, int32 $slot) : void
+    {
+        MetalTextureTable $table = guard $handle->table else {
+            return;
+        }
+        $table->erase($slot);
+    }
+
+    public function writeTextureTableSampler(TextureTableHandle $handle, int32 $index, Sampler $sampler) : void
+    {
+        MetalTextureTable $table = guard $handle->table else {
+            die('metal: texture table handle is empty');
+        }
+        mtl::SamplerState $state = guard $sampler->handle->sampler else {
+            die('metal: texture table sampler has no state');
+        }
+        $table->writeSampler($index, $state);
+    }
+
+    public function destroyTextureTable(TextureTableHandle $handle) : void
+    {
+        // rc drop: a command buffer in flight retains the buffer it bound
+    }
+
     public function uploadBuffer(BufferHandle $handle, uint64 $offset, ptr<const uint8> $src, uint64 $bytes) : void
     {
         assert($this->gpu != null, 'uploadBuffer before initialize');
@@ -1004,6 +1054,9 @@ public class Device : DeviceProtocol
             $sd->maxAnisotropy = $this->anisoLevel as uint32;
         }
 
+        // any sampler may sit in a TextureTable's sampler row
+        $sd->supportArgumentBuffers = $this->limits->bindless;
+
         mtl::SamplerState $samp = guard $gpu->newSamplerState($sd) else {
             die('metal: newSamplerState failed');
         }
@@ -1026,7 +1079,13 @@ public class Device : DeviceProtocol
             return .error(.shader($name, 'unsupported stage'));
         }
 
-        mtl::Library $lib = guard $gpu->newLibrary(source: $bytes) else ($e) {
+        // a program that reads the texture table (set 3) is MSL 3: argument buffers of resource ids
+        mtl::LanguageVersion $version = .default;
+        if ($bytes->contains(METAL_TABLE_MARKER)) {
+            $version = .v3_0;
+        }
+
+        mtl::Library $lib = guard $gpu->newLibrary(source: $bytes, mtl::CompileOptions(true, $version)) else ($e) {
             string $log = match ($e) {
                 mtl::Error::compile($m) => $m,
                 mtl::Error::pipeline($m) => $m,

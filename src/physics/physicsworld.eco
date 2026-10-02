@@ -1,0 +1,750 @@
+/**
+ * The physics of one scene. It owns the backend world, one body per `Collider` and one per
+ * `Sensor`, and the shapes they share, and it answers queries in visu's own types: rays, sweeps,
+ * collide and slide, overlaps. `PhysicsSystem` keeps the bodies in step with the entities; any
+ * system may query.
+ *
+ * Built when a scene loads and dropped with it. Everything a step or a query touches is sized in
+ * the constructor, so the displayed frame allocates nothing on the Echo side. Adding or removing a
+ * body allocates once in the backend, the same one-off an entity spawn is.
+ */
+
+namespace visu::physics;
+
+use visu::components::{Collider, RigidBody, Sensor};
+use visu::ecs::Entity;
+use visu::geo::Ray;
+use visu::math::{Quat, Vec3, dot, length, normalize};
+
+/**
+ * Metres a slide stops short of what it meets, so the next sweep starts clear of it.
+ */
+public const float32 PHYSICS_SKIN = 0.01f;
+
+/**
+ * One backend body and the entity it belongs to. A free row has no body.
+ */
+internal struct BodyRow
+{
+    internal Entity $entity = Entity::none();
+    internal bt::Body? $body = null;
+    internal bool $sensor = false;
+    internal bool $dynamic = false;
+    internal bool $kinematic = false;
+
+    /**
+     * The shape's centre in the entity's frame, already scaled: body origin is entity position
+     * plus orientation times this, plus `shift`.
+     */
+    internal Vec3 $lever = Vec3(0.0f, 0.0f, 0.0f);
+    internal Vec3 $shift = Vec3(0.0f, 0.0f, 0.0f);
+    internal bool $turns = true;
+
+    /**
+     * The collider's tyre grip, handed back with every hit on this body.
+     */
+    internal float32 $grip = 1.0f;
+
+    /**
+     * The entity's world scale the shape was built for. A scale change needs a new shape, not a
+     * new pose.
+     */
+    internal Vec3 $scale = Vec3(1.0f, 1.0f, 1.0f);
+
+    /**
+     * Awake as far as the system has told anyone (`BodyWoke` sent, `BodySlept` not yet), and the
+     * last step that reported it moving.
+     */
+    internal bool $awake = false;
+    internal int64 $seen = 0;
+
+    /**
+     * Where a kinematic row was last put, as the entity's world pose. `drive` moves the body
+     * only when that changes, so a kinematic body standing still can sleep and stops waking
+     * what leans on it.
+     */
+    internal Vec3 $driven = Vec3(0.0f, 0.0f, 0.0f);
+    internal Quat $drivenTurn = Quat();
+
+    /**
+     * A kinematic row's place in `PhysicsWorld.kinematics`, so a drop swap-removes it.
+     */
+    internal int32 $kinematicAt = -1;
+}
+
+public class PhysicsWorld
+{
+    public const PhysicsSettings $settings;
+    internal bt::World $world;
+    internal array<BodyRow> $rows;
+    private array<int32> $free;
+    private map<Entity, int32> $solidOf;
+    private map<Entity, int32> $sensorOf;
+    private ShapeCache $shapes;
+    private int32 $live;
+
+    /**
+     * Rows of kinematic bodies: the system reads their transforms every step.
+     */
+    internal array<int32> $kinematics;
+
+    /**
+     * What the last step moved, and the contact events it queued.
+     */
+    internal array<bt::BodyPose> $poses;
+    internal array<bt::ContactEvent> $events;
+
+    private array<bt::Body> $found;
+    private array<float32> $lines;
+
+    /**
+     * Whether `debugLines` has anything to say. The console and the `physics.debug` flag set it.
+     */
+    public bool $debugging;
+
+    /**
+     * Whether the debug overlay also draws each `Vehicle`'s suspension and tires. The
+     * `physics debug vehicles` verb and the `physics.debug.vehicles` flag set it.
+     */
+    public bool $debugVehicles;
+
+    /**
+     * Threads a step runs on: `settings.threads` as far as the machine allows.
+     */
+    public int32 $threads;
+
+    /**
+     * No step runs while set: the app's clock is paused. Bodies are still built and the previous
+     * poses still stored, so a paused world draws still and wakes where it was.
+     */
+    public bool $paused;
+
+    public constructor(PhysicsSettings $settings = PhysicsSettings())
+    {
+        $this->settings = $settings;
+        // one Bullet global: the last world built sets it for the process
+        bt::setSleepSeconds($settings->sleepSeconds);
+        $this->threads = 1;
+        if ($settings->threads > 1 && bt::maxThreads() > 1) {
+            $this->threads = std::math::min($settings->threads, bt::maxThreads());
+            $this->world = bt::World(gravity: toBt($settings->gravity), threads: $this->threads);
+        } else {
+            $this->world = bt::World(gravity: toBt($settings->gravity));
+        }
+        // statics move only through place(), which refreshes their box; a step boxes what is awake
+        $this->world->setUpdateAllAabbs(false);
+
+        usize $cap = $settings->capacity as usize;
+        $this->world->reserve(bodies: $cap);
+        $this->rows = arr::room<BodyRow>($cap);
+        $this->free = arr::room<int32>($cap);
+        $this->solidOf = map<Entity, int32>();
+        $this->solidOf->reserve($cap);
+        $this->sensorOf = map<Entity, int32>();
+        $this->sensorOf->reserve($cap);
+        $this->shapes = ShapeCache();
+        $this->live = 0;
+        $this->kinematics = arr::room<int32>(64);
+        $this->poses = arr::room<bt::BodyPose>($cap);
+        $this->events = arr::room<bt::ContactEvent>(256);
+        $this->found = arr::room<bt::Body>(64);
+        $this->lines = array<float32>();
+        $this->debugging = false;
+        $this->debugVehicles = true;
+        $this->paused = false;
+
+        if ($settings->contacts) {
+            $this->world->trackContacts(true);
+        }
+    }
+
+    public const function gravity() : Vec3
+    {
+        return fromBt($this->world->gravity());
+    }
+
+    public function setGravity(Vec3 $gravity) : void
+    {
+        $this->world->setGravity(toBt($gravity));
+    }
+
+    /**
+     * Seconds a body stays under its thresholds before it sleeps. One Bullet global: it holds for
+     * every world in the process.
+     */
+    public const function sleepSeconds() : float32
+    {
+        return bt::sleepSeconds();
+    }
+
+    public function setSleepSeconds(float32 $seconds) : void
+    {
+        bt::setSleepSeconds($seconds);
+    }
+
+    /**
+     * Bodies in the world, colliders and sensors together.
+     */
+    public const function count() : int32
+    {
+        return $this->live;
+    }
+
+    /**
+     * Dynamic bodies the last step moved. Zero once everything has come to rest.
+     */
+    public const function awake() : int32
+    {
+        return $this->poses->count() as int32;
+    }
+
+    /**
+     * Distinct backend shapes the colliders share.
+     */
+    public const function shapes() : int32
+    {
+        return $this->shapes->count();
+    }
+
+    public const function kinematicCount() : int32
+    {
+        return $this->kinematics->count() as int32;
+    }
+
+    /**
+     * Whether `$e` has a solid body here.
+     */
+    public const function has(Entity $e) : bool
+    {
+        return $this->solidOf->has($e);
+    }
+
+    /**
+     * `$e`'s dynamic body, for a `PhysicsStepper` that pushes it before the step. Null when `$e`
+     * has no body or a static or kinematic one. One map lookup; do not keep the handle past the
+     * step, a rebuilt collider is a new body.
+     */
+    public const function body(Entity $e) : PhysicsBody?
+    {
+        if (!$this->solidOf->has($e)) {
+            return null;
+        }
+
+        BodyRow $row = $this->rows[$this->solidOf[$e] as usize];
+        if (!$row->dynamic) {
+            return null;
+        }
+
+        bt::Body $body = guard $row->body else {
+            return null;
+        }
+        return PhysicsBody($body, $row->lever, $row->shift, $row->turns);
+    }
+
+    // queries
+
+    /**
+     * The nearest collider or sensor on a layer in `mask:` along `$ray`, within `$maxDistance`.
+     * The direction need not be unit length. `ignore:` never counts: a ray cast from inside a
+     * body, such as a wheel's from its chassis, passes out through it.
+     */
+    public const function ray(
+        Ray $ray,
+        float32 $maxDistance,
+        mask: PhysicsLayer $mask = PhysicsLayer::all(),
+        ignore: PhysicsBody? $ignore = null
+    ) : PhysicsHit?
+    {
+        Vec3 $to = $ray->origin + normalize($ray->direction) * $maxDistance;
+        bt::Body? $skip = $ignore?->body;
+        bt::RayHit $hit = guard $this->world->ray(toBt($ray->origin), toBt($to), mask: toBt($mask), ignore: $skip) else {
+            return null;
+        }
+        return $this->hitOf($hit->body, $hit->point, $hit->normal, $hit->fraction * $maxDistance);
+    }
+
+    /**
+     * Move `$shape` in a straight line and report the first collider it would meet. With `facing:`
+     * only surfaces it moves into count, so a shape that starts inside something can leave it.
+     * Null for a clear path, and for a heightfield, which cannot be swept.
+     */
+    public function sweep(
+        ColliderShape $shape,
+        from: Vec3 $from,
+        to: Vec3 $to,
+        mask: PhysicsLayer $mask = PhysicsLayer::all(),
+        facing: bool $facing = false
+    ) : PhysicsHit?
+    {
+        bt::Shape $probe = guard $this->probe($shape) else {
+            return null;
+        }
+        bt::SweepHit? $found = guard $this->world->sweep(
+            $probe,
+            from: bt::Transform(toBt($from)),
+            to: bt::Transform(toBt($to)),
+            mask: toBt($mask),
+            facing: $facing
+        ) else {
+            return null;
+        }
+        bt::SweepHit $hit = guard $found else {
+            return null;
+        }
+        return $this->hitOf($hit->body, $hit->point, $hit->normal, $hit->fraction * length($to - $from));
+    }
+
+    /**
+     * Where `$shape` ends up moving by `delta:` from `from:`, sliding along what it meets instead
+     * of stopping: each hit takes the part of the move that points into the surface away, at most
+     * `iterations:` times. It stops `PHYSICS_SKIN` short of every surface. A walker that stands on
+     * the ground by other means leaves the ground's layer out of `mask:`.
+     */
+    public function slide(
+        ColliderShape $shape,
+        from: Vec3 $from,
+        delta: Vec3 $delta,
+        mask: PhysicsLayer $mask = PhysicsLayer::all(),
+        iterations: int32 $iterations = 3
+    ) : Vec3
+    {
+        bt::Shape $probe = guard $this->probe($shape) else {
+            return $from + $delta;
+        }
+        bt::Layer $layer = toBt($mask);
+        Vec3 $at = $from;
+        Vec3 $rest = $delta;
+
+        for (int32 $i = 0; $i < $iterations; $i++) {
+            float32 $len = length($rest);
+            if ($len < 0.00001f) {
+                return $at;
+            }
+
+            Vec3 $to = $at + $rest;
+            bt::SweepHit? $found = guard $this->world->sweep(
+                $probe,
+                from: bt::Transform(toBt($at)),
+                to: bt::Transform(toBt($to)),
+                mask: $layer,
+                facing: true
+            ) else {
+                return $at;
+            }
+            bt::SweepHit $hit = guard $found else {
+                return $to;
+            }
+
+            Vec3 $dir = $rest / $len;
+            float32 $travel = $hit->fraction * $len - PHYSICS_SKIN;
+            if ($travel < 0.0f) {
+                $travel = 0.0f;
+            }
+
+            $at = $at + $dir * $travel;
+            Vec3 $left = $dir * ($len - $travel);
+            Vec3 $normal = fromBt($hit->normal);
+            $rest = $left - $normal * dot($left, $normal);
+        }
+
+        return $at;
+    }
+
+    /**
+     * The entities whose colliders or sensors `$shape` would touch placed `at:` there, into
+     * `into:` (cleared first). Reserve the array once and the query allocates nothing.
+     */
+    public function overlap(
+        ColliderShape $shape,
+        at: Vec3 $at,
+        into: array<Entity>& $into,
+        orientation: Quat $orientation = Quat(),
+        mask: PhysicsLayer $mask = PhysicsLayer::all()
+    ) : void
+    {
+        $into->clear();
+        bt::Shape $probe = guard $this->probe($shape) else {
+            return;
+        }
+
+        $this->world->overlap($probe, at: toBt($at, $orientation), into: $this->found, mask: toBt($mask));
+        foreach ($this->found as $body) {
+            int32 $slot = $body->slot();
+            if ($slot >= 0 && ($slot as usize) < $this->rows->count()) {
+                $into[] = $this->rows[$slot as usize]->entity;
+            }
+        }
+    }
+
+    // debug
+
+    /**
+     * Turn the debug drawer on or off. On, `debugLines` draws every body but the heightfields as
+     * wireframe, plus bounding boxes and contact points when asked. O(bodies): a debug view.
+     */
+    public function showDebug(bool $on, aabb: bool $aabb = false, contacts: bool $contacts = false) : void
+    {
+        $this->debugging = $on;
+        if (!$on) {
+            $this->world->disableDebug();
+            return;
+        }
+
+        $this->world->enableDebug(bt::DebugOptions($aabb: $aabb, $contacts: $contacts));
+    }
+
+    /**
+     * The world as line segments, six floats per vertex (x y z r g b), two vertices per line.
+     * The buffer is the world's own and is overwritten by the next call.
+     */
+    public function debugLines() : const array<float32>&
+    {
+        $this->world->debugLines(into: $this->lines);
+        return &$this->lines;
+    }
+
+    // bodies, for PhysicsSystem
+
+    /**
+     * Build `$e`'s solid body from its collider and, when it has one, its rigid body, at the pose
+     * its transform gives. An existing body for `$e` is replaced.
+     */
+    internal function add(Entity $e, const Collider& $c, RigidBody? $rb, Vec3 $position, Quat $orientation, Vec3 $scale) : void
+    {
+        $this->remove($e);
+        BuiltShape $built = guard $this->shapes->build($c->shape, $scale) else {
+            return;
+        }
+
+        BodyRow $row = BodyRow();
+        $row->entity = $e;
+        $row->scale = $scale;
+        $row->driven = $position;
+        $row->drivenTurn = $orientation;
+        $row->lever = $c->offset * $scale;
+        $row->shift = $built->shift;
+        $row->turns = $built->turns;
+        $row->grip = $c->grip;
+
+        float32 $mass = 0.0f;
+        PhysicsLayer $layer = $c->layer ?? PhysicsLayer::world();
+        RigidBody? $held = $rb;
+        if ($held != null) {
+            RigidBody $spec = guard $held;
+            match ($spec->kind) {
+                BodyKind::dynamic => {
+                    assert(colliderMoves($c->shape), 'physics: a heightfield or a mesh cannot be a dynamic body');
+                    $row->dynamic = true;
+                    $mass = $spec->mass;
+                    $layer = $c->layer ?? PhysicsLayer::dynamic();
+                },
+                BodyKind::kinematic => {
+                    $row->kinematic = true;
+                    $layer = $c->layer ?? PhysicsLayer::kinematic();
+                },
+            };
+        }
+
+        bt::Body $body = bt::Body($built->shape, $mass, at: $this->poseOf($row, $position, $orientation));
+        $body->setFriction($c->friction);
+        $body->setRestitution($c->restitution);
+        if ($row->turns == false) {
+            $body->setDebugDraw(false);
+        }
+
+        if ($held != null) {
+            RigidBody $spec = guard $held;
+            $body->setDamping($spec->linearDamping, angular: $spec->angularDamping);
+            if ($row->kinematic) {
+                $body->setKinematic(true);
+            } else {
+                $body->setSleepThresholds($this->settings->sleepLinear, angular: $this->settings->sleepAngular);
+            }
+
+            if ($spec->upright) {
+                $body->setAngularFactor(bt::Vec3(0.0f, 0.0f, 0.0f));
+            }
+
+            if ($spec->ccd) {
+                float32 $radius = $built->shape->bounds()->radius;
+                $body->setCcd($radius * 0.5f, radius: $radius * 0.5f);
+            }
+
+            if ($spec->alwaysAwake) {
+                $body->setAlwaysAwake(true);
+            }
+        }
+
+        int32 $slot = $this->claim($row, $body);
+        guard $this->world->add($body, group: toBt($layer), mask: toBt($c->mask)) else ($err) {
+            die("physics: could not add a body: {$err}");
+        }
+
+        $this->solidOf[$e] = $slot;
+        if ($row->kinematic) {
+            $this->rows[$slot as usize]->kinematicAt = $this->kinematics->count() as int32;
+            $this->kinematics[] = $slot;
+        }
+    }
+
+    /**
+     * Build `$e`'s sensor body. An existing sensor for `$e` is replaced.
+     */
+    internal function addSensor(Entity $e, const Sensor& $s, Vec3 $position, Quat $orientation, Vec3 $scale) : void
+    {
+        $this->removeSensor($e);
+        BuiltShape $built = guard $this->shapes->build($s->shape, $scale) else {
+            return;
+        }
+
+        BodyRow $row = BodyRow();
+        $row->entity = $e;
+        $row->scale = $scale;
+        $row->sensor = true;
+        $row->lever = $s->offset * $scale;
+        $row->shift = $built->shift;
+        $row->turns = $built->turns;
+
+        bt::Body $body = bt::Body($built->shape, 0.0f, at: $this->poseOf($row, $position, $orientation));
+        $body->setSensor(true);
+        if ($row->turns == false) {
+            $body->setDebugDraw(false);
+        }
+
+        int32 $slot = $this->claim($row, $body);
+        PhysicsLayer $mask = $s->mask ?? $s->layer;
+        guard $this->world->add($body, group: toBt($s->layer), mask: toBt($mask)) else ($err) {
+            die("physics: could not add a sensor: {$err}");
+        }
+
+        $this->sensorOf[$e] = $slot;
+    }
+
+    internal function remove(Entity $e) : void
+    {
+        if (!$this->solidOf->has($e)) {
+            return;
+        }
+
+        int32 $slot = $this->solidOf[$e];
+        $this->solidOf->remove($e);
+        $this->drop($slot);
+    }
+
+    internal function removeSensor(Entity $e) : void
+    {
+        if (!$this->sensorOf->has($e)) {
+            return;
+        }
+
+        int32 $slot = $this->sensorOf[$e];
+        $this->sensorOf->remove($e);
+        $this->drop($slot);
+    }
+
+    /**
+     * `$e` moved by hand: put its bodies where its transform now says. A dynamic body is
+     * teleported and woken; returns whether `$e` has one, so the caller can drop its
+     * interpolation.
+     */
+    internal function place(Entity $e, Vec3 $position, Quat $orientation) : bool
+    {
+        bool $dynamic = false;
+        if ($this->solidOf->has($e)) {
+            $dynamic = $this->placeRow($this->solidOf[$e], $position, $orientation);
+        }
+
+        if ($this->sensorOf->has($e)) {
+            $this->placeRow($this->sensorOf[$e], $position, $orientation);
+        }
+
+        return $dynamic;
+    }
+
+    /**
+     * Whether one of `$e`'s bodies was built for another scale than `$scale`: a grown tree, a
+     * resized crate. Its shape must be rebuilt, which a pose change cannot do.
+     */
+    internal const function rescaled(Entity $e, Vec3 $scale) : bool
+    {
+        if ($this->solidOf->has($e) && !sameScale($this->rows[$this->solidOf[$e] as usize]->scale, $scale)) {
+            return true;
+        }
+
+        if ($this->sensorOf->has($e) && !sameScale($this->rows[$this->sensorOf[$e] as usize]->scale, $scale)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Where a kinematic row should be at the end of the next step. A pose equal to the last one
+     * moves nothing, so the body is left to sleep.
+     */
+    internal function drive(int32 $slot, Vec3 $position, Quat $orientation) : void
+    {
+        BodyRow $row = $this->rows[$slot as usize];
+        if ($position == $row->driven && $orientation == $row->drivenTurn) {
+            return;
+        }
+
+        bt::Body $body = guard $row->body else {
+            return;
+        }
+        $this->rows[$slot as usize]->driven = $position;
+        $this->rows[$slot as usize]->drivenTurn = $orientation;
+        $body->moveTo($this->poseOf($row, $position, $orientation));
+    }
+
+    /**
+     * One step of `settings.step`, then what it moved into `poses` and, with contacts on, what
+     * it joined or parted into `events`.
+     */
+    internal function step() : void
+    {
+        $this->world->advance($this->settings->step);
+        $this->world->moving($this->poses);
+        if ($this->settings->contacts) {
+            $this->world->events(into: $this->events);
+        }
+    }
+
+    /**
+     * The entity behind row `$slot`, `Entity::none()` for a free or unknown row.
+     */
+    internal const function entityAt(int32 $slot) : Entity
+    {
+        if ($slot < 0 || ($slot as usize) >= $this->rows->count()) {
+            return Entity::none();
+        }
+
+        return $this->rows[$slot as usize]->entity;
+    }
+
+    /**
+     * Every body gone, the shape cache kept.
+     */
+    public function clear() : void
+    {
+        for (usize $i = 0; $i < $this->rows->count(); $i++) {
+            if ($this->rows[$i]->body != null) {
+                $this->drop($i as int32);
+            }
+        }
+
+        $this->solidOf->clear();
+        $this->sensorOf->clear();
+    }
+
+    private function placeRow(int32 $slot, Vec3 $position, Quat $orientation) : bool
+    {
+        BodyRow $row = $this->rows[$slot as usize];
+        bt::Body $body = guard $row->body else {
+            return false;
+        }
+
+        $body->setTransform($this->poseOf($row, $position, $orientation));
+        $this->rows[$slot as usize]->driven = $position;
+        $this->rows[$slot as usize]->drivenTurn = $orientation;
+        if (!$row->dynamic) {
+            $this->world->refresh($body);
+        }
+
+        return $row->dynamic;
+    }
+
+    /**
+     * The backend transform of a body on `$row` for an entity at this pose.
+     */
+    private const function poseOf(const BodyRow& $row, Vec3 $position, Quat $orientation) : bt::Transform
+    {
+        if (!$row->turns) {
+            return bt::Transform(toBt($position + $row->shift));
+        }
+
+        return toBt($position + $orientation * $row->lever + $row->shift, $orientation);
+    }
+
+    private function claim(BodyRow $row, bt::Body $body) : int32
+    {
+        $row->body = $body;
+        int32 $slot = 0;
+        if ($this->free->empty()) {
+            $slot = $this->rows->count() as int32;
+            $this->rows[] = $row;
+        } else {
+            $slot = $this->free->pop();
+            $this->rows[$slot as usize] = $row;
+        }
+
+        $body->setSlot($slot);
+        $this->live = $this->live + 1;
+        return $slot;
+    }
+
+    private function drop(int32 $slot) : void
+    {
+        BodyRow $row = $this->rows[$slot as usize];
+        bt::Body $body = guard $row->body else {
+            return;
+        }
+
+        guard $this->world->remove($body) else ($err) {
+            die("physics: could not remove a body: {$err}");
+        }
+
+        if ($row->kinematic && $row->kinematicAt >= 0) {
+            // the last kinematic row takes the hole: O(1), order is not kept
+            usize $at = $row->kinematicAt as usize;
+            usize $last = $this->kinematics->count() - 1;
+            if ($at != $last) {
+                int32 $moved = $this->kinematics[$last];
+                $this->kinematics[$at] = $moved;
+                $this->rows[$moved as usize]->kinematicAt = $at as int32;
+            }
+
+            $this->kinematics->pop();
+        }
+
+        $this->rows[$slot as usize] = BodyRow();
+        $this->free[] = $slot;
+        $this->live = $this->live - 1;
+    }
+
+    /**
+     * A query shape at unit scale, from the cache. Null for a heightfield or a mesh.
+     */
+    private function probe(const ColliderShape& $shape) : bt::Shape?
+    {
+        if (!colliderMoves($shape)) {
+            return null;
+        }
+
+        BuiltShape $built = guard $this->shapes->build($shape, Vec3(1.0f, 1.0f, 1.0f)) else {
+            return null;
+        }
+        return $built->shape;
+    }
+
+    private const function hitOf(bt::Body $body, bt::Vec3 $point, bt::Vec3 $normal, float32 $distance) : PhysicsHit?
+    {
+        int32 $slot = $body->slot();
+        Entity $e = $this->entityAt($slot);
+        if ($e == Entity::none()) {
+            return null;
+        }
+
+        return PhysicsHit($e, fromBt($point), fromBt($normal), $distance, $this->rows[$slot as usize]->grip);
+    }
+}
+
+/**
+ * Two scales the shape cache would build the same shape for.
+ */
+internal function sameScale(Vec3 $a, Vec3 $b) : bool
+{
+    return std::math::abs($a->x - $b->x) < 0.0001f
+        && std::math::abs($a->y - $b->y) < 0.0001f
+        && std::math::abs($a->z - $b->z) < 0.0001f;
+}

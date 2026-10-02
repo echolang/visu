@@ -1,0 +1,112 @@
+/**
+ * A stacked pile of loose bodies: the `physics stress` verb's pile, and a map's loose crates.
+ */
+
+namespace visu::physics;
+
+use visu::components::{Collider, DynamicModel, RigidBody};
+use visu::ecs::{Entities, Entity};
+use visu::geo::Transform;
+use visu::math::Vec3;
+
+/**
+ * A pile is at most this many bodies a side per layer, spaced this many body sizes apart, and
+ * starts this many metres above the ground.
+ */
+public const int32 PHYSICS_PILE_SIDE = 10;
+public const float32 PHYSICS_PILE_SPACING = 1.25f;
+public const float32 PHYSICS_PILE_LIFT = 5.0f;
+
+public struct PhysicsPile
+{
+    public int32 $count;
+    public bool $sphere;
+
+    /**
+     * The edge of a box or the diameter of a sphere, in metres.
+     */
+    public float32 $size;
+    public float32 $x;
+    public float32 $z;
+
+    /**
+     * What each body draws as a `DynamicModel`; empty draws nothing.
+     */
+    public string $model;
+
+    /**
+     * Kilograms a body. Keep it in proportion to what will hit the pile: a 1200 kg car into 1 kg
+     * boxes is a mass ratio the solver cannot settle, so the boxes jitter, sink and fly instead
+     * of coming to rest.
+     */
+    public float32 $mass = 1.0f;
+}
+
+/**
+ * Stack `$pile` over the ground at `$ground`: layers of up to `PHYSICS_PILE_SIDE` squared, every
+ * other layer offset by half a spacing so the pile topples and settles. Each body is a dynamic
+ * `RigidBody` with its `Collider`, plus its model when the pile names one, and is appended to
+ * `$into`. Allocates (entities, components): call it at load or from a verb, never in the
+ * displayed frame.
+ */
+public function stackPile(Entities $entities, const PhysicsPile& $pile, float32 $ground, array<Entity>& $into) : void
+{
+    int32 $side = pileSide($pile);
+    float32 $half = $pile->size * 0.5f;
+    ColliderShape $shape = ColliderShape::box(Vec3($half, $half, $half));
+    if ($pile->sphere) {
+        $shape = ColliderShape::sphere($half);
+    }
+
+    float32 $step = $pile->size * PHYSICS_PILE_SPACING;
+    float32 $origin = -0.5f * ($side - 1) as float32 * $step;
+    int32 $perLayer = $side * $side;
+    $entities->reserve($pile->count as usize);
+    $into->reserve($into->count() + $pile->count as usize);
+    for (int32 $i = 0; $i < $pile->count; $i++) {
+        int32 $layer = $i / $perLayer;
+        int32 $cell = $i % $perLayer;
+        float32 $shift = 0.0f;
+        if ($layer % 2 == 1) {
+            $shift = 0.5f * $step;
+        }
+
+        Transform $t = Transform();
+        $t->position = Vec3(
+            $pile->x + $origin + ($cell % $side) as float32 * $step + $shift,
+            $ground + PHYSICS_PILE_LIFT + $half + $layer as float32 * $step,
+            $pile->z + $origin + ($cell / $side) as float32 * $step + $shift,
+        );
+        Entity $e = $entities->create();
+        $entities->attach<Transform>($e, $t);
+        $entities->attach<Collider>($e, Collider($shape));
+        $entities->attach<RigidBody>($e, RigidBody(BodyKind::dynamic, $pile->mass));
+        if (!$pile->model->empty()) {
+            $entities->attach<DynamicModel>($e, DynamicModel($pile->model));
+        }
+        $into[] = $e;
+    }
+}
+
+/**
+ * Bodies a side of each layer of `$pile`: the smallest square that holds it, at most
+ * `PHYSICS_PILE_SIDE`.
+ */
+public function pileSide(const PhysicsPile& $pile) : int32
+{
+    int32 $side = 1;
+    while ($side * $side < $pile->count && $side < PHYSICS_PILE_SIDE) {
+        $side = $side + 1;
+    }
+
+    return $side;
+}
+
+/**
+ * Layers `$pile` stacks into.
+ */
+public function pileLayers(const PhysicsPile& $pile) : int32
+{
+    int32 $perLayer = pileSide($pile) * pileSide($pile);
+    return ($pile->count + $perLayer - 1) / $perLayer;
+}

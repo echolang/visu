@@ -1,0 +1,147 @@
+/**
+ * The physics world as wireframe in the GBuffer: every body but the heightfields, and bounding
+ * boxes or contact points when asked. A `GeometryFiller` the scene calls from its geometry fill,
+ * after the models. Off, it joins nothing and costs a flag check; on, it walks every body each
+ * frame, which is fine for a debug view and nothing else. The `physics.debug` flag or the
+ * `physics debug` verb switches it.
+ *
+ * Each `Vehicle` adds its suspension and tires (`drawVehicleDebug`) unless `debugVehicles` is
+ * off (`physics debug vehicles off`, `physics.debug.vehicles`). Those draw over the scene, depth
+ * test off: the springs sit inside the wheel wells, where the car's own model would hide them.
+ */
+
+namespace visu::physics;
+
+use visu::app::{Flags, flags};
+use visu::components::Vehicle;
+use visu::ecs::Entities;
+use visu::graphics::{
+    DebugLines, DeferredRenderer, Device, GBufferData, GeometryFiller, GeometryFillers, GpuPass, PipelineError,
+    Raster, RenderContext, RenderEncoder, ShaderProgram, debugLineLayout, debugLinePass
+};
+use visu::math::{Vec3, Vec4, length};
+
+public class PhysicsDebug : GeometryFiller
+{
+    private PhysicsWorld $world;
+    private DeferredRenderer $renderer;
+    private DebugLines $lines;
+    private GpuPass? $pass;
+
+    /**
+     * The vehicles' lines and the pass that draws them over the scene.
+     */
+    private DebugLines $xray;
+    private GpuPass? $xrayPass;
+    private int32 $flagsSeen;
+
+    public constructor(PhysicsWorld $world, DeferredRenderer $renderer, Device $device)
+    {
+        $this->world = $world;
+        $this->renderer = $renderer;
+        $this->lines = DebugLines($device);
+        $this->pass = null;
+        $this->xray = DebugLines($device);
+        $this->xrayPass = null;
+        $this->flagsSeen = -1;
+    }
+
+    /**
+     * Join this frame's geometry fill when the overlay is on.
+     */
+    public function fill(Entities $entities, RenderContext $ctx, GBufferData $gbuffer) : void
+    {
+        Flags $bag = flags();
+        if ($bag->version != $this->flagsSeen) {
+            $this->flagsSeen = $bag->version;
+            if ($bag->has('physics.debug')) {
+                $this->world->showDebug($bag->bool('physics.debug', false));
+            }
+            if ($bag->has('physics.debug.vehicles')) {
+                $this->world->debugVehicles = $bag->bool('physics.debug.vehicles', true);
+            }
+        }
+
+        if (!$this->world->debugging) {
+            return;
+        }
+
+        visu::profile::begin('physics.debug');
+        $this->lines->clear();
+        const array<float32>& $raw = $this->world->debugLines();
+        usize $n = $raw->count() / 12;
+        for (usize $i = 0; $i < $n; $i++) {
+            usize $k = $i * 12;
+            $this->lines->line(
+                Vec3($raw[$k], $raw[$k + 1], $raw[$k + 2]),
+                Vec3($raw[$k + 6], $raw[$k + 7], $raw[$k + 8]),
+                Vec4($raw[$k + 3], $raw[$k + 4], $raw[$k + 5], 1.0f),
+            );
+        }
+
+        $this->xray->clear();
+        if ($this->world->debugVehicles) {
+            visu::profile::begin('vehicles');
+            float32 $g = length($this->world->gravity());
+            foreach ($entities->view<Vehicle>() as $e => &$v) {
+                PhysicsBody $body = guard $this->world->body($e) else {
+                    continue;
+                }
+
+                Vehicle& $held = $v;
+                drawVehicleDebug($this->xray, $held, $body, $g);
+            }
+            visu::profile::end();
+        }
+
+        $this->ensurePass();
+        if (!$this->lines->empty() || !$this->xray->empty()) {
+            $ctx->frame->get<GeometryFillers>()->add($this);
+        }
+        visu::profile::end();
+    }
+
+    public function name() : string
+    {
+        return 'physics.debug';
+    }
+
+    public function record(RenderContext $ctx, RenderEncoder $enc) : status<PipelineError>
+    {
+        GpuPass $pass = guard $this->pass else {
+            return .ok;
+        }
+
+        if (!$this->lines->empty()) {
+            $pass->bind($enc);
+            $this->lines->draw($enc);
+        }
+
+        GpuPass $xray = guard $this->xrayPass else {
+            return .ok;
+        }
+
+        if (!$this->xray->empty()) {
+            $xray->bind($enc);
+            $this->xray->draw($enc);
+        }
+        return .ok;
+    }
+
+    private function ensurePass() : void
+    {
+        if ($this->pass != null) {
+            return;
+        }
+
+        ShaderProgram $prog = guard $this->renderer->program('debug_lines') else {
+            return;
+        }
+        $this->pass = debugLinePass($prog);
+        Raster $over = Raster::opaque();
+        $over->cull = .none;
+        $over->depthTest = false;
+        $over->depthWrite = false;
+        $this->xrayPass = GpuPass($prog, debugLineLayout(), $over, topology: .lines);
+    }
+}

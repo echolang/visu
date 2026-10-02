@@ -1,0 +1,182 @@
+#version 450
+
+// visu::graphics::GpuScene, the meshlet stage: every meshlet of every pair, flattened pair after
+// pair and in run order within a pair (`pairWalk`, the scanned meshlet counts, gives each pair
+// its first flat index), 64 a workgroup, so a far impostor's one meshlet and a near rock's
+// hundred cost the same per meshlet and no workgroup walks more than 64. A meshlet is kept when
+// its sphere meets the view (a posed skin keeps all: its bind pose spheres say nothing, and its
+// instance box already passed). In a G-buffer set a meshlet that faces away from the view's eye
+// everywhere (its normal cone) is dropped too, unless its instance is skinned or scaled unevenly.
+// Mode 0 counts each workgroup's kept meshlets and their triangles; mode 1, after both were
+// scanned into offsets, writes the draw items (meshlet, instance, view, first triangle) in the
+// flat order, and the thread of each pair's first meshlet records where the pair's items and
+// triangles start (`pairItems`, `pairTriangles`, which the draws read)
+layout(local_size_x = 64) in;
+
+#include "visu/scenecull.glsl"
+
+layout(std430, set = 2, binding = 0) readonly buffer Pairs {
+    uvec4 pairs[];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer Meshlets {
+    SceneMeshlet meshlets[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer Instances {
+    SceneInstance instances[];
+};
+
+layout(std430, set = 2, binding = 3) readonly buffer Poses {
+    ScenePose poses[];
+};
+
+layout(std430, set = 2, binding = 4) readonly buffer Views {
+    SceneView views[];
+};
+
+layout(std430, set = 2, binding = 5) writeonly buffer PairItems {
+    uint pairItems[];
+};
+
+layout(std430, set = 2, binding = 6) writeonly buffer PairTriangles {
+    uint pairTriangles[];
+};
+
+layout(std430, set = 2, binding = 7) writeonly buffer Items {
+    uvec4 items[];
+};
+
+layout(std430, set = 2, binding = 8) readonly buffer Counters {
+    uint counters[];
+};
+
+// each pair's first flat meshlet index (the scanned meshlet counts)
+layout(std430, set = 2, binding = 9) readonly buffer PairWalk {
+    uint pairWalk[];
+};
+
+// per workgroup its kept meshlets and their triangles, scanned between the modes
+layout(std430, set = 2, binding = 10) buffer WalkItems {
+    uint walkItems[];
+};
+
+layout(std430, set = 2, binding = 11) buffer WalkTriangles {
+    uint walkTriangles[];
+};
+
+shared uint s_keep[64];
+shared uint s_tris[64];
+
+// the pair whose meshlets hold flat index `f`: the last first index at or before it
+uint pair_of(uint f, uint pairCount)
+{
+    uint lo = 0u;
+    uint hi = pairCount;
+    while (hi - lo > 1u) {
+        uint mid = (lo + hi) / 2u;
+        if (pairWalk[mid] <= f) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x;
+    uint w = gl_WorkGroupID.x;
+    uint f = w * 64u + t;
+    uint pairCount = counters[SCENE_COUNTER_PAIRS];
+    uint walk = counters[SCENE_COUNTER_WALK];
+    bool writing = u_mode.x == 1u;
+    // a depth set's triangle counts are one stand-in word: only a G-buffer set has them
+    bool counted = u_mode.z != 0u;
+
+    bool keep = false;
+    uint n = 0u;
+    uint p = 0u;
+    uint meshlet = 0u;
+    uvec4 pair = uvec4(0u);
+    if (f < walk) {
+        p = pair_of(f, pairCount);
+        pair = pairs[p];
+        meshlet = pair.z + (f - pairWalk[p]);
+        SceneInstance inst = instances[pair.x];
+        SceneMeshlet c = meshlets[meshlet];
+        if ((inst.meta.y & SCENE_INSTANCE_SKINNED) != 0u) {
+            keep = true;
+        } else {
+            SceneView view = views[pair.y];
+            mat4 world = scene_world(poses[inst.meta.z]);
+            float sx = length(world[0].xyz);
+            float sy = length(world[1].xyz);
+            float sz = length(world[2].xyz);
+            float scale = max(sx, max(sy, sz));
+            bool even = min(sx, min(sy, sz)) * 1.01 >= scale;
+            bool cones = counted && (view.meta.z & SCENE_VIEW_CONE) != 0u && even;
+            vec3 centre = (world * vec4(c.sphere.xyz, 1.0)).xyz;
+            float radius = c.sphere.w * scale * 1.001 + 0.001;
+            keep = scene_sphere_visible(view, centre, radius);
+            if (keep && cones && c.cone.w < 1.0) {
+                vec3 axis = normalize(mat3(world) * c.cone.xyz);
+                keep = !scene_cone_backfacing(view.eye.xyz, centre, radius, axis, c.cone.w);
+            }
+        }
+
+        if (keep) {
+            n = c.range.z;
+        }
+    }
+
+    uint own = keep ? 1u : 0u;
+    s_keep[t] = own;
+    s_tris[t] = n;
+    barrier();
+    for (uint o = 1u; o < 64u; o <<= 1u) {
+        uint addKeep = 0u;
+        uint addTris = 0u;
+        if (t >= o) {
+            addKeep = s_keep[t - o];
+            addTris = s_tris[t - o];
+        }
+        barrier();
+        s_keep[t] += addKeep;
+        s_tris[t] += addTris;
+        barrier();
+    }
+
+    if (!writing) {
+        if (t == 0u) {
+            walkItems[w] = s_keep[63];
+            if (counted) {
+                walkTriangles[w] = s_tris[63];
+            }
+        }
+        return;
+    }
+
+    if (f >= walk) {
+        return;
+    }
+
+    uint at = walkItems[w] + s_keep[t] - own;
+    uint tri = 0u;
+    if (counted) {
+        tri = walkTriangles[w] + s_tris[t] - n;
+    }
+
+    // the pair's first meshlet: where its items and triangles start, kept or not
+    if (f == pairWalk[p]) {
+        pairItems[p] = min(at, u_caps.z);
+        if (counted) {
+            pairTriangles[p] = min(tri, u_caps.w);
+        }
+    }
+
+    if (keep && at < u_caps.z) {
+        items[at] = uvec4(meshlet, pair.x, pair.y, tri);
+    }
+}

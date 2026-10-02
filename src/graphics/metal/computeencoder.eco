@@ -71,6 +71,17 @@ public class ComputeEncoder : ComputeEncoderProtocol
         $this->enc->setSamplerState($ss, index: $slot);
     }
 
+    public function bindTextureTable(TextureTable $table) : void
+    {
+        assert(!$this->ended, 'bindTextureTable after endCompute');
+        $table->refresh();
+        MetalTextureTable $t = guard $table->handle->table else {
+            die('metal: texture table handle is empty');
+        }
+        $this->enc->setBuffer($t->buffer, 0, index: METAL_TEXTURE_TABLE_SLOT);
+        $this->enc->useResources($t->resident, .read);
+    }
+
     public function bindStorage(uint32 $slot, Buffer $buffer, uint64 $offset = 0) : void
     {
         assert(!$this->ended, 'bindStorage after endCompute');

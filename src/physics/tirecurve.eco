@@ -1,0 +1,159 @@
+/**
+ * A drawn friction curve: grip as a function of slip, through up to twelve points the designer
+ * places, smoothed by a monotone cubic so it never overshoots between them. Rising from zero to a
+ * peak and falling off into a slide is the usual shape, but any shape that fits the points goes.
+ *
+ * The tangents are solved once, when the curve is built (a load or a console tune). `at` is a
+ * short scan and a cubic, with no allocation.
+ */
+
+namespace visu::physics;
+
+use visu::math::Vec2;
+
+public const int32 TIRE_CURVE_POINTS = 12;
+
+public struct TireCurve
+{
+    /**
+     * The drawn points, increasing in x. Only the first `count` are used.
+     */
+    public fixed_array<Vec2, 12> $points;
+    public int32 $count;
+
+    /**
+     * The slope at each point, Fritsch–Carlson limited so every span is monotone.
+     */
+    private fixed_array<float32, 12> $tangents;
+
+    /**
+     * A flat curve at `$value`.
+     */
+    public constructor(float32 $value = 0.0f)
+    {
+        $this->count = 1;
+        $this->points[0] = Vec2(0.0f, $value);
+    }
+
+    /**
+     * Through `$points`, increasing in x. Past the twelfth point the rest are dropped; past the
+     * ends the curve holds the end values.
+     */
+    public constructor(const array<Vec2>& $points)
+    {
+        $this->count = 0;
+        foreach ($points as $p) {
+            if ($this->count >= TIRE_CURVE_POINTS) {
+                break;
+            }
+
+            $this->points[$this->count as usize] = $p;
+            $this->count = $this->count + 1;
+        }
+
+        if ($this->count == 0) {
+            $this->count = 1;
+            $this->points[0] = Vec2(0.0f, 0.0f);
+        }
+
+        $this->solve();
+    }
+
+    /**
+     * The curve at `$x`, clamped to the end points outside the drawn range.
+     */
+    public const function at(float32 $x) : float32
+    {
+        Vec2 $first = $this->points[0];
+        if ($this->count == 1 || $x <= $first->x) {
+            return $first->y;
+        }
+
+        usize $last = ($this->count - 1) as usize;
+        if ($x >= $this->points[$last]->x) {
+            return $this->points[$last]->y;
+        }
+
+        usize $i = 0;
+        while ($i + 1 < $last && $x >= $this->points[$i + 1]->x) {
+            $i = $i + 1;
+        }
+
+        Vec2 $a = $this->points[$i];
+        Vec2 $b = $this->points[$i + 1];
+        float32 $h = $b->x - $a->x;
+        if ($h <= 0.0f) {
+            return $b->y;
+        }
+
+        float32 $t = ($x - $a->x) / $h;
+        float32 $t2 = $t * $t;
+        float32 $t3 = $t2 * $t;
+        float32 $h00 = 2.0f * $t3 - 3.0f * $t2 + 1.0f;
+        float32 $h10 = $t3 - 2.0f * $t2 + $t;
+        float32 $h01 = 3.0f * $t2 - 2.0f * $t3;
+        float32 $h11 = $t3 - $t2;
+        return $h00 * $a->y + $h10 * $h * $this->tangents[$i] + $h01 * $b->y + $h11 * $h * $this->tangents[$i + 1];
+    }
+
+    /**
+     * The highest y of the drawn points: the peak grip the curve allows.
+     */
+    public const function peak() : float32
+    {
+        float32 $top = $this->points[0]->y;
+        for (usize $i = 1; $i < ($this->count as usize); $i++) {
+            $top = std::math::max($top, $this->points[$i]->y);
+        }
+
+        return $top;
+    }
+
+    private function solve() : void
+    {
+        usize $n = $this->count as usize;
+        if ($n < 2) {
+            $this->tangents[0] = 0.0f;
+            return;
+        }
+
+        // secant slopes, then the average of neighbours where they agree in sign
+        fixed_array<float32, 12> $d;
+        for (usize $i = 0; $i + 1 < $n; $i++) {
+            float32 $h = $this->points[$i + 1]->x - $this->points[$i]->x;
+            if ($h > 0.0f) {
+                $d[$i] = ($this->points[$i + 1]->y - $this->points[$i]->y) / $h;
+            } else {
+                $d[$i] = 0.0f;
+            }
+        }
+
+        $this->tangents[0] = $d[0];
+        $this->tangents[$n - 1] = $d[$n - 2];
+        for (usize $i = 1; $i + 1 < $n; $i++) {
+            if ($d[$i - 1] * $d[$i] <= 0.0f) {
+                $this->tangents[$i] = 0.0f;
+            } else {
+                $this->tangents[$i] = ($d[$i - 1] + $d[$i]) * 0.5f;
+            }
+        }
+
+        // limit each span so the cubic stays within its end values
+        for (usize $i = 0; $i + 1 < $n; $i++) {
+            if ($d[$i] == 0.0f) {
+                $this->tangents[$i] = 0.0f;
+                $this->tangents[$i + 1] = 0.0f;
+                continue;
+            }
+
+            float32 $a = $this->tangents[$i] / $d[$i];
+            float32 $b = $this->tangents[$i + 1] / $d[$i];
+            float32 $s = $a * $a + $b * $b;
+            if ($s > 9.0f) {
+                float32 $tau = 3.0f / std::math::sqrt($s);
+                $this->tangents[$i] = $tau * $a * $d[$i];
+                $this->tangents[$i + 1] = $tau * $b * $d[$i];
+            }
+        }
+    }
+}

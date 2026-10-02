@@ -1,7 +1,7 @@
 /**
  * Console grammar for point lights. `add` and `clear` own debug lamps, rows in the same light
  * table as the entities. `shadow` sets whether those debug lamps cast; `vsm` reads the shadow
- * atlas back.
+ * atlas back; `movingbias` sets how much coarser a moving light's pages are.
  */
 
 namespace visu::console;
@@ -12,7 +12,7 @@ use visu::runtime::{ConsoleCommandHandler, ConsoleCommandRegistry, DebugConsole}
 use visu::signal::ConsoleCommandSignal;
 use visu::system::PointLightSystem;
 
-internal const LIGHT_USAGE = 'usage: light [add <x> <y> <z> [r g b] [radius] [intensity]|clear|shadow on|off|vsm]';
+internal const LIGHT_USAGE = 'usage: light [add <x> <y> <z> [r g b] [radius] [intensity]|clear|shadow on|off|vsm|movingbias <levels>]';
 
 public class LightConsole : ConsoleCommandHandler
 {
@@ -25,7 +25,7 @@ public class LightConsole : ConsoleCommandHandler
 
     public function registerConsoleCommands(ConsoleCommandRegistry $registry) : array<string>
     {
-        $registry->add('light', $this, 'add <x> <y> <z> [r g b] [radius] [intensity]|clear|shadow on|off|vsm');
+        $registry->add('light', $this, 'add <x> <y> <z> [r g b] [radius] [intensity]|clear|shadow on|off|vsm|movingbias <levels>');
         array<string> $names = array<string>();
         $names[] = 'light';
         return $names;
@@ -54,6 +54,21 @@ public class LightConsole : ConsoleCommandHandler
             string $line = $this->lights->atlas->stats();
             visu::app::info($line);
             $console->writeLine($line);
+            return;
+        }
+
+        if ($verb == 'movingbias') {
+            if ($n != 3) {
+                $console->writeLine(LIGHT_USAGE);
+                return;
+            }
+
+            float64 $levels = guard str::float($cmd->parts[2]) else {
+                $console->writeLine(LIGHT_USAGE);
+                return;
+            }
+            $this->lights->atlas->movingBias = std::math::max($levels as float32, 0.0f);
+            $console->writeLine("light: a moving light asks for pages {$this->lights->atlas->movingBias} levels coarser");
             return;
         }
 

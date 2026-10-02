@@ -1,0 +1,21 @@
+#version 450
+#extension GL_EXT_nonuniform_qualifier : require
+
+// the TextureTable check from a kernel: thread i reads the centre texel of slot u_slots[i]
+layout(local_size_x = 4) in;
+
+#include "visu/bindless.glsl"
+
+layout(std140, set = 0, binding = 0) uniform TableParams {
+    uvec4 u_slots;
+};
+
+layout(std430, set = 2, binding = 0) writeonly buffer Out {
+    vec4 texels[];
+};
+
+void main()
+{
+    uint i = gl_LocalInvocationID.x;
+    texels[i] = table_sample_lod(u_slots[i], 0u, vec2(0.5), 0.0);
+}

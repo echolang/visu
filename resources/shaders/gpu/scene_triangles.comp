@@ -1,0 +1,83 @@
+#version 450
+
+// visu::graphics::GpuScene, the triangle stage of a G-buffer set: one workgroup per draw item
+// writes its meshlet's triangles as indices from the item's first triangle on. An index names the
+// item and a meshlet-local vertex, `(item << 6) | local`, so the indexed draw shades each vertex
+// of a meshlet once. The first thread also writes the item's draw record, everything the vertex
+// program needs besides the vertex (SceneDrawItem), so a vertex reads one record instead of the
+// meshlet and the instance. With the meshlet debug view on, the record's tint is a colour hashed
+// from the meshlet id instead of the instance's, so the shading shows every meshlet's cut
+layout(local_size_x = 64) in;
+
+#include "visu/scenecull.glsl"
+
+layout(std430, set = 2, binding = 0) readonly buffer Items {
+    uvec4 items[];
+};
+
+layout(std430, set = 2, binding = 1) readonly buffer Meshlets {
+    SceneMeshlet meshlets[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer Detail {
+    uint detail[];
+};
+
+layout(std430, set = 2, binding = 3) writeonly buffer Indices {
+    uint indices[];
+};
+
+layout(std430, set = 2, binding = 4) readonly buffer Instances {
+    SceneInstance instances[];
+};
+
+layout(std430, set = 2, binding = 5) writeonly buffer DrawItems {
+    SceneDrawItem drawItems[];
+};
+
+// a bright, saturated colour for `id`, as two half pairs (the tint the albedo is multiplied by;
+// scaled past 1 so a dark texture still reads)
+uvec2 debug_tint(uint id)
+{
+    uint h = id * 2654435761u;
+    h ^= h >> 15u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    float hue = float(h & 0xFFFFu) / 65535.0;
+    vec3 c = clamp(abs(fract(hue + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+    c = mix(vec3(1.0), c, 0.85) * 3.0;
+    return uvec2(packHalf2x16(c.rg), packHalf2x16(vec2(c.b, 1.0)));
+}
+
+void main()
+{
+    uint i = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uvec4 item = items[i];
+    SceneMeshlet m = meshlets[item.x];
+    if (t == 0u) {
+        SceneInstance inst = instances[item.y];
+        SceneDrawItem d;
+        d.head = uvec4(m.range.x, inst.meta.z, m.material.y, floatBitsToUint(inst.hi.w));
+        d.extra = uvec4(inst.extra.x, inst.extra.y, inst.meta.y, 0u);
+        if (u_debug.x == SCENE_DEBUG_MESHLETS) {
+            d.extra.xy = debug_tint(item.x);
+        }
+        drawItems[i] = d;
+    }
+
+    if (t >= m.range.z) {
+        return;
+    }
+
+    uint at = item.w + t;
+    if (at >= u_caps.w) {
+        return;
+    }
+
+    uint tri = detail[m.range.y + t];
+    uint name = i << 6u;
+    indices[at * 3u] = name | (tri & 0xFFu);
+    indices[at * 3u + 1u] = name | ((tri >> 8u) & 0xFFu);
+    indices[at * 3u + 2u] = name | ((tri >> 16u) & 0xFFu);
+}

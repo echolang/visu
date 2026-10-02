@@ -1,7 +1,8 @@
 #version 450
 
 // visu::graphics::ShadowAtlas, invalidation, one thread per light. A light that was added,
-// moved or removed gets a new generation, which retires all of its pages. A box where casters
+// moved or removed gets a new generation, which retires all of its pages, and notes the frame,
+// so the request asks it for coarser pages while it keeps moving. A box where casters
 // changed (a mover's last and new box, a placed or removed static) clears only the entries of
 // the pages it projects onto, face by face and level by level, so a car driving past a torch
 // redraws the few pages it crosses and the rest stay cached
@@ -54,7 +55,8 @@ void main()
     uint changed = uint(u_vsm_shadow.y + 0.5);
     for (uint i = 0u; i < changed; i++) {
         if (changedSlots[i] == slot) {
-            gens[slot] = gens[slot] + 1u;
+            uint gen = ((gens[slot] & VSM_GEN_MASK) + 1u) & VSM_GEN_MASK;
+            gens[slot] = gen | ((u_vsm_counts.y & 0xFFFFu) << VSM_MOVED_SHIFT);
             return;
         }
     }

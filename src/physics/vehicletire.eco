@@ -1,0 +1,124 @@
+/**
+ * The tire model's arithmetic, pure so it can be tested on its own. `stepVehicle` strings these
+ * together for every wheel on every physics step.
+ */
+
+namespace visu::physics;
+
+use visu::math::{Vec3, cross};
+
+/**
+ * The longitudinal slip: how much faster the tread moves than the ground under it, over the
+ * wheel's speed (`(ωr - Vx) / |Vx|`). Below `$lowSpeed` the denominator holds at `$lowSpeed`, so a
+ * car pulling away or standing still reads a bounded slip instead of an infinite one. Positive
+ * drives the car forward, negative brakes it.
+ */
+public function tireSlipRatio(float32 $treadSpeed, float32 $vx, float32 $lowSpeed) : float32
+{
+    float32 $over = std::math::max(std::math::abs($vx), std::math::max($lowSpeed, 0.001f));
+    return ($treadSpeed - $vx) / $over;
+}
+
+/**
+ * The angle between where the wheel points and where its contact patch goes, in radians. Signed
+ * like `$vy` (positive sliding left), the same going forward or in reverse. Below `$lowSpeed` the
+ * forward speed holds at `$lowSpeed`, as the slip ratio's does, so a car creeping sideways at a
+ * standstill reads a small angle instead of a full slide.
+ */
+public function tireSlipAngle(float32 $vx, float32 $vy, float32 $lowSpeed) : float32
+{
+    return std::math::atan2($vy, std::math::max(std::math::abs($vx), std::math::max($lowSpeed, 0.001f)));
+}
+
+/**
+ * The load the tire feels: `rest^(1-r) * instant^r`, the instant load clamped to `0..$max`. With
+ * `$response` 0 the tire always feels its rest load, with 1 every bump.
+ */
+public function tireLoad(float32 $rest, float32 $instant, float32 $response, float32 $max) : float32
+{
+    float32 $now = std::math::clamp($instant, 0.0f, $max);
+    if ($now <= 0.0f || $rest <= 0.0f) {
+        return 0.0f;
+    }
+
+    float32 $r = std::math::clamp($response, 0.0f, 1.0f);
+    return std::math::pow($rest, 1.0f - $r) * std::math::pow($now, $r);
+}
+
+/**
+ * Keep the wheel from spinning through the road's speed in one step: if the tread was faster than
+ * the ground before (`$slipBefore` positive) it may not end slower, and the other way around. The
+ * answer is `$omega` or the road's own spin, `$roadOmega`.
+ */
+public function wheelOmegaClamp(float32 $omega, float32 $slipBefore, float32 $roadOmega, float32 $radius) : float32
+{
+    float32 $after = $omega * $radius - $roadOmega * $radius;
+    if ($slipBefore > 0.0f && $after < 0.0f) {
+        return $roadOmega;
+    }
+
+    if ($slipBefore < 0.0f && $after > 0.0f) {
+        return $roadOmega;
+    }
+
+    return $omega;
+}
+
+/**
+ * The mass the body shows an impulse along `$normal` at `$lever` from its centre of mass, both
+ * in the body's own frame, where `$invInertia` is diagonal. The pitch (x) and roll (z) parts of
+ * the inertia are taken as scaled, the same way the tire impulses are, so the clamp asks for the
+ * impulse the chassis will really get.
+ */
+public function contactEffectiveMass(
+    float32 $invMass,
+    Vec3 $invInertia,
+    Vec3 $lever,
+    Vec3 $normal,
+    float32 $pitchScale,
+    float32 $rollScale
+) : float32
+{
+    Vec3 $a = cross($lever, $normal);
+    float32 $turn = $invInertia->x * $pitchScale * $a->x * $a->x
+        + $invInertia->y * $a->y * $a->y
+        + $invInertia->z * $rollScale * $a->z * $a->z;
+    float32 $inv = $invMass + $turn;
+    if ($inv <= 0.0f) {
+        return 0.0f;
+    }
+
+    return 1.0f / $inv;
+}
+
+/**
+ * The engine's force at the patches for `$throttle` at `$speed` m/s forward: the full force up to
+ * where power takes over, power over speed beyond it, nothing past the top speed. Reverse takes
+ * `reverseScale` of it up to `reverseSpeed`.
+ */
+public function driveForceAt(const VehicleSpec& $spec, float32 $throttle, float32 $speed) : float32
+{
+    if ($throttle == 0.0f) {
+        return 0.0f;
+    }
+
+    if ($throttle < 0.0f) {
+        if (-$speed >= $spec->reverseSpeed) {
+            return 0.0f;
+        }
+
+        return $throttle * $spec->driveForce * $spec->reverseScale;
+    }
+
+    if ($speed >= $spec->maxSpeed) {
+        return 0.0f;
+    }
+
+    float32 $force = $spec->driveForce;
+    float32 $v = std::math::max($speed, 0.0f);
+    if ($v > 0.1f) {
+        $force = std::math::min($force, $spec->power / $v);
+    }
+
+    return $throttle * $force;
+}
