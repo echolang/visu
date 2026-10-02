@@ -34,6 +34,9 @@ internal const int32 DEBUG_CONNECTIONS_MAX = 4;
 // how long a thread sleeps in accept or read before it looks at the stop flag again
 internal const int32 DEBUG_POLL_MS = 100;
 
+// a connection with no whole request in this long is dropped, so a silent client cannot hold a slot
+internal const int32 DEBUG_IDLE_MS = 60000;
+
 // a reply that cannot be written in this long goes to a client that stopped reading
 internal const int32 DEBUG_WRITE_MS = 5000;
 
@@ -217,10 +220,10 @@ internal function acceptLoop(tcp::Listener $listener, DebugMailbox $mail, DebugG
  */
 internal function serveConnection(tcp::Stream $stream, DebugMailbox $mail, DebugGate $gate) : void
 {
-    tcp::FrameReader $reader = tcp::FrameReader(DEBUG_FRAME_MAX);
+    tcp::FrameReader $reader = tcp::FrameReader(DEBUG_FRAME_MAX, DEBUG_IDLE_MS);
     bool $greeted = false;
     while ($gate->running()) {
-        // closed, truncated, oversized (an HTTP client) or broken: the conversation is over
+        // closed, truncated, oversized (an HTTP client), idle or broken: the conversation is over
         string? $next = guard $reader->read($stream, DEBUG_POLL_MS) else {
             return;
         }
