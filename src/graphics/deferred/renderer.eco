@@ -89,6 +89,12 @@ public class DeferredRenderer
     public ShadowQuality? $shadows;
 
     /**
+     * The cascade layout `applyQuality` switches shadows on with, copied (its splits and
+     * reach); the quality's resolution, distance and stabilisation are laid over the copy.
+     */
+    public ShadowQuality $shadowLayout;
+
+    /**
      * `.scene` runs light + skybox. Any other case skips shading and blits that buffer.
      */
     public DeferredView $view;
@@ -150,6 +156,7 @@ public class DeferredRenderer
         $this->ssao = SsaoQuality::ultra();
         $this->ibl = IblQuality();
         $this->shadows = null;
+        $this->shadowLayout = ShadowQuality::medium();
         $this->view = .scene;
         $this->device = $device;
         $this->gpu = null;
@@ -189,6 +196,72 @@ public class DeferredRenderer
         $this->exposure->auto = $settings->exposureAuto;
         $this->splitGeometry = $settings->splitGeometry;
         $this->scene->configure($settings->scene);
+    }
+
+    /**
+     * Apply what a settings screen chose. Ambient occlusion and the cascades are left alone when
+     * they did not change, so their targets are not rebuilt; the god rays take only their switch
+     * and tier, and the tone map and exposure only their switches.
+     */
+    public function applyQuality(const RenderQuality& $q) : void
+    {
+        $this->applySsao($q);
+        $this->applyShadows($q);
+        GodRays $rays = $this->godRays;
+        $rays->enabled = $q->godRays;
+        $rays->scale = $q->godRayScale;
+        $rays->steps = $q->godRaySteps;
+        $this->godRays = $rays;
+        Exposure $exposure = $this->exposure;
+        $exposure->auto = $q->toneMapping;
+        $this->exposure = $exposure;
+        ToneMap $map = $this->toneMap;
+        $map->local = $q->toneMapping;
+        $this->toneMap = $map;
+    }
+
+    private function applySsao(const RenderQuality& $q) : void
+    {
+        if (!$q->ssao) {
+            $this->ssao = null;
+            return;
+        }
+
+        SsaoQuality $now = $this->ssao ?? SsaoQuality::ultra();
+        if ($this->ssao != null
+            && $now->level == $q->ssaoLevel
+            && $now->radius == $q->ssaoRadius
+            && $now->strength == $q->ssaoStrength
+        ) {
+            return;
+        }
+
+        $now->apply($q->ssaoLevel);
+        $now->radius = $q->ssaoRadius;
+        $now->strength = $q->ssaoStrength;
+        $this->ssao = $now;
+    }
+
+    private function applyShadows(const RenderQuality& $q) : void
+    {
+        if (!$q->shadows) {
+            $this->shadows = null;
+            return;
+        }
+
+        ShadowQuality $now = $this->shadows ?? $this->shadowLayout->copy();
+        if ($this->shadows != null
+            && $now->resolution == $q->shadowResolution
+            && $now->maxLength == $q->shadowDistance
+            && $now->stabilize == $q->shadowStabilize
+        ) {
+            return;
+        }
+
+        $now->resolution = $q->shadowResolution;
+        $now->maxLength = $q->shadowDistance;
+        $now->stabilize = $q->shadowStabilize;
+        $this->shadows = $now;
     }
 
     /**
