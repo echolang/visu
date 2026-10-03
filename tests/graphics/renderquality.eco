@@ -1,0 +1,56 @@
+/**
+ * A settings screen's cost tiers onto the renderer: only what changed is rebuilt, and the
+ * cascade layout is a template, never edited through the live cascades.
+ */
+
+use visu::graphics::{DeferredRenderer, Device, RenderQuality, ShadowQuality, SsaoLevel, SsaoQuality};
+
+test render_quality_keeps_what_did_not_change
+{
+    DeferredRenderer $renderer = DeferredRenderer(Device());
+    RenderQuality $q = RenderQuality();
+    $renderer->applyQuality($q);
+    SsaoQuality $ssao = guard $renderer->ssao else {
+        assert(false, 'ssao on');
+        return;
+    }
+    ShadowQuality $shadows = guard $renderer->shadows else {
+        assert(false, 'shadows on');
+        return;
+    }
+
+    // marks no apply writes: they survive only on the objects already held
+    $ssao->biasRatio = 0.123f;
+    $shadows->debug = true;
+    $renderer->applyQuality($q);
+    assert(($renderer->ssao?->biasRatio ?? 0.0f) == 0.123f, 'the same occlusion');
+    assert($renderer->shadows?->debug ?? false, 'the same cascades');
+}
+
+test render_quality_switches_and_retunes
+{
+    DeferredRenderer $renderer = DeferredRenderer(Device());
+    ShadowQuality $layout = ShadowQuality::medium();
+    array<float32> $splits = [10.0f, 20.0f, 30.0f, 40.0f, 50.0f];
+    $layout->splits = $splits;
+    $renderer->shadowLayout = $layout;
+    RenderQuality $q = RenderQuality();
+    $q->shadowResolution = 1024;
+    $q->ssaoLevel = SsaoLevel::low;
+    $q->godRaySteps = 20;
+    $q->toneMapping = true;
+    $renderer->applyQuality($q);
+    ShadowQuality $shadows = guard $renderer->shadows else {
+        assert(false, 'shadows on');
+        return;
+    }
+    assert($shadows->resolution == 1024 && $shadows->splits->count() == 5, 'the layout with the tier over it');
+    assert($layout->resolution == 2048, 'the layout itself untouched');
+    assert($renderer->godRays->steps == 20, 'the march tier');
+    assert($renderer->exposure->auto && $renderer->toneMap->local, 'both tone switches');
+
+    $q->ssao = false;
+    $q->shadows = false;
+    $renderer->applyQuality($q);
+    assert($renderer->ssao == null && $renderer->shadows == null, 'both off');
+}

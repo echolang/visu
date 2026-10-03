@@ -109,3 +109,20 @@ test debug_lines_frustum_is_twelve_edges
     assert($lines->vertexCount() == 24, 'each edge is two vertices');
     $device->shutdown();
 }
+
+test debug_lines_append_replays_a_cached_set_under_the_limit
+{
+    Device $device = Device();
+    DebugLines $still = DebugLines($device);
+    $still->box(AABB(Vec3(-1.0f), Vec3(1.0f)), lineColor());
+    DebugLines $frame = DebugLines($device, 14);
+    $frame->line(Vec3(0.0f), Vec3(1.0f), lineColor());
+    $frame->append($still);
+    assert($frame->count() == 13, 'what was asked for, the cached edges included');
+    assert($frame->vertexCount() == 26, 'one line then the twelve edges');
+    $frame->append($still);
+    assert($frame->count() == 25, 'still counting past the limit');
+    assert($frame->vertexCount() == 28, 'only the room left is filled');
+    assert($still->vertexCount() == 24, 'the cached set is untouched');
+    $device->shutdown();
+}

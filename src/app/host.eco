@@ -87,6 +87,12 @@ public class Host
     private HostPassData? $hostPass;
     private SceneTargetData? $sceneTargetData;
 
+    /**
+     * The display last applied (`display`), valid once `displayed` is set.
+     */
+    private Display $shown;
+    private bool $displayed;
+
     public constructor(HostConfig $config, Services $services)
     {
         $this->script = $services->find<DCapture>();
@@ -122,6 +128,8 @@ public class Host
         $this->presentPipe = null;
         $this->hostPass = null;
         $this->sceneTargetData = null;
+        $this->shown = Display();
+        $this->displayed = false;
         $this->dispatcher = Dispatcher();
         $this->input = InputHub($this->window, $this->dispatcher);
         $this->inputContext = ContextMap($this->dispatcher, $this->input);
@@ -199,6 +207,32 @@ public class Host
         }
 
         return $overlay->enabled;
+    }
+
+    /**
+     * Apply `$d`: vsync, then (with a window to change) the window mode and size. The same
+     * display as the last one does nothing. Headless runs take only the vsync.
+     */
+    public function display(const Display& $d) : void
+    {
+        if ($this->displayed && $this->shown->same($d)) {
+            return;
+        }
+
+        $this->window->setVsync($d->vsync);
+        #[if: os != ios]
+        if (!$this->config->headless) {
+            if ($d->fullscreen) {
+                $this->window->setFullscreen($d->width, $d->height, $d->refresh);
+            } else {
+                Vec2 $pos = $this->window->position();
+                $this->window->setWindowed($d->width, $d->height, $pos->x as int32, $pos->y as int32);
+            }
+        }
+        #[end]
+
+        $this->shown = $d;
+        $this->displayed = true;
     }
 
     public function setOverlayEnabled(bool $on) : void
