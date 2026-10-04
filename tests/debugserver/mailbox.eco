@@ -1,10 +1,10 @@
 /**
  * The worker to main-thread hand-off: a posting thread sleeps until the main side answers,
- * and closing the mailbox wakes it with a 503.
+ * and closing the mailbox wakes it with `shuttingDown`.
  */
 
 use std::thread;
-use visu::debugserver::{DebugJob, DebugMailbox, DebugReply};
+use visu::debugserver::{DebugFault, DebugJob, DebugMailbox, DebugReply};
 
 test debugserver_mailbox_idle_takes_nothing
 {
@@ -16,9 +16,9 @@ test debugserver_mailbox_idle_takes_nothing
 test debugserver_mailbox_post_answers_across_threads
 {
     DebugMailbox $mail = DebugMailbox();
-    thread::task<int32> $client = guard thread::spawn(function() : int32 {
+    thread::task<bool> $client = guard thread::spawn(function() : bool {
         DebugReply $reply = $mail->post(.status);
-        return $reply->status;
+        return $reply->fault == null && $reply->body == '{"ok":true}';
     }) else ($e) {
         assert(false, "spawn failed");
         return;
@@ -36,15 +36,18 @@ test debugserver_mailbox_post_answers_across_threads
     }
     assert(!$mail->waiting(), 'taken');
     $job->answer(DebugReply(json: '{"ok":true}'));
-    assert($client->wait() == 200, 'the worker got the answer');
+    assert($client->wait(), 'the worker got the answer');
 }
 
-test debugserver_mailbox_dropped_job_is_503
+test debugserver_mailbox_closed_answers_shutting_down
 {
     DebugMailbox $mail = DebugMailbox();
-    thread::task<int32> $client = guard thread::spawn(function() : int32 {
+    thread::task<bool> $client = guard thread::spawn(function() : bool {
         DebugReply $reply = $mail->post(.verbs);
-        return $reply->status;
+        DebugFault $fault = guard $reply->fault else {
+            return false;
+        }
+        return $fault == DebugFault::shuttingDown;
     }) else ($e) {
         assert(false, "spawn failed");
         return;
@@ -53,7 +56,11 @@ test debugserver_mailbox_dropped_job_is_503
         thread::sleep(1);
     }
     $mail->close();
-    assert($client->wait() == 503, 'a closed mailbox answers 503');
+    assert($client->wait(), 'a closed mailbox answers shuttingDown');
     DebugReply $late = $mail->post(.status);
-    assert($late->status == 503, 'a post after close is refused');
+    DebugFault $lateFault = guard $late->fault else {
+        assert(false, 'a post after close is refused');
+        return;
+    }
+    assert($lateFault == DebugFault::shuttingDown, 'a post after close is refused as shuttingDown');
 }

@@ -43,20 +43,27 @@ internal function parseHello(const string& $text) : result<int64, string>
 
 /**
  * A request frame to its reply frame: parse, post to `$mail` (which sleeps until the main thread
- * answers), wrap. A frame that does not parse is answered 400 with the id it carried, or 0.
+ * answers), wrap. A frame that does not parse is answered `badRequest` with the id it carried, or
+ * 0, and so is an `id` that is not an integer.
  */
 internal function answerFrame(const string& $text, DebugMailbox $mail) : string
 {
     json::Value $v = guard json::parse($text) else ($e) {
-        return replyJson(0, DebugReply(400, error: "bad json: {$e->message()}"));
+        return replyJson(0, DebugReply(.badRequest, error: "bad json: {$e->message()}"));
     }
     int64 $id = 0;
     if ($v->isObject()) {
-        $id = $v['id']->asInt() ?? 0;
+        json::Value? $given = $v->get('id');
+        if ($given != null) {
+            int64 $number = guard $given?->asInt() else {
+                return replyJson(0, DebugReply(.badRequest, error: '"id" must be an integer'));
+            }
+            $id = $number;
+        }
     }
 
     DebugRequest $request = guard parseOp($v) else ($why) {
-        return replyJson($id, DebugReply(400, error: $why));
+        return replyJson($id, DebugReply(.badRequest, error: $why));
     }
     return replyJson($id, $mail->post($request));
 }

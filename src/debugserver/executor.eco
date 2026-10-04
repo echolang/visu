@@ -59,7 +59,7 @@ public class DebugExecutor : DumpSink
                 json::Value $o = json::object();
                 $o['name'] = $name;
                 FlagValue $now = guard $bag->get($name) else {
-                    $job->answer(DebugReply(500, error: "flag {$name} did not stick"));
+                    $job->answer(DebugReply(.failed, error: "flag {$name} did not stick"));
                     return;
                 }
                 $o['value'] = flagJson($now);
@@ -138,7 +138,7 @@ public class DebugExecutor : DumpSink
     }
 
     /**
-     * Answer 504 to every parked job past the deadline. From every poll while one is parked, so
+     * Answer `timeout` to every parked job past the deadline. From every poll while one is parked, so
      * it runs even when no frame is presented.
      */
     public function expire() : void
@@ -153,19 +153,19 @@ public class DebugExecutor : DumpSink
             }
 
             $this->unpark($i);
-            $job->answer(DebugReply(504, error: 'no frame was presented in time (window minimized, or the frame never completed)'));
+            $job->answer(DebugReply(.timeout, error: 'no frame was presented in time (window minimized, or the frame never completed)'));
         }
     }
 
     /**
-     * Answer every parked job with a 503. Main side, before the server stops.
+     * Answer every parked job with `shuttingDown`. Main side, before the server stops.
      */
     public function close() : void
     {
         array<DebugJob> $left = $this->waiting;
         $this->waiting = array<DebugJob>();
         foreach ($left as $job) {
-            $job->answer(DebugReply(503, error: 'the app is shutting down'));
+            $job->answer(DebugReply(.shuttingDown, error: 'the app is shutting down'));
         }
     }
 
@@ -188,12 +188,12 @@ public class DebugExecutor : DumpSink
             }
 
             // an unknown name is the client's mistake; a matched name that failed to write is ours
-            int32 $status = 500;
+            DebugFault $fault = .failed;
             if ($matched == 0) {
-                $status = 404;
+                $fault = .notFound;
             }
 
-            $job->answer(DebugReply($status, error: $why));
+            $job->answer(DebugReply($fault, error: $why));
             return;
         }
 
@@ -220,7 +220,7 @@ public class DebugExecutor : DumpSink
         DebugJob $job = $this->waiting[$at];
         $this->unpark($at);
         if ($path->empty()) {
-            $job->answer(DebugReply(500, error: 'the profile frame never completed'));
+            $job->answer(DebugReply(.failed, error: 'the profile frame never completed'));
             return;
         }
 
@@ -297,7 +297,7 @@ public class DebugExecutor : DumpSink
     private function console(const array<string>& $commands, DebugConsole? $maybe) : DebugReply
     {
         DebugConsole $console = guard $maybe else {
-            return DebugReply(409, error: 'no debug console in this app');
+            return DebugReply(.noConsole, error: 'no debug console in this app');
         }
         json::Value $results = json::arr();
         foreach ($commands as $command) {
@@ -316,7 +316,7 @@ public class DebugExecutor : DumpSink
     private function verbs(DebugConsole? $maybe) : DebugReply
     {
         DebugConsole $console = guard $maybe else {
-            return DebugReply(409, error: 'no debug console in this app');
+            return DebugReply(.noConsole, error: 'no debug console in this app');
         }
         json::Value $list = json::arr();
         foreach ($console->registry->names() as $name) {

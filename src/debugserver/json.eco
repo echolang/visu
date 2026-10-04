@@ -7,15 +7,16 @@ namespace visu::debugserver;
 use visu::app::FlagValue;
 
 /**
- * One reply frame: `{"id", "ok", "status", "result"}` on success, `{"id", "ok", "status",
- * "error"}` otherwise. The result is spliced in as the executor wrote it, not parsed again.
+ * One reply frame: `{"id", "ok", "result"}` on success, `{"id", "ok", "error", "message"}`
+ * otherwise, where `error` is the `DebugFault` name and `message` the reason in words. The result
+ * is spliced in as the executor wrote it, not parsed again.
  */
 internal function replyJson(int64 $id, const DebugReply& $reply) : string
 {
-    if ($reply->status == 200) {
+    DebugFault $fault = guard $reply->fault else {
         string $out = '{"id":';
         $out->append("{$id}");
-        $out->append(',"ok":true,"status":200,"result":');
+        $out->append(',"ok":true,"result":');
         $out->append($reply->body);
         $out->append('}');
         return $out;
@@ -24,8 +25,8 @@ internal function replyJson(int64 $id, const DebugReply& $reply) : string
     json::Value $o = json::object();
     $o['id'] = json::int($id);
     $o['ok'] = json::bool(false);
-    $o['status'] = json::int($reply->status as int64);
-    $o['error'] = json::str($reply->error);
+    $o['error'] = json::str($fault->word());
+    $o['message'] = json::str($reply->message);
     return json::dump($o);
 }
 

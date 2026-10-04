@@ -1,0 +1,62 @@
+/**
+ * Why the debug server refused or failed a request. It goes on the wire as `error` (the case
+ * name, `word()`) beside a human `message`, so a client branches on the name and shows the text.
+ */
+
+namespace visu::debugserver;
+
+public enum DebugFault
+{
+    /**
+     * The request did not parse, named no known op, or carried bad arguments. Also the answer to
+     * a first frame that is not the handshake.
+     */
+    case badRequest;
+
+    /**
+     * Nothing matched: a snapshot name or glob that names no image this frame.
+     */
+    case notFound;
+
+    /**
+     * The app has no debug console to run commands or list verbs on.
+     */
+    case noConsole;
+
+    /**
+     * Every connection slot is taken; the connection closes after this answer.
+     */
+    case busy;
+
+    /**
+     * The app is going away: the request came in or was waiting when the server stopped.
+     */
+    case shuttingDown;
+
+    /**
+     * No frame was presented before the deadline, for example while the window is minimized.
+     */
+    case timeout;
+
+    /**
+     * The app took the request and could not do it: a dump that matched but did not write, a
+     * profile frame that never completed, a flag that did not stick, a request it dropped.
+     */
+    case failed;
+
+    /**
+     * The name the reply carries as `error`.
+     */
+    public const function word() : string
+    {
+        return match ($this) {
+            DebugFault::badRequest => 'badRequest',
+            DebugFault::notFound => 'notFound',
+            DebugFault::noConsole => 'noConsole',
+            DebugFault::busy => 'busy',
+            DebugFault::shuttingDown => 'shuttingDown',
+            DebugFault::timeout => 'timeout',
+            DebugFault::failed => 'failed',
+        };
+    }
+}

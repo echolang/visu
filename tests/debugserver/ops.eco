@@ -177,3 +177,35 @@ test debugserver_unknown_and_malformed_requests
     assert(refused('{"id":3}'), 'no op');
     assert(refused('[1,2]'), 'not an object');
 }
+
+test debugserver_reply_names_the_fault
+{
+    string $bad = visu::debugserver::replyJson(3, visu::debugserver::DebugReply(.busy, error: 'full'));
+    json::Value $v = guard json::parse($bad) else ($e) {
+        die("reply: {$bad}");
+    }
+    assert(!($v['ok']->asBool() ?? true), 'not ok');
+    assert(($v['id']->asInt() ?? 0) == 3, 'carries the id');
+    assert(($v['error']->asStr() ?? '') == 'busy', 'error is the fault name');
+    assert(($v['message']->asStr() ?? '') == 'full', 'message is the reason');
+    assert($v->get('status') == null, 'no status number');
+
+    string $good = visu::debugserver::replyJson(4, visu::debugserver::DebugReply(json: '{"frame":9}'));
+    json::Value $g = guard json::parse($good) else ($e) {
+        die("reply: {$good}");
+    }
+    assert(($g['ok']->asBool() ?? false), 'ok');
+    assert(($g['result']['frame']->asInt() ?? 0) == 9, 'result spliced in');
+    assert($g->get('status') == null && $g->get('error') == null, 'no status, no error');
+}
+
+test debugserver_refuses_an_id_that_is_not_an_integer
+{
+    visu::debugserver::DebugMailbox $mail = visu::debugserver::DebugMailbox();
+    string $reply = visu::debugserver::answerFrame('{"id":"seven","op":"status"}', $mail);
+    json::Value $v = guard json::parse($reply) else ($e) {
+        die("reply: {$reply}");
+    }
+    assert(($v['error']->asStr() ?? '') == 'badRequest', 'a string id is a bad request');
+    assert(!$mail->waiting(), 'nothing was posted');
+}

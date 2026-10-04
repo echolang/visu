@@ -2,7 +2,7 @@
  * The opt-in debug server: `--flag debug.port=<port>` (and `debug.host`, default 127.0.0.1).
  * Length-prefixed JSON over TCP (libtcp): every frame is a uint32 big-endian byte count and that
  * much JSON. The client's first frame is `{"op":"hello","protocol":1}`; after that each request
- * `{"id", "op", ...}` gets one reply `{"id", "ok", "status", "result" | "error"}`, in order.
+ * `{"id", "op", ...}` gets one reply, `{"id", "ok", "result"}` or `{"id", "ok", "error", "message"}`, in order.
  *
  * An accept thread hands each connection a thread of its own (at most `DEBUG_CONNECTIONS_MAX`).
  * A connection thread posts every request to the mailbox and sleeps until the main thread answers
@@ -152,7 +152,7 @@ public class DebugServer
     }
 
     /**
-     * Answer everything in flight with a 503, stop accepting, and wait for every thread to leave,
+     * Answer everything in flight with `shuttingDown`, stop accepting, and wait for every thread to leave,
      * so none runs past the Host.
      */
     public function stop() : void
@@ -192,7 +192,7 @@ internal function acceptLoop(tcp::Listener $listener, DebugMailbox $mail, DebugG
         tcp::Stream $stream = guard $maybe;
         if (!$gate->enter(DEBUG_CONNECTIONS_MAX)) {
             int32 $most = DEBUG_CONNECTIONS_MAX;
-            string $busy = replyJson(0, DebugReply(503, error: "the debug server serves {$most} connections at most"));
+            string $busy = replyJson(0, DebugReply(.busy, error: "the debug server serves {$most} connections at most"));
             // best effort: the connection closes either way
             status<tcp::Error> $sent = tcp::writeFrame($stream, $busy, DEBUG_WRITE_MS);
             $stream->close();
@@ -235,7 +235,7 @@ internal function serveConnection(tcp::Stream $stream, DebugMailbox $mail, Debug
         if (!$greeted) {
             int64 $protocol = guard parseHello($text) else ($why) {
                 // best effort: the connection closes either way
-                status<tcp::Error> $sent = tcp::writeFrame($stream, replyJson(0, DebugReply(400, error: $why)), DEBUG_WRITE_MS);
+                status<tcp::Error> $sent = tcp::writeFrame($stream, replyJson(0, DebugReply(.badRequest, error: $why)), DEBUG_WRITE_MS);
                 return;
             }
             guard tcp::writeFrame($stream, helloJson(), DEBUG_WRITE_MS) else {

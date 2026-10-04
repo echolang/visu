@@ -29,19 +29,19 @@ public class DebugMailbox
     }
 
     /**
-     * Worker side: queue `$request` and sleep until the main thread answers. 503 once the
-     * mailbox closed, or when the job was dropped unanswered.
+     * Worker side: queue `$request` and sleep until the main thread answers. `shuttingDown` once the
+     * mailbox closed, `failed` when the job was dropped unanswered.
      */
     public function post(DebugRequest $request) : DebugReply
     {
         thread::channel<DebugReply> $ch = thread::channel<DebugReply>(1);
         thread::receiver<DebugReply> $rx = $ch->rx();
         if (!$this->push($request, $ch->tx())) {
-            return DebugReply(503, error: 'the app is shutting down');
+            return DebugReply(.shuttingDown, error: 'the app is shutting down');
         }
 
         DebugReply $answer = guard $rx->recv() else {
-            return DebugReply(503, error: 'the app dropped the request');
+            return DebugReply(.failed, error: 'the app dropped the request');
         }
         return $answer;
     }
@@ -75,7 +75,7 @@ public class DebugMailbox
 
     /**
      * Refuse every later post and drop what is queued, which wakes each waiting worker with
-     * a 503. Main side, before the server stops.
+     * `shuttingDown`. Main side, before the server stops.
      */
     public function close() : void
     {
@@ -89,7 +89,7 @@ public class DebugMailbox
         }
 
         foreach ($dropped as $job) {
-            $job->answer(DebugReply(503, error: 'the app is shutting down'));
+            $job->answer(DebugReply(.shuttingDown, error: 'the app is shutting down'));
         }
     }
 
