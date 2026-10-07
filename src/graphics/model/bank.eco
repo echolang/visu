@@ -135,6 +135,13 @@ public class ModelBank
     private bool $classic = true;
 
     /**
+     * Ids first decoded inside a displayed frame: each read its model and uploaded its maps there,
+     * a hitch a load step (`ModelSystem`'s arrivals outside a frame, a `previewForm`) spares.
+     * Logged once each.
+     */
+    public int32 $lateModels = 0;
+
+    /**
      * The bindless side of the materials, on a device that has it: every map in a `TextureTable`
      * slot (one slot per distinct texture, by label), every material a row of the material
      * table at its dense index. Made with the first material; null on a device without
@@ -178,6 +185,11 @@ public class ModelBank
     {
         if ($this->models->has($id)) {
             return .ok($this->models[$id]);
+        }
+
+        if ($this->device->inFrame()) {
+            $this->lateModels = $this->lateModels + 1;
+            info("model: '{$id}' decoded in the displayed frame; warm it at load");
         }
 
         Model $model = guard $this->assets->load<Model>($id) else ($e) {

@@ -181,7 +181,8 @@ public class Texture : GpuObject
 
     /**
      * Write a texel rectangle of one cube face or array slice. Every other upload lands here,
-     * so the rect, face and size checks live here once and the backends only copy.
+     * so the rect, face and size checks and the in-frame upload count live here once and the
+     * backends only copy. The count is the rect's tight bytes, whatever the source's row pitch.
      */
     public function upload(
         rect: int32 $x,
@@ -203,6 +204,9 @@ public class Texture : GpuObject
             'Texture.upload: rect past the mip'
         );
         $this->device->uploadTexture($this, $x, $y, $width, $height, $mip, $face, $src, $bytes, $bytesPerRow);
+        if ($this->device->inFrame()) {
+            $this->device->draws->upload(mipByteCount($this->desc->format, $width, $height));
+        }
     }
 
     /**

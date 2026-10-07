@@ -175,8 +175,7 @@ internal function vkUploadTexture(
             $mip,
             $layer,
             $src,
-            $row,
-            $bpp
+            $row
         );
         return;
     }
@@ -250,8 +249,8 @@ internal function vkUploadRectOneShot(
 }
 
 /**
- * Staging from the frame host ring, recorded on the scene command buffer. No QueueWaitIdle.
- * Bands that do not fit the remaining ring die the same way a uniform overflow does.
+ * Staged in the slot's belt and recorded on the frame's command buffer, so no QueueWaitIdle.
+ * The belt grows rather than fail.
  */
 internal function vkUploadRectInFrame(
     Device $device,
@@ -263,69 +262,57 @@ internal function vkUploadRectInFrame(
     int32 $mip,
     int32 $layer,
     ptr<const uint8> $src,
-    uint64 $srcRow,
-    uint32 $bpp
+    uint64 $srcRow
 ) : void
 {
+    PixelFormat $fmt = $texture->desc->format;
+    uint64 $tight = mipRowBytes($fmt, $width);
+    uint64 $total = mipByteCount($fmt, $width, $height);
     FrameSlot $slot = $device->slots[$device->slot];
-    HostRing $ring = $slot->ring;
-    vk::CommandBuffer $cmd = $device->currentCmd();
-    uint32 $aspect = vkAspect($texture->desc->format);
-    uint64 $tight = ($width as uint64) * ($bpp as uint64);
-    vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferDst, $aspect);
-    int32 $row0 = 0;
-    while ($row0 < $height) {
-        uint64 $left = $ring->remaining();
-        assert($left >= $tight, 'upload ring overflow');
-        int32 $rows = ($left / $tight) as int32;
-        int32 $want = $height - $row0;
-        if ($rows > $want) {
-            $rows = $want;
-        }
+    StagingSlice $slice = guard $slot->staging->stage($device, $total, vkStagingAlign($fmt)) else ($e) {
+        die($e->message());
+    }
 
-        uint64 $bandBytes = ($rows as uint64) * $tight;
-        TransientSlice $slice = $ring->bump($bandBytes, 4, $device->slot);
-        // tightly packed rows are one run in the source too, so the band is one copy
+    // tightly packed rows are one run in the source too, so the whole rect is one copy
+    if ($srcRow == $tight) {
+        mem::copy<uint8>($slice->data, ptr<uint8>($src:$), $total);
+    } else {
+        // a compressed row is a row of 4x4 blocks
+        int32 $rows = ($total / $tight) as int32;
         int32 $r = 0;
-        if ($srcRow == $tight) {
-            ptr<uint8> $from = ptr<uint8>($src:$);
-            $from:$ = $from:$ + ((($row0 as uint64) * $tight) as isize);
-            mem::copy<uint8>($slice->data, $from, $bandBytes);
-            $r = $rows;
-        }
-
         while ($r < $rows) {
             ptr<uint8> $dst = $slice->data;
             $dst:$ = $dst:$ + ((($r as uint64) * $tight) as isize);
             ptr<uint8> $from = ptr<uint8>($src:$);
-            $from:$ = $from:$ + (((($row0 + $r) as uint64) * $srcRow) as isize);
+            $from:$ = $from:$ + ((($r as uint64) * $srcRow) as isize);
             mem::copy<uint8>($dst, $from, $tight);
             $r = $r + 1;
         }
-
-        vk::BufferImageCopy $region = vkFillBufferImageCopy(
-            $texture,
-            $x,
-            $y + $row0,
-            $width,
-            $rows,
-            $mip,
-            $layer,
-            $tight,
-            $bpp
-        );
-        $region->bufferOffset = $slice->offset;
-        vk::CmdCopyBufferToImage(
-            $cmd,
-            $ring->buffer,
-            $texture->handle->image,
-            vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1,
-            &$region
-        );
-        $row0 = $row0 + $rows;
     }
 
+    vk::CommandBuffer $cmd = $device->currentCmd();
+    uint32 $aspect = vkAspect($fmt);
+    vkRecordBarrier($cmd, $texture->handle->image, $texture->state, .transferDst, $aspect);
+    vk::BufferImageCopy $region = vkFillBufferImageCopy(
+        $texture,
+        $x,
+        $y,
+        $width,
+        $height,
+        $mip,
+        $layer,
+        $tight,
+        pixelByteCount($fmt)
+    );
+    $region->bufferOffset = $slice->offset;
+    vk::CmdCopyBufferToImage(
+        $cmd,
+        $slice->buffer,
+        $texture->handle->image,
+        vk::IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &$region
+    );
     vkRecordBarrier($cmd, $texture->handle->image, .transferDst, .shaderRead, $aspect);
     $texture->state = .shaderRead;
 }

@@ -1,12 +1,21 @@
 /**
- * Host-visible ring (uniforms, staging) and dedicated buffer memory.
+ * Host-visible uniform ring and dedicated buffer memory.
  * Each Buffer is its own VkBuffer + allocation; the ring is a bump allocator reset in beginFrame.
+ * Uploads stage through the slot's `StagingBelt`, never the ring.
  */
 
 namespace visu::graphics;
 
 internal const uint64 RING_BYTES = 16777216;
 internal const uint64 RING_SLACK = 65536;
+
+/**
+ * What the uniform ring is bound as. Nothing copies from it: uploads stage through the belt.
+ */
+internal const uint32 RING_USAGE = vk::BUFFER_USAGE_UNIFORM_BUFFER_BIT
+    | vk::BUFFER_USAGE_STORAGE_BUFFER_BIT
+    | vk::BUFFER_USAGE_VERTEX_BUFFER_BIT
+    | vk::BUFFER_USAGE_INDEX_BUFFER_BIT;
 
 internal function vkMemoryStats(Device $device) : MemoryStats
 {
@@ -57,17 +66,17 @@ internal class HostRing
         $this->bump = 0;
     }
 
-    public function allocate(Device $device, uint64 $bytes) : status<DeviceError>
+    /**
+     * Mapped, coherent host memory of `$bytes` for `$usage`: `RING_USAGE` for the uniform ring,
+     * `TRANSFER_SRC` for a staging chunk.
+     */
+    public function allocate(Device $device, uint64 $bytes, uint32 $usage) : status<DeviceError>
     {
         $this->destroy($device);
         BufferHandle $h = guard vkCreateBoundBuffer(
             $device,
             $bytes,
-            vk::BUFFER_USAGE_UNIFORM_BUFFER_BIT
-                | vk::BUFFER_USAGE_STORAGE_BUFFER_BIT
-                | vk::BUFFER_USAGE_TRANSFER_SRC_BIT
-                | vk::BUFFER_USAGE_VERTEX_BUFFER_BIT
-                | vk::BUFFER_USAGE_INDEX_BUFFER_BIT,
+            $usage,
             vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT
         ) else ($e) {
             return .error($e);
@@ -135,23 +144,6 @@ internal class HostRing
         ptr<uint8> $p = $this->mapped;
         $p:$ = $this->mapped:$ + ($off as isize);
         return TransientSlice($p, $off, $bytes, $frameSlot);
-    }
-
-    /**
-     * Bytes left after RING_SLACK, so a large upload cannot starve uniforms.
-     */
-    public const function remaining() : uint64
-    {
-        if ($this->bytes <= RING_SLACK) {
-            return 0;
-        }
-
-        uint64 $cap = $this->bytes - RING_SLACK;
-        if ($this->bump >= $cap) {
-            return 0;
-        }
-
-        return $cap - $this->bump;
     }
 }
 
@@ -273,6 +265,47 @@ internal function vkBufferUsage(uint32 $usage) : uint32
         $bits = $bits | vk::BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     }
     return $bits;
+}
+
+/**
+ * Stage `$bytes` in the slot's belt and record their copy into `$dst` at `$dstOffset` on the
+ * frame's command buffer, fenced like `copyBuffer` against the reads before and after it.
+ */
+internal function vkUploadBufferInFrame(
+    Device $device,
+    BufferHandle $dst,
+    uint64 $dstOffset,
+    ptr<const uint8> $src,
+    uint64 $bytes
+) : void
+{
+    FrameSlot $slot = $device->slots[$device->slot];
+    StagingSlice $slice = guard $slot->staging->stage($device, $bytes, 4 as uint64) else ($e) {
+        die($e->message());
+    }
+    mem::copy<uint8>($slice->data, ptr<uint8>($src:$), $bytes);
+    vkRecordBufferCopy($device->currentCmd(), $slice->buffer, $slice->offset, $dst->buffer, $dstOffset, $bytes);
+}
+
+/**
+ * Record one buffer copy, fenced against the transfers and reads before and after it.
+ */
+internal function vkRecordBufferCopy(
+    vk::CommandBuffer $cmd,
+    vk::Buffer $src,
+    uint64 $srcOffset,
+    vk::Buffer $dst,
+    uint64 $dstOffset,
+    uint64 $bytes
+) : void
+{
+    vkTransferOpen($cmd);
+    vk::BufferCopy $region = vk::BufferCopy();
+    $region->srcOffset = $srcOffset;
+    $region->dstOffset = $dstOffset;
+    $region->size = $bytes;
+    vk::CmdCopyBuffer($cmd, $src, $dst, 1, &$region);
+    vkTransferClose($cmd);
 }
 
 internal function vkOneShotCopy(

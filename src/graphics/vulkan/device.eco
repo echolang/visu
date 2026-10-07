@@ -422,6 +422,7 @@ public class Device : DeviceProtocol
         vkTimestampsResolve($this, $slot, $this->gpuProfiler);
         $this->sweepGraves(false);
         $slot->ring->reset();
+        $slot->staging->reset($this);
         $slot->uniformsDirty = true;
 
         if ($slot->set1pool->handle != 0) {
@@ -740,7 +741,8 @@ public class Device : DeviceProtocol
             ) else ($e) {
                 return .error($e);
             }
-            $handle->mapped = $mapped;
+            // re-seat: a plain `=` on a ptr writes through it, here into the null it starts as
+            $handle->mapped:$ = $mapped:$;
         }
 
         vkNoteAlloc($this, $handle->bytes);
@@ -879,10 +881,20 @@ public class Device : DeviceProtocol
         }
     }
 
+    /**
+     * Inside a frame (no encoder open) the bytes go through the slot's staging belt and the copy
+     * is recorded on the frame's command buffer, ordered after what the frame recorded so far.
+     * Outside a frame, or with an encoder open, it is a one-shot copy that waits for the queue.
+     */
     public function uploadBuffer(BufferHandle $handle, uint64 $offset, ptr<const uint8> $src, uint64 $bytes) : void
     {
         assert($this->logical->handle != 0, 'uploadBuffer before initialize');
         assert($bytes > 0, 'uploadBuffer size');
+        if ($this->inFrame && !$this->encoderOpen) {
+            vkUploadBufferInFrame($this, $handle, $offset, $src, $bytes);
+            return;
+        }
+
         BufferHandle $staging = guard vkCreateBoundBuffer(
             $this,
             $bytes,
@@ -973,14 +985,7 @@ public class Device : DeviceProtocol
             return;
         }
 
-        vk::CommandBuffer $cmd = $this->currentCmd();
-        vkTransferOpen($cmd);
-        vk::BufferCopy $region = vk::BufferCopy();
-        $region->srcOffset = $srcOffset;
-        $region->dstOffset = $dstOffset;
-        $region->size = $bytes;
-        vk::CmdCopyBuffer($cmd, $src->handle->buffer, $dst->handle->buffer, 1, &$region);
-        vkTransferClose($cmd);
+        vkRecordBufferCopy($this->currentCmd(), $src->handle->buffer, $srcOffset, $dst->handle->buffer, $dstOffset, $bytes);
     }
 
     public function createTexture(const TextureDesc& $desc) : result<TextureHandle, DeviceError>

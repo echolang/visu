@@ -40,7 +40,7 @@ public class Buffer : GpuObject
         $this->handle = $handle;
         $this->dead = false;
         ptr<const float32> $src = $data->data();
-        $device->uploadBuffer($handle, 0 as uint64, ptr<const uint8>($src:$), $bytes);
+        bufferUpload($device, $handle, 0 as uint64, ptr<const uint8>($src:$), $bytes);
     }
 
     public constructor(Device $device, uint32 $usage, ptr<const uint8> $src, uint64 $bytes)
@@ -54,7 +54,7 @@ public class Buffer : GpuObject
         $this->device = $device;
         $this->handle = $handle;
         $this->dead = false;
-        $device->uploadBuffer($handle, 0 as uint64, $src, $bytes);
+        bufferUpload($device, $handle, 0 as uint64, $src, $bytes);
     }
 
     destructor()
@@ -76,7 +76,19 @@ public class Buffer : GpuObject
     public function upload(ptr<const uint8> $src, uint64 $bytes, uint64 $offset = 0) : void
     {
         assert(!$this->dead, 'upload on destroyed buffer');
-        $this->device->uploadBuffer($this->handle, $offset, $src, $bytes);
+        bufferUpload($this->device, $this->handle, $offset, $src, $bytes);
+    }
+}
+
+/**
+ * Every buffer upload lands here, so an upload inside a displayed frame is counted once in the
+ * frame's draw stats on every backend; the backends only copy.
+ */
+internal function bufferUpload(Device $device, BufferHandle $handle, uint64 $offset, ptr<const uint8> $src, uint64 $bytes) : void
+{
+    $device->uploadBuffer($handle, $offset, $src, $bytes);
+    if ($device->inFrame()) {
+        $device->draws->upload($bytes);
     }
 }
 

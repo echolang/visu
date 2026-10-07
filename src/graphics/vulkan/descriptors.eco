@@ -157,7 +157,11 @@ internal function vkCreateDrawStack(Device $device) : status<DeviceError>
 
     while ($i < FRAMES_IN_FLIGHT) {
         FrameSlot $slot = $device->slots[$i];
-        guard $slot->ring->allocate($device, RING_BYTES) else ($e) {
+        guard $slot->ring->allocate($device, RING_BYTES, RING_USAGE) else ($e) {
+            return .error($e);
+        }
+
+        guard $slot->staging->reserve($device) else ($e) {
             return .error($e);
         }
 
@@ -356,6 +360,7 @@ internal function vkDestroyDrawStack(Device $device) : void
 
     foreach ($device->slots as $slot) {
         $slot->ring->destroy($device);
+        $slot->staging->destroy($device);
         $slot->set0 = vk::DescriptorSet::none();
 
         if ($slot->set1pool->handle != 0) {

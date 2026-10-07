@@ -109,15 +109,19 @@ public class ComputeEncoder : ComputeEncoderProtocol
         vk::CmdDispatchIndirect($this->device->currentCmd(), $arguments->handle->buffer, $offset);
     }
 
+    /**
+     * The dispatches before it are visible to the ones after, including a `dispatchIndirect`
+     * whose arguments they wrote: Vulkan reads those in the draw-indirect stage, not as a shader.
+     */
     public function barrier() : void
     {
         assert(!$this->ended, 'barrier after endCompute');
         vkMemoryBarrier(
             $this->device->currentCmd(),
             vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk::PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk::PIPELINE_STAGE_DRAW_INDIRECT_BIT,
             vk::ACCESS_SHADER_WRITE_BIT,
-            vk::ACCESS_SHADER_READ_BIT | vk::ACCESS_SHADER_WRITE_BIT
+            vk::ACCESS_SHADER_READ_BIT | vk::ACCESS_SHADER_WRITE_BIT | vk::ACCESS_INDIRECT_COMMAND_READ_BIT
         );
     }
 
@@ -203,7 +207,7 @@ internal function vkTransferOpen(vk::CommandBuffer $cmd) : void
 }
 
 /**
- * The transfer's writes are visible to every later shader, vertex and indirect read.
+ * The transfer's writes are visible to every later shader, uniform, vertex, index and indirect read.
  */
 internal function vkTransferClose(vk::CommandBuffer $cmd) : void
 {
@@ -221,6 +225,8 @@ internal function vkTransferClose(vk::CommandBuffer $cmd) : void
         vk::ACCESS_HOST_READ_BIT
             | vk::ACCESS_SHADER_READ_BIT
             | vk::ACCESS_SHADER_WRITE_BIT
+            | vk::ACCESS_UNIFORM_READ_BIT
+            | vk::ACCESS_INDEX_READ_BIT
             | vk::ACCESS_VERTEX_ATTRIBUTE_READ_BIT
             | vk::ACCESS_INDIRECT_COMMAND_READ_BIT
             | vk::ACCESS_TRANSFER_READ_BIT

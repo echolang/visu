@@ -293,20 +293,22 @@ public class ModelSystem : System, SceneDrawer, GeometryFiller, ShadowCaster, Ou
     /**
      * Arrivals queue from the attach hooks (and one sweep here of what was attached before the
      * system was bound), edits from the change hooks; a detach releases at once, before the
-     * entity is reused. Continuous movers come from the move log.
+     * entity is reused. Continuous movers come from the move log. An arrival outside a frame
+     * (the sweep, a scene's load-time spawns) decodes its model there, so the first frames only
+     * place rows.
      */
     public function register(Entities $entities) : void
     {
         $this->world = $entities;
         ModelSystem $sys = $this;
         $this->hooks[] = $entities->onAttach<StaticModel>(function(Entities $w, Entity $e, const StaticModel& $c) : void {
-            $sys->arrive($e);
+            $sys->arrive($e, $c->model);
         });
         $this->hooks[] = $entities->onAttach<DynamicModel>(function(Entities $w, Entity $e, const DynamicModel& $c) : void {
-            $sys->arrive($e);
+            $sys->arrive($e, $c->model);
         });
         $this->hooks[] = $entities->onAttach<SkinnedModel>(function(Entities $w, Entity $e, const SkinnedModel& $c) : void {
-            $sys->arrive($e);
+            $sys->arrive($e, $c->model);
         });
         $this->hooks[] = $entities->onChange<Transform>(function(Entities $w, Entity $e, const Transform& $t) : void {
             $sys->refresh($e);
@@ -335,15 +337,15 @@ public class ModelSystem : System, SceneDrawer, GeometryFiller, ShadowCaster, Ou
         $this->moveReader = $entities->moveReader();
 
         foreach ($entities->view<StaticModel>() as $id => &$static) {
-            $this->arrivals[] = $id;
+            $this->arrive($id, $static->model);
         }
 
         foreach ($entities->view<DynamicModel>() as $id => &$dynamic) {
-            $this->arrivals[] = $id;
+            $this->arrive($id, $dynamic->model);
         }
 
         foreach ($entities->view<SkinnedModel>() as $id => &$skin) {
-            $this->arrivals[] = $id;
+            $this->arrive($id, $skin->model);
         }
     }
 
@@ -988,6 +990,7 @@ public class ModelSystem : System, SceneDrawer, GeometryFiller, ShadowCaster, Ou
             $console->writeLine("model: gpu views, {$rows} scene rows, {$active} active, {$moving} moving (see `scene`)");
             $console->writeLine("model: palette {$this->paletteRows}/{$rowCap} rows, {$this->paletteDropped} skins dropped");
             $console->writeLine("model: bias {$this->lodBias}, overlay {$this->lines->count()} segments");
+            $console->writeLine("model: {$this->bank->lateModels} models decoded in a displayed frame");
             return;
         }
 
@@ -1066,11 +1069,16 @@ public class ModelSystem : System, SceneDrawer, GeometryFiller, ShadowCaster, Ou
     }
 
     /**
-     * `$e` gained a model component: acquired at the next fill.
+     * `$e` gained a model component drawing `$model`: its row is placed at the next fill. Outside a
+     * frame the model is decoded now (a map hit after the first); inside one it waits for the
+     * fill, where the bank logs it as a late decode.
      */
-    internal function arrive(Entity $e) : void
+    internal function arrive(Entity $e, const string& $model) : void
     {
         $this->arrivals[] = $e;
+        if (!$this->bank->device->inFrame()) {
+            $this->acquire($model);
+        }
     }
 
     /**

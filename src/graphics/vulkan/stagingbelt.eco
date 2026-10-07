@@ -1,0 +1,158 @@
+/**
+ * Host-visible staging for uploads recorded inside a frame, one belt per frame slot. Chunks of
+ * mapped TRANSFER_SRC memory (`HostRing`s), bump-allocated and reset when `beginFrame` has waited
+ * out the slot, so a steady frame allocates nothing. A frame that stages more than the chunks hold
+ * grows the belt by a chunk (logged: it is an allocation in the displayed frame), and a grown chunk
+ * no frame has touched for `STAGING_TRIM_FRAMES` resets goes back to the device. Apart from the
+ * uniform ring, so an upload never starves the uniforms and never overflows.
+ */
+
+namespace visu::graphics;
+
+use visu::app::info;
+
+internal const uint64 STAGING_CHUNK_BYTES = 8388608;
+internal const int32 STAGING_TRIM_FRAMES = 240;
+
+/**
+ * Where one staged upload sits: the chunk's buffer, the offset into it, and the mapped bytes.
+ */
+internal struct StagingSlice
+{
+    public vk::Buffer $buffer;
+    public uint64 $offset;
+    public ptr<uint8> $data;
+}
+
+internal class StagingChunk
+{
+    public HostRing $ring;
+
+    /**
+     * Resets in a row this chunk staged nothing.
+     */
+    public int32 $idle;
+
+    public constructor()
+    {
+        $this->ring = HostRing();
+        $this->idle = 0;
+    }
+}
+
+internal class StagingBelt
+{
+    private array<StagingChunk> $chunks;
+    private usize $current;
+
+    public constructor()
+    {
+        $this->chunks = array<StagingChunk>();
+        $this->current = 0;
+    }
+
+    /**
+     * The first chunk, taken with the ring at device init so the usual frame never grows.
+     */
+    public function reserve(Device $device) : status<DeviceError>
+    {
+        return $this->grow($device, STAGING_CHUNK_BYTES);
+    }
+
+    /**
+     * `$bytes` of staging at `$align`, valid until this slot's next `reset`.
+     */
+    public function stage(Device $device, uint64 $bytes, uint64 $align) : result<StagingSlice, DeviceError>
+    {
+        while (true) {
+            if ($this->current == $this->chunks->count()) {
+                uint64 $size = STAGING_CHUNK_BYTES;
+                if ($bytes > $size) {
+                    $size = $bytes;
+                }
+
+                info("staging: a frame staged past {$this->chunks->count()} chunks, grew by {$size} bytes");
+                guard $this->grow($device, $size) else ($e) {
+                    return .error($e);
+                }
+            }
+
+            HostRing $ring = $this->chunks[$this->current]->ring;
+            uint64 $off = alignUp($ring->bump, $align);
+            if ($off + $bytes <= $ring->bytes) {
+                $ring->bump = $off + $bytes;
+                ptr<uint8> $p = $ring->mapped;
+                $p:$ = $ring->mapped:$ + ($off as isize);
+                return .ok(StagingSlice($ring->buffer, $off, $p));
+            }
+
+            $this->current = $this->current + 1;
+        }
+    }
+
+    /**
+     * The slot's fence was waited: every chunk is free again. Grown chunks idle for
+     * `STAGING_TRIM_FRAMES` resets are freed from the end; the first is always kept.
+     */
+    public function reset(Device $device) : void
+    {
+        foreach ($this->chunks as $chunk) {
+            if ($chunk->ring->bump > 0) {
+                $chunk->idle = 0;
+            } else {
+                $chunk->idle = $chunk->idle + 1;
+            }
+
+            $chunk->ring->reset();
+        }
+
+        usize $n = $this->chunks->count();
+        while ($n > 1 && $this->chunks[$n - 1]->idle >= STAGING_TRIM_FRAMES) {
+            // idle for many fence waits, so no frame in flight reads it
+            $this->chunks[$n - 1]->ring->destroy($device);
+            $n = $n - 1;
+        }
+
+        $this->chunks->truncate($n);
+        $this->current = 0;
+    }
+
+    public function destroy(Device $device) : void
+    {
+        foreach ($this->chunks as $chunk) {
+            $chunk->ring->destroy($device);
+        }
+
+        $this->chunks->truncate(0);
+        $this->current = 0;
+    }
+
+    private function grow(Device $device, uint64 $bytes) : status<DeviceError>
+    {
+        StagingChunk $chunk = StagingChunk();
+        guard $chunk->ring->allocate($device, $bytes, vk::BUFFER_USAGE_TRANSFER_SRC_BIT) else ($e) {
+            return .error($e);
+        }
+
+        $this->chunks[] = $chunk;
+        return .ok;
+    }
+}
+
+/**
+ * Buffer-to-image copy offsets are a multiple of the texel block and of 4.
+ */
+internal function vkStagingAlign(PixelFormat $format) : uint64
+{
+    if ($format->isCompressed()) {
+        return 16;
+    }
+
+    uint64 $b = pixelByteCount($format) as uint64;
+    uint64 $a = $b;
+    while (($a % 4) != 0) {
+        $a = $a + $b;
+    }
+
+    return $a;
+}
