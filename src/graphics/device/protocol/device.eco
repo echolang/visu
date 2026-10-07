@@ -105,6 +105,11 @@ public interface DeviceProtocol
     function endFrame() : status<DeviceError>;
 
     /**
+     * Whether `beginFrame` has opened a frame that `endFrame` has not yet closed.
+     */
+    const function inFrame() : bool;
+
+    /**
      * Index into the in-flight ring (0 .. frames-in-flight-1).
      * Transient slices and per-frame GPU objects live on this slot.
      */
@@ -239,7 +244,9 @@ public interface DeviceProtocol
     function destroyTextureTable(TextureTableHandle $handle) : void;
 
     /**
-     * CPU write into a host-visible buffer at `$offset`.
+     * Copy `$bytes` from `$src` into the buffer at `$offset`. Inside a frame the copy is recorded
+     * on the command stream and counted (Vulkan stages through the slot's belt; Metal writes
+     * shared memory). Outside a frame it may stall. Not while an encoder is open.
      */
     function uploadBuffer(BufferHandle $handle, uint64 $offset, ptr<const uint8> $src, uint64 $bytes) : void;
 
@@ -284,6 +291,8 @@ public interface DeviceProtocol
     /**
      * CPU write a rectangle of one mip of one array slice (a cube face). Sets state to shaderRead.
      * `$bytesPerRow` 0 means tightly packed. `$x` `$y` `$width` `$height` are in texels at `$mip`.
+     * Inside a frame the copy is recorded and counted; outside a frame it may stall. Not while an
+     * encoder is open.
      */
     function uploadTexture(
         Texture $texture,

@@ -882,15 +882,16 @@ public class Device : DeviceProtocol
     }
 
     /**
-     * Inside a frame (no encoder open) the bytes go through the slot's staging belt and the copy
-     * is recorded on the frame's command buffer, ordered after what the frame recorded so far.
-     * Outside a frame, or with an encoder open, it is a one-shot copy that waits for the queue.
+     * Inside a frame the bytes go through the slot's staging belt and the copy is recorded on the
+     * frame's command buffer, ordered after what the frame recorded so far. Outside a frame it is
+     * a one-shot copy that waits for the queue. Not while an encoder is open.
      */
     public function uploadBuffer(BufferHandle $handle, uint64 $offset, ptr<const uint8> $src, uint64 $bytes) : void
     {
         assert($this->logical->handle != 0, 'uploadBuffer before initialize');
         assert($bytes > 0, 'uploadBuffer size');
-        if ($this->inFrame && !$this->encoderOpen) {
+        assert(!$this->encoderOpen, 'uploadBuffer with an open encoder');
+        if ($this->inFrame) {
             vkUploadBufferInFrame($this, $handle, $offset, $src, $bytes);
             return;
         }
